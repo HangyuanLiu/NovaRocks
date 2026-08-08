@@ -312,7 +312,7 @@ mod tests {
                 },
             ),
             statistics_pin: None,
-            planning_lease: None,
+            admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local,
             scan_materialization: None,
             iceberg_write_table: None,
             mv_target_read: None,

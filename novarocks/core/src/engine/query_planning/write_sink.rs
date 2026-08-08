@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 use arrow::datatypes::DataType;
 use novarocks_catalog::schema::ColumnDef;
 
-use super::bindings::{QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore};
+use super::bindings::{
+    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
+};
 use crate::sql::analysis::TypedExpr;
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::planner::distributed::write::contract::{
@@ -115,9 +117,9 @@ pub(crate) fn sql_write_plan_input_from_admitted_binding(
     root_output_exprs: Option<Vec<TypedExpr>>,
 ) -> Result<SqlWritePlanInput, String> {
     let captured = bindings.binding(binding)?;
-    if captured.planning_lease.is_none() {
-        return Err("SQL write target binding is missing its admission planning lease".to_string());
-    }
+    captured.admission.exact_planning_lease().map_err(|_| {
+        "SQL write target binding is missing its admission planning lease".to_string()
+    })?;
     let table = admitted_iceberg_table(&captured)?;
     let identity = SqlTableIdentity {
         catalog: table.catalog.clone(),
@@ -325,7 +327,7 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
                 planner,
             ),
             statistics_pin: None,
-            planning_lease: Some(planning_lease),
+            admission: QueryTableBindingAdmission::Exact(planning_lease),
             // This token represents a terminal write target, not a read
             // source.  Do not invent a synthetic Iceberg file scan merely to
             // prove admission; the provider-owned write table below is the

@@ -199,7 +199,9 @@ fn coalesce_binding(
             table,
         ),
         statistics_pin: None,
-        planning_lease: Some(planning_lease),
+        admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+            planning_lease,
+        ),
         scan_materialization: Some(materialization),
         iceberg_write_table: None,
         mv_target_read,
@@ -445,7 +447,10 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                         resolved,
                     ),
                     statistics_pin: None,
-                    planning_lease: Some(lease.clone()),
+                    admission:
+                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                            lease.clone(),
+                        ),
                     scan_materialization: Some(
                         crate::engine::query_planning::bindings::QueryScanMaterialization {
                             table: metadata.table,

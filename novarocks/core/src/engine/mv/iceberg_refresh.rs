@@ -14058,7 +14058,7 @@ fn compile_canonical_select_for_imv_for_maintenance(
     bind_imv_target_query_table_in_store(
         ctx,
         &bindings,
-        Some(&target_planning_materialization.planning_lease),
+        &target_planning_materialization.planning_lease,
     )
     .map_err(RefreshError::user)?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
@@ -14260,14 +14260,12 @@ pub(crate) fn sql_imv_planning_input(
 pub(crate) fn bind_imv_target_query_table_in_store(
     refresh: &IcebergMvRefreshContext,
     store: &Arc<QueryTableBindingStore>,
-    planning_lease: Option<&novarocks_spi::connector::ConnectorControlPlanningLease>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<crate::sql::binding::SqlTableBindingId, String> {
     let target = &refresh.rewrite.target;
     let target_table_uuid = refresh.rewrite.target_table_uuid.clone();
     let frozen_snapshot_id = refresh.rewrite.target_snapshot_id;
-    let planning_lease = planning_lease.cloned().ok_or_else(|| {
-        "IMV target admission requires an exact connector control planning lease".to_string()
-    })?;
+    let planning_lease = planning_lease.clone();
     let context = refresh_connector_context(refresh)?.clone();
     let materialization =
         crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
@@ -14367,7 +14365,9 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             // optimizer statistics are resolved for this target as a side
             // channel during refresh preparation.
             statistics_pin: None,
-            planning_lease: Some(planning_lease),
+            admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                planning_lease,
+            ),
             scan_materialization: Some(mv_target_read.full.clone()),
             mv_target_read: Some(mv_target_read),
             iceberg_write_table: Some(table.clone()),
@@ -14380,7 +14380,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
 
 fn bind_imv_target_query_table(
     refresh: &IcebergMvRefreshContext,
-    planning_lease: Option<&novarocks_spi::connector::ConnectorControlPlanningLease>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     (
         Arc<QueryTableBindingStore>,
@@ -15143,7 +15143,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     let target_binding = bind_imv_target_query_table_in_store(
         &ctx,
         &bindings,
-        Some(&target_materialization.planning_lease),
+        &target_materialization.planning_lease,
     )?;
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
     let overlays = freeze_imv_base_query_local_overlays(state, &ctx)?;
@@ -15373,7 +15373,7 @@ fn execute_join_delta_branches_logical(
     let target_binding = bind_imv_target_query_table_in_store(
         ctx,
         &target_bindings,
-        Some(&target_planning_materialization.planning_lease),
+        &target_planning_materialization.planning_lease,
     )?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         target_bindings.as_ref(),
@@ -16365,11 +16365,8 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         table: request.target_name,
     };
     let target_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = bind_imv_target_query_table_in_store(
-        &refresh_context,
-        &target_bindings,
-        Some(planning_lease),
-    )?;
+    let target_binding =
+        bind_imv_target_query_table_in_store(&refresh_context, &target_bindings, planning_lease)?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         target_bindings.as_ref(),
         refresh_context
@@ -17459,7 +17456,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let target_binding = bind_imv_target_query_table_in_store(
         &ctx,
         &target_bindings,
-        Some(&target_planning_materialization.planning_lease),
+        &target_planning_materialization.planning_lease,
     )?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         target_bindings.as_ref(),
@@ -21678,8 +21675,7 @@ mod tests {
             } if snapshot_id == frozen_snapshot_id
         ));
         let lease = bindings
-            .planning_lease(source.binding)
-            .expect("read frozen overlay lease")
+            .exact_planning_lease(source.binding)
             .expect("frozen overlay must retain planning lease");
         assert_eq!(lease.binding().incarnation(), original_incarnation);
         assert_ne!(lease.binding().incarnation(), replacement_incarnation);

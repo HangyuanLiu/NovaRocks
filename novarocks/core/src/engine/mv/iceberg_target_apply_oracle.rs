@@ -918,7 +918,10 @@ fn framework_locator_query_local_overlay(
                 Ok(QueryTableBinding {
                     resolved: ResolvedAnalyzerTable::from_planner(None, &namespace, planner),
                     statistics_pin: None,
-                    planning_lease: Some(planning_lease.clone()),
+                    admission:
+                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                            planning_lease.clone(),
+                        ),
                     scan_materialization: Some(scan_materialization.clone()),
                     iceberg_write_table: None,
                     mv_target_read: None,

@@ -30,8 +30,8 @@ use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
 use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingStore,
-    parse_time_travel_overlay_identity,
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
+    QueryTableBindingStore, parse_time_travel_overlay_identity,
 };
 use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
@@ -129,9 +129,10 @@ fn project_binding_statistics(
             ),
         ));
     };
-    let Some(planning_lease) = binding.planning_lease.as_ref() else {
-        return Err(SqlStatisticsFatalError::BindingMissing);
-    };
+    let planning_lease = binding
+        .admission
+        .exact_planning_lease()
+        .map_err(|_| SqlStatisticsFatalError::BindingMissing)?;
     let control_binding = planning_lease.binding();
     if control_binding.descriptor().instance_id != *pin.table.owner() {
         return Err(SqlStatisticsFatalError::OwnerMismatch);
@@ -335,7 +336,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         Ok(QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
             statistics_pin: materialization.statistics_pin.clone(),
-            planning_lease: Some(materialization.planning_lease.clone()),
+            admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
             scan_materialization: Some(QueryScanMaterialization {
                 table: materialization.read_table,
                 schema: materialization.read_schema,

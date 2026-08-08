@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::engine::query_planning::bindings::{
-    QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
 };
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{
@@ -170,7 +170,7 @@ pub(crate) fn admit_frozen_rewrite_scan_binding(
                     },
                 ),
                 statistics_pin: None,
-                planning_lease: None,
+                admission: QueryTableBindingAdmission::Local,
                 scan_materialization: None,
                 mv_target_read: None,
                 iceberg_write_table: None,

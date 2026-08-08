@@ -192,10 +192,29 @@ pub(crate) fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i
 /// stays here; neither the SQL scan vocabulary nor SQL catalog facts contain
 /// a provider table, files, cloud properties, or serialized metadata.
 #[derive(Clone)]
+pub(crate) enum QueryTableBindingAdmission {
+    /// Local SQL tables do not own a connector generation and cannot be used
+    /// as a connector read or write admission source.
+    Local,
+    /// A connector-owned table admission retains the exact generation that
+    /// admitted its read materialization or terminal write target.
+    Exact(ConnectorControlPlanningLease),
+}
+
+impl QueryTableBindingAdmission {
+    pub(crate) fn exact_planning_lease(&self) -> Result<ConnectorControlPlanningLease, String> {
+        match self {
+            Self::Exact(lease) => Ok(lease.clone()),
+            Self::Local => Err("query binding has no connector planning lease".to_string()),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct QueryTableBinding {
     pub(crate) resolved: ResolvedAnalyzerTable,
     pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
-    pub(crate) planning_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+    pub(crate) admission: QueryTableBindingAdmission,
     /// Provider facts required by scan preparation.  This is deliberately
     /// application-owned and paired with the same token as `resolved`; it is
     /// never embedded in a SQL logical or distributed plan.
@@ -274,7 +293,7 @@ impl QueryTableBinding {
         Self {
             resolved,
             statistics_pin: None,
-            planning_lease: None,
+            admission: QueryTableBindingAdmission::Local,
             scan_materialization: None,
             mv_target_read: None,
             iceberg_write_table: None,
@@ -390,7 +409,7 @@ impl QueryTableBindingStore {
                 material.extend_from_slice(Sha256::digest(pin.table.payload()).as_slice());
                 material.extend_from_slice(Sha256::digest(pin.data_version.as_bytes()).as_slice());
             }
-            if let Some(lease) = &binding.planning_lease {
+            if let QueryTableBindingAdmission::Exact(lease) = &binding.admission {
                 let descriptor = lease.binding().descriptor();
                 material.extend_from_slice(descriptor.provider_id.as_str().as_bytes());
                 material.push(0);
@@ -472,11 +491,11 @@ impl QueryTableBindingStore {
         Ok(self.binding(id)?.statistics_pin.clone())
     }
 
-    pub(crate) fn planning_lease(
+    pub(crate) fn exact_planning_lease(
         &self,
         id: SqlTableBindingId,
-    ) -> Result<Option<novarocks_spi::connector::ConnectorControlPlanningLease>, String> {
-        Ok(self.binding(id)?.planning_lease.clone())
+    ) -> Result<ConnectorControlPlanningLease, String> {
+        self.binding(id)?.admission.exact_planning_lease()
     }
 
     /// Recover provider scan facts only through the exact request-local token.

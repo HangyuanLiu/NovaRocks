@@ -494,7 +494,8 @@ fn admit_statistics_scan_binding(
                         },
                     ),
                     statistics_pin: None,
-                    planning_lease: None,
+                    admission:
+                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local,
                     scan_materialization: None,
                     mv_target_read: None,
                     iceberg_write_table: None,

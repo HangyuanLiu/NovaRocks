@@ -840,7 +840,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 crate::engine::mv::iceberg_refresh::bind_imv_target_query_table_in_store(
                     &refresh_context,
                     &bindings,
-                    Some(planning_lease),
+                    planning_lease,
                 )?;
             let write_target_binding = admit_frozen_iceberg_write_target(
                 bindings.as_ref(),

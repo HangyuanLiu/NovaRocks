@@ -225,7 +225,10 @@ fn fixture_query_table_bindings_with_materialized_files(
                         resolved_planner,
                     ),
                     statistics_pin: None,
-                    planning_lease: planning_lease.clone(),
+                    admission: planning_lease
+                        .clone()
+                        .map(crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact)
+                        .unwrap_or(crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local),
                     scan_materialization: Some(scan_materialization.clone()),
                     mv_target_read: match &source.kind {
                         SqlScanKind::MvTargetState { facts } => Some(

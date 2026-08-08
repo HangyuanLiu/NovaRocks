@@ -164,7 +164,10 @@ pub(super) fn fixture_query_table_bindings(
                         resolved_planner,
                     ),
                     statistics_pin: None,
-                    planning_lease: Some(lease.clone()),
+                    admission:
+                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                            lease.clone(),
+                        ),
                     scan_materialization: Some(QueryScanMaterialization {
                         table: metadata.table,
                         schema: metadata.schema,

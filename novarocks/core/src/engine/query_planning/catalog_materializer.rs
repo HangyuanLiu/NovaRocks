@@ -30,7 +30,8 @@ use novarocks_catalog::provider::CatalogProvider;
 use novarocks_catalog::table::CatalogTable;
 
 use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
+    QueryTableBindingStore,
 };
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::catalog::{
@@ -146,7 +147,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
     Ok(QueryTableBinding {
         resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
         statistics_pin: materialization.statistics_pin.clone(),
-        planning_lease: Some(materialization.planning_lease.clone()),
+        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
         scan_materialization: Some(QueryScanMaterialization {
             table: materialization.read_table,
             schema: materialization.read_schema,
@@ -503,7 +504,7 @@ mod tests {
         QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some("ice"), "db", planner),
             statistics_pin: None,
-            planning_lease: None,
+            admission: QueryTableBindingAdmission::Local,
             scan_materialization: None,
             iceberg_write_table: None,
             mv_target_read: None,

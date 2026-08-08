@@ -589,9 +589,9 @@ fn exact_query_binding_lease_for_source(
     };
     let binding_id = binding_id
         .ok_or_else(|| format!("scan preparation has no exact query binding for {source_name}"))?;
-    let lease = bindings.planning_lease(binding_id)?.ok_or_else(|| {
-        format!("query binding for {source_name} has no connector planning lease")
-    })?;
+    let lease = bindings
+        .exact_planning_lease(binding_id)
+        .map_err(|_| format!("query binding for {source_name} has no connector planning lease"))?;
     if lease.binding().descriptor().instance_id.as_str() != expected_catalog {
         return Err(format!(
             "query binding lease owner '{:?}' does not match scan catalog '{}'",
