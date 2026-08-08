@@ -18,7 +18,7 @@
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
-use crate::sql::common::ChangeStreamBranchKind;
+use novarocks_types::change_stream::ChangeStreamBranchKind;
 
 use super::ExecNode;
 

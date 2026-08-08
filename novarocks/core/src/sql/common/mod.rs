@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod change_stream;
+pub(crate) mod change_stream;
 #[cfg(feature = "runtime-filter-test-support")]
 pub mod expr;
 #[cfg(not(feature = "runtime-filter-test-support"))]

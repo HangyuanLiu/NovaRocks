@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::sql::plan_read::OutputColumn;
 
 pub(super) fn encode_fragment_output_contract(
     src: &PlanFragment,
@@ -179,14 +180,12 @@ fn encode_node_execution_column(
 }
 
 pub(super) fn encode_output_columns(
-    src: &[crate::sql::analysis::OutputColumn],
+    src: &[OutputColumn],
 ) -> Result<Vec<common::OutputColumn>, String> {
     src.iter().map(encode_output_column).collect()
 }
 
-pub(super) fn encode_output_column(
-    src: &crate::sql::analysis::OutputColumn,
-) -> Result<common::OutputColumn, String> {
+pub(super) fn encode_output_column(src: &OutputColumn) -> Result<common::OutputColumn, String> {
     Ok(common::OutputColumn {
         column_id: src.column_id.0,
         name: src.name.clone(),

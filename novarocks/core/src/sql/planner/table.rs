@@ -37,7 +37,7 @@ pub(crate) enum SqlTableVersionSelector {
 /// SQL-level metadata table identity.  Provider-specific metadata APIs are
 /// deliberately not represented in the compiler vocabulary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum SqlMetadataTableKind {
+pub enum SqlMetadataTableKind {
     Snapshots,
     History,
     Refs,
@@ -65,7 +65,7 @@ impl SqlMetadataTableKind {
 /// Immutable SQL facts that characterize a scan without carrying provider
 /// metadata, files, credentials, or an executable connector handle.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum SqlScanKind {
+pub enum SqlScanKind {
     /// A connector-neutral external scan. Its exact execution authority is
     /// recovered by `binding` at the application preparation boundary.
     ConnectorRead,
@@ -252,7 +252,7 @@ fn table_name_matches_identity(expected: &str, table: &str, alias: Option<&str>)
 /// `QueryTableBindingStore`; attempts to use it with another request fail
 /// before connector submission.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SqlScanSource {
+pub struct SqlScanSource {
     pub(crate) binding: SqlTableBindingId,
     pub(crate) table: SqlTableIdentity,
     pub(crate) kind: SqlScanKind,
@@ -295,7 +295,7 @@ impl SqlScanSource {
 /// standalone refresh codegen lowers this source into the local target-state
 /// scan used by aggregate-state merge execution.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SqlMvTargetStateScan {
+pub struct SqlMvTargetStateScan {
     pub(crate) target_table_uuid: String,
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) aggregate_state_layout_version: u16,
@@ -326,7 +326,7 @@ pub(crate) struct BranchScope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SqlMvTargetStateRowFilter {
+pub enum SqlMvTargetStateRowFilter {
     DeltaInputRowIds {
         row_id_column_name: String,
         branch_scope: Option<BranchScope>,
@@ -334,7 +334,7 @@ pub(crate) enum SqlMvTargetStateRowFilter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SqlMvTargetStatePartitionConstraint {
+pub enum SqlMvTargetStatePartitionConstraint {
     Unpartitioned,
     AffectedPartitionAllowListRequired,
 }

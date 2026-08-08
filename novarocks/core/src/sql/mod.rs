@@ -30,6 +30,7 @@ pub(crate) mod functions;
 pub(crate) mod literal;
 pub mod mv_refresh;
 pub(crate) mod parser;
+pub mod plan_read;
 
 pub(crate) mod optimizer;
 

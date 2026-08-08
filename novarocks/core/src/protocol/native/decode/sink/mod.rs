@@ -44,6 +44,7 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity, StatisticsMetric,
     StatisticsMetricRequest,
 };
+use novarocks_types::change_stream::ChangeStreamBranchKind;
 
 struct NativeWriterCancellation {
     query_id: QueryId,
@@ -788,22 +789,11 @@ fn decode_change_stream_router_program(
         let split_exprs = branch_kinds
             .into_iter()
             .map(|branch_kind| {
-                let execution_branch_kind = match branch_kind {
-                    crate::sql::common::ChangeStreamBranchKind::DeleteDv => {
-                        crate::exec::change_op::ChangeStreamBranchKind::DeleteDv
-                    }
-                    crate::sql::common::ChangeStreamBranchKind::ReuseData => {
-                        crate::exec::change_op::ChangeStreamBranchKind::ReuseData
-                    }
-                    crate::sql::common::ChangeStreamBranchKind::FreshData => {
-                        crate::exec::change_op::ChangeStreamBranchKind::FreshData
-                    }
-                };
                 build_change_stream_split_predicate(
                     &mut partition_arena,
                     change_op_slot_id,
                     data_route_slot_id,
-                    execution_branch_kind,
+                    branch_kind,
                 )
                 .map_err(|error| {
                     NativeFragmentLeafDecodeError::at_field(
@@ -947,21 +937,13 @@ fn decode_router_output_slots(
     decoded
 }
 
-fn decode_change_stream_branch_kind(
-    value: i32,
-) -> Result<crate::sql::common::ChangeStreamBranchKind, String> {
+fn decode_change_stream_branch_kind(value: i32) -> Result<ChangeStreamBranchKind, String> {
     match plan::ChangeStreamBranchKind::try_from(value)
         .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
     {
-        plan::ChangeStreamBranchKind::DeleteDv => {
-            Ok(crate::sql::common::ChangeStreamBranchKind::DeleteDv)
-        }
-        plan::ChangeStreamBranchKind::ReuseData => {
-            Ok(crate::sql::common::ChangeStreamBranchKind::ReuseData)
-        }
-        plan::ChangeStreamBranchKind::FreshData => {
-            Ok(crate::sql::common::ChangeStreamBranchKind::FreshData)
-        }
+        plan::ChangeStreamBranchKind::DeleteDv => Ok(ChangeStreamBranchKind::DeleteDv),
+        plan::ChangeStreamBranchKind::ReuseData => Ok(ChangeStreamBranchKind::ReuseData),
+        plan::ChangeStreamBranchKind::FreshData => Ok(ChangeStreamBranchKind::FreshData),
         plan::ChangeStreamBranchKind::Unspecified => {
             Err("native ChangeStreamBranchKind is unspecified".to_string())
         }

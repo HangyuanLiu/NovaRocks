@@ -27,7 +27,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AggMode {
+pub enum AggMode {
     Single,
     Local,
     Global,
@@ -39,14 +39,14 @@ pub(crate) enum AggMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum TopNPhase {
+pub enum TopNPhase {
     Partial,
     #[default]
     Final,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum JoinDistribution {
+pub enum JoinDistribution {
     Unknown,
     Shuffle,
     Broadcast,
@@ -54,7 +54,7 @@ pub(crate) enum JoinDistribution {
 }
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
-pub(crate) enum HashSource {
+pub enum HashSource {
     ShuffleAgg,
     ShuffleJoin,
 }

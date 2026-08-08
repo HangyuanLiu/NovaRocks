@@ -36,12 +36,12 @@ use crate::runtime_filter::port::ordered_bound::{
 use crate::runtime_filter::port::topk_summary::{
     RuntimeTopKSummaryContract, TopKSummaryContractDigest,
 };
-use crate::sql::planner::runtime_filter::contract as sql_contract;
-use crate::sql::planner::runtime_filter::graph::{ApplyPoint, ProducerBindingTarget};
+use crate::sql::plan_read::{FragmentId, runtime_filter as sql_contract};
 use novarocks_protocol::plan;
+use sql_contract::{ApplyPoint, ProducerBindingTarget};
 
 pub(super) fn encode_runtime_filter_binding_table(
-    enclosing_fragment_id: crate::sql::planner::distributed::FragmentId,
+    enclosing_fragment_id: FragmentId,
     table: &RuntimeFilterBindingTable,
 ) -> Result<plan::RuntimeFilterBindingTable, String> {
     if table.fragment_id() != enclosing_fragment_id {

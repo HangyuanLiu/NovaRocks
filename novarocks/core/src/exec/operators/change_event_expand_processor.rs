@@ -253,9 +253,13 @@ impl ChangeEventExpandProcessorOperator {
         for slot_schema in self.output_chunk_schema.slots() {
             let slot_id = slot_schema.slot_id();
             let array = if slot_id == self.change_op_slot_id {
-                route_value_array(route_key.change_op, slot_schema.data_type(), selected_count)?
+                route_value_array(
+                    route_key.change_op(),
+                    slot_schema.data_type(),
+                    selected_count,
+                )?
             } else if Some(slot_id) == self.data_route_slot_id {
-                match route_key.data_route {
+                match route_key.data_route() {
                     Some(route) => {
                         route_value_array(route, slot_schema.data_type(), selected_count)?
                     }
@@ -473,7 +477,7 @@ mod tests {
     };
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
-    use crate::sql::common::ChangeStreamBranchKind;
+    use novarocks_types::change_stream::ChangeStreamBranchKind;
 
     const INPUT_FILE_SLOT: SlotId = SlotId::new(10);
     const INPUT_POS_SLOT: SlotId = SlotId::new(11);

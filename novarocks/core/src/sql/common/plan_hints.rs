@@ -24,7 +24,7 @@ use crate::sql::column_id::ColumnId;
 /// Native encoding and execution translate this SQL fact explicitly; it is
 /// deliberately not an execution-node re-export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SqlTopNType {
+pub enum SqlTopNType {
     RowNumber,
     Rank,
     DenseRank,
@@ -38,7 +38,7 @@ pub(crate) enum ApplyKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ScanVariantColumn {
+pub struct ScanVariantColumn {
     pub source_column_id: ColumnId,
     pub source_column: String,
     pub synthetic_column_id: ColumnId,

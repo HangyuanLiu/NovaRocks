@@ -62,7 +62,7 @@ pub(crate) struct ChangeStreamWriteDagSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChangeStreamRouterSink {
+pub struct ChangeStreamRouterSink {
     pub(crate) group_id: i32,
     pub(crate) change_op_output_ordinal: usize,
     pub(crate) data_route_output_ordinal: Option<usize>,

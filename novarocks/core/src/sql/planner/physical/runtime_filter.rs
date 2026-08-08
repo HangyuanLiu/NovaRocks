@@ -52,7 +52,7 @@ pub(crate) struct AggregateTopNRuntimeFilterBuildIntent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JoinExecutionMode {
+pub enum JoinExecutionMode {
     Broadcast,
     Partitioned,
     Colocate,

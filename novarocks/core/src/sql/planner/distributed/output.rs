@@ -132,7 +132,7 @@ impl fmt::Display for NodeExecutionKind {
 /// One output column of a finalized execution node, carrying both its
 /// query-scoped occurrence identity and its logical planner provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NodeExecutionColumn {
+pub struct NodeExecutionColumn {
     /// Query-scoped occurrence identity (reused from the boundary catalog when
     /// this node output participates in a boundary, otherwise freshly allocated).
     pub execution_column_id: ExecutionColumnId,
@@ -149,7 +149,7 @@ pub(crate) struct NodeExecutionColumn {
 /// The finalized execution output of a single covered node, keyed by the node's
 /// `(fragment_id, node_id)` identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NodeExecutionOutput {
+pub struct NodeExecutionOutput {
     pub fragment_id: FragmentId,
     pub node_id: i32,
     pub kind: NodeExecutionKind,
@@ -167,7 +167,7 @@ pub(crate) struct NodeExecutionOutput {
 /// (`OutputColumn` derives only `Clone, Debug` — not `PartialEq`/`Eq` — so this,
 /// and the [`NodeOutputCatalog`] that holds it, are `Clone, Debug` only.)
 #[derive(Clone, Debug)]
-pub(crate) struct FinalizedAggregateLayout {
+pub struct FinalizedAggregateLayout {
     pub group_key_columns: Vec<OutputColumn>,
     pub aggregate_columns: Vec<OutputColumn>,
 }
@@ -176,7 +176,7 @@ pub(crate) struct FinalizedAggregateLayout {
 /// plan, in deterministic derivation order (fragment declaration order, then a
 /// pre-order walk of each fragment's node tree).
 #[derive(Clone, Debug)]
-pub(crate) struct NodeOutputCatalog {
+pub struct NodeOutputCatalog {
     outputs: Vec<NodeExecutionOutput>,
     index: BTreeMap<(FragmentId, i32), usize>,
     /// Finalized `HashAggregate` wire layouts, keyed by `(fragment_id, node_id)`.
@@ -186,13 +186,13 @@ pub(crate) struct NodeOutputCatalog {
 
 impl NodeOutputCatalog {
     /// All finalized node outputs in canonical derivation order.
-    pub(crate) fn outputs(&self) -> &[NodeExecutionOutput] {
+    pub fn outputs(&self) -> &[NodeExecutionOutput] {
         &self.outputs
     }
 
     /// The finalized output of the node identified by `(fragment_id, node_id)`,
     /// or `None` if that node is not a covered kind.
-    pub(crate) fn output_for(
+    pub fn output_for(
         &self,
         fragment_id: FragmentId,
         node_id: i32,
@@ -204,7 +204,7 @@ impl NodeOutputCatalog {
 
     /// The finalized `HashAggregate` wire layout of the node identified by
     /// `(fragment_id, node_id)`, or `None` if that node is not a `HashAggregate`.
-    pub(crate) fn aggregate_layout(
+    pub fn aggregate_layout(
         &self,
         fragment_id: FragmentId,
         node_id: i32,
@@ -946,7 +946,7 @@ fn assign_occurrences(
 /// (`OutputColumn` carries an arrow `DataType` and does not implement `Eq`, so
 /// this catalog is compared structurally in tests via its `Debug` form.)
 #[derive(Clone, Debug)]
-pub(crate) struct FragmentEdgeOutputCatalog {
+pub struct FragmentEdgeOutputCatalog {
     /// Finalized `output_columns` per fragment, keyed by fragment id. Iceberg
     /// write fragments are absent (Task 3 owns their output schema).
     fragment_outputs: BTreeMap<FragmentId, Vec<OutputColumn>>,
@@ -962,10 +962,7 @@ impl FragmentEdgeOutputCatalog {
     /// or `None` for an Iceberg write fragment (whose output schema is owned by
     /// the `WriteContractCatalog`, finalized at seal in CGO-9C Task 3; the
     /// encoder only maps that contract 1:1).
-    pub(crate) fn fragment_output_columns(
-        &self,
-        fragment_id: FragmentId,
-    ) -> Option<&[OutputColumn]> {
+    pub fn fragment_output_columns(&self, fragment_id: FragmentId) -> Option<&[OutputColumn]> {
         self.fragment_outputs
             .get(&fragment_id)
             .map(|columns| columns.as_slice())
@@ -984,7 +981,7 @@ impl FragmentEdgeOutputCatalog {
     /// an Exchange node that is not the destination of a finalized stream edge
     /// (e.g. a CTE-multicast or change-stream-router receiver, whose columns come
     /// straight from its declared receiver schema).
-    pub(crate) fn stream_edge_projection(
+    pub fn stream_edge_projection(
         &self,
         target_fragment_id: FragmentId,
         target_exchange_node_id: i32,
@@ -1744,7 +1741,7 @@ fn find_exchange_receiver(node: &DistributedNode, node_id: i32) -> Option<&Excha
 /// the write sink's output schema carries, matching the target table's field
 /// positions.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FinalizedWriteTargetColumn {
+pub struct FinalizedWriteTargetColumn {
     pub column_id: u32,
     pub name: String,
     pub data_type: DataType,
@@ -1756,7 +1753,7 @@ pub(crate) struct FinalizedWriteTargetColumn {
 /// the fragment feeds into its write sink, and the sink's target output schema.
 /// The native encoder maps both 1:1.
 #[derive(Clone, Debug)]
-pub(crate) struct ConnectorWriteOutputContract {
+pub struct ConnectorWriteOutputContract {
     /// The write output expressions, evaluated against the fragment's execution
     /// output. Always populated: either the fragment's declared `output_exprs`
     /// (validated against the target arity) or, when the fragment declares none,
@@ -1775,7 +1772,7 @@ pub(crate) struct ConnectorWriteOutputContract {
 /// (`TypedExpr` / `DataPartition` carry an arrow `DataType` and do not implement
 /// `Eq`, so this catalog is `Clone, Debug` only, like [`FragmentEdgeOutputCatalog`].)
 #[derive(Clone, Debug)]
-pub(crate) struct WriteContractCatalog {
+pub struct WriteContractCatalog {
     /// Finalized Iceberg write output/target-schema, keyed by fragment id. Only
     /// Connector-write fragments with a frozen output contract are present.
     connector_write_outputs: BTreeMap<FragmentId, ConnectorWriteOutputContract>,
@@ -1788,7 +1785,7 @@ pub(crate) struct WriteContractCatalog {
 impl WriteContractCatalog {
     /// The finalized write output/target-schema of the Iceberg write fragment
     /// identified by `fragment_id`, or `None` for a non-write fragment.
-    pub(crate) fn connector_write_output(
+    pub fn connector_write_output(
         &self,
         fragment_id: FragmentId,
     ) -> Option<&ConnectorWriteOutputContract> {
@@ -1798,7 +1795,7 @@ impl WriteContractCatalog {
     /// The finalized partition of the change-stream router branch identified by
     /// `(fragment_id, branch_id)`, or `None` if that fragment is not a router or
     /// the branch id is unknown.
-    pub(crate) fn router_branch_partition(
+    pub fn router_branch_partition(
         &self,
         fragment_id: FragmentId,
         branch_id: i32,

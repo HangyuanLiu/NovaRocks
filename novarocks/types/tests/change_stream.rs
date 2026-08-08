@@ -15,11 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod change_stream;
-pub(crate) mod contract;
-pub(crate) mod plan;
-pub(crate) mod sink;
+use novarocks_types::change_stream::ChangeStreamBranchKind;
 
-pub use change_stream::ChangeStreamRouterSink;
-pub use contract::ConnectorWriteInputBinding;
-pub use sink::ConnectorWriteFragmentSink;
+#[test]
+fn branch_kinds_have_stable_immutable_route_keys() {
+    let cases = [
+        (ChangeStreamBranchKind::DeleteDv, -1, None),
+        (ChangeStreamBranchKind::ReuseData, 1, Some(1)),
+        (ChangeStreamBranchKind::FreshData, 1, Some(2)),
+    ];
+
+    for (branch_kind, change_op, data_route) in cases {
+        let route_key = branch_kind.route_key();
+        assert_eq!(route_key.change_op(), change_op);
+        assert_eq!(route_key.data_route(), data_route);
+    }
+}

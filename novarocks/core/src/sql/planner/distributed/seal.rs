@@ -62,20 +62,20 @@ struct DistributedPlanData {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DistributedPlan {
+pub struct DistributedPlan {
     data: DistributedPlanData,
 }
 
 impl DistributedPlan {
-    pub(crate) fn fragments(&self) -> &[PlanFragment] {
+    pub fn fragments(&self) -> &[PlanFragment] {
         &self.data.fragments
     }
 
-    pub(crate) fn root_fragment_id(&self) -> FragmentId {
+    pub fn root_fragment_id(&self) -> FragmentId {
         self.data.root_fragment_id
     }
 
-    pub(crate) fn edges(&self) -> &[FragmentEdge] {
+    pub fn edges(&self) -> &[FragmentEdge] {
         &self.data.edges
     }
 
@@ -123,14 +123,14 @@ impl DistributedPlan {
     // Consumed by the native encoder (CGO-9C Task 1), which reads each covered
     // node's execution output from this catalog instead of re-deriving it, and
     // by later CGO-9C tasks that thread the occurrence mapping.
-    pub(crate) fn node_outputs(&self) -> &NodeOutputCatalog {
+    pub fn node_outputs(&self) -> &NodeOutputCatalog {
         &self.data.node_outputs
     }
 
     // Consumed by the native encoder (CGO-9C Task 2), which maps each fragment's
     // finalized output columns and each stream edge's finalized projection 1:1
     // instead of re-deriving a stream schema or patching the exchange receiver.
-    pub(crate) fn fragment_edge_outputs(&self) -> &FragmentEdgeOutputCatalog {
+    pub fn fragment_edge_outputs(&self) -> &FragmentEdgeOutputCatalog {
         &self.data.fragment_edge_outputs
     }
 
@@ -138,7 +138,7 @@ impl DistributedPlan {
     // write fragment's finalized output expressions/target schema and each
     // change-stream router branch's finalized partition 1:1 instead of
     // synthesizing the write output or reconstructing a partition from ordinals.
-    pub(crate) fn write_contracts(&self) -> &WriteContractCatalog {
+    pub fn write_contracts(&self) -> &WriteContractCatalog {
         &self.data.write_contracts
     }
 

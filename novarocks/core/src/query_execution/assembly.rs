@@ -604,7 +604,8 @@ fn patch_native_change_stream_router_sink_in_place(
                 fragment_id, router_group_id, edge_group_id
             ));
         }
-        if !edge_route_keys.insert((*branch_id, *branch_kind)) {
+        let branch_kind = sql_change_stream_branch_kind(*branch_kind);
+        if !edge_route_keys.insert((*branch_id, branch_kind)) {
             return Err(format!(
                 "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
                  has duplicate branch edge route key branch_id={branch_id} branch_kind={branch_kind:?}"
@@ -661,8 +662,9 @@ fn patch_native_change_stream_router_sink_in_place(
             .iter_mut()
             .find(|route| {
                 route.branch_id == branch_id
-                    && native_change_stream_branch_kind(route.branch_kind)
-                        .is_ok_and(|route_kind| route_kind == branch_kind)
+                    && native_change_stream_branch_kind(route.branch_kind).is_ok_and(|route_kind| {
+                        route_kind == sql_change_stream_branch_kind(branch_kind)
+                    })
             })
             .ok_or_else(|| {
                 format!(
@@ -713,21 +715,37 @@ fn patch_native_change_stream_router_sink_in_place(
 
 fn native_change_stream_branch_kind(
     value: i32,
-) -> Result<crate::sql::common::ChangeStreamBranchKind, String> {
+) -> Result<novarocks_types::change_stream::ChangeStreamBranchKind, String> {
     match novarocks_protocol::plan::ChangeStreamBranchKind::try_from(value)
         .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
     {
         novarocks_protocol::plan::ChangeStreamBranchKind::DeleteDv => {
-            Ok(crate::sql::common::ChangeStreamBranchKind::DeleteDv)
+            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::DeleteDv)
         }
         novarocks_protocol::plan::ChangeStreamBranchKind::ReuseData => {
-            Ok(crate::sql::common::ChangeStreamBranchKind::ReuseData)
+            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::ReuseData)
         }
         novarocks_protocol::plan::ChangeStreamBranchKind::FreshData => {
-            Ok(crate::sql::common::ChangeStreamBranchKind::FreshData)
+            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::FreshData)
         }
         novarocks_protocol::plan::ChangeStreamBranchKind::Unspecified => {
             Err("native ChangeStreamBranchKind is unspecified".to_string())
+        }
+    }
+}
+
+fn sql_change_stream_branch_kind(
+    value: crate::sql::common::ChangeStreamBranchKind,
+) -> novarocks_types::change_stream::ChangeStreamBranchKind {
+    match value {
+        crate::sql::common::ChangeStreamBranchKind::DeleteDv => {
+            novarocks_types::change_stream::ChangeStreamBranchKind::DeleteDv
+        }
+        crate::sql::common::ChangeStreamBranchKind::ReuseData => {
+            novarocks_types::change_stream::ChangeStreamBranchKind::ReuseData
+        }
+        crate::sql::common::ChangeStreamBranchKind::FreshData => {
+            novarocks_types::change_stream::ChangeStreamBranchKind::FreshData
         }
     }
 }

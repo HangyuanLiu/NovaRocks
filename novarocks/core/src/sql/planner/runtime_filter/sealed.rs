@@ -28,7 +28,7 @@ use super::progress::JoinBuildProgressCatalog;
 /// Downstream preparation may retain a clone of this handle, but cannot mutate
 /// or rebuild any of the contained planning facts.
 #[derive(Clone, Debug)]
-pub(crate) struct SealedRuntimeFilterPlan {
+pub struct SealedRuntimeFilterPlan {
     graph: Arc<RuntimeFilterGraph>,
     activation_decisions: Arc<ActivationDecisionCatalog>,
     join_progress: Arc<JoinBuildProgressCatalog>,
@@ -47,7 +47,7 @@ impl SealedRuntimeFilterPlan {
         }
     }
 
-    pub(crate) fn graph(&self) -> &RuntimeFilterGraph {
+    pub fn graph(&self) -> &RuntimeFilterGraph {
         &self.graph
     }
 
@@ -55,7 +55,7 @@ impl SealedRuntimeFilterPlan {
         &self.activation_decisions
     }
 
-    pub(crate) fn join_progress(&self) -> &JoinBuildProgressCatalog {
+    pub fn join_progress(&self) -> &JoinBuildProgressCatalog {
         &self.join_progress
     }
 }

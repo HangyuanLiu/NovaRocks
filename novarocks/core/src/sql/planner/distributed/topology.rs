@@ -54,7 +54,7 @@ use super::{DataSink, FragmentEdge, FragmentId, PlanFragment};
 /// edges. Two structurally identical drafts produce identical contracts,
 /// including the topological order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TopologyContract {
+pub struct TopologyContract {
     planner_root_fragment_id: FragmentId,
     result_fragment_id: Option<FragmentId>,
     execution_anchor_fragment_id: FragmentId,
@@ -65,37 +65,37 @@ pub(crate) struct TopologyContract {
 
 impl TopologyContract {
     /// The draft's resolved root fragment id (the planner's logical root).
-    pub(crate) fn planner_root_fragment_id(&self) -> FragmentId {
+    pub fn planner_root_fragment_id(&self) -> FragmentId {
         self.planner_root_fragment_id
     }
 
     /// The result fragment id: the root iff its sink is [`DataSink::Result`],
     /// otherwise `None` (a write-only DAG has no result fragment).
-    pub(crate) fn result_fragment_id(&self) -> Option<FragmentId> {
+    pub fn result_fragment_id(&self) -> Option<FragmentId> {
         self.result_fragment_id
     }
 
     /// The single fragment that coordinates fetch/write, selected by planner
     /// semantics (see [`select_execution_anchor`]).
-    pub(crate) fn execution_anchor_fragment_id(&self) -> FragmentId {
+    pub fn execution_anchor_fragment_id(&self) -> FragmentId {
         self.execution_anchor_fragment_id
     }
 
     /// Terminal fragments (fragments that are the source of no edge) whose sink
     /// is a terminal write, in fragment declaration order.
-    pub(crate) fn terminal_write_fragment_ids(&self) -> &[FragmentId] {
+    pub fn terminal_write_fragment_ids(&self) -> &[FragmentId] {
         &self.terminal_write_fragment_ids
     }
 
     /// Fragments that are the source of at least one edge, in ascending id
     /// order.
-    pub(crate) fn producer_fragment_ids(&self) -> &[FragmentId] {
+    pub fn producer_fragment_ids(&self) -> &[FragmentId] {
         &self.producer_fragment_ids
     }
 
     /// The fragment ids in topological order: leaves (producers) first, root
     /// last. Stable and deterministic for a given draft.
-    pub(crate) fn topological_fragment_order(&self) -> &[FragmentId] {
+    pub fn topological_fragment_order(&self) -> &[FragmentId] {
         &self.topological_fragment_order
     }
 }

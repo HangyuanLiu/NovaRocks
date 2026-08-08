@@ -15,11 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod change_stream;
-pub(crate) mod contract;
-pub(crate) mod plan;
-pub(crate) mod sink;
+use novarocks::sql::plan_read::{
+    DataSink, DistributedPlan, FragmentEdge, FragmentId, PlanFragment,
+};
 
-pub use change_stream::ChangeStreamRouterSink;
-pub use contract::ConnectorWriteInputBinding;
-pub use sink::ConnectorWriteFragmentSink;
+fn read_sealed_plan(plan: &DistributedPlan) {
+    let _: &[PlanFragment] = plan.fragments();
+    let _: FragmentId = plan.root_fragment_id();
+    let _: &[FragmentEdge] = plan.edges();
+    let _: &DataSink = &plan.fragments()[0].sink;
+    let _ = plan.node_outputs();
+    let _ = plan.fragment_edge_outputs();
+    let _ = plan.write_contracts();
+}
+
+#[test]
+fn external_consumers_can_read_but_not_construct_a_sealed_plan() {
+    let _ = read_sealed_plan as fn(&DistributedPlan);
+}

@@ -935,18 +935,18 @@ fn decode_router_output_slots(
 
 fn decode_change_stream_branch_kind(
     value: i32,
-) -> Result<novarocks::exec::change_op::ChangeStreamBranchKind, String> {
+) -> Result<novarocks_types::change_stream::ChangeStreamBranchKind, String> {
     match plan::ChangeStreamBranchKind::try_from(value)
         .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
     {
         plan::ChangeStreamBranchKind::DeleteDv => {
-            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::DeleteDv)
+            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::DeleteDv)
         }
         plan::ChangeStreamBranchKind::ReuseData => {
-            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::ReuseData)
+            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::ReuseData)
         }
         plan::ChangeStreamBranchKind::FreshData => {
-            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::FreshData)
+            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::FreshData)
         }
         plan::ChangeStreamBranchKind::Unspecified => {
             Err("native ChangeStreamBranchKind is unspecified".to_string())
@@ -1027,9 +1027,34 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
 
 #[cfg(test)]
 mod tests {
-    use super::decode_fragment_sink_assignment;
+    use super::{decode_change_stream_branch_kind, decode_fragment_sink_assignment};
     use novarocks::runtime::fragment::FragmentSinkAssignment;
     use novarocks_protocol::{novarocks as proto, plan};
+    use novarocks_types::change_stream::ChangeStreamBranchKind;
+
+    #[test]
+    fn change_stream_branch_kind_decoding_uses_neutral_values_and_rejects_invalid_wire_values() {
+        assert_eq!(
+            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::DeleteDv as i32),
+            Ok(ChangeStreamBranchKind::DeleteDv)
+        );
+        assert_eq!(
+            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::ReuseData as i32),
+            Ok(ChangeStreamBranchKind::ReuseData)
+        );
+        assert_eq!(
+            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::FreshData as i32),
+            Ok(ChangeStreamBranchKind::FreshData)
+        );
+        assert_eq!(
+            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::Unspecified as i32),
+            Err("native ChangeStreamBranchKind is unspecified".to_string())
+        );
+        assert_eq!(
+            decode_change_stream_branch_kind(99),
+            Err("unknown native ChangeStreamBranchKind value 99".to_string())
+        );
+    }
 
     #[test]
     fn result_sink_without_destinations_has_no_assignment() {

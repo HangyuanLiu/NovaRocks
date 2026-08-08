@@ -16,10 +16,10 @@
 // under the License.
 
 use super::super::expr::encode_expr;
-use crate::sql::common::{ChangeStreamBranchKind, JoinKind, SqlTopNType};
-use crate::sql::planner::distributed::{DataPartition, PartitionKind};
-use crate::sql::planner::physical::{
-    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PlanSetOpKind, RedistributeMode,
+use crate::sql::plan_read::table::SqlMetadataTableKind;
+use crate::sql::plan_read::{
+    AggMode, ChangeStreamBranchKind, DataPartition, HashSource, JoinDistribution,
+    JoinExecutionMode, JoinKind, PartitionKind, PlanSetOpKind, RedistributeMode, SqlTopNType,
     TopNPhase,
 };
 use novarocks_catalog::schema::SqlType;
@@ -214,31 +214,17 @@ pub(super) fn encode_redistribute_mode(src: &RedistributeMode) -> plan::Redistri
     }
 }
 
-pub(super) fn encode_iceberg_metadata_table_type(
-    src: &crate::sql::planner::table::SqlMetadataTableKind,
-) -> i32 {
+pub(super) fn encode_iceberg_metadata_table_type(src: &SqlMetadataTableKind) -> i32 {
     match src {
-        crate::sql::planner::table::SqlMetadataTableKind::Files => {
-            plan::IcebergMetadataTableType::Files as i32
-        }
-        crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
-            plan::IcebergMetadataTableType::Manifests as i32
-        }
-        crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
+        SqlMetadataTableKind::Files => plan::IcebergMetadataTableType::Files as i32,
+        SqlMetadataTableKind::Manifests => plan::IcebergMetadataTableType::Manifests as i32,
+        SqlMetadataTableKind::LogicalIcebergMetadata => {
             plan::IcebergMetadataTableType::LogicalIcebergMetadata as i32
         }
-        crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
-            plan::IcebergMetadataTableType::Snapshots as i32
-        }
-        crate::sql::planner::table::SqlMetadataTableKind::History => {
-            plan::IcebergMetadataTableType::History as i32
-        }
-        crate::sql::planner::table::SqlMetadataTableKind::Refs => {
-            plan::IcebergMetadataTableType::Refs as i32
-        }
-        crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
-            plan::IcebergMetadataTableType::Partitions as i32
-        }
+        SqlMetadataTableKind::Snapshots => plan::IcebergMetadataTableType::Snapshots as i32,
+        SqlMetadataTableKind::History => plan::IcebergMetadataTableType::History as i32,
+        SqlMetadataTableKind::Refs => plan::IcebergMetadataTableType::Refs as i32,
+        SqlMetadataTableKind::Partitions => plan::IcebergMetadataTableType::Partitions as i32,
     }
 }
 

@@ -20,6 +20,7 @@ use super::type_mapping::{
 };
 use super::write::{encode_change_stream_router_sink, encode_connector_write_fragment_sink};
 use super::*;
+use crate::sql::plan_read::FragmentId;
 
 pub(super) fn attach_stream_sinks(
     src: &DistributedPlan,
@@ -144,7 +145,7 @@ pub(super) fn encode_plan_fragment_with_context(
 
 fn encode_data_sink(
     src: &DataSink,
-    fragment_id: crate::sql::planner::distributed::FragmentId,
+    fragment_id: FragmentId,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::DataSink, String> {
     use plan::data_sink::Kind;

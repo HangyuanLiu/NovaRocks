@@ -35,15 +35,17 @@ use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
 };
-use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
-use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
-use crate::sql::planner::table as table_model;
+use crate::sql::plan_read::table as table_model;
+use crate::sql::plan_read::{
+    ColumnId, ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn, PlanScanNode,
+    ScanVariantColumn,
+};
 use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
 use novarocks_connector_iceberg::scan_model as iceberg_scan_model;
 use novarocks_protocol::{common, plan};
 
 pub(super) fn encode_scan_node(
-    src: &crate::sql::planner::payload::PlanScanNode,
+    src: &PlanScanNode,
     node_id: i32,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanNode, String> {
@@ -100,7 +102,7 @@ pub(super) fn encode_scan_node(
 }
 
 fn encode_bound_scan_output_columns(
-    src: &crate::sql::planner::payload::PlanScanNode,
+    src: &PlanScanNode,
     binding: &ResolvedScanBinding,
 ) -> Result<Vec<common::OutputColumn>, String> {
     let physical_by_planner_id = binding
@@ -131,10 +133,7 @@ fn encode_bound_scan_output_columns(
     Ok(encoded)
 }
 
-fn encode_bound_required_columns(
-    src: &crate::sql::planner::payload::PlanScanNode,
-    binding: &ResolvedScanBinding,
-) -> Vec<String> {
+fn encode_bound_required_columns(src: &PlanScanNode, binding: &ResolvedScanBinding) -> Vec<String> {
     let mut required = binding
         .required_reads
         .iter()
@@ -228,7 +227,7 @@ pub(super) fn encode_table_def_with_context(
     scan_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
-    scan_variant_columns: Option<&[crate::sql::common::ScanVariantColumn]>,
+    scan_variant_columns: Option<&[ScanVariantColumn]>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
@@ -637,7 +636,7 @@ fn encode_scan_source(
     scan_analysis_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
-    scan_variant_columns: &[crate::sql::common::ScanVariantColumn],
+    scan_variant_columns: &[ScanVariantColumn],
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
@@ -785,7 +784,7 @@ fn encode_connector_expected_schema_ipc(
     analysis_columns: &[AnalysisOutputColumn],
     required_columns: &[String],
     iceberg_schema: Option<&iceberg_scan_model::IcebergSchemaDef>,
-    variant_columns: &[crate::sql::common::ScanVariantColumn],
+    variant_columns: &[ScanVariantColumn],
     binding: Option<&ResolvedScanBinding>,
 ) -> Result<Vec<u8>, String> {
     let required = (!required_columns.is_empty()).then(|| {
@@ -810,12 +809,11 @@ fn encode_connector_expected_schema_ipc(
     let selected = output_columns
         .iter()
         .filter(|column| {
-            !synthetic_ids.contains(&crate::sql::column_id::ColumnId(column.column_id))
+            !synthetic_ids.contains(&ColumnId(column.column_id))
                 && (required
                     .as_ref()
                     .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
-                    || required_variant_source_ids
-                        .contains(&crate::sql::column_id::ColumnId(column.column_id)))
+                    || required_variant_source_ids.contains(&ColumnId(column.column_id)))
         })
         .map(|column| {
             let domain_column = binding

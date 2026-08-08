@@ -25,8 +25,7 @@ use super::type_mapping::{
 };
 use super::{NativePlanEncodeContext, encode_exprs};
 use crate::protocol::native::type_mapping::encode_type;
-use crate::sql::planner::payload::PlanRowCountAssertion;
-use crate::sql::planner::physical::PhysicalPlanKind;
+use crate::sql::plan_read::{PhysicalPlanKind, PlanRowCountAssertion};
 use novarocks_protocol::plan;
 
 #[cfg(test)]

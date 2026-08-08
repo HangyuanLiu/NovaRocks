@@ -30,7 +30,7 @@ pub mod fragment;
 mod fragment;
 mod node;
 pub(crate) mod output;
-mod runtime_filter_progress;
+pub(crate) mod runtime_filter_progress;
 mod seal;
 pub(crate) mod topology;
 mod validation;
@@ -39,21 +39,25 @@ pub(crate) mod write;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use boundary::{BoundaryCatalog, ExecutionColumnIdAllocator};
 pub(crate) use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
 pub use fragment::{DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
-pub(crate) use fragment::{DataSink, PartitionKind, PlanFragment};
-pub(crate) use node::{
+pub use fragment::{DataSink, PartitionKind, PlanFragment};
+pub(crate) use node::distributed_kind_from_physical;
+pub use node::{
     DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
-    distributed_kind_from_physical, distributed_kind_to_physical,
+    distributed_kind_to_physical,
 };
-pub(crate) use output::{
-    FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeOutputCatalog, WriteContractCatalog,
+pub use output::{
+    ConnectorWriteOutputContract, FinalizedAggregateLayout, FragmentEdgeOutputCatalog,
+    NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, WriteContractCatalog,
 };
 pub(crate) use runtime_filter_progress::{
     FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
     JoinBuildProgressSkip,
 };
-pub(crate) use seal::DistributedPlan;
+pub use seal::DistributedPlan;
+pub use topology::TopologyContract;
 
 #[cfg(test)]
 mod tests {

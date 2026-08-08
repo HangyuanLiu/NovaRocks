@@ -18,7 +18,7 @@
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JoinKind {
+pub enum JoinKind {
     Inner,
     LeftOuter,
     RightOuter,
@@ -40,20 +40,20 @@ pub(crate) struct LambdaParam {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct WindowFrame {
+pub struct WindowFrame {
     pub frame_type: WindowFrameType,
     pub start: WindowBound,
     pub end: WindowBound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum WindowFrameType {
+pub enum WindowFrameType {
     Rows,
     Range,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum WindowBound {
+pub enum WindowBound {
     UnboundedPreceding,
     Preceding(i64),
     CurrentRow,
@@ -74,7 +74,7 @@ pub enum LiteralValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum BinOp {
+pub enum BinOp {
     Add,
     Sub,
     Mul,
@@ -92,7 +92,7 @@ pub(crate) enum BinOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum UnOp {
+pub enum UnOp {
     Not,
     Negate,
     BitwiseNot,
