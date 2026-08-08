@@ -640,6 +640,15 @@ fn resolve_consumer_binding(
     probe: &RuntimeFilterProbeBinding,
 ) -> Result<Vec<ResolvedConsumerBinding>, ()> {
     let node = find_node(fragments, probe.fragment_id, probe.node_id).ok_or(())?;
+    resolve_consumer_at(fragments, bindings, node, probe.intent.probe_expr.clone())
+}
+
+fn resolve_consumer_at(
+    fragments: &[PlanFragment],
+    bindings: &RuntimeFilterBindings,
+    node: &DistributedNode,
+    expression: TypedExpr,
+) -> Result<Vec<ResolvedConsumerBinding>, ()> {
     match &node.payload {
         DistributedNodeKind::Project(project) => {
             let replacements = project
@@ -647,11 +656,14 @@ fn resolve_consumer_binding(
                 .iter()
                 .map(|item| (item.output_column_id, item.expr.clone()))
                 .collect::<BTreeMap<_, _>>();
-            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-            Ok(vec![resolved_consumer_binding(bindings, node, expression)?])
+            let [child] = node.children.as_slice() else {
+                return Err(());
+            };
+            let expression = rewrite_expr_by_column(&expression, &replacements)?;
+            resolve_consumer_at(fragments, bindings, child, expression)
         }
         DistributedNodeKind::HashAggregate(aggregate) => {
-            let referenced = expression_column_ids(&probe.intent.probe_expr);
+            let referenced = expression_column_ids(&expression);
             if referenced.iter().any(|column_id| {
                 aggregate
                     .output_layout
@@ -669,8 +681,11 @@ fn resolve_consumer_binding(
                 .zip(&aggregate.group_by)
                 .map(|(column, expression)| (column.column_id, expression.clone()))
                 .collect::<BTreeMap<_, _>>();
-            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-            Ok(vec![resolved_consumer_binding(bindings, node, expression)?])
+            let [child] = node.children.as_slice() else {
+                return Err(());
+            };
+            let expression = rewrite_expr_by_column(&expression, &replacements)?;
+            resolve_consumer_at(fragments, bindings, child, expression)
         }
         DistributedNodeKind::SetOp(set_op)
             if matches!(
@@ -696,8 +711,8 @@ fn resolve_consumer_binding(
                         exact_column_mapping(output, input).map(|expr| (output.column_id, expr))
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?;
-                let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-                resolved.push(resolved_consumer_binding(bindings, child, expression)?);
+                let expression = rewrite_expr_by_column(&expression, &replacements)?;
+                resolved.extend(resolve_consumer_at(fragments, bindings, child, expression)?);
             }
             Ok(resolved)
         }
@@ -717,18 +732,10 @@ fn resolve_consumer_binding(
                     exact_column_mapping(output, input).map(|expr| (output.column_id, expr))
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-            Ok(vec![resolved_consumer_binding(
-                bindings,
-                &source.root,
-                expression,
-            )?])
+            let expression = rewrite_expr_by_column(&expression, &replacements)?;
+            resolve_consumer_at(fragments, bindings, &source.root, expression)
         }
-        _ => Ok(vec![resolved_consumer_binding(
-            bindings,
-            node,
-            probe.intent.probe_expr.clone(),
-        )?]),
+        _ => Ok(vec![resolved_consumer_binding(bindings, node, expression)?]),
     }
 }
 
@@ -1598,7 +1605,7 @@ mod tests {
         )
         .expect("resolve Project consumer");
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].node_id, 1);
+        assert_eq!(resolved[0].node_id, 2);
         assert_eq!(
             expression_column_ids(&resolved[0].expression),
             vec![ColumnId::new_for_test(1)]

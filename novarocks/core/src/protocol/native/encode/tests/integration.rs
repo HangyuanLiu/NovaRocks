@@ -212,6 +212,7 @@ fn prepared_connector_scan_bindings(
                     predicate_dispositions: Vec::new(),
                 },
                 splits: Vec::new(),
+                provider_field_ordinals: (0..columns.len() as u32).collect(),
                 planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(
                 ),
                 static_predicates: Vec::new(),
