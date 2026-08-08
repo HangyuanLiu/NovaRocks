@@ -16,7 +16,7 @@
 // under the License.
 
 /// Execution-neutral branch semantics for change-stream writers.
-// Design: ADR-0041 (docs/adr/ADR-0041-sealed-distributed-plan-read-contract.md)
+// Design: ADR-0042 (docs/adr/ADR-0042-sealed-distributed-plan-read-contract.md)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChangeStreamBranchKind {
     DeleteDv,

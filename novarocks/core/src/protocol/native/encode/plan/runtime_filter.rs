@@ -38,7 +38,7 @@ use crate::runtime_filter::port::topk_summary::{
 };
 use crate::sql::plan_read::{FragmentId, runtime_filter as sql_contract};
 use novarocks_protocol::plan;
-use sql_contract::{ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget};
+use sql_contract::{ApplyPoint, ProducerBindingTarget};
 
 pub(super) fn encode_runtime_filter_binding_table(
     enclosing_fragment_id: FragmentId,

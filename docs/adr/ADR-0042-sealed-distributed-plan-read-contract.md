@@ -1,5 +1,5 @@
 ---
-id: ADR-0041
+id: ADR-0042
 title: "Sealed distributed plan read contract"
 domain: [sql-compiler]
 status: active
@@ -14,7 +14,7 @@ code-anchors:
   - "novarocks/types/src/change_stream.rs (neutral change-stream value contract)"
 ---
 
-# ADR-0041：为何以同形状只读契约公开 sealed DistributedPlan
+# ADR-0042：为何以同形状只读契约公开 sealed DistributedPlan
 
 ## 问题
 
