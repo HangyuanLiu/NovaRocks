@@ -44,7 +44,7 @@ pub(super) fn resolve_external_target(
 }
 
 pub(super) fn resolve_external_target_parts(
-    engine: &dyn ViewEngine,
+    _engine: &dyn ViewEngine,
     parts: &[String],
     context: ViewRequestContext<'_>,
 ) -> Result<Option<ViewTarget>, String> {

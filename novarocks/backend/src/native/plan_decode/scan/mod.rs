@@ -93,7 +93,7 @@ pub(crate) fn lower_scan_node(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use arrow::datatypes::{DataType, Field, Schema};
@@ -114,9 +114,7 @@ mod tests {
     use super::super::node::{decode_node, decode_node_with_runtime_filters};
     use super::super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
     use crate::native::type_decode::encode_type;
-    use novarocks::common::ids::SlotId;
-    use novarocks::connector::ConnectorRegistry;
-    use novarocks::exec::expr::{ExprArena, ExprNode};
+    use novarocks::exec::expr::ExprArena;
     use novarocks::exec::node::ExecNodeKind;
     use novarocks::exec::node::scan::ScanMorsel;
     use novarocks::protocol::ProtocolErrorKind;

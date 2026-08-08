@@ -656,7 +656,6 @@ impl IcebergReadOnlyConnectorInstance {
         )?;
         let units =
             materialize_local_scan_units(&self.binding, payload.units, special_unit, &request)?;
-        let unit_count = units.len();
         let leaf_kind = if units.iter().any(|unit| unit.row_groups.is_some()) {
             "row_group"
         } else {
