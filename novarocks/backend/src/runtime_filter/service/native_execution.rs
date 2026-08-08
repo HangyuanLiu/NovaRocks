@@ -25,7 +25,7 @@ use novarocks_spi::connector::ConnectorScalarValue;
 
 use novarocks::runtime_filter_transition::codec::contribution::{
     ContributionCodecError, RuntimeFilterContribution as CoreContribution,
-    decode_canonical_membership_body, decode_contribution, encode_contribution,
+    decode_canonical_membership_body, decode_contribution,
 };
 use novarocks::runtime_filter_transition::materializer::codec::{
     ArtifactCodecError, MembershipProbe, encode_range_leaf, indexed_membership_contains,
@@ -374,44 +374,6 @@ impl ResolvedNativeProducer {
 
     pub(crate) fn execution_contract(&self) -> execution::RuntimeFilterExecutionContract {
         to_execution_contract(&self.contract)
-    }
-
-    pub(crate) fn encode_execution_contribution(
-        &self,
-        partition: novarocks::runtime_filter_transition::port::identity::PartitionId,
-        sequence: novarocks::runtime_filter_transition::port::identity::ProducerSequence,
-        contribution: CoreContribution,
-    ) -> Result<execution::RuntimeFilterContribution, execution::RuntimeFilterContractViolation>
-    {
-        let kind = match &contribution {
-            CoreContribution::Membership(_) => execution::RuntimeFilterContributionKind::Membership,
-            CoreContribution::OrderedBound(_) => {
-                execution::RuntimeFilterContributionKind::OrderedBound
-            }
-            CoreContribution::TopKSummary(_) => {
-                execution::RuntimeFilterContributionKind::TopKSummary
-            }
-            CoreContribution::FinalDomain(_) => {
-                execution::RuntimeFilterContributionKind::FinalDomain
-            }
-        };
-        let stream = novarocks::runtime_filter_transition::port::identity::ProducerStreamId::new(
-            self.binding_id,
-            self.fragment_instance_id,
-            partition,
-        );
-        let encoded = encode_contribution(
-            &contribution,
-            self.inbound_contract.codec_expectation(stream, sequence),
-            self.inbound_contract.limits().max_encoded_bytes(),
-        )
-        .map_err(codec_violation)?;
-        let (contract_digest, canonical_bytes) = encoded.into_parts();
-        Ok(execution::RuntimeFilterContribution::new(
-            kind,
-            contract_digest,
-            canonical_bytes,
-        ))
     }
 
     pub(crate) fn open_membership(
