@@ -297,6 +297,9 @@ pub(crate) fn prepare_statistics_connector_read(
         .map_err(connector_planning_error)?;
     Ok(PlannedConnectorRead {
         declaration,
+        provider_field_ordinals: (0..scan.output_schema.fields().len())
+            .map(|ordinal| u32::try_from(ordinal).expect("connector output ordinal fits u32"))
+            .collect(),
         scan,
         splits: split_result.splits,
         planning_metrics: split_result.metrics,

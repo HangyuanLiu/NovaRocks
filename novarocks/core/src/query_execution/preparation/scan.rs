@@ -94,6 +94,10 @@ pub(crate) struct ResolvedIcebergDeltaScan {
 pub(crate) struct PlannedConnectorRead {
     pub(crate) declaration: ConnectorExecutionDeclaration,
     pub(crate) scan: ConnectorScan,
+    /// Stable provider field ordinals aligned 1:1 with `scan.output_schema`.
+    /// These are frozen with the exact FE read and are the only authority for
+    /// Scan-domain target encoding for pre-reader evaluation.
+    pub(crate) provider_field_ordinals: Vec<u32>,
     pub(crate) splits: Vec<ConnectorSplit>,
     /// Provider split-planning evidence retained only in FE preparation.
     pub(crate) planning_metrics: ConnectorSplitPlanningMetrics,
@@ -291,6 +295,23 @@ impl ScanExecutionBindings {
         if read.scan.handle.owner() != &read.declaration.descriptor().instance_id {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"
+            ));
+        }
+        if read.provider_field_ordinals.len() != read.scan.output_schema.fields().len() {
+            return Err(format!(
+                "connector read fragment_id={fragment_id} node_id={node_id} provider ordinal count {} does not match output schema field count {}",
+                read.provider_field_ordinals.len(),
+                read.scan.output_schema.fields().len(),
+            ));
+        }
+        let mut provider_ordinals = BTreeSet::new();
+        if read
+            .provider_field_ordinals
+            .iter()
+            .any(|ordinal| !provider_ordinals.insert(*ordinal))
+        {
+            return Err(format!(
+                "connector read fragment_id={fragment_id} node_id={node_id} has duplicate provider field ordinals"
             ));
         }
         if read

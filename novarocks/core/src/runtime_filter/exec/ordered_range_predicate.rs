@@ -26,6 +26,10 @@ use arrow::array::{
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_execution::runtime_filter::scan_domain::{
+    RuntimeFilterScanDomainCapabilityError, RuntimeFilterScanDomainPredicate,
+};
+use novarocks_spi::connector::ConnectorScalarValue;
 
 use crate::runtime_filter::materializer::codec::{ArtifactCodecError, encode_range_leaf};
 use crate::runtime_filter::model::contract::ChannelId;
@@ -208,6 +212,38 @@ impl NativeOrderedRangePredicate {
         self.order_contract.keys()[0].data_type()
     }
 
+    fn scan_domain_matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        self.scan_domain_matches_tuple(
+            OrderedTuple::try_new(&self.order_contract, [None])
+                .map_err(|_| RuntimeFilterScanDomainCapabilityError::ContractViolation)?,
+        )
+    }
+
+    fn scan_domain_range_may_match(
+        &self,
+        inclusive_min: &ConnectorScalarValue,
+        inclusive_max: &ConnectorScalarValue,
+    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        let min = scan_ordered_scalar(inclusive_min, self.data_type())?;
+        let max = scan_ordered_scalar(inclusive_max, self.data_type())?;
+        let min = OrderedTuple::try_new(&self.order_contract, [Some(min)])
+            .map_err(|_| RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+        let max = OrderedTuple::try_new(&self.order_contract, [Some(max)])
+            .map_err(|_| RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+        Ok(self.scan_domain_matches_tuple(min)? || self.scan_domain_matches_tuple(max)?)
+    }
+
+    fn scan_domain_matches_tuple(
+        &self,
+        value: OrderedTuple,
+    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        Ok(self
+            .order_contract
+            .compare(&value, &self.bound)
+            .map_err(|_| RuntimeFilterScanDomainCapabilityError::ContractViolation)?
+            != Ordering::Greater)
+    }
+
     pub fn evaluate(
         &self,
         array: &dyn Array,
@@ -290,6 +326,58 @@ impl NativeOrderedRangePredicate {
         }
         Ok(BooleanArray::from(mask))
     }
+}
+
+impl RuntimeFilterScanDomainPredicate for NativeOrderedRangePredicate {
+    fn data_type(&self) -> &DataType {
+        self.data_type()
+    }
+
+    fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        self.scan_domain_matches_null()
+    }
+
+    fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        // A range fact is required to decide the side of an ordered bound.
+        // This merely states that the retained artifact has a supported
+        // non-null domain; no provider fact is inspected here.
+        Ok(true)
+    }
+
+    fn non_null_range_may_match(
+        &self,
+        inclusive_min: &ConnectorScalarValue,
+        inclusive_max: &ConnectorScalarValue,
+    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        self.scan_domain_range_may_match(inclusive_min, inclusive_max)
+    }
+}
+
+fn scan_ordered_scalar(
+    value: &ConnectorScalarValue,
+    expected: &DataType,
+) -> Result<OrderedScalar, RuntimeFilterScanDomainCapabilityError> {
+    let scalar = match (value, expected) {
+        (ConnectorScalarValue::Boolean(value), DataType::Boolean) => OrderedScalar::Boolean(*value),
+        (ConnectorScalarValue::Int8(value), DataType::Int8) => OrderedScalar::Int8(*value),
+        (ConnectorScalarValue::Int16(value), DataType::Int16) => OrderedScalar::Int16(*value),
+        (ConnectorScalarValue::Int32(value), DataType::Int32) => OrderedScalar::Int32(*value),
+        (ConnectorScalarValue::Int64(value), DataType::Int64) => OrderedScalar::Int64(*value),
+        (ConnectorScalarValue::Date32(value), DataType::Date32) => OrderedScalar::Date32(*value),
+        (
+            ConnectorScalarValue::TimestampMicros(value),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        | (
+            ConnectorScalarValue::TimestampNanos(value),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ) => OrderedScalar::Timestamp(*value),
+        (ConnectorScalarValue::Utf8(value), DataType::Utf8) => {
+            OrderedScalar::Utf8(Arc::from(value.as_str()))
+        }
+        _ => return Err(RuntimeFilterScanDomainCapabilityError::Unsupported),
+    };
+    Ok(scalar)
 }
 
 impl fmt::Debug for NativeOrderedRangePredicate {

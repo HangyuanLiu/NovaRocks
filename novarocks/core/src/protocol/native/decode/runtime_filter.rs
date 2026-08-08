@@ -32,6 +32,7 @@ use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::binding::RuntimeFilterProducerTarget;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
+use arrow::datatypes::DataType;
 use novarocks_protocol::{expr, plan};
 
 use super::error::NativeFragmentLeafDecodeError;
@@ -69,10 +70,21 @@ pub(crate) enum DecodedBindingRole {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecodedConsumerBindingTarget {
-    DirectInput { input_ordinal: usize },
-    SourceBoundary,
+    DirectInput {
+        input_ordinal: usize,
+    },
+    SourceBoundary {
+        scan_domain: Option<DecodedRuntimeFilterScanDomainTarget>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodedRuntimeFilterScanDomainTarget {
+    pub(crate) field_ordinal: u32,
+    pub(crate) data_type: DataType,
+    pub(crate) nullable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1011,16 +1023,24 @@ fn decode_role(
                         })?,
                     }
                 }
-                plan::runtime_filter_consumer_role::Target::SourceBoundary(true) => {
-                    DecodedConsumerBindingTarget::SourceBoundary
-                }
-                plan::runtime_filter_consumer_role::Target::SourceBoundary(false) => {
-                    return Err(super::NativeFragmentDecodeError::invalid_value(
-                        target_path.field("source_boundary"),
-                        format!(
-                            "native runtime-filter consumer binding_id={binding_id} source boundary marker must be true"
-                        ),
-                    ));
+                plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(target) => {
+                    let scan_domain = target.scan_domain_target.as_ref().map(|target| {
+                        let target_path = target_path.clone().field("source_boundary_target").field("scan_domain_target");
+                        let data_type = crate::protocol::native::type_mapping::decode_type(
+                            target.r#type.as_ref().ok_or_else(|| super::NativeFragmentDecodeError::missing(
+                                target_path.clone().field("type"),
+                                "native scan-domain target requires type",
+                            ))?
+                        ).map_err(|error| super::NativeFragmentDecodeError::invalid_value(
+                            target_path.clone().field("type"), error,
+                        ))?;
+                        Ok::<_, super::NativeFragmentDecodeError>(DecodedRuntimeFilterScanDomainTarget {
+                            field_ordinal: target.field_ordinal,
+                            data_type,
+                            nullable: target.nullable,
+                        })
+                    }).transpose()?;
+                    DecodedConsumerBindingTarget::SourceBoundary { scan_domain }
                 }
             };
             Ok(DecodedBindingRole::Consumer {

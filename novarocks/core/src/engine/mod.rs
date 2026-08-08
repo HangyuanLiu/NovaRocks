@@ -306,6 +306,15 @@ impl PreparedQueryCompletion {
                 if let Some(counters) =
                     crate::query_execution::profile::format_counter_sums_from_profile_trees(
                         &fragment_profiles,
+                        RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES,
+                        "RuntimeFilterScanUnits",
+                    )
+                {
+                    lines.push(counters);
+                }
+                if let Some(counters) =
+                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
+                        &fragment_profiles,
                         CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES,
                         "ConnectorFileMetrics",
                     )
@@ -4005,8 +4014,25 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
     "IcebergRuntimeFilePruning/Unavailable",
 ];
 
-const CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES: &[&str] =
-    &["ConnectorFileRowGroupsRead", "ConnectorFileRowGroupsPruned"];
+const RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES: &[&str] = &[
+    "RuntimeFilterScanUnitsPruned",
+    "RuntimeFilterScanUnitsKept",
+    "RuntimeFilterScanUnitsNotEvaluated",
+    "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing",
+    "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing",
+    "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported",
+    "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported",
+    "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable",
+    "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable",
+    "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut",
+    "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
+];
+
+const CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES: &[&str] = &[
+    "ConnectorFileRowGroupsRead",
+    "ConnectorFileRowGroupsPruned",
+    "ConnectorUnitReadersOpened",
+];
 
 fn format_distributed_profile_summary(
     summary: &crate::query_execution::profile::DistributedProfileSummary,

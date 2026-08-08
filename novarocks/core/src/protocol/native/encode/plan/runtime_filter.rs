@@ -21,7 +21,7 @@ use super::super::expr::encode_expr;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::runtime_filter_binding::{
     PreparedReductionContract, PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
-    PreparedRuntimeFilterContract, RuntimeFilterBindingTable,
+    PreparedRuntimeFilterConsumerTarget, PreparedRuntimeFilterContract, RuntimeFilterBindingTable,
 };
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
@@ -102,18 +102,31 @@ fn encode_runtime_filter_binding(
                 .collect(),
             activation: Some(encode_sql_runtime_filter_activation(*activation)),
             target: Some(match target {
-                crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::DirectInput {
-                    input_ordinal,
-                } => plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(
-                    u32::try_from(*input_ordinal).map_err(|_| {
-                        format!(
-                            "runtime-filter binding_id={} input ordinal does not fit u32",
-                            binding.binding_id().get()
-                        )
-                    })?,
-                ),
-                crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::SourceBoundary => {
-                    plan::runtime_filter_consumer_role::Target::SourceBoundary(true)
+                PreparedRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
+                    plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(
+                        u32::try_from(*input_ordinal).map_err(|_| {
+                            format!(
+                                "runtime-filter binding_id={} input ordinal does not fit u32",
+                                binding.binding_id().get()
+                            )
+                        })?,
+                    )
+                }
+                PreparedRuntimeFilterConsumerTarget::SourceBoundary { scan_domain } => {
+                    plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
+                        plan::RuntimeFilterSourceBoundaryTarget {
+                            scan_domain_target: scan_domain
+                                .as_ref()
+                                .map(|target| -> Result<_, String> {
+                                    Ok(plan::RuntimeFilterScanDomainTarget {
+                                        field_ordinal: target.field_ordinal,
+                                        r#type: Some(encode_type(&target.data_type)?),
+                                        nullable: target.nullable,
+                                    })
+                                })
+                                .transpose()?,
+                        },
+                    )
                 }
             }),
         }),

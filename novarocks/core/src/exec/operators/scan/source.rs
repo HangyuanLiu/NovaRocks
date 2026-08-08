@@ -42,6 +42,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, warn};
+use crate::runtime::fragment::{FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::scan_executor::scan_executor;
 use std::collections::HashSet;
@@ -206,6 +207,7 @@ impl OperatorFactory for ScanSourceFactory {
                 self.runtime_filter_execution.ordered_live_consumers.clone(),
             ),
             profiles: None,
+            event_sink: Arc::new(NoopFragmentEventSink),
             async_state: ScanAsyncState::new(operator_buffer_chunks().max(1), label),
             async_runners: Arc::new(Mutex::new(Vec::new())),
             inflight_tasks: Arc::new(AtomicUsize::new(0)),
@@ -238,6 +240,7 @@ struct ScanSourceOperator {
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    event_sink: Arc<dyn FragmentEventSink>,
     async_state: Arc<ScanAsyncState>,
     async_runners: Arc<Mutex<Vec<ScanAsyncRunner>>>,
     // Tracks how many async scan tasks are currently submitted and not yet finished.
@@ -391,6 +394,7 @@ impl ScanSourceOperator {
                 self.native_ordered_live_consumers.clone(),
                 Arc::clone(&self.arena),
                 self.profiles.clone(),
+                Arc::clone(&self.event_sink),
                 self.driver_id,
             );
             guard.push(runner);
@@ -571,6 +575,10 @@ impl Operator for ScanSourceOperator {
 
     fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
+    }
+
+    fn set_fragment_event_sink(&mut self, sink: Arc<dyn FragmentEventSink>) {
+        self.event_sink = sink;
     }
 
     fn prepare(&mut self) -> Result<(), String> {
@@ -1192,6 +1200,7 @@ mod tests {
                 schema_digest: membership_schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
         let ordered = RuntimeFilterConsumerBinding {
             binding_id: 2,
@@ -1207,6 +1216,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         };
         let op: Arc<dyn ScanOp> = Arc::new(PlainScanOp::new());
         let mut scan = ScanNode::new_for_test(Arc::clone(&op))
@@ -1255,6 +1265,7 @@ mod tests {
                 schema_digest: membership_schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         }]);
 
         ScanSourceFactory::new_native(scan, op, Arc::new(arena))
@@ -1296,6 +1307,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         }]);
         let factory =
             ScanSourceFactory::new_native(scan, op, Arc::new(arena)).expect("native scan factory");
@@ -1361,6 +1373,7 @@ mod tests {
                     order_contract_digest: order.digest().bytes(),
                 },
                 reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+                scan_domain: None,
             }]);
             assert!(
                 ScanSourceFactory::new_native(scan, op, Arc::new(arena))
@@ -1407,6 +1420,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         };
         let idle = Arc::new(IdleOrderedLiveSubscription {
             polls: AtomicUsize::new(0),

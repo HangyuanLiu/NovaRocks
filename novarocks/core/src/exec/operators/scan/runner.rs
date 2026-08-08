@@ -42,9 +42,13 @@ use crate::exec::operators::runtime_filter::{
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::RowPositionSpec;
 use crate::novarocks_logging::debug;
+use crate::runtime::fragment::{FragmentEvent, FragmentEventSink};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array};
 use arrow::compute::filter_record_batch;
+use novarocks_execution::runtime_filter::scan_domain::{
+    RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitInput, evaluate_scan_unit,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +64,9 @@ const SCAN_TIME: &str = "ScanTime";
 // for correctness.
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
+const RUNTIME_FILTER_SCAN_UNITS_PRUNED: &str = "RuntimeFilterScanUnitsPruned";
+const RUNTIME_FILTER_SCAN_UNITS_KEPT: &str = "RuntimeFilterScanUnitsKept";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED: &str = "RuntimeFilterScanUnitsNotEvaluated";
 
 type PositionedChunk = (Chunk, Option<Vec<i64>>);
 
@@ -120,6 +127,7 @@ pub(super) struct ScanAsyncRunner {
     conjunct_encoding_policy: Option<FilterEncodingPolicy>,
     arena: Arc<ExprArena>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    event_sink: Arc<dyn FragmentEventSink>,
     last_progress: Instant,
     last_log: Instant,
     current_morsel: Option<ScanMorsel>,
@@ -144,6 +152,7 @@ impl ScanAsyncRunner {
         native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
         arena: Arc<ExprArena>,
         profiles: Option<crate::runtime::profile::OperatorProfiles>,
+        event_sink: Arc<dyn FragmentEventSink>,
         driver_id: i32,
     ) -> Self {
         let conjunct_predicate = scan.conjunct_predicate();
@@ -163,6 +172,7 @@ impl ScanAsyncRunner {
             native_ordered_live_consumers,
             arena,
             profiles,
+            event_sink,
             last_progress: Instant::now(),
             last_log: Instant::now(),
             current_morsel: None,
@@ -199,7 +209,7 @@ impl ScanAsyncRunner {
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
-                let late_prune = ScanMorselPruneDecision::Keep;
+                let late_prune = self.evaluate_scan_unit(&morsel)?;
                 if late_prune == ScanMorselPruneDecision::Skip {
                     self.late_pruned_units = self.late_pruned_units.saturating_add(1);
                     if let Some(profiles) = self.profiles.as_ref() {
@@ -311,6 +321,79 @@ impl ScanAsyncRunner {
                     continue;
                 }
             }
+        }
+    }
+
+    fn evaluate_scan_unit(
+        &mut self,
+        morsel: &ScanMorsel,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        // Design: ADR-0041 (docs/adr/ADR-0041-runtime-filter-scan-domain-evaluation-boundary.md)
+        let Some(unit) = self.op.prepared_scan_unit(morsel)? else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let mut bindings = self
+            .native_runtime_filter_consumers
+            .as_ref()
+            .map(RuntimeFilterConsumerSet::scan_domain_snapshots)
+            .unwrap_or_default();
+        if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
+            bindings.extend(consumers.scan_domain_snapshots()?);
+        }
+        bindings.sort_by_key(|(binding, _)| binding.binding_id());
+        for (binding, snapshot) in bindings {
+            let outcome = evaluate_scan_unit(
+                &binding,
+                snapshot.as_deref(),
+                RuntimeFilterScanUnitInput::from_prepared(&unit),
+            )
+            .map_err(|error| error.to_string())?;
+            self.record_scan_domain_outcome(&outcome);
+            if matches!(
+                outcome.effect().map(|effect| effect.decision()),
+                Some(RuntimeFilterScanUnitDecision::Pruned)
+            ) {
+                return Ok(ScanMorselPruneDecision::Skip);
+            }
+        }
+        Ok(ScanMorselPruneDecision::Keep)
+    }
+
+    fn record_scan_domain_outcome(
+        &self,
+        outcome: &novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome,
+    ) {
+        self.event_sink
+            .record(FragmentEvent::RuntimeFilterScanUnitOutcome(*outcome));
+        let Some(profiles) = self.profiles.as_ref() else {
+            return;
+        };
+        let counter = match outcome.evaluation() {
+            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
+                decision: RuntimeFilterScanUnitDecision::Pruned,
+                ..
+            } => RUNTIME_FILTER_SCAN_UNITS_PRUNED,
+            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
+                decision: RuntimeFilterScanUnitDecision::Kept,
+                ..
+            } => RUNTIME_FILTER_SCAN_UNITS_KEPT,
+            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated { .. } => {
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED
+            }
+        };
+        profiles.common.counter_add(counter, ProfileUnit::Unit, 1);
+        if let novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated { reason, .. } = outcome.evaluation() {
+            let reason_counter = match reason {
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::UnitFactsMissing(_) => "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::ColumnFactsMissing(_) => "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::DataTypeUnsupported => "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::PredicateCapabilityUnsupported => "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::ResourceUnavailable => "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotUnavailable => "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotTimedOut => "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotNotPublished => "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
+            };
+            profiles.common.counter_add(reason_counter, ProfileUnit::Unit, 1);
         }
     }
 
@@ -888,6 +971,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         }
     }
 
@@ -1060,6 +1144,7 @@ mod tests {
                 schema_digest: membership_schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
         let blocking_subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(PublishedBlockingSubscription(
@@ -1095,6 +1180,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         };
         let live = Arc::new(ControllableOrderedLiveSubscription::new());
         let typed: Arc<dyn NonBlockingLiveSubscription> = live.clone();
@@ -1121,6 +1207,7 @@ mod tests {
             Some(ordered_consumers),
             arena,
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
 
@@ -1158,6 +1245,7 @@ mod tests {
             None,
             Arc::clone(&arena),
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
         pending_runner.pending_chunk = Some(single_value_chunk(7));
@@ -1171,6 +1259,7 @@ mod tests {
             None,
             arena,
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             1,
         );
 
@@ -1234,6 +1323,7 @@ mod tests {
             None,
             arena,
             Some(profiles.clone()),
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
 
@@ -1312,6 +1402,7 @@ mod tests {
             None,
             arena,
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
 

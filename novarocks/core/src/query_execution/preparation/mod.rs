@@ -100,11 +100,6 @@ pub(crate) fn prepare_fragments(
         plan.boundaries().contracts(),
         &sealed_ids,
     )?;
-    let mut runtime_filter_binding_tables =
-        runtime_filter_binding::materialize_runtime_filter_binding_tables(
-            plan.runtime_filter_graph(),
-            plan.fragments(),
-        )?;
     let scan_bindings = prepare_scan_bindings(
         plan,
         controls,
@@ -113,6 +108,14 @@ pub(crate) fn prepare_fragments(
         resolver,
         scan_options,
     )?;
+    // Scan-domain target ordinals are derived only after the exact provider read
+    // is pinned.  Never materialize RF bindings against a later catalog view.
+    let mut runtime_filter_binding_tables =
+        runtime_filter_binding::materialize_runtime_filter_binding_tables_with_scan_bindings(
+            plan.runtime_filter_graph(),
+            plan.fragments(),
+            Some(&scan_bindings),
+        )?;
 
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();

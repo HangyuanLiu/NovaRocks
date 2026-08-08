@@ -514,7 +514,7 @@ mod tests {
                     ArtifactCapability::EmptyDomain,
                 ]),
                 activation,
-                target: ConsumerBindingTarget::SourceBoundary,
+                target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
             }),
         }
     }

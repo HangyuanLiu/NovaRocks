@@ -31,6 +31,7 @@ use crate::sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
     ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
     RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
+    RuntimeFilterSemanticScanDomainTarget,
 };
 
 use crate::sql::planner::distributed::activation_decision::DraftRuntimeFilterGraph;
@@ -639,6 +640,15 @@ fn resolve_consumer_binding(
     probe: &RuntimeFilterProbeBinding,
 ) -> Result<Vec<ResolvedConsumerBinding>, ()> {
     let node = find_node(fragments, probe.fragment_id, probe.node_id).ok_or(())?;
+    resolve_consumer_at(fragments, bindings, node, probe.intent.probe_expr.clone())
+}
+
+fn resolve_consumer_at(
+    fragments: &[PlanFragment],
+    bindings: &RuntimeFilterBindings,
+    node: &DistributedNode,
+    expression: TypedExpr,
+) -> Result<Vec<ResolvedConsumerBinding>, ()> {
     match &node.payload {
         DistributedNodeKind::Project(project) => {
             let replacements = project
@@ -646,11 +656,14 @@ fn resolve_consumer_binding(
                 .iter()
                 .map(|item| (item.output_column_id, item.expr.clone()))
                 .collect::<BTreeMap<_, _>>();
-            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-            Ok(vec![resolved_consumer_binding(bindings, node, expression)?])
+            let [child] = node.children.as_slice() else {
+                return Err(());
+            };
+            let expression = rewrite_expr_by_column(&expression, &replacements)?;
+            resolve_consumer_at(fragments, bindings, child, expression)
         }
         DistributedNodeKind::HashAggregate(aggregate) => {
-            let referenced = expression_column_ids(&probe.intent.probe_expr);
+            let referenced = expression_column_ids(&expression);
             if referenced.iter().any(|column_id| {
                 aggregate
                     .output_layout
@@ -668,8 +681,11 @@ fn resolve_consumer_binding(
                 .zip(&aggregate.group_by)
                 .map(|(column, expression)| (column.column_id, expression.clone()))
                 .collect::<BTreeMap<_, _>>();
-            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-            Ok(vec![resolved_consumer_binding(bindings, node, expression)?])
+            let [child] = node.children.as_slice() else {
+                return Err(());
+            };
+            let expression = rewrite_expr_by_column(&expression, &replacements)?;
+            resolve_consumer_at(fragments, bindings, child, expression)
         }
         DistributedNodeKind::SetOp(set_op)
             if matches!(
@@ -695,8 +711,8 @@ fn resolve_consumer_binding(
                         exact_column_mapping(output, input).map(|expr| (output.column_id, expr))
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?;
-                let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-                resolved.push(resolved_consumer_binding(bindings, child, expression)?);
+                let expression = rewrite_expr_by_column(&expression, &replacements)?;
+                resolved.extend(resolve_consumer_at(fragments, bindings, child, expression)?);
             }
             Ok(resolved)
         }
@@ -716,18 +732,10 @@ fn resolve_consumer_binding(
                     exact_column_mapping(output, input).map(|expr| (output.column_id, expr))
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
-            Ok(vec![resolved_consumer_binding(
-                bindings,
-                &source.root,
-                expression,
-            )?])
+            let expression = rewrite_expr_by_column(&expression, &replacements)?;
+            resolve_consumer_at(fragments, bindings, &source.root, expression)
         }
-        _ => Ok(vec![resolved_consumer_binding(
-            bindings,
-            node,
-            probe.intent.probe_expr.clone(),
-        )?]),
+        _ => Ok(vec![resolved_consumer_binding(bindings, node, expression)?]),
     }
 }
 
@@ -737,7 +745,9 @@ fn resolved_consumer_binding(
     expression: TypedExpr,
 ) -> Result<ResolvedConsumerBinding, ()> {
     let target = if node.children.is_empty() {
-        ConsumerBindingTarget::SourceBoundary
+        ConsumerBindingTarget::SourceBoundary {
+            scan_domain: scan_domain_target(node, &expression),
+        }
     } else {
         let inputs = bindings
             .node_input_columns
@@ -776,6 +786,33 @@ fn resolved_consumer_binding(
         fragment_id: node.fragment_id,
         expression,
         target,
+    })
+}
+
+/// Scan-domain pre-reader evaluation starts only at a scan leaf whose already-rewritten consumer
+/// expression is precisely one user-visible scan output.  Anything less
+/// exact remains an ordinary source boundary and is still eligible for the
+/// normal row-filter path.
+fn scan_domain_target(
+    node: &DistributedNode,
+    expression: &TypedExpr,
+) -> Option<RuntimeFilterSemanticScanDomainTarget> {
+    let DistributedNodeKind::Scan(scan) = &node.payload else {
+        return None;
+    };
+    let ExprKind::ColumnRef { column_id, .. } = &expression.kind else {
+        return None;
+    };
+    let output = scan.columns.iter().find(|output| {
+        output.column_id == *column_id
+            && !output.is_internal
+            && output.data_type == expression.data_type
+            && output.nullable == expression.nullable
+    })?;
+    Some(RuntimeFilterSemanticScanDomainTarget {
+        column_id: output.column_id,
+        data_type: output.data_type.clone(),
+        nullable: output.nullable,
     })
 }
 
@@ -1439,7 +1476,7 @@ mod tests {
                     consumers: vec![RuntimeFilterConsumerCandidate {
                         location: location(2),
                         expression: expression(),
-                        target: ConsumerBindingTarget::SourceBoundary,
+                        target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
                         capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
                         activation: live,
                     }],
@@ -1475,7 +1512,7 @@ mod tests {
                     consumers: vec![RuntimeFilterConsumerCandidate {
                         location: location(2),
                         expression: expression(),
-                        target: ConsumerBindingTarget::SourceBoundary,
+                        target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
                         capabilities: BTreeSet::from([
                             ArtifactCapability::Membership,
                             ArtifactCapability::EmptyDomain,
@@ -1568,7 +1605,7 @@ mod tests {
         )
         .expect("resolve Project consumer");
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].node_id, 1);
+        assert_eq!(resolved[0].node_id, 2);
         assert_eq!(
             expression_column_ids(&resolved[0].expression),
             vec![ColumnId::new_for_test(1)]

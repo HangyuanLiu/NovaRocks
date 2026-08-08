@@ -27,6 +27,10 @@ use arrow::array::{
     TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_execution::runtime_filter::scan_domain::{
+    RuntimeFilterScanDomainCapabilityError, RuntimeFilterScanDomainPredicate,
+};
+use novarocks_spi::connector::ConnectorScalarValue;
 
 use crate::runtime_filter::materializer::codec::{
     ArtifactCodecError, MembershipProbe, indexed_membership_contains,
@@ -236,6 +240,112 @@ impl NativeRuntimeFilterPredicate {
         }
     }
 
+    pub const fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn scan_domain_matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        Ok(self.null_semantics == NullSemantics::NullSafeEqual && self.artifact.contains_null())
+    }
+
+    fn scan_domain_has_non_null_matches(
+        &self,
+    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        let index = self
+            .artifact
+            .membership_index()
+            .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+        Ok(match index.view() {
+            crate::runtime_filter::port::artifact::ResidentMembershipIndexView::EmptyDomain => {
+                false
+            }
+            crate::runtime_filter::port::artifact::ResidentMembershipIndexView::Fixed {
+                count,
+                ..
+            } => count > 0,
+            crate::runtime_filter::port::artifact::ResidentMembershipIndexView::Utf8 {
+                length_offsets,
+                ..
+            } => !length_offsets.is_empty(),
+        })
+    }
+
+    fn scan_domain_range_may_match(
+        &self,
+        inclusive_min: &ConnectorScalarValue,
+        inclusive_max: &ConnectorScalarValue,
+    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        if inclusive_min.data_type() != inclusive_max.data_type()
+            || !scan_scalar_matches_arrow(inclusive_min, &self.data_type)
+        {
+            return Err(RuntimeFilterScanDomainCapabilityError::ContractViolation);
+        }
+        let index = self
+            .artifact
+            .membership_index()
+            .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+        let encoded = self.artifact.canonical_bytes();
+        match index.view() {
+            crate::runtime_filter::port::artifact::ResidentMembershipIndexView::EmptyDomain => {
+                Ok(false)
+            }
+            crate::runtime_filter::port::artifact::ResidentMembershipIndexView::Fixed {
+                tag,
+                values,
+                count,
+                width,
+            } => {
+                let bytes = encoded
+                    .get(values.clone())
+                    .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+                let expected = count
+                    .checked_mul(width)
+                    .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+                if bytes.len() != expected {
+                    return Err(RuntimeFilterScanDomainCapabilityError::ContractViolation);
+                }
+                for value in bytes.chunks_exact(width) {
+                    let value = fixed_scan_scalar(tag, value, &self.data_type)?;
+                    if in_closed_range(&value, inclusive_min, inclusive_max)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            crate::runtime_filter::port::artifact::ResidentMembershipIndexView::Utf8 {
+                length_offsets,
+                ..
+            } => {
+                let (ConnectorScalarValue::Utf8(min), ConnectorScalarValue::Utf8(max)) =
+                    (inclusive_min, inclusive_max)
+                else {
+                    return Err(RuntimeFilterScanDomainCapabilityError::ContractViolation);
+                };
+                for offset in length_offsets {
+                    let bytes = encoded
+                        .get(*offset..)
+                        .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+                    let length = bytes
+                        .get(..8)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u64::from_be_bytes)
+                        .and_then(|length| usize::try_from(length).ok())
+                        .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+                    let value = std::str::from_utf8(
+                        bytes
+                            .get(8..8 + length)
+                            .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?,
+                    )
+                    .map_err(|_| RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+                    if value.as_bytes() >= min.as_bytes() && value.as_bytes() <= max.as_bytes() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
     fn evaluate_rows<'a, A: Array>(
         &self,
         array: &'a A,
@@ -267,6 +377,101 @@ impl NativeRuntimeFilterPredicate {
         }
         Ok(BooleanArray::from(mask))
     }
+}
+
+impl RuntimeFilterScanDomainPredicate for NativeRuntimeFilterPredicate {
+    fn data_type(&self) -> &DataType {
+        self.data_type()
+    }
+
+    fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        self.scan_domain_matches_null()
+    }
+
+    fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        self.scan_domain_has_non_null_matches()
+    }
+
+    fn non_null_range_may_match(
+        &self,
+        inclusive_min: &ConnectorScalarValue,
+        inclusive_max: &ConnectorScalarValue,
+    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        self.scan_domain_range_may_match(inclusive_min, inclusive_max)
+    }
+}
+
+fn in_closed_range(
+    value: &ConnectorScalarValue,
+    inclusive_min: &ConnectorScalarValue,
+    inclusive_max: &ConnectorScalarValue,
+) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+    let lower = value
+        .compare_same_type(inclusive_min)
+        .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+    let upper = value
+        .compare_same_type(inclusive_max)
+        .ok_or(RuntimeFilterScanDomainCapabilityError::ContractViolation)?;
+    Ok(lower.is_ge() && upper.is_le())
+}
+
+fn fixed_scan_scalar(
+    tag: u8,
+    bytes: &[u8],
+    data_type: &DataType,
+) -> Result<ConnectorScalarValue, RuntimeFilterScanDomainCapabilityError> {
+    macro_rules! decode {
+        ($ty:ty) => {
+            <$ty>::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| RuntimeFilterScanDomainCapabilityError::ContractViolation)?,
+            )
+        };
+    }
+    Ok(match tag {
+        1 => match bytes {
+            [0] => ConnectorScalarValue::Boolean(false),
+            [1] => ConnectorScalarValue::Boolean(true),
+            _ => return Err(RuntimeFilterScanDomainCapabilityError::ContractViolation),
+        },
+        2 => ConnectorScalarValue::Int8(decode!(i8)),
+        3 => ConnectorScalarValue::Int16(decode!(i16)),
+        4 => ConnectorScalarValue::Int32(decode!(i32)),
+        5 => ConnectorScalarValue::Int64(decode!(i64)),
+        10 => ConnectorScalarValue::Date32(decode!(i32)),
+        11 => match data_type {
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                ConnectorScalarValue::TimestampMicros(decode!(i64))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                ConnectorScalarValue::TimestampNanos(decode!(i64))
+            }
+            _ => return Err(RuntimeFilterScanDomainCapabilityError::Unsupported),
+        },
+        _ => return Err(RuntimeFilterScanDomainCapabilityError::Unsupported),
+    })
+}
+
+fn scan_scalar_matches_arrow(value: &ConnectorScalarValue, data_type: &DataType) -> bool {
+    matches!(
+        (value, data_type),
+        (ConnectorScalarValue::Boolean(_), DataType::Boolean)
+            | (ConnectorScalarValue::Int8(_), DataType::Int8)
+            | (ConnectorScalarValue::Int16(_), DataType::Int16)
+            | (ConnectorScalarValue::Int32(_), DataType::Int32)
+            | (ConnectorScalarValue::Int64(_), DataType::Int64)
+            | (ConnectorScalarValue::Date32(_), DataType::Date32)
+            | (
+                ConnectorScalarValue::TimestampMicros(_),
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            )
+            | (
+                ConnectorScalarValue::TimestampNanos(_),
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
+            )
+            | (ConnectorScalarValue::Utf8(_), DataType::Utf8)
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

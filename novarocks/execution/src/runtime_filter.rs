@@ -24,6 +24,8 @@ use std::time::Duration;
 use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::DataType;
 
+pub mod scan_domain;
+
 macro_rules! id {
     ($name:ident, $raw:ty) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -415,11 +417,6 @@ pub enum LiveTerminal {
 }
 
 pub trait RuntimeFilterPredicate: Send + Sync {
-    /// Allows a role-local execution adapter to expose an optional, typed
-    /// evaluator extension without exposing delivery artifacts or Service
-    /// state through the session/snapshot surface.
-    fn as_any(&self) -> &dyn Any;
-
     fn evaluate(&self, input: &ArrayRef) -> Result<BooleanArray, RuntimeFilterContractViolation>;
 }
 
@@ -429,6 +426,7 @@ pub struct RuntimeFilterSnapshot {
     logical_version: LogicalVersion,
     contract_digest: [u8; 32],
     predicate: Arc<dyn RuntimeFilterPredicate>,
+    scan_domain: Option<Arc<dyn scan_domain::RuntimeFilterScanDomainPredicate>>,
 }
 impl RuntimeFilterSnapshot {
     pub fn new(
@@ -437,11 +435,28 @@ impl RuntimeFilterSnapshot {
         contract_digest: [u8; 32],
         predicate: Arc<dyn RuntimeFilterPredicate>,
     ) -> Self {
+        Self::with_scan_domain(
+            binding_id,
+            logical_version,
+            contract_digest,
+            predicate,
+            None,
+        )
+    }
+
+    pub fn with_scan_domain(
+        binding_id: RuntimeFilterBindingId,
+        logical_version: LogicalVersion,
+        contract_digest: [u8; 32],
+        predicate: Arc<dyn RuntimeFilterPredicate>,
+        scan_domain: Option<Arc<dyn scan_domain::RuntimeFilterScanDomainPredicate>>,
+    ) -> Self {
         Self {
             binding_id,
             logical_version,
             contract_digest,
             predicate,
+            scan_domain,
         }
     }
     pub const fn binding_id(&self) -> RuntimeFilterBindingId {
@@ -455,6 +470,9 @@ impl RuntimeFilterSnapshot {
     }
     pub const fn predicate(&self) -> &Arc<dyn RuntimeFilterPredicate> {
         &self.predicate
+    }
+    pub fn scan_domain(&self) -> Option<&Arc<dyn scan_domain::RuntimeFilterScanDomainPredicate>> {
+        self.scan_domain.as_ref()
     }
 }
 
@@ -663,10 +681,6 @@ mod tests {
 
     struct Predicate;
     impl RuntimeFilterPredicate for Predicate {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn evaluate(
             &self,
             input: &ArrayRef,

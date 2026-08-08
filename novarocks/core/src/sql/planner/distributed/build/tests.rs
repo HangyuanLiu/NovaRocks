@@ -136,7 +136,7 @@ fn activation_neutral_graph_structure<A>(
                     RuntimeFilterBindingRoleData::Consumer(consumer) => {
                         ActivationNeutralBindingRoleStructure::Consumer {
                             capabilities: consumer.capabilities.clone(),
-                            target: consumer.target,
+                            target: consumer.target.clone(),
                         }
                     }
                 },
@@ -712,7 +712,7 @@ fn build_distributed_plan_seals_partitioned_join_progress_certificate() {
         DistributedNodeKind::HashJoin(_)
     ));
     assert_eq!(graph.channel_count(), 1);
-    assert_eq!(graph.binding_count(), 3);
+    assert_eq!(graph.binding_count(), 2);
     assert_eq!(producer.location.fragment_id.get(), join_node.fragment_id);
     assert_eq!(producer.location.node_id.get(), join_node.node_id);
     assert_column_ref(&producer.expression, 2, "r_k");
@@ -742,7 +742,7 @@ fn build_distributed_plan_seals_partitioned_join_progress_certificate() {
 
     let probe_project = &probe_fragment.root;
     assert_eq!(probe_project.fragment_id, probe_fragment.fragment_id);
-    assert_eq!(probe_project.runtime_filter_binding_ids.len(), 1);
+    assert!(probe_project.runtime_filter_binding_ids.is_empty());
     let probe_scan = &probe_project.children[0];
     assert!(matches!(&probe_scan.payload, DistributedNodeKind::Scan(_)));
     assert_eq!(probe_scan.runtime_filter_binding_ids.len(), 1);
@@ -1040,7 +1040,15 @@ fn aggregate_topn_runtime_filter_materializes_ordered_live_graph() {
     let RuntimeFilterBindingRole::Consumer(requirement) = &consumer.role else {
         unreachable!("filtered to a consumer")
     };
-    assert_eq!(requirement.target, ConsumerBindingTarget::SourceBoundary);
+    let ConsumerBindingTarget::SourceBoundary {
+        scan_domain: Some(target),
+    } = &requirement.target
+    else {
+        panic!("scan-column probe must freeze a scan-domain semantic target");
+    };
+    assert_eq!(target.column_id, ColumnId::new_for_test(1));
+    assert_eq!(target.data_type, DataType::Int64);
+    assert!(!target.nullable);
     assert_eq!(
         requirement.activation,
         ConsumerActivation::NonBlockingLive {
@@ -1436,7 +1444,7 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     let consumer_target = sealed_graph
         .bindings()
         .find_map(|binding| match &binding.role {
-            RuntimeFilterBindingRole::Consumer(consumer) => Some(consumer.target),
+            RuntimeFilterBindingRole::Consumer(consumer) => Some(consumer.target.clone()),
             RuntimeFilterBindingRole::Producer(_) => None,
         })
         .expect("sealed consumer target");
@@ -1459,7 +1467,7 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     });
     assert_snapshot_detects_binding_mutation(&sealed_graph, "consumer.target", |binding| {
         if let RuntimeFilterBindingRole::Consumer(consumer) = &mut binding.role {
-            consumer.target = changed_consumer_target;
+            consumer.target = changed_consumer_target.clone();
         }
     });
     assert_eq!(

@@ -71,6 +71,7 @@ fn planned_connector_read_for_test(
             predicate_dispositions: Vec::new(),
         },
         splits: Vec::new(),
+        provider_field_ordinals: vec![0],
         planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(),
         static_predicates: Vec::new(),
         predicate_dispositions: Vec::new(),

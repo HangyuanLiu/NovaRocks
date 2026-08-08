@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray};
 use novarocks_execution::runtime_filter as execution;
+use novarocks_spi::connector::ConnectorScalarValue;
 
 use super::membership_predicate::NativeRuntimeFilterPredicate;
 use super::ordered_range_predicate::NativeOrderedRangePredicate;
@@ -32,20 +33,7 @@ pub enum NativeExecutionPredicate {
     Ordered(Arc<NativeOrderedRangePredicate>),
 }
 
-impl NativeExecutionPredicate {
-    pub fn ordered_range(&self) -> Option<&Arc<NativeOrderedRangePredicate>> {
-        match self {
-            Self::Membership(_) => None,
-            Self::Ordered(predicate) => Some(predicate),
-        }
-    }
-}
-
 impl execution::RuntimeFilterPredicate for NativeExecutionPredicate {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn evaluate(
         &self,
         input: &ArrayRef,
@@ -63,6 +51,48 @@ impl execution::RuntimeFilterPredicate for NativeExecutionPredicate {
                     error.to_string(),
                 )
             }),
+        }
+    }
+}
+
+impl execution::scan_domain::RuntimeFilterScanDomainPredicate for NativeExecutionPredicate {
+    fn data_type(&self) -> &arrow::datatypes::DataType {
+        match self {
+            Self::Membership(predicate) => predicate.data_type(),
+            Self::Ordered(predicate) => predicate.data_type(),
+        }
+    }
+
+    fn matches_null(
+        &self,
+    ) -> Result<bool, execution::scan_domain::RuntimeFilterScanDomainCapabilityError> {
+        match self {
+            Self::Membership(predicate) => predicate.matches_null(),
+            Self::Ordered(predicate) => predicate.matches_null(),
+        }
+    }
+
+    fn has_non_null_matches(
+        &self,
+    ) -> Result<bool, execution::scan_domain::RuntimeFilterScanDomainCapabilityError> {
+        match self {
+            Self::Membership(predicate) => predicate.has_non_null_matches(),
+            Self::Ordered(predicate) => predicate.has_non_null_matches(),
+        }
+    }
+
+    fn non_null_range_may_match(
+        &self,
+        inclusive_min: &ConnectorScalarValue,
+        inclusive_max: &ConnectorScalarValue,
+    ) -> Result<bool, execution::scan_domain::RuntimeFilterScanDomainCapabilityError> {
+        match self {
+            Self::Membership(predicate) => {
+                predicate.non_null_range_may_match(inclusive_min, inclusive_max)
+            }
+            Self::Ordered(predicate) => {
+                predicate.non_null_range_may_match(inclusive_min, inclusive_max)
+            }
         }
     }
 }

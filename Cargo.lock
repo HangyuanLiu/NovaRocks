@@ -3295,6 +3295,7 @@ name = "novarocks-execution"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "novarocks-spi",
  "novarocks-types",
 ]
 

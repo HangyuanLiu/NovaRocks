@@ -70,7 +70,7 @@ pub(super) fn plan_iceberg_connector_read(
     let ResolvedScanExecution::IcebergFiles(files) = execution else {
         return Err("Iceberg connector planning requires IcebergFiles execution".to_string());
     };
-    let projection = effective_scan_column_names(scan)
+    let requested_projection = effective_scan_column_names(scan)
         .iter()
         .filter_map(|name| {
             files
@@ -81,6 +81,14 @@ pub(super) fn plan_iceberg_connector_read(
                 .position(|field| field.name.eq_ignore_ascii_case(name))
         })
         .collect::<Vec<_>>();
+    // The connector treats an empty projection as all provider fields.  Make
+    // that implicit choice explicit before sealing the read so every output
+    // field has a stable ordinal for scan-domain evaluation.
+    let projection = if requested_projection.is_empty() {
+        (0..files.table.schema.fields.len()).collect()
+    } else {
+        requested_projection
+    };
     let planned = match exact_lease {
         Some(lease) => crate::connector::iceberg::provider::plan_native_iceberg_read_with_lease(
             lease,
@@ -113,9 +121,17 @@ pub(super) fn plan_iceberg_connector_read(
         normalize_predicate_dispositions(&static_predicates, &planned.scan.predicate_dispositions)
             .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
     let residual_predicates = residual_predicates(&scan.predicates, &predicate_dispositions)?;
+    let provider_field_ordinals = projection
+        .into_iter()
+        .map(|ordinal| {
+            u32::try_from(ordinal)
+                .map_err(|_| "Iceberg provider field ordinal does not fit u32".to_string())
+        })
+        .collect::<Result<_, _>>()?;
     Ok(PlannedConnectorRead {
         declaration: planned.declaration,
         scan: planned.scan,
+        provider_field_ordinals,
         splits: planned.splits,
         planning_metrics: planned.planning_metrics,
         static_predicates,
@@ -151,9 +167,16 @@ pub(super) fn plan_iceberg_delta_connector_read(
         target_parallelism,
         max_split_bytes,
     )?;
+    let provider_field_ordinals = (0..planned.scan.output_schema.fields().len())
+        .map(|ordinal| {
+            u32::try_from(ordinal)
+                .map_err(|_| "Iceberg delta provider field ordinal does not fit u32".to_string())
+        })
+        .collect::<Result<_, _>>()?;
     Ok(PlannedConnectorRead {
         declaration: planned.declaration,
         scan: planned.scan,
+        provider_field_ordinals,
         splits: planned.splits,
         planning_metrics: planned.planning_metrics,
         static_predicates: Vec::new(),

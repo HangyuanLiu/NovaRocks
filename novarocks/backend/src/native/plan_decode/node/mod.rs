@@ -380,7 +380,7 @@ fn attach_direct_input_consumers(
         };
         let DecodedConsumerBindingTarget::DirectInput {
             input_ordinal: index,
-        } = *target
+        } = target
         else {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone(),
@@ -390,7 +390,7 @@ fn attach_direct_input_consumers(
                 ),
             ));
         };
-        let child = children.get(index).ok_or_else(|| {
+        let child = children.get(*index).ok_or_else(|| {
             NativeFragmentDecodeError::inconsistent(
                 path.clone(),
                 format!(
@@ -403,7 +403,7 @@ fn attach_direct_input_consumers(
         let expr_id =
             lower_binding_expression(binding, &child.layout, &child.output_schema, arena, ctx)?;
         grouped
-            .entry(index)
+            .entry(*index)
             .or_default()
             .push(NativeFragmentDecodeError::map_invalid(
                 path.clone(),
@@ -442,7 +442,7 @@ fn attach_leaf_consumers(
                 ),
             ));
         };
-        if *target != DecodedConsumerBindingTarget::SourceBoundary {
+        let DecodedConsumerBindingTarget::SourceBoundary { scan_domain } = target else {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("runtime_filter_binding_ids"),
                 format!(
@@ -450,6 +450,24 @@ fn attach_leaf_consumers(
                     binding.binding_id, wire_node.node_id
                 ),
             ));
+        };
+        if scan_domain.is_some()
+            && !matches!(
+                wire_node.payload.as_ref(),
+                Some(plan::distributed_node::Payload::Physical(physical))
+                    if matches!(physical.kind.as_ref(), Some(plan::plan_node::Kind::Scan(_)))
+            )
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().field("runtime_filter_binding_ids"),
+                format!(
+                    "native runtime-filter binding_id={} scan-domain target must attach to a connector scan leaf",
+                    binding.binding_id
+                ),
+            ));
+        }
+        if let Some(target) = scan_domain {
+            validate_scan_domain_target(binding, target, path.clone())?;
         }
     }
     let specs = bindings
@@ -518,6 +536,52 @@ fn attach_leaf_consumers(
                 ));
             }
         },
+    }
+    Ok(())
+}
+
+fn validate_scan_domain_target(
+    binding: &DecodedRuntimeFilterBinding,
+    target: &crate::native::plan_decode::runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    use novarocks_protocol::expr::expr::Kind;
+
+    if !matches!(&binding.expression.kind, Some(Kind::ColumnRef(_))) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.field("runtime_filter_binding_ids"),
+            format!(
+                "native runtime-filter binding_id={} scan-domain target requires an exact ColumnRef consumer expression",
+                binding.binding_id
+            ),
+        ));
+    }
+    let expression_type = binding.expression.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            binding.expression_path.clone().field("type"),
+            format!(
+                "native runtime-filter binding_id={} scan-domain consumer expression is missing type",
+                binding.binding_id
+            ),
+        )
+    })?;
+    let expression_type = crate::native::type_decode::decode_type(expression_type).map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            binding.expression_path.clone().field("type"),
+            format!(
+                "native runtime-filter binding_id={} scan-domain consumer expression has invalid type: {error}",
+                binding.binding_id
+            ),
+        )
+    })?;
+    if expression_type != target.data_type || binding.expression.nullable != target.nullable {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.field("runtime_filter_binding_ids"),
+            format!(
+                "native runtime-filter binding_id={} scan-domain target type/nullability does not match consumer expression",
+                binding.binding_id
+            ),
+        ));
     }
     Ok(())
 }
@@ -984,13 +1048,28 @@ fn consumer_spec(
     let DecodedBindingRole::Consumer {
         capabilities,
         activation,
-        ..
+        target,
     } = &binding.role
     else {
         return Err(format!(
             "native runtime-filter binding_id={} expected consumer role",
             binding.binding_id
         ));
+    };
+    let scan_domain = match target {
+        DecodedConsumerBindingTarget::DirectInput { .. } => None,
+        DecodedConsumerBindingTarget::SourceBoundary { scan_domain } => {
+            scan_domain.as_ref().map(|target| {
+                execution::scan_domain::RuntimeFilterScanDomainBinding::new(
+                    execution::RuntimeFilterBindingId::new(binding.binding_id),
+                    execution::scan_domain::RuntimeFilterScanDomainTarget::new(
+                        target.field_ordinal,
+                        target.data_type.clone(),
+                        target.nullable,
+                    ),
+                )
+            })
+        }
     };
     RuntimeFilterConsumerBinding::try_new(
         binding.binding_id,
@@ -1000,6 +1079,7 @@ fn consumer_spec(
         capabilities.clone(),
         native_contract(&binding.contract),
         native_reduction(&binding.reduction),
+        scan_domain,
     )
 }
 

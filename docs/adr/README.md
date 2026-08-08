@@ -60,6 +60,7 @@ code-anchors:
 - ADR-0002 — multicast 反压为何保持消费者耦合（active）
 - ADR-0003 — RF consumer 为何默认 BlockingSnapshot、NonBlockingLive 只做定点降级（active）
 - ADR-0027 — Runtime Filter 规划为何由 SQL 私有拥有、角色之间只交换封存 wire facts（active）
+- ADR-0041 — Runtime Filter scan-domain 评估为何由 Execution 拥有、Core 只提供中立 artifact capability（active）
 
 ### join-execution
 

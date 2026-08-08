@@ -460,7 +460,7 @@ mod tests {
                 activation: ActivationConstraint::BlockingOrBatchLive {
                     fallback: ActivationFallback::BlockingSnapshot,
                 },
-                target: crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::SourceBoundary,
+                target: crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::SourceBoundary { scan_domain: None },
             }),
         }
     }

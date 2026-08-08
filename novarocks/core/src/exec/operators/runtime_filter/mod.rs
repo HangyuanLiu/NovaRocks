@@ -127,6 +127,36 @@ impl Clone for NativeOrderedLiveConsumerSet {
 }
 
 impl NativeOrderedLiveConsumerSet {
+    pub(crate) fn scan_domain_snapshots(
+        &self,
+    ) -> Result<
+        Vec<(
+            execution::scan_domain::RuntimeFilterScanDomainBinding,
+            Option<Arc<execution::RuntimeFilterSnapshot>>,
+        )>,
+        String,
+    > {
+        self.poll_updates()?;
+        let bindings = self
+            .inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock");
+        Ok(bindings
+            .iter()
+            .filter_map(|binding| {
+                let target = binding.spec.scan_domain.clone()?;
+                let snapshot = match &binding.state {
+                    NativeOrderedLiveBindingState::BoundExecutionLive {
+                        latest_snapshot, ..
+                    } => latest_snapshot.clone(),
+                    _ => None,
+                };
+                Some((target, snapshot))
+            })
+            .collect())
+    }
+
     pub(crate) fn from_plan(
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
@@ -240,63 +270,6 @@ impl NativeOrderedLiveConsumerSet {
 
     pub(crate) fn poll_and_apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
         self.poll_and_apply_chunk_profiled(chunk, None)
-    }
-
-    pub(crate) fn poll_and_prune_morsel(
-        &self,
-        mut prune: impl FnMut(
-            SlotId,
-            &NativeOrderedRangePredicate,
-        ) -> Result<ScanMorselPruneDecision, String>,
-    ) -> Result<ScanMorselPruneDecision, String> {
-        self.poll()?;
-        let active = {
-            let bindings = self
-                .inner
-                .bindings
-                .lock()
-                .expect("native ordered RF consumer lock");
-            bindings
-                .iter()
-                .filter_map(|binding| {
-                    let ConsumerActivation::NonBlockingLive {
-                        late_apply: LateApplyGranularity::Split,
-                    } = binding.spec.activation
-                    else {
-                        return None;
-                    };
-                    let predicate = match &binding.state {
-                        NativeOrderedLiveBindingState::BoundExecutionLive {
-                            latest_snapshot: Some(snapshot),
-                            ..
-                        } => snapshot
-                            .predicate()
-                            .as_any()
-                            .downcast_ref::<NativeExecutionPredicate>()
-                            .and_then(NativeExecutionPredicate::ordered_range)
-                            .cloned(),
-                        #[cfg(test)]
-                        NativeOrderedLiveBindingState::TestLive {
-                            latest_predicate: Some(predicate),
-                            ..
-                        } => Some(Arc::clone(predicate)),
-                        _ => None,
-                    }?;
-                    let Some(ExprNode::SlotId(slot_id)) =
-                        self.inner.arena.node(binding.spec.expr_id)
-                    else {
-                        return None;
-                    };
-                    Some((*slot_id, predicate))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (slot_id, predicate) in active {
-            if prune(slot_id, predicate.as_ref())? == ScanMorselPruneDecision::Skip {
-                return Ok(ScanMorselPruneDecision::Skip);
-            }
-        }
-        Ok(ScanMorselPruneDecision::Keep)
     }
 
     pub(crate) fn poll_and_apply_chunk_profiled(
@@ -434,22 +407,6 @@ impl NativeOrderedLiveConsumerSet {
                 terminal: update_terminal,
             } => {
                 if observed.is_none_or(|seen| snapshot.logical_version() > seen) {
-                    let Some(predicate) = snapshot
-                        .predicate()
-                        .as_any()
-                        .downcast_ref::<NativeExecutionPredicate>()
-                    else {
-                        return Err(format!(
-                            "native ordered runtime-filter binding_id={} execution snapshot has no ordered predicate",
-                            spec.binding_id
-                        ));
-                    };
-                    if predicate.ordered_range().is_none() {
-                        return Err(format!(
-                            "native ordered runtime-filter binding_id={} execution snapshot has the wrong predicate kind",
-                            spec.binding_id
-                        ));
-                    }
                     *observed = Some(snapshot.logical_version());
                     *latest_snapshot = Some(snapshot);
                 }
@@ -782,6 +739,28 @@ enum NativeConsumerTestSubscription {
 }
 
 impl RuntimeFilterConsumerSet {
+    pub(crate) fn scan_domain_snapshots(
+        &self,
+    ) -> Vec<(
+        execution::scan_domain::RuntimeFilterScanDomainBinding,
+        Option<Arc<execution::RuntimeFilterSnapshot>>,
+    )> {
+        let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
+        bindings
+            .iter()
+            .filter_map(|binding| {
+                let target = binding.spec.scan_domain.clone()?;
+                let snapshot = match &binding.state {
+                    NativeConsumerBindingState::Active(NativeConsumerPredicate::Execution(
+                        snapshot,
+                    )) => Some(Arc::clone(snapshot)),
+                    _ => None,
+                };
+                Some((target, snapshot))
+            })
+            .collect()
+    }
+
     pub(crate) fn from_plan(
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
@@ -2073,6 +2052,7 @@ mod tests {
                 schema_digest: schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         }
     }
 
@@ -2298,10 +2278,6 @@ mod tests {
     struct AlwaysPassesTestPredicate;
 
     impl execution::RuntimeFilterPredicate for AlwaysPassesTestPredicate {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn evaluate(
             &self,
             input: &arrow::array::ArrayRef,
@@ -3171,6 +3147,7 @@ mod native_ordered_live_consumer_tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         }
     }
 
@@ -3459,6 +3436,7 @@ mod native_ordered_live_consumer_tests {
                 schema_digest: schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
         assert!(
             NativeOrderedLiveConsumerSet::from_plan(&[membership], Arc::new(membership_arena))
@@ -3658,6 +3636,7 @@ pub(crate) mod tests_support {
                 schema_digest: schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
         let subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(ObservedPublishedSubscription {
@@ -3710,6 +3689,7 @@ pub(crate) mod tests_support {
                 schema_digest: schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
         let subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(PublishedSubscription(bundle));

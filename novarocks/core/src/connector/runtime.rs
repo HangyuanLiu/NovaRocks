@@ -899,6 +899,29 @@ impl ScanOp for ConnectorReadScanOp {
         self.reader_group.terminate()
     }
 
+    fn prepared_scan_unit(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<ConnectorPreparedScanUnit>, String> {
+        let ScanMorsel::ConnectorScanUnit { index, .. } = morsel else {
+            return Ok(None);
+        };
+        let unit = self
+            .units
+            .read()
+            .map_err(|_| "SPI connector split state lock poisoned".to_string())?
+            .scheduled
+            .get(*index)
+            .map(|scheduled| scheduled.unit.clone())
+            .ok_or_else(|| format!("SPI connector scan unit index {index} is out of bounds"))?;
+        if unit.binding_key() != self.binding.execution_key() {
+            return Err(
+                "connector prepared scan unit belongs to another execution binding".to_string(),
+            );
+        }
+        Ok(Some(unit))
+    }
+
     fn execute_iter(
         &self,
         morsel: ScanMorsel,
@@ -912,18 +935,11 @@ impl ScanOp for ConnectorReadScanOp {
             }
         };
         let unit = self
-            .units
-            .read()
-            .map_err(|_| "SPI connector split state lock poisoned".to_string())?
-            .scheduled
-            .get(index)
-            .map(|scheduled| scheduled.unit.clone())
-            .ok_or_else(|| format!("SPI connector scan unit index {index} is out of bounds"))?;
-        if unit.binding_key() != self.binding.execution_key() {
-            return Err(
-                "connector prepared scan unit belongs to another execution binding".to_string(),
-            );
-        }
+            .prepared_scan_unit(&ScanMorsel::ConnectorScanUnit {
+                index,
+                row_position: None,
+            })?
+            .expect("connector scan morsel must expose a prepared unit");
         if let Some(profile) = profile.as_ref() {
             let prepared = self
                 .units

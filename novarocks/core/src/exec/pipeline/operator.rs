@@ -31,6 +31,7 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::runtime::fragment::FragmentEventSink;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
@@ -72,6 +73,8 @@ pub trait Operator: Send {
     fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
         Ok(())
     }
+
+    fn set_fragment_event_sink(&mut self, _sink: Arc<dyn FragmentEventSink>) {}
 
     fn close(&mut self) -> Result<(), String> {
         Ok(())

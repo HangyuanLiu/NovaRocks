@@ -97,6 +97,10 @@ pub struct RuntimeFilterConsumerBinding {
     pub(crate) capabilities: BTreeSet<ArtifactCapability>,
     pub(crate) contract: RuntimeFilterExecutionContract,
     pub(crate) reduction: RuntimeFilterExecutionReduction,
+    /// Present only for a connector scan whose FE-pinned source boundary is
+    /// eligible for scan-unit pre-reader evaluation. Core carries this sealed
+    /// value but does not interpret scan-domain facts or decisions.
+    pub(crate) scan_domain: Option<execution::scan_domain::RuntimeFilterScanDomainBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +156,7 @@ impl RuntimeFilterConsumerBinding {
         capabilities: BTreeSet<ArtifactCapability>,
         contract: RuntimeFilterExecutionContract,
         reduction: RuntimeFilterExecutionReduction,
+        scan_domain: Option<execution::scan_domain::RuntimeFilterScanDomainBinding>,
     ) -> Result<Self, String> {
         let expected_capabilities = match &contract {
             RuntimeFilterExecutionContract::Membership { .. } => BTreeSet::from([
@@ -183,6 +188,7 @@ impl RuntimeFilterConsumerBinding {
             capabilities,
             contract,
             reduction,
+            scan_domain,
         })
     }
 }
@@ -217,6 +223,7 @@ mod tests {
                 schema_digest: [2; 32],
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
 
         let producer = crate::exec::node::join::JoinRuntimeFilterProducerBinding {

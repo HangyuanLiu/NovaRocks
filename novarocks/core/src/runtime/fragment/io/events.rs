@@ -5,6 +5,11 @@ use crate::runtime::profile::RuntimeProfileTree;
 pub enum FragmentEvent {
     Progress(FragmentProgress),
     ProfileSnapshot(FragmentProfileSnapshot),
+    /// Neutral Execution-owned scan-unit evaluation outcome. Backend validates/consumes
+    /// this event but intentionally does not persist or aggregate it yet.
+    RuntimeFilterScanUnitOutcome(
+        novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome,
+    ),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
