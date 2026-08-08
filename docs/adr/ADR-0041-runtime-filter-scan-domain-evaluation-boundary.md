@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-08-08
 provenance:
-  - "PR: pending"
+  - "PR: #841"
   - "discussion: 2026-08-04 runtime-filter scan-domain evaluation boundary"
 code-anchors:
   - "novarocks/execution/src/runtime_filter/scan_domain.rs (evaluate_scan_unit)"
