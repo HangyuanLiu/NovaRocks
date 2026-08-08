@@ -85,7 +85,7 @@ pub(crate) enum DecodedConsumerBindingTarget {
     },
 }
 
-/// A Route C target is deliberately decoded before the execution node is
+/// A scan-domain target is deliberately decoded before the execution node is
 /// built.  The backend never infers it from a connector schema or catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DecodedRuntimeFilterScanDomainTarget {
@@ -1037,7 +1037,7 @@ fn decode_role(
                             NativeFragmentDecodeError::missing(
                                 path.clone().field("type"),
                                 format!(
-                                    "native runtime-filter consumer binding_id={binding_id} Route C target is missing type"
+                                    "native runtime-filter consumer binding_id={binding_id} scan-domain target is missing type"
                                 ),
                             )
                         })?;
@@ -1045,7 +1045,7 @@ fn decode_role(
                             NativeFragmentDecodeError::invalid_value(
                                 path.clone().field("type"),
                                 format!(
-                                    "native runtime-filter consumer binding_id={binding_id} Route C target has invalid type: {error}"
+                                    "native runtime-filter consumer binding_id={binding_id} scan-domain target has invalid type: {error}"
                                 ),
                             )
                         })?;

@@ -379,13 +379,13 @@ fn materialize_scan_domain_target(
 ) -> Result<PreparedRuntimeFilterScanDomainTarget, String> {
     let scan_bindings = scan_bindings.ok_or_else(|| {
         format!(
-            "runtime filter binding id={} has a Route C semantic target without pinned scan bindings",
+            "runtime filter binding id={} has a scan-domain semantic target without pinned scan bindings",
             binding_id.get()
         )
     })?;
     let binding = scan_bindings.binding(node_id.get()).ok_or_else(|| {
         format!(
-            "runtime filter binding id={} Route C target has no pinned scan binding for node_id={}",
+            "runtime filter binding id={} scan-domain target has no pinned scan binding for node_id={}",
             binding_id.get(),
             node_id.get()
         )
@@ -394,7 +394,7 @@ fn materialize_scan_domain_target(
         .connector_read(fragment_id.get(), node_id.get())
         .ok_or_else(|| {
             format!(
-                "runtime filter binding id={} Route C target requires a pinned connector read for fragment_id={} node_id={}",
+                "runtime filter binding id={} scan-domain target requires a pinned connector read for fragment_id={} node_id={}",
                 binding_id.get(),
                 fragment_id.get(),
                 node_id.get()
@@ -407,7 +407,7 @@ fn materialize_scan_domain_target(
         .collect::<Vec<_>>();
     let [physical] = physical.as_slice() else {
         return Err(format!(
-            "runtime filter binding id={} Route C target column id {} does not resolve to exactly one pinned physical scan output",
+            "runtime filter binding id={} scan-domain target column id {} does not resolve to exactly one pinned physical scan output",
             binding_id.get(),
             target.column_id
         ));
@@ -418,7 +418,7 @@ fn materialize_scan_domain_target(
         || physical.source.nullable != target.nullable
     {
         return Err(format!(
-            "runtime filter binding id={} Route C target column '{}' type/nullability drifted from its pinned scan binding",
+            "runtime filter binding id={} scan-domain target column '{}' type/nullability drifted from its pinned scan binding",
             binding_id.get(),
             physical.source.name
         ));
@@ -433,21 +433,21 @@ fn materialize_scan_domain_target(
         .collect::<Vec<_>>();
     let [(output_ordinal, output)] = output_matches.as_slice() else {
         return Err(format!(
-            "runtime filter binding id={} Route C target source column '{}' does not resolve to exactly one pinned connector output",
+            "runtime filter binding id={} scan-domain target source column '{}' does not resolve to exactly one pinned connector output",
             binding_id.get(),
             physical.source.name
         ));
     };
     if output.data_type() != &target.data_type || output.is_nullable() != target.nullable {
         return Err(format!(
-            "runtime filter binding id={} Route C target source column '{}' type/nullability drifted from pinned connector output",
+            "runtime filter binding id={} scan-domain target source column '{}' type/nullability drifted from pinned connector output",
             binding_id.get(),
             physical.source.name
         ));
     }
     let field_ordinal = *read.provider_field_ordinals.get(*output_ordinal).ok_or_else(|| {
         format!(
-            "runtime filter binding id={} Route C target connector output ordinal {} has no pinned provider ordinal",
+            "runtime filter binding id={} scan-domain target connector output ordinal {} has no pinned provider ordinal",
             binding_id.get(), output_ordinal
         )
     })?;
@@ -870,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn route_c_semantic_target_requires_pinned_scan_bindings() {
+    fn scan_domain_semantic_target_requires_pinned_scan_bindings() {
         let channel_id = ChannelId::new(9);
         let producer_id = BindingId::new(7);
         let consumer_id = BindingId::new(8);
@@ -902,7 +902,7 @@ mod tests {
                 ),
             )],
         )
-        .expect_err("Route C target cannot use an unpinned provider read");
+        .expect_err("scan-domain target cannot use an unpinned provider read");
         assert!(error.contains("without pinned scan bindings"), "{error}");
     }
 

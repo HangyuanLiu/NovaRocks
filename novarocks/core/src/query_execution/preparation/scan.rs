@@ -96,7 +96,7 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) scan: ConnectorScan,
     /// Stable provider field ordinals aligned 1:1 with `scan.output_schema`.
     /// These are frozen with the exact FE read and are the only authority for
-    /// Route C scan-domain target encoding.
+    /// Scan-domain target encoding for pre-reader evaluation.
     pub(crate) provider_field_ordinals: Vec<u32>,
     pub(crate) splits: Vec<ConnectorSplit>,
     /// Provider split-planning evidence retained only in FE preparation.

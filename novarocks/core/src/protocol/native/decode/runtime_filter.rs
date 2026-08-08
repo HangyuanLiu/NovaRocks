@@ -1029,7 +1029,7 @@ fn decode_role(
                         let data_type = crate::protocol::native::type_mapping::decode_type(
                             target.r#type.as_ref().ok_or_else(|| super::NativeFragmentDecodeError::missing(
                                 target_path.clone().field("type"),
-                                "native Route C scan-domain target requires type",
+                                "native scan-domain target requires type",
                             ))?
                         ).map_err(|error| super::NativeFragmentDecodeError::invalid_value(
                             target_path.clone().field("type"), error,

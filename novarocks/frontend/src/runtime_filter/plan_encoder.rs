@@ -545,26 +545,28 @@ mod tests {
             );
         }
 
-        let Role::Consumer(route_c) = encode_role(RuntimeFilterBindingRoleFacts::Consumer {
-            capabilities: vec![RuntimeFilterArtifactCapability::Membership],
-            activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
-            target: RuntimeFilterConsumerTarget::SourceBoundary {
-                scan_domain_target: Some(RuntimeFilterScanDomainTarget {
-                    field_ordinal: 17,
-                    r#type: common::TypeDesc { kind: None },
-                    nullable: true,
-                }),
-            },
-        })
-        .expect("Route C consumer role") else {
+        let Role::Consumer(scan_domain_consumer) =
+            encode_role(RuntimeFilterBindingRoleFacts::Consumer {
+                capabilities: vec![RuntimeFilterArtifactCapability::Membership],
+                activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+                target: RuntimeFilterConsumerTarget::SourceBoundary {
+                    scan_domain_target: Some(RuntimeFilterScanDomainTarget {
+                        field_ordinal: 17,
+                        r#type: common::TypeDesc { kind: None },
+                        nullable: true,
+                    }),
+                },
+            })
+            .expect("scan-domain consumer role")
+        else {
             panic!("consumer role");
         };
         let Some(plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(target)) =
-            route_c.target
+            scan_domain_consumer.target
         else {
             panic!("structured source-boundary target");
         };
-        let target = target.scan_domain_target.expect("Route C target");
+        let target = target.scan_domain_target.expect("scan-domain target");
         assert_eq!(target.field_ordinal, 17);
         assert_eq!(target.nullable, true);
         assert!(target.r#type.is_some());

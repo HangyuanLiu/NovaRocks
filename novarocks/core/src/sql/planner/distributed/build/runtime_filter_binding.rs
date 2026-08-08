@@ -789,7 +789,7 @@ fn resolved_consumer_binding(
     })
 }
 
-/// Route C starts only at a scan leaf whose already-rewritten consumer
+/// Scan-domain pre-reader evaluation starts only at a scan leaf whose already-rewritten consumer
 /// expression is precisely one user-visible scan output.  Anything less
 /// exact remains an ordinary source boundary and is still eligible for the
 /// normal row-filter path.

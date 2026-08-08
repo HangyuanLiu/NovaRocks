@@ -16,7 +16,7 @@ code-anchors:
 
 ## 问题
 
-当一个已封存的 Connector scan unit 能提供物理列域事实时，runtime filter 的 Route C 剪枝判断应由哪个层拥有，才能既不改变 SQL 结果，又不把 provider、artifact 或 Core 的过渡实现泄漏进跨角色契约？
+当一个已封存的 Connector scan unit 能提供物理列域事实时，runtime filter 的 scan-unit reader-open 前剪枝判断应由哪个层拥有，才能既不改变 SQL 结果，又不把 provider、artifact 或 Core 的过渡实现泄漏进跨角色契约？
 
 ## 背景与执行事实
 

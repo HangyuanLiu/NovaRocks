@@ -461,13 +461,13 @@ fn attach_leaf_consumers(
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("runtime_filter_binding_ids"),
                 format!(
-                    "native runtime-filter binding_id={} Route C target must attach to a connector scan leaf",
+                    "native runtime-filter binding_id={} scan-domain target must attach to a connector scan leaf",
                     binding.binding_id
                 ),
             ));
         }
         if let Some(target) = scan_domain {
-            validate_route_c_target(binding, target, path.clone())?;
+            validate_scan_domain_target(binding, target, path.clone())?;
         }
     }
     let specs = bindings
@@ -540,7 +540,7 @@ fn attach_leaf_consumers(
     Ok(())
 }
 
-fn validate_route_c_target(
+fn validate_scan_domain_target(
     binding: &DecodedRuntimeFilterBinding,
     target: &crate::native::plan_decode::runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
     path: FieldPath,
@@ -551,7 +551,7 @@ fn validate_route_c_target(
         return Err(NativeFragmentDecodeError::inconsistent(
             path.field("runtime_filter_binding_ids"),
             format!(
-                "native runtime-filter binding_id={} Route C target requires an exact ColumnRef consumer expression",
+                "native runtime-filter binding_id={} scan-domain target requires an exact ColumnRef consumer expression",
                 binding.binding_id
             ),
         ));
@@ -560,7 +560,7 @@ fn validate_route_c_target(
         NativeFragmentDecodeError::missing(
             binding.expression_path.clone().field("type"),
             format!(
-                "native runtime-filter binding_id={} Route C consumer expression is missing type",
+                "native runtime-filter binding_id={} scan-domain consumer expression is missing type",
                 binding.binding_id
             ),
         )
@@ -569,7 +569,7 @@ fn validate_route_c_target(
         NativeFragmentDecodeError::invalid_value(
             binding.expression_path.clone().field("type"),
             format!(
-                "native runtime-filter binding_id={} Route C consumer expression has invalid type: {error}",
+                "native runtime-filter binding_id={} scan-domain consumer expression has invalid type: {error}",
                 binding.binding_id
             ),
         )
@@ -578,7 +578,7 @@ fn validate_route_c_target(
         return Err(NativeFragmentDecodeError::inconsistent(
             path.field("runtime_filter_binding_ids"),
             format!(
-                "native runtime-filter binding_id={} Route C target type/nullability does not match consumer expression",
+                "native runtime-filter binding_id={} scan-domain target type/nullability does not match consumer expression",
                 binding.binding_id
             ),
         ));

@@ -1044,7 +1044,7 @@ fn aggregate_topn_runtime_filter_materializes_ordered_live_graph() {
         scan_domain: Some(target),
     } = &requirement.target
     else {
-        panic!("scan-column probe must freeze a Route C semantic target");
+        panic!("scan-column probe must freeze a scan-domain semantic target");
     };
     assert_eq!(target.column_id, ColumnId::new_for_test(1));
     assert_eq!(target.data_type, DataType::Int64);

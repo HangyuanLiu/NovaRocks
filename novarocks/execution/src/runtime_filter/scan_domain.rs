@@ -48,9 +48,9 @@ macro_rules! capability_bool {
     };
 }
 
-/// The physical provider field frozen by Frontend preparation for a Route C
-/// consumer. The ordinal has provider schema meaning; it is never inferred by
-/// a Backend reader.
+/// The physical provider field frozen by Frontend preparation for a scan-domain
+/// consumer. The ordinal has provider schema meaning; it is never inferred by a
+/// Backend reader.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterScanDomainTarget {
     field_ordinal: u32,
@@ -104,7 +104,7 @@ impl RuntimeFilterScanUnitId {
 }
 
 /// A neutral query over the retained RF artifact. This capability never sees
-/// provider facts and cannot mint a Route C decision.
+/// provider facts and cannot mint a scan-unit decision.
 pub trait RuntimeFilterScanDomainPredicate: Send + Sync {
     fn data_type(&self) -> &DataType;
     fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError>;

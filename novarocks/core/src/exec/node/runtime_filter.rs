@@ -98,7 +98,7 @@ pub struct RuntimeFilterConsumerBinding {
     pub(crate) contract: RuntimeFilterExecutionContract,
     pub(crate) reduction: RuntimeFilterExecutionReduction,
     /// Present only for a connector scan whose FE-pinned source boundary is
-    /// eligible for Route C scan-unit evaluation.  Core carries this sealed
+    /// eligible for scan-unit pre-reader evaluation. Core carries this sealed
     /// value but does not interpret scan-domain facts or decisions.
     pub(crate) scan_domain: Option<execution::scan_domain::RuntimeFilterScanDomainBinding>,
 }

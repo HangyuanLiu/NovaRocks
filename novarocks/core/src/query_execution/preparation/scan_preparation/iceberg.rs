@@ -83,7 +83,7 @@ pub(super) fn plan_iceberg_connector_read(
         .collect::<Vec<_>>();
     // The connector treats an empty projection as all provider fields.  Make
     // that implicit choice explicit before sealing the read so every output
-    // field has a stable Route C ordinal.
+    // field has a stable ordinal for scan-domain evaluation.
     let projection = if requested_projection.is_empty() {
         (0..files.table.schema.fields.len()).collect()
     } else {

@@ -387,7 +387,7 @@ impl RuntimeFilterConsumerTarget {
 
     // Deployment compilation consumes lifecycle/placement facts only.  Its
     // view exists before pinned scan preparation and must never manufacture a
-    // Route C physical target from semantic SQL identity.
+    // Scan-domain physical target from semantic SQL identity.
     fn from_unprepared_sql(value: &ConsumerBindingTarget) -> Self {
         match value {
             ConsumerBindingTarget::DirectInput { input_ordinal } => Self::DirectInputOrdinal(
