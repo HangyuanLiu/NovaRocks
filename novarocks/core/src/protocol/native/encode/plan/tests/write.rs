@@ -27,6 +27,7 @@ use novarocks_spi::connector::{
     ConnectorScanHandle,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use prost::Message;
 
 use super::super::scan::encode_column_def;
 use super::super::write::encode_change_stream_router_sink;
@@ -236,6 +237,32 @@ fn change_stream_router_encoder_materializes_partition_exprs() {
         panic!("expected partition expr to be a column ref");
     };
     assert_eq!(column_ref.column_id, 3);
+}
+
+#[test]
+fn change_stream_router_encoder_preserves_wire_bytes() {
+    let plan = single_fragment_router_plan_for_test();
+    let fragment = plan.fragments().first().expect("router fragment");
+    let DataSink::ChangeStreamRouter(sink) = &fragment.sink else {
+        panic!("expected Iceberg change-stream router sink");
+    };
+    let router = encode_change_stream_router_sink(
+        sink,
+        fragment.fragment_id,
+        &NativePlanEncodeContext {
+            scan_bindings: None,
+            node_outputs: None,
+            fragment_edge_outputs: None,
+            write_contracts: Some(plan.write_contracts()),
+            runtime_filter_bindings: None,
+        },
+    )
+    .expect("encode change-stream router sink");
+
+    assert_eq!(
+        hex::encode(router.encode_to_vec()),
+        "180122241001180120142a01023201023a16080312120a040a020804520a08031a066275636b6574"
+    );
 }
 
 fn single_fragment_router_plan_for_test() -> DistributedPlan {
