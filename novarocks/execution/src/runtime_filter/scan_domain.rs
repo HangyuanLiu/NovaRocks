@@ -18,18 +18,19 @@
 //! Execution-owned evaluation of one sealed connector scan unit against an
 //! immutable runtime-filter snapshot.
 //!
-//! Design: ADR-0041 (docs/adr/ADR-0041-runtime-filter-scan-domain-evaluation-boundary.md)
+//! Design: ADR-0042 (docs/adr/ADR-0042-runtime-filter-artifact-query-and-evaluator-boundary.md)
 
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_spi::connector::{
-    ConnectorPreparedScanUnit, ConnectorScalarType, ConnectorScalarValue,
-    ConnectorScanUnitColumnDomain, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
+    ConnectorPreparedScanUnit, ConnectorScalarType, ConnectorScanUnitColumnDomain,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
     ConnectorScanUnitFactsMissingReason,
 };
 
 use super::{
     LogicalVersion, RuntimeFilterBindingId, RuntimeFilterContractViolation,
     RuntimeFilterContractViolationKind, RuntimeFilterSnapshot,
+    evaluator::RuntimeFilterArtifactQueryError,
 };
 
 macro_rules! capability_bool {
@@ -101,26 +102,6 @@ impl RuntimeFilterScanUnitId {
     pub const fn unit_ordinal(&self) -> u32 {
         self.unit_ordinal
     }
-}
-
-/// A neutral query over the retained RF artifact. This capability never sees
-/// provider facts and cannot mint a scan-unit decision.
-pub trait RuntimeFilterScanDomainPredicate: Send + Sync {
-    fn data_type(&self) -> &DataType;
-    fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError>;
-    fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError>;
-    fn non_null_range_may_match(
-        &self,
-        inclusive_min: &ConnectorScalarValue,
-        inclusive_max: &ConnectorScalarValue,
-    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeFilterScanDomainCapabilityError {
-    Unsupported,
-    ResourceUnavailable,
-    ContractViolation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,14 +267,7 @@ pub fn evaluate_scan_unit(
             "runtime-filter scan-domain binding differs from the immutable snapshot",
         ));
     }
-    let Some(capability) = snapshot.scan_domain() else {
-        return Ok(not_evaluated(
-            binding,
-            input.unit_id,
-            RuntimeFilterScanUnitNotEvaluatedReason::PredicateCapabilityUnsupported,
-            Some(snapshot.logical_version()),
-        ));
-    };
+    let capability = snapshot.artifact_query();
     let Some(expected_scalar_type) = connector_scalar_type(binding.target.data_type()) else {
         return Ok(not_evaluated(
             binding,
@@ -448,20 +422,18 @@ enum CapabilityValue {
 }
 
 fn capability_value(
-    result: Result<bool, RuntimeFilterScanDomainCapabilityError>,
+    result: Result<bool, RuntimeFilterArtifactQueryError>,
 ) -> Result<CapabilityValue, RuntimeFilterContractViolation> {
     result
         .map(CapabilityValue::Value)
         .or_else(|error| match error {
-            RuntimeFilterScanDomainCapabilityError::ContractViolation => Err(violation(
+            RuntimeFilterArtifactQueryError::ContractViolation => Err(violation(
                 "runtime-filter scan-domain capability rejected its retained artifact",
             )),
-            RuntimeFilterScanDomainCapabilityError::Unsupported => {
-                Ok(CapabilityValue::NotEvaluated(
-                    RuntimeFilterScanUnitNotEvaluatedReason::PredicateCapabilityUnsupported,
-                ))
-            }
-            RuntimeFilterScanDomainCapabilityError::ResourceUnavailable => {
+            RuntimeFilterArtifactQueryError::Unsupported => Ok(CapabilityValue::NotEvaluated(
+                RuntimeFilterScanUnitNotEvaluatedReason::PredicateCapabilityUnsupported,
+            )),
+            RuntimeFilterArtifactQueryError::ResourceUnavailable => {
                 Ok(CapabilityValue::NotEvaluated(
                     RuntimeFilterScanUnitNotEvaluatedReason::ResourceUnavailable,
                 ))
@@ -498,21 +470,14 @@ mod tests {
     use std::sync::Arc;
 
     use novarocks_spi::connector::{
-        ConnectorScanUnitColumn, ConnectorScanUnitColumnFacts, ConnectorScanUnitFactsEvidence,
+        ConnectorScalarValue, ConnectorScanUnitColumn, ConnectorScanUnitColumnFacts,
+        ConnectorScanUnitFactsEvidence,
     };
 
-    use crate::runtime_filter::{RuntimeFilterPredicate, RuntimeFilterSnapshot};
-    use arrow::array::{ArrayRef, BooleanArray};
-
-    struct Predicate;
-    impl RuntimeFilterPredicate for Predicate {
-        fn evaluate(
-            &self,
-            input: &ArrayRef,
-        ) -> Result<BooleanArray, RuntimeFilterContractViolation> {
-            Ok(BooleanArray::from(vec![true; input.len()]))
-        }
-    }
+    use crate::runtime_filter::{
+        RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterScalarRef,
+        RuntimeFilterSnapshot,
+    };
 
     struct Domain {
         data_type: DataType,
@@ -521,42 +486,54 @@ mod tests {
         range_may_match: bool,
     }
 
-    impl RuntimeFilterScanDomainPredicate for Domain {
+    impl RuntimeFilterArtifactQuery for Domain {
         fn data_type(&self) -> &DataType {
             &self.data_type
         }
-        fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        fn matches_null(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
             Ok(self.matches_null)
         }
-        fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
             Ok(self.has_non_null_matches)
+        }
+        fn non_null_value_may_match(
+            &self,
+            _: RuntimeFilterScalarRef<'_>,
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(self.range_may_match)
         }
         fn non_null_range_may_match(
             &self,
             _: &ConnectorScalarValue,
             _: &ConnectorScalarValue,
-        ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
             Ok(self.range_may_match)
         }
     }
 
     struct ResourceConstrainedDomain;
 
-    impl RuntimeFilterScanDomainPredicate for ResourceConstrainedDomain {
+    impl RuntimeFilterArtifactQuery for ResourceConstrainedDomain {
         fn data_type(&self) -> &DataType {
             &DataType::Int64
         }
-        fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        fn matches_null(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
             Ok(false)
         }
-        fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
-            Err(RuntimeFilterScanDomainCapabilityError::ResourceUnavailable)
+        fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Err(RuntimeFilterArtifactQueryError::ResourceUnavailable)
+        }
+        fn non_null_value_may_match(
+            &self,
+            _: RuntimeFilterScalarRef<'_>,
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(false)
         }
         fn non_null_range_may_match(
             &self,
             _: &ConnectorScalarValue,
             _: &ConnectorScalarValue,
-        ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
             Ok(false)
         }
     }
@@ -569,12 +546,11 @@ mod tests {
     }
 
     fn snapshot(domain: Domain) -> RuntimeFilterSnapshot {
-        RuntimeFilterSnapshot::with_scan_domain(
+        RuntimeFilterSnapshot::new(
             super::RuntimeFilterBindingId::new(7),
             LogicalVersion::new(2),
             [9; 32],
-            Arc::new(Predicate),
-            Some(Arc::new(domain)),
+            Arc::new(domain),
         )
     }
 
@@ -709,12 +685,11 @@ mod tests {
     #[test]
     fn resource_constrained_capability_fails_open_without_an_effect() {
         let facts = facts(range(false));
-        let snapshot = RuntimeFilterSnapshot::with_scan_domain(
+        let snapshot = RuntimeFilterSnapshot::new(
             super::RuntimeFilterBindingId::new(7),
             LogicalVersion::new(2),
             [9; 32],
-            Arc::new(Predicate),
-            Some(Arc::new(ResourceConstrainedDomain)),
+            Arc::new(ResourceConstrainedDomain),
         );
         let outcome = evaluate_scan_unit(
             &target(false),

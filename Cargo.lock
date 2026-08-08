@@ -3297,6 +3297,7 @@ dependencies = [
  "arrow",
  "novarocks-spi",
  "novarocks-types",
+ "sha2",
 ]
 
 [[package]]

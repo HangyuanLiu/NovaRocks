@@ -15,16 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::DataType;
 
+pub mod contribution;
+pub mod evaluator;
 pub mod scan_domain;
+
+pub use evaluator::{
+    RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterRowEffect,
+    RuntimeFilterRowEvaluation, RuntimeFilterRowNotEvaluatedReason, RuntimeFilterRowOutcome,
+    RuntimeFilterScalarRef,
+};
 
 macro_rules! id {
     ($name:ident, $raw:ty) => {
@@ -144,36 +150,57 @@ pub struct RuntimeFilterContribution {
 /// A frozen, fragment-local membership domain submitted through a final-domain
 /// completion fence.
 ///
-/// The execution surface owns the lifecycle of this payload, while a
-/// role-local session adapter validates and converts the opaque value into its
-/// reducer representation. `canonical_bytes` gives callers a stable size
-/// bound without exposing a transport envelope or a service-issued authority.
-#[derive(Clone)]
+/// The payload is canonical and typed at the Execution boundary.  Completion
+/// adapters must strictly decode it using the exact schema and digest instead
+/// of receiving an untyped side-channel value.
+#[derive(Clone, Eq, PartialEq)]
 pub struct RuntimeFilterFinalDomain {
     canonical_bytes: Arc<[u8]>,
-    value: Arc<dyn Any + Send + Sync>,
+    data_type: DataType,
+    contract_digest: [u8; 32],
 }
 
 impl RuntimeFilterFinalDomain {
-    pub fn new<T>(canonical_bytes: impl Into<Arc<[u8]>>, value: T) -> Self
-    where
-        T: Any + Send + Sync,
-    {
-        Self {
-            canonical_bytes: canonical_bytes.into(),
-            value: Arc::new(value),
-        }
+    pub fn from_value_domain(
+        domain: &contribution::ValueDomainDelta,
+        contract_digest: [u8; 32],
+        max_canonical_bytes: usize,
+    ) -> Result<Self, contribution::ContributionCodecError> {
+        let data_type = domain.data_type();
+        let canonical_bytes =
+            contribution::encode_value_domain(domain, max_canonical_bytes)?.into();
+        Ok(Self {
+            canonical_bytes,
+            data_type,
+            contract_digest,
+        })
+    }
+
+    pub fn from_canonical(
+        canonical_bytes: impl Into<Arc<[u8]>>,
+        data_type: DataType,
+        contract_digest: [u8; 32],
+        max_canonical_bytes: usize,
+    ) -> Result<Self, contribution::ContributionCodecError> {
+        let canonical_bytes = canonical_bytes.into();
+        contribution::decode_value_domain(&canonical_bytes, &data_type, max_canonical_bytes)?;
+        Ok(Self {
+            canonical_bytes,
+            data_type,
+            contract_digest,
+        })
     }
 
     pub const fn canonical_bytes(&self) -> &Arc<[u8]> {
         &self.canonical_bytes
     }
 
-    /// This is for a role-local session adapter only. Execution callers pass
-    /// the opaque payload to a typed completion capability; they never mint
-    /// completion authority or address a delivery route.
-    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        self.value.downcast_ref()
+    pub const fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    pub const fn contract_digest(&self) -> [u8; 32] {
+        self.contract_digest
     }
 }
 
@@ -213,9 +240,33 @@ impl RuntimeFilterContribution {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterLateApplyGranularity {
+    Row,
+    Batch,
+    RowGroup,
+    Split,
+    File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsumerActivation {
     BlockingSnapshot,
-    NonBlockingLive,
+    NonBlockingLive {
+        late_apply: RuntimeFilterLateApplyGranularity,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterReduction {
+    SetUnion,
+    TightenOrderedBound,
+    MergeTopKSummary { k: u32, contract_digest: [u8; 32] },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterCompletion {
+    ProducerClosed,
+    FencedFinalDomain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,8 +316,149 @@ pub struct RuntimeFilterProducerContract {
     channel_id: RuntimeFilterChannelId,
     kind: RuntimeFilterProducerKind,
     contract: RuntimeFilterExecutionContract,
+    reduction: RuntimeFilterReduction,
+    completion: RuntimeFilterCompletion,
 }
 impl RuntimeFilterProducerContract {
+    pub fn membership(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        Self::for_kind(
+            binding_id,
+            channel_id,
+            RuntimeFilterProducerKind::Membership,
+            contract,
+        )
+    }
+
+    pub fn ordered_bound(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        Self::for_kind(
+            binding_id,
+            channel_id,
+            RuntimeFilterProducerKind::OrderedBound,
+            contract,
+        )
+    }
+
+    pub fn top_k_summary(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        k: u32,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        if k == 0 {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::ContractMismatch,
+                "top-k runtime-filter producer requires a non-zero K",
+            ));
+        }
+        let mut producer = Self::for_kind(
+            binding_id,
+            channel_id,
+            RuntimeFilterProducerKind::TopKSummary,
+            contract,
+        )?;
+        let RuntimeFilterExecutionContract::Ordered {
+            order_contract_digest,
+            ..
+        } = producer.contract()
+        else {
+            unreachable!("kind and contract were validated above")
+        };
+        producer.reduction = RuntimeFilterReduction::MergeTopKSummary {
+            k,
+            contract_digest: *order_contract_digest,
+        };
+        Ok(producer)
+    }
+
+    pub fn final_domain(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        Self::for_kind(
+            binding_id,
+            channel_id,
+            RuntimeFilterProducerKind::FinalDomain,
+            contract,
+        )
+    }
+
+    fn for_kind(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        kind: RuntimeFilterProducerKind,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        let valid = matches!(
+            (kind, &contract),
+            (
+                RuntimeFilterProducerKind::Membership,
+                RuntimeFilterExecutionContract::Membership { .. }
+            ) | (
+                RuntimeFilterProducerKind::OrderedBound,
+                RuntimeFilterExecutionContract::Ordered { .. }
+            ) | (
+                RuntimeFilterProducerKind::TopKSummary,
+                RuntimeFilterExecutionContract::Ordered { .. }
+            ) | (
+                RuntimeFilterProducerKind::FinalDomain,
+                RuntimeFilterExecutionContract::Membership { .. }
+            )
+        );
+        if !valid {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::RoleMismatch,
+                "runtime-filter producer kind does not match its execution contract",
+            ));
+        }
+        Ok(Self {
+            binding_id,
+            channel_id,
+            kind,
+            reduction: match kind {
+                RuntimeFilterProducerKind::Membership | RuntimeFilterProducerKind::FinalDomain => {
+                    RuntimeFilterReduction::SetUnion
+                }
+                RuntimeFilterProducerKind::OrderedBound => {
+                    RuntimeFilterReduction::TightenOrderedBound
+                }
+                RuntimeFilterProducerKind::TopKSummary => {
+                    let RuntimeFilterExecutionContract::Ordered {
+                        order_contract_digest,
+                        ..
+                    } = &contract
+                    else {
+                        unreachable!("kind and contract were validated above")
+                    };
+                    RuntimeFilterReduction::MergeTopKSummary {
+                        k: 0,
+                        contract_digest: *order_contract_digest,
+                    }
+                }
+            },
+            completion: match kind {
+                RuntimeFilterProducerKind::FinalDomain => {
+                    RuntimeFilterCompletion::FencedFinalDomain
+                }
+                RuntimeFilterProducerKind::Membership
+                | RuntimeFilterProducerKind::OrderedBound
+                | RuntimeFilterProducerKind::TopKSummary => RuntimeFilterCompletion::ProducerClosed,
+            },
+            contract,
+        })
+    }
+
+    /// Transitional constructor retained while Core plan carriers are cut to
+    /// the named Execution constructors. New fragment callers must use the
+    /// role-specific constructors above.
     pub const fn new(
         binding_id: RuntimeFilterBindingId,
         channel_id: RuntimeFilterChannelId,
@@ -277,6 +469,28 @@ impl RuntimeFilterProducerContract {
             binding_id,
             channel_id,
             kind,
+            reduction: match kind {
+                RuntimeFilterProducerKind::Membership | RuntimeFilterProducerKind::FinalDomain => {
+                    RuntimeFilterReduction::SetUnion
+                }
+                RuntimeFilterProducerKind::OrderedBound => {
+                    RuntimeFilterReduction::TightenOrderedBound
+                }
+                RuntimeFilterProducerKind::TopKSummary => {
+                    RuntimeFilterReduction::MergeTopKSummary {
+                        k: 0,
+                        contract_digest: [0; 32],
+                    }
+                }
+            },
+            completion: match kind {
+                RuntimeFilterProducerKind::FinalDomain => {
+                    RuntimeFilterCompletion::FencedFinalDomain
+                }
+                RuntimeFilterProducerKind::Membership
+                | RuntimeFilterProducerKind::OrderedBound
+                | RuntimeFilterProducerKind::TopKSummary => RuntimeFilterCompletion::ProducerClosed,
+            },
             contract,
         }
     }
@@ -292,6 +506,12 @@ impl RuntimeFilterProducerContract {
     pub const fn contract(&self) -> &RuntimeFilterExecutionContract {
         &self.contract
     }
+    pub const fn reduction(&self) -> RuntimeFilterReduction {
+        self.reduction
+    }
+    pub const fn completion(&self) -> RuntimeFilterCompletion {
+        self.completion
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -300,19 +520,150 @@ pub struct RuntimeFilterConsumerContract {
     channel_id: RuntimeFilterChannelId,
     activation: ConsumerActivation,
     contract: RuntimeFilterExecutionContract,
+    reduction: RuntimeFilterReduction,
 }
 impl RuntimeFilterConsumerContract {
+    pub fn membership_blocking(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        Self::for_activation(
+            binding_id,
+            channel_id,
+            ConsumerActivation::BlockingSnapshot,
+            contract,
+            RuntimeFilterReduction::SetUnion,
+        )
+    }
+
+    pub fn membership_live(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        late_apply: RuntimeFilterLateApplyGranularity,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        Self::for_activation(
+            binding_id,
+            channel_id,
+            ConsumerActivation::NonBlockingLive { late_apply },
+            contract,
+            RuntimeFilterReduction::SetUnion,
+        )
+    }
+
+    pub fn ordered_live(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        late_apply: RuntimeFilterLateApplyGranularity,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        Self::for_activation(
+            binding_id,
+            channel_id,
+            ConsumerActivation::NonBlockingLive { late_apply },
+            contract,
+            RuntimeFilterReduction::TightenOrderedBound,
+        )
+    }
+
+    pub fn top_k_live(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        late_apply: RuntimeFilterLateApplyGranularity,
+        k: u32,
+        contract: RuntimeFilterExecutionContract,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        let RuntimeFilterExecutionContract::Ordered {
+            order_contract_digest,
+            ..
+        } = &contract
+        else {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::RoleMismatch,
+                "top-k runtime-filter consumer requires an ordered contract",
+            ));
+        };
+        if k == 0 {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::ContractMismatch,
+                "top-k runtime-filter consumer requires a non-zero K",
+            ));
+        }
+        let contract_digest = *order_contract_digest;
+        Self::for_activation(
+            binding_id,
+            channel_id,
+            ConsumerActivation::NonBlockingLive { late_apply },
+            contract,
+            RuntimeFilterReduction::MergeTopKSummary { k, contract_digest },
+        )
+    }
+
+    fn for_activation(
+        binding_id: RuntimeFilterBindingId,
+        channel_id: RuntimeFilterChannelId,
+        activation: ConsumerActivation,
+        contract: RuntimeFilterExecutionContract,
+        reduction: RuntimeFilterReduction,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        let valid = matches!(
+            (&contract, reduction),
+            (
+                RuntimeFilterExecutionContract::Membership { .. },
+                RuntimeFilterReduction::SetUnion
+            ) | (
+                RuntimeFilterExecutionContract::Ordered { .. },
+                RuntimeFilterReduction::TightenOrderedBound
+            ) | (
+                RuntimeFilterExecutionContract::Ordered { .. },
+                RuntimeFilterReduction::MergeTopKSummary { .. }
+            )
+        );
+        if !valid {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::RoleMismatch,
+                "runtime-filter consumer reduction does not match its execution contract",
+            ));
+        }
+        if matches!(activation, ConsumerActivation::BlockingSnapshot)
+            && !matches!(contract, RuntimeFilterExecutionContract::Membership { .. })
+        {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::RoleMismatch,
+                "ordered runtime-filter consumers cannot use blocking snapshots",
+            ));
+        }
+        Ok(Self {
+            binding_id,
+            channel_id,
+            activation,
+            contract,
+            reduction,
+        })
+    }
+
+    /// Transitional constructor retained while Core plan carriers are cut to
+    /// the named Execution constructors. New fragment callers must use the
+    /// role-specific constructors above.
     pub const fn new(
         binding_id: RuntimeFilterBindingId,
         channel_id: RuntimeFilterChannelId,
         activation: ConsumerActivation,
         contract: RuntimeFilterExecutionContract,
     ) -> Self {
+        let reduction = match &contract {
+            RuntimeFilterExecutionContract::Membership { .. } => RuntimeFilterReduction::SetUnion,
+            RuntimeFilterExecutionContract::Ordered { .. } => {
+                RuntimeFilterReduction::TightenOrderedBound
+            }
+        };
         Self {
             binding_id,
             channel_id,
             activation,
             contract,
+            reduction,
         }
     }
     pub const fn binding_id(&self) -> RuntimeFilterBindingId {
@@ -326,6 +677,9 @@ impl RuntimeFilterConsumerContract {
     }
     pub const fn contract(&self) -> &RuntimeFilterExecutionContract {
         &self.contract
+    }
+    pub const fn reduction(&self) -> RuntimeFilterReduction {
+        self.reduction
     }
 }
 
@@ -416,47 +770,25 @@ pub enum LiveTerminal {
     Cancelled,
 }
 
-pub trait RuntimeFilterPredicate: Send + Sync {
-    fn evaluate(&self, input: &ArrayRef) -> Result<BooleanArray, RuntimeFilterContractViolation>;
-}
-
 #[derive(Clone)]
 pub struct RuntimeFilterSnapshot {
     binding_id: RuntimeFilterBindingId,
     logical_version: LogicalVersion,
     contract_digest: [u8; 32],
-    predicate: Arc<dyn RuntimeFilterPredicate>,
-    scan_domain: Option<Arc<dyn scan_domain::RuntimeFilterScanDomainPredicate>>,
+    artifact_query: Arc<dyn evaluator::RuntimeFilterArtifactQuery>,
 }
 impl RuntimeFilterSnapshot {
     pub fn new(
         binding_id: RuntimeFilterBindingId,
         logical_version: LogicalVersion,
         contract_digest: [u8; 32],
-        predicate: Arc<dyn RuntimeFilterPredicate>,
-    ) -> Self {
-        Self::with_scan_domain(
-            binding_id,
-            logical_version,
-            contract_digest,
-            predicate,
-            None,
-        )
-    }
-
-    pub fn with_scan_domain(
-        binding_id: RuntimeFilterBindingId,
-        logical_version: LogicalVersion,
-        contract_digest: [u8; 32],
-        predicate: Arc<dyn RuntimeFilterPredicate>,
-        scan_domain: Option<Arc<dyn scan_domain::RuntimeFilterScanDomainPredicate>>,
+        artifact_query: Arc<dyn evaluator::RuntimeFilterArtifactQuery>,
     ) -> Self {
         Self {
             binding_id,
             logical_version,
             contract_digest,
-            predicate,
-            scan_domain,
+            artifact_query,
         }
     }
     pub const fn binding_id(&self) -> RuntimeFilterBindingId {
@@ -468,11 +800,8 @@ impl RuntimeFilterSnapshot {
     pub const fn contract_digest(&self) -> [u8; 32] {
         self.contract_digest
     }
-    pub const fn predicate(&self) -> &Arc<dyn RuntimeFilterPredicate> {
-        &self.predicate
-    }
-    pub fn scan_domain(&self) -> Option<&Arc<dyn scan_domain::RuntimeFilterScanDomainPredicate>> {
-        self.scan_domain.as_ref()
+    pub const fn artifact_query(&self) -> &Arc<dyn evaluator::RuntimeFilterArtifactQuery> {
+        &self.artifact_query
     }
 }
 
@@ -610,41 +939,6 @@ pub trait RuntimeFilterSession: Send + Sync {
 }
 pub type RuntimeFilterSessionRef = Arc<dyn RuntimeFilterSession>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuntimeFilterRowEffect {
-    binding_id: RuntimeFilterBindingId,
-    logical_version: LogicalVersion,
-    input_rows: u64,
-    output_rows: u64,
-}
-impl RuntimeFilterRowEffect {
-    pub const fn new(
-        binding_id: RuntimeFilterBindingId,
-        logical_version: LogicalVersion,
-        input_rows: u64,
-        output_rows: u64,
-    ) -> Self {
-        Self {
-            binding_id,
-            logical_version,
-            input_rows,
-            output_rows,
-        }
-    }
-    pub const fn binding_id(self) -> RuntimeFilterBindingId {
-        self.binding_id
-    }
-    pub const fn logical_version(self) -> LogicalVersion {
-        self.logical_version
-    }
-    pub const fn input_rows(self) -> u64 {
-        self.input_rows
-    }
-    pub const fn output_rows(self) -> u64 {
-        self.output_rows
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeFilterLiveCursor {
     observed: Option<LogicalVersion>,
@@ -677,15 +971,36 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{ArrayRef, Int64Array};
+    use novarocks_spi::connector::ConnectorScalarValue;
 
-    struct Predicate;
-    impl RuntimeFilterPredicate for Predicate {
-        fn evaluate(
+    struct Query;
+    impl RuntimeFilterArtifactQuery for Query {
+        fn data_type(&self) -> &DataType {
+            &DataType::Int64
+        }
+
+        fn matches_null(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(false)
+        }
+
+        fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+
+        fn non_null_value_may_match(
             &self,
-            input: &ArrayRef,
-        ) -> Result<BooleanArray, RuntimeFilterContractViolation> {
-            Ok(BooleanArray::from(vec![true; input.len()]))
+            _: RuntimeFilterScalarRef<'_>,
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+
+        fn non_null_range_may_match(
+            &self,
+            _: &ConnectorScalarValue,
+            _: &ConnectorScalarValue,
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(true)
         }
     }
     struct Producer;
@@ -879,6 +1194,20 @@ mod tests {
             schema_digest: [2; 32],
         }
     }
+
+    #[test]
+    fn named_membership_producer_contract_fixes_its_role() {
+        let contract = RuntimeFilterProducerContract::membership(
+            RuntimeFilterBindingId::new(7),
+            RuntimeFilterChannelId::new(9),
+            membership(),
+        )
+        .expect("membership execution contract is accepted");
+
+        assert_eq!(contract.kind(), RuntimeFilterProducerKind::Membership);
+        assert_eq!(contract.binding_id(), RuntimeFilterBindingId::new(7));
+        assert_eq!(contract.channel_id(), RuntimeFilterChannelId::new(9));
+    }
     #[test]
     fn fake_session_distinguishes_exact_admission_from_unavailability() {
         let session: RuntimeFilterSessionRef = Arc::new(FakeSession);
@@ -916,28 +1245,25 @@ mod tests {
     }
     #[test]
     fn live_cursor_rejects_version_regression_and_effect_is_versioned() {
-        let predicate = Arc::new(Predicate);
+        let query = Arc::new(Query);
         let snapshot = RuntimeFilterSnapshot::new(
             RuntimeFilterBindingId::new(3),
             LogicalVersion::new(2),
             [9; 32],
-            predicate,
+            query,
         );
         let mut cursor = RuntimeFilterLiveCursor::default();
         assert!(cursor.observe(&snapshot).is_ok());
         assert!(cursor.observe(&snapshot).is_err());
         let values: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2]));
-        assert_eq!(snapshot.predicate().evaluate(&values).unwrap().len(), 2);
-        assert_eq!(
-            RuntimeFilterRowEffect::new(
-                RuntimeFilterBindingId::new(3),
-                LogicalVersion::new(2),
-                2,
-                1
-            )
-            .output_rows(),
-            1
-        );
+        let outcome = evaluator::evaluate_rows(
+            RuntimeFilterBindingId::new(3),
+            LogicalVersion::new(2),
+            snapshot.artifact_query().as_ref(),
+            &values,
+        )
+        .expect("query evaluates");
+        assert_eq!(outcome.effect().expect("evaluated query").output_rows(), 2);
     }
 
     #[test]
@@ -948,7 +1274,7 @@ mod tests {
             .expect("first partition is claimable");
         assert!(first.close().is_err());
         first
-            .seal(RuntimeFilterFinalDomain::new([1_u8], 7_i64))
+            .seal(final_domain_payload(7))
             .expect("first partition seals");
         first.close().expect("first partition closes");
         assert!(!completion.completed());
@@ -957,10 +1283,19 @@ mod tests {
             .claim_partition(PartitionId::new(1))
             .expect("second partition is claimable");
         second
-            .seal(RuntimeFilterFinalDomain::new([2_u8], 8_i64))
+            .seal(final_domain_payload(8))
             .expect("second partition seals");
         second.close().expect("second partition closes");
         assert!(completion.completed());
         assert!(completion.claim_partition(PartitionId::new(1)).is_err());
+    }
+
+    fn final_domain_payload(value: i64) -> RuntimeFilterFinalDomain {
+        let domain = contribution::ValueDomainDelta::new(
+            contribution::MembershipValues::int64([value]),
+            false,
+        );
+        RuntimeFilterFinalDomain::from_value_domain(&domain, [7; 32], 1024)
+            .expect("small final domain is canonical")
     }
 }

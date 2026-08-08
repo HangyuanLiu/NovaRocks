@@ -10,3 +10,4 @@ doctest = false
 arrow = { version = "58.2.0" }
 novarocks-types = { path = "../types" }
 novarocks-spi = { path = "../spi" }
+sha2 = "0.10"

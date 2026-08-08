@@ -2,9 +2,9 @@
 id: ADR-0041
 title: "Runtime filter scan-domain evaluation boundary"
 domain: [runtime-filter]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0042
 date: 2026-08-08
 provenance:
   - "PR: #842"
