@@ -33,7 +33,7 @@ use novarocks_spi::connector::{
     ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase,
     ConnectorStagedCreateReconcileOutcome, ConnectorStagedCreateReconcilePhase,
     ConnectorStagedCreateReconcileRequest, ConnectorStagedTableHandle,
-    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
+    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest, ConnectorTableHandle,
     ConnectorWriteOperationCompletion, CreatePolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization,
 };
@@ -629,9 +629,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     committer,
                 )?,
             );
-            let table =
-                crate::engine::iceberg_writer::iceberg_connector_table_handle(&target, "main")
-                    .map_err(internal)?;
+            // The staged target is intentionally invisible to ordinary
+            // metadata lookup. Its provider-owned staged handle is therefore
+            // the only valid opaque table carrier for this writer binding.
+            let table = ConnectorTableHandle::try_new(
+                self.descriptor.instance_id.clone(),
+                request.handle.provider_payload().clone(),
+            )?;
             let binding = ConnectorStagedWritePlanningBinding::try_new(
                 &request.handle,
                 request.operation_id,

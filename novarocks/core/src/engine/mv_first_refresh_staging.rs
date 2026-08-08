@@ -8,6 +8,7 @@
 //! MVX-2W exercises it through the native fixture; MVX-2 will make the route
 //! switch only after that fixture proves the data plane.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
 use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
@@ -133,6 +134,7 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
         execution,
         move |operation_id, observed_binding| {
             prepare_mv_first_refresh_sql_write(
+                state,
                 ctx,
                 shape,
                 physical_sql,
@@ -375,6 +377,7 @@ pub(crate) fn build_mv_first_refresh_sink_spec(
 /// lease, writer service, fragment or backend work.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_mv_first_refresh_sql_write(
+    state: &Arc<StandaloneState>,
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
     shape: MvFirstRefreshShape,
     physical_sql: MvFirstRefreshPhysicalSql,
@@ -388,8 +391,14 @@ pub(crate) fn prepare_mv_first_refresh_sql_write(
     ) {
         return Err("join first-refresh must use the typed append logical artifact".to_string());
     }
-    let request =
-        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
+    let request = mv_first_refresh_request(
+        state,
+        ctx,
+        shape,
+        staging_branch,
+        operation_id,
+        observed_binding,
+    )?;
     MvFirstRefreshWritePreparer::prepare(request, physical_sql)
 }
 
@@ -411,8 +420,14 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
     ) {
         return Err("typed first-refresh append artifact requires a join shape".to_string());
     }
-    let request =
-        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
+    let request = mv_first_refresh_request(
+        state,
+        ctx,
+        shape,
+        staging_branch,
+        operation_id,
+        observed_binding,
+    )?;
     MvFirstRefreshWritePreparer::prepare_join_logical(
         request,
         frozen_logical_context_with_base_overlays(state, ctx)?,
@@ -454,6 +469,7 @@ pub(crate) fn frozen_logical_context_with_base_overlays(
 
 #[allow(clippy::too_many_arguments)]
 fn mv_first_refresh_request(
+    state: &Arc<StandaloneState>,
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
     shape: MvFirstRefreshShape,
     staging_branch: &str,
@@ -522,8 +538,11 @@ fn mv_first_refresh_request(
         persisted_partition_spec_id,
         hidden_hash_key,
     )?;
-    let table =
-        crate::engine::iceberg_writer::iceberg_connector_table_handle(&target, staging_branch)?;
+    let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+        state,
+        &target,
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?,
+    )?;
     MvFirstRefreshWriteRequest::try_new(
         ctx.rewrite.canonical_select_query.to_string(),
         shape,

@@ -1217,6 +1217,7 @@ pub struct ConnectorWriteLease {
     binding_key: ConnectorExecutionBindingKey,
     control: Arc<dyn ConnectorWriteControl>,
     execution_distribution: Option<Arc<dyn ConnectorExecutionDistribution>>,
+    metadata: Option<Arc<dyn super::ConnectorMetadata>>,
     _release: Arc<ConnectorWriteLeaseRelease>,
 }
 
@@ -1240,6 +1241,7 @@ impl ConnectorWriteLease {
             binding_key,
             control,
             execution_distribution: None,
+            metadata: None,
             _release: Arc::new(ConnectorWriteLeaseRelease {
                 release: Mutex::new(Some(Box::new(release))),
             }),
@@ -1267,6 +1269,29 @@ impl ConnectorWriteLease {
 
     pub fn control(&self) -> &Arc<dyn ConnectorWriteControl> {
         &self.control
+    }
+
+    /// Retain metadata from the same control generation as this writer.
+    /// Only `ConnectorControlPlanningLease::derive_write_lease` supplies this
+    /// in production; standalone write-control tests may deliberately omit it.
+    pub fn with_metadata(mut self, metadata: Arc<dyn super::ConnectorMetadata>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Resolve an opaque write target through the metadata capability retained
+    /// from this exact generation. Core never constructs a table-handle payload.
+    pub fn load_table(
+        &self,
+        request: super::ConnectorTableRequest,
+    ) -> Result<super::ConnectorTableMetadata, ConnectorError> {
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector write lease has no exact-generation metadata capability",
+            )
+        })?;
+        metadata.load_table(request)
     }
 
     /// Materialize a declaration only through the exact generation held by

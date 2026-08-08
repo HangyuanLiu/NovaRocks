@@ -480,13 +480,14 @@ fn prepare_frontend_first_refresh_write(
         // artifact now so activation cannot resolve a later base generation.
         context.connector_context = Some(connector_context.clone());
         let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+            state,
             &crate::engine::backend_resolver::TargetBackend {
                 backend_name: "iceberg",
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
             },
-            &attempt.staging_branch,
+            connector_context.clone(),
         )?;
         let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
             definition.select_sql.clone(),
@@ -608,13 +609,14 @@ fn prepare_frontend_first_refresh_write(
         )
     };
     let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+        state,
         &crate::engine::backend_resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: target.catalog.clone(),
             namespace: target.namespace.clone(),
             table: target.table.clone(),
         },
-        &attempt.staging_branch,
+        connector_context.clone(),
     )?;
     let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
         definition.select_sql,

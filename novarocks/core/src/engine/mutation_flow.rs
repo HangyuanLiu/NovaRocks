@@ -735,6 +735,7 @@ pub(crate) fn stage_prepared_update_mutation(
             );
             let connector_write =
                 crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
+                    state,
                     &target,
                     &provider_binding,
                     operation_id,
@@ -2993,6 +2994,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         );
         let connector_write =
             crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
+                state,
                 &target,
                 &provider_binding,
                 operation_id,

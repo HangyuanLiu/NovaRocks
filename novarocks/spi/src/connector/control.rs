@@ -811,6 +811,7 @@ impl ConnectorControlPlanningLease {
         ConnectorWriteLease::new_with_execution_distribution(key, write, distribution, move || {
             drop(retained_planning_lease)
         })
+        .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
     }
 
     /// Derive a catalog-mutation lease from this retained planning generation.
