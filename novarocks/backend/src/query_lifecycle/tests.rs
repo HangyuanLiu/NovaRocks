@@ -1629,6 +1629,61 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
 }
 
 #[test]
+fn spi5b_local_failure_then_coordinator_abort_acknowledges_the_abort_command() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = registry_with(runtime, 8);
+    let expected = UniqueId::new(76, 3);
+    let request = fragment_init_request_fixture(76_003, &[expected]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    assert_eq!(
+        attachment.events.try_recv().expect("ControlReady event"),
+        QueryControlEvent::ControlReady
+    );
+    registry
+        .admit_fragment(execution_id, expected)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+    registry.record_fragment_terminal(
+        execution_id,
+        expected,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "pipeline worker failed",
+        )),
+    );
+    assert!(matches!(
+        attachment.events.try_recv().expect("LocalFailure event"),
+        QueryControlEvent::LocalFailure { .. }
+    ));
+
+    attachment
+        .control
+        .abort("coordinator observes local failure".to_string())
+        .expect("coordinator abort is accepted");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match attachment.events.try_recv() {
+            Ok(QueryControlEvent::TerminationAccepted { reason }) => {
+                assert_eq!(reason, QueryTerminationReason::CoordinatorAbort);
+                return;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("coordinator abort acknowledgement was not delivered: {error}"),
+        }
+    }
+}
+
+#[test]
 fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);

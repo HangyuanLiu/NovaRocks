@@ -1839,12 +1839,23 @@ impl QueryLifecycleRegistry {
         if let Some((reason, events)) = already_terminated {
             // A LocalFailure consumes the reserved terminal event permit to
             // publish its cause.  A later coordinator Abort still needs an
-            // acknowledgement so FE cleanup can keep the stream alive for
-            // the drained immutable snapshot.
+            // Abort acknowledgement so FE cleanup can keep the stream alive
+            // for the drained immutable snapshot. The entry's immutable
+            // LocalFailure remains the termination fact; the control reply
+            // acknowledges the command that FE is waiting on.
             if terminal_event.is_none()
                 && let Some(events) = events
             {
-                let _ = events.try_send(QueryControlEvent::TerminationAccepted { reason });
+                let acknowledgement = match (reason, requested_reason) {
+                    (
+                        QueryTerminationReason::LocalFailure,
+                        QueryTerminationReason::CoordinatorAbort,
+                    ) => QueryTerminationReason::CoordinatorAbort,
+                    _ => reason,
+                };
+                let _ = events.try_send(QueryControlEvent::TerminationAccepted {
+                    reason: acknowledgement,
+                });
             }
             return reason;
         }
