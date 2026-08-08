@@ -7248,6 +7248,68 @@ mod tests {
     }
 
     #[test]
+    fn spi5b_frozen_read_handle_keeps_an_explicit_empty_or_subset_file_set() {
+        let lease = fixture_planning_lease("test_catalog");
+        let owner = lease.binding().descriptor().instance_id.clone();
+        let table = IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            table_uuid: Some("uuid".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/orders".to_string(),
+            schema: IcebergSchemaDef { fields: Vec::new() },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        };
+        let read_table = ConnectorTableHandle::try_new(
+            owner,
+            encode_payload(
+                &TablePayload {
+                    namespace: "db".to_string(),
+                    table: "orders".to_string(),
+                    table_info: Some(table.clone()),
+                    metadata_columns: Vec::new(),
+                    metadata_table_type: None,
+                    prepared_files: Vec::new(),
+                    explicit_files: None,
+                    logical_type_columns: BTreeMap::new(),
+                    hidden_columns: Vec::new(),
+                    frozen_rewrite: None,
+                },
+                "test table",
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            )
+            .expect("encode table"),
+        )
+        .expect("table handle");
+        let materialization = IcebergQueryTableMaterialization {
+            table_name: "orders".to_string(),
+            schema_id: Some(1),
+            columns: Vec::new(),
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            read_table,
+            read_schema: Arc::new(Schema::empty()),
+            read_selector: ConnectorReadSelector::Current,
+            table,
+            files: Vec::new(),
+            binding: IcebergDataFileBinding::CurrentSnapshot,
+            statistics_pin: None,
+            planning_lease: lease,
+        };
+        let frozen = materialization
+            .with_frozen_files(Vec::new(), ConnectorReadSelector::SnapshotId(7))
+            .expect("freeze empty target read");
+        assert_eq!(frozen.read_selector, ConnectorReadSelector::SnapshotId(7));
+        let payload: TablePayload = decode_payload(frozen.read_table.payload(), "frozen table")
+            .expect("decode frozen provider handle");
+        assert!(payload.explicit_files.is_some());
+        assert_eq!(payload.explicit_files.as_ref().map(Vec::len), Some(0));
+        assert!(payload.prepared_files.is_empty());
+    }
+
+    #[test]
     fn variant_partition_validation_is_known_uncommitted() {
         let error = map_iceberg_error(
             "iceberg table column `v` is variant; variant columns cannot appear in the partition spec"
