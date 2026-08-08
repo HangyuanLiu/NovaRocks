@@ -6782,53 +6782,6 @@ fn sql_metadata_table_kind(
     }
 }
 
-pub(crate) fn plan_scan_files(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
-    explicit_files: &[IcebergDataFileInfo],
-    projection: &[usize],
-) -> Result<Vec<IcebergDataFileInfo>, String> {
-    // Schema metadata does not carry data-file planning results.  A
-    // time-travel table therefore has an ExplicitFiles binding with an empty
-    // placeholder here; it must still ask the provider to enumerate the
-    // table's already-pinned snapshot rather than treating that placeholder
-    // as an explicitly empty scan.
-    let file_override = (!matches!(
-        binding,
-        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-    ) || !explicit_files.is_empty())
-    .then_some(explicit_files);
-    let planned = plan_native_iceberg_read_with_file_override(
-        controls,
-        context,
-        table,
-        binding,
-        file_override,
-        projection,
-        Vec::new(),
-        NonZeroUsize::new(1).expect("metadata file enumeration parallelism is nonzero"),
-        None,
-    )?;
-    planned
-        .splits
-        .iter()
-        .map(|split| {
-            decode_payload::<SplitPayload>(split.payload(), "split")
-                .map(|payload| {
-                    payload
-                        .units
-                        .into_iter()
-                        .map(|unit| unit.data_file)
-                        .collect::<Vec<_>>()
-                })
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|groups| groups.into_iter().flatten().collect())
-}
-
 #[cfg(test)]
 pub(crate) fn planned_split_data_file_for_test(
     split: &ConnectorSplit,
@@ -6848,35 +6801,6 @@ pub(crate) fn planned_split_data_file_for_test(
                 })
         })
         .map_err(|error| error.to_string())
-}
-
-/// Fully plans an Iceberg read through its real connector instance.  The
-/// returned scan handle and splits are provider-owned bytes; callers may only
-/// schedule and carry them.  This is intentionally separate from range
-/// planning so native execution never reconstructs an Iceberg file scan in
-/// core.
-pub(crate) fn plan_native_iceberg_read(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
-    explicit_files: &[IcebergDataFileInfo],
-    projection: &[usize],
-    static_predicates: Vec<ConnectorStaticPredicate>,
-    target_parallelism: NonZeroUsize,
-    max_split_bytes: Option<NonZeroU64>,
-) -> Result<PlannedIcebergConnectorRead, String> {
-    plan_native_iceberg_read_with_file_override(
-        controls,
-        context,
-        table,
-        binding,
-        Some(explicit_files),
-        projection,
-        static_predicates,
-        target_parallelism,
-        max_split_bytes,
-    )
 }
 
 /// Plans an Iceberg read against a control generation selected during query
@@ -6900,35 +6824,6 @@ pub(crate) fn plan_native_iceberg_read_with_lease(
         table,
         binding,
         Some(explicit_files),
-        projection,
-        static_predicates,
-        target_parallelism,
-        max_split_bytes,
-    )
-}
-
-fn plan_native_iceberg_read_with_file_override(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
-    explicit_files: Option<&[IcebergDataFileInfo]>,
-    projection: &[usize],
-    static_predicates: Vec<ConnectorStaticPredicate>,
-    target_parallelism: NonZeroUsize,
-    max_split_bytes: Option<NonZeroU64>,
-) -> Result<PlannedIcebergConnectorRead, String> {
-    let instance_id =
-        ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
-    let lease = controls
-        .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())?;
-    plan_native_iceberg_read_with_bound_lease(
-        lease,
-        context,
-        table,
-        binding,
-        explicit_files,
         projection,
         static_predicates,
         target_parallelism,
@@ -7060,31 +6955,6 @@ fn plan_native_iceberg_read_with_bound_lease(
 /// Plan snapshot-delta physical reads as ordinary opaque Iceberg connector
 /// splits.  Delta retains its logical planner identity; no native carrier or
 /// core scan operator receives a role-specific file/deletion payload.
-pub(crate) fn plan_native_iceberg_delta_read(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    sources: &[novarocks_connector_iceberg::delta::DeltaSourceFile],
-    delete_side: Option<&novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
-    target_parallelism: NonZeroUsize,
-    max_split_bytes: Option<NonZeroU64>,
-) -> Result<PlannedIcebergConnectorRead, String> {
-    let instance_id =
-        ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
-    let lease = controls
-        .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())?;
-    plan_native_iceberg_delta_read_with_lease(
-        lease,
-        context,
-        table,
-        sources,
-        delete_side,
-        target_parallelism,
-        max_split_bytes,
-    )
-}
-
 /// Equivalent to [`plan_native_iceberg_delta_read`] but uses the exact
 /// metadata lease already retained by the query binding store.
 pub(crate) fn plan_native_iceberg_delta_read_with_lease(
