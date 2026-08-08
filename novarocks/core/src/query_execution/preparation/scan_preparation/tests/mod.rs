@@ -27,7 +27,7 @@ use arrow::datatypes::DataType;
 
 use crate::connector::ConnectorRegistry;
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergFileScan, ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
+    ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
@@ -116,6 +116,17 @@ fn fixture_query_table_bindings_with_materialized_files(
         })
         .expect("shared fixture plan must have a root scan");
     let ScanSource::Sql(source) = &scan.table.source;
+    let store = QueryTableBindingStore::try_new_with_scope_for_test(
+        NonZeroU64::new(1).expect("fixture scope"),
+    );
+    if matches!(
+        source.kind,
+        SqlScanKind::ConnectorRead | SqlScanKind::Delta { .. }
+    ) {
+        // These source kinds are supplied by their dedicated resolver tests;
+        // no catalog admission is expected before resolver dispatch.
+        return store;
+    }
     let planning_lease = controls
         .acquire_current(
             &ConnectorInstanceId::parse(&source.table.catalog)
@@ -125,9 +136,6 @@ fn fixture_query_table_bindings_with_materialized_files(
     let source = source.clone();
     let planner = scan.table.clone();
 
-    let store = QueryTableBindingStore::try_new_with_scope_for_test(
-        NonZeroU64::new(1).expect("fixture scope"),
-    );
     store
         .resolve_or_insert_with_id(
             QueryTableBindingKey::strict_base(
@@ -466,14 +474,6 @@ fn recording_registry(
     (registry, seen_projections)
 }
 
-fn resolved_files(files: Vec<IcebergDataFileInfo>) -> ResolvedScanExecution {
-    ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-        table: iceberg_table(),
-        files,
-        binding: IcebergDataFileBinding::ExplicitFiles,
-    })
-}
-
 fn resolved_delta() -> ResolvedScanExecution {
     ResolvedScanExecution::IcebergDelta(
         crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
@@ -490,7 +490,6 @@ fn resolved_delta() -> ResolvedScanExecution {
 fn resolved_data_delta() -> ResolvedScanExecution {
     let mut delta = match resolved_delta() {
         ResolvedScanExecution::IcebergDelta(delta) => delta,
-        ResolvedScanExecution::IcebergFiles(_) => unreachable!("fixture is delta"),
         ResolvedScanExecution::ConnectorRead => unreachable!("fixture is delta"),
         ResolvedScanExecution::AdmittedConnectorRead(_) => unreachable!("fixture is delta"),
     };

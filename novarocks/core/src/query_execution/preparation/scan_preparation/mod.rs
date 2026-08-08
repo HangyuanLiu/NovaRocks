@@ -17,8 +17,7 @@
 
 use crate::engine::query_planning::bindings::{QueryScanMaterialization, QueryTableBindingStore};
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergFileScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
-    ScanExecutionBindings,
+    ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
@@ -31,9 +30,7 @@ mod projection;
 mod pruning;
 mod static_predicate;
 
-use iceberg::{
-    plan_connector_read, plan_iceberg_connector_read, plan_iceberg_delta_connector_read,
-};
+use iceberg::{plan_connector_read, plan_iceberg_delta_connector_read};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
 use static_predicate::lower_static_connector_predicates;
 
@@ -337,43 +334,6 @@ fn prepare_scan_node(
             .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             (Vec::new(), Vec::new(), Some(planned))
         }
-        ResolvedScanExecution::IcebergFiles(files) => {
-            // Design: ADR-0018 (docs/adr/ADR-0018-static-connector-predicate-disposition.md)
-            let static_predicates = options
-                .enable_connector_static_predicate_pushdown
-                .then(|| {
-                    let connector_schema_fields = files
-                        .table
-                        .schema
-                        .fields
-                        .iter()
-                        .map(|field| field.name.as_str())
-                        .collect::<Vec<_>>();
-                    lower_static_connector_predicates(scan, &connector_schema_fields)
-                })
-                .unwrap_or_default();
-            let query_table_bindings = query_table_bindings.ok_or_else(|| {
-                format!(
-                    "Iceberg file scan node_id={node_id} has no query-local binding store with an exact planning lease"
-                )
-            })?;
-            let exact_lease =
-                exact_query_binding_lease_for_source(query_table_bindings, &scan.table.source)?;
-            let planned = plan_iceberg_connector_read(
-                exact_lease,
-                context.clone(),
-                scan,
-                &execution,
-                static_predicates,
-                options.connector_target_parallelism,
-                options.connector_max_split_bytes,
-            )
-            .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
-            // The provider reader projects physical equality keys internally
-            // and drops them before delivery. Core therefore never owns a
-            // hidden Iceberg delete column or file range.
-            (Vec::new(), Vec::new(), Some(planned))
-        }
         ResolvedScanExecution::IcebergDelta(_) => {
             let ScanSource::Sql(source) = &scan.table.source;
             if !matches!(
@@ -657,19 +617,11 @@ fn validate_resolved_execution_kind(
             }
             crate::sql::planner::table::SqlScanKind::Data { .. }
             | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
-                matches!(
-                    execution,
-                    ResolvedScanExecution::IcebergFiles(_)
-                        | ResolvedScanExecution::AdmittedConnectorRead(_)
-                )
+                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
             }
             crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
             | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
-                matches!(
-                    execution,
-                    ResolvedScanExecution::IcebergFiles(_)
-                        | ResolvedScanExecution::AdmittedConnectorRead(_)
-                )
+                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
             }
             crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
                 matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
@@ -686,11 +638,11 @@ fn validate_resolved_execution_kind(
             crate::sql::planner::table::SqlScanKind::Metadata { .. } => "AdmittedConnectorRead",
             crate::sql::planner::table::SqlScanKind::Data { .. }
             | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
-                "IcebergFiles or AdmittedConnectorRead"
+                "AdmittedConnectorRead"
             }
             crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
             | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
-                "IcebergFiles or AdmittedConnectorRead"
+                "AdmittedConnectorRead"
             }
         },
     };
@@ -716,22 +668,10 @@ fn reject_target_equality_deletes(
         }) => "target-locator",
         _ => return Ok(()),
     };
-    let ResolvedScanExecution::IcebergFiles(files) = execution else {
-        // Query-local neutral reads are deliberately opaque to Core. The
-        // provider validates any delete visibility encoded in the handle
-        // while planning its split set.
-        return Ok(());
-    };
-    if files.files.iter().any(|file| {
-        file.delete_files.iter().any(|delete| {
-            delete.file_content
-                == novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality
-        })
-    }) {
-        return Err(format!(
-            "Iceberg {target_kind} scan node_id={node_id} does not support equality deletes yet"
-        ));
-    }
+    // Query-local neutral reads are deliberately opaque to Core. The provider
+    // validates delete visibility encoded in the admitted handle while
+    // planning its split set.
+    let _ = (node_id, target_kind, execution);
     Ok(())
 }
 

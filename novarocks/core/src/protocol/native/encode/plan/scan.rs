@@ -590,8 +590,7 @@ fn scan_binding_for_source<'a>(
             | table_model::SqlScanKind::MvTargetLocator { .. } => {
                 matches!(
                     binding.execution,
-                    ResolvedScanExecution::IcebergFiles(_)
-                        | ResolvedScanExecution::AdmittedConnectorRead(_)
+                    ResolvedScanExecution::AdmittedConnectorRead(_)
                 )
             }
             table_model::SqlScanKind::Metadata { .. } => {
@@ -630,7 +629,6 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
     match execution {
         ResolvedScanExecution::ConnectorRead => "ConnectorRead",
         ResolvedScanExecution::AdmittedConnectorRead(_) => "AdmittedConnectorRead",
-        ResolvedScanExecution::IcebergFiles(_) => "IcebergFiles",
         ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
     }
 }
@@ -678,7 +676,7 @@ fn encode_scan_source(
                     scan_output_columns.unwrap_or_default(),
                     scan_analysis_columns.unwrap_or_default(),
                     scan_required_columns.unwrap_or_default(),
-                    iceberg_schema_for_connector_source(binding),
+                    None,
                     scan_variant_columns,
                     binding,
                 )?,
@@ -741,15 +739,6 @@ fn encode_scan_source(
             },
         }),
     })
-}
-
-fn iceberg_schema_for_connector_source(
-    binding: Option<&ResolvedScanBinding>,
-) -> Option<&iceberg_scan_model::IcebergSchemaDef> {
-    match binding.map(|binding| &binding.execution) {
-        Some(ResolvedScanExecution::IcebergFiles(files)) => Some(&files.table.schema),
-        _ => None,
-    }
 }
 
 fn encode_connector_expected_schema_ipc(

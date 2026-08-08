@@ -31,9 +31,6 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
-};
 
 pub(crate) use super::iceberg_delta::IcebergDeltaScanRuntimePlan;
 
@@ -64,15 +61,7 @@ pub(crate) enum ResolvedScanExecution {
     /// A query-local opaque read admission.  Core may inspect only its SPI
     /// schema and selector while preparation asks the exact lease to plan it.
     AdmittedConnectorRead(QueryScanMaterialization),
-    IcebergFiles(ResolvedIcebergFileScan),
     IcebergDelta(ResolvedIcebergDeltaScan),
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedIcebergFileScan {
-    pub table: IcebergTableInfo,
-    pub files: Vec<IcebergDataFileInfo>,
-    pub binding: IcebergDataFileBinding,
 }
 
 #[derive(Clone, Debug)]

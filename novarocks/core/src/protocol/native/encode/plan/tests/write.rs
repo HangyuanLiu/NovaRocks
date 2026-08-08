@@ -33,8 +33,8 @@ use super::super::scan::encode_column_def;
 use super::super::write::encode_change_stream_router_sink;
 use super::*;
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
-    ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
+    ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumn,
+    ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
@@ -86,9 +86,9 @@ fn planned_connector_read_for_test(
     }
 }
 
-fn encode_scan_node_with_file_binding(
+fn encode_scan_node_with_admitted_read(
     scan: &DistributedNode,
-    table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    _table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     column_name: &str,
     data_type: DataType,
     nullable: bool,
@@ -107,12 +107,9 @@ fn encode_scan_node_with_file_binding(
     let mut bindings = ScanExecutionBindings::default();
     bindings.insert_binding(ResolvedScanBinding {
         node_id: scan.node_id,
-        execution: ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-            table,
-            files: Vec::new(),
-            binding:
-                novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-        }),
+        execution: ResolvedScanExecution::AdmittedConnectorRead(
+            crate::connector::iceberg::provider::fixture_query_scan_materialization("ice"),
+        ),
         physical_columns: vec![ResolvedScanColumn {
             planner: OutputColumn {
                 column_id: ColumnId::new_for_test(10),
@@ -658,7 +655,7 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
         ),
     };
 
-    let encoded = encode_scan_node_with_file_binding(
+    let encoded = encode_scan_node_with_admitted_read(
         &scan,
         iceberg_table,
         "amount",
@@ -738,7 +735,7 @@ fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata
         ),
     };
 
-    let encoded = encode_scan_node_with_file_binding(
+    let encoded = encode_scan_node_with_admitted_read(
         &scan,
         iceberg_table_for_write_default_test("tags"),
         "tags",

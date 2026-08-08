@@ -43,14 +43,10 @@ fn version_scan_without_required_columns_rejects_unmaterializable_planner_output
     );
     let plan = plan(root);
     let before = format!("{plan:#?}");
-    let resolver = StaticResolver {
-        execution: resolved_files(vec![data_file("s3://bucket/version-6.parquet")]),
-    };
-
     let error = match prepare_scan_bindings(
         &plan,
         &registry(vec![data_file("s3://bucket/version-6.parquet")]),
-        Some(&resolver),
+        None,
     ) {
         Ok(_) => panic!("unmaterializable planner column must fail before submission"),
         Err(error) => error,
@@ -99,14 +95,10 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
             },
         },
     );
-    let resolver = StaticResolver {
-        execution: resolved_files(vec![data_file("s3://bucket/target-6.parquet")]),
-    };
-
     let (registry, seen_column_names) =
         recording_registry(vec![data_file("s3://bucket/target-6.parquet")]);
-    let bindings = prepare_scan_bindings(&plan(root), &registry, Some(&resolver))
-        .expect("prepare target locator scan");
+    let bindings =
+        prepare_scan_bindings(&plan(root), &registry, None).expect("prepare target locator scan");
     let binding = bindings.binding(37).expect("binding");
     let physical = &binding.physical_columns;
 
@@ -143,7 +135,7 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
             .expect("seen column names lock")
             .last()
             .cloned(),
-        Some(vec![0])
+        Some(vec![0, 6, 7, 8, 9])
     );
 }
 
@@ -198,14 +190,10 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
             },
         },
     );
-    let resolver = StaticResolver {
-        execution: resolved_files(vec![data_file("s3://bucket/target-state-6.parquet")]),
-    };
-
     let bindings = prepare_scan_bindings(
         &plan(root),
         &registry(vec![data_file("s3://bucket/target-state-6.parquet")]),
-        Some(&resolver),
+        None,
     )
     .expect("prepare target-state scan");
     let physical = &bindings.binding(38).expect("binding").physical_columns;
@@ -319,7 +307,7 @@ fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
             .expect("seen column names lock")
             .last()
             .cloned(),
-        Some(vec![0])
+        Some(vec![2])
     );
 }
 

@@ -17,8 +17,8 @@
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorReadPurpose, ConnectorReadSelector,
-    ConnectorSplitPlanningRequest, ConnectorStaticPredicate, normalize_predicate_dispositions,
+    ConnectorPredicateDispositionKind, ConnectorReadPurpose, ConnectorSplitPlanningRequest,
+    ConnectorStaticPredicate, normalize_predicate_dispositions,
 };
 
 use crate::engine::query_planning::bindings::QueryScanMaterialization;
@@ -28,77 +28,6 @@ use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
 
 use super::projection::effective_scan_column_names;
-
-/// Plans executable opaque splits through the real Iceberg connector instance.
-/// Native scheduling owns only the resulting SPI identities and byte-size
-/// hints; it must not lower these splits back into `FileScanRange`.
-pub(super) fn plan_iceberg_connector_read(
-    exact_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    scan: &PlanScanNode,
-    execution: &ResolvedScanExecution,
-    static_predicates: Vec<ConnectorStaticPredicate>,
-    target_parallelism: std::num::NonZeroUsize,
-    max_split_bytes: Option<std::num::NonZeroU64>,
-) -> Result<PlannedConnectorRead, String> {
-    let ResolvedScanExecution::IcebergFiles(files) = execution else {
-        return Err("Iceberg connector planning requires IcebergFiles execution".to_string());
-    };
-    let requested_projection = effective_scan_column_names(scan)
-        .iter()
-        .filter_map(|name| {
-            files
-                .table
-                .schema
-                .fields
-                .iter()
-                .position(|field| field.name.eq_ignore_ascii_case(name))
-        })
-        .collect::<Vec<_>>();
-    // The connector treats an empty projection as all provider fields.  Make
-    // that implicit choice explicit before sealing the read so every output
-    // field has a stable ordinal for scan-domain evaluation.
-    let projection = if requested_projection.is_empty() {
-        (0..files.table.schema.fields.len()).collect()
-    } else {
-        requested_projection
-    };
-    let planned = crate::connector::iceberg::provider::plan_native_iceberg_read_with_lease(
-        exact_lease,
-        context,
-        &files.table,
-        files.binding,
-        &files.files,
-        &projection,
-        static_predicates.clone(),
-        target_parallelism,
-        max_split_bytes,
-    )?;
-    let predicate_dispositions =
-        normalize_predicate_dispositions(&static_predicates, &planned.scan.predicate_dispositions)
-            .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
-    let residual_predicates = residual_predicates(&scan.predicates, &predicate_dispositions)?;
-    let provider_field_ordinals = projection
-        .into_iter()
-        .map(|ordinal| {
-            u32::try_from(ordinal)
-                .map_err(|_| "Iceberg provider field ordinal does not fit u32".to_string())
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(PlannedConnectorRead {
-        declaration: planned.declaration,
-        scan: planned.scan,
-        provider_field_ordinals,
-        splits: planned.splits,
-        planning_metrics: planned.planning_metrics,
-        static_predicates,
-        predicate_dispositions,
-        residual_predicates,
-        batch: planned.batch,
-        planning_lease: planned.planning_lease,
-        read_session: None,
-    })
-}
 
 /// Plan an admitted connector read without decoding or reconstructing a
 /// provider handle.  Projection ordinals are derived exclusively from the

@@ -8632,6 +8632,37 @@ pub(crate) fn fixture_planning_lease(
     )
 }
 
+/// A provider-produced neutral admission fixture for Core protocol tests.
+/// Tests may choose a synthetic scan shape, but they must not manufacture an
+/// Iceberg data-file carrier or a provider table handle in Core.
+#[cfg(test)]
+pub(crate) fn fixture_query_scan_materialization(
+    catalog: &str,
+) -> crate::engine::query_planning::bindings::QueryScanMaterialization {
+    let planning_lease = fixture_planning_lease(catalog);
+    let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture connector instance ID");
+    let metadata = planning_lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: crate::connector::test_request_context(),
+        })
+        .expect("fixture connector read admission");
+    crate::engine::query_planning::bindings::QueryScanMaterialization {
+        table: metadata.table,
+        schema: metadata.schema,
+        selector: ConnectorReadSelector::Current,
+        statistics_pin: None,
+        planning_lease,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn register_planned_table_files_control_fixture(
     controls: &dyn novarocks_spi::connector::ConnectorControlRegistry,
@@ -8659,6 +8690,8 @@ fn planned_table_files_fixture_binding(
             Field::new("id", DataType::Int32, false),
             Field::new("category", DataType::Utf8, true),
             Field::new("v", DataType::LargeBinary, false),
+            Field::new("agg", DataType::Binary, true),
+            Field::new("extra", DataType::Utf8, true),
             Field::new("__nova_join_row_key", DataType::Utf8, false),
             Field::new("_file", DataType::Utf8, false),
             Field::new("_pos", DataType::Int64, false),

@@ -757,15 +757,11 @@ fn target_state_and_locator_reject_equality_deletes() {
         scan.table.source = source;
         let mut file = data_file("s3://bucket/target-data.parquet");
         file.delete_files = vec![equality_delete_file(Vec::new(), vec![3])];
-        let resolver = StaticResolver {
-            execution: resolved_files(vec![file.clone()]),
-        };
-
         let controls = crate::connector::FixtureControlResolver::new(registry(vec![file.clone()]));
         let err = match prepare_scan_bindings_with_materialized_files(
             &plan(root),
             &controls,
-            Some(&resolver),
+            None,
             vec![file],
         ) {
             Ok(_) => panic!("{expected_kind} equality-delete scan must fail"),
