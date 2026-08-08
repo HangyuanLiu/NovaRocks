@@ -880,6 +880,7 @@ pub type RuntimeFilterFinalDomainPartitionHandle = Box<dyn RuntimeFilterFinalDom
 pub trait RuntimeFilterFinalDomainCompletion: Send + Sync {
     fn membership_key_type(&self) -> DataType;
     fn max_domain_canonical_bytes(&self) -> usize;
+    fn contract_digest(&self) -> [u8; 32];
     fn claim_partition(
         &self,
         partition: PartitionId,
@@ -1099,6 +1100,10 @@ mod tests {
 
         fn max_domain_canonical_bytes(&self) -> usize {
             1024
+        }
+
+        fn contract_digest(&self) -> [u8; 32] {
+            [0; 32]
         }
 
         fn claim_partition(

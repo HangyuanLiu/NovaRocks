@@ -83,6 +83,7 @@ pub struct AggregateFinalDomainSessionBuilder {
     declared_dop: i32,
     installed_membership_key_type: DataType,
     max_domain_canonical_bytes: usize,
+    contract_digest: [u8; 32],
     #[cfg(test)]
     partition_observer: Option<AggregateFinalDomainPartitionObserver>,
 }
@@ -95,6 +96,7 @@ struct AggregateFinalDomainPartitionCommitter {
     #[cfg(test)]
     partition_id: PartitionId,
     committer: execution::RuntimeFilterFinalDomainPartitionHandle,
+    contract_digest: [u8; 32],
 }
 
 impl AggregateFinalDomainSessionBuilder {
@@ -127,11 +129,13 @@ impl AggregateFinalDomainSessionBuilder {
             );
         }
         let installed_membership_key_type = completion.membership_key_type();
+        let contract_digest = completion.contract_digest();
         Ok(Self {
             completion,
             declared_dop,
             installed_membership_key_type,
             max_domain_canonical_bytes,
+            contract_digest,
             #[cfg(test)]
             partition_observer: None,
         })
@@ -178,6 +182,7 @@ impl AggregateFinalDomainSessionBuilder {
             #[cfg(test)]
             partition_id,
             committer,
+            contract_digest: self.contract_digest,
         })
     }
 
@@ -477,7 +482,7 @@ impl AggregateProcessorFactory {
             let session = runtime_filter_session.ok_or_else(|| {
                 format!(
                     "native aggregate TopN producer binding_id={} requires an execution runtime-filter session",
-                    topn_producers[0].binding_id
+                    topn_producers[0].binding_id()
                 )
             })?;
             Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(
@@ -1225,7 +1230,11 @@ impl AggregateProcessorOperator {
             .expect("checked aggregate final-domain committer");
         #[cfg(test)]
         let observed_domain = domain.clone();
-        let domain = final_domain_payload(domain)?;
+        let domain = final_domain_payload(
+            domain,
+            partition.contract_digest,
+            max_domain_canonical_bytes,
+        )?;
         if let Err(error) = partition.committer.seal(domain) {
             if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed {
                 return Ok(());
@@ -1864,6 +1873,10 @@ mod tests {
 
         fn max_domain_canonical_bytes(&self) -> usize {
             self.max_domain_canonical_bytes
+        }
+
+        fn contract_digest(&self) -> [u8; 32] {
+            [0; 32]
         }
 
         fn claim_partition(

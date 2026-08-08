@@ -82,13 +82,13 @@ impl ScanSourceFactory {
         let mut ordered_live_specs = Vec::new();
         let mut seen_bindings = HashSet::new();
         for spec in scan.native_runtime_filter_specs() {
-            if !seen_bindings.insert(spec.binding_id) {
+            if !seen_bindings.insert(spec.binding_id()) {
                 return Err(format!(
                     "duplicate native scan runtime-filter consumer binding_id={}",
-                    spec.binding_id
+                    spec.binding_id()
                 ));
             }
-            match &spec.contract {
+            match spec.execution_contract() {
                 crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership {
                     ..
                 } => membership_specs.push(spec.clone()),

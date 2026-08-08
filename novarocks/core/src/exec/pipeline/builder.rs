@@ -693,7 +693,7 @@ fn native_aggregate_topn_session(
     let Some(spec) = specs.first() else {
         return Ok(None);
     };
-    runtime_filter_session(runtime_filter_execution, spec.binding_id)
+    runtime_filter_session(runtime_filter_execution, spec.binding_id())
         .cloned()
         .map(Some)
 }
@@ -703,7 +703,7 @@ fn validate_native_producer_specs(
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
     if let Some(spec) = specs.first() {
-        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id())?;
     }
     Ok(())
 }
@@ -713,16 +713,13 @@ fn validate_native_aggregate_topn_specs(
     group_by: &[ExprId],
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
-    let expected_contributions = std::collections::BTreeSet::from([
-        crate::runtime_filter::model::contract::ContributionKind::OrderedBoundUpdate,
-        crate::runtime_filter::model::contract::ContributionKind::ProducerClosed,
-    ]);
     let mut seen = std::collections::BTreeSet::new();
     for spec in specs {
-        if !seen.insert((spec.binding_id, spec.group_key_ordinal)) {
+        if !seen.insert((spec.binding_id(), spec.group_key_ordinal)) {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} duplicates group key ordinal={}",
-                spec.binding_id, spec.group_key_ordinal
+                spec.binding_id(),
+                spec.group_key_ordinal
             ));
         }
     }
@@ -730,7 +727,7 @@ fn validate_native_aggregate_topn_specs(
         let expected_expr = group_by.get(spec.group_key_ordinal).ok_or_else(|| {
             format!(
                 "native aggregate TopN producer binding_id={} targets missing group key ordinal={}, key_count={}",
-                spec.binding_id,
+                spec.binding_id(),
                 spec.group_key_ordinal,
                 group_by.len()
             )
@@ -738,50 +735,44 @@ fn validate_native_aggregate_topn_specs(
         if *expected_expr != spec.group_key_expr_id {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} expression does not match group key ordinal={}",
-                spec.binding_id, spec.group_key_ordinal
+                spec.binding_id(),
+                spec.group_key_ordinal
             ));
         }
         let group_key_type = ctx.arena.data_type(spec.group_key_expr_id).ok_or_else(|| {
             format!(
                 "native aggregate TopN producer binding_id={} group key expression has no type",
-                spec.binding_id
+                spec.binding_id()
             )
         })?;
-        let RuntimeFilterExecutionContract::Ordered { keys, .. } = &spec.contract else {
+        let RuntimeFilterExecutionContract::Ordered { keys, .. } = spec.contract().contract()
+        else {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} requires an ordered contract",
-                spec.binding_id
+                spec.binding_id()
             ));
         };
         if keys.len() != 1 || keys[0].data_type() != group_key_type {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} ordered contract must contain exactly one key matching group key type={group_key_type:?}",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
-        if spec.reduction != RuntimeFilterExecutionReduction::TightenOrderedBound {
+        if spec.contract().reduction() != execution::RuntimeFilterReduction::TightenOrderedBound {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} requires TightenOrderedBound reduction",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
-        if spec.contribution_kinds != expected_contributions {
-            return Err(format!(
-                "native aggregate TopN producer binding_id={} contribution kinds must be exactly OrderedBoundUpdate and ProducerClosed",
-                spec.binding_id
-            ));
-        }
-        if spec.completion_requirement
-            != crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
-        {
+        if spec.contract().completion() != execution::RuntimeFilterCompletion::ProducerClosed {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} completion must be ProducerClosed",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
     }
     if let Some(spec) = specs.first() {
-        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id())?;
     }
     Ok(())
 }
@@ -828,7 +819,7 @@ fn resolve_aggregate_topn_producer_site_if_present(
 ) -> Result<Option<AggregateTopNProducerSite>, String> {
     specs
         .first()
-        .map(|spec| resolve_aggregate_topn_producer_site(spec.binding_id, candidates))
+        .map(|spec| resolve_aggregate_topn_producer_site(spec.binding_id(), candidates))
         .transpose()
 }
 
@@ -855,7 +846,7 @@ fn native_join_producer_factory(
         return Ok(None);
     }
     let session =
-        runtime_filter_session(&ctx.runtime_filter_execution, specs[0].binding_id)?.clone();
+        runtime_filter_session(&ctx.runtime_filter_execution, specs[0].binding_id())?.clone();
     Ok(Some(Arc::new(
         NativeRuntimeFilterProducerFactory::from_plan(
             specs,
@@ -873,7 +864,7 @@ fn validate_native_consumer_specs(
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
     if let Some(spec) = specs.first() {
-        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id())?;
     }
     Ok(())
 }

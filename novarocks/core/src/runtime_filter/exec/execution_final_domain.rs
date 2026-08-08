@@ -25,10 +25,18 @@ use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 /// helper receives an issuance authority.
 pub fn final_domain_payload(
     domain: ValueDomainDelta,
+    contract_digest: [u8; 32],
+    max_canonical_bytes: usize,
 ) -> Result<execution::RuntimeFilterFinalDomain, String> {
     let mut canonical = Vec::new();
     domain
         .encode_canonical_into(&mut canonical)
         .map_err(|error| error.to_string())?;
-    Ok(execution::RuntimeFilterFinalDomain::new(canonical, domain))
+    execution::RuntimeFilterFinalDomain::from_canonical(
+        canonical,
+        domain.data_type(),
+        contract_digest,
+        max_canonical_bytes,
+    )
+    .map_err(|error| error.to_string())
 }

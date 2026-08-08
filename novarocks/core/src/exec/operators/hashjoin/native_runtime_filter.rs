@@ -123,7 +123,7 @@ impl NativeMembershipProducerBinding {
         let build_expr = build_keys.get(spec.build_key_index).ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} join key ordinal {} is out of bounds for {} build keys",
-                spec.binding_id,
+                spec.binding_id(),
                 spec.build_key_index,
                 build_keys.len()
             )
@@ -131,13 +131,14 @@ impl NativeMembershipProducerBinding {
         if *build_expr != spec.build_expr_id {
             return Err(format!(
                 "native runtime-filter binding_id={} build expression does not match join key ordinal {}",
-                spec.binding_id, spec.build_key_index
+                spec.binding_id(),
+                spec.build_key_index
             ));
         }
         if eq_null_safe.get(spec.build_key_index).copied() != Some(false) {
             return Err(format!(
                 "native runtime-filter binding_id={} requires a non-null-safe equality join key",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
         let data_type = arena
@@ -146,24 +147,24 @@ impl NativeMembershipProducerBinding {
             .ok_or_else(|| {
                 format!(
                     "native runtime-filter binding_id={} build expression has no frozen data type",
-                    spec.binding_id
+                    spec.binding_id()
                 )
             })?;
         let expected_schema = ArtifactMembershipSchema::new(&data_type, NullSemantics::NeverMatches)
             .map_err(|error| {
                 format!(
                     "native runtime-filter binding_id={} build expression has an unsupported membership schema: {error}",
-                    spec.binding_id
+                    spec.binding_id()
                 )
             })?;
         let RuntimeFilterExecutionContract::Membership {
             canonical_schema,
             schema_digest,
-        } = &spec.contract
+        } = spec.contract().contract()
         else {
             return Err(format!(
                 "native runtime-filter binding_id={} hash join producer requires a membership contract",
-                spec.binding_id
+                spec.binding_id()
             ));
         };
         if canonical_schema.as_ref() != expected_schema.canonical_bytes()
@@ -171,31 +172,30 @@ impl NativeMembershipProducerBinding {
         {
             return Err(format!(
                 "native runtime-filter binding_id={} membership schema does not match build key ordinal {}",
-                spec.binding_id, spec.build_key_index
+                spec.binding_id(),
+                spec.build_key_index
             ));
         }
-        let expected_kinds = BTreeSet::from([
-            ContributionKind::ValueDomainDelta,
-            ContributionKind::ProducerClosed,
-        ]);
-        if spec.contribution_kinds != expected_kinds
-            || spec.completion_requirement != CompletionRequirement::ProducerClosed
-            || spec.reduction != RuntimeFilterExecutionReduction::SetUnion
+        if spec.contract().reduction() != execution::RuntimeFilterReduction::SetUnion
+            || spec.contract().completion() != execution::RuntimeFilterCompletion::ProducerClosed
         {
             return Err(format!(
                 "native runtime-filter binding_id={} hash join producer contract is not Membership + SetUnion + ProducerClosed",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
         Ok(Self {
-            binding_id: spec.binding_id,
-            channel_id: spec.channel_id,
+            binding_id: spec.binding_id(),
+            channel_id: spec.channel_id(),
             join_key_ordinal: spec.build_key_index,
             data_type,
-            contract: spec.contract.clone(),
-            contribution_kinds: spec.contribution_kinds.clone(),
-            completion_requirement: spec.completion_requirement,
-            reduction: spec.reduction.clone(),
+            contract: spec.contract().contract().clone(),
+            contribution_kinds: BTreeSet::from([
+                ContributionKind::ValueDomainDelta,
+                ContributionKind::ProducerClosed,
+            ]),
+            completion_requirement: CompletionRequirement::ProducerClosed,
+            reduction: crate::exec::node::runtime_filter::RuntimeFilterExecutionReduction::SetUnion,
             membership_schema: expected_schema,
             source: NativeMembershipProducerSource::Session(session),
             coordinator: Arc::new(NativeProducerInstanceCoordinator::default()),

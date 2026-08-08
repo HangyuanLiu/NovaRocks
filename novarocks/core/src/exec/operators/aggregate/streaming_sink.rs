@@ -108,7 +108,7 @@ impl AggregateStreamingSinkFactory {
             let session = runtime_filter_session.ok_or_else(|| {
                 format!(
                     "native aggregate TopN producer binding_id={} requires an execution runtime-filter session",
-                    topn_producers[0].binding_id
+                    topn_producers[0].binding_id()
                 )
             })?;
             Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(

@@ -54,8 +54,7 @@ pub mod deployment {
 
 pub mod exec {
     pub use crate::runtime_filter::exec::{
-        execution_final_domain, execution_predicate, membership_delta, membership_predicate,
-        ordered_range_predicate,
+        execution_final_domain, membership_delta, membership_predicate, ordered_range_predicate,
     };
 }
 

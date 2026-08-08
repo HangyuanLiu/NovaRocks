@@ -19,18 +19,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks::exec::node::runtime_filter::{
-    ArtifactCapability, ArtifactMembershipSchema, ComparatorDigest, CompletionFenceKind,
-    CompletionRequirement, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
-    OrderContract, OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain,
-    RuntimeOrderContract, RuntimeOrderKey, RuntimeTopKSummaryContract, SortDirection,
-    TopKSummaryRequirement,
+    ArtifactMembershipSchema, ComparatorDigest, NullOrder, OrderContract, OrderKeyContract,
+    RuntimeOrderContract, RuntimeTopKSummaryContract, SortDirection, TopKSummaryRequirement,
 };
 use novarocks::protocol::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::runtime_filter as execution;
 use novarocks_protocol::{expr, plan};
 
 /// Backend-local producer attachment target decoded from the native fragment
@@ -51,8 +48,6 @@ pub(crate) struct DecodedRuntimeFilterBinding {
     pub(crate) expression: expr::Expr,
     pub(crate) expression_path: FieldPath,
     pub(crate) role: DecodedBindingRole,
-    pub(crate) contract: DecodedRuntimeFilterContract,
-    pub(crate) reduction: DecodedRuntimeFilterReduction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,13 +59,11 @@ pub(crate) enum DecodedApplyPoint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecodedBindingRole {
     Producer {
-        contribution_kinds: BTreeSet<ContributionKind>,
-        completion_requirement: CompletionRequirement,
+        contract: execution::RuntimeFilterProducerContract,
         target: ProducerBindingTarget,
     },
     Consumer {
-        capabilities: BTreeSet<ArtifactCapability>,
-        activation: ConsumerActivation,
+        contract: execution::RuntimeFilterConsumerContract,
         target: DecodedConsumerBindingTarget,
     },
 }
@@ -95,26 +88,33 @@ pub(crate) struct DecodedRuntimeFilterScanDomainTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DecodedRuntimeFilterContract {
-    Membership {
-        canonical_schema: Arc<[u8]>,
-        schema_digest: [u8; 32],
+enum DecodedWireBindingRole {
+    Producer {
+        contribution_kinds: BTreeSet<WireContributionKind>,
+        completion_requirement: execution::RuntimeFilterCompletion,
+        target: ProducerBindingTarget,
     },
-    Ordered {
-        keys: Arc<[RuntimeOrderKey]>,
-        comparator_digest: [u8; 32],
-        order_contract_digest: [u8; 32],
+    Consumer {
+        capabilities: BTreeSet<WireArtifactCapability>,
+        activation: execution::ConsumerActivation,
+        target: DecodedConsumerBindingTarget,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DecodedRuntimeFilterReduction {
-    SetUnion,
-    TightenOrderedBound,
-    MergeTopKSummary {
-        k: NonZeroU32,
-        contract_digest: [u8; 32],
-    },
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum WireContributionKind {
+    ValueDomainDelta,
+    FinalDomainShard,
+    OrderedBoundUpdate,
+    TopKSummary,
+    ProducerClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum WireArtifactCapability {
+    Membership,
+    OrderedRange,
+    EmptyDomain,
 }
 
 pub(crate) struct NativeRuntimeFilterDecodeLedger {
@@ -199,9 +199,13 @@ impl NativeRuntimeFilterDecodeLedger {
             ));
         }
         let record = self.records.get(&binding_id).ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, "runtime_filter_binding_ids", format!(
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "runtime_filter_binding_ids",
+                format!(
                 "native node_id={node_id} references unknown runtime-filter binding_id={binding_id}"
-            ))
+            ),
+            )
         })?;
         if record.node_id != node_id {
             return Err(NativeFragmentLeafDecodeError::at_field(
@@ -347,15 +351,15 @@ fn decode_binding(
         wire.reduction.as_ref(),
         path.clone().field("reduction"),
     )?;
-    let role = decode_role(
+    let wire_role = decode_wire_role(
         wire.binding_id,
         wire.role.as_ref(),
         path.clone().field("role"),
     )?;
-    match (&role, apply_point) {
-        (DecodedBindingRole::Consumer { .. }, plan::RuntimeFilterApplyPoint::NodeInput)
-        | (DecodedBindingRole::Producer { .. }, plan::RuntimeFilterApplyPoint::NodeOutput) => {}
-        (DecodedBindingRole::Consumer { .. }, _) => {
+    match (&wire_role, apply_point) {
+        (DecodedWireBindingRole::Consumer { .. }, plan::RuntimeFilterApplyPoint::NodeInput)
+        | (DecodedWireBindingRole::Producer { .. }, plan::RuntimeFilterApplyPoint::NodeOutput) => {}
+        (DecodedWireBindingRole::Consumer { .. }, _) => {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("apply_point"),
                 format!(
@@ -364,7 +368,7 @@ fn decode_binding(
                 ),
             ));
         }
-        (DecodedBindingRole::Producer { .. }, _) => {
+        (DecodedWireBindingRole::Producer { .. }, _) => {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("apply_point"),
                 format!(
@@ -374,8 +378,16 @@ fn decode_binding(
             ));
         }
     }
-    validate_role_contract(wire.binding_id, &contract, &reduction, &role)
+    validate_role_contract(wire.binding_id, &contract, reduction, &wire_role)
         .map_err(|error| NativeFragmentDecodeError::inconsistent(path.clone(), error))?;
+    let role = into_execution_role(
+        wire.binding_id,
+        wire.channel_id,
+        contract,
+        reduction,
+        wire_role,
+        path.clone().field("role"),
+    )?;
     Ok(DecodedRuntimeFilterBinding {
         binding_id: wire.binding_id,
         channel_id: wire.channel_id,
@@ -384,111 +396,37 @@ fn decode_binding(
         expression,
         expression_path,
         role,
-        contract,
-        reduction,
     })
 }
 
 fn digest32(binding_id: u32, field: &str, bytes: &[u8]) -> Result<[u8; 32], String> {
-    bytes.try_into().map_err(|_| format!(
+    bytes.try_into().map_err(|_| {
+        format!(
         "native runtime-filter binding_id={binding_id} {field} must be exactly 32 bytes, got {}",
         bytes.len()
-    ))
+    )
+    })
 }
 
-#[allow(dead_code)] // Shared with the install codec before its Task 4 handler call site lands.
-pub(crate) fn decode_runtime_filter_logical_domain_and_reduction(
-    wire_type: Option<&novarocks_protocol::common::TypeDesc>,
-    wire_contract: Option<&plan::RuntimeFilterContract>,
-    wire_reduction: Option<&plan::RuntimeFilterReductionContract>,
-    path: FieldPath,
-) -> Result<(RuntimeFilterLogicalDomain, ReductionRequirement), NativeFragmentDecodeError> {
-    let type_path = path.clone().field("value_type");
-    let wire_type = wire_type.ok_or_else(|| {
-        NativeFragmentDecodeError::missing(
-            type_path.clone(),
-            "runtime filter deployment logical domain is missing value type",
-        )
-    })?;
-    let value_type = crate::native::type_decode::decode_type(wire_type)
-        .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path, error))?;
-    let decoded_contract = decode_contract(
-        0,
-        &value_type,
-        wire_contract,
-        path.clone().field("contract"),
-    )?;
-    let decoded_reduction = decode_reduction(
-        0,
-        &decoded_contract,
-        wire_reduction,
-        path.field("reduction"),
-    )?;
-    let domain = match decoded_contract {
-        DecodedRuntimeFilterContract::Membership {
-            canonical_schema, ..
-        } => {
-            let schema = ArtifactMembershipSchema::view(&canonical_schema).map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    FieldPath::root("runtime_filter_install")
-                        .field("logical_domain")
-                        .field("contract"),
-                    format!("invalid membership schema: {error:?}"),
-                )
-            })?;
-            RuntimeFilterLogicalDomain::Membership {
-                value_type,
-                null_semantics: schema.null_semantics(),
-            }
-        }
-        DecodedRuntimeFilterContract::Ordered {
-            keys,
-            comparator_digest,
-            ..
-        } => RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
-            keys: keys
-                .iter()
-                .map(|key| OrderKeyContract {
-                    data_type: key.data_type().clone(),
-                    direction: key.direction(),
-                    null_order: key.null_order(),
-                })
-                .collect(),
-            inclusive: true,
-            comparator_digest: ComparatorDigest::new(comparator_digest),
-        }),
-    };
-    let reduction = match decoded_reduction {
-        DecodedRuntimeFilterReduction::SetUnion => ReductionRequirement::SetUnion,
-        DecodedRuntimeFilterReduction::TightenOrderedBound => {
-            ReductionRequirement::TightenOrderedBound
-        }
-        DecodedRuntimeFilterReduction::MergeTopKSummary { k, .. } => {
-            ReductionRequirement::MergeTopKSummary(
-                TopKSummaryRequirement::try_new(k.get()).expect("decoded TopK K is nonzero"),
-            )
-        }
-    };
-    Ok((domain, reduction))
-}
-
-pub(crate) fn decode_runtime_filter_contribution_kind(
+fn decode_runtime_filter_contribution_kind(
     raw: i32,
     path: FieldPath,
-) -> Result<ContributionKind, NativeFragmentDecodeError> {
+) -> Result<WireContributionKind, NativeFragmentDecodeError> {
     match plan::RuntimeFilterContributionKind::try_from(raw) {
         Ok(plan::RuntimeFilterContributionKind::ValueDomainDelta) => {
-            Ok(ContributionKind::ValueDomainDelta)
+            Ok(WireContributionKind::ValueDomainDelta)
         }
         Ok(plan::RuntimeFilterContributionKind::FinalDomainShard) => {
-            Ok(ContributionKind::FinalDomainShard)
+            Ok(WireContributionKind::FinalDomainShard)
         }
         Ok(plan::RuntimeFilterContributionKind::OrderedBoundUpdate) => {
-            Ok(ContributionKind::OrderedBoundUpdate)
+            Ok(WireContributionKind::OrderedBoundUpdate)
         }
-        Ok(plan::RuntimeFilterContributionKind::TopkSummary) => Ok(ContributionKind::TopKSummary),
+        Ok(plan::RuntimeFilterContributionKind::TopkSummary) => {
+            Ok(WireContributionKind::TopKSummary)
+        }
         Ok(plan::RuntimeFilterContributionKind::ProducerClosed) => {
-            Ok(ContributionKind::ProducerClosed)
+            Ok(WireContributionKind::ProducerClosed)
         }
         Ok(plan::RuntimeFilterContributionKind::Unspecified) | Err(_) => {
             Err(NativeFragmentDecodeError::invalid_enum(
@@ -499,17 +437,17 @@ pub(crate) fn decode_runtime_filter_contribution_kind(
     }
 }
 
-pub(crate) fn decode_runtime_filter_completion(
+fn decode_runtime_filter_completion(
     raw: i32,
     path: FieldPath,
-) -> Result<CompletionRequirement, NativeFragmentDecodeError> {
+) -> Result<execution::RuntimeFilterCompletion, NativeFragmentDecodeError> {
     match plan::RuntimeFilterCompletionRequirement::try_from(raw) {
         Ok(plan::RuntimeFilterCompletionRequirement::ProducerClosed) => {
-            Ok(CompletionRequirement::ProducerClosed)
+            Ok(execution::RuntimeFilterCompletion::ProducerClosed)
         }
-        Ok(plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen) => Ok(
-            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
-        ),
+        Ok(plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen) => {
+            Ok(execution::RuntimeFilterCompletion::FencedFinalDomain)
+        }
         Ok(plan::RuntimeFilterCompletionRequirement::Unspecified) | Err(_) => {
             Err(NativeFragmentDecodeError::invalid_enum(
                 path,
@@ -519,17 +457,19 @@ pub(crate) fn decode_runtime_filter_completion(
     }
 }
 
-pub(crate) fn decode_runtime_filter_capability(
+fn decode_runtime_filter_capability(
     raw: i32,
     path: FieldPath,
-) -> Result<ArtifactCapability, NativeFragmentDecodeError> {
+) -> Result<WireArtifactCapability, NativeFragmentDecodeError> {
     match plan::RuntimeFilterArtifactCapability::try_from(raw) {
-        Ok(plan::RuntimeFilterArtifactCapability::Membership) => Ok(ArtifactCapability::Membership),
+        Ok(plan::RuntimeFilterArtifactCapability::Membership) => {
+            Ok(WireArtifactCapability::Membership)
+        }
         Ok(plan::RuntimeFilterArtifactCapability::OrderedRange) => {
-            Ok(ArtifactCapability::OrderedRange)
+            Ok(WireArtifactCapability::OrderedRange)
         }
         Ok(plan::RuntimeFilterArtifactCapability::EmptyDomain) => {
-            Ok(ArtifactCapability::EmptyDomain)
+            Ok(WireArtifactCapability::EmptyDomain)
         }
         Ok(plan::RuntimeFilterArtifactCapability::Unspecified) | Err(_) => {
             Err(NativeFragmentDecodeError::invalid_enum(
@@ -540,10 +480,10 @@ pub(crate) fn decode_runtime_filter_capability(
     }
 }
 
-pub(crate) fn decode_runtime_filter_activation(
+fn decode_runtime_filter_activation(
     wire: Option<&plan::RuntimeFilterConsumerActivation>,
     path: FieldPath,
-) -> Result<ConsumerActivation, NativeFragmentDecodeError> {
+) -> Result<execution::ConsumerActivation, NativeFragmentDecodeError> {
     let wire = wire.ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             path.clone(),
@@ -557,7 +497,7 @@ pub(crate) fn decode_runtime_filter_activation(
         )
     })? {
         plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true) => {
-            Ok(ConsumerActivation::BlockingSnapshot)
+            Ok(execution::ConsumerActivation::BlockingSnapshot)
         }
         plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(false) => {
             Err(NativeFragmentDecodeError::invalid_value(
@@ -567,13 +507,21 @@ pub(crate) fn decode_runtime_filter_activation(
         }
         plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(raw) => {
             let late_apply = match plan::RuntimeFilterLateApplyGranularity::try_from(*raw) {
-                Ok(plan::RuntimeFilterLateApplyGranularity::Row) => LateApplyGranularity::Row,
-                Ok(plan::RuntimeFilterLateApplyGranularity::Batch) => LateApplyGranularity::Batch,
-                Ok(plan::RuntimeFilterLateApplyGranularity::RowGroup) => {
-                    LateApplyGranularity::RowGroup
+                Ok(plan::RuntimeFilterLateApplyGranularity::Row) => {
+                    execution::RuntimeFilterLateApplyGranularity::Row
                 }
-                Ok(plan::RuntimeFilterLateApplyGranularity::Split) => LateApplyGranularity::Split,
-                Ok(plan::RuntimeFilterLateApplyGranularity::File) => LateApplyGranularity::File,
+                Ok(plan::RuntimeFilterLateApplyGranularity::Batch) => {
+                    execution::RuntimeFilterLateApplyGranularity::Batch
+                }
+                Ok(plan::RuntimeFilterLateApplyGranularity::RowGroup) => {
+                    execution::RuntimeFilterLateApplyGranularity::RowGroup
+                }
+                Ok(plan::RuntimeFilterLateApplyGranularity::Split) => {
+                    execution::RuntimeFilterLateApplyGranularity::Split
+                }
+                Ok(plan::RuntimeFilterLateApplyGranularity::File) => {
+                    execution::RuntimeFilterLateApplyGranularity::File
+                }
                 Ok(plan::RuntimeFilterLateApplyGranularity::Unspecified) | Err(_) => {
                     return Err(NativeFragmentDecodeError::invalid_enum(
                         path.field("kind").field("non_blocking_live"),
@@ -581,7 +529,7 @@ pub(crate) fn decode_runtime_filter_activation(
                     ));
                 }
             };
-            Ok(ConsumerActivation::NonBlockingLive { late_apply })
+            Ok(execution::ConsumerActivation::NonBlockingLive { late_apply })
         }
     }
 }
@@ -591,7 +539,7 @@ fn decode_contract(
     expression_type: &arrow::datatypes::DataType,
     wire: Option<&plan::RuntimeFilterContract>,
     path: FieldPath,
-) -> Result<DecodedRuntimeFilterContract, NativeFragmentDecodeError> {
+) -> Result<execution::RuntimeFilterExecutionContract, NativeFragmentDecodeError> {
     let wire = wire.ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             path.clone(),
@@ -658,8 +606,8 @@ fn decode_contract(
                     ),
                 ));
             }
-            Ok(DecodedRuntimeFilterContract::Membership {
-                canonical_schema: Arc::from(membership.canonical_schema.as_slice()),
+            Ok(execution::RuntimeFilterExecutionContract::Membership {
+                canonical_schema: membership.canonical_schema.clone().into(),
                 schema_digest: digest,
             })
         }
@@ -718,15 +666,18 @@ fn decode_contract(
                         ));
                     }
                 };
-                keys.push(RuntimeOrderKey::new(data_type, direction, null_order));
+                keys.push(OrderKeyContract {
+                    data_type,
+                    direction,
+                    null_order,
+                });
             }
-            if keys[0].data_type() != expression_type {
+            if &keys[0].data_type != expression_type {
                 return Err(NativeFragmentDecodeError::inconsistent(
                     path.clone().field("keys").index(0).field("type"),
                     format!(
                         "native runtime-filter binding_id={binding_id} ordered key type {:?} does not match expression type {:?}",
-                        keys[0].data_type(),
-                        expression_type
+                        keys[0].data_type, expression_type
                     ),
                 ));
             }
@@ -749,14 +700,7 @@ fn decode_contract(
                 )
             })?;
             let plan_contract = OrderContract {
-                keys: keys
-                    .iter()
-                    .map(|key| OrderKeyContract {
-                        data_type: key.data_type().clone(),
-                        direction: key.direction(),
-                        null_order: key.null_order(),
-                    })
-                    .collect(),
+                keys: keys.clone(),
                 inclusive: true,
                 comparator_digest: ComparatorDigest::new(comparator),
             };
@@ -776,8 +720,28 @@ fn decode_contract(
                     ),
                 ));
             }
-            Ok(DecodedRuntimeFilterContract::Ordered {
-                keys: keys.into(),
+            Ok(execution::RuntimeFilterExecutionContract::Ordered {
+                keys: keys
+                    .iter()
+                    .map(|key| {
+                        execution::RuntimeOrderKey::new(
+                            key.data_type.clone(),
+                            match key.direction {
+                                SortDirection::Ascending => {
+                                    execution::RuntimeOrderSortDirection::Ascending
+                                }
+                                SortDirection::Descending => {
+                                    execution::RuntimeOrderSortDirection::Descending
+                                }
+                            },
+                            match key.null_order {
+                                NullOrder::First => execution::RuntimeOrderNullOrder::First,
+                                NullOrder::Last => execution::RuntimeOrderNullOrder::Last,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
                 comparator_digest: comparator,
                 order_contract_digest: order_digest,
             })
@@ -787,10 +751,10 @@ fn decode_contract(
 
 fn decode_reduction(
     binding_id: u32,
-    contract: &DecodedRuntimeFilterContract,
+    contract: &execution::RuntimeFilterExecutionContract,
     wire: Option<&plan::RuntimeFilterReductionContract>,
     path: FieldPath,
-) -> Result<DecodedRuntimeFilterReduction, NativeFragmentDecodeError> {
+) -> Result<execution::RuntimeFilterReduction, NativeFragmentDecodeError> {
     let wire = wire.ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             path.clone(),
@@ -805,10 +769,10 @@ fn decode_reduction(
     })?;
     match kind {
         plan::runtime_filter_reduction_contract::Kind::SetUnion(true) => {
-            Ok(DecodedRuntimeFilterReduction::SetUnion)
+            Ok(execution::RuntimeFilterReduction::SetUnion)
         }
         plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(true) => {
-            Ok(DecodedRuntimeFilterReduction::TightenOrderedBound)
+            Ok(execution::RuntimeFilterReduction::TightenOrderedBound)
         }
         plan::runtime_filter_reduction_contract::Kind::SetUnion(false)
         | plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(false) => {
@@ -834,7 +798,7 @@ fn decode_reduction(
                         error,
                     )
                 })?;
-            let DecodedRuntimeFilterContract::Ordered {
+            let execution::RuntimeFilterExecutionContract::Ordered {
                 keys,
                 comparator_digest,
                 ..
@@ -852,8 +816,18 @@ fn decode_reduction(
                     .iter()
                     .map(|key| OrderKeyContract {
                         data_type: key.data_type().clone(),
-                        direction: key.direction(),
-                        null_order: key.null_order(),
+                        direction: match key.direction() {
+                            execution::RuntimeOrderSortDirection::Ascending => {
+                                SortDirection::Ascending
+                            }
+                            execution::RuntimeOrderSortDirection::Descending => {
+                                SortDirection::Descending
+                            }
+                        },
+                        null_order: match key.null_order() {
+                            execution::RuntimeOrderNullOrder::First => NullOrder::First,
+                            execution::RuntimeOrderNullOrder::Last => NullOrder::Last,
+                        },
                     })
                     .collect(),
                 inclusive: true,
@@ -877,19 +851,19 @@ fn decode_reduction(
                     ),
                 ));
             }
-            Ok(DecodedRuntimeFilterReduction::MergeTopKSummary {
-                k,
+            Ok(execution::RuntimeFilterReduction::MergeTopKSummary {
+                k: k.get(),
                 contract_digest: digest,
             })
         }
     }
 }
 
-fn decode_role(
+fn decode_wire_role(
     binding_id: u32,
     role: Option<&plan::runtime_filter_binding::Role>,
     path: FieldPath,
-) -> Result<DecodedBindingRole, NativeFragmentDecodeError> {
+) -> Result<DecodedWireBindingRole, NativeFragmentDecodeError> {
     match role.ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             path.clone(),
@@ -976,7 +950,7 @@ fn decode_role(
                     }
                 }
             };
-            Ok(DecodedBindingRole::Producer {
+            Ok(DecodedWireBindingRole::Producer {
                 contribution_kinds,
                 completion_requirement,
                 target,
@@ -1058,7 +1032,7 @@ fn decode_role(
                     DecodedConsumerBindingTarget::SourceBoundary { scan_domain }
                 }
             };
-            Ok(DecodedBindingRole::Consumer {
+            Ok(DecodedWireBindingRole::Consumer {
                 capabilities,
                 activation,
                 target,
@@ -1069,22 +1043,22 @@ fn decode_role(
 
 fn validate_role_contract(
     binding_id: u32,
-    contract: &DecodedRuntimeFilterContract,
-    reduction: &DecodedRuntimeFilterReduction,
-    role: &DecodedBindingRole,
+    contract: &execution::RuntimeFilterExecutionContract,
+    reduction: execution::RuntimeFilterReduction,
+    role: &DecodedWireBindingRole,
 ) -> Result<(), String> {
     match (contract, reduction) {
         (
-            DecodedRuntimeFilterContract::Membership { .. },
-            DecodedRuntimeFilterReduction::SetUnion,
+            execution::RuntimeFilterExecutionContract::Membership { .. },
+            execution::RuntimeFilterReduction::SetUnion,
         )
         | (
-            DecodedRuntimeFilterContract::Ordered { .. },
-            DecodedRuntimeFilterReduction::TightenOrderedBound,
+            execution::RuntimeFilterExecutionContract::Ordered { .. },
+            execution::RuntimeFilterReduction::TightenOrderedBound,
         )
         | (
-            DecodedRuntimeFilterContract::Ordered { .. },
-            DecodedRuntimeFilterReduction::MergeTopKSummary { .. },
+            execution::RuntimeFilterExecutionContract::Ordered { .. },
+            execution::RuntimeFilterReduction::MergeTopKSummary { .. },
         ) => {}
         _ => {
             return Err(format!(
@@ -1093,14 +1067,14 @@ fn validate_role_contract(
         }
     }
     match role {
-        DecodedBindingRole::Consumer { capabilities, .. } => {
+        DecodedWireBindingRole::Consumer { capabilities, .. } => {
             let expected = match contract {
-                DecodedRuntimeFilterContract::Membership { .. } => BTreeSet::from([
-                    ArtifactCapability::Membership,
-                    ArtifactCapability::EmptyDomain,
+                execution::RuntimeFilterExecutionContract::Membership { .. } => BTreeSet::from([
+                    WireArtifactCapability::Membership,
+                    WireArtifactCapability::EmptyDomain,
                 ]),
-                DecodedRuntimeFilterContract::Ordered { .. } => {
-                    BTreeSet::from([ArtifactCapability::OrderedRange])
+                execution::RuntimeFilterExecutionContract::Ordered { .. } => {
+                    BTreeSet::from([WireArtifactCapability::OrderedRange])
                 }
             };
             if capabilities != &expected {
@@ -1108,59 +1082,58 @@ fn validate_role_contract(
                     "native runtime-filter binding_id={binding_id} consumer capabilities do not match the canonical role contract"
                 ));
             }
-            if matches!(contract, DecodedRuntimeFilterContract::Ordered { .. })
-                && matches!(
-                    role,
-                    DecodedBindingRole::Consumer {
-                        activation: ConsumerActivation::BlockingSnapshot,
-                        ..
-                    }
-                )
-            {
+            if matches!(
+                contract,
+                execution::RuntimeFilterExecutionContract::Ordered { .. }
+            ) && matches!(
+                role,
+                DecodedWireBindingRole::Consumer {
+                    activation: execution::ConsumerActivation::BlockingSnapshot,
+                    ..
+                }
+            ) {
                 return Err(format!(
                     "native runtime-filter binding_id={binding_id} ordered consumer cannot block on feedback"
                 ));
             }
         }
-        DecodedBindingRole::Producer {
+        DecodedWireBindingRole::Producer {
             contribution_kinds,
             completion_requirement,
             ..
         } => {
             let (expected, expected_completion) = match reduction {
-                DecodedRuntimeFilterReduction::SetUnion
-                    if contribution_kinds.contains(&ContributionKind::FinalDomainShard) =>
+                execution::RuntimeFilterReduction::SetUnion
+                    if contribution_kinds.contains(&WireContributionKind::FinalDomainShard) =>
                 {
                     (
                         BTreeSet::from([
-                            ContributionKind::FinalDomainShard,
-                            ContributionKind::ProducerClosed,
+                            WireContributionKind::FinalDomainShard,
+                            WireContributionKind::ProducerClosed,
                         ]),
-                        CompletionRequirement::FencedFinalDomain(
-                            CompletionFenceKind::CommittedDomainFrozen,
-                        ),
+                        execution::RuntimeFilterCompletion::FencedFinalDomain,
                     )
                 }
-                DecodedRuntimeFilterReduction::SetUnion => (
+                execution::RuntimeFilterReduction::SetUnion => (
                     BTreeSet::from([
-                        ContributionKind::ValueDomainDelta,
-                        ContributionKind::ProducerClosed,
+                        WireContributionKind::ValueDomainDelta,
+                        WireContributionKind::ProducerClosed,
                     ]),
-                    CompletionRequirement::ProducerClosed,
+                    execution::RuntimeFilterCompletion::ProducerClosed,
                 ),
-                DecodedRuntimeFilterReduction::TightenOrderedBound => (
+                execution::RuntimeFilterReduction::TightenOrderedBound => (
                     BTreeSet::from([
-                        ContributionKind::OrderedBoundUpdate,
-                        ContributionKind::ProducerClosed,
+                        WireContributionKind::OrderedBoundUpdate,
+                        WireContributionKind::ProducerClosed,
                     ]),
-                    CompletionRequirement::ProducerClosed,
+                    execution::RuntimeFilterCompletion::ProducerClosed,
                 ),
-                DecodedRuntimeFilterReduction::MergeTopKSummary { .. } => (
+                execution::RuntimeFilterReduction::MergeTopKSummary { .. } => (
                     BTreeSet::from([
-                        ContributionKind::TopKSummary,
-                        ContributionKind::ProducerClosed,
+                        WireContributionKind::TopKSummary,
+                        WireContributionKind::ProducerClosed,
                     ]),
-                    CompletionRequirement::ProducerClosed,
+                    execution::RuntimeFilterCompletion::ProducerClosed,
                 ),
             };
             if contribution_kinds != &expected || completion_requirement != &expected_completion {
@@ -1171,6 +1144,116 @@ fn validate_role_contract(
         }
     }
     Ok(())
+}
+
+fn into_execution_role(
+    binding_id: u32,
+    channel_id: u32,
+    contract: execution::RuntimeFilterExecutionContract,
+    reduction: execution::RuntimeFilterReduction,
+    role: DecodedWireBindingRole,
+    path: FieldPath,
+) -> Result<DecodedBindingRole, NativeFragmentDecodeError> {
+    let binding_id = execution::RuntimeFilterBindingId::new(binding_id);
+    let channel_id = execution::RuntimeFilterChannelId::new(channel_id);
+    match role {
+        DecodedWireBindingRole::Producer {
+            contribution_kinds,
+            target,
+            ..
+        } => {
+            let producer = match (&contract, reduction) {
+                (
+                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterReduction::SetUnion,
+                ) => {
+                    if contribution_kinds.contains(&WireContributionKind::FinalDomainShard) {
+                        execution::RuntimeFilterProducerContract::final_domain(
+                            binding_id, channel_id, contract,
+                        )
+                    } else {
+                        execution::RuntimeFilterProducerContract::membership(
+                            binding_id, channel_id, contract,
+                        )
+                    }
+                }
+                (
+                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterReduction::TightenOrderedBound,
+                ) => execution::RuntimeFilterProducerContract::ordered_bound(
+                    binding_id, channel_id, contract,
+                ),
+                (
+                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterReduction::MergeTopKSummary { k, .. },
+                ) => execution::RuntimeFilterProducerContract::top_k_summary(
+                    binding_id, channel_id, k, contract,
+                ),
+                _ => {
+                    return Err(NativeFragmentDecodeError::inconsistent(
+                        path,
+                        "runtime-filter producer contract/reduction is not constructable",
+                    ));
+                }
+            };
+            producer
+                .map(|contract| DecodedBindingRole::Producer { contract, target })
+                .map_err(|error| {
+                    NativeFragmentDecodeError::inconsistent(
+                        path,
+                        format!("runtime-filter producer contract rejected: {error}"),
+                    )
+                })
+        }
+        DecodedWireBindingRole::Consumer {
+            activation, target, ..
+        } => {
+            let consumer = match (&contract, reduction, activation) {
+                (
+                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterReduction::SetUnion,
+                    execution::ConsumerActivation::BlockingSnapshot,
+                ) => execution::RuntimeFilterConsumerContract::membership_blocking(
+                    binding_id, channel_id, contract,
+                ),
+                (
+                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterReduction::SetUnion,
+                    execution::ConsumerActivation::NonBlockingLive { late_apply },
+                ) => execution::RuntimeFilterConsumerContract::membership_live(
+                    binding_id, channel_id, late_apply, contract,
+                ),
+                (
+                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterReduction::TightenOrderedBound,
+                    execution::ConsumerActivation::NonBlockingLive { late_apply },
+                ) => execution::RuntimeFilterConsumerContract::ordered_live(
+                    binding_id, channel_id, late_apply, contract,
+                ),
+                (
+                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterReduction::MergeTopKSummary { k, .. },
+                    execution::ConsumerActivation::NonBlockingLive { late_apply },
+                ) => execution::RuntimeFilterConsumerContract::top_k_live(
+                    binding_id, channel_id, late_apply, k, contract,
+                ),
+                _ => {
+                    return Err(NativeFragmentDecodeError::inconsistent(
+                        path,
+                        "runtime-filter consumer contract/reduction/activation is not constructable",
+                    ));
+                }
+            };
+            consumer
+                .map(|contract| DecodedBindingRole::Consumer { contract, target })
+                .map_err(|error| {
+                    NativeFragmentDecodeError::inconsistent(
+                        path,
+                        format!("runtime-filter consumer contract rejected: {error}"),
+                    )
+                })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1752,7 +1835,11 @@ mod tests {
             NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![ordered.clone()])))
                 .expect("single-key ordered TopK");
         let record = ledger.lookup_for_node(2, 11, 7).expect("binding");
-        let DecodedRuntimeFilterContract::Ordered { keys, .. } = &record.contract else {
+        let DecodedBindingRole::Consumer { contract, .. } = &record.role else {
+            panic!("consumer")
+        };
+        let execution::RuntimeFilterExecutionContract::Ordered { keys, .. } = contract.contract()
+        else {
             panic!("ordered")
         };
         assert_eq!(keys.len(), 1);
@@ -1798,6 +1885,56 @@ mod tests {
         topk.contract_digest[0] ^= 1;
         assert!(
             NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![wrong_topk]))).is_err()
+        );
+    }
+
+    #[test]
+    fn binding_table_constructs_execution_contracts_without_core_mirrors() {
+        let consumer = membership_binding(1, 11);
+        let mut producer = membership_binding(2, 12);
+        producer.apply_point = i32::from(plan::RuntimeFilterApplyPoint::NodeOutput);
+        producer.role = Some(plan::runtime_filter_binding::Role::Producer(
+            plan::RuntimeFilterProducerRole {
+                contribution_kinds: vec![
+                    i32::from(plan::RuntimeFilterContributionKind::ValueDomainDelta),
+                    i32::from(plan::RuntimeFilterContributionKind::ProducerClosed),
+                ],
+                completion_requirement: i32::from(
+                    plan::RuntimeFilterCompletionRequirement::ProducerClosed,
+                ),
+                target: Some(plan::runtime_filter_producer_role::Target::JoinBuildKey(
+                    plan::RuntimeFilterJoinBuildKey { ordinal: 0 },
+                )),
+            },
+        ));
+
+        let ledger =
+            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![consumer, producer])))
+                .expect("canonical execution contracts");
+        let consumer = ledger.lookup_for_node(1, 11, 7).expect("consumer binding");
+        let DecodedBindingRole::Consumer { contract, .. } = &consumer.role else {
+            panic!("consumer role")
+        };
+        assert_eq!(contract.binding_id().get(), 1);
+        assert_eq!(contract.channel_id().get(), 11);
+        assert_eq!(
+            contract.reduction(),
+            execution::RuntimeFilterReduction::SetUnion
+        );
+
+        let producer = ledger.lookup_for_node(2, 12, 7).expect("producer binding");
+        let DecodedBindingRole::Producer { contract, .. } = &producer.role else {
+            panic!("producer role")
+        };
+        assert_eq!(contract.binding_id().get(), 2);
+        assert_eq!(contract.channel_id().get(), 12);
+        assert_eq!(
+            contract.kind(),
+            execution::RuntimeFilterProducerKind::Membership
+        );
+        assert_eq!(
+            contract.completion(),
+            execution::RuntimeFilterCompletion::ProducerClosed
         );
     }
 

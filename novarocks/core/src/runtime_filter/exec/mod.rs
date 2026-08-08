@@ -16,7 +16,6 @@
 // under the License.
 
 pub mod execution_final_domain;
-pub mod execution_predicate;
 pub mod membership_delta;
 pub mod membership_predicate;
 pub mod ordered_range_predicate;

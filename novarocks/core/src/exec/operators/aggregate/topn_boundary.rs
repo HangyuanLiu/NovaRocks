@@ -304,7 +304,7 @@ impl AggregateTopNBoundaryBinding {
             keys,
             comparator_digest,
             order_contract_digest,
-        } = &spec.contract
+        } = spec.contract().contract()
         else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
@@ -342,7 +342,7 @@ pub(crate) fn validate_topn_boundary_specs(
             keys,
             comparator_digest,
             order_contract_digest,
-        } = &spec.contract
+        } = spec.contract().contract()
         else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };

@@ -328,7 +328,7 @@ impl ScanAsyncRunner {
         &mut self,
         morsel: &ScanMorsel,
     ) -> Result<ScanMorselPruneDecision, String> {
-        // Design: ADR-0041 (docs/adr/ADR-0041-runtime-filter-scan-domain-evaluation-boundary.md)
+        // Design: ADR-0042 (docs/adr/ADR-0042-runtime-filter-artifact-query-and-evaluator-boundary.md)
         let Some(unit) = self.op.prepared_scan_unit(morsel)? else {
             return Ok(ScanMorselPruneDecision::Keep);
         };

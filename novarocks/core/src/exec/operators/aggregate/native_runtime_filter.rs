@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,9 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use novarocks_execution::runtime_filter as execution;
 
 use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
-use crate::exec::node::runtime_filter::{
-    RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
-};
+use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
+#[cfg(test)]
+use crate::exec::node::runtime_filter::RuntimeFilterExecutionReduction;
 use crate::exec::operators::aggregate::topn_boundary::AggregateTopNBoundaryBinding;
 use crate::runtime_filter::codec::contribution::{
     ContributionCodecExpectation, RuntimeFilterContribution as CoreContribution,
@@ -72,8 +73,8 @@ impl AggregateTopNProducerBinding {
     ) -> Result<Self, String> {
         let (contract, execution_contract) = frozen_binding_contract(spec)?;
         Ok(Self {
-            binding_id: spec.binding_id,
-            channel_id: spec.channel_id,
+            binding_id: spec.binding_id(),
+            channel_id: spec.channel_id(),
             contract,
             execution_contract,
             source: AggregateTopNProducerSource::Session(session),
@@ -95,8 +96,8 @@ impl AggregateTopNProducerBinding {
             resolved.completion_requirement,
         )?;
         Ok(Self {
-            binding_id: spec.binding_id,
-            channel_id: spec.channel_id,
+            binding_id: spec.binding_id(),
+            channel_id: spec.channel_id(),
             contract,
             execution_contract: frozen_execution_contract(spec)?,
             source: AggregateTopNProducerSource::Prebound(resolved.adapter),
@@ -114,28 +115,23 @@ fn frozen_binding_contract(
     ),
     String,
 > {
-    if spec.reduction != RuntimeFilterExecutionReduction::TightenOrderedBound
-        || spec.contribution_kinds
-            != BTreeSet::from([
-                ContributionKind::OrderedBoundUpdate,
-                ContributionKind::ProducerClosed,
-            ])
-        || spec.completion_requirement != CompletionRequirement::ProducerClosed
+    if spec.contract().reduction() != execution::RuntimeFilterReduction::TightenOrderedBound
+        || spec.contract().completion() != execution::RuntimeFilterCompletion::ProducerClosed
     {
         return Err(format!(
             "native aggregate TopN producer binding_id={} has an invalid frozen contract",
-            spec.binding_id
+            spec.binding_id()
         ));
     }
     let RuntimeFilterExecutionContract::Ordered {
         keys,
         comparator_digest,
         order_contract_digest,
-    } = &spec.contract
+    } = spec.contract().contract()
     else {
         return Err(format!(
             "native aggregate TopN producer binding_id={} requires an ordered contract",
-            spec.binding_id
+            spec.binding_id()
         ));
     };
     let contract = RuntimeOrderContract::from_codec(
@@ -147,7 +143,7 @@ fn frozen_binding_contract(
     .map_err(|error| {
         format!(
             "native aggregate TopN producer binding_id={} ordered contract is invalid: {error:?}",
-            spec.binding_id
+            spec.binding_id()
         )
     })?;
     Ok((contract, frozen_execution_contract(spec)?))
@@ -156,23 +152,16 @@ fn frozen_binding_contract(
 fn frozen_execution_contract(
     spec: &AggregateTopNRuntimeFilterProducerBinding,
 ) -> Result<execution::RuntimeFilterProducerContract, String> {
-    let RuntimeFilterExecutionContract::Ordered {
-        keys,
-        comparator_digest,
-        order_contract_digest,
-    } = &spec.contract
-    else {
+    if !matches!(
+        spec.contract().contract(),
+        RuntimeFilterExecutionContract::Ordered { .. }
+    ) {
         return Err(format!(
             "native aggregate TopN producer binding_id={} requires an ordered contract",
-            spec.binding_id
+            spec.binding_id()
         ));
-    };
-    Ok(execution::RuntimeFilterProducerContract::new(
-        execution::RuntimeFilterBindingId::new(spec.binding_id),
-        execution::RuntimeFilterChannelId::new(spec.channel_id),
-        execution::RuntimeFilterProducerKind::OrderedBound,
-        spec.contract.clone(),
-    ))
+    }
+    Ok(spec.contract().clone())
 }
 
 #[cfg(test)]

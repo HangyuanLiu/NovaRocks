@@ -548,6 +548,27 @@ fn decode_membership_body(
     )
 }
 
+/// Strictly decodes an unframed canonical membership body for the narrow
+/// Backend final-domain completion bridge.  Callers must already own the
+/// completion authority; this helper carries no stream, fragment, or
+/// evaluator policy.
+pub fn decode_canonical_membership_body(
+    body: &[u8],
+    expected_data_type: &DataType,
+    max_encoded_bytes: usize,
+) -> Result<ValueDomainDelta, ContributionCodecError> {
+    if body.len() > max_encoded_bytes {
+        return Err(ContributionCodecError::EncodedSizeExceeded);
+    }
+    let domain = decode_membership_body(body, expected_data_type)?;
+    let mut canonical = Vec::new();
+    domain.encode_canonical_into(&mut canonical)?;
+    if canonical != body {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    Ok(domain)
+}
+
 fn decode_membership_body_with_policy(
     body: &[u8],
     expected_data_type: &DataType,
@@ -3647,6 +3668,31 @@ mod tests {
                 exact,
             ),
             Ok(contribution)
+        );
+    }
+
+    #[test]
+    fn canonical_membership_body_bridge_is_typed_bounded_and_noncanonical_rejecting() {
+        let domain = ValueDomainDelta::new(MembershipValues::int64([3, 9]), true);
+        let mut body = Vec::new();
+        domain.encode_canonical_into(&mut body).unwrap();
+
+        assert_eq!(
+            decode_canonical_membership_body(&body, &DataType::Int64, body.len()),
+            Ok(domain.clone())
+        );
+        assert_eq!(
+            decode_canonical_membership_body(&body, &DataType::Int32, body.len()),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+        assert_eq!(
+            decode_canonical_membership_body(&body, &DataType::Int64, body.len() - 1),
+            Err(ContributionCodecError::EncodedSizeExceeded)
+        );
+        body.push(0);
+        assert_eq!(
+            decode_canonical_membership_body(&body, &DataType::Int64, body.len()),
+            Err(ContributionCodecError::NonCanonicalPayload)
         );
     }
 }
