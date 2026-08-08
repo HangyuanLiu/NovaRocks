@@ -328,12 +328,11 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
             ),
             statistics_pin: None,
             planning_lease: Some(planning_lease),
-            scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-                table: table.clone(),
-                files: Vec::new(),
-                binding:
-                    novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-            }),
+            // This token represents a terminal write target, not a read
+            // source.  Do not invent a synthetic Iceberg file scan merely to
+            // prove admission; the provider-owned write table below is the
+            // exact SQL write-target contract.
+            scan_materialization: None,
             iceberg_write_table: Some(table),
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),

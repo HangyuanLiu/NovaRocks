@@ -578,11 +578,8 @@ impl QueryTableBindingStore {
                 "SQL write target {catalog}.{namespace}.{table} was not admitted into this query binding store"
             ));
         };
-        match binding.scan_materialization.as_ref() {
-            Some(
-                QueryScanMaterialization::IcebergDataFiles { .. }
-                | QueryScanMaterialization::IcebergMvTarget { .. },
-            ) => {
+        match binding.iceberg_write_table.as_ref() {
+            Some(_) => {
                 let ScanSource::Sql(source) = &binding.resolved.planner.source;
                 Ok(source.binding)
             }
