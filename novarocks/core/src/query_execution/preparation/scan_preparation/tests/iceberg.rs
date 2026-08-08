@@ -182,6 +182,7 @@ fn sqlx2_scan_metadata_recovers_exact_request_local_materialization() {
                             metadata_payload: None,
                         },
                     ),
+                    iceberg_write_table: None,
                     frozen_snapshot_files: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })

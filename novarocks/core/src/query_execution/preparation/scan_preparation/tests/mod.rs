@@ -201,6 +201,7 @@ fn fixture_query_table_bindings_with_materialized_files(
                     statistics_pin: None,
                     planning_lease: planning_lease.clone(),
                     scan_materialization: Some(scan_materialization),
+                    iceberg_write_table: None,
                     frozen_snapshot_files,
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })

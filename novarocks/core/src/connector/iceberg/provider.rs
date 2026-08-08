@@ -566,6 +566,45 @@ impl IcebergReadOnlyConnectorInstance {
                 "Iceberg split does not belong to this installed instance incarnation",
             ));
         }
+        if let Some(metadata) = payload.metadata {
+            let shared_payload = encode_payload(
+                &IcebergPreparedSplitSharedPayload {
+                    version: ICEBERG_PREPARED_SPLIT_SHARED_V2,
+                    owner_instance_id: payload.owner_instance_id,
+                    incarnation: payload.incarnation,
+                    namespace: payload.namespace,
+                    table: payload.table,
+                    snapshot_id: payload.snapshot_id,
+                    table_uuid: payload.table_uuid,
+                    schema_id: payload.schema_id,
+                    projection: payload.projection,
+                    limit: payload.limit,
+                    physical_predicates: payload.physical_predicates,
+                    fact_columns: payload.fact_columns,
+                    name_mapping: payload.name_mapping,
+                    delta: payload.delta,
+                    distributed_rewrite_position: payload.distributed_rewrite_position,
+                    metadata: Some(metadata),
+                },
+                "prepared metadata split shared payload",
+                request.context.max_handle_payload_bytes(),
+            )?;
+            let descriptor = ConnectorPreparedScanUnitDescriptor::try_new(
+                Bytes::new(),
+                None,
+                ConnectorScanUnitDomainFacts::missing(
+                    novarocks_spi::connector::ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                ),
+            )?;
+            return ConnectorPreparedScanUnitSet::try_new_with_preparation_evidence(
+                self.key.clone(),
+                split,
+                shared_payload,
+                vec![descriptor],
+                Some("metadata"),
+                &request,
+            );
+        }
         if payload.units.is_empty() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -602,6 +641,7 @@ impl IcebergReadOnlyConnectorInstance {
                 name_mapping: payload.name_mapping,
                 delta: payload.delta,
                 distributed_rewrite_position: payload.distributed_rewrite_position,
+                metadata: None,
             },
             "prepared split shared payload",
             request.context.max_handle_payload_bytes(),
@@ -672,6 +712,24 @@ impl IcebergReadOnlyConnectorInstance {
             unit.shared_payload(),
             "Iceberg prepared split shared payload",
         )?;
+        if let Some(metadata) = shared.metadata {
+            if shared.owner_instance_id != self.key.instance_id.as_str()
+                || shared.incarnation != self.key.incarnation.to_bytes()
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg metadata prepared unit does not belong to this installed instance incarnation",
+                ));
+            }
+            return super::metadata::open_metadata_connector_reader(
+                metadata.metadata_table_type,
+                metadata.serialized_table,
+                metadata.serialized_payload,
+                request.expected_schema.clone(),
+                request.batch,
+                request.context,
+            );
+        }
         let prepared: IcebergPreparedUnitPayload =
             decode_payload(unit.payload(), "Iceberg prepared scan unit")?;
         validate_prepared_payload(&shared, &prepared)?;
@@ -3872,7 +3930,6 @@ impl ConnectorMetadata for IcebergControlProvider {
             resolve_table_request(&requested_table, request.resolution)?;
         let loaded =
             load_table(&entry, &request.table.namespace, &table_name).map_err(map_iceberg_error)?;
-        let schema = self.schema_for(&entry, &request.table.namespace, &table_name, &[])?;
         let version = Some(Bytes::copy_from_slice(
             &loaded.table.metadata().current_schema_id().to_le_bytes(),
         ));
@@ -3887,6 +3944,11 @@ impl ConnectorMetadata for IcebergControlProvider {
             loaded,
             metadata_table_type,
         )?;
+        let schema = if table.metadata_table_type.is_some() {
+            self.metadata_schema(&table, &[])?
+        } else {
+            self.schema_for(&entry, &request.table.namespace, &table_name, &[])?
+        };
         Ok(ConnectorTableMetadata {
             identity: novarocks_spi::connector::ConnectorTableIdentity {
                 instance_id: self.instance_id.clone(),
@@ -4736,6 +4798,9 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                     &table.table,
                     &request.projection,
                 )?,
+            _ if table.metadata_table_type.is_some() => {
+                self.metadata_schema(&table, &request.projection)?
+            }
             _ => self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?,
         };
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
@@ -4789,6 +4854,9 @@ impl ConnectorScanPlanning for IcebergControlProvider {
     ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
         self.validate_context(&request.context)?;
         let scan = self.scan_payload(scan)?;
+        if scan.table.metadata_table_type.is_some() {
+            return self.plan_metadata_splits(scan, request);
+        }
         let files = match (&scan.table.explicit_files, scan.snapshot_id) {
             (Some(files), _) => files.clone(),
             (None, None) => Vec::new(),
@@ -4966,6 +5034,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                     name_mapping: name_mapping.clone(),
                     delta: None,
                     distributed_rewrite_position: None,
+                    metadata: None,
                 };
                 let index = splits.len();
                 push_split_with_budget(
@@ -5011,6 +5080,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 name_mapping: name_mapping.clone(),
                 delta: None,
                 distributed_rewrite_position: None,
+                metadata: None,
             };
             push_split_with_budget(
                 &mut splits,
@@ -5043,6 +5113,144 @@ impl ConnectorScanPlanning for IcebergControlProvider {
 }
 
 impl IcebergControlProvider {
+    fn metadata_schema(
+        &self,
+        table: &TablePayload,
+        projection: &[usize],
+    ) -> Result<SchemaRef, ConnectorError> {
+        let metadata_table_type = table.metadata_table_type.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata schema requires a metadata table type",
+            )
+        })?;
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg metadata alias is missing its frozen table information",
+            )
+        })?;
+        let columns = crate::engine::query_stats::metadata_columns_for_table(
+            sql_metadata_table_kind(metadata_table_type),
+            table_info,
+        )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+        let fields = columns
+            .into_iter()
+            .map(|column| Field::new(column.name, column.data_type, column.nullable))
+            .collect::<Vec<_>>();
+        let fields = if projection.is_empty() {
+            fields
+        } else {
+            projection
+                .iter()
+                .map(|index| {
+                    fields.get(*index).cloned().ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            format!(
+                                "metadata projection index {index} is outside the visible schema"
+                            ),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
+    fn plan_metadata_splits(
+        &self,
+        scan: ScanPayload,
+        request: ConnectorSplitPlanningRequest,
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+        let metadata_table_type = scan.table.metadata_table_type.clone().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata split planning requires a metadata table type",
+            )
+        })?;
+        let table = scan.table.table_info.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg metadata split is missing frozen table information",
+            )
+        })?;
+        let serialized_table = table.serialized_metadata.clone().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg metadata split is missing serialized table metadata",
+            )
+        })?;
+        let serialized_payload = match &metadata_table_type {
+            super::metadata::IcebergMetadataTableType::Files
+            | super::metadata::IcebergMetadataTableType::Manifests
+            | super::metadata::IcebergMetadataTableType::LogicalIcebergMetadata => {
+                table.serialized_metadata_rows.clone().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "Iceberg metadata split is missing its frozen metadata rows",
+                    )
+                })?
+            }
+            super::metadata::IcebergMetadataTableType::Snapshots
+            | super::metadata::IcebergMetadataTableType::History
+            | super::metadata::IcebergMetadataTableType::Refs => String::new(),
+            super::metadata::IcebergMetadataTableType::Partitions => {
+                crate::engine::query_stats::metadata_payload(
+                    crate::sql::planner::table::SqlMetadataTableKind::Partitions,
+                    table,
+                    &scan.table.prepared_files,
+                )
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?
+                .unwrap_or_default()
+            }
+        };
+        let payload = SplitPayload {
+            version: ICEBERG_SPLIT_V5,
+            owner_instance_id: self.instance_id.as_str().to_string(),
+            incarnation: self.incarnation.to_bytes(),
+            namespace: scan.table.namespace,
+            table: scan.table.table,
+            snapshot_id: scan.snapshot_id,
+            table_uuid: scan.table_uuid,
+            schema_id: table.schema_id.into(),
+            units: Vec::new(),
+            projection: scan.projection,
+            limit: scan.limit,
+            physical_predicates: Vec::new(),
+            fact_columns: Vec::new(),
+            name_mapping: None,
+            delta: None,
+            distributed_rewrite_position: None,
+            metadata: Some(IcebergMetadataSplitPayloadV1 {
+                metadata_table_type,
+                serialized_table,
+                serialized_payload,
+            }),
+        };
+        let mut splits = Vec::new();
+        let mut total_payload_bytes = 0;
+        push_split_with_budget(
+            &mut splits,
+            &mut total_payload_bytes,
+            self.instance_id.clone(),
+            "iceberg-metadata-0".to_string(),
+            &payload,
+            None,
+            &request.context,
+        )?;
+        ConnectorSplitPlanningResult::try_new(
+            splits,
+            ConnectorSplitPlanningMetrics {
+                candidate_units_considered: 1,
+                candidate_units_pruned: 0,
+                composite_splits_planned: 1,
+                scan_units_planned: 1,
+            },
+        )
+    }
+
     fn plan_frozen_rewrite_position_splits(
         &self,
         scan: ScanPayload,
@@ -5128,6 +5336,7 @@ impl IcebergControlProvider {
                 version: ICEBERG_REWRITE_POSITION_SPLIT_V1,
                 selected_delete_files: selected,
             }),
+            metadata: None,
         };
         let mut splits = Vec::new();
         let mut payload_bytes = 0usize;
@@ -5533,6 +5742,15 @@ struct SplitPayload {
     delta: Option<IcebergDeltaSplitPayload>,
     #[serde(default)]
     distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
+    #[serde(default)]
+    metadata: Option<IcebergMetadataSplitPayloadV1>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct IcebergMetadataSplitPayloadV1 {
+    metadata_table_type: super::metadata::IcebergMetadataTableType,
+    serialized_table: String,
+    serialized_payload: String,
 }
 
 /// FE-frozen physical leaf. The outer split is intentionally a composite
@@ -5564,6 +5782,7 @@ struct IcebergPreparedSplitSharedPayload {
     name_mapping: Option<String>,
     delta: Option<IcebergDeltaSplitPayload>,
     distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
+    metadata: Option<IcebergMetadataSplitPayloadV1>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -6535,6 +6754,34 @@ fn metadata_table_name(metadata_type: &super::IcebergMetadataTableType) -> &'sta
     }
 }
 
+fn sql_metadata_table_kind(
+    metadata_type: &super::IcebergMetadataTableType,
+) -> crate::sql::planner::table::SqlMetadataTableKind {
+    match metadata_type {
+        super::IcebergMetadataTableType::Files => {
+            crate::sql::planner::table::SqlMetadataTableKind::Files
+        }
+        super::IcebergMetadataTableType::Manifests => {
+            crate::sql::planner::table::SqlMetadataTableKind::Manifests
+        }
+        super::IcebergMetadataTableType::LogicalIcebergMetadata => {
+            crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata
+        }
+        super::IcebergMetadataTableType::Snapshots => {
+            crate::sql::planner::table::SqlMetadataTableKind::Snapshots
+        }
+        super::IcebergMetadataTableType::History => {
+            crate::sql::planner::table::SqlMetadataTableKind::History
+        }
+        super::IcebergMetadataTableType::Refs => {
+            crate::sql::planner::table::SqlMetadataTableKind::Refs
+        }
+        super::IcebergMetadataTableType::Partitions => {
+            crate::sql::planner::table::SqlMetadataTableKind::Partitions
+        }
+    }
+}
+
 pub(crate) fn plan_scan_files(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
@@ -6906,6 +7153,7 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
                 delete_side: delete_side.cloned(),
             }),
             distributed_rewrite_position: None,
+            metadata: None,
         };
         push_split_with_budget(
             &mut splits,
@@ -8053,6 +8301,7 @@ mod tests {
             name_mapping: None,
             delta: None,
             distributed_rewrite_position: None,
+            metadata: None,
         };
 
         let encoded = serde_json::to_vec(&payload).expect("encode split payload");
@@ -8095,6 +8344,7 @@ mod tests {
             name_mapping: Some(r#"[{"field-id":1,"names":["legacy_id"]}]"#.to_string()),
             delta: None,
             distributed_rewrite_position: None,
+            metadata: None,
         };
         validate_split_payload(&payload).expect("canonical V5 mapping");
         assert!(payload.name_mapping.is_some());
@@ -8133,6 +8383,7 @@ mod tests {
             name_mapping: None,
             delta: None,
             distributed_rewrite_position: None,
+            metadata: None,
         };
         let first = payload("first");
         let second = payload("second");
@@ -8214,6 +8465,7 @@ mod tests {
                 name_mapping: None,
                 delta: None,
                 distributed_rewrite_position: None,
+                metadata: None,
             })
             .collect::<Vec<_>>();
         let lengths = split_payloads
@@ -8465,6 +8717,7 @@ fn planned_table_files_fixture_binding(
                                 name_mapping: None,
                                 delta: None,
                                 distributed_rewrite_position: None,
+                                metadata: None,
                             },
                             "fixture split",
                             request.context.max_handle_payload_bytes(),

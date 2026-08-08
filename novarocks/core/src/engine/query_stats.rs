@@ -314,28 +314,9 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 table,
                 iceberg_metadata_table_type,
             )?;
-        let table_info = materialization.table;
-        let files = materialization.files;
-        let columns = metadata_columns_for_table(metadata_table_type, &table_info)?;
-        let columns = columns
-            .into_iter()
-            .map(|column| novarocks_catalog::schema::ColumnDef {
-                name: column.name,
-                data_type: column.data_type,
-                nullable: column.nullable,
-                write_default: None,
-                logical_type: None,
-            })
-            .collect::<Vec<_>>();
-        let serialized_table = table_info.serialized_metadata.clone().ok_or_else(|| {
-            format!(
-                "iceberg metadata table {catalog}.{namespace}.{table} has no serialized metadata"
-            )
-        })?;
-        let metadata_payload = metadata_payload(metadata_table_type, &table_info, &files)?;
         let planner = crate::sql::planner::table::TableDef {
             name: materialization.table_name,
-            columns,
+            columns: materialization.columns,
             iceberg_row_lineage_metadata_columns: materialization
                 .iceberg_row_lineage_metadata_columns,
             source: ScanSource::Sql(SqlScanSource::new(
@@ -353,13 +334,14 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         };
         Ok(QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-            statistics_pin: materialization.statistics_pin,
-            planning_lease: Some(materialization.planning_lease),
-            scan_materialization: Some(QueryScanMaterialization::IcebergMetadata {
-                table: table_info,
-                metadata_table_type,
-                serialized_table,
-                metadata_payload,
+            statistics_pin: materialization.statistics_pin.clone(),
+            planning_lease: Some(materialization.planning_lease.clone()),
+            scan_materialization: Some(QueryScanMaterialization::ConnectorRead {
+                table: materialization.read_table,
+                schema: materialization.read_schema,
+                selector: materialization.read_selector,
+                statistics_pin: materialization.statistics_pin,
+                planning_lease: materialization.planning_lease,
             }),
             iceberg_write_table: None,
             frozen_snapshot_files: std::collections::BTreeMap::new(),
@@ -368,7 +350,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
     }
 }
 
-fn metadata_payload(
+pub(crate) fn metadata_payload(
     kind: SqlMetadataTableKind,
     table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     files: &[novarocks_connector_iceberg::scan_model::IcebergDataFileInfo],
@@ -459,7 +441,7 @@ fn metadata_payload(
     }
 }
 
-fn metadata_columns_for_table(
+pub(crate) fn metadata_columns_for_table(
     kind: SqlMetadataTableKind,
     table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<Vec<crate::sql::analyzer::iceberg_metadata::MetadataColumn>, String> {

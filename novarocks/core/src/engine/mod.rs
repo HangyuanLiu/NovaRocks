@@ -75,7 +75,7 @@ pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
 pub(crate) mod query_planning;
 pub(crate) mod query_prep;
-mod query_stats;
+pub(crate) mod query_stats;
 pub(crate) mod statement;
 pub mod statistics;
 pub mod statistics_application;

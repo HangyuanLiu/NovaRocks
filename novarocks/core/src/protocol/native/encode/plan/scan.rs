@@ -27,9 +27,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::super::expr::encode_sort_items;
 use super::output::{encode_output_column, encode_output_columns};
-use super::type_mapping::{
-    encode_edge_partition_type, encode_iceberg_metadata_table_type, encode_sql_type,
-};
+use super::type_mapping::{encode_edge_partition_type, encode_sql_type};
 use super::{NativePlanEncodeContext, encode_exprs, optional_context_ref};
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
@@ -597,7 +595,10 @@ fn scan_binding_for_source<'a>(
                 )
             }
             table_model::SqlScanKind::Metadata { .. } => {
-                matches!(binding.execution, ResolvedScanExecution::IcebergMetadata(_))
+                matches!(
+                    binding.execution,
+                    ResolvedScanExecution::AdmittedConnectorRead(_)
+                )
             }
         },
     };
@@ -630,7 +631,7 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
         ResolvedScanExecution::ConnectorRead => "ConnectorRead",
         ResolvedScanExecution::AdmittedConnectorRead(_) => "AdmittedConnectorRead",
         ResolvedScanExecution::IcebergFiles(_) => "IcebergFiles",
-        ResolvedScanExecution::IcebergMetadata(_) => "IcebergMetadata",
+        ResolvedScanExecution::IcebergMetadata(_) => "LegacyIcebergMetadata",
         ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
     }
 }
@@ -728,38 +729,6 @@ fn encode_scan_source(
                         target_snapshot_id: facts.target_snapshot_id,
                         apply_key_column: facts.apply_key_column.clone(),
                         branch_id_column: facts.branch_id_column.clone(),
-                    })
-                }
-                table_model::SqlScanKind::Metadata { kind, .. } => {
-                    let binding = binding.ok_or_else(|| {
-                        format!(
-                            "native SQL metadata scan node_id={} has no prepared binding",
-                            scan_node_id
-                                .map(|node_id| node_id.to_string())
-                                .unwrap_or_else(|| "<none>".to_string())
-                        )
-                    })?;
-                    let ResolvedScanExecution::IcebergMetadata(metadata) = &binding.execution
-                    else {
-                        return Err(format!(
-                            "native SQL metadata scan node_id={} has non-metadata prepared execution",
-                            binding.node_id
-                        ));
-                    };
-                    if kind != &metadata.metadata_table_type {
-                        return Err(format!(
-                            "native SQL metadata scan node_id={} kind differs from its exact binding",
-                            binding.node_id
-                        ));
-                    }
-                    Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
-                        table: Some(encode_iceberg_table_info(&metadata.table)?),
-                        metadata_table_type: encode_iceberg_metadata_table_type(
-                            &metadata.metadata_table_type,
-                        ),
-                        serialized_table: metadata.serialized_table.clone(),
-                        cloud_properties: Default::default(),
-                        metadata_payload: metadata.metadata_payload.clone(),
                     })
                 }
                 _ => {

@@ -138,53 +138,28 @@ fn sort_item() -> expr::SortItem {
 }
 
 fn iceberg_table(table: &str, file_count: usize) -> plan::TableDef {
-    let table_info = plan::IcebergTableInfo {
-        catalog: "rest".to_string(),
-        namespace: "tpch".to_string(),
-        table: table.to_string(),
-        table_uuid: Some(format!("uuid-{table}")),
-        current_snapshot_id: Some(10),
-        schema_id: 1,
-        location: format!("s3://warehouse/{table}"),
-        schema: Some(plan::IcebergSchemaDef {
-            fields: vec![plan::IcebergSchemaFieldDef {
-                field_id: 1,
-                name: "id".to_string(),
-                initial_default_json: None,
-                write_default_json: None,
-                children: vec![],
-            }],
-        }),
-        serialized_metadata: None,
-        serialized_metadata_rows: None,
-    };
-
     plan::TableDef {
         name: table.to_string(),
         columns: vec![column_def("id", common::PrimitiveType::Bigint)],
         iceberg_row_lineage_metadata_columns: vec![],
         source: Some(plan::ScanSource {
-            kind: Some(plan::scan_source::Kind::IcebergDataFiles(
-                plan::IcebergDataFiles {
-                    table: Some(table_info),
-                    files: (0..file_count)
-                        .map(|idx| plan::IcebergDataFileInfo {
-                            path: format!("s3://warehouse/{table}/data-{idx}.parquet"),
-                            size: 1024,
-                            row_count: Some(10),
-                            column_stats: None,
-                            partition_spec_id: Some(0),
-                            partition_key: None,
-                            first_row_id: Some(idx as i64 * 10),
-                            data_sequence_number: Some(1),
-                            ivm_change_op: None,
-                            included_positions: None,
-                            delete_files: vec![],
-                            manifest_path: Some("manifest.avro".to_string()),
-                            partition_values: vec![],
+            kind: Some(plan::scan_source::Kind::ConnectorRead(
+                plan::ConnectorReadSource {
+                    instance_id: "rest".to_string(),
+                    instance_incarnation: vec![1; 16],
+                    scan_payload: table.as_bytes().to_vec(),
+                    splits: (0..file_count)
+                        .map(|idx| plan::ConnectorReadSplit {
+                            split_id: format!("{table}-{idx}"),
+                            split_payload: Vec::new(),
+                            estimated_bytes: Some(1024),
                         })
                         .collect(),
-                    binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+                    max_batch_rows: 1024,
+                    max_batch_bytes: 1_048_576,
+                    max_handle_payload_bytes: 1_048_576,
+                    max_total_payload_bytes: 8_388_608,
+                    expected_schema_ipc: Vec::new(),
                 },
             )),
         }),
@@ -305,7 +280,7 @@ fn node_from_proto(proto: &plan::DistributedNode) -> Result<INode, String> {
                     let table = scan.table.as_ref().ok_or("ScanNode.table missing")?;
                     let source = table.source.as_ref().ok_or("TableDef.source missing")?;
                     let file_count = match source.kind.as_ref().ok_or("ScanSource.kind missing")? {
-                        plan::scan_source::Kind::IcebergDataFiles(files) => files.files.len(),
+                        plan::scan_source::Kind::ConnectorRead(source) => source.splits.len(),
                         other => return Err(format!("unexpected scan source: {other:?}")),
                     };
                     IPayload::Scan {
