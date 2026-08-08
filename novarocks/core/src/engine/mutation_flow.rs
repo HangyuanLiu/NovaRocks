@@ -2045,13 +2045,14 @@ fn build_cow_rewrite_query_local_overlay(
     // request-local overlay instead of rejecting the schema-only materialization
     // because its default snapshot is main.
     materialization.table.current_snapshot_id = Some(base_snapshot_id);
-    materialization.files = vec![
-        crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
-            data_file,
-        ),
-    ];
-    materialization.binding =
-        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles;
+    materialization = materialization.with_frozen_files(
+        vec![
+            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
+                data_file,
+            ),
+        ],
+        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(base_snapshot_id),
+    )?;
     // The single-file scan must expose `_row_id` / `_last_updated_sequence_number`
     // for the rewrite projection; the table is v3 row-lineage (COW mode was
     // selected) and the file carries `first_row_id`, so the builder advertises

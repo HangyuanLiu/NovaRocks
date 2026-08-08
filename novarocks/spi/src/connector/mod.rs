@@ -108,11 +108,11 @@ pub use handle::{
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
 pub use metadata::{
-    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorReadNamedReference,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
-    ConnectorReadSnapshotLogEntry, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableRequest, ConnectorTableResolution,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
+    ConnectorReadNamedReference, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry, ConnectorTableIdentity,
+    ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
 };
 pub use metadata_maintenance::{
     CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMetadataMaintenance,

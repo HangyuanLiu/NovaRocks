@@ -5660,7 +5660,12 @@ fn iceberg_metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, Co
                     ));
                 }
             };
-            Ok(Arc::new(Field::new(name, data_type, nullable)))
+            Ok(Arc::new(
+                Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+                    novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
+                    "true".to_string(),
+                )])),
+            ))
         })
         .collect()
 }
@@ -7428,6 +7433,22 @@ mod tests {
         assert!(payload.explicit_files.is_some());
         assert_eq!(payload.explicit_files.as_ref().map(Vec::len), Some(0));
         assert!(payload.prepared_files.is_empty());
+    }
+
+    #[test]
+    fn spi5b_row_lineage_read_fields_are_hidden_from_sql_targets() {
+        let fields = iceberg_metadata_arrow_fields(&[
+            "_file".to_string(),
+            "_pos".to_string(),
+            "_row_id".to_string(),
+        ])
+        .expect("known row-lineage fields");
+        assert!(fields.iter().all(|field| {
+            field
+                .metadata()
+                .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                .is_some_and(|value| value == "true")
+        }));
     }
 
     #[test]

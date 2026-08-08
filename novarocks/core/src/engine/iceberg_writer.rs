@@ -1082,14 +1082,30 @@ pub(crate) fn build_iceberg_write_plan(
     entry: &IcebergCatalogEntry,
 ) -> Result<(sqlparser::ast::Query, IcebergWriteSinkSpec), String> {
     let write_columns = iceberg_insert_columns_from_schema(table.metadata().current_schema())?;
-    let query = append_source_to_query_for_write(
-        source,
-        insert_columns,
-        &resolved.columns,
-        &write_columns,
-    )?;
+    let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
+    let query =
+        append_source_to_query_for_write(source, insert_columns, &source_columns, &write_columns)?;
     let sink_spec = build_insert_write_sink_spec(target, resolved, table, entry, &write_columns)?;
     Ok((query, sink_spec))
+}
+
+/// A connector read schema can carry execution-only fields (for example
+/// row-lineage fields) alongside SQL target columns.  INSERT shaping is owned
+/// by the SQL write target contract, so retain only the columns that exist in
+/// that contract before assigning derived-query aliases.
+fn sql_write_source_columns(
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+) -> Vec<ColumnDef> {
+    source_columns
+        .iter()
+        .filter(|source| {
+            write_columns
+                .iter()
+                .any(|target| target.name.eq_ignore_ascii_case(&source.name))
+        })
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn build_insert_write_sink_spec(
@@ -2693,6 +2709,29 @@ mod tests {
         assert_eq!(
             row,
             vec!["CAST(1 AS INT)", "CAST(NULL AS STRING)", "CAST(10 AS INT)"]
+        );
+    }
+
+    #[test]
+    fn spi5b_write_projection_excludes_execution_only_read_fields() {
+        let source_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("value", DataType::Utf8, None),
+            test_column("_file", DataType::Utf8, None),
+            test_column("_pos", DataType::Int64, None),
+        ];
+        let write_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("value", DataType::Utf8, None),
+        ];
+
+        let source = sql_write_source_columns(&source_columns, &write_columns);
+        assert_eq!(
+            source
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "value"]
         );
     }
 

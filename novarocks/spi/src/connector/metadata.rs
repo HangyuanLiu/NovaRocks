@@ -25,6 +25,12 @@ use super::{
     StatisticsDataVersion,
 };
 
+/// Arrow field metadata key for connector fields that participate in a read
+/// schema but must not be exposed as SQL target columns.  Core preserves the
+/// field and its ordinal for connector scan planning, while generic DML
+/// admission omits it from SQL-owned write shaping.
+pub const CONNECTOR_FIELD_HIDDEN_FROM_SQL: &str = "novarocks.connector.hidden_from_sql";
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConnectorNamespaceIdentity {
     pub instance_id: ConnectorInstanceId,
