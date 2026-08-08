@@ -5641,6 +5641,54 @@ pub(crate) struct IcebergQueryTableMaterialization {
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
+impl IcebergQueryTableMaterialization {
+    /// Freeze an already admitted Iceberg file set into a new provider-owned
+    /// opaque handle.  Callers never decode or rebuild the handle: MV target
+    /// partition filtering may choose a subset of files, but only this
+    /// provider boundary is allowed to turn that selection into read
+    /// authority for generic connector planning.
+    pub(crate) fn with_frozen_files(
+        &self,
+        files: Vec<IcebergDataFileInfo>,
+        selector: ConnectorReadSelector,
+    ) -> Result<Self, String> {
+        let mut payload: TablePayload =
+            decode_payload(self.read_table.payload(), "Iceberg admitted table handle")
+                .map_err(|error| error.to_string())?;
+        if payload.metadata_table_type.is_some() {
+            return Err(
+                "Iceberg metadata aliases cannot be materialized as MV target files".to_string(),
+            );
+        }
+        payload.explicit_files = Some(files.clone());
+        payload.prepared_files = files;
+        let table = ConnectorTableHandle::try_new(
+            self.read_table.owner().clone(),
+            encode_payload(
+                &payload,
+                "Iceberg frozen read table",
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            table_name: self.table_name.clone(),
+            schema_id: self.schema_id,
+            columns: self.columns.clone(),
+            iceberg_row_lineage_metadata_columns: self.iceberg_row_lineage_metadata_columns.clone(),
+            read_table: table,
+            read_schema: self.read_schema.clone(),
+            read_selector: selector,
+            table: self.table.clone(),
+            files: Vec::new(),
+            binding: IcebergDataFileBinding::ExplicitFiles,
+            statistics_pin: self.statistics_pin.clone(),
+            planning_lease: self.planning_lease.clone(),
+        })
+    }
+}
+
 /// A bounded reference to an Iceberg-owned rewrite artifact.  It is the only
 /// special table handle C1 needs: the detailed file list is rehydrated by the
 /// FE provider, then reaches BEs through ordinary opaque Iceberg splits.
