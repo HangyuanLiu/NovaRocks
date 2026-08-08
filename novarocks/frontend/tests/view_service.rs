@@ -724,7 +724,7 @@ async fn external_view_qualification_preserves_ctes_inside_nested_queries() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rewrite_keeps_tables_and_table_probe_failures_and_reports_view_cycles() {
+async fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_result() {
     let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
         .await
         .unwrap();

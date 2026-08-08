@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn native_connector_read_carrier_resolves_the_typed_host_and_executes_its_split() {
+    fn spi5b_native_connector_read_carrier_resolves_the_typed_host_and_executes_its_split() {
         let node = scan_node(plan::scan_source::Kind::ConnectorRead(
             plan::ConnectorReadSource {
                 instance_id: "test.native".to_string(),
