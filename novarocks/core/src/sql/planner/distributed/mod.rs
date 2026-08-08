@@ -43,11 +43,11 @@ pub use boundary::{BoundaryCatalog, ExecutionColumnIdAllocator};
 pub(crate) use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
 pub use fragment::{DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 pub use fragment::{DataSink, PartitionKind, PlanFragment};
+pub(crate) use node::distributed_kind_from_physical;
 pub use node::{
     DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
     distributed_kind_to_physical,
 };
-pub(crate) use node::distributed_kind_from_physical;
 pub use output::{
     ConnectorWriteOutputContract, FinalizedAggregateLayout, FragmentEdgeOutputCatalog,
     NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, WriteContractCatalog,

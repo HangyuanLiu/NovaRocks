@@ -21,11 +21,11 @@ use super::expr::encode_expr;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::preparation::scan::ScanExecutionBindings;
-use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
-use crate::sql::planner::distributed::{
+use crate::sql::plan_read::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
     FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentStreamKind, NodeExecutionColumn,
-    NodeOutputCatalog, PlanFragment, WriteContractCatalog,
+    NodeOutputCatalog, OutputColumn as AnalysisOutputColumn, PlanFragment, TypedExpr,
+    WriteContractCatalog, distributed_kind_to_physical,
 };
 use novarocks_protocol::{common, plan};
 
@@ -216,7 +216,7 @@ pub(super) fn encode_node_with_context(
             )?)
         }
         other => {
-            let physical = crate::sql::planner::distributed::distributed_kind_to_physical(other);
+            let physical = distributed_kind_to_physical(other);
             plan::distributed_node::Payload::Physical(encode_physical_node(
                 &physical,
                 src.node_id,
@@ -242,9 +242,7 @@ pub(super) fn encode_node_with_context(
     Ok(node)
 }
 
-fn encode_exprs(
-    src: &[crate::sql::analysis::TypedExpr],
-) -> Result<Vec<novarocks_protocol::expr::Expr>, String> {
+fn encode_exprs(src: &[TypedExpr]) -> Result<Vec<novarocks_protocol::expr::Expr>, String> {
     src.iter().map(encode_expr).collect()
 }
 

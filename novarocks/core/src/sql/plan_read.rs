@@ -20,6 +20,7 @@
 //! This is the single public SQL plan reading surface. Construction, draft
 //! mutation, sealing, and validation remain private to the SQL compiler.
 
+pub use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 pub use crate::sql::column_id::ColumnId;
 pub use crate::sql::common::change_stream::ChangeStreamBranchKind;
 pub use crate::sql::common::expr::{
@@ -27,24 +28,19 @@ pub use crate::sql::common::expr::{
 };
 pub use crate::sql::common::plan_hints::{ScanVariantColumn, SqlTopNType};
 pub use crate::sql::common::schema::OutputColumn;
-pub use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 pub use crate::sql::planner::distributed::write::{
     ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding,
 };
 pub use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentId,
-    FragmentStreamKind, NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog,
-    PartitionKind, PlanFragment, WriteContractCatalog, distributed_kind_to_physical,
+    FragmentStreamKind, NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, PartitionKind,
+    PlanFragment, WriteContractCatalog, distributed_kind_to_physical,
 };
 pub use crate::sql::planner::payload::{PlanRowCountAssertion, PlanScanNode};
-pub use crate::sql::planner::physical::node::{
-    PhysicalPlanKind, PlanSetOpKind, RedistributeMode,
-};
+pub use crate::sql::planner::physical::node::{PhysicalPlanKind, PlanSetOpKind, RedistributeMode};
 pub use crate::sql::planner::physical::runtime_filter::JoinExecutionMode;
-pub use crate::sql::planner::physical::vocab::{
-    AggMode, HashSource, JoinDistribution, TopNPhase,
-};
+pub use crate::sql::planner::physical::vocab::{AggMode, HashSource, JoinDistribution, TopNPhase};
 
 /// Read-only SQL table facts used by plan encoders.
 pub mod table {
@@ -56,7 +52,7 @@ pub mod table {
 
 /// Read-only runtime-filter planning facts used by plan encoders.
 pub mod runtime_filter {
-    pub use crate::runtime_filter::model::contract::{
+    pub use crate::sql::planner::runtime_filter::contract::{
         ArtifactCapability, CompletionFenceKind, CompletionRequirement, ConsumerActivation,
         ContributionKind, LateApplyGranularity,
     };

@@ -17,10 +17,9 @@
 
 use super::type_mapping::{encode_change_stream_branch_kind, encode_data_partition, usize_to_u64};
 use super::{NativePlanEncodeContext, required_context_ref};
-use crate::sql::planner::distributed::FragmentId;
-use crate::sql::planner::distributed::write::change_stream::ChangeStreamRouterSink;
-use crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding;
-use crate::sql::planner::distributed::write::sink::ConnectorWriteFragmentSink;
+use crate::sql::plan_read::{
+    ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding, FragmentId,
+};
 use novarocks_protocol::{common, plan};
 
 /// Encode the generic writer envelope without inspecting the provider payload.

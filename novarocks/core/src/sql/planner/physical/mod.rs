@@ -31,6 +31,4 @@ pub(crate) use stats::{
     MAX_ROW_COUNT, PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic,
     PlannerConfidence, PlannerCostEstimate,
 };
-pub(crate) use vocab::{
-    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase,
-};
+pub(crate) use vocab::{AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase};

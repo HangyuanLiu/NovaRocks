@@ -31,7 +31,9 @@ pub(crate) use change_stream::{
     ChangeStreamRouteKey, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
 };
 pub use expr::LiteralValue;
-pub(crate) use expr::{BinOp, JoinKind, LambdaParam, UnOp, WindowBound, WindowFrame, WindowFrameType};
+pub(crate) use expr::{
+    BinOp, JoinKind, LambdaParam, UnOp, WindowBound, WindowFrame, WindowFrameType,
+};
 pub(crate) use imv::{ImvVersionRef, ImvVersionRole};
 pub(crate) use plan_hints::{ApplyKind, ScanVariantColumn, SqlTopNType};
 pub(crate) use row_lineage::{

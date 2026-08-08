@@ -21,8 +21,10 @@ use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
 use crate::protocol::native::type_mapping::encode_type;
-use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
-use crate::sql::common::{BinOp, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType};
+use crate::sql::plan_read::{
+    BinOp, ExprKind, LiteralValue, SortItem, TypedExpr, UnOp, WindowBound, WindowFrame,
+    WindowFrameType,
+};
 use novarocks_protocol::{common, expr};
 use novarocks_types::largeint;
 

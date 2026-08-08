@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 use crate::query_execution::preparation::PreparedFragmentSet;
-use crate::sql::planner::distributed::{DistributedPlan, FragmentId};
+use crate::sql::plan_read::{DistributedPlan, FragmentId};
 use novarocks_protocol::plan::PlanFragment as NativePlanFragment;
 
 pub(crate) struct NativeFragmentBundle {
