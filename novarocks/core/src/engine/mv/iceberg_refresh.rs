@@ -14291,7 +14291,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
         )?;
     let affected_materialization = materialization.with_frozen_files(affected_files, selector)?;
     let to_read = |materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization| {
-        QueryScanMaterialization::ConnectorRead {
+        QueryScanMaterialization {
             table: materialization.read_table.clone(),
             schema: materialization.read_schema.clone(),
             selector: materialization.read_selector,

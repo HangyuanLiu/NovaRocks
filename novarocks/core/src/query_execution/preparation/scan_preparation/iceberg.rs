@@ -113,7 +113,7 @@ pub(super) fn plan_connector_read(
     target_parallelism: std::num::NonZeroUsize,
     max_split_bytes: Option<std::num::NonZeroU64>,
 ) -> Result<PlannedConnectorRead, String> {
-    let QueryScanMaterialization::ConnectorRead {
+    let QueryScanMaterialization {
         table,
         schema,
         selector,

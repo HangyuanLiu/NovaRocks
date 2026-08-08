@@ -232,42 +232,15 @@ pub(crate) struct QueryTableBinding {
 /// callers are migrated to `SqlScanSource`; preparation must obtain it by the
 /// request-local binding token rather than from a planner table.
 #[derive(Clone)]
-pub(crate) enum QueryScanMaterialization {
+pub(crate) struct QueryScanMaterialization {
     /// Provider-neutral scan authority.  The handle is opaque to Core; the
     /// schema is the single projection-ordinal authority and the lease keeps
     /// the exact control generation alive until native preparation finishes.
-    ConnectorRead {
-        table: ConnectorTableHandle,
-        schema: SchemaRef,
-        selector: ConnectorReadSelector,
-        statistics_pin: Option<ResolvedTableStatisticsPin>,
-        planning_lease: ConnectorControlPlanningLease,
-    },
-    IcebergDataFiles {
-        table: IcebergTableInfo,
-        files: Vec<IcebergDataFileInfo>,
-        binding: IcebergDataFileBinding,
-    },
-    /// Exact target facts retained for one MV refresh.  SQL sees the binding
-    /// token and target-state/locator facts only; the provider table, frozen
-    /// files, and admission lease remain application-owned in this store.
-    ///
-    /// `frozen_snapshot_id` is separate from `table.current_snapshot_id`: the
-    /// latter is provider metadata and may be absent for the empty-target
-    /// bootstrap case, whereas the former is the refresh contract identity.
-    IcebergMvTarget {
-        table: IcebergTableInfo,
-        files: Vec<IcebergDataFileInfo>,
-        binding: IcebergDataFileBinding,
-        target_table_uuid: String,
-        frozen_snapshot_id: Option<i64>,
-        /// Admission-frozen facts for the aggregate target-state lane.  These
-        /// stay with the provider materialization rather than the SQL scan:
-        /// SQL only states whether an allow-list is required, while
-        /// preparation derives matching files from this exact file set.
-        target_state_partition_filter: crate::mv::model::TargetPartitionFilter,
-        target_partition_contract: Option<crate::mv::persistence::schema::MvPartitionContract>,
-    },
+    pub(crate) table: ConnectorTableHandle,
+    pub(crate) schema: SchemaRef,
+    pub(crate) selector: ConnectorReadSelector,
+    pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
 }
 
 #[derive(Clone)]
@@ -280,17 +253,11 @@ pub(crate) struct MvTargetReadAdmission {
 
 impl std::fmt::Debug for QueryScanMaterialization {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ConnectorRead {
-                table, selector, ..
-            } => formatter
-                .debug_struct("ConnectorRead")
-                .field("owner", table.owner())
-                .field("selector", selector)
-                .finish_non_exhaustive(),
-            Self::IcebergDataFiles { .. } => formatter.write_str("IcebergDataFiles(..)"),
-            Self::IcebergMvTarget { .. } => formatter.write_str("IcebergMvTarget(..)"),
-        }
+        formatter
+            .debug_struct("ConnectorRead")
+            .field("owner", self.table.owner())
+            .field("selector", &self.selector)
+            .finish_non_exhaustive()
     }
 }
 

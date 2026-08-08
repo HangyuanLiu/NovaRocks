@@ -164,7 +164,7 @@ fn fixture_query_table_bindings_with_materialized_files(
                         context: crate::connector::test_request_context(),
                     })
                     .map_err(|error| error.to_string())?;
-                let scan_materialization = QueryScanMaterialization::ConnectorRead {
+                let scan_materialization = QueryScanMaterialization {
                     table: metadata.table,
                     schema: metadata.schema,
                     selector: novarocks_spi::connector::ConnectorReadSelector::Current,
@@ -196,7 +196,7 @@ fn fixture_query_table_bindings_with_materialized_files(
                             .map_err(|error| error.to_string())?;
                         std::collections::BTreeMap::from([(
                             *snapshot_id,
-                            QueryScanMaterialization::ConnectorRead {
+                            QueryScanMaterialization {
                                 table: metadata.table,
                                 schema: metadata.schema,
                                 selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
@@ -219,8 +219,15 @@ fn fixture_query_table_bindings_with_materialized_files(
                     planning_lease: planning_lease.clone(),
                     scan_materialization: Some(scan_materialization.clone()),
                     mv_target_read: match &source.kind {
-                        SqlScanKind::MvTargetState { facts }
-                        | SqlScanKind::MvTargetLocator { facts } => Some(
+                        SqlScanKind::MvTargetState { facts } => Some(
+                            crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                                full: scan_materialization.clone(),
+                                affected_partitions: scan_materialization.clone(),
+                                target_table_uuid: facts.target_table_uuid.clone(),
+                                frozen_snapshot_id: facts.target_snapshot_id,
+                            },
+                        ),
+                        SqlScanKind::MvTargetLocator { facts } => Some(
                             crate::engine::query_planning::bindings::MvTargetReadAdmission {
                                 full: scan_materialization.clone(),
                                 affected_partitions: scan_materialization.clone(),

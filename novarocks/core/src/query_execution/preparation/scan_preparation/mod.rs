@@ -177,7 +177,7 @@ fn prepare_scan_node(
                         )
                     })?;
                 match materialization {
-                    connector @ QueryScanMaterialization::ConnectorRead { .. } => {
+                    connector @ QueryScanMaterialization { .. } => {
                         ResolvedScanExecution::AdmittedConnectorRead(connector)
                     }
                     _ => {
@@ -199,7 +199,7 @@ fn prepare_scan_node(
                 let materialization = query_table_bindings
                     .frozen_snapshot_materialization(source.binding, *snapshot_id)?;
                 match materialization {
-                    connector @ QueryScanMaterialization::ConnectorRead { .. } => {
+                    connector @ QueryScanMaterialization { .. } => {
                         ResolvedScanExecution::AdmittedConnectorRead(connector)
                     }
                     _ => {
@@ -233,7 +233,7 @@ fn prepare_scan_node(
                         )
                     })?;
                 match materialization {
-                    connector @ QueryScanMaterialization::ConnectorRead { .. } => {
+                    connector @ QueryScanMaterialization { .. } => {
                         ResolvedScanExecution::AdmittedConnectorRead(connector)
                     }
                     _ => {
@@ -315,8 +315,7 @@ fn prepare_scan_node(
             let static_predicates = options
                 .enable_connector_static_predicate_pushdown
                 .then(|| {
-                    let QueryScanMaterialization::ConnectorRead { schema, .. } = materialization
-                    else {
+                    let QueryScanMaterialization { schema, .. } = materialization else {
                         return Vec::new();
                     };
                     let connector_schema_fields = schema
@@ -398,7 +397,7 @@ fn prepare_scan_node(
                         source.table.catalog, source.table.namespace, source.table.table
                     )
                 })?;
-            let QueryScanMaterialization::ConnectorRead { table, .. } = materialization else {
+            let QueryScanMaterialization { table, .. } = materialization else {
                 return Err(format!(
                     "SQL delta scan binding for '{}.{}.{}' is missing its admitted connector read",
                     source.table.catalog, source.table.namespace, source.table.table

@@ -336,7 +336,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
             statistics_pin: materialization.statistics_pin.clone(),
             planning_lease: Some(materialization.planning_lease.clone()),
-            scan_materialization: Some(QueryScanMaterialization::ConnectorRead {
+            scan_materialization: Some(QueryScanMaterialization {
                 table: materialization.read_table,
                 schema: materialization.read_schema,
                 selector: materialization.read_selector,

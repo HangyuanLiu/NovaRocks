@@ -131,7 +131,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
         .map(|snapshot_id| {
             (
                 snapshot_id,
-                QueryScanMaterialization::ConnectorRead {
+                QueryScanMaterialization {
                     table: materialization.read_table.clone(),
                     schema: materialization.read_schema.clone(),
                     selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
@@ -147,7 +147,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
         resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
         statistics_pin: materialization.statistics_pin.clone(),
         planning_lease: Some(materialization.planning_lease.clone()),
-        scan_materialization: Some(QueryScanMaterialization::ConnectorRead {
+        scan_materialization: Some(QueryScanMaterialization {
             table: materialization.read_table,
             schema: materialization.read_schema,
             selector: materialization.read_selector,

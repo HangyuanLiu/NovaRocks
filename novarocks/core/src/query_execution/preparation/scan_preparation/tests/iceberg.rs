@@ -252,10 +252,8 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
     let selected = store
         .frozen_snapshot_materialization(source.binding, 11)
         .expect("select admitted snapshot files");
-    let crate::engine::query_planning::bindings::QueryScanMaterialization::ConnectorRead {
-        selector,
-        ..
-    } = selected
+    let crate::engine::query_planning::bindings::QueryScanMaterialization { selector, .. } =
+        selected
     else {
         panic!("frozen snapshot must retain neutral connector materialization");
     };
