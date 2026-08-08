@@ -7008,16 +7008,21 @@ fn plan_native_iceberg_read_with_bound_lease(
 pub(crate) fn plan_native_iceberg_delta_read_with_lease(
     lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    table: &ConnectorTableHandle,
     sources: &[novarocks_connector_iceberg::delta::DeltaSourceFile],
     delete_side: Option<&novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
     target_parallelism: NonZeroUsize,
     max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
+    let table_payload: TablePayload = decode_payload(table.payload(), "Iceberg delta table handle")
+        .map_err(|error| error.to_string())?;
+    let table = table_payload
+        .table_info
+        .ok_or_else(|| "Iceberg delta table handle is missing its table descriptor".to_string())?;
     let mut planned = plan_native_iceberg_read_with_lease(
         lease,
         context.clone(),
-        table,
+        &table,
         novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         &[],
         &[],

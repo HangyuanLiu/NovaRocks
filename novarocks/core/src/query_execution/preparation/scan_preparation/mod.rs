@@ -398,9 +398,9 @@ fn prepare_scan_node(
                         source.table.catalog, source.table.namespace, source.table.table
                     )
                 })?;
-            let QueryScanMaterialization::IcebergDataFiles { table, .. } = materialization else {
+            let QueryScanMaterialization::ConnectorRead { table, .. } = materialization else {
                 return Err(format!(
-                    "SQL delta scan binding for '{}.{}.{}' has non-data materialization",
+                    "SQL delta scan binding for '{}.{}.{}' is missing its admitted connector read",
                     source.table.catalog, source.table.namespace, source.table.table
                 ));
             };
