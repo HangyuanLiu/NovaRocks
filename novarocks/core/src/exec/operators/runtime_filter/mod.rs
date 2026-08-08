@@ -289,25 +289,20 @@ impl NativeOrderedLiveConsumerSet {
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
     ) -> Result<Option<Chunk>, String> {
-        let configured = !self
-            .inner
-            .bindings
-            .lock()
-            .expect("native ordered RF consumer lock")
-            .is_empty();
-        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-        let output = self.apply_chunk_inner(chunk)?;
-        if configured && let Some(profiles) = profiles {
-            profiles
-                .common
-                .counter_add(RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit, input_rows);
-            profiles.common.counter_add(
-                RUNTIME_FILTER_OUTPUT_ROWS,
-                ProfileUnit::Unit,
-                output
-                    .as_ref()
-                    .map_or(0, |chunk| i64::try_from(chunk.len()).unwrap_or(i64::MAX)),
-            );
+        let (output, effects) = self.apply_chunk_inner(chunk)?;
+        if let Some(profiles) = profiles {
+            for effect in effects {
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_INPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.input_rows()).unwrap_or(i64::MAX),
+                );
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_OUTPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.output_rows()).unwrap_or(i64::MAX),
+                );
+            }
         }
         Ok(output)
     }
@@ -527,7 +522,10 @@ impl NativeOrderedLiveConsumerSet {
         Ok(())
     }
 
-    fn apply_chunk_inner(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn apply_chunk_inner(
+        &self,
+        chunk: Chunk,
+    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), String> {
         let active = {
             let bindings = self
                 .inner
@@ -557,27 +555,32 @@ impl NativeOrderedLiveConsumerSet {
                 .collect::<Vec<_>>()
         };
         if active.is_empty() {
-            return Ok(Some(chunk));
+            return Ok((Some(chunk), Vec::new()));
         }
         let chunk = crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)?;
         let mut current = Some(chunk);
+        let mut effects = Vec::new();
         for (expr_id, predicate) in active {
             let Some(input) = current else {
-                return Ok(None);
+                return Ok((None, effects));
             };
             let array = self.inner.arena.eval(expr_id, &input)?;
             let mask = match predicate {
                 NativeOrderedPredicateForApply::Execution(snapshot) => {
-                    match execution::evaluator::evaluate_rows(
+                    let outcome = execution::evaluator::evaluate_rows(
                         snapshot.binding_id(),
                         snapshot.logical_version(),
                         snapshot.artifact_query().as_ref(),
                         &array,
                     )
-                    .map_err(|error| error.to_string())?
-                    .evaluation()
-                    {
+                    .map_err(|error| error.to_string())?;
+                    match outcome.evaluation() {
                         execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } => {
+                            effects.push(
+                                outcome
+                                    .effect()
+                                    .expect("evaluated runtime-filter row outcome has an effect"),
+                            );
                             mask.clone()
                         }
                         execution::RuntimeFilterRowEvaluation::NotEvaluated { .. } => {
@@ -608,7 +611,7 @@ impl NativeOrderedLiveConsumerSet {
                 current = Some(Chunk::try_new_like(filtered, &input)?);
             }
         }
-        Ok(current)
+        Ok((current, effects))
     }
 
     #[cfg(test)]
@@ -1169,30 +1172,28 @@ impl RuntimeFilterConsumerSet {
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
     ) -> Result<Option<Chunk>, String> {
-        let configured = !self
-            .inner
-            .bindings
-            .lock()
-            .expect("native RF consumer lock")
-            .is_empty();
-        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-        let output = self.apply_chunk_inner(chunk)?;
-        if configured && let Some(profiles) = profiles {
-            profiles
-                .common
-                .counter_add(RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit, input_rows);
-            profiles.common.counter_add(
-                RUNTIME_FILTER_OUTPUT_ROWS,
-                ProfileUnit::Unit,
-                output
-                    .as_ref()
-                    .map_or(0, |chunk| i64::try_from(chunk.len()).unwrap_or(i64::MAX)),
-            );
+        let (output, effects) = self.apply_chunk_inner(chunk)?;
+        if let Some(profiles) = profiles {
+            for effect in effects {
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_INPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.input_rows()).unwrap_or(i64::MAX),
+                );
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_OUTPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.output_rows()).unwrap_or(i64::MAX),
+                );
+            }
         }
         Ok(output)
     }
 
-    fn apply_chunk_inner(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn apply_chunk_inner(
+        &self,
+        chunk: Chunk,
+    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), String> {
         self.poll_live_bindings()?;
         let active = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
@@ -1225,27 +1226,32 @@ impl RuntimeFilterConsumerSet {
                 .collect::<Vec<_>>()
         };
         if active.is_empty() {
-            return Ok(Some(chunk));
+            return Ok((Some(chunk), Vec::new()));
         }
         let chunk = crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)?;
         let mut current = Some(chunk);
+        let mut effects = Vec::new();
         for (index, expr_id, predicate) in active {
             let Some(input) = current else {
-                return Ok(None);
+                return Ok((None, effects));
             };
             let array = self.inner.arena.eval(expr_id, &input)?;
             let mask = match predicate {
                 NativeConsumerPredicateForApply::Execution(snapshot) => {
-                    match execution::evaluator::evaluate_rows(
+                    let outcome = execution::evaluator::evaluate_rows(
                         snapshot.binding_id(),
                         snapshot.logical_version(),
                         snapshot.artifact_query().as_ref(),
                         &array,
                     )
-                    .map_err(|error| error.to_string())?
-                    .evaluation()
-                    {
+                    .map_err(|error| error.to_string())?;
+                    match outcome.evaluation() {
                         execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } => {
+                            effects.push(
+                                outcome
+                                    .effect()
+                                    .expect("evaluated runtime-filter row outcome has an effect"),
+                            );
                             mask.clone()
                         }
                         execution::RuntimeFilterRowEvaluation::NotEvaluated { .. } => {
@@ -1280,7 +1286,7 @@ impl RuntimeFilterConsumerSet {
                 current = Some(Chunk::try_new_like(filtered, &input)?);
             }
         }
-        Ok(current)
+        Ok((current, effects))
     }
 
     fn poll_live_bindings(&self) -> Result<(), String> {
@@ -2812,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_pass_through_records_equal_apply_counters() {
+    fn configured_not_evaluated_pass_through_does_not_record_apply_counters() {
         let (consumers, input) = fixture(vec![ArtifactAcquireOutcome::Unavailable(
             UnavailableReason::ProducerFailed,
         )]);
@@ -2830,11 +2836,11 @@ mod tests {
         assert_eq!(output.len(), 4);
         assert_eq!(
             profiles.common.counter_value(RUNTIME_FILTER_INPUT_ROWS),
-            Some(4)
+            None
         );
         assert_eq!(
             profiles.common.counter_value(RUNTIME_FILTER_OUTPUT_ROWS),
-            Some(4)
+            None
         );
     }
 
@@ -3238,20 +3244,20 @@ mod native_ordered_live_consumer_tests {
             ExprNode::SlotId(SlotId::new(1)),
             order.keys()[0].data_type().clone(),
         );
-        RuntimeFilterConsumerBinding {
-            binding_id: 2,
-            channel_id: 1,
+        RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation,
-            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                comparator_digest: order.plan_comparator_digest().get(),
-                order_contract_digest: order.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            scan_domain: None,
-        }
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                2,
+                1,
+                activation,
+                RuntimeFilterExecutionContract::Ordered {
+                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
+                    comparator_digest: order.plan_comparator_digest().get(),
+                    order_contract_digest: order.digest().bytes(),
+                },
+            ),
+            None,
+        )
     }
 
     fn live_fixture(
@@ -3526,21 +3532,21 @@ mod native_ordered_live_consumer_tests {
             membership_arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let schema =
             ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches).unwrap();
-        let membership = RuntimeFilterConsumerBinding {
-            binding_id: 2,
-            channel_id: 1,
+        let membership = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            capabilities: BTreeSet::from([ArtifactCapability::Membership]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                2,
+                1,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(schema.canonical_bytes()),
+                    schema_digest: schema.digest().bytes(),
+                },
+            ),
+            None,
+        );
         assert!(
             NativeOrderedLiveConsumerSet::from_plan(&[membership], Arc::new(membership_arena))
                 .err()
@@ -3725,22 +3731,19 @@ pub(crate) mod tests_support {
         let arena = Arc::new(arena);
         let schema =
             ArtifactMembershipSchema::new(&DataType::Int32, NullSemantics::NeverMatches).unwrap();
-        let spec = RuntimeFilterConsumerBinding {
-            binding_id: 11,
-            channel_id: 7,
+        let spec = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                11,
+                7,
+                ConsumerActivation::BlockingSnapshot,
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(schema.canonical_bytes()),
+                    schema_digest: schema.digest().bytes(),
+                },
+            ),
+            None,
+        );
         let subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(ObservedPublishedSubscription {
                 bundle,
@@ -3778,22 +3781,19 @@ pub(crate) mod tests_support {
         let arena = Arc::new(arena);
         let schema =
             ArtifactMembershipSchema::new(&data_type, NullSemantics::NeverMatches).unwrap();
-        let spec = RuntimeFilterConsumerBinding {
-            binding_id: 11,
-            channel_id: 7,
+        let spec = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                11,
+                7,
+                ConsumerActivation::BlockingSnapshot,
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(schema.canonical_bytes()),
+                    schema_digest: schema.digest().bytes(),
+                },
+            ),
+            None,
+        );
         let subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(PublishedSubscription(bundle));
         (

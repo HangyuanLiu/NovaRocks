@@ -142,6 +142,50 @@ impl RuntimeFilterConsumerBinding {
     }
 }
 
+/// Builds a deliberately permissive consumer contract for Core-only legacy
+/// fixtures. Production fragment decoding must use the role-specific
+/// constructors in `novarocks-execution`.
+#[cfg(test)]
+pub(crate) fn test_consumer_contract(
+    binding_id: u32,
+    channel_id: u32,
+    activation: crate::runtime_filter::model::contract::ConsumerActivation,
+    contract: execution::RuntimeFilterExecutionContract,
+) -> execution::RuntimeFilterConsumerContract {
+    let activation = match activation {
+        crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+            execution::ConsumerActivation::BlockingSnapshot
+        }
+        crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+            late_apply,
+        } => execution::ConsumerActivation::NonBlockingLive {
+            late_apply: match late_apply {
+                crate::runtime_filter::model::contract::LateApplyGranularity::Row => {
+                    execution::RuntimeFilterLateApplyGranularity::Row
+                }
+                crate::runtime_filter::model::contract::LateApplyGranularity::Batch => {
+                    execution::RuntimeFilterLateApplyGranularity::Batch
+                }
+                crate::runtime_filter::model::contract::LateApplyGranularity::RowGroup => {
+                    execution::RuntimeFilterLateApplyGranularity::RowGroup
+                }
+                crate::runtime_filter::model::contract::LateApplyGranularity::Split => {
+                    execution::RuntimeFilterLateApplyGranularity::Split
+                }
+                crate::runtime_filter::model::contract::LateApplyGranularity::File => {
+                    execution::RuntimeFilterLateApplyGranularity::File
+                }
+            },
+        },
+    };
+    execution::RuntimeFilterConsumerContract::new(
+        execution::RuntimeFilterBindingId::new(binding_id),
+        execution::RuntimeFilterChannelId::new(channel_id),
+        activation,
+        contract,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
