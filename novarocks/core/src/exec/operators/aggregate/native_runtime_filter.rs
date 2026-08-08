@@ -27,21 +27,29 @@ use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 #[cfg(test)]
 use crate::exec::node::runtime_filter::RuntimeFilterExecutionReduction;
 use crate::exec::operators::aggregate::topn_boundary::AggregateTopNBoundaryBinding;
+#[cfg(test)]
 use crate::runtime_filter::codec::contribution::{
     ContributionCodecExpectation, RuntimeFilterContribution as CoreContribution,
     encode_contribution,
 };
 #[cfg(test)]
 use crate::runtime_filter::model::contract::ReductionRequirement;
+#[cfg(test)]
 use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
-use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
+use crate::runtime_filter::port::identity::PartitionId;
+#[cfg(test)]
+use crate::runtime_filter::port::identity::ProducerSequence;
+use crate::runtime_filter::port::ordered_bound::OrderedTuple;
+#[cfg(test)]
 use crate::runtime_filter::port::ordered_bound::{
-    OrderContractDigest, OrderedBoundUpdate, OrderedTuple, RuntimeOrderContract,
+    OrderContractDigest, OrderedBoundUpdate, RuntimeOrderContract,
 };
+use crate::runtime_filter::port::producer::ProducerFailureReason;
 #[cfg(test)]
 use crate::runtime_filter::port::producer::ProducerPortKind;
+#[cfg(test)]
 use crate::runtime_filter::port::producer::{
-    OrderedBoundProducerAdapter, ProducerFailureReason, RuntimeContractViolationKind, SubmitOutcome,
+    OrderedBoundProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
 };
 
 #[derive(Default)]
@@ -60,6 +68,7 @@ enum AggregateTopNProducerSource {
 struct AggregateTopNProducerBinding {
     binding_id: u32,
     channel_id: u32,
+    #[cfg(test)]
     contract: Arc<RuntimeOrderContract>,
     execution_contract: execution::RuntimeFilterProducerContract,
     source: AggregateTopNProducerSource,
@@ -71,12 +80,10 @@ impl AggregateTopNProducerBinding {
         spec: &AggregateTopNRuntimeFilterProducerBinding,
         session: execution::RuntimeFilterSessionRef,
     ) -> Result<Self, String> {
-        let (contract, execution_contract) = frozen_binding_contract(spec)?;
         Ok(Self {
             binding_id: spec.binding_id(),
             channel_id: spec.channel_id(),
-            contract,
-            execution_contract,
+            execution_contract: frozen_execution_contract(spec)?,
             source: AggregateTopNProducerSource::Session(session),
             coordinator: Arc::new(AggregateTopNProducerInstanceCoordinator::default()),
         })
@@ -104,49 +111,6 @@ impl AggregateTopNProducerBinding {
             coordinator: Arc::new(AggregateTopNProducerInstanceCoordinator::default()),
         })
     }
-}
-
-fn frozen_binding_contract(
-    spec: &AggregateTopNRuntimeFilterProducerBinding,
-) -> Result<
-    (
-        Arc<RuntimeOrderContract>,
-        execution::RuntimeFilterProducerContract,
-    ),
-    String,
-> {
-    if spec.contract().reduction() != execution::RuntimeFilterReduction::TightenOrderedBound
-        || spec.contract().completion() != execution::RuntimeFilterCompletion::ProducerClosed
-    {
-        return Err(format!(
-            "native aggregate TopN producer binding_id={} has an invalid frozen contract",
-            spec.binding_id()
-        ));
-    }
-    let RuntimeFilterExecutionContract::Ordered {
-        keys,
-        comparator_digest,
-        order_contract_digest,
-    } = spec.contract().contract()
-    else {
-        return Err(format!(
-            "native aggregate TopN producer binding_id={} requires an ordered contract",
-            spec.binding_id()
-        ));
-    };
-    let contract = RuntimeOrderContract::from_codec(
-        crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
-        crate::runtime_filter::model::contract::ComparatorDigest::new(*comparator_digest),
-        OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
-    )
-    .map(Arc::new)
-    .map_err(|error| {
-        format!(
-            "native aggregate TopN producer binding_id={} ordered contract is invalid: {error:?}",
-            spec.binding_id()
-        )
-    })?;
-    Ok((contract, frozen_execution_contract(spec)?))
 }
 
 fn frozen_execution_contract(
@@ -585,30 +549,17 @@ impl AggregateTopNProducerStream {
                 self.binding.binding_id
             )
         })?;
-        let update =
-            OrderedBoundUpdate::new(&self.binding.contract, bound).map_err(|error| {
-                format!(
-                    "native aggregate TopN producer binding_id={} update construction failed: {error:?}",
-                    self.binding.binding_id
-                )
-            })?;
         let terminal_noop = match endpoint {
             AggregateTopNProducerEndpoint::Execution(producer) => {
-                let encoded = encode_contribution(
-                    &CoreContribution::OrderedBound(update),
-                    ContributionCodecExpectation::OrderedBound(&self.binding.contract),
+                let contribution = encode_execution_ordered_bound(
+                    &self.binding.execution_contract,
+                    &bound,
                     producer.max_contribution_bytes(),
                 )
                 .map_err(|error| format!(
                         "native aggregate TopN producer binding_id={} contribution encoding failed: {error}",
                         self.binding.binding_id
                     ))?;
-                let (contract_digest, canonical_bytes) = encoded.into_parts();
-                let contribution = execution::RuntimeFilterContribution::new(
-                    execution::RuntimeFilterContributionKind::OrderedBound,
-                    contract_digest,
-                    canonical_bytes,
-                );
                 match producer.submit(
                     execution::PartitionId::new(self.partition_id.get()),
                     execution::ProducerSequence::new(self.next_sequence),
@@ -635,27 +586,39 @@ impl AggregateTopNProducerStream {
                 }
             }
             #[cfg(test)]
-            AggregateTopNProducerEndpoint::Prebound(adapter) => match adapter.submit_bound(
-                self.partition_id,
-                ProducerSequence::new(self.next_sequence),
-                update,
-            ) {
-                Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
-                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
-                    self.binding
-                        .coordinator
-                        .failed
-                        .store(true, Ordering::Release);
-                    self.terminal = true;
-                    return Ok(());
+            AggregateTopNProducerEndpoint::Prebound(adapter) => {
+                let update = OrderedBoundUpdate::new(&self.binding.contract, bound).map_err(
+                    |error| {
+                        format!(
+                            "native aggregate TopN producer binding_id={} update construction failed: {error:?}",
+                            self.binding.binding_id
+                        )
+                    },
+                )?;
+                match adapter.submit_bound(
+                    self.partition_id,
+                    ProducerSequence::new(self.next_sequence),
+                    update,
+                ) {
+                    Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
+                    Err(error)
+                        if error.kind() == RuntimeContractViolationKind::ServiceUnavailable =>
+                    {
+                        self.binding
+                            .coordinator
+                            .failed
+                            .store(true, Ordering::Release);
+                        self.terminal = true;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "native aggregate TopN producer binding_id={} contribution failed: {error}",
+                            self.binding.binding_id
+                        ));
+                    }
                 }
-                Err(error) => {
-                    return Err(format!(
-                        "native aggregate TopN producer binding_id={} contribution failed: {error}",
-                        self.binding.binding_id
-                    ));
-                }
-            },
+            }
         };
         if terminal_noop {
             self.fail(ProducerFailureReason::ExecutionFailed)?;
@@ -794,6 +757,98 @@ impl AggregateTopNProducerStream {
     }
 }
 
+fn encode_execution_ordered_bound(
+    producer: &execution::RuntimeFilterProducerContract,
+    bound: &OrderedTuple,
+    max_contribution_bytes: usize,
+) -> Result<execution::RuntimeFilterContribution, execution::contribution::ContributionCodecError> {
+    let execution::RuntimeFilterExecutionContract::Ordered {
+        keys,
+        comparator_digest,
+        order_contract_digest,
+    } = producer.contract()
+    else {
+        return Err(execution::contribution::ContributionCodecError::SchemaMismatch);
+    };
+    let contract = execution::contribution::RuntimeOrderContract::from_frozen(
+        keys.iter().map(|key| {
+            execution::contribution::RuntimeOrderKey::with_order(
+                key.data_type().clone(),
+                match key.direction() {
+                    execution::RuntimeOrderSortDirection::Ascending => {
+                        execution::contribution::RuntimeOrderSortDirection::Ascending
+                    }
+                    execution::RuntimeOrderSortDirection::Descending => {
+                        execution::contribution::RuntimeOrderSortDirection::Descending
+                    }
+                },
+                match key.null_order() {
+                    execution::RuntimeOrderNullOrder::First => {
+                        execution::contribution::RuntimeOrderNullOrder::First
+                    }
+                    execution::RuntimeOrderNullOrder::Last => {
+                        execution::contribution::RuntimeOrderNullOrder::Last
+                    }
+                },
+            )
+        }),
+        *comparator_digest,
+        *order_contract_digest,
+    );
+    let tuple = execution::contribution::OrderedTuple::try_new(
+        &contract,
+        bound.values().iter().map(|value| match value {
+            None => None,
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean(value)) => {
+                Some(execution::contribution::OrderedScalar::Boolean(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8(value)) => {
+                Some(execution::contribution::OrderedScalar::Int8(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16(value)) => {
+                Some(execution::contribution::OrderedScalar::Int16(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32(value)) => {
+                Some(execution::contribution::OrderedScalar::Int32(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64(value)) => {
+                Some(execution::contribution::OrderedScalar::Int64(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt(value)) => {
+                Some(execution::contribution::OrderedScalar::LargeInt(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8(value)) => Some(
+                execution::contribution::OrderedScalar::Utf8(value.to_string()),
+            ),
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32(value)) => {
+                Some(execution::contribution::OrderedScalar::Date32(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp(value)) => {
+                Some(execution::contribution::OrderedScalar::Timestamp(*value))
+            }
+            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128(value)) => {
+                Some(execution::contribution::OrderedScalar::Decimal128(*value))
+            }
+        }),
+    )
+    .map_err(|_| execution::contribution::ContributionCodecError::SchemaMismatch)?;
+    let typed = execution::contribution::RuntimeFilterContribution::ordered_bound(
+        execution::contribution::OrderedBoundUpdate::try_new(&contract, tuple)
+            .map_err(|_| execution::contribution::ContributionCodecError::SchemaMismatch)?,
+    );
+    let encoded = execution::contribution::encode_contribution(
+        &typed,
+        execution::contribution::ContributionCodecExpectation::OrderedBound(&contract),
+        max_contribution_bytes,
+    )?;
+    let (contract_digest, canonical_bytes) = encoded.into_parts();
+    Ok(execution::RuntimeFilterContribution::new(
+        execution::RuntimeFilterContributionKind::OrderedBound,
+        contract_digest,
+        canonical_bytes,
+    ))
+}
+
 #[cfg(test)]
 struct TestResolvedOrderedProducer {
     port: ProducerPortKind,
@@ -831,7 +886,7 @@ mod tests {
 
     use super::{
         AggregateTopNProducerSessionFactory, TestInstalledRuntimeFilterExecutionContract,
-        TestResolvedOrderedProducer,
+        TestResolvedOrderedProducer, encode_execution_ordered_bound,
     };
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
@@ -843,6 +898,10 @@ mod tests {
     };
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::runtime::runtime_state::RuntimeState;
+    use crate::runtime_filter::codec::contribution::{
+        ContributionCodecExpectation, RuntimeFilterContribution as CoreContribution,
+        encode_contribution,
+    };
     use crate::runtime_filter::model::contract::{
         CompletionRequirement, ContributionKind, NullOrder, OrderContract, OrderKeyContract,
         ReductionRequirement, SortDirection,
@@ -1034,6 +1093,27 @@ mod tests {
                     .expect("ordered tuple"),
             )
             .expect("new group");
+    }
+
+    #[test]
+    fn execution_ordered_encoder_preserves_existing_canonical_bytes() {
+        let contract = runtime_contract();
+        let binding = spec(&contract, 10);
+        let bound = OrderedTuple::try_new(&contract, [Some(OrderedScalar::Int64(42))])
+            .expect("ordered tuple");
+        let legacy = OrderedBoundUpdate::new(&contract, bound.clone()).expect("ordered update");
+        let expected = encode_contribution(
+            &CoreContribution::OrderedBound(legacy),
+            ContributionCodecExpectation::OrderedBound(&contract),
+            usize::MAX,
+        )
+        .expect("legacy canonical contribution");
+
+        let actual = encode_execution_ordered_bound(binding.contract(), &bound, usize::MAX)
+            .expect("execution canonical contribution");
+
+        assert_eq!(actual.contract_digest(), *expected.schema_digest());
+        assert_eq!(actual.canonical_bytes().as_ref(), expected.payload());
     }
 
     fn one_row_empty_chunk() -> Chunk {

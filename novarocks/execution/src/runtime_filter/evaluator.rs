@@ -21,12 +21,7 @@
 //! Arrow arrays and cannot make a fragment-local row or scan decision.
 // Design: ADR-0042 (docs/adr/ADR-0042-runtime-filter-artifact-query-and-evaluator-boundary.md)
 
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
-};
+use arrow::array::{Array, ArrayData, ArrayRef, BooleanArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_spi::connector::ConnectorScalarValue;
 
@@ -205,118 +200,94 @@ pub fn evaluate_rows(
         ));
     }
 
+    let data = input.to_data();
     let evaluation = match input.data_type() {
-        DataType::Boolean => {
-            evaluate_primitive::<BooleanArray>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Boolean(array.value(index)))
-            })
-        }
-        DataType::Int8 => {
-            evaluate_primitive::<Int8Array>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Int8(array.value(index)))
-            })
-        }
-        DataType::Int16 => {
-            evaluate_primitive::<Int16Array>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Int16(array.value(index)))
-            })
-        }
-        DataType::Int32 => {
-            evaluate_primitive::<Int32Array>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Int32(array.value(index)))
-            })
-        }
-        DataType::Int64 => {
-            evaluate_primitive::<Int64Array>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Int64(array.value(index)))
-            })
-        }
+        DataType::Boolean => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Boolean(boolean_value(data, row)?))
+        }),
+        DataType::Int8 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Int8(i8::from_ne_bytes(
+                fixed_value::<1>(data, row)?,
+            )))
+        }),
+        DataType::Int16 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Int16(i16::from_ne_bytes(
+                fixed_value::<2>(data, row)?,
+            )))
+        }),
+        DataType::Int32 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Int32(i32::from_ne_bytes(
+                fixed_value::<4>(data, row)?,
+            )))
+        }),
+        DataType::Int64 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Int64(i64::from_ne_bytes(
+                fixed_value::<8>(data, row)?,
+            )))
+        }),
         DataType::FixedSizeBinary(width)
             if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
-            evaluate_primitive::<FixedSizeBinaryArray>(
-                artifact,
-                input,
-                logical_version,
-                |array, index| {
-                    // FixedSizeBinary(16) guarantees a complete i128 payload.  The
-                    // only remaining failure would mean Arrow violated its own
-                    // declared width and is therefore a contract violation.
-                    let value =
-                        novarocks_types::largeint::i128_from_be_bytes(array.value(index))
-                            .map_err(|_| violation("invalid FixedSizeBinary(16) LargeInt value"))?;
-                    Ok(RuntimeFilterScalarRef::LargeInt(value))
-                },
-            )
-        }
-        DataType::Float32 => {
-            evaluate_primitive::<Float32Array>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Float32(array.value(index)))
+            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+                let value =
+                    novarocks_types::largeint::i128_from_be_bytes(&fixed_value::<16>(data, row)?)
+                        .map_err(|_| violation("invalid FixedSizeBinary(16) LargeInt value"))?;
+                Ok(RuntimeFilterScalarRef::LargeInt(value))
             })
         }
-        DataType::Float64 => {
-            evaluate_primitive::<Float64Array>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Float64(array.value(index)))
+        DataType::Float32 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Float32(f32::from_ne_bytes(
+                fixed_value::<4>(data, row)?,
+            )))
+        }),
+        DataType::Float64 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Float64(f64::from_ne_bytes(
+                fixed_value::<8>(data, row)?,
+            )))
+        }),
+        DataType::Utf8 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Utf8(utf8_value(data, row)?))
+        }),
+        DataType::Date32 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            Ok(RuntimeFilterScalarRef::Date32(i32::from_ne_bytes(
+                fixed_value::<4>(data, row)?,
+            )))
+        }),
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+                Ok(RuntimeFilterScalarRef::TimestampSecond(i64::from_ne_bytes(
+                    fixed_value::<8>(data, row)?,
+                )))
             })
         }
-        DataType::Utf8 => {
-            evaluate_primitive::<StringArray>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Utf8(array.value(index)))
-            })
-        }
-        DataType::Date32 => {
-            evaluate_primitive::<Date32Array>(artifact, input, logical_version, |array, index| {
-                Ok(RuntimeFilterScalarRef::Date32(array.value(index)))
-            })
-        }
-        DataType::Timestamp(TimeUnit::Second, _) => evaluate_primitive::<TimestampSecondArray>(
-            artifact,
-            input,
-            logical_version,
-            |array, index| Ok(RuntimeFilterScalarRef::TimestampSecond(array.value(index))),
-        ),
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            evaluate_primitive::<TimestampMillisecondArray>(
-                artifact,
-                input,
-                logical_version,
-                |array, index| {
-                    Ok(RuntimeFilterScalarRef::TimestampMillisecond(
-                        array.value(index),
-                    ))
-                },
-            )
+            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+                Ok(RuntimeFilterScalarRef::TimestampMillisecond(
+                    i64::from_ne_bytes(fixed_value::<8>(data, row)?),
+                ))
+            })
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            evaluate_primitive::<TimestampMicrosecondArray>(
-                artifact,
-                input,
-                logical_version,
-                |array, index| {
-                    Ok(RuntimeFilterScalarRef::TimestampMicrosecond(
-                        array.value(index),
-                    ))
-                },
-            )
+            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+                Ok(RuntimeFilterScalarRef::TimestampMicrosecond(
+                    i64::from_ne_bytes(fixed_value::<8>(data, row)?),
+                ))
+            })
         }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            evaluate_primitive::<TimestampNanosecondArray>(
-                artifact,
-                input,
-                logical_version,
-                |array, index| {
-                    Ok(RuntimeFilterScalarRef::TimestampNanosecond(
-                        array.value(index),
-                    ))
-                },
-            )
+            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+                Ok(RuntimeFilterScalarRef::TimestampNanosecond(
+                    i64::from_ne_bytes(fixed_value::<8>(data, row)?),
+                ))
+            })
         }
-        DataType::Decimal128(_, _) => evaluate_primitive::<Decimal128Array>(
-            artifact,
-            input,
-            logical_version,
-            |array, index| Ok(RuntimeFilterScalarRef::Decimal128(array.value(index))),
-        ),
+        DataType::Decimal128(_, _) => {
+            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+                Ok(RuntimeFilterScalarRef::Decimal128(i128::from_ne_bytes(
+                    fixed_value::<16>(data, row)?,
+                )))
+            })
+        }
         _ => Ok(RuntimeFilterRowEvaluation::NotEvaluated {
             reason: RuntimeFilterRowNotEvaluatedReason::DataTypeUnsupported,
             observed_version: logical_version,
@@ -329,30 +300,33 @@ pub fn evaluate_rows(
     })
 }
 
-fn evaluate_primitive<A>(
+fn evaluate_data(
     artifact: &dyn RuntimeFilterArtifactQuery,
     input: &ArrayRef,
+    data: &ArrayData,
     logical_version: LogicalVersion,
-    scalar: impl Fn(&A, usize) -> Result<RuntimeFilterScalarRef<'_>, RuntimeFilterContractViolation>,
-) -> Result<RuntimeFilterRowEvaluation, RuntimeFilterContractViolation>
-where
-    A: Array + 'static,
-{
-    let typed = input.as_any().downcast_ref::<A>().ok_or_else(|| {
-        violation("runtime-filter Arrow array implementation differs from its declared type")
-    })?;
+    scalar: impl Fn(
+        &ArrayData,
+        usize,
+    ) -> Result<RuntimeFilterScalarRef<'_>, RuntimeFilterContractViolation>,
+) -> Result<RuntimeFilterRowEvaluation, RuntimeFilterContractViolation> {
+    if data.data_type() != input.data_type() || data.len() != input.len() {
+        return Err(violation(
+            "runtime-filter Arrow array physical data differs from its declared input type or length",
+        ));
+    }
     let mut mask = Vec::new();
-    if mask.try_reserve_exact(typed.len()).is_err() {
+    if mask.try_reserve_exact(data.len()).is_err() {
         return Ok(RuntimeFilterRowEvaluation::NotEvaluated {
             reason: RuntimeFilterRowNotEvaluatedReason::ResourceUnavailable,
             observed_version: logical_version,
         });
     }
-    for index in 0..typed.len() {
-        let result = if typed.is_null(index) {
+    for index in 0..data.len() {
+        let result = if row_is_null(data, index)? {
             artifact.matches_null()
         } else {
-            artifact.non_null_value_may_match(scalar(typed, index)?)
+            artifact.non_null_value_may_match(scalar(data, index)?)
         };
         match result {
             Ok(matched) => mask.push(matched),
@@ -381,6 +355,128 @@ where
     })
 }
 
+pub(crate) fn row_is_null(
+    data: &ArrayData,
+    row: usize,
+) -> Result<bool, RuntimeFilterContractViolation> {
+    let physical_row = physical_row(data, row)?;
+    let Some(nulls) = data.nulls() else {
+        return Ok(false);
+    };
+    if physical_row >= nulls.len() {
+        return Err(violation(
+            "runtime-filter Arrow null bitmap is shorter than its declared array length",
+        ));
+    }
+    Ok(nulls.is_null(physical_row))
+}
+
+pub(crate) fn boolean_value(
+    data: &ArrayData,
+    row: usize,
+) -> Result<bool, RuntimeFilterContractViolation> {
+    let physical_row = physical_row(data, row)?;
+    let byte = *value_buffer(data)?.get(physical_row / 8).ok_or_else(|| {
+        violation("runtime-filter Arrow boolean values buffer is shorter than its declared length")
+    })?;
+    Ok((byte & (1 << (physical_row % 8))) != 0)
+}
+
+pub(crate) fn fixed_value<const WIDTH: usize>(
+    data: &ArrayData,
+    row: usize,
+) -> Result<[u8; WIDTH], RuntimeFilterContractViolation> {
+    let start = physical_row(data, row)?
+        .checked_mul(WIDTH)
+        .ok_or_else(|| violation("runtime-filter Arrow values offset overflow"))?;
+    let end = start
+        .checked_add(WIDTH)
+        .ok_or_else(|| violation("runtime-filter Arrow values range overflow"))?;
+    value_buffer(data)?
+        .get(start..end)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            violation(
+                "runtime-filter Arrow fixed-width values buffer is shorter than its declared length",
+            )
+        })
+}
+
+pub(crate) fn utf8_value<'a>(
+    data: &'a ArrayData,
+    row: usize,
+) -> Result<&'a str, RuntimeFilterContractViolation> {
+    if data.buffers().len() != 2 {
+        return Err(violation(
+            "runtime-filter Arrow UTF-8 array does not have offset and values buffers",
+        ));
+    }
+    let physical_row = physical_row(data, row)?;
+    let start = utf8_offset(data, physical_row)?;
+    let end = utf8_offset(
+        data,
+        physical_row
+            .checked_add(1)
+            .ok_or_else(|| violation("runtime-filter Arrow UTF-8 offset overflow"))?,
+    )?;
+    if start > end {
+        return Err(violation(
+            "runtime-filter Arrow UTF-8 offsets are not monotonically increasing",
+        ));
+    }
+    let bytes = data.buffers()[1]
+        .as_slice()
+        .get(start..end)
+        .ok_or_else(|| {
+            violation(
+                "runtime-filter Arrow UTF-8 values buffer is shorter than its declared offsets",
+            )
+        })?;
+    std::str::from_utf8(bytes)
+        .map_err(|_| violation("runtime-filter Arrow UTF-8 values buffer contains invalid UTF-8"))
+}
+
+fn utf8_offset(data: &ArrayData, row: usize) -> Result<usize, RuntimeFilterContractViolation> {
+    let start = row
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| violation("runtime-filter Arrow UTF-8 offset position overflow"))?;
+    let end = start
+        .checked_add(std::mem::size_of::<i32>())
+        .ok_or_else(|| violation("runtime-filter Arrow UTF-8 offset range overflow"))?;
+    let bytes: [u8; 4] = data
+        .buffers()
+        .first()
+        .and_then(|buffer| buffer.as_slice().get(start..end))
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            violation(
+                "runtime-filter Arrow UTF-8 offsets buffer is shorter than its declared length",
+            )
+        })?;
+    usize::try_from(i32::from_ne_bytes(bytes))
+        .map_err(|_| violation("runtime-filter Arrow UTF-8 offset is negative"))
+}
+
+fn physical_row(data: &ArrayData, row: usize) -> Result<usize, RuntimeFilterContractViolation> {
+    if row >= data.len() {
+        return Err(violation(
+            "runtime-filter Arrow row is outside the declared array length",
+        ));
+    }
+    data.offset()
+        .checked_add(row)
+        .ok_or_else(|| violation("runtime-filter Arrow row offset overflow"))
+}
+
+fn value_buffer(data: &ArrayData) -> Result<&[u8], RuntimeFilterContractViolation> {
+    if data.buffers().len() != 1 {
+        return Err(violation(
+            "runtime-filter Arrow fixed-width array does not have exactly one values buffer",
+        ));
+    }
+    Ok(data.buffers()[0].as_slice())
+}
+
 fn violation(detail: &'static str) -> RuntimeFilterContractViolation {
     RuntimeFilterContractViolation::new(
         RuntimeFilterContractViolationKind::ContractMismatch,
@@ -392,7 +488,7 @@ fn violation(detail: &'static str) -> RuntimeFilterContractViolation {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int32Array};
+    use arrow::array::{Float64Array, Int32Array, StringArray};
 
     use super::*;
 
@@ -592,5 +688,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.effect().unwrap().output_rows(), 1);
+    }
+
+    #[test]
+    fn utf8_slice_uses_validated_offsets_from_array_data() {
+        struct Utf8Query(Query);
+        impl RuntimeFilterArtifactQuery for Utf8Query {
+            fn data_type(&self) -> &DataType {
+                self.0.data_type()
+            }
+            fn matches_null(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
+                self.0.matches_null()
+            }
+            fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
+                self.0.has_non_null_matches()
+            }
+            fn non_null_value_may_match(
+                &self,
+                value: RuntimeFilterScalarRef<'_>,
+            ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+                let RuntimeFilterScalarRef::Utf8(value) = value else {
+                    panic!("expected UTF-8 scalar");
+                };
+                Ok(value == "second")
+            }
+            fn non_null_range_may_match(
+                &self,
+                min: &ConnectorScalarValue,
+                max: &ConnectorScalarValue,
+            ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+                self.0.non_null_range_may_match(min, max)
+            }
+        }
+
+        let array: ArrayRef = Arc::new(StringArray::from(vec!["first", "second", "third"]));
+        let input = array.slice(1, 2);
+        let outcome = evaluate_rows(
+            RuntimeFilterBindingId::new(5),
+            LogicalVersion::new(2),
+            &Utf8Query(query(DataType::Utf8)),
+            &input,
+        )
+        .unwrap();
+
+        let RuntimeFilterRowEvaluation::Evaluated { mask, .. } = outcome.evaluation() else {
+            panic!("expected evaluated outcome");
+        };
+        assert_eq!(mask.values().iter().collect::<Vec<_>>(), vec![true, false]);
     }
 }

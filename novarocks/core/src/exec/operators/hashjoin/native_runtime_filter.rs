@@ -32,20 +32,23 @@ use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::{
     RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
 };
-use crate::runtime_filter::codec::contribution::{
-    ContributionCodecError, ContributionCodecExpectation,
-    RuntimeFilterContribution as CoreContribution, encode_contribution,
-};
+#[cfg(test)]
+use crate::runtime_filter::codec::contribution::ContributionCodecError;
+#[cfg(test)]
 use crate::runtime_filter::exec::membership_delta::{
     MembershipDeltaEncoder, MembershipEncodingOutcome,
 };
-use crate::runtime_filter::model::contract::{
-    BindingId, CompletionRequirement, ContributionKind, NullSemantics,
-};
+use crate::runtime_filter::model::contract::NullSemantics;
+#[cfg(test)]
+use crate::runtime_filter::model::contract::{BindingId, CompletionRequirement, ContributionKind};
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
+use crate::runtime_filter::port::identity::PartitionId;
+#[cfg(test)]
+use crate::runtime_filter::port::identity::ProducerSequence;
+use crate::runtime_filter::port::producer::ProducerFailureReason;
+#[cfg(test)]
 use crate::runtime_filter::port::producer::{
-    ProducerAdapter, ProducerFailureReason, RuntimeContractViolationKind, SubmitOutcome,
+    ProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
 };
 
 #[derive(Default)]
@@ -391,23 +394,39 @@ enum NativeMembershipSubmitOutcome {
     Unavailable,
 }
 
+#[cfg(test)]
 fn encode_execution_membership_contribution(
-    delta: CoreContribution,
+    delta: crate::runtime_filter::port::value_domain::ValueDomainDelta,
     membership_schema: &ArtifactMembershipSchema,
     max_contribution_bytes: usize,
 ) -> Result<Option<execution::RuntimeFilterContribution>, ContributionCodecError> {
-    let encoded = match encode_contribution(
-        &delta,
-        ContributionCodecExpectation::Membership(membership_schema),
+    let mut canonical_domain = Vec::new();
+    delta
+        .encode_canonical_into(&mut canonical_domain)
+        .map_err(|_| ContributionCodecError::ResourceLimit)?;
+    let domain = execution::contribution::decode_value_domain(
+        &canonical_domain,
+        membership_schema.data_type(),
+        max_contribution_bytes,
+    )
+    .map_err(|_| ContributionCodecError::Malformed)?;
+    let typed = execution::contribution::RuntimeFilterContribution::membership(domain);
+    let encoded = match execution::contribution::encode_contribution(
+        &typed,
+        execution::contribution::ContributionCodecExpectation::membership(
+            membership_schema.data_type(),
+            membership_schema.digest().bytes(),
+        ),
         max_contribution_bytes,
     ) {
         Ok(encoded) => encoded,
         Err(
-            ContributionCodecError::EncodedSizeExceeded | ContributionCodecError::ResourceLimit,
+            execution::contribution::ContributionCodecError::EncodedSizeExceeded
+            | execution::contribution::ContributionCodecError::ResourceLimit,
         ) => {
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(_) => return Err(ContributionCodecError::Malformed),
     };
     let (contract_digest, canonical_bytes) = encoded.into_parts();
     Ok(Some(execution::RuntimeFilterContribution::new(
@@ -499,7 +518,70 @@ impl NativeMembershipProducerStream {
                     "native runtime-filter binding_id={} build key ordinal {} is missing from evaluated arrays",
                     self.binding.binding_id, self.binding.join_key_ordinal
                 )
-            })?;
+        })?;
+        if let NativeMembershipProducerEndpoint::Execution(producer) = endpoint {
+            let producer_contract = execution_membership_producer_contract(&self.binding)?;
+            let contributions = match execution::contribution::encode_membership_contributions(
+                &producer_contract,
+                array,
+                max_contribution_bytes,
+            )
+            .map_err(|error| {
+                format!(
+                    "native runtime-filter binding_id={} membership encoding failed: {error}",
+                    self.binding.binding_id
+                )
+            })? {
+                execution::contribution::MembershipContributionEncodingOutcome::Contributions(
+                    contributions,
+                ) => contributions,
+                execution::contribution::MembershipContributionEncodingOutcome::Unavailable(_) => {
+                    return Ok(NativeMembershipSubmitOutcome::Unavailable);
+                }
+            };
+            for contribution in contributions {
+                match producer.submit(
+                    execution::PartitionId::new(self.partition_id.get()),
+                    execution::ProducerSequence::new(self.next_sequence),
+                    contribution,
+                ) {
+                    Ok(execution::RuntimeFilterSubmitOutcome::TerminalNoop) => {
+                        self.binding
+                            .coordinator
+                            .failed
+                            .store(true, Ordering::Release);
+                        self.terminal = true;
+                        return Ok(NativeMembershipSubmitOutcome::Applied);
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if error.kind()
+                            == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                    {
+                        self.mark_service_unavailable();
+                        return Ok(NativeMembershipSubmitOutcome::Applied);
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "native runtime-filter binding_id={} contribution failed: {error}",
+                            self.binding.binding_id
+                        ));
+                    }
+                }
+                self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "native runtime-filter binding_id={} producer sequence overflow",
+                        self.binding.binding_id
+                    )
+                })?;
+            }
+            return Ok(NativeMembershipSubmitOutcome::Applied);
+        }
+        #[cfg(test)]
+        let NativeMembershipProducerEndpoint::Prebound(adapter) = endpoint else {
+            unreachable!("execution producer returns after execution-owned encoding");
+        };
+        #[cfg(test)]
         let outcome = MembershipDeltaEncoder::encode(
             array.as_ref(),
             &self.binding.data_type,
@@ -511,69 +593,31 @@ impl NativeMembershipProducerStream {
                 self.binding.binding_id
             )
         })?;
+        #[cfg(test)]
         let MembershipEncodingOutcome::Deltas(deltas) = outcome else {
             return Ok(NativeMembershipSubmitOutcome::Unavailable);
         };
+        #[cfg(test)]
         for delta in deltas {
             if delta.values().is_empty() && !delta.contains_null() {
                 continue;
             }
-            let outcome = match endpoint {
-                NativeMembershipProducerEndpoint::Execution(producer) => {
-                    let Some(contribution) = encode_execution_membership_contribution(
-                        CoreContribution::Membership(delta),
-                        &self.binding.membership_schema,
-                        max_contribution_bytes,
-                    )
-                    .map_err(|error| format!(
-                        "native runtime-filter binding_id={} contribution encoding failed: {error}",
-                        self.binding.binding_id
-                    ))? else {
-                        return Ok(NativeMembershipSubmitOutcome::Unavailable);
-                    };
-                    match producer.submit(
-                        execution::PartitionId::new(self.partition_id.get()),
-                        execution::ProducerSequence::new(self.next_sequence),
-                        contribution,
-                    ) {
-                        Ok(outcome) => {
-                            outcome == execution::RuntimeFilterSubmitOutcome::TerminalNoop
-                        }
-                        Err(error)
-                            if error.kind()
-                                == execution::RuntimeFilterContractViolationKind::SessionClosed =>
-                        {
-                            self.mark_service_unavailable();
-                            return Ok(NativeMembershipSubmitOutcome::Applied);
-                        }
-                        Err(error) => {
-                            return Err(format!(
-                                "native runtime-filter binding_id={} contribution failed: {error}",
-                                self.binding.binding_id
-                            ));
-                        }
-                    }
+            let outcome = match adapter.submit(
+                self.partition_id,
+                ProducerSequence::new(self.next_sequence),
+                delta,
+            ) {
+                Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
+                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                    self.mark_service_unavailable();
+                    return Ok(NativeMembershipSubmitOutcome::Applied);
                 }
-                #[cfg(test)]
-                NativeMembershipProducerEndpoint::Prebound(adapter) => match adapter.submit(
-                    self.partition_id,
-                    ProducerSequence::new(self.next_sequence),
-                    delta,
-                ) {
-                    Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
-                    Err(error)
-                        if error.kind() == RuntimeContractViolationKind::ServiceUnavailable =>
-                    {
-                        self.mark_service_unavailable();
-                        return Ok(NativeMembershipSubmitOutcome::Applied);
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "native runtime-filter binding_id={} contribution failed: {error}",
-                            self.binding.binding_id
-                        ));
-                    }
-                },
+                Err(error) => {
+                    return Err(format!(
+                        "native runtime-filter binding_id={} contribution failed: {error}",
+                        self.binding.binding_id
+                    ));
+                }
             };
             if outcome {
                 self.binding
@@ -590,7 +634,11 @@ impl NativeMembershipProducerStream {
                 )
             })?;
         }
-        Ok(NativeMembershipSubmitOutcome::Applied)
+        #[cfg(test)]
+        return Ok(NativeMembershipSubmitOutcome::Applied);
+
+        #[cfg(not(test))]
+        unreachable!("execution producer returns after execution-owned encoding");
     }
 
     fn finish(&mut self) -> Result<(), String> {

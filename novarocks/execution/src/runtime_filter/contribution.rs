@@ -23,9 +23,16 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
+use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
+
+use super::{
+    RuntimeFilterContractViolationKind, RuntimeFilterContribution as ExecutionContribution,
+    RuntimeFilterContributionKind, RuntimeFilterExecutionContract, RuntimeFilterProducerContract,
+    RuntimeFilterProducerKind,
+};
 
 pub const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
 const MAGIC: &[u8; 4] = b"NRFC";
@@ -216,6 +223,22 @@ impl MembershipValues {
             Self::Decimal128 {
                 precision, scale, ..
             } => DataType::Decimal128(*precision, *scale),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Boolean(values) => values.is_empty(),
+            Self::Int8(values) => values.is_empty(),
+            Self::Int16(values) => values.is_empty(),
+            Self::Int32(values) => values.is_empty(),
+            Self::Int64(values) => values.is_empty(),
+            Self::LargeInt(values) => values.is_empty(),
+            Self::Float32(values) => values.is_empty(),
+            Self::Float64(values) => values.is_empty(),
+            Self::Utf8(values) => values.is_empty(),
+            Self::Date32(values) => values.is_empty(),
+            Self::Timestamp { values, .. } => values.is_empty(),
+            Self::Decimal128 { values, .. } => values.is_empty(),
         }
     }
     fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), ContributionSizeError> {
@@ -1105,6 +1128,405 @@ fn decode_membership(
     Ok(ValueDomainDelta::new(values, contains_null))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipContributionEncodingUnavailable {
+    ResourceOrSize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MembershipContributionEncodingOutcome {
+    Contributions(Vec<ExecutionContribution>),
+    Unavailable(MembershipContributionEncodingUnavailable),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MembershipContributionEncodingError {
+    ContractViolation {
+        kind: RuntimeFilterContractViolationKind,
+        detail: String,
+    },
+    TypeMismatch {
+        expected: DataType,
+        actual: DataType,
+    },
+    UnsupportedType(DataType),
+    InvalidArray {
+        data_type: DataType,
+        detail: String,
+    },
+    InvalidDecimal {
+        precision: u8,
+        scale: i8,
+        detail: String,
+    },
+}
+
+impl fmt::Display for MembershipContributionEncodingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContractViolation { kind, detail } => write!(
+                formatter,
+                "runtime-filter contract violation {kind:?}: {detail}"
+            ),
+            Self::TypeMismatch { expected, actual } => write!(
+                formatter,
+                "runtime-filter membership type mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::UnsupportedType(data_type) => write!(
+                formatter,
+                "unsupported runtime-filter membership type: {data_type:?}"
+            ),
+            Self::InvalidArray { data_type, detail } => write!(
+                formatter,
+                "invalid runtime-filter membership array for {data_type:?}: {detail}"
+            ),
+            Self::InvalidDecimal {
+                precision,
+                scale,
+                detail,
+            } => write!(
+                formatter,
+                "invalid runtime-filter Decimal128({precision}, {scale}) membership value: {detail}"
+            ),
+        }
+    }
+}
+impl Error for MembershipContributionEncodingError {}
+
+/// Encode one complete Arrow membership build input against a frozen producer
+/// contract. A contribution either fits in its entirety or produces the
+/// typed unavailable outcome; the encoder never submits a partial domain.
+pub fn encode_membership_contributions(
+    producer: &RuntimeFilterProducerContract,
+    array: &ArrayRef,
+    max_encoded_bytes: usize,
+) -> Result<MembershipContributionEncodingOutcome, MembershipContributionEncodingError> {
+    if producer.kind() != RuntimeFilterProducerKind::Membership {
+        return Err(contract_error(
+            RuntimeFilterContractViolationKind::RoleMismatch,
+            "membership encoder requires a membership producer contract",
+        ));
+    }
+    let RuntimeFilterExecutionContract::Membership {
+        canonical_schema,
+        schema_digest,
+    } = producer.contract()
+    else {
+        return Err(contract_error(
+            RuntimeFilterContractViolationKind::ContractMismatch,
+            "membership producer does not carry a membership execution contract",
+        ));
+    };
+    if <[u8; 32]>::from(Sha256::digest(canonical_schema)) != *schema_digest {
+        return Err(contract_error(
+            RuntimeFilterContractViolationKind::ContractMismatch,
+            "membership canonical schema digest does not match the frozen contract",
+        ));
+    }
+    let expected = decode_membership_schema(canonical_schema).map_err(|detail| {
+        contract_error(RuntimeFilterContractViolationKind::ContractMismatch, detail)
+    })?;
+    if array.data_type() != &expected {
+        return Err(MembershipContributionEncodingError::TypeMismatch {
+            expected,
+            actual: array.data_type().clone(),
+        });
+    }
+    let domain = value_domain_from_array(array.as_ref(), &expected)?;
+    if domain.values().is_empty() && !domain.contains_null() {
+        return Ok(MembershipContributionEncodingOutcome::Contributions(
+            Vec::new(),
+        ));
+    }
+    let typed = RuntimeFilterContribution::membership(domain);
+    let encoded = match encode_contribution(
+        &typed,
+        ContributionCodecExpectation::membership(&expected, *schema_digest),
+        max_encoded_bytes,
+    ) {
+        Ok(encoded) => encoded,
+        Err(
+            ContributionCodecError::EncodedSizeExceeded
+            | ContributionCodecError::ResourceLimit
+            | ContributionCodecError::LengthOverflow,
+        ) => {
+            return Ok(MembershipContributionEncodingOutcome::Unavailable(
+                MembershipContributionEncodingUnavailable::ResourceOrSize,
+            ));
+        }
+        Err(error) => {
+            return Err(contract_error(
+                RuntimeFilterContractViolationKind::ContractMismatch,
+                error.to_string(),
+            ));
+        }
+    };
+    let (contract_digest, canonical_bytes) = encoded.into_parts();
+    Ok(MembershipContributionEncodingOutcome::Contributions(vec![
+        ExecutionContribution::new(
+            RuntimeFilterContributionKind::Membership,
+            contract_digest,
+            canonical_bytes,
+        ),
+    ]))
+}
+
+fn contract_error(
+    kind: RuntimeFilterContractViolationKind,
+    detail: impl Into<String>,
+) -> MembershipContributionEncodingError {
+    MembershipContributionEncodingError::ContractViolation {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+fn value_domain_from_array(
+    array: &dyn Array,
+    expected: &DataType,
+) -> Result<ValueDomainDelta, MembershipContributionEncodingError> {
+    let data = array.to_data();
+    if data.data_type() != expected || data.len() != array.len() {
+        return Err(invalid_array(
+            expected,
+            "Arrow physical array does not match its declared data type or length",
+        ));
+    }
+    macro_rules! collect_fixed {
+        ($width:expr, $convert:expr, $constructor:ident) => {{
+            let mut values = Vec::new();
+            let mut contains_null = false;
+            for row in 0..data.len() {
+                if row_is_null(&data, row, expected)? {
+                    contains_null = true;
+                } else {
+                    values.push($convert(fixed_value::<$width>(&data, row, expected)?));
+                }
+            }
+            ValueDomainDelta::new(MembershipValues::$constructor(values), contains_null)
+        }};
+    }
+    Ok(match expected {
+        DataType::Boolean => {
+            let mut values = Vec::new();
+            let mut contains_null = false;
+            for row in 0..data.len() {
+                if row_is_null(&data, row, expected)? {
+                    contains_null = true;
+                } else {
+                    values.push(boolean_value(&data, row, expected)?);
+                }
+            }
+            ValueDomainDelta::new(MembershipValues::boolean(values), contains_null)
+        }
+        DataType::Int8 => collect_fixed!(1, |bytes: [u8; 1]| i8::from_ne_bytes(bytes), int8),
+        DataType::Int16 => collect_fixed!(2, |bytes: [u8; 2]| i16::from_ne_bytes(bytes), int16),
+        DataType::Int32 => collect_fixed!(4, |bytes: [u8; 4]| i32::from_ne_bytes(bytes), int32),
+        DataType::Int64 => collect_fixed!(8, |bytes: [u8; 8]| i64::from_ne_bytes(bytes), int64),
+        DataType::Date32 => collect_fixed!(4, |bytes: [u8; 4]| i32::from_ne_bytes(bytes), date32),
+        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => {
+            let mut collected = Vec::new();
+            let mut contains_null = false;
+            for row in 0..data.len() {
+                if row_is_null(&data, row, expected)? {
+                    contains_null = true;
+                } else {
+                    let bytes = fixed_value::<16>(&data, row, expected)?;
+                    let value = novarocks_types::largeint::i128_from_be_bytes(&bytes)
+                        .map_err(|error| invalid_array(expected, error.to_string()))?;
+                    collected.push(value);
+                }
+            }
+            ValueDomainDelta::new(MembershipValues::large_int(collected), contains_null)
+        }
+        DataType::Float32 => collect_fixed!(4, |bytes: [u8; 4]| f32::from_ne_bytes(bytes), float32),
+        DataType::Float64 => collect_fixed!(8, |bytes: [u8; 8]| f64::from_ne_bytes(bytes), float64),
+        DataType::Utf8 => {
+            let mut values = Vec::new();
+            let mut contains_null = false;
+            for row in 0..data.len() {
+                if row_is_null(&data, row, expected)? {
+                    contains_null = true;
+                } else {
+                    values.push(utf8_value(&data, row, expected)?.to_string());
+                }
+            }
+            ValueDomainDelta::new(MembershipValues::utf8(values), contains_null)
+        }
+        DataType::Timestamp(unit, timezone) => {
+            let mut values = Vec::new();
+            let mut contains_null = false;
+            for row in 0..data.len() {
+                if row_is_null(&data, row, expected)? {
+                    contains_null = true;
+                } else {
+                    values.push(i64::from_ne_bytes(fixed_value::<8>(&data, row, expected)?));
+                }
+            }
+            ValueDomainDelta::new(
+                MembershipValues::timestamp(
+                    unit.clone(),
+                    timezone.as_ref().map(|value| value.as_ref()),
+                    values,
+                ),
+                contains_null,
+            )
+        }
+        DataType::Decimal128(precision, scale) => {
+            let mut collected = Vec::new();
+            let mut contains_null = false;
+            for row in 0..data.len() {
+                if row_is_null(&data, row, expected)? {
+                    contains_null = true;
+                } else {
+                    collected.push(i128::from_ne_bytes(fixed_value::<16>(
+                        &data, row, expected,
+                    )?));
+                }
+            }
+            let membership =
+                MembershipValues::decimal128(*precision, *scale, collected).map_err(|error| {
+                    MembershipContributionEncodingError::InvalidDecimal {
+                        precision: *precision,
+                        scale: *scale,
+                        detail: error.to_string(),
+                    }
+                })?;
+            ValueDomainDelta::new(membership, contains_null)
+        }
+        other => {
+            return Err(MembershipContributionEncodingError::UnsupportedType(
+                other.clone(),
+            ));
+        }
+    })
+}
+
+fn invalid_array(
+    data_type: &DataType,
+    detail: impl Into<String>,
+) -> MembershipContributionEncodingError {
+    MembershipContributionEncodingError::InvalidArray {
+        data_type: data_type.clone(),
+        detail: detail.into(),
+    }
+}
+
+fn row_is_null(
+    data: &arrow::array::ArrayData,
+    row: usize,
+    expected: &DataType,
+) -> Result<bool, MembershipContributionEncodingError> {
+    super::evaluator::row_is_null(data, row)
+        .map_err(|error| invalid_array(expected, error.to_string()))
+}
+
+fn boolean_value(
+    data: &arrow::array::ArrayData,
+    row: usize,
+    expected: &DataType,
+) -> Result<bool, MembershipContributionEncodingError> {
+    super::evaluator::boolean_value(data, row)
+        .map_err(|error| invalid_array(expected, error.to_string()))
+}
+
+fn fixed_value<const WIDTH: usize>(
+    data: &arrow::array::ArrayData,
+    row: usize,
+    expected: &DataType,
+) -> Result<[u8; WIDTH], MembershipContributionEncodingError> {
+    super::evaluator::fixed_value(data, row)
+        .map_err(|error| invalid_array(expected, error.to_string()))
+}
+
+fn utf8_value<'a>(
+    data: &'a arrow::array::ArrayData,
+    row: usize,
+    expected: &DataType,
+) -> Result<&'a str, MembershipContributionEncodingError> {
+    super::evaluator::utf8_value(data, row)
+        .map_err(|error| invalid_array(expected, error.to_string()))
+}
+
+fn decode_membership_schema(canonical: &[u8]) -> Result<DataType, String> {
+    const DOMAIN: &[u8] = b"novarocks.runtime-filter.artifact-schema";
+    let mut reader = Reader::new(canonical);
+    if reader
+        .take(DOMAIN.len())
+        .map_err(|_| "truncated membership schema")?
+        != DOMAIN
+        || reader.u8().map_err(|_| "truncated membership schema")? != 1
+    {
+        return Err("membership schema has an unknown canonical prefix".to_string());
+    }
+    let tag = reader.u8().map_err(|_| "truncated membership schema")?;
+    let data_type = match tag {
+        1 => DataType::Boolean,
+        2 => DataType::Int8,
+        3 => DataType::Int16,
+        4 => DataType::Int32,
+        5 => DataType::Int64,
+        6 => DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH),
+        7 => DataType::Float32,
+        8 => DataType::Float64,
+        9 => DataType::Utf8,
+        10 => DataType::Date32,
+        11 => {
+            let unit = match reader.u8().map_err(|_| "truncated timestamp schema")? {
+                1 => TimeUnit::Second,
+                2 => TimeUnit::Millisecond,
+                3 => TimeUnit::Microsecond,
+                4 => TimeUnit::Nanosecond,
+                _ => return Err("timestamp schema has an invalid time unit".to_string()),
+            };
+            let timezone = match reader.u8().map_err(|_| "truncated timestamp schema")? {
+                0 => None,
+                1 => {
+                    let len = usize::try_from(u32::from_be_bytes(
+                        reader
+                            .take(4)
+                            .map_err(|_| "truncated timestamp timezone")?
+                            .try_into()
+                            .expect("four-byte schema length"),
+                    ))
+                    .map_err(|_| "timestamp timezone length overflow")?;
+                    Some(
+                        std::str::from_utf8(
+                            reader
+                                .take(len)
+                                .map_err(|_| "truncated timestamp timezone")?,
+                        )
+                        .map_err(|_| "timestamp timezone is not UTF-8")?
+                        .into(),
+                    )
+                }
+                _ => return Err("timestamp schema has invalid timezone metadata".to_string()),
+            };
+            DataType::Timestamp(unit, timezone)
+        }
+        12 => {
+            let precision = reader.u8().map_err(|_| "truncated decimal schema")?;
+            let scale = reader.u8().map_err(|_| "truncated decimal schema")? as i8;
+            let values = BTreeSet::new();
+            validate_decimal(precision, scale, &values)
+                .map_err(|_| "decimal schema metadata is invalid")?;
+            DataType::Decimal128(precision, scale)
+        }
+        _ => return Err("membership schema has an unsupported type tag".to_string()),
+    };
+    match reader
+        .u8()
+        .map_err(|_| "membership schema is missing null semantics")?
+    {
+        1 | 2 => {}
+        _ => return Err("membership schema has invalid null semantics".to_string()),
+    }
+    if !reader.empty() {
+        return Err("membership schema has trailing bytes".to_string());
+    }
+    Ok(data_type)
+}
+
 fn decode_tuple(
     bytes: &[u8],
     contract: &RuntimeOrderContract,
@@ -1399,8 +1821,76 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::runtime_filter::{
+        RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterExecutionContract,
+        RuntimeFilterProducerContract,
+    };
+    use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::DataType;
+
+    #[test]
+    fn arrow_membership_encoder_uses_the_frozen_contract_and_nrfc_frame() {
+        let schema = membership_schema_for_test(&DataType::Int32);
+        let digest: [u8; 32] = Sha256::digest(&schema).into();
+        let producer = RuntimeFilterProducerContract::membership(
+            RuntimeFilterBindingId::new(7),
+            RuntimeFilterChannelId::new(9),
+            RuntimeFilterExecutionContract::Membership {
+                canonical_schema: Arc::from(schema),
+                schema_digest: digest,
+            },
+        )
+        .unwrap();
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(2), None, Some(1), Some(2)]));
+
+        let MembershipContributionEncodingOutcome::Contributions(contributions) =
+            encode_membership_contributions(&producer, &input, usize::MAX).unwrap()
+        else {
+            panic!("the complete canonical contribution fits");
+        };
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].contract_digest(), digest);
+        let decoded = decode_contribution(
+            contributions[0].canonical_bytes(),
+            &digest,
+            ContributionCodecExpectation::membership(&DataType::Int32, digest),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            RuntimeFilterContribution::membership(ValueDomainDelta::new(
+                MembershipValues::int32([1, 2]),
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn arrow_membership_encoder_fails_open_without_emitting_a_partial_domain() {
+        let schema = membership_schema_for_test(&DataType::Int64);
+        let digest: [u8; 32] = Sha256::digest(&schema).into();
+        let producer = RuntimeFilterProducerContract::membership(
+            RuntimeFilterBindingId::new(7),
+            RuntimeFilterChannelId::new(9),
+            RuntimeFilterExecutionContract::Membership {
+                canonical_schema: Arc::from(schema),
+                schema_digest: digest,
+            },
+        )
+        .unwrap();
+        let input: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1_i64, 2, 3]));
+
+        assert_eq!(
+            encode_membership_contributions(&producer, &input, 1).unwrap(),
+            MembershipContributionEncodingOutcome::Unavailable(
+                MembershipContributionEncodingUnavailable::ResourceOrSize
+            ),
+        );
+    }
 
     #[test]
     fn membership_frame_uses_the_v1_nrfc_fixture_bytes() {
@@ -1585,5 +2075,25 @@ mod tests {
             decode_contribution(encoded.payload(), &digest, expectation, usize::MAX).unwrap(),
             contribution
         );
+    }
+
+    fn membership_schema_for_test(data_type: &DataType) -> Vec<u8> {
+        let mut schema = b"novarocks.runtime-filter.artifact-schema".to_vec();
+        schema.push(1);
+        schema.push(match data_type {
+            DataType::Boolean => 1,
+            DataType::Int8 => 2,
+            DataType::Int16 => 3,
+            DataType::Int32 => 4,
+            DataType::Int64 => 5,
+            DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => 6,
+            DataType::Float32 => 7,
+            DataType::Float64 => 8,
+            DataType::Utf8 => 9,
+            DataType::Date32 => 10,
+            _ => panic!("test schema only needs primitive membership types"),
+        });
+        schema.push(2);
+        schema
     }
 }
