@@ -679,6 +679,9 @@ pub(crate) fn stage_prepared_update_mutation(
             } = mor_write_target.ok_or_else(|| {
                 "MOR UPDATE reached stage without an admitted frozen write target".to_string()
             })?;
+            let write_lease = write_planning_lease
+                .derive_write_lease()
+                .map_err(|error| format!("derive MOR UPDATE write lease: {error}"))?;
             let metadata = table.metadata();
             let collector = Arc::new(
                 IcebergCommitCollector::new(
@@ -747,6 +750,7 @@ pub(crate) fn stage_prepared_update_mutation(
                     &provider_binding,
                     operation_id,
                     connector_context.clone(),
+                    &write_lease,
                 )?;
             let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
                 state: Arc::clone(state),
@@ -2457,6 +2461,10 @@ fn build_cow_update_distributed_execution(
         snapshot_properties: BTreeMap::new(),
     });
     let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+    let write_lease = write
+        .planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive COW UPDATE write lease: {error}"))?;
     let mut write = write;
     write
         .file_plans
@@ -2546,6 +2554,7 @@ fn build_cow_update_distributed_execution(
         target_ref,
         service,
         operation_id,
+        &write_lease,
         cohort_templates,
     )?;
     let registration =
@@ -2932,6 +2941,9 @@ pub(crate) fn stage_prepared_merge_mutation(
         } = mor_write_target.ok_or_else(|| {
             "MOR MERGE reached stage without an admitted frozen write target".to_string()
         })?;
+        let write_lease = write_planning_lease
+            .derive_write_lease()
+            .map_err(|error| format!("derive MOR MERGE write lease: {error}"))?;
         let collector = Arc::new(
             IcebergCommitCollector::new(
                 CommitOpKind::RowDeltaDvFromFiles,
@@ -3000,6 +3012,7 @@ pub(crate) fn stage_prepared_merge_mutation(
                 &provider_binding,
                 operation_id,
                 connector_context.clone(),
+                &write_lease,
             )?;
         let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
             state: Arc::clone(state),
@@ -3419,12 +3432,17 @@ fn prepare_cow_merge_operation(
         )
         .map_err(|error| format!("build MERGE COW operation service: {error}"))?,
     );
+    let write_lease = write
+        .planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive COW MERGE write lease: {error}"))?;
     let templates = crate::engine::iceberg_writer::register_iceberg_connector_write_cohort_service(
         state,
         target,
         target_ref,
         service,
         operation_id,
+        &write_lease,
         templates,
     )?;
     let registration =

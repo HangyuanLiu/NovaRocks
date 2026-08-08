@@ -344,6 +344,18 @@ fn prepare_frontend_first_refresh_write(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive MV first-refresh write lease: {error}"))?;
+    if write_lease.binding_key() != &observed_binding {
+        return Err(
+            "MV first-refresh target connector generation changed during admission".to_string(),
+        );
+    }
     let definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     let definition = rebind_mv_definition_before_refresh_derivation(
@@ -480,7 +492,7 @@ fn prepare_frontend_first_refresh_write(
         // artifact now so activation cannot resolve a later base generation.
         context.connector_context = Some(connector_context.clone());
         let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
-            state,
+            &write_lease,
             &crate::engine::backend_resolver::TargetBackend {
                 backend_name: "iceberg",
                 catalog: target.catalog.clone(),
@@ -609,7 +621,7 @@ fn prepare_frontend_first_refresh_write(
         )
     };
     let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
-        state,
+        &write_lease,
         &crate::engine::backend_resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: target.catalog.clone(),
@@ -16150,6 +16162,13 @@ fn execute_imv_change_stream_writer(
                 commit_executor: Arc::clone(&commit_executor),
             },
         )?;
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive Iceberg MV change-stream write lease: {error}"))?;
     let connector_write =
         crate::engine::iceberg_writer::register_iceberg_change_stream_provider_binding(
             state,
@@ -16157,6 +16176,7 @@ fn execute_imv_change_stream_writer(
             &binding,
             refresh_plan.connector_operation_id,
             connector_context.clone(),
+            &write_lease,
         )?;
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
         state,

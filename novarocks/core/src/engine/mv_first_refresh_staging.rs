@@ -485,6 +485,18 @@ fn mv_first_refresh_request(
         namespace: ctx.rewrite.target.namespace.clone(),
         table: ctx.rewrite.target.table.clone(),
     };
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive MV first-refresh request write lease: {error}"))?;
+    if write_lease.binding_key() != &observed_binding {
+        return Err(
+            "MV first-refresh target connector generation changed during admission".to_string(),
+        );
+    }
     let runtime = ctx.target_bindings.runtime();
     let persisted_partition_spec_id = ctx
         .rewrite
@@ -539,7 +551,7 @@ fn mv_first_refresh_request(
         hidden_hash_key,
     )?;
     let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
-        state,
+        &write_lease,
         &target,
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?,
     )?;

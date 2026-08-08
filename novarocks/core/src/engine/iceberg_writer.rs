@@ -267,6 +267,9 @@ fn prepare_iceberg_distributed_write(
     options: IcebergWritePreparationOptions,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedIcebergWrite, String> {
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive Iceberg write admission lease: {error}"))?;
     let metadata = table.metadata();
     let (query, sink_spec) =
         build_iceberg_write_plan(target, resolved, insert_columns, source, &table, entry)?;
@@ -327,6 +330,7 @@ fn prepare_iceberg_distributed_write(
         Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
+        &write_lease,
     )?;
     let executor = PreparedIcebergWriteExecutor {
         state: Arc::clone(state),
@@ -374,6 +378,7 @@ fn register_insert_connector_write(
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     let writer_handle_payload = encode_data_sink_spec_handle_payload(sink_spec)?;
     let input_schema = Arc::new(Schema::new(
@@ -398,6 +403,7 @@ fn register_insert_connector_write(
         commit_executor,
         operation_id,
         context,
+        exact_lease,
     )
 }
 
@@ -412,6 +418,7 @@ pub(crate) fn register_iceberg_connector_write(
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     let plan_payload = IcebergWritePlanPayloadV1 {
         version: 1,
@@ -438,6 +445,7 @@ pub(crate) fn register_iceberg_connector_write(
         service,
         operation_id,
         context,
+        exact_lease,
     )
 }
 
@@ -447,6 +455,7 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
     binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     register_iceberg_connector_write_service(
         state,
@@ -461,6 +470,7 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
             .map_err(|error| format!("build Iceberg change-stream write service: {error}"))?,
         operation_id,
         context,
+        exact_lease,
     )
 }
 
@@ -473,12 +483,13 @@ pub(crate) fn iceberg_change_stream_provider_binding_template(
     binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
     let mut templates = build_iceberg_connector_write_templates(
-        state,
         target,
         operation_id,
+        exact_lease,
         vec![(
             cohort_id,
             ConnectorWriteIntent::RowDelta,
@@ -661,9 +672,9 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
         .map_err(|error| format!("reserve Iceberg first-refresh write service: {error}"))?;
     let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
     let mut templates = build_iceberg_connector_write_templates(
-        state,
         target,
         operation_id,
+        exact_lease,
         vec![(cohort_id, intent, input_schema, provider_payload, context)],
     )?;
     Ok(templates
@@ -682,6 +693,7 @@ pub(crate) fn register_iceberg_connector_write_service<S>(
     service: S,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String>
 where
     S: crate::connector::iceberg::write_control::IcebergWriteControlBackend + 'static,
@@ -696,6 +708,7 @@ where
         target_ref,
         service,
         operation_id,
+        exact_lease,
         vec![(cohort_id, intent, input_schema, payload, context)],
     )?;
     Ok(templates
@@ -710,6 +723,7 @@ pub(crate) fn register_iceberg_connector_write_cohort_service<S>(
     target_ref: &str,
     service: S,
     operation_id: ConnectorWriteOperationId,
+    exact_lease: &ConnectorWriteLease,
     cohorts: Vec<(
         novarocks_spi::connector::ConnectorWriteCohortId,
         ConnectorWriteIntent,
@@ -735,7 +749,7 @@ where
         .register(operation_id, service)
         .map_err(|error| format!("register Iceberg connector write service: {error}"))?;
 
-    build_iceberg_connector_write_templates(state, target, operation_id, cohorts)
+    build_iceberg_connector_write_templates(target, operation_id, exact_lease, cohorts)
 }
 
 /// Reserve an Iceberg write service only after the application has retained
@@ -783,14 +797,14 @@ where
     services
         .register_lazy(operation_id, activation_digest, factory)
         .map_err(|error| format!("reserve Iceberg connector write service: {error}"))?;
-    build_iceberg_connector_write_templates(state, target, operation_id, cohorts)
+    build_iceberg_connector_write_templates(target, operation_id, exact_lease, cohorts)
 }
 
 #[allow(clippy::type_complexity)]
 fn build_iceberg_connector_write_templates(
-    state: &Arc<StandaloneState>,
     target: &TargetBackend,
     operation_id: ConnectorWriteOperationId,
+    exact_lease: &ConnectorWriteLease,
     cohorts: Vec<(
         novarocks_spi::connector::ConnectorWriteCohortId,
         ConnectorWriteIntent,
@@ -804,7 +818,7 @@ fn build_iceberg_connector_write_templates(
         .ok_or_else(|| "Iceberg connector write operation has no cohorts".to_string())?
         .4
         .clone();
-    let table = iceberg_connector_table_handle(state, target, context)?;
+    let table = iceberg_connector_table_handle(exact_lease, target, context)?;
     cohorts
         .into_iter()
         .map(
@@ -829,20 +843,16 @@ fn build_iceberg_connector_write_templates(
 /// capability owned by the exact generation observed at write admission.
 /// Core only forwards the target identity; it never builds a handle payload.
 pub(crate) fn iceberg_connector_table_handle(
-    state: &Arc<StandaloneState>,
+    exact_lease: &ConnectorWriteLease,
     target: &TargetBackend,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorTableHandle, String> {
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let planning_lease = state
-        .connector_control
-        .acquire_current(&instance_id)
-        .map_err(|error| format!("acquire Iceberg write admission lease: {error}"))?;
-    let write_lease = planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive Iceberg write admission lease: {error}"))?;
-    let metadata = write_lease
+    if exact_lease.binding_key().instance_id != instance_id {
+        return Err("Iceberg write lease does not match the target connector instance".to_string());
+    }
+    let metadata = exact_lease
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,

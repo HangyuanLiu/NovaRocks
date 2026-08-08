@@ -372,8 +372,14 @@ fn prepare_delete_dv_write(
     sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
     sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding =
-        admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive deletion-vector write lease: {error}"))?;
+    let target_binding = admit_frozen_iceberg_write_target(
+        table_bindings.as_ref(),
+        &sink_spec,
+        planning_lease.clone(),
+    )?;
     let sql_write_input = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
@@ -449,6 +455,7 @@ fn prepare_delete_dv_write(
         Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
+        &write_lease,
     )?;
     let executor = DistributedDvDeleteWriteExecutor {
         state: Arc::clone(state),
@@ -495,8 +502,14 @@ fn prepare_delete_write(
     let mut sink_spec = sink_spec;
     sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding =
-        admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive position-delete write lease: {error}"))?;
+    let target_binding = admit_frozen_iceberg_write_target(
+        table_bindings.as_ref(),
+        &sink_spec,
+        planning_lease.clone(),
+    )?;
     let sql_write_input = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
@@ -552,6 +565,7 @@ fn prepare_delete_write(
         Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
+        &write_lease,
     )?;
     let executor = DistributedDeleteWriteExecutor {
         state: Arc::clone(state),

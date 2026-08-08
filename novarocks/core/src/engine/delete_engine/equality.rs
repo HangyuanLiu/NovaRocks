@@ -223,8 +223,14 @@ fn prepare_equality_delete_distributed_write(
     sink_spec.mode = IcebergWriteSinkMode::EqualityDeletes;
     sink_spec.set_planned_snapshot_id(current_snapshot_id)?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding =
-        admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
+    let target_binding = admit_frozen_iceberg_write_target(
+        table_bindings.as_ref(),
+        &sink_spec,
+        planning_lease.clone(),
+    )?;
     let input_columns = delete_columns
         .iter()
         .map(|column| ColumnDef {
@@ -299,6 +305,7 @@ fn prepare_equality_delete_distributed_write(
         Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
+        &write_lease,
     )?;
     let executor = DistributedEqualityDeleteWriteExecutor {
         state: Arc::clone(state),
