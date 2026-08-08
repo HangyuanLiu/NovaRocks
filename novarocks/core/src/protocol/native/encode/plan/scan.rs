@@ -679,6 +679,7 @@ fn encode_scan_source(
                     None,
                     scan_variant_columns,
                     binding,
+                    Some(&planned.scan.output_schema),
                 )?,
             })),
         });
@@ -748,6 +749,7 @@ fn encode_connector_expected_schema_ipc(
     iceberg_schema: Option<&iceberg_scan_model::IcebergSchemaDef>,
     variant_columns: &[ScanVariantColumn],
     binding: Option<&ResolvedScanBinding>,
+    provider_schema: Option<&arrow::datatypes::SchemaRef>,
 ) -> Result<Vec<u8>, String> {
     let required = (!required_columns.is_empty()).then(|| {
         required_columns
@@ -805,8 +807,33 @@ fn encode_connector_expected_schema_ipc(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let schema = if let Some(iceberg_schema) = iceberg_schema {
-        let columns = selected
+    let selected_schema = Schema::new(selected);
+    let schema = if let Some(provider_schema) = provider_schema {
+        // The read provider owns field metadata such as Iceberg field IDs and
+        // initial defaults. A physical scan can also carry execution-only
+        // columns (for example DML equality keys), so retain provider fields
+        // only where the native output actually consumes the same field.
+        Schema::new(
+            selected_schema
+                .fields()
+                .iter()
+                .map(|selected| {
+                    provider_schema
+                        .fields()
+                        .iter()
+                        .find(|provider| {
+                            provider.name() == selected.name()
+                                && provider.is_nullable() == selected.is_nullable()
+                                && provider.data_type() == selected.data_type()
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| selected.clone())
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else if let Some(iceberg_schema) = iceberg_schema {
+        let columns = selected_schema
+            .fields()
             .iter()
             .map(|field| crate::connector::iceberg::IcebergArrowColumn {
                 name: field.name().to_string(),
@@ -821,7 +848,7 @@ fn encode_connector_expected_schema_ipc(
         .as_ref()
         .clone()
     } else {
-        Schema::new(selected)
+        selected_schema
     };
     let mut writer = StreamWriter::try_new(Vec::new(), &schema)
         .map_err(|error| format!("encode ConnectorReadSource expected schema: {error}"))?;
@@ -1046,7 +1073,12 @@ fn encode_iceberg_partition_value(
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
+    use std::collections::HashMap;
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::reader::StreamReader;
 
     use super::encode_connector_expected_schema_ipc;
     use crate::sql::analysis::OutputColumn;
@@ -1074,9 +1106,51 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .expect("domain schema should encode without a protobuf type descriptor");
 
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn spi5b_connector_expected_schema_preserves_provider_field_metadata() {
+        let provider_schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true).with_metadata(HashMap::from([(
+                "novarocks.iceberg.initial_default".to_string(),
+                "9".to_string(),
+            )])),
+        ]));
+        let bytes = encode_connector_expected_schema_ipc(
+            &[common::OutputColumn {
+                column_id: 7,
+                name: "value".to_string(),
+                r#type: None,
+                nullable: true,
+                is_internal: false,
+            }],
+            &[OutputColumn {
+                column_id: ColumnId(7),
+                name: "value".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                is_internal: false,
+            }],
+            &[],
+            None,
+            &[],
+            None,
+            Some(&provider_schema),
+        )
+        .expect("provider schema should encode");
+        let decoded = StreamReader::try_new(Cursor::new(bytes), None)
+            .expect("decode provider schema")
+            .schema();
+        assert_eq!(
+            decoded.fields()[0]
+                .metadata()
+                .get("novarocks.iceberg.initial_default"),
+            Some(&"9".to_string())
+        );
     }
 }

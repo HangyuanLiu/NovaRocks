@@ -594,7 +594,11 @@ impl IcebergReadOnlyConnectorInstance {
                 request.context.max_handle_payload_bytes(),
             )?;
             let descriptor = ConnectorPreparedScanUnitDescriptor::try_new(
-                Bytes::new(),
+                encode_payload(
+                    &IcebergPreparedMetadataUnitPayloadV1 { version: 1 },
+                    "prepared metadata scan unit payload",
+                    request.context.max_handle_payload_bytes(),
+                )?,
                 None,
                 ConnectorScanUnitDomainFacts::missing(
                     novarocks_spi::connector::ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
@@ -1749,6 +1753,7 @@ impl IcebergControlProvider {
         entry: &IcebergCatalogEntry,
         namespace: &str,
         table: &str,
+        metadata_columns: &[String],
         projection: &[usize],
     ) -> Result<SchemaRef, ConnectorError> {
         let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
@@ -1756,20 +1761,25 @@ impl IcebergControlProvider {
             loaded.table.metadata().current_schema(),
         )
         .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
+        let mut storage_fields = storage_schema.fields().to_vec();
+        storage_fields.extend(iceberg_metadata_arrow_fields(metadata_columns)?);
         let indexes = if projection.is_empty() {
-            (0..storage_schema.fields().len()).collect::<Vec<_>>()
+            (0..storage_fields.len()).collect::<Vec<_>>()
         } else {
             projection.to_vec()
         };
         let fields = indexes
             .into_iter()
             .map(|index| {
-                let storage_field = storage_schema.fields().get(index).ok_or_else(|| {
+                let storage_field = storage_fields.get(index).ok_or_else(|| {
                     ConnectorError::new(
                         ConnectorErrorKind::InvalidRequest,
                         format!("Iceberg projection index {index} is outside the table schema"),
                     )
                 })?;
+                if is_iceberg_metadata_column(storage_field.name()) {
+                    return Ok(storage_field.clone());
+                }
                 let logical_column = loaded
                     .columns
                     .iter()
@@ -3951,7 +3961,13 @@ impl ConnectorMetadata for IcebergControlProvider {
         let schema = if table.metadata_table_type.is_some() {
             self.metadata_schema(&table, &[])?
         } else {
-            self.schema_for(&entry, &request.table.namespace, &table_name, &[])?
+            self.schema_for(
+                &entry,
+                &request.table.namespace,
+                &table_name,
+                &table.metadata_columns,
+                &[],
+            )?
         };
         Ok(ConnectorTableMetadata {
             identity: novarocks_spi::connector::ConnectorTableIdentity {
@@ -4825,7 +4841,13 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             _ if table.metadata_table_type.is_some() => {
                 self.metadata_schema(&table, &request.projection)?
             }
-            _ => self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?,
+            _ => self.schema_for(
+                &entry,
+                &table.namespace,
+                &table.table,
+                &table.metadata_columns,
+                &request.projection,
+            )?,
         };
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
             (None, None)
@@ -5622,6 +5644,34 @@ fn iceberg_metadata_column_names(
     names
 }
 
+fn iceberg_metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, ConnectorError> {
+    names
+        .iter()
+        .map(|name| {
+            let (data_type, nullable) = match name.as_str() {
+                "_file" => (DataType::Utf8, false),
+                "_pos" => (DataType::Int64, false),
+                "_row_id" => (DataType::Int64, false),
+                "_last_updated_sequence_number" => (DataType::Int64, true),
+                other => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        format!("unknown Iceberg metadata column `{other}`"),
+                    ));
+                }
+            };
+            Ok(Arc::new(Field::new(name, data_type, nullable)))
+        })
+        .collect()
+}
+
+fn is_iceberg_metadata_column(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number"
+    )
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct TablePayload {
     namespace: String,
@@ -5864,6 +5914,14 @@ struct IcebergPreparedUnitPayload {
     row_groups: Option<Vec<usize>>,
 }
 
+/// Metadata readers receive their frozen descriptor in the shared split
+/// payload. This marker keeps every generic prepared unit explicitly opaque
+/// and non-empty for protocol validation.
+#[derive(Deserialize, Serialize)]
+struct IcebergPreparedMetadataUnitPayloadV1 {
+    version: u16,
+}
+
 /// Provider-private description of one projected top-level Iceberg field.
 /// It binds the table-schema ordinal to the field ID, canonical name, and
 /// scalar vocabulary before a split crosses the FE/BE boundary.
@@ -5918,7 +5976,7 @@ fn scan_fact_columns(
         return Ok(Vec::new());
     };
     let indexes = if projection.is_empty() {
-        (0..table_info.schema.fields.len()).collect::<Vec<_>>()
+        (0..output_schema.fields().len()).collect::<Vec<_>>()
     } else {
         projection.to_vec()
     };
@@ -5932,6 +5990,9 @@ fn scan_fact_columns(
         .into_iter()
         .zip(output_schema.fields())
         .map(|(ordinal, field)| {
+            if is_iceberg_metadata_column(field.name()) {
+                return Ok(None);
+            }
             let field_ordinal = u32::try_from(ordinal).map_err(|_| {
                 ConnectorError::new(
                     ConnectorErrorKind::ResourceExhausted,
@@ -5952,15 +6013,18 @@ fn scan_fact_columns(
                     "Iceberg frozen table schema disagrees with its output schema",
                 ));
             }
-            Ok(IcebergScanFactColumnV1 {
+            Ok(Some(IcebergScanFactColumnV1 {
                 field_ordinal,
                 field_id: table_field.field_id,
                 canonical_name: table_field.name.to_ascii_lowercase(),
                 scalar_type: iceberg_scan_fact_scalar_type(field.data_type()),
                 nullable: field.is_nullable(),
-            })
+            }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<Option<_>>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     // The projection preserves planner output order, which can differ from the
     // frozen table schema. Domain facts are sealed in table-schema ordinal
     // order so their constructor can reject duplicate or reordered entries.
@@ -6768,6 +6832,10 @@ fn materialization_from_metadata(
                 .hidden_columns
                 .iter()
                 .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
+                && !payload
+                    .metadata_columns
+                    .iter()
+                    .any(|metadata| column.name.eq_ignore_ascii_case(metadata))
         })
         .collect();
     Ok(IcebergQueryTableMaterialization {
