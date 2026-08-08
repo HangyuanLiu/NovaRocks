@@ -266,3 +266,105 @@ pub trait ConnectorMetadata: Send + Sync {
         request: ConnectorTableRequest,
     ) -> Result<ConnectorTableMetadata, ConnectorError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    struct NeverCancelled;
+
+    impl super::super::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context(total_payload_bytes: usize) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            total_payload_bytes,
+            total_payload_bytes,
+        )
+        .expect("valid connector request context")
+    }
+
+    #[test]
+    fn spi5b_reference_facts_are_canonicalized_deterministically() {
+        let facts = ConnectorReadReferenceFacts::try_new(
+            vec![30, 10, 20],
+            vec![
+                ConnectorReadSnapshotLogEntry {
+                    snapshot_id: 30,
+                    timestamp_millis: 200,
+                },
+                ConnectorReadSnapshotLogEntry {
+                    snapshot_id: 10,
+                    timestamp_millis: 100,
+                },
+            ],
+            vec![
+                ConnectorReadNamedReference {
+                    name: Arc::from("release"),
+                    kind: ConnectorReadReferenceKind::Tag,
+                    snapshot_id: 30,
+                },
+                ConnectorReadNamedReference {
+                    name: Arc::from("main"),
+                    kind: ConnectorReadReferenceKind::Branch,
+                    snapshot_id: 20,
+                },
+            ],
+            Some(20),
+            &context(1024),
+        )
+        .expect("facts are valid");
+
+        assert_eq!(facts.snapshot_ids(), &[10, 20, 30]);
+        assert_eq!(facts.snapshot_log()[0].snapshot_id, 10);
+        assert_eq!(facts.named_references()[0].name.as_ref(), "main");
+        assert_eq!(facts.current_snapshot_id(), Some(20));
+    }
+
+    #[test]
+    fn spi5b_reference_facts_reject_unknown_named_reference_snapshot() {
+        let error = ConnectorReadReferenceFacts::try_new(
+            vec![10],
+            Vec::new(),
+            vec![ConnectorReadNamedReference {
+                name: Arc::from("main"),
+                kind: ConnectorReadReferenceKind::Branch,
+                snapshot_id: 20,
+            }],
+            None,
+            &context(1024),
+        )
+        .expect_err("unknown named-reference snapshot is corrupt provider data");
+
+        assert_eq!(error.kind(), super::super::ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn spi5b_reference_facts_enforce_the_request_payload_budget() {
+        let error = ConnectorReadReferenceFacts::try_new(
+            vec![10],
+            Vec::new(),
+            vec![ConnectorReadNamedReference {
+                name: Arc::from("main"),
+                kind: ConnectorReadReferenceKind::Branch,
+                snapshot_id: 10,
+            }],
+            None,
+            &context(16),
+        )
+        .expect_err("facts larger than the request budget must fail");
+
+        assert_eq!(
+            error.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+}

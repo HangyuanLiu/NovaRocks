@@ -129,3 +129,144 @@ pub(crate) fn validate_view_metadata_owner(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect,
+    };
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct ViewCapability {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+    }
+
+    impl ConnectorViewMetadata for ViewCapability {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+            self.incarnation
+        }
+
+        fn view_exists(&self, _: ConnectorViewRequest) -> Result<bool, ConnectorError> {
+            Ok(false)
+        }
+
+        fn load_view(
+            &self,
+            _: ConnectorViewRequest,
+        ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "missing view",
+            ))
+        }
+
+        fn list_views(
+            &self,
+            _: ConnectorListViewsRequest,
+        ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn descriptor() -> ConnectorInstanceDescriptor {
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            1024,
+        )
+        .expect("valid connector request context")
+    }
+
+    fn identity() -> ConnectorViewIdentity {
+        ConnectorViewIdentity {
+            instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
+            namespace: Arc::from("db"),
+            view: Arc::from("v"),
+        }
+    }
+
+    fn definition() -> ConnectorViewDefinition {
+        ConnectorViewDefinition {
+            dialect: ConnectorViewDialect::StarRocks,
+            sql: Arc::from("SELECT 1"),
+        }
+    }
+
+    #[test]
+    fn spi5b_view_metadata_canonicalizes_properties() {
+        let value = ConnectorViewMetadataValue::try_new(
+            identity(),
+            definition(),
+            Arc::from("db"),
+            vec![Arc::from("c")],
+            Some(Arc::from("comment")),
+            vec![
+                (Arc::from("z"), Arc::from("2")),
+                (Arc::from("a"), Arc::from("1")),
+            ],
+            &context(),
+        )
+        .expect("valid view metadata");
+
+        assert_eq!(value.properties[0].0.as_ref(), "a");
+        assert_eq!(value.properties[1].0.as_ref(), "z");
+    }
+
+    #[test]
+    fn spi5b_view_metadata_rejects_duplicate_properties() {
+        let error = ConnectorViewMetadataValue::try_new(
+            identity(),
+            definition(),
+            Arc::from("db"),
+            Vec::new(),
+            None,
+            vec![
+                (Arc::from("a"), Arc::from("1")),
+                (Arc::from("a"), Arc::from("2")),
+            ],
+            &context(),
+        )
+        .expect_err("duplicate properties are corrupt provider data");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn spi5b_view_metadata_rejects_a_different_generation_owner() {
+        let descriptor = descriptor();
+        let expected_incarnation = ConnectorInstanceIncarnation::new();
+        let capability = ViewCapability {
+            descriptor: descriptor.clone(),
+            incarnation: ConnectorInstanceIncarnation::new(),
+        };
+
+        let error = validate_view_metadata_owner(&descriptor, expected_incarnation, &capability)
+            .expect_err("view capability must belong to the exact control generation");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+}
