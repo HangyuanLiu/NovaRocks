@@ -42,6 +42,7 @@ use crate::exec::operators::runtime_filter::{
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::RowPositionSpec;
 use crate::novarocks_logging::debug;
+use crate::runtime::fragment::{FragmentEvent, FragmentEventSink};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array};
 use arrow::compute::filter_record_batch;
@@ -63,6 +64,9 @@ const SCAN_TIME: &str = "ScanTime";
 // for correctness.
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
+const RUNTIME_FILTER_SCAN_UNITS_PRUNED: &str = "RuntimeFilterScanUnitsPruned";
+const RUNTIME_FILTER_SCAN_UNITS_KEPT: &str = "RuntimeFilterScanUnitsKept";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED: &str = "RuntimeFilterScanUnitsNotEvaluated";
 
 type PositionedChunk = (Chunk, Option<Vec<i64>>);
 
@@ -123,6 +127,7 @@ pub(super) struct ScanAsyncRunner {
     conjunct_encoding_policy: Option<FilterEncodingPolicy>,
     arena: Arc<ExprArena>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    event_sink: Arc<dyn FragmentEventSink>,
     last_progress: Instant,
     last_log: Instant,
     current_morsel: Option<ScanMorsel>,
@@ -147,6 +152,7 @@ impl ScanAsyncRunner {
         native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
         arena: Arc<ExprArena>,
         profiles: Option<crate::runtime::profile::OperatorProfiles>,
+        event_sink: Arc<dyn FragmentEventSink>,
         driver_id: i32,
     ) -> Self {
         let conjunct_predicate = scan.conjunct_predicate();
@@ -166,6 +172,7 @@ impl ScanAsyncRunner {
             native_ordered_live_consumers,
             arena,
             profiles,
+            event_sink,
             last_progress: Instant::now(),
             last_log: Instant::now(),
             current_morsel: None,
@@ -340,6 +347,7 @@ impl ScanAsyncRunner {
                 RuntimeFilterScanUnitInput::from_prepared(&unit),
             )
             .map_err(|error| error.to_string())?;
+            self.record_scan_domain_outcome(&outcome);
             if matches!(
                 outcome.effect().map(|effect| effect.decision()),
                 Some(RuntimeFilterScanUnitDecision::Pruned)
@@ -348,6 +356,44 @@ impl ScanAsyncRunner {
             }
         }
         Ok(ScanMorselPruneDecision::Keep)
+    }
+
+    fn record_scan_domain_outcome(
+        &self,
+        outcome: &novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome,
+    ) {
+        self.event_sink
+            .record(FragmentEvent::RuntimeFilterScanUnitOutcome(*outcome));
+        let Some(profiles) = self.profiles.as_ref() else {
+            return;
+        };
+        let counter = match outcome.evaluation() {
+            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
+                decision: RuntimeFilterScanUnitDecision::Pruned,
+                ..
+            } => RUNTIME_FILTER_SCAN_UNITS_PRUNED,
+            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
+                decision: RuntimeFilterScanUnitDecision::Kept,
+                ..
+            } => RUNTIME_FILTER_SCAN_UNITS_KEPT,
+            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated { .. } => {
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED
+            }
+        };
+        profiles.common.counter_add(counter, ProfileUnit::Unit, 1);
+        if let novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated { reason, .. } = outcome.evaluation() {
+            let reason_counter = match reason {
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::UnitFactsMissing(_) => "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::ColumnFactsMissing(_) => "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::DataTypeUnsupported => "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::PredicateCapabilityUnsupported => "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::ResourceUnavailable => "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotUnavailable => "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotTimedOut => "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut",
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotNotPublished => "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
+            };
+            profiles.common.counter_add(reason_counter, ProfileUnit::Unit, 1);
+        }
     }
 
     #[cfg(test)]
@@ -1160,6 +1206,7 @@ mod tests {
             Some(ordered_consumers),
             arena,
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
 
@@ -1197,6 +1244,7 @@ mod tests {
             None,
             Arc::clone(&arena),
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
         pending_runner.pending_chunk = Some(single_value_chunk(7));
@@ -1210,6 +1258,7 @@ mod tests {
             None,
             arena,
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             1,
         );
 
@@ -1273,6 +1322,7 @@ mod tests {
             None,
             arena,
             Some(profiles.clone()),
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
 
@@ -1351,6 +1401,7 @@ mod tests {
             None,
             arena,
             None,
+            Arc::new(crate::runtime::fragment::NoopFragmentEventSink),
             0,
         );
 

@@ -30,6 +30,11 @@ struct LifecycleFragmentEventSink {
 impl FragmentEventSink for LifecycleFragmentEventSink {
     fn record(&self, event: FragmentEvent) {
         let FragmentEvent::Progress(progress) = event else {
+            if let FragmentEvent::RuntimeFilterScanUnitOutcome(outcome) = event {
+                // RFO-8 owns the observation store.  Touch the invariant-bearing
+                // effect here so malformed future event adapters cannot ignore it.
+                let _ = outcome.effect();
+            }
             return;
         };
         let profile = self.profiler.as_ref().map(Profiler::to_native_tree);

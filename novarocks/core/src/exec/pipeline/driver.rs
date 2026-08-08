@@ -407,6 +407,7 @@ impl PipelineDriver {
             if let Some(tracker) = operator_mem_trackers.get(idx).and_then(|v| v.as_ref()) {
                 op.set_mem_tracker(Arc::clone(tracker));
             }
+            op.set_fragment_event_sink(Arc::clone(&event_sink));
         }
         Self {
             driver_id,

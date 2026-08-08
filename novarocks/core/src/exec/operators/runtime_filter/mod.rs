@@ -2278,10 +2278,6 @@ mod tests {
     struct AlwaysPassesTestPredicate;
 
     impl execution::RuntimeFilterPredicate for AlwaysPassesTestPredicate {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn evaluate(
             &self,
             input: &arrow::array::ArrayRef,
