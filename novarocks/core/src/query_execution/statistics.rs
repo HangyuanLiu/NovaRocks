@@ -72,7 +72,7 @@ const VISIBLE_ROW_ARTIFACT_VERSION: u8 = 1;
 /// collection partial.  It is deliberately separate from the provider
 /// artifact: this payload crosses only the native execution lifecycle,
 /// whereas the provider artifact is retained only after finalization.
-const STATISTICS_FRAGMENT_PAYLOAD_VERSION: u8 = 1;
+const STATISTICS_FRAGMENT_PAYLOAD_VERSION: u8 = 2;
 
 /// A statistics collection is either tied to a statement wait or owned by a
 /// durable frontend job. Only the former observes the statement cancellation
@@ -603,16 +603,22 @@ pub struct ThetaSketchFinal {
     estimate: f64,
 }
 
-/// Mergeable scalar partial for row/null/min/max/size collection. Numeric
-/// bounds are deliberately typed at the compiler boundary; unsupported input
-/// types must be reported as missing rather than coerced through strings.
+/// Mergeable scalar partial for row/null/min/max/size collection. Bounds keep
+/// their physical scalar type until the provider-owned artifact boundary;
+/// they must never be coerced through strings or lossy floating-point values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatisticsScalarPartial {
     row_count: u64,
     null_count: u64,
     total_size: u64,
-    minimum: Option<f64>,
-    maximum: Option<f64>,
+    minimum: Option<StatisticsScalarBound>,
+    maximum: Option<StatisticsScalarBound>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum StatisticsScalarBound {
+    F64(f64),
+    LargeInt(i128),
 }
 
 /// Per-fragment Arrow collector used by the native statistics sink.  It is
@@ -633,8 +639,8 @@ struct StatisticsScalarAccumulator {
     row_count: u64,
     null_count: u64,
     total_size: u64,
-    minimum: Option<f64>,
-    maximum: Option<f64>,
+    minimum: Option<StatisticsScalarBound>,
+    maximum: Option<StatisticsScalarBound>,
 }
 
 /// Keeps one bounded Theta sketch per requested column.  Batch input may be
@@ -654,17 +660,33 @@ impl StatisticsScalarPartial {
         minimum: Option<f64>,
         maximum: Option<f64>,
     ) -> Result<Self, DistributedQueryError> {
+        Self::try_new_bounds(
+            row_count,
+            null_count,
+            total_size,
+            minimum.map(StatisticsScalarBound::F64),
+            maximum.map(StatisticsScalarBound::F64),
+        )
+    }
+
+    fn try_new_bounds(
+        row_count: u64,
+        null_count: u64,
+        total_size: u64,
+        minimum: Option<StatisticsScalarBound>,
+        maximum: Option<StatisticsScalarBound>,
+    ) -> Result<Self, DistributedQueryError> {
         if null_count > row_count {
             return Err(contract_violation(
                 "statistics null count exceeds row count",
             ));
         }
-        if minimum.is_some_and(|value| !value.is_finite())
-            || maximum.is_some_and(|value| !value.is_finite())
-            || matches!((minimum, maximum), (Some(minimum), Some(maximum)) if minimum > maximum)
+        if minimum.as_ref().is_some_and(|value| !value.is_valid())
+            || maximum.as_ref().is_some_and(|value| !value.is_valid())
+            || matches!((&minimum, &maximum), (Some(minimum), Some(maximum)) if minimum.compare(maximum).is_none_or(|order| order.is_gt()))
         {
             return Err(contract_violation(
-                "statistics scalar bounds must be finite and ordered",
+                "statistics scalar bounds must be finite, equally typed, and ordered",
             ));
         }
         Ok(Self {
@@ -679,7 +701,7 @@ impl StatisticsScalarPartial {
     pub fn try_merge(
         partials: impl IntoIterator<Item = Self>,
     ) -> Result<Self, DistributedQueryError> {
-        let mut merged = Self::try_new(0, 0, 0, None, None)?;
+        let mut merged = Self::try_new_bounds(0, 0, 0, None, None)?;
         for partial in partials {
             merged.row_count = merged
                 .row_count
@@ -693,18 +715,10 @@ impl StatisticsScalarPartial {
                 .total_size
                 .checked_add(partial.total_size)
                 .ok_or_else(|| resource_exhausted("statistics total size overflow"))?;
-            merged.minimum = match (merged.minimum, partial.minimum) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                (value @ Some(_), None) | (None, value @ Some(_)) => value,
-                (None, None) => None,
-            };
-            merged.maximum = match (merged.maximum, partial.maximum) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                (value @ Some(_), None) | (None, value @ Some(_)) => value,
-                (None, None) => None,
-            };
+            merged.minimum = merge_scalar_bounds(merged.minimum, partial.minimum, true)?;
+            merged.maximum = merge_scalar_bounds(merged.maximum, partial.maximum, false)?;
         }
-        Self::try_new(
+        Self::try_new_bounds(
             merged.row_count,
             merged.null_count,
             merged.total_size,
@@ -727,14 +741,16 @@ impl StatisticsScalarPartial {
                         .then(|| self.total_size as f64 / self.row_count as f64)
                         .unwrap_or(0.0),
                 ),
-                StatisticsMetric::Minimum { .. } => StatisticsMetricValue::F64(
-                    self.minimum
-                        .ok_or_else(|| contract_violation("statistics minimum is unavailable"))?,
-                ),
-                StatisticsMetric::Maximum { .. } => StatisticsMetricValue::F64(
-                    self.maximum
-                        .ok_or_else(|| contract_violation("statistics maximum is unavailable"))?,
-                ),
+                StatisticsMetric::Minimum { .. } => self
+                    .minimum
+                    .as_ref()
+                    .ok_or_else(|| contract_violation("statistics minimum is unavailable"))?
+                    .metric_value(),
+                StatisticsMetric::Maximum { .. } => self
+                    .maximum
+                    .as_ref()
+                    .ok_or_else(|| contract_violation("statistics maximum is unavailable"))?
+                    .metric_value(),
                 StatisticsMetric::ThetaNdv { .. } => continue,
             };
             output.insert(metric, StatisticsMetricState::Available(value));
@@ -864,15 +880,15 @@ impl StatisticsScalarAccumulator {
             .total_size
             .checked_add(estimated_value_bytes(array)?)
             .ok_or_else(|| resource_exhausted("statistics total size overflow"))?;
-        for value in array_numeric_values(array)? {
-            self.minimum = Some(self.minimum.map_or(value, |current| current.min(value)));
-            self.maximum = Some(self.maximum.map_or(value, |current| current.max(value)));
+        for value in array_scalar_bounds(array)? {
+            self.minimum = merge_scalar_bounds(self.minimum.take(), Some(value.clone()), true)?;
+            self.maximum = merge_scalar_bounds(self.maximum.take(), Some(value), false)?;
         }
         Ok(())
     }
 
     fn finish(self) -> Result<StatisticsScalarPartial, DistributedQueryError> {
-        StatisticsScalarPartial::try_new(
+        StatisticsScalarPartial::try_new_bounds(
             self.row_count,
             self.null_count,
             self.total_size,
@@ -938,10 +954,62 @@ fn estimated_value_bytes(array: &ArrayRef) -> Result<u64, DistributedQueryError>
     Ok(bytes)
 }
 
-fn array_numeric_values(array: &ArrayRef) -> Result<Vec<f64>, DistributedQueryError> {
+impl StatisticsScalarBound {
+    fn is_valid(&self) -> bool {
+        !matches!(self, Self::F64(value) if !value.is_finite())
+    }
+
+    fn compare(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::F64(left), Self::F64(right)) => left.partial_cmp(right),
+            (Self::LargeInt(left), Self::LargeInt(right)) => Some(left.cmp(right)),
+            _ => None,
+        }
+    }
+
+    fn metric_value(&self) -> StatisticsMetricValue {
+        match self {
+            Self::F64(value) => StatisticsMetricValue::F64(*value),
+            Self::LargeInt(value) => {
+                StatisticsMetricValue::Bytes(Bytes::copy_from_slice(&value.to_be_bytes()))
+            }
+        }
+    }
+}
+
+fn merge_scalar_bounds(
+    left: Option<StatisticsScalarBound>,
+    right: Option<StatisticsScalarBound>,
+    minimum: bool,
+) -> Result<Option<StatisticsScalarBound>, DistributedQueryError> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let ordering = left.compare(&right).ok_or_else(|| {
+                contract_violation("statistics scalar bounds use incompatible physical types")
+            })?;
+            Ok(Some(
+                if (minimum && ordering.is_gt()) || (!minimum && ordering.is_lt()) {
+                    right
+                } else {
+                    left
+                },
+            ))
+        }
+        (value @ Some(_), None) | (None, value @ Some(_)) => Ok(value),
+        (None, None) => Ok(None),
+    }
+}
+
+fn array_scalar_bounds(
+    array: &ArrayRef,
+) -> Result<Vec<StatisticsScalarBound>, DistributedQueryError> {
     macro_rules! values {
         ($array:expr) => {
-            return Ok($array.iter().flatten().map(|value| value as f64).collect())
+            return Ok($array
+                .iter()
+                .flatten()
+                .map(|value| StatisticsScalarBound::F64(value as f64))
+                .collect())
         };
     }
     if let Some(array) = array.as_any().downcast_ref::<Int8Array>() {
@@ -966,7 +1034,11 @@ fn array_numeric_values(array: &ArrayRef) -> Result<Vec<f64>, DistributedQueryEr
         values!(array);
     }
     if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
-        return Ok(array.iter().flatten().map(|value| value as f64).collect());
+        return Ok(array
+            .iter()
+            .flatten()
+            .map(|value| StatisticsScalarBound::F64(value as f64))
+            .collect());
     }
     if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
         return array
@@ -976,7 +1048,7 @@ fn array_numeric_values(array: &ArrayRef) -> Result<Vec<f64>, DistributedQueryEr
                 let value = value as f64;
                 value
                     .is_finite()
-                    .then_some(value)
+                    .then_some(StatisticsScalarBound::F64(value))
                     .ok_or_else(|| contract_violation("statistics numeric value is not finite"))
             })
             .collect();
@@ -988,8 +1060,24 @@ fn array_numeric_values(array: &ArrayRef) -> Result<Vec<f64>, DistributedQueryEr
             .map(|value| {
                 value
                     .is_finite()
-                    .then_some(value)
+                    .then_some(StatisticsScalarBound::F64(value))
                     .ok_or_else(|| contract_violation("statistics numeric value is not finite"))
+            })
+            .collect();
+    }
+    if let Some(array) = array.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        if array.value_length() != novarocks_types::largeint::LARGEINT_BYTE_WIDTH {
+            return Ok(Vec::new());
+        }
+        return array
+            .iter()
+            .flatten()
+            .map(|value| {
+                novarocks_types::largeint::i128_from_be_bytes(value)
+                    .map(StatisticsScalarBound::LargeInt)
+                    .map_err(|error| {
+                        contract_violation(format!("statistics LARGEINT value: {error}"))
+                    })
             })
             .collect();
     }
@@ -1415,11 +1503,15 @@ fn encode_scalar_partial(bytes: &mut Vec<u8>, partial: &StatisticsScalarPartial)
     bytes.extend_from_slice(&partial.row_count.to_be_bytes());
     bytes.extend_from_slice(&partial.null_count.to_be_bytes());
     bytes.extend_from_slice(&partial.total_size.to_be_bytes());
-    for value in [partial.minimum, partial.maximum] {
+    for value in [&partial.minimum, &partial.maximum] {
         match value {
-            Some(value) => {
+            Some(StatisticsScalarBound::F64(value)) => {
                 bytes.push(1);
                 bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+            Some(StatisticsScalarBound::LargeInt(value)) => {
+                bytes.push(2);
+                bytes.extend_from_slice(&value.to_be_bytes());
             }
             None => bytes.push(0),
         }
@@ -1440,20 +1532,28 @@ fn decode_scalar_partial(
     let row_count = read_u64(cursor)?;
     let null_count = read_u64(cursor)?;
     let total_size = read_u64(cursor)?;
-    let read_bound = |cursor: &mut usize| -> Result<Option<f64>, DistributedQueryError> {
-        match take_bytes(bytes, cursor, 1)?[0] {
-            0 => Ok(None),
-            1 => Ok(Some(f64::from_bits(u64::from_be_bytes(
-                take_bytes(bytes, cursor, 8)?
-                    .try_into()
-                    .expect("fixed scalar field width"),
-            )))),
-            _ => Err(contract_violation(
-                "statistics scalar partial has an invalid bound flag",
-            )),
-        }
-    };
-    StatisticsScalarPartial::try_new(
+    let read_bound =
+        |cursor: &mut usize| -> Result<Option<StatisticsScalarBound>, DistributedQueryError> {
+            match take_bytes(bytes, cursor, 1)?[0] {
+                0 => Ok(None),
+                1 => Ok(Some(StatisticsScalarBound::F64(f64::from_bits(
+                    u64::from_be_bytes(
+                        take_bytes(bytes, cursor, 8)?
+                            .try_into()
+                            .expect("fixed scalar field width"),
+                    ),
+                )))),
+                2 => Ok(Some(StatisticsScalarBound::LargeInt(i128::from_be_bytes(
+                    take_bytes(bytes, cursor, 16)?
+                        .try_into()
+                        .expect("fixed LARGEINT scalar field width"),
+                )))),
+                _ => Err(contract_violation(
+                    "statistics scalar partial has an invalid bound flag",
+                )),
+            }
+        };
+    StatisticsScalarPartial::try_new_bounds(
         row_count,
         null_count,
         total_size,
@@ -2120,6 +2220,59 @@ mod tests {
             states.get(&StatisticsMetric::ThetaNdv { column: "v".into() }),
             Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value >= 2.0
         ));
+    }
+
+    #[test]
+    fn spi5b_batch_collector_preserves_largeint_bounds_through_fragment_wire() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
+            false,
+        )]));
+        let metrics = StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::Minimum { column: "k".into() },
+            StatisticsMetric::Maximum { column: "k".into() },
+            StatisticsMetric::ThetaNdv { column: "k".into() },
+        ])
+        .expect("metrics");
+        let mut values = FixedSizeBinaryBuilder::with_capacity(
+            3,
+            novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
+        );
+        values
+            .append_value(i128::MIN.to_be_bytes())
+            .expect("minimum LARGEINT");
+        values
+            .append_value(0_i128.to_be_bytes())
+            .expect("zero LARGEINT");
+        values
+            .append_value(i128::MAX.to_be_bytes())
+            .expect("maximum LARGEINT");
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values.finish())])
+            .expect("batch");
+        let mut collector =
+            StatisticsBatchCollector::try_new(schema, metrics.clone()).expect("collector");
+        collector.push_batch(&batch).expect("collect batch");
+        let finalizer = collector.finish().expect("finish collector");
+        let payload = finalizer
+            .try_to_fragment_payload()
+            .expect("encode LARGEINT fragment");
+        let restored = StatisticsCollectionFinalizer::try_from_fragment_payload(&payload)
+            .expect("decode LARGEINT fragment");
+        let states = restored.metric_states(&metrics);
+
+        assert_eq!(
+            states.get(&StatisticsMetric::Minimum { column: "k".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::Bytes(Bytes::copy_from_slice(&i128::MIN.to_be_bytes()),)
+            ))
+        );
+        assert_eq!(
+            states.get(&StatisticsMetric::Maximum { column: "k".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::Bytes(Bytes::copy_from_slice(&i128::MAX.to_be_bytes()),)
+            ))
+        );
     }
 
     #[test]

@@ -750,21 +750,28 @@ fn evidence_to_base_statistics(
             name.clone(),
             BaseColumnStatistics {
                 nulls_fraction,
-                average_row_size: metric_f64(evidence.metrics.get(
-                    &StatisticsMetric::AverageSize {
+                average_row_size: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::AverageSize {
                         column: Arc::clone(&key),
-                    },
-                ))
+                    }),
+                    None,
+                )
                 .map(|value| StatValue::known(value, Confidence::Exact, source))
                 .unwrap_or_else(|| StatValue::missing(missing())),
-                min_value: metric_f64(evidence.metrics.get(&StatisticsMetric::Minimum {
-                    column: Arc::clone(&key),
-                }))
+                min_value: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::Minimum {
+                        column: Arc::clone(&key),
+                    }),
+                    Some(&column.data_type),
+                )
                 .map(|value| StatValue::known(value, Confidence::Exact, source))
                 .unwrap_or_else(|| StatValue::missing(missing())),
-                max_value: metric_f64(evidence.metrics.get(&StatisticsMetric::Maximum {
-                    column: Arc::clone(&key),
-                }))
+                max_value: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::Maximum {
+                        column: Arc::clone(&key),
+                    }),
+                    Some(&column.data_type),
+                )
                 .map(|value| StatValue::known(value, Confidence::Exact, source))
                 .unwrap_or_else(|| StatValue::missing(missing())),
                 // Theta is a mergeable approximate sketch. It is useful to
@@ -800,11 +807,22 @@ fn metric_u64(state: Option<&StatisticsMetricState>) -> Option<u64> {
     }
 }
 
-fn metric_f64(state: Option<&StatisticsMetricState>) -> Option<f64> {
+fn metric_f64(state: Option<&StatisticsMetricState>, data_type: Option<&DataType>) -> Option<f64> {
     let value = match state {
         Some(StatisticsMetricState::Available(StatisticsMetricValue::U64(value))) => *value as f64,
         Some(StatisticsMetricState::Available(StatisticsMetricValue::I64(value))) => *value as f64,
         Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) => *value,
+        // The provider artifact keeps LARGEINT bounds as exact i128 bytes.
+        // Optimizer cardinality estimation is currently f64-only, so make the
+        // approximation explicit at this terminal heuristic boundary rather
+        // than losing information in collection or persistence.
+        Some(StatisticsMetricState::Available(StatisticsMetricValue::Bytes(value)))
+            if matches!(data_type, Some(DataType::FixedSizeBinary(width)) if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+                && value.len()
+                    == usize::try_from(novarocks_types::largeint::LARGEINT_BYTE_WIDTH).ok()? =>
+        {
+            novarocks_types::largeint::i128_from_be_bytes(value).ok()? as f64
+        }
         _ => return None,
     };
     value.is_finite().then_some(value)
@@ -841,6 +859,20 @@ mod unified_tests {
             write_default: None,
             logical_type: None,
         }
+    }
+
+    #[test]
+    fn spi5b_largeint_artifact_bound_is_projected_only_for_optimizer_estimation() {
+        let state = StatisticsMetricState::Available(StatisticsMetricValue::Bytes(
+            Bytes::copy_from_slice(&i128::MIN.to_be_bytes()),
+        ));
+        let data_type = DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH);
+
+        assert_eq!(
+            metric_f64(Some(&state), Some(&data_type)),
+            Some(i128::MIN as f64)
+        );
+        assert_eq!(metric_f64(Some(&state), Some(&DataType::Binary)), None);
     }
 
     fn evidence(coverage: StatisticsCoverage, accuracy: StatisticsAccuracy) -> StatisticsEvidence {
