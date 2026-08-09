@@ -1478,7 +1478,7 @@ impl SnapshotPredicateCompiler {
         binding_id: execution::RuntimeFilterBindingId,
         contract_digest: [u8; 32],
     ) -> Result<Arc<execution::RuntimeFilterSnapshot>, execution::UnavailableReason> {
-        // Design: ADR-0042 (docs/adr/ADR-0042-runtime-filter-artifact-query-and-evaluator-boundary.md)
+        // Design: ADR-0043 (docs/adr/ADR-0043-runtime-filter-artifact-query-and-evaluator-boundary.md)
         // Backend owns this immutable artifact adapter. It exposes only
         // retained-artifact primitives; Execution owns Arrow/scan evaluation.
         let artifact_query: Arc<dyn execution::RuntimeFilterArtifactQuery> = match self {

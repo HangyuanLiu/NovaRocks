@@ -18,7 +18,7 @@
 //! Execution-owned evaluation of one sealed connector scan unit against an
 //! immutable runtime-filter snapshot.
 //!
-//! Design: ADR-0042 (docs/adr/ADR-0042-runtime-filter-artifact-query-and-evaluator-boundary.md)
+//! Design: ADR-0043 (docs/adr/ADR-0043-runtime-filter-artifact-query-and-evaluator-boundary.md)
 
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_spi::connector::{

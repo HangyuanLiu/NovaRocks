@@ -19,7 +19,7 @@
 //! The artifact query is deliberately narrower than an evaluator: a Backend
 //! adapter can expose immutable, validated artifact facts, but it never sees
 //! Arrow arrays and cannot make a fragment-local row or scan decision.
-// Design: ADR-0042 (docs/adr/ADR-0042-runtime-filter-artifact-query-and-evaluator-boundary.md)
+// Design: ADR-0043 (docs/adr/ADR-0043-runtime-filter-artifact-query-and-evaluator-boundary.md)
 
 use arrow::array::{Array, ArrayData, ArrayRef, BooleanArray};
 use arrow::datatypes::{DataType, TimeUnit};

@@ -4,7 +4,7 @@ title: "Runtime filter scan-domain evaluation boundary"
 domain: [runtime-filter]
 status: superseded
 supersedes: []
-superseded-by: ADR-0042
+superseded-by: ADR-0043
 date: 2026-08-08
 provenance:
   - "PR: #842"
