@@ -27,5 +27,6 @@ pub(crate) mod refresh;
 pub mod repository;
 pub(crate) mod rewrite;
 pub(crate) mod schema_validation;
+pub(crate) mod storage_observation;
 #[doc(hidden)]
 pub mod test_repository;
