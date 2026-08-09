@@ -1056,17 +1056,16 @@ message ColumnDef {
 // future BE/native plan prepare layer.
 message ScanSource {
   oneof kind {
-    IcebergMvTargetState iceberg_mv_target_state = 5;     // IMV target-state scan.
-    IcebergMvTargetLocator iceberg_mv_target_locator = 6; // IMV target-locator scan.
-    ConnectorReadSource connector_read = 8;                // provider-owned opaque scan and splits.
+    ConnectorReadSource connector_read = 8; // provider-owned opaque scan and splits.
   }
-  reserved 1, 2, 3, 4;
-  reserved 7;
+  reserved 1, 2, 3, 4, 5, 6, 7;
   reserved "iceberg_data_files";
   reserved "iceberg_metadata_table";
   reserved "iceberg_version_table";
   reserved "iceberg_delta_table"; // former core-owned Iceberg delta carrier.
   reserved "starrocks_table"; // former Core-owned StarRocks tablet carrier.
+  reserved "iceberg_mv_target_state"; // former MV target-state carrier.
+  reserved "iceberg_mv_target_locator"; // former MV target-locator carrier.
 }
 
 // A provider-neutral, already-planned connector read. The opaque handles are
@@ -1213,70 +1212,6 @@ message IcebergDeltaDeleteVisibilityDeleteFile {
   optional int64 length = 4;                    // delete file length.
   optional int64 content_offset = 5;            // Puffin blob offset.
   optional int64 content_size_in_bytes = 6;     // Puffin blob size.
-}
-
-// IMV target-state scan source.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergMvTargetState {
-  string catalog = 1;                                 // catalog name.
-  string database = 2;                                // database name.
-  string table = 3;                                   // table name.
-  string target_table_uuid = 4;                       // target Iceberg table UUID.
-  optional int64 target_snapshot_id = 5;              // optional target snapshot id.
-  uint32 aggregate_state_layout_version = 6;          // aggregate-state layout version.
-  repeated ColumnDef columns = 7;                     // target-state columns.
-  repeated string group_key_names = 8;                // group key column names.
-  repeated string aggregate_state_names = 9;          // aggregate state column names.
-  repeated string physical_column_names = 10;         // physical column names.
-  string row_id_column_name = 11;                     // row-id column name.
-  IcebergMvTargetStateRowFilter row_filter = 12;      // target-state row filter.
-  IcebergMvTargetStatePartitionConstraint partition_constraint = 13; // partition constraint.
-}
-
-// IMV target-state row filter.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergMvTargetStateRowFilter {
-  oneof kind {
-    DeltaInputRowIdsFilter delta_input_row_ids = 1; // filter by delta input row ids.
-  }
-}
-
-// Delta-input-row-id target-state filter.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message DeltaInputRowIdsFilter {
-  string row_id_column_name = 1; // row-id column name.
-  BranchScope branch_scope = 2;  // optional branch scope.
-}
-
-// Optional branch scope for an IMV target-state filter.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message BranchScope {
-  string branch_id_column_name = 1; // branch id column name.
-  int32 branch_id = 2;              // branch id value.
-}
-
-// IMV target-state partition constraint.
-enum IcebergMvTargetStatePartitionConstraint {
-  ICEBERG_MV_TARGET_STATE_PARTITION_CONSTRAINT_UNSPECIFIED = 0;
-  ICEBERG_MV_TARGET_STATE_PARTITION_CONSTRAINT_UNPARTITIONED = 1;
-  ICEBERG_MV_TARGET_STATE_PARTITION_CONSTRAINT_AFFECTED_PARTITION_ALLOW_LIST_REQUIRED = 2;
-}
-
-// IMV target-locator scan source.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergMvTargetLocator {
-  string catalog = 1;                    // catalog name.
-  string database = 2;                   // database name.
-  string table = 3;                      // table name.
-  string target_table_uuid = 4;          // target Iceberg table UUID.
-  optional int64 target_snapshot_id = 5; // optional target snapshot id.
-  string apply_key_column = 6;           // logical apply-key column name.
-  optional string branch_id_column = 7;  // optional branch id column name.
 }
 
 // Iceberg table identity, schema, and serialized metadata.

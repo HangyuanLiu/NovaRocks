@@ -57,18 +57,6 @@ pub(crate) fn lower_scan_node(
     let source_path = path.clone().field("table").field("source");
     let output_columns = common::decode_scan_output_columns(scan, path.clone())?;
     match source {
-        plan::scan_source::Kind::IcebergMvTargetState(_) => {
-            Err(NativeFragmentDecodeError::unsupported(
-                source_path.field("iceberg_mv_target_state"),
-                "IcebergMvTargetState native scan source is not implemented",
-            ))
-        }
-        plan::scan_source::Kind::IcebergMvTargetLocator(_) => {
-            Err(NativeFragmentDecodeError::unsupported(
-                source_path.field("iceberg_mv_target_locator"),
-                "IcebergMvTargetLocator native scan source is not implemented",
-            ))
-        }
         plan::scan_source::Kind::ConnectorRead(source) => {
             let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
                 scan,
