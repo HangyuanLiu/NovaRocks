@@ -100,7 +100,10 @@ impl IcebergMvStorageObservationAdapter {
         if descriptor.package_id != expected_package_id {
             return Err(corrupt(format!(
                 "Iceberg MV descriptor package ID mismatch for {}.{}.{}: expected {expected_package_id}, got {}",
-                table.instance_id, table.namespace, table.table, descriptor.package_id
+                table.instance_id.as_str(),
+                table.namespace,
+                table.table,
+                descriptor.package_id
             )));
         }
 
@@ -151,7 +154,8 @@ impl MvStorageObservation for IcebergMvStorageObservationAdapter {
         for catalog in catalog_names {
             validate_context(&context)?;
             reserve_payload(&context, &mut budget, &catalog)?;
-            let instance_id = ConnectorInstanceId::parse(&catalog).map_err(internal)?;
+            let instance_id = ConnectorInstanceId::parse(&catalog)
+                .map_err(|error| internal(error.to_string()))?;
             // Retain one current generation per catalog so namespace/table
             // enumeration and every package observation are fenced together.
             let exact_lease = self.controls.acquire_current(&instance_id)?;
@@ -233,7 +237,7 @@ impl MvStorageObservation for IcebergMvStorageObservationAdapter {
             Ok(loaded) => loaded,
             Err(error) => {
                 tracing::warn!(
-                    catalog = %table.instance_id,
+                    catalog = %table.instance_id.as_str(),
                     namespace = %table.namespace,
                     table = %table.table,
                     error,

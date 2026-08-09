@@ -280,7 +280,7 @@ fn clear_sqlite_and_rebuild_from_lake(
             "{PROCEDURE_NAME} full level: MV '{}.{}' has no repository definition to clear (target {}.{}.{}); cannot prove a clear+rebuild round-trip",
             package.table.namespace,
             package.table.table,
-            package.table.instance_id,
+            package.table.instance_id.as_str(),
             package.table.namespace,
             package.table.table
         ));
@@ -295,7 +295,9 @@ fn clear_sqlite_and_rebuild_from_lake(
     if !dropped {
         return Err(format!(
             "{PROCEDURE_NAME} full level: expected to clear MV repository definition for target {}.{}.{}",
-            package.table.instance_id, package.table.namespace, package.table.table
+            package.table.instance_id.as_str(),
+            package.table.namespace,
+            package.table.table
         ));
     }
 
@@ -311,7 +313,9 @@ fn clear_sqlite_and_rebuild_from_lake(
     if rebuilt.is_none() {
         return Err(format!(
             "{PROCEDURE_NAME} full level: MV repository definition for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
-            package.table.instance_id, package.table.namespace, package.table.table
+            package.table.instance_id.as_str(),
+            package.table.namespace,
+            package.table.table
         ));
     }
 
