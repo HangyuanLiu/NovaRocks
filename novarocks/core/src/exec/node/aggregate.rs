@@ -14,16 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::BTreeSet;
 use std::num::NonZeroU32;
+
+use novarocks_execution::runtime_filter::RuntimeFilterProducerContract;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::exec::node::runtime_filter::{
-    CompletionRequirement, ContributionKind, RuntimeFilterExecutionContract,
-    RuntimeFilterExecutionReduction,
-};
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug)]
@@ -68,15 +65,10 @@ pub struct AggFunction {
 
 #[derive(Clone, Debug)]
 pub struct AggregateTopNRuntimeFilterProducerBinding {
-    pub(crate) binding_id: u32,
-    pub(crate) channel_id: u32,
     pub(crate) group_key_expr_id: ExprId,
     pub(crate) group_key_ordinal: usize,
     pub(crate) limit: NonZeroU32,
-    pub(crate) contract: RuntimeFilterExecutionContract,
-    pub(crate) reduction: RuntimeFilterExecutionReduction,
-    pub(crate) contribution_kinds: BTreeSet<ContributionKind>,
-    pub(crate) completion_requirement: CompletionRequirement,
+    pub(crate) contract: RuntimeFilterProducerContract,
 }
 
 #[derive(Clone, Debug)]
@@ -99,47 +91,35 @@ impl AggregateRuntimeFilterSpec {
     pub fn try_new(
         topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
     ) -> Result<Self, String> {
-        if topn_producers
-            .iter()
-            .any(|producer| producer.contribution_kinds.is_empty())
-        {
-            return Err(
-                "runtime-filter aggregate producer requires contribution kinds".to_string(),
-            );
-        }
         Ok(Self { topn_producers })
     }
 }
 
 impl AggregateTopNRuntimeFilterProducerBinding {
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        binding_id: u32,
-        channel_id: u32,
+    pub const fn new(
         group_key_expr_id: ExprId,
         group_key_ordinal: usize,
         limit: NonZeroU32,
-        contract: RuntimeFilterExecutionContract,
-        reduction: RuntimeFilterExecutionReduction,
-        contribution_kinds: BTreeSet<ContributionKind>,
-        completion_requirement: CompletionRequirement,
-    ) -> Result<Self, String> {
-        if contribution_kinds.is_empty() {
-            return Err(
-                "runtime-filter aggregate producer requires contribution kinds".to_string(),
-            );
-        }
-        Ok(Self {
-            binding_id,
-            channel_id,
+        contract: RuntimeFilterProducerContract,
+    ) -> Self {
+        Self {
             group_key_expr_id,
             group_key_ordinal,
             limit,
             contract,
-            reduction,
-            contribution_kinds,
-            completion_requirement,
-        })
+        }
+    }
+
+    pub const fn contract(&self) -> &RuntimeFilterProducerContract {
+        &self.contract
+    }
+
+    pub const fn binding_id(&self) -> u32 {
+        self.contract.binding_id().get()
+    }
+
+    pub const fn channel_id(&self) -> u32 {
+        self.contract.channel_id().get()
     }
 }
 

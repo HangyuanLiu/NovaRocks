@@ -21,28 +21,27 @@ use std::time::Duration;
 
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
+use novarocks_spi::connector::ConnectorScalarValue;
 
 use novarocks::runtime_filter_transition::codec::contribution::{
-    ContributionCodecError, RuntimeFilterContribution as CoreContribution, decode_contribution,
-    encode_contribution,
+    ContributionCodecError, RuntimeFilterContribution as CoreContribution,
+    decode_canonical_membership_body, decode_contribution,
 };
-use novarocks::runtime_filter_transition::exec::execution_predicate::NativeExecutionPredicate;
-use novarocks::runtime_filter_transition::exec::membership_predicate::{
-    MembershipPredicateContract, NativeRuntimeFilterPredicate,
-};
-use novarocks::runtime_filter_transition::exec::ordered_range_predicate::{
-    NativeOrderedRangePredicate, OrderedRangePredicateContract,
+use novarocks::runtime_filter_transition::materializer::codec::{
+    ArtifactCodecError, MembershipProbe, encode_range_leaf, indexed_membership_contains,
+    indexed_membership_range_may_match,
 };
 use novarocks::runtime_filter_transition::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
-    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+    NullSemantics, ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
 };
 use novarocks::runtime_filter_transition::port::artifact::{
-    ArtifactMembershipSchema, ConsumerArtifactProfile,
+    ArtifactKind, ArtifactMembershipSchema, ArtifactSchemaDigest, ConsumerArtifactProfile,
+    LEAF_CODEC_VERSION, PhysicalArtifact, ResidentMembershipIndexView,
 };
 use novarocks::runtime_filter_transition::port::identity::{DeploymentEpoch, LogicalVersion};
 use novarocks::runtime_filter_transition::port::ordered_bound::{
-    RuntimeOrderContract, RuntimeOrderKey,
+    OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey,
 };
 use novarocks::runtime_filter_transition::port::producer::{
     OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, ProducerHandle,
@@ -377,44 +376,6 @@ impl ResolvedNativeProducer {
         to_execution_contract(&self.contract)
     }
 
-    pub(crate) fn encode_execution_contribution(
-        &self,
-        partition: novarocks::runtime_filter_transition::port::identity::PartitionId,
-        sequence: novarocks::runtime_filter_transition::port::identity::ProducerSequence,
-        contribution: CoreContribution,
-    ) -> Result<execution::RuntimeFilterContribution, execution::RuntimeFilterContractViolation>
-    {
-        let kind = match &contribution {
-            CoreContribution::Membership(_) => execution::RuntimeFilterContributionKind::Membership,
-            CoreContribution::OrderedBound(_) => {
-                execution::RuntimeFilterContributionKind::OrderedBound
-            }
-            CoreContribution::TopKSummary(_) => {
-                execution::RuntimeFilterContributionKind::TopKSummary
-            }
-            CoreContribution::FinalDomain(_) => {
-                execution::RuntimeFilterContributionKind::FinalDomain
-            }
-        };
-        let stream = novarocks::runtime_filter_transition::port::identity::ProducerStreamId::new(
-            self.binding_id,
-            self.fragment_instance_id,
-            partition,
-        );
-        let encoded = encode_contribution(
-            &contribution,
-            self.inbound_contract.codec_expectation(stream, sequence),
-            self.inbound_contract.limits().max_encoded_bytes(),
-        )
-        .map_err(codec_violation)?;
-        let (contract_digest, canonical_bytes) = encoded.into_parts();
-        Ok(execution::RuntimeFilterContribution::new(
-            kind,
-            contract_digest,
-            canonical_bytes,
-        ))
-    }
-
     pub(crate) fn open_membership(
         &self,
         local_partition_count: u32,
@@ -640,6 +601,7 @@ impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
             NativeExecutionFinalDomainCompletion {
                 session: Arc::new(session),
                 max_domain_canonical_bytes,
+                expected_contract_digest: execution_contract_digest(contract.contract()),
             },
         )))
     }
@@ -648,6 +610,7 @@ impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
 struct NativeExecutionFinalDomainCompletion {
     session: Arc<super::final_domain_completion::FinalDomainCompletionSession>,
     max_domain_canonical_bytes: usize,
+    expected_contract_digest: [u8; 32],
 }
 
 impl execution::RuntimeFilterFinalDomainCompletion for NativeExecutionFinalDomainCompletion {
@@ -657,6 +620,10 @@ impl execution::RuntimeFilterFinalDomainCompletion for NativeExecutionFinalDomai
 
     fn max_domain_canonical_bytes(&self) -> usize {
         self.max_domain_canonical_bytes
+    }
+
+    fn contract_digest(&self) -> [u8; 32] {
+        self.expected_contract_digest
     }
 
     fn claim_partition(
@@ -677,6 +644,7 @@ impl execution::RuntimeFilterFinalDomainCompletion for NativeExecutionFinalDomai
                     committer,
                     expected_key_type: self.session.membership_key_type().clone(),
                     max_domain_canonical_bytes: self.max_domain_canonical_bytes,
+                    expected_contract_digest: self.expected_contract_digest,
                 }) as execution::RuntimeFilterFinalDomainPartitionHandle
             })
             .map_err(execution_violation)
@@ -698,6 +666,7 @@ struct NativeExecutionFinalDomainPartition {
     committer: super::final_domain_completion::FinalDomainPartitionCommitter,
     expected_key_type: DataType,
     max_domain_canonical_bytes: usize,
+    expected_contract_digest: [u8; 32],
 }
 
 impl execution::RuntimeFilterFinalDomainPartition for NativeExecutionFinalDomainPartition {
@@ -711,38 +680,47 @@ impl execution::RuntimeFilterFinalDomainPartition for NativeExecutionFinalDomain
                 "final-domain payload exceeds the opened producer budget",
             ));
         }
-        let Some(domain) =
-            payload.downcast_ref::<novarocks::runtime_filter_transition::port::value_domain::ValueDomainDelta>()
-        else {
-            return Err(execution::RuntimeFilterContractViolation::new(
-                execution::RuntimeFilterContractViolationKind::RoleMismatch,
-                "final-domain payload was not created by the native execution adapter",
-            ));
-        };
-        if !domain.matches_data_type(&self.expected_key_type) {
+        if payload.data_type() != &self.expected_key_type {
             return Err(execution::RuntimeFilterContractViolation::new(
                 execution::RuntimeFilterContractViolationKind::ContractMismatch,
                 "final-domain payload type does not match the opened producer contract",
             ));
         }
-        let mut canonical = Vec::new();
-        domain
-            .encode_canonical_into(&mut canonical)
-            .map_err(|error| {
-                execution::RuntimeFilterContractViolation::new(
-                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
-                    error.to_string(),
-                )
-            })?;
-        if canonical.as_slice() != payload.canonical_bytes().as_ref() {
+        if payload.contract_digest() != self.expected_contract_digest {
             return Err(execution::RuntimeFilterContractViolation::new(
                 execution::RuntimeFilterContractViolationKind::ContractMismatch,
-                "final-domain canonical payload does not match its native value domain",
+                "final-domain payload contract digest does not match the opened producer contract",
             ));
         }
-        self.committer
-            .seal(domain.clone())
-            .map_err(execution_violation)
+        let decoded_execution = execution::contribution::decode_value_domain(
+            payload.canonical_bytes(),
+            payload.data_type(),
+            self.max_domain_canonical_bytes,
+        )
+        .map_err(|error| {
+            execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                error.to_string(),
+            )
+        })?;
+        if decoded_execution.data_type() != self.expected_key_type {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "strictly decoded final-domain value type does not match the opened producer contract",
+            ));
+        }
+        let domain = decode_canonical_membership_body(
+            payload.canonical_bytes(),
+            &self.expected_key_type,
+            self.max_domain_canonical_bytes,
+        )
+        .map_err(|error| {
+            execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                error.to_string(),
+            )
+        })?;
+        self.committer.seal(domain).map_err(execution_violation)
     }
 
     fn close(&mut self) -> Result<(), execution::RuntimeFilterContractViolation> {
@@ -1092,6 +1070,407 @@ enum SnapshotPredicateCompiler {
     },
 }
 
+/// Backend-owned queries over one retained, already-validated artifact. This
+/// adapter intentionally exposes neither Arrow memory nor connector facts;
+/// Execution owns row/scan evaluation and every resulting outcome.
+enum NativeRuntimeFilterArtifactQuery {
+    Membership {
+        artifact: Arc<PhysicalArtifact>,
+        data_type: DataType,
+        null_semantics: NullSemantics,
+    },
+    Ordered {
+        artifact: Arc<PhysicalArtifact>,
+        data_type: DataType,
+    },
+}
+
+impl NativeRuntimeFilterArtifactQuery {
+    fn membership(
+        bundle: &novarocks::runtime_filter_transition::port::artifact::ArtifactBundle,
+        data_type: DataType,
+        null_semantics: NullSemantics,
+    ) -> Result<Self, execution::UnavailableReason> {
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
+        if bundle.profile_id() != profile.id() {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        let [(kind, artifact)] = bundle.artifacts() else {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        };
+        if !matches!(kind, ArtifactKind::ValueSet | ArtifactKind::EmptyDomain)
+            || artifact.kind() != *kind
+            || artifact.version() != bundle.version()
+            || artifact.codec_version() != LEAF_CODEC_VERSION
+            || artifact.membership_index().is_none()
+        {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        let schema = ArtifactMembershipSchema::new(&data_type, null_semantics)
+            .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
+        if artifact.schema_digest() != schema.digest()
+            || (artifact.contains_null() && null_semantics != NullSemantics::NullSafeEqual)
+            || (matches!(kind, ArtifactKind::EmptyDomain)
+                != matches!(
+                    artifact
+                        .membership_index()
+                        .expect("checked membership index")
+                        .view(),
+                    ResidentMembershipIndexView::EmptyDomain
+                ))
+        {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        Ok(Self::Membership {
+            artifact: Arc::clone(artifact),
+            data_type,
+            null_semantics,
+        })
+    }
+
+    fn ordered(
+        bundle: &novarocks::runtime_filter_transition::port::artifact::ArtifactBundle,
+        order_contract: Arc<RuntimeOrderContract>,
+    ) -> Result<Self, execution::UnavailableReason> {
+        if order_contract.keys().len() != 1 {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        let profile = ConsumerArtifactProfile::new_ordered_range(order_contract.digest())
+            .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
+        if bundle.profile_id() != profile.id() {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        let [(kind, artifact)] = bundle.artifacts() else {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        };
+        if *kind != ArtifactKind::Range
+            || artifact.kind() != ArtifactKind::Range
+            || artifact.version() != bundle.version()
+            || artifact.codec_version() != LEAF_CODEC_VERSION
+            || artifact.schema_digest()
+                != ArtifactSchemaDigest::from_canonical_bytes(order_contract.digest().bytes())
+        {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        let range = artifact
+            .range()
+            .ok_or(execution::UnavailableReason::MaterializationFailed)?;
+        if range.contract().as_ref() != order_contract.as_ref()
+            || range.contract().digest() != order_contract.digest()
+            || range
+                .contract()
+                .compare(range.bound(), range.bound())
+                .is_err()
+        {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        let canonical = encode_range_leaf(range.contract(), range.bound(), bundle.version())
+            .map_err(map_codec_unavailable)?;
+        if canonical.as_slice() != artifact.canonical_bytes() {
+            return Err(execution::UnavailableReason::MaterializationFailed);
+        }
+        Ok(Self::Ordered {
+            artifact: Arc::clone(artifact),
+            data_type: order_contract.keys()[0].data_type().clone(),
+        })
+    }
+
+    fn ordered_range(
+        &self,
+    ) -> Result<
+        &novarocks::runtime_filter_transition::port::artifact::RangeArtifactData,
+        execution::RuntimeFilterArtifactQueryError,
+    > {
+        match self {
+            Self::Ordered { artifact, .. } => artifact
+                .range()
+                .ok_or(execution::RuntimeFilterArtifactQueryError::ContractViolation),
+            Self::Membership { .. } => {
+                Err(execution::RuntimeFilterArtifactQueryError::ContractViolation)
+            }
+        }
+    }
+
+    fn ordered_matches_tuple(
+        &self,
+        value: OrderedTuple,
+    ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+        let range = self.ordered_range()?;
+        Ok(range
+            .contract()
+            .compare(&value, range.bound())
+            .map_err(|_| execution::RuntimeFilterArtifactQueryError::ContractViolation)?
+            != std::cmp::Ordering::Greater)
+    }
+}
+
+impl execution::RuntimeFilterArtifactQuery for NativeRuntimeFilterArtifactQuery {
+    fn data_type(&self) -> &DataType {
+        match self {
+            Self::Membership { data_type, .. } | Self::Ordered { data_type, .. } => data_type,
+        }
+    }
+
+    fn matches_null(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+        match self {
+            Self::Membership {
+                artifact,
+                null_semantics,
+                ..
+            } => Ok(*null_semantics == NullSemantics::NullSafeEqual && artifact.contains_null()),
+            Self::Ordered { .. } => {
+                let range = self.ordered_range()?;
+                let value = OrderedTuple::try_new(range.contract(), [None])
+                    .map_err(|_| execution::RuntimeFilterArtifactQueryError::ContractViolation)?;
+                self.ordered_matches_tuple(value)
+            }
+        }
+    }
+
+    fn has_non_null_matches(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+        match self {
+            Self::Membership { artifact, .. } => {
+                let index = artifact
+                    .membership_index()
+                    .ok_or(execution::RuntimeFilterArtifactQueryError::ContractViolation)?;
+                Ok(match index.view() {
+                    ResidentMembershipIndexView::EmptyDomain => false,
+                    ResidentMembershipIndexView::Fixed { count, .. } => count > 0,
+                    ResidentMembershipIndexView::Utf8 { length_offsets, .. } => {
+                        !length_offsets.is_empty()
+                    }
+                })
+            }
+            Self::Ordered { .. } => Ok(true),
+        }
+    }
+
+    fn non_null_value_may_match(
+        &self,
+        value: execution::RuntimeFilterScalarRef<'_>,
+    ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+        match self {
+            Self::Membership {
+                artifact,
+                data_type,
+                ..
+            } => {
+                let index = artifact
+                    .membership_index()
+                    .ok_or(execution::RuntimeFilterArtifactQueryError::ContractViolation)?;
+                indexed_membership_contains(
+                    artifact.canonical_bytes(),
+                    index,
+                    membership_probe(value, data_type)?,
+                )
+                .map_err(map_codec_query)
+            }
+            Self::Ordered { data_type, .. } => {
+                let range = self.ordered_range()?;
+                let scalar = ordered_scalar(value, data_type)?;
+                let tuple = OrderedTuple::try_new(range.contract(), [Some(scalar)])
+                    .map_err(|_| execution::RuntimeFilterArtifactQueryError::ContractViolation)?;
+                self.ordered_matches_tuple(tuple)
+            }
+        }
+    }
+
+    fn non_null_range_may_match(
+        &self,
+        inclusive_min: &ConnectorScalarValue,
+        inclusive_max: &ConnectorScalarValue,
+    ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+        match self {
+            Self::Membership {
+                artifact,
+                data_type,
+                ..
+            } => {
+                let index = artifact
+                    .membership_index()
+                    .ok_or(execution::RuntimeFilterArtifactQueryError::ContractViolation)?;
+                indexed_membership_range_may_match(
+                    artifact.canonical_bytes(),
+                    index,
+                    connector_membership_probe(inclusive_min, data_type)?,
+                    connector_membership_probe(inclusive_max, data_type)?,
+                )
+                .map_err(map_codec_query)
+            }
+            Self::Ordered { data_type, .. } => {
+                let range = self.ordered_range()?;
+                let min = OrderedTuple::try_new(
+                    range.contract(),
+                    [Some(connector_ordered_scalar(inclusive_min, data_type)?)],
+                )
+                .map_err(|_| execution::RuntimeFilterArtifactQueryError::ContractViolation)?;
+                let max = OrderedTuple::try_new(
+                    range.contract(),
+                    [Some(connector_ordered_scalar(inclusive_max, data_type)?)],
+                )
+                .map_err(|_| execution::RuntimeFilterArtifactQueryError::ContractViolation)?;
+                Ok(self.ordered_matches_tuple(min)? || self.ordered_matches_tuple(max)?)
+            }
+        }
+    }
+}
+
+fn map_codec_unavailable(error: ArtifactCodecError) -> execution::UnavailableReason {
+    match error {
+        ArtifactCodecError::ResourceUnavailable | ArtifactCodecError::ResourceLimit => {
+            execution::UnavailableReason::MaterializationFailed
+        }
+        _ => execution::UnavailableReason::MaterializationFailed,
+    }
+}
+
+fn map_codec_query(error: ArtifactCodecError) -> execution::RuntimeFilterArtifactQueryError {
+    match error {
+        ArtifactCodecError::ResourceUnavailable | ArtifactCodecError::ResourceLimit => {
+            execution::RuntimeFilterArtifactQueryError::ResourceUnavailable
+        }
+        _ => execution::RuntimeFilterArtifactQueryError::ContractViolation,
+    }
+}
+
+fn membership_probe(
+    value: execution::RuntimeFilterScalarRef<'_>,
+    expected: &DataType,
+) -> Result<MembershipProbe<'_>, execution::RuntimeFilterArtifactQueryError> {
+    match (value, expected) {
+        (execution::RuntimeFilterScalarRef::Boolean(value), DataType::Boolean) => {
+            Ok(MembershipProbe::Boolean(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int8(value), DataType::Int8) => {
+            Ok(MembershipProbe::Int8(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int16(value), DataType::Int16) => {
+            Ok(MembershipProbe::Int16(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int32(value), DataType::Int32) => {
+            Ok(MembershipProbe::Int32(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int64(value), DataType::Int64) => {
+            Ok(MembershipProbe::Int64(value))
+        }
+        (execution::RuntimeFilterScalarRef::Utf8(value), DataType::Utf8) => {
+            Ok(MembershipProbe::Utf8(value))
+        }
+        (execution::RuntimeFilterScalarRef::Date32(value), DataType::Date32) => {
+            Ok(MembershipProbe::Date32(value))
+        }
+        (
+            execution::RuntimeFilterScalarRef::TimestampMicrosecond(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )
+        | (
+            execution::RuntimeFilterScalarRef::TimestampNanosecond(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ) => Ok(MembershipProbe::Timestamp(value)),
+        _ => Err(execution::RuntimeFilterArtifactQueryError::Unsupported),
+    }
+}
+
+fn connector_membership_probe(
+    value: &ConnectorScalarValue,
+    expected: &DataType,
+) -> Result<MembershipProbe<'_>, execution::RuntimeFilterArtifactQueryError> {
+    match (value, expected) {
+        (ConnectorScalarValue::Boolean(value), DataType::Boolean) => {
+            Ok(MembershipProbe::Boolean(*value))
+        }
+        (ConnectorScalarValue::Int8(value), DataType::Int8) => Ok(MembershipProbe::Int8(*value)),
+        (ConnectorScalarValue::Int16(value), DataType::Int16) => Ok(MembershipProbe::Int16(*value)),
+        (ConnectorScalarValue::Int32(value), DataType::Int32) => Ok(MembershipProbe::Int32(*value)),
+        (ConnectorScalarValue::Int64(value), DataType::Int64) => Ok(MembershipProbe::Int64(*value)),
+        (ConnectorScalarValue::Date32(value), DataType::Date32) => {
+            Ok(MembershipProbe::Date32(*value))
+        }
+        (
+            ConnectorScalarValue::TimestampMicros(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )
+        | (
+            ConnectorScalarValue::TimestampNanos(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ) => Ok(MembershipProbe::Timestamp(*value)),
+        (ConnectorScalarValue::Utf8(value), DataType::Utf8) => Ok(MembershipProbe::Utf8(value)),
+        _ => Err(execution::RuntimeFilterArtifactQueryError::Unsupported),
+    }
+}
+
+fn ordered_scalar(
+    value: execution::RuntimeFilterScalarRef<'_>,
+    expected: &DataType,
+) -> Result<OrderedScalar, execution::RuntimeFilterArtifactQueryError> {
+    match (value, expected) {
+        (execution::RuntimeFilterScalarRef::Boolean(value), DataType::Boolean) => {
+            Ok(OrderedScalar::Boolean(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int8(value), DataType::Int8) => {
+            Ok(OrderedScalar::Int8(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int16(value), DataType::Int16) => {
+            Ok(OrderedScalar::Int16(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int32(value), DataType::Int32) => {
+            Ok(OrderedScalar::Int32(value))
+        }
+        (execution::RuntimeFilterScalarRef::Int64(value), DataType::Int64) => {
+            Ok(OrderedScalar::Int64(value))
+        }
+        (execution::RuntimeFilterScalarRef::Utf8(value), DataType::Utf8) => {
+            Ok(OrderedScalar::Utf8(Arc::from(value)))
+        }
+        (execution::RuntimeFilterScalarRef::Date32(value), DataType::Date32) => {
+            Ok(OrderedScalar::Date32(value))
+        }
+        (
+            execution::RuntimeFilterScalarRef::TimestampMicrosecond(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )
+        | (
+            execution::RuntimeFilterScalarRef::TimestampNanosecond(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ) => Ok(OrderedScalar::Timestamp(value)),
+        _ => Err(execution::RuntimeFilterArtifactQueryError::Unsupported),
+    }
+}
+
+fn connector_ordered_scalar(
+    value: &ConnectorScalarValue,
+    expected: &DataType,
+) -> Result<OrderedScalar, execution::RuntimeFilterArtifactQueryError> {
+    match (value, expected) {
+        (ConnectorScalarValue::Boolean(value), DataType::Boolean) => {
+            Ok(OrderedScalar::Boolean(*value))
+        }
+        (ConnectorScalarValue::Int8(value), DataType::Int8) => Ok(OrderedScalar::Int8(*value)),
+        (ConnectorScalarValue::Int16(value), DataType::Int16) => Ok(OrderedScalar::Int16(*value)),
+        (ConnectorScalarValue::Int32(value), DataType::Int32) => Ok(OrderedScalar::Int32(*value)),
+        (ConnectorScalarValue::Int64(value), DataType::Int64) => Ok(OrderedScalar::Int64(*value)),
+        (ConnectorScalarValue::Date32(value), DataType::Date32) => {
+            Ok(OrderedScalar::Date32(*value))
+        }
+        (
+            ConnectorScalarValue::TimestampMicros(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )
+        | (
+            ConnectorScalarValue::TimestampNanos(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ) => Ok(OrderedScalar::Timestamp(*value)),
+        (ConnectorScalarValue::Utf8(value), DataType::Utf8) => {
+            Ok(OrderedScalar::Utf8(Arc::from(value.as_str())))
+        }
+        _ => Err(execution::RuntimeFilterArtifactQueryError::Unsupported),
+    }
+}
+
 impl SnapshotPredicateCompiler {
     fn compile(
         &self,
@@ -1099,48 +1478,28 @@ impl SnapshotPredicateCompiler {
         binding_id: execution::RuntimeFilterBindingId,
         contract_digest: [u8; 32],
     ) -> Result<Arc<execution::RuntimeFilterSnapshot>, execution::UnavailableReason> {
-        let native_predicate = match self {
+        // Design: ADR-0043 (docs/adr/ADR-0043-runtime-filter-artifact-query-and-evaluator-boundary.md)
+        // Backend owns this immutable artifact adapter. It exposes only
+        // retained-artifact primitives; Execution owns Arrow/scan evaluation.
+        let artifact_query: Arc<dyn execution::RuntimeFilterArtifactQuery> = match self {
             Self::Membership {
                 data_type,
                 null_semantics,
-            } => {
-                let expected = MembershipPredicateContract::join(
-                    bundle.channel_id(),
-                    data_type.clone(),
-                    *null_semantics,
-                    bundle.version(),
-                )
-                .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
-                Arc::new(NativeExecutionPredicate::Membership(
-                    NativeRuntimeFilterPredicate::compile(bundle, &expected)
-                        .map_err(|_| execution::UnavailableReason::MaterializationFailed)?,
-                ))
-            }
-            Self::Ordered { order_contract } => {
-                let expected = OrderedRangePredicateContract::new(
-                    bundle.channel_id(),
-                    Arc::clone(order_contract),
-                    bundle.version(),
-                )
-                .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
-                Arc::new(NativeExecutionPredicate::Ordered(Arc::new(
-                    NativeOrderedRangePredicate::compile(bundle, &expected)
-                        .map_err(|_| execution::UnavailableReason::MaterializationFailed)?,
-                )))
-            }
-        };
-        let predicate: Arc<dyn execution::RuntimeFilterPredicate> = native_predicate.clone();
-        let scan_domain: Arc<dyn execution::scan_domain::RuntimeFilterScanDomainPredicate> =
-            native_predicate;
-        Ok(Arc::new(
-            execution::RuntimeFilterSnapshot::with_scan_domain(
-                binding_id,
-                execution::LogicalVersion::new(bundle.version().get()),
-                contract_digest,
-                predicate,
-                Some(scan_domain),
+            } => Arc::new(NativeRuntimeFilterArtifactQuery::membership(
+                bundle,
+                data_type.clone(),
+                *null_semantics,
+            )?),
+            Self::Ordered { order_contract } => Arc::new(
+                NativeRuntimeFilterArtifactQuery::ordered(bundle, Arc::clone(order_contract))?,
             ),
-        ))
+        };
+        Ok(Arc::new(execution::RuntimeFilterSnapshot::new(
+            binding_id,
+            execution::LogicalVersion::new(bundle.version().get()),
+            contract_digest,
+            artifact_query,
+        )))
     }
 }
 
@@ -1385,4 +1744,141 @@ fn resolution_violation(
     detail: impl Into<String>,
 ) -> RuntimeContractViolation {
     RuntimeContractViolation::new(kind, detail)
+}
+
+#[cfg(test)]
+mod artifact_query_tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use arrow::datatypes::DataType;
+    use novarocks_execution::runtime_filter::{
+        RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterScalarRef,
+    };
+    use novarocks_spi::connector::ConnectorScalarValue;
+
+    use super::{NativeRuntimeFilterArtifactQuery, map_codec_query};
+    use novarocks::runtime_filter_transition::materializer::codec::{
+        ArtifactCodecError, ArtifactDecodeExpectations, decode_leaf, encode_membership_leaf,
+    };
+    use novarocks::runtime_filter_transition::model::contract::{ChannelId, NullSemantics};
+    use novarocks::runtime_filter_transition::port::artifact::{
+        ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
+    };
+    use novarocks::runtime_filter_transition::port::identity::LogicalVersion;
+    use novarocks::runtime_filter_transition::port::support::{
+        ArtifactRetainedBudget, MemoryAccountError, RuntimeFilterMemoryAccount,
+    };
+    use novarocks::runtime_filter_transition::port::value_domain::{
+        MembershipValues, ReducedMembershipDomain,
+    };
+
+    struct UnlimitedMemory;
+
+    impl RuntimeFilterMemoryAccount for UnlimitedMemory {
+        fn try_consume(&self, _: usize) -> Result<(), MemoryAccountError> {
+            Ok(())
+        }
+
+        fn release(&self, _: usize) {}
+    }
+
+    fn membership_query(
+        values: impl IntoIterator<Item = i64>,
+        contains_null: bool,
+        null_semantics: NullSemantics,
+    ) -> NativeRuntimeFilterArtifactQuery {
+        let version = LogicalVersion::FIRST;
+        let domain = ReducedMembershipDomain::new(MembershipValues::int64(values), contains_null);
+        let encoded = encode_membership_leaf(&domain, null_semantics, version).unwrap();
+        let kind = ArtifactKind::from_tag(encoded[6]).unwrap();
+        let schema = ArtifactMembershipSchema::new(&DataType::Int64, null_semantics).unwrap();
+        let artifact = decode_leaf(
+            &encoded,
+            ArtifactDecodeExpectations {
+                expected_kind: kind,
+                expected_schema_digest: schema.digest(),
+                expected_logical_version: version,
+                expected_hash_contract: None,
+            },
+            encoded.len(),
+            Arc::new(ArtifactRetainedBudget::new(1 << 20)),
+            Arc::new(UnlimitedMemory),
+        )
+        .unwrap();
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let bundle = ArtifactBundle::new(
+            ChannelId::new(7),
+            version,
+            &profile,
+            vec![(kind, artifact)],
+            usize::MAX,
+        )
+        .unwrap();
+        NativeRuntimeFilterArtifactQuery::membership(&bundle, DataType::Int64, null_semantics)
+            .unwrap()
+    }
+
+    #[test]
+    fn membership_adapter_uses_indexed_closed_range_and_null_primitives() {
+        let query = membership_query([1, 5, 9], true, NullSemantics::NullSafeEqual);
+
+        assert!(query.matches_null().unwrap());
+        assert!(query.has_non_null_matches().unwrap());
+        assert!(
+            query
+                .non_null_value_may_match(RuntimeFilterScalarRef::Int64(5))
+                .unwrap()
+        );
+        assert!(
+            !query
+                .non_null_value_may_match(RuntimeFilterScalarRef::Int64(4))
+                .unwrap()
+        );
+        assert!(
+            query
+                .non_null_range_may_match(
+                    &ConnectorScalarValue::Int64(4),
+                    &ConnectorScalarValue::Int64(6),
+                )
+                .unwrap()
+        );
+        assert!(
+            !query
+                .non_null_range_may_match(
+                    &ConnectorScalarValue::Int64(6),
+                    &ConnectorScalarValue::Int64(8),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn adapter_rejects_unsupported_types_and_preserves_query_error_classes() {
+        let query = membership_query([1], false, NullSemantics::NeverMatches);
+
+        assert_eq!(
+            query.non_null_value_may_match(RuntimeFilterScalarRef::Float64(1.0)),
+            Err(RuntimeFilterArtifactQueryError::Unsupported)
+        );
+        assert_eq!(
+            query.non_null_range_may_match(
+                &ConnectorScalarValue::TimestampMicros(1),
+                &ConnectorScalarValue::TimestampMicros(2),
+            ),
+            Err(RuntimeFilterArtifactQueryError::Unsupported)
+        );
+        assert_eq!(
+            map_codec_query(ArtifactCodecError::ResourceLimit),
+            RuntimeFilterArtifactQueryError::ResourceUnavailable
+        );
+        assert_eq!(
+            map_codec_query(ArtifactCodecError::NonCanonicalPayload),
+            RuntimeFilterArtifactQueryError::ContractViolation
+        );
+    }
 }

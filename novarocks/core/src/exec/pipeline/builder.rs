@@ -693,7 +693,7 @@ fn native_aggregate_topn_session(
     let Some(spec) = specs.first() else {
         return Ok(None);
     };
-    runtime_filter_session(runtime_filter_execution, spec.binding_id)
+    runtime_filter_session(runtime_filter_execution, spec.binding_id())
         .cloned()
         .map(Some)
 }
@@ -703,7 +703,7 @@ fn validate_native_producer_specs(
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
     if let Some(spec) = specs.first() {
-        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id())?;
     }
     Ok(())
 }
@@ -713,16 +713,13 @@ fn validate_native_aggregate_topn_specs(
     group_by: &[ExprId],
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
-    let expected_contributions = std::collections::BTreeSet::from([
-        crate::runtime_filter::model::contract::ContributionKind::OrderedBoundUpdate,
-        crate::runtime_filter::model::contract::ContributionKind::ProducerClosed,
-    ]);
     let mut seen = std::collections::BTreeSet::new();
     for spec in specs {
-        if !seen.insert((spec.binding_id, spec.group_key_ordinal)) {
+        if !seen.insert((spec.binding_id(), spec.group_key_ordinal)) {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} duplicates group key ordinal={}",
-                spec.binding_id, spec.group_key_ordinal
+                spec.binding_id(),
+                spec.group_key_ordinal
             ));
         }
     }
@@ -730,7 +727,7 @@ fn validate_native_aggregate_topn_specs(
         let expected_expr = group_by.get(spec.group_key_ordinal).ok_or_else(|| {
             format!(
                 "native aggregate TopN producer binding_id={} targets missing group key ordinal={}, key_count={}",
-                spec.binding_id,
+                spec.binding_id(),
                 spec.group_key_ordinal,
                 group_by.len()
             )
@@ -738,50 +735,44 @@ fn validate_native_aggregate_topn_specs(
         if *expected_expr != spec.group_key_expr_id {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} expression does not match group key ordinal={}",
-                spec.binding_id, spec.group_key_ordinal
+                spec.binding_id(),
+                spec.group_key_ordinal
             ));
         }
         let group_key_type = ctx.arena.data_type(spec.group_key_expr_id).ok_or_else(|| {
             format!(
                 "native aggregate TopN producer binding_id={} group key expression has no type",
-                spec.binding_id
+                spec.binding_id()
             )
         })?;
-        let RuntimeFilterExecutionContract::Ordered { keys, .. } = &spec.contract else {
+        let RuntimeFilterExecutionContract::Ordered { keys, .. } = spec.contract().contract()
+        else {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} requires an ordered contract",
-                spec.binding_id
+                spec.binding_id()
             ));
         };
         if keys.len() != 1 || keys[0].data_type() != group_key_type {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} ordered contract must contain exactly one key matching group key type={group_key_type:?}",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
-        if spec.reduction != RuntimeFilterExecutionReduction::TightenOrderedBound {
+        if spec.contract().reduction() != execution::RuntimeFilterReduction::TightenOrderedBound {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} requires TightenOrderedBound reduction",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
-        if spec.contribution_kinds != expected_contributions {
-            return Err(format!(
-                "native aggregate TopN producer binding_id={} contribution kinds must be exactly OrderedBoundUpdate and ProducerClosed",
-                spec.binding_id
-            ));
-        }
-        if spec.completion_requirement
-            != crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
-        {
+        if spec.contract().completion() != execution::RuntimeFilterCompletion::ProducerClosed {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} completion must be ProducerClosed",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
     }
     if let Some(spec) = specs.first() {
-        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id())?;
     }
     Ok(())
 }
@@ -828,7 +819,7 @@ fn resolve_aggregate_topn_producer_site_if_present(
 ) -> Result<Option<AggregateTopNProducerSite>, String> {
     specs
         .first()
-        .map(|spec| resolve_aggregate_topn_producer_site(spec.binding_id, candidates))
+        .map(|spec| resolve_aggregate_topn_producer_site(spec.binding_id(), candidates))
         .transpose()
 }
 
@@ -855,7 +846,7 @@ fn native_join_producer_factory(
         return Ok(None);
     }
     let session =
-        runtime_filter_session(&ctx.runtime_filter_execution, specs[0].binding_id)?.clone();
+        runtime_filter_session(&ctx.runtime_filter_execution, specs[0].binding_id())?.clone();
     Ok(Some(Arc::new(
         NativeRuntimeFilterProducerFactory::from_plan(
             specs,
@@ -873,7 +864,7 @@ fn validate_native_consumer_specs(
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
     if let Some(spec) = specs.first() {
-        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id())?;
     }
     Ok(())
 }
@@ -2032,19 +2023,16 @@ mod tests {
                 kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
                     input: Box::new(lookup_node(1, Arc::clone(&schema))),
                     owner_node_id: 2,
-                    bindings: vec![RuntimeFilterConsumerBinding {
-                        binding_id: 4,
-                        channel_id: 1,
+                    bindings: vec![RuntimeFilterConsumerBinding::new(
                         expr_id,
-                        activation,
-                        capabilities: BTreeSet::from([
-                            crate::runtime_filter::model::contract::ArtifactCapability::Membership,
-                            crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
-                        ]),
-                        contract: installed_native_membership_contract_for_activation(activation),
-                        reduction: RuntimeFilterExecutionReduction::SetUnion,
-                        scan_domain: None,
-                    }],
+                        crate::exec::node::runtime_filter::test_consumer_contract(
+                            4,
+                            1,
+                            activation,
+                            installed_native_membership_contract_for_activation(activation),
+                        ),
+                        None,
+                    )],
                 }),
             },
         };
@@ -2125,22 +2113,19 @@ mod tests {
                         }),
                     }),
                     owner_node_id: 2,
-                    bindings: vec![RuntimeFilterConsumerBinding {
-                        binding_id: 4,
-                        channel_id: 1,
+                    bindings: vec![RuntimeFilterConsumerBinding::new(
                         expr_id,
-                        activation: crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
-                        capabilities: BTreeSet::from([
-                            crate::runtime_filter::model::contract::ArtifactCapability::Membership,
-                            crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
-                        ]),
-                        contract: RuntimeFilterExecutionContract::Membership {
-                            canonical_schema: Arc::from(installed_schema.canonical_bytes()),
-                            schema_digest,
-                        },
-                        reduction: RuntimeFilterExecutionReduction::SetUnion,
-                        scan_domain: None,
-                    }],
+                        crate::exec::node::runtime_filter::test_consumer_contract(
+                            4,
+                            1,
+                            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
+                            RuntimeFilterExecutionContract::Membership {
+                                canonical_schema: Arc::from(installed_schema.canonical_bytes()),
+                                schema_digest,
+                            },
+                        ),
+                        None,
+                    )],
                 }),
             },
         }
@@ -2230,19 +2215,16 @@ mod tests {
                     eq_null_safe: vec![false],
                     residual_predicate: None,
                     runtime_filter_execution: JoinRuntimeFilterExecution {
-                        producers: vec![JoinRuntimeFilterProducerBinding {
-                            binding_id: 3,
-                            channel_id: 1,
-                            build_expr_id: build_expr,
-                            build_key_index: 0,
-                            contribution_kinds: BTreeSet::from([
-                                ContributionKind::ValueDomainDelta,
-                                ContributionKind::ProducerClosed,
-                            ]),
-                            completion_requirement: CompletionRequirement::ProducerClosed,
-                            contract,
-                            reduction: RuntimeFilterExecutionReduction::SetUnion,
-                        }],
+                        producers: vec![JoinRuntimeFilterProducerBinding::new(
+                            build_expr,
+                            0,
+                            execution::RuntimeFilterProducerContract::membership(
+                                execution::RuntimeFilterBindingId::new(3),
+                                execution::RuntimeFilterChannelId::new(1),
+                                contract,
+                            )
+                            .expect("test membership producer contract"),
+                        )],
                     },
                 }),
             },
@@ -2280,24 +2262,22 @@ mod tests {
             inclusive: true,
         })
         .expect("canonical aggregate TopN order");
-        crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding {
-            binding_id,
-            channel_id: 1,
+        crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding::new(
             group_key_expr_id,
-            group_key_ordinal: 0,
-            limit: std::num::NonZeroU32::new(5).expect("nonzero limit"),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: execution_order_keys(runtime.keys()),
-                comparator_digest: runtime.plan_comparator_digest().get(),
-                order_contract_digest: runtime.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            contribution_kinds: BTreeSet::from([
-                ContributionKind::OrderedBoundUpdate,
-                ContributionKind::ProducerClosed,
-            ]),
-            completion_requirement: CompletionRequirement::ProducerClosed,
-        }
+            0,
+            std::num::NonZeroU32::new(5).expect("nonzero limit"),
+            execution::RuntimeFilterProducerContract::top_k_summary(
+                execution::RuntimeFilterBindingId::new(binding_id),
+                execution::RuntimeFilterChannelId::new(1),
+                5,
+                RuntimeFilterExecutionContract::Ordered {
+                    keys: execution_order_keys(runtime.keys()),
+                    comparator_digest: runtime.plan_comparator_digest().get(),
+                    order_contract_digest: runtime.digest().bytes(),
+                },
+            )
+            .expect("test top-k producer contract"),
+        )
     }
 
     fn native_aggregate_topn_plan(
@@ -2534,19 +2514,16 @@ mod tests {
                         }),
                     }),
                     owner_node_id: 2,
-                    bindings: vec![RuntimeFilterConsumerBinding {
-                        binding_id: 4,
-                        channel_id: 1,
+                    bindings: vec![RuntimeFilterConsumerBinding::new(
                         expr_id,
-                        activation,
-                        capabilities: BTreeSet::from([
-                            crate::runtime_filter::model::contract::ArtifactCapability::Membership,
-                            crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
-                        ]),
-                        contract: installed_native_membership_contract_for_activation(activation),
-                        reduction: RuntimeFilterExecutionReduction::SetUnion,
-                        scan_domain: None,
-                    }],
+                        crate::exec::node::runtime_filter::test_consumer_contract(
+                            4,
+                            1,
+                            activation,
+                            installed_native_membership_contract_for_activation(activation),
+                        ),
+                        None,
+                    )],
                 }),
             },
         };

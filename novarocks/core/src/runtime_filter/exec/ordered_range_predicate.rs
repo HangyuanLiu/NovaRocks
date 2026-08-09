@@ -26,9 +26,6 @@ use arrow::array::{
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_execution::runtime_filter::scan_domain::{
-    RuntimeFilterScanDomainCapabilityError, RuntimeFilterScanDomainPredicate,
-};
 use novarocks_spi::connector::ConnectorScalarValue;
 
 use crate::runtime_filter::materializer::codec::{ArtifactCodecError, encode_range_leaf};
@@ -328,29 +325,10 @@ impl NativeOrderedRangePredicate {
     }
 }
 
-impl RuntimeFilterScanDomainPredicate for NativeOrderedRangePredicate {
-    fn data_type(&self) -> &DataType {
-        self.data_type()
-    }
-
-    fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
-        self.scan_domain_matches_null()
-    }
-
-    fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
-        // A range fact is required to decide the side of an ordered bound.
-        // This merely states that the retained artifact has a supported
-        // non-null domain; no provider fact is inspected here.
-        Ok(true)
-    }
-
-    fn non_null_range_may_match(
-        &self,
-        inclusive_min: &ConnectorScalarValue,
-        inclusive_max: &ConnectorScalarValue,
-    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
-        self.scan_domain_range_may_match(inclusive_min, inclusive_max)
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeFilterScanDomainCapabilityError {
+    Unsupported,
+    ContractViolation,
 }
 
 fn scan_ordered_scalar(

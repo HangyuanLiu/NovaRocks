@@ -6,14 +6,16 @@
 
 use std::num::NonZeroU32;
 
-use crate::exec::node::runtime_filter::{
-    ArtifactCapability, ArtifactMembershipSchema, ComparatorDigest, CompletionFenceKind,
-    CompletionRequirement, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
-    OrderContract, OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain,
-    RuntimeOrderContract, RuntimeOrderKey, RuntimeTopKSummaryContract, SortDirection,
+use crate::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use crate::runtime_filter::model::contract::{
+    ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, OrderContract,
+    OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain, SortDirection,
     TopKSummaryRequirement,
 };
-use crate::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
+use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 use novarocks_protocol::plan;
 
 type CodecResult<T> = Result<T, ProtocolError>;

@@ -37,19 +37,16 @@ mod topn;
 mod values;
 mod window;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
 use self::common::*;
 use novarocks_execution::runtime_filter as execution;
+use std::collections::BTreeMap;
 
 use crate::native::plan_decode::context::NativePlanDecodeContext;
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
 use crate::native::plan_decode::runtime_filter_binding::{
     DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
-    DecodedRuntimeFilterContract, DecodedRuntimeFilterReduction, NativeRuntimeFilterDecodeLedger,
-    ProducerBindingTarget,
+    NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
 };
 use novarocks::exec::chunk::ChunkSchemaRef;
 use novarocks::exec::expr::ExprArena;
@@ -60,8 +57,7 @@ use novarocks::exec::node::aggregate::{
 use novarocks::exec::node::join::{JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding};
 use novarocks::exec::node::limit::LimitNode;
 use novarocks::exec::node::runtime_filter::{
-    NullOrder, RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
-    RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction, SortDirection,
+    RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
@@ -715,12 +711,7 @@ fn attach_hash_join_producers(
     let (build_layout, build_schema) = &direct_inputs[build_input_index];
     let mut producers = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        let DecodedBindingRole::Producer {
-            contribution_kinds,
-            completion_requirement,
-            target,
-        } = &binding.role
-        else {
+        let DecodedBindingRole::Producer { contract, target } = &binding.role else {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("runtime_filter_binding_ids"),
                 format!(
@@ -810,24 +801,13 @@ fn attach_hash_join_producers(
                 ),
             )
         })?;
-        producers.push(NativeFragmentDecodeError::map_invalid(
-            path.clone().field("runtime_filter_binding_ids"),
-            JoinRuntimeFilterProducerBinding::try_new(
-                binding.binding_id,
-                binding.channel_id,
-                build_expr_id,
-                build_key_index,
-                contribution_kinds.clone(),
-                *completion_requirement,
-                native_contract(&binding.contract),
-                native_reduction(&binding.reduction),
-            ),
-        )?);
+        producers.push(JoinRuntimeFilterProducerBinding::new(
+            build_expr_id,
+            build_key_index,
+            contract.clone(),
+        ));
     }
-    join.runtime_filter_execution = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("runtime_filter_binding_ids"),
-        JoinRuntimeFilterExecution::try_new(producers),
-    )?;
+    join.runtime_filter_execution = JoinRuntimeFilterExecution::new(producers);
     Ok(())
 }
 
@@ -866,12 +846,7 @@ fn attach_hash_aggregate_producers(
     let mut seen = std::collections::BTreeSet::new();
     let mut producers = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        let DecodedBindingRole::Producer {
-            contribution_kinds,
-            completion_requirement,
-            target,
-        } = &binding.role
-        else {
+        let DecodedBindingRole::Producer { contract, target } = &binding.role else {
             return Err(NativeFragmentDecodeError::inconsistent(
                 binding_path.clone(),
                 format!(
@@ -960,7 +935,8 @@ fn attach_hash_aggregate_producers(
                 ),
             )
         })?;
-        let DecodedRuntimeFilterContract::Ordered { keys, .. } = &binding.contract else {
+        let execution::RuntimeFilterExecutionContract::Ordered { keys, .. } = contract.contract()
+        else {
             return Err(NativeFragmentDecodeError::inconsistent(
                 binding_path.clone(),
                 format!(
@@ -978,7 +954,7 @@ fn attach_hash_aggregate_producers(
                 ),
             ));
         }
-        if binding.reduction != DecodedRuntimeFilterReduction::TightenOrderedBound {
+        if contract.kind() != execution::RuntimeFilterProducerKind::OrderedBound {
             return Err(NativeFragmentDecodeError::inconsistent(
                 binding_path.clone(),
                 format!(
@@ -987,20 +963,12 @@ fn attach_hash_aggregate_producers(
                 ),
             ));
         }
-        producers.push(NativeFragmentDecodeError::map_invalid(
-            binding_path.clone(),
-            AggregateTopNRuntimeFilterProducerBinding::try_new(
-                binding.binding_id,
-                binding.channel_id,
-                group_key_expr_id,
-                group_key_ordinal,
-                limit,
-                native_contract(&binding.contract),
-                native_reduction(&binding.reduction),
-                contribution_kinds.clone(),
-                *completion_requirement,
-            ),
-        )?);
+        producers.push(AggregateTopNRuntimeFilterProducerBinding::new(
+            group_key_expr_id,
+            group_key_ordinal,
+            limit,
+            contract.clone(),
+        ));
     }
     aggregate.runtime_filter_spec = NativeFragmentDecodeError::map_invalid(
         binding_path,
@@ -1045,12 +1013,7 @@ fn consumer_spec(
     binding: &DecodedRuntimeFilterBinding,
     expr_id: novarocks::exec::expr::ExprId,
 ) -> Result<RuntimeFilterConsumerBinding, String> {
-    let DecodedBindingRole::Consumer {
-        capabilities,
-        activation,
-        target,
-    } = &binding.role
-    else {
+    let DecodedBindingRole::Consumer { contract, target } = &binding.role else {
         return Err(format!(
             "native runtime-filter binding_id={} expected consumer role",
             binding.binding_id
@@ -1071,72 +1034,11 @@ fn consumer_spec(
             })
         }
     };
-    RuntimeFilterConsumerBinding::try_new(
-        binding.binding_id,
-        binding.channel_id,
+    Ok(RuntimeFilterConsumerBinding::new(
         expr_id,
-        *activation,
-        capabilities.clone(),
-        native_contract(&binding.contract),
-        native_reduction(&binding.reduction),
+        contract.clone(),
         scan_domain,
-    )
-}
-
-fn native_contract(contract: &DecodedRuntimeFilterContract) -> RuntimeFilterExecutionContract {
-    match contract {
-        DecodedRuntimeFilterContract::Membership {
-            canonical_schema,
-            schema_digest,
-        } => RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::clone(canonical_schema),
-            schema_digest: *schema_digest,
-        },
-        DecodedRuntimeFilterContract::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        } => RuntimeFilterExecutionContract::Ordered {
-            keys: keys
-                .iter()
-                .map(|key| {
-                    execution::RuntimeOrderKey::new(
-                        key.data_type().clone(),
-                        match key.direction() {
-                            SortDirection::Ascending => {
-                                execution::RuntimeOrderSortDirection::Ascending
-                            }
-                            SortDirection::Descending => {
-                                execution::RuntimeOrderSortDirection::Descending
-                            }
-                        },
-                        match key.null_order() {
-                            NullOrder::First => execution::RuntimeOrderNullOrder::First,
-                            NullOrder::Last => execution::RuntimeOrderNullOrder::Last,
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into(),
-            comparator_digest: *comparator_digest,
-            order_contract_digest: *order_contract_digest,
-        },
-    }
-}
-
-fn native_reduction(reduction: &DecodedRuntimeFilterReduction) -> RuntimeFilterExecutionReduction {
-    match reduction {
-        DecodedRuntimeFilterReduction::SetUnion => RuntimeFilterExecutionReduction::SetUnion,
-        DecodedRuntimeFilterReduction::TightenOrderedBound => {
-            RuntimeFilterExecutionReduction::TightenOrderedBound
-        }
-        DecodedRuntimeFilterReduction::MergeTopKSummary { k, contract_digest } => {
-            RuntimeFilterExecutionReduction::MergeTopKSummary {
-                k: *k,
-                contract_digest: *contract_digest,
-            }
-        }
-    }
+    ))
 }
 
 fn lower_binding_expression(
@@ -1694,26 +1596,23 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
-    use novarocks::exec::node::runtime_filter::{
-        NullOrder, RuntimeFilterExecutionContract, RuntimeOrderKey, SortDirection,
-    };
     use novarocks_execution::runtime_filter as execution;
 
-    use super::{DecodedRuntimeFilterContract, native_contract};
+    use super::*;
 
     #[test]
-    fn native_contract_canonicalizes_ordered_keys_for_execution() {
-        let contract = native_contract(&DecodedRuntimeFilterContract::Ordered {
-            keys: Arc::from([RuntimeOrderKey::new(
+    fn execution_contract_retains_ordered_key_semantics() {
+        let contract = execution::RuntimeFilterExecutionContract::Ordered {
+            keys: Arc::from([execution::RuntimeOrderKey::new(
                 DataType::Int64,
-                SortDirection::Descending,
-                NullOrder::First,
+                execution::RuntimeOrderSortDirection::Descending,
+                execution::RuntimeOrderNullOrder::First,
             )]),
             comparator_digest: [3; 32],
             order_contract_digest: [4; 32],
-        });
+        };
 
-        let RuntimeFilterExecutionContract::Ordered {
+        let execution::RuntimeFilterExecutionContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,

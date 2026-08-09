@@ -27,9 +27,6 @@ use arrow::array::{
     TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_execution::runtime_filter::scan_domain::{
-    RuntimeFilterScanDomainCapabilityError, RuntimeFilterScanDomainPredicate,
-};
 use novarocks_spi::connector::ConnectorScalarValue;
 
 use crate::runtime_filter::materializer::codec::{
@@ -379,26 +376,10 @@ impl NativeRuntimeFilterPredicate {
     }
 }
 
-impl RuntimeFilterScanDomainPredicate for NativeRuntimeFilterPredicate {
-    fn data_type(&self) -> &DataType {
-        self.data_type()
-    }
-
-    fn matches_null(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
-        self.scan_domain_matches_null()
-    }
-
-    fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
-        self.scan_domain_has_non_null_matches()
-    }
-
-    fn non_null_range_may_match(
-        &self,
-        inclusive_min: &ConnectorScalarValue,
-        inclusive_max: &ConnectorScalarValue,
-    ) -> Result<bool, RuntimeFilterScanDomainCapabilityError> {
-        self.scan_domain_range_may_match(inclusive_min, inclusive_max)
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeFilterScanDomainCapabilityError {
+    Unsupported,
+    ContractViolation,
 }
 
 fn in_closed_range(

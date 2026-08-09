@@ -82,13 +82,13 @@ impl ScanSourceFactory {
         let mut ordered_live_specs = Vec::new();
         let mut seen_bindings = HashSet::new();
         for spec in scan.native_runtime_filter_specs() {
-            if !seen_bindings.insert(spec.binding_id) {
+            if !seen_bindings.insert(spec.binding_id()) {
                 return Err(format!(
                     "duplicate native scan runtime-filter consumer binding_id={}",
-                    spec.binding_id
+                    spec.binding_id()
                 ));
             }
-            match &spec.contract {
+            match spec.execution_contract() {
                 crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership {
                     ..
                 } => membership_specs.push(spec.clone()),
@@ -1186,38 +1186,35 @@ mod tests {
         let membership_schema =
             ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
                 .expect("membership schema");
-        let blocking = RuntimeFilterConsumerBinding {
-            binding_id: 1,
-            channel_id: 9,
+        let blocking = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(membership_schema.canonical_bytes()),
-                schema_digest: membership_schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
-        let ordered = RuntimeFilterConsumerBinding {
-            binding_id: 2,
-            channel_id: 1,
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                1,
+                9,
+                ConsumerActivation::BlockingSnapshot,
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(membership_schema.canonical_bytes()),
+                    schema_digest: membership_schema.digest().bytes(),
+                },
+            ),
+            None,
+        );
+        let ordered = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                comparator_digest: order.plan_comparator_digest().get(),
-                order_contract_digest: order.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                2,
+                1,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+                RuntimeFilterExecutionContract::Ordered {
+                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
+                    comparator_digest: order.plan_comparator_digest().get(),
+                    order_contract_digest: order.digest().bytes(),
+                },
+            ),
+            None,
+        );
         let op: Arc<dyn ScanOp> = Arc::new(PlainScanOp::new());
         let mut scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_connector_io_tasks_per_scan_operator(Some(1));
@@ -1249,24 +1246,21 @@ mod tests {
         let op: Arc<dyn ScanOp> = Arc::new(PlainScanOp::new());
         let mut scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_connector_io_tasks_per_scan_operator(Some(1));
-        scan.set_native_runtime_filter_specs(vec![RuntimeFilterConsumerBinding {
-            binding_id: 4,
-            channel_id: 2,
+        scan.set_native_runtime_filter_specs(vec![RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(membership_schema.canonical_bytes()),
-                schema_digest: membership_schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        }]);
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                4,
+                2,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(membership_schema.canonical_bytes()),
+                    schema_digest: membership_schema.digest().bytes(),
+                },
+            ),
+            None,
+        )]);
 
         ScanSourceFactory::new_native(scan, op, Arc::new(arena))
             .expect("cycle-forced membership must remain a Join consumer");
@@ -1293,22 +1287,22 @@ mod tests {
         });
         let mut scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_connector_io_tasks_per_scan_operator(Some(1));
-        scan.set_native_runtime_filter_specs(vec![RuntimeFilterConsumerBinding {
-            binding_id: 2,
-            channel_id: 1,
+        scan.set_native_runtime_filter_specs(vec![RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                comparator_digest: order.plan_comparator_digest().get(),
-                order_contract_digest: order.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            scan_domain: None,
-        }]);
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                2,
+                1,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+                RuntimeFilterExecutionContract::Ordered {
+                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
+                    comparator_digest: order.plan_comparator_digest().get(),
+                    order_contract_digest: order.digest().bytes(),
+                },
+            ),
+            None,
+        )]);
         let factory =
             ScanSourceFactory::new_native(scan, op, Arc::new(arena)).expect("native scan factory");
         let mut source = factory.create(1, 0);
@@ -1361,20 +1355,20 @@ mod tests {
             let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
             let op: Arc<dyn ScanOp> = Arc::new(PlainScanOp::new());
             let mut scan = ScanNode::new_for_test(Arc::clone(&op));
-            scan.set_native_runtime_filter_specs(vec![RuntimeFilterConsumerBinding {
-                binding_id: 2,
-                channel_id: 1,
+            scan.set_native_runtime_filter_specs(vec![RuntimeFilterConsumerBinding::new(
                 expr_id,
-                activation: ConsumerActivation::NonBlockingLive { late_apply },
-                capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-                contract: RuntimeFilterExecutionContract::Ordered {
-                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                    comparator_digest: order.plan_comparator_digest().get(),
-                    order_contract_digest: order.digest().bytes(),
-                },
-                reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-                scan_domain: None,
-            }]);
+                crate::exec::node::runtime_filter::test_consumer_contract(
+                    2,
+                    1,
+                    ConsumerActivation::NonBlockingLive { late_apply },
+                    RuntimeFilterExecutionContract::Ordered {
+                        keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
+                        comparator_digest: order.plan_comparator_digest().get(),
+                        order_contract_digest: order.digest().bytes(),
+                    },
+                ),
+                None,
+            )]);
             assert!(
                 ScanSourceFactory::new_native(scan, op, Arc::new(arena))
                     .err()
@@ -1406,22 +1400,22 @@ mod tests {
             SortDirection::Ascending,
             NullOrder::Last,
         );
-        let ordered_spec = RuntimeFilterConsumerBinding {
-            binding_id: 12,
-            channel_id: 7,
-            expr_id: ExprId(0),
-            activation: ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                comparator_digest: order.plan_comparator_digest().get(),
-                order_contract_digest: order.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            scan_domain: None,
-        };
+        let ordered_spec = RuntimeFilterConsumerBinding::new(
+            ExprId(0),
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                12,
+                7,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+                RuntimeFilterExecutionContract::Ordered {
+                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
+                    comparator_digest: order.plan_comparator_digest().get(),
+                    order_contract_digest: order.digest().bytes(),
+                },
+            ),
+            None,
+        );
         let idle = Arc::new(IdleOrderedLiveSubscription {
             polls: AtomicUsize::new(0),
         });

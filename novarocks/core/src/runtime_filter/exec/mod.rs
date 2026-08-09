@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod execution_final_domain;
-pub mod execution_predicate;
 pub mod membership_delta;
+#[cfg(test)]
 pub mod membership_predicate;
+#[cfg(test)]
 pub mod ordered_range_predicate;

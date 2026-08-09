@@ -34,18 +34,14 @@ use crate::runtime::profile::{
     OperatorProfiles, ProfileUnit, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS,
 };
 use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime_filter::exec::execution_predicate::NativeExecutionPredicate;
-use crate::runtime_filter::exec::membership_predicate::MembershipPredicateContract;
 #[cfg(test)]
 use crate::runtime_filter::exec::membership_predicate::{
-    NativeRuntimeFilterPredicate, PredicateEvaluationError,
-};
-use crate::runtime_filter::exec::ordered_range_predicate::{
-    NativeOrderedRangePredicate, OrderedRangePredicateContract,
+    MembershipPredicateContract, NativeRuntimeFilterPredicate, PredicateEvaluationError,
 };
 #[cfg(test)]
 use crate::runtime_filter::exec::ordered_range_predicate::{
-    OrderedPredicateCompileError, OrderedPredicateEvaluationError,
+    NativeOrderedRangePredicate, OrderedPredicateCompileError, OrderedPredicateEvaluationError,
+    OrderedRangePredicateContract,
 };
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ChannelId, ComparatorDigest, ConsumerActivation, LateApplyGranularity,
@@ -253,7 +249,7 @@ impl NativeOrderedLiveConsumerSet {
                 Ok(_) => {
                     return Err(format!(
                         "native ordered runtime-filter binding_id={} session returned a non-live subscription",
-                        binding.spec.binding_id
+                        binding.spec.binding_id()
                     ));
                 }
                 Err(error)
@@ -290,25 +286,20 @@ impl NativeOrderedLiveConsumerSet {
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
     ) -> Result<Option<Chunk>, String> {
-        let configured = !self
-            .inner
-            .bindings
-            .lock()
-            .expect("native ordered RF consumer lock")
-            .is_empty();
-        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-        let output = self.apply_chunk_inner(chunk)?;
-        if configured && let Some(profiles) = profiles {
-            profiles
-                .common
-                .counter_add(RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit, input_rows);
-            profiles.common.counter_add(
-                RUNTIME_FILTER_OUTPUT_ROWS,
-                ProfileUnit::Unit,
-                output
-                    .as_ref()
-                    .map_or(0, |chunk| i64::try_from(chunk.len()).unwrap_or(i64::MAX)),
-            );
+        let (output, effects) = self.apply_chunk_inner(chunk)?;
+        if let Some(profiles) = profiles {
+            for effect in effects {
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_INPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.input_rows()).unwrap_or(i64::MAX),
+                );
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_OUTPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.output_rows()).unwrap_or(i64::MAX),
+                );
+            }
         }
         Ok(output)
     }
@@ -425,13 +416,13 @@ impl NativeOrderedLiveConsumerSet {
                 if latest_version.is_some_and(|latest| observed.is_none_or(|seen| latest > seen)) {
                     return Err(format!(
                         "native ordered runtime-filter binding_id={} reported a newer live version without artifact",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if latest_version.is_some_and(|latest| observed.is_some_and(|seen| latest < seen)) {
                     return Err(format!(
                         "native ordered runtime-filter binding_id={} live cursor regressed",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if let Some(idle_terminal) = idle_terminal {
@@ -506,14 +497,14 @@ impl NativeOrderedLiveConsumerSet {
                 if latest_version.is_some_and(|latest| last_seen.is_none_or(|seen| latest > seen)) {
                     return Err(format!(
                         "native ordered runtime-filter binding_id={} reported a newer live version without artifact",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if latest_version.is_some_and(|latest| last_seen.is_some_and(|seen| latest < seen))
                 {
                     return Err(format!(
                         "native ordered runtime-filter binding_id={} live cursor regressed",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if let Some(idle_terminal) = idle_terminal {
@@ -528,7 +519,10 @@ impl NativeOrderedLiveConsumerSet {
         Ok(())
     }
 
-    fn apply_chunk_inner(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn apply_chunk_inner(
+        &self,
+        chunk: Chunk,
+    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), String> {
         let active = {
             let bindings = self
                 .inner
@@ -558,20 +552,40 @@ impl NativeOrderedLiveConsumerSet {
                 .collect::<Vec<_>>()
         };
         if active.is_empty() {
-            return Ok(Some(chunk));
+            return Ok((Some(chunk), Vec::new()));
         }
         let chunk = crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)?;
         let mut current = Some(chunk);
+        let mut effects = Vec::new();
         for (expr_id, predicate) in active {
             let Some(input) = current else {
-                return Ok(None);
+                return Ok((None, effects));
             };
             let array = self.inner.arena.eval(expr_id, &input)?;
             let mask = match predicate {
-                NativeOrderedPredicateForApply::Execution(snapshot) => snapshot
-                    .predicate()
-                    .evaluate(&array)
-                    .map_err(|error| error.to_string())?,
+                NativeOrderedPredicateForApply::Execution(snapshot) => {
+                    let outcome = execution::evaluator::evaluate_rows(
+                        snapshot.binding_id(),
+                        snapshot.logical_version(),
+                        snapshot.artifact_query().as_ref(),
+                        &array,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    match outcome.evaluation() {
+                        execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } => {
+                            effects.push(
+                                outcome
+                                    .effect()
+                                    .expect("evaluated runtime-filter row outcome has an effect"),
+                            );
+                            mask.clone()
+                        }
+                        execution::RuntimeFilterRowEvaluation::NotEvaluated { .. } => {
+                            current = Some(input);
+                            continue;
+                        }
+                    }
+                }
                 #[cfg(test)]
                 NativeOrderedPredicateForApply::Test(predicate) => {
                     match predicate.evaluate(array.as_ref()) {
@@ -594,7 +608,7 @@ impl NativeOrderedLiveConsumerSet {
                 current = Some(Chunk::try_new_like(filtered, &input)?);
             }
         }
-        Ok(current)
+        Ok((current, effects))
     }
 
     #[cfg(test)]
@@ -944,8 +958,8 @@ impl RuntimeFilterConsumerSet {
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
                     execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
                 )) if matches!(
-                    binding.spec.activation,
-                    ConsumerActivation::BlockingSnapshot
+                    binding.spec.activation(),
+                    execution::ConsumerActivation::BlockingSnapshot
                 ) =>
                 {
                     binding.state = NativeConsumerBindingState::BoundBlocking(subscription);
@@ -953,9 +967,9 @@ impl RuntimeFilterConsumerSet {
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
                     execution::RuntimeFilterSubscriptionHandle::Live(subscription),
                 )) if matches!(
-                    binding.spec.activation,
-                    ConsumerActivation::NonBlockingLive {
-                        late_apply: LateApplyGranularity::Batch,
+                    binding.spec.activation(),
+                    execution::ConsumerActivation::NonBlockingLive {
+                        late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
                     }
                 ) =>
                 {
@@ -970,7 +984,7 @@ impl RuntimeFilterConsumerSet {
                 Ok(_) => {
                     return Err(format!(
                         "native Join runtime-filter binding_id={} session returned an activation-mismatched subscription",
-                        binding.spec.binding_id
+                        binding.spec.binding_id()
                     ));
                 }
                 Err(error)
@@ -981,15 +995,15 @@ impl RuntimeFilterConsumerSet {
                 }
                 Err(error) => return Err(error.to_string()),
             }
-            match binding.spec.activation {
-                ConsumerActivation::BlockingSnapshot
-                | ConsumerActivation::NonBlockingLive {
-                    late_apply: LateApplyGranularity::Batch,
+            match binding.spec.activation() {
+                execution::ConsumerActivation::BlockingSnapshot
+                | execution::ConsumerActivation::NonBlockingLive {
+                    late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
                 } => {}
-                ConsumerActivation::NonBlockingLive { .. } => {
+                execution::ConsumerActivation::NonBlockingLive { .. } => {
                     return Err(format!(
                         "native Join runtime-filter binding_id={} has unsupported activation",
-                        binding.spec.binding_id
+                        binding.spec.binding_id()
                     ));
                 }
             }
@@ -1155,30 +1169,28 @@ impl RuntimeFilterConsumerSet {
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
     ) -> Result<Option<Chunk>, String> {
-        let configured = !self
-            .inner
-            .bindings
-            .lock()
-            .expect("native RF consumer lock")
-            .is_empty();
-        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-        let output = self.apply_chunk_inner(chunk)?;
-        if configured && let Some(profiles) = profiles {
-            profiles
-                .common
-                .counter_add(RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit, input_rows);
-            profiles.common.counter_add(
-                RUNTIME_FILTER_OUTPUT_ROWS,
-                ProfileUnit::Unit,
-                output
-                    .as_ref()
-                    .map_or(0, |chunk| i64::try_from(chunk.len()).unwrap_or(i64::MAX)),
-            );
+        let (output, effects) = self.apply_chunk_inner(chunk)?;
+        if let Some(profiles) = profiles {
+            for effect in effects {
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_INPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.input_rows()).unwrap_or(i64::MAX),
+                );
+                profiles.common.counter_add(
+                    RUNTIME_FILTER_OUTPUT_ROWS,
+                    ProfileUnit::Unit,
+                    i64::try_from(effect.output_rows()).unwrap_or(i64::MAX),
+                );
+            }
         }
         Ok(output)
     }
 
-    fn apply_chunk_inner(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn apply_chunk_inner(
+        &self,
+        chunk: Chunk,
+    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), String> {
         self.poll_live_bindings()?;
         let active = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
@@ -1211,20 +1223,42 @@ impl RuntimeFilterConsumerSet {
                 .collect::<Vec<_>>()
         };
         if active.is_empty() {
-            return Ok(Some(chunk));
+            return Ok((Some(chunk), Vec::new()));
         }
         let chunk = crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)?;
         let mut current = Some(chunk);
+        let mut effects = Vec::new();
         for (index, expr_id, predicate) in active {
             let Some(input) = current else {
-                return Ok(None);
+                return Ok((None, effects));
             };
             let array = self.inner.arena.eval(expr_id, &input)?;
             let mask = match predicate {
-                NativeConsumerPredicateForApply::Execution(snapshot) => snapshot
-                    .predicate()
-                    .evaluate(&array)
-                    .map_err(|error| error.to_string())?,
+                NativeConsumerPredicateForApply::Execution(snapshot) => {
+                    let outcome = execution::evaluator::evaluate_rows(
+                        snapshot.binding_id(),
+                        snapshot.logical_version(),
+                        snapshot.artifact_query().as_ref(),
+                        &array,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    match outcome.evaluation() {
+                        execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } => {
+                            effects.push(
+                                outcome
+                                    .effect()
+                                    .expect("evaluated runtime-filter row outcome has an effect"),
+                            );
+                            mask.clone()
+                        }
+                        execution::RuntimeFilterRowEvaluation::NotEvaluated { .. } => {
+                            self.inner.bindings.lock().expect("native RF consumer lock")[index]
+                                .state = NativeConsumerBindingState::PassThrough;
+                            current = Some(input);
+                            continue;
+                        }
+                    }
+                }
                 #[cfg(test)]
                 NativeConsumerPredicateForApply::Test(predicate) => {
                     match predicate.evaluate(array.as_ref()) {
@@ -1249,7 +1283,7 @@ impl RuntimeFilterConsumerSet {
                 current = Some(Chunk::try_new_like(filtered, &input)?);
             }
         }
-        Ok(current)
+        Ok((current, effects))
     }
 
     fn poll_live_bindings(&self) -> Result<(), String> {
@@ -1322,7 +1356,7 @@ impl RuntimeFilterConsumerSet {
         if observed_version.is_some_and(|version| version != LogicalVersion::FIRST) {
             return Err(format!(
                 "native Join CompleteOnce runtime-filter binding_id={} private cursor must use LogicalVersion::FIRST",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
         match outcome {
@@ -1332,7 +1366,7 @@ impl RuntimeFilterConsumerSet {
                 {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} returned an invalid terminal update",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 let contract = membership_predicate_contract(spec)?;
@@ -1348,13 +1382,13 @@ impl RuntimeFilterConsumerSet {
                 if latest_version.is_some_and(|version| version != LogicalVersion::FIRST) {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} Idle latest version is invalid",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if terminal == Some(LiveTerminal::Completed) {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} completed without final artifact",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if matches!(
@@ -1363,7 +1397,7 @@ impl RuntimeFilterConsumerSet {
                 ) {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} private cursor drifted",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if terminal.is_some() {
@@ -1393,7 +1427,7 @@ impl RuntimeFilterConsumerSet {
         {
             return Err(format!(
                 "native Join CompleteOnce runtime-filter binding_id={} private cursor must use LogicalVersion::FIRST, got {version:?}",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
         match outcome {
@@ -1401,13 +1435,13 @@ impl RuntimeFilterConsumerSet {
                 if snapshot.logical_version() != execution::LogicalVersion::FIRST {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} Updated artifact must use LogicalVersion::FIRST",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if terminal != Some(execution::LiveTerminal::Completed) {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} Updated artifact requires terminal Completed, got {terminal:?}",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 binding.state = NativeConsumerBindingState::Active(
@@ -1423,26 +1457,26 @@ impl RuntimeFilterConsumerSet {
                 {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} Idle latest version must use LogicalVersion::FIRST, got {version:?}",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 if terminal == Some(execution::LiveTerminal::Completed) {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} reported Completed without the final artifact",
-                        spec.binding_id
+                        spec.binding_id()
                     ));
                 }
                 match (observed_version, latest_version) {
                     (None, Some(_)) => {
                         return Err(format!(
                             "native Join CompleteOnce runtime-filter binding_id={} Idle cursor advanced without returning an artifact",
-                            spec.binding_id
+                            spec.binding_id()
                         ));
                     }
                     (Some(_), None) => {
                         return Err(format!(
                             "native Join CompleteOnce runtime-filter binding_id={} Idle cursor regressed from LogicalVersion::FIRST",
-                            spec.binding_id
+                            spec.binding_id()
                         ));
                     }
                     _ => {}
@@ -1476,79 +1510,52 @@ fn join_profile() -> Result<ConsumerArtifactProfile, String> {
 fn execution_membership_consumer_contract(
     spec: &RuntimeFilterConsumerBinding,
 ) -> Result<execution::RuntimeFilterConsumerContract, String> {
-    let RuntimeFilterExecutionContract::Membership {
-        canonical_schema,
-        schema_digest,
-    } = &spec.contract
-    else {
+    if !matches!(
+        spec.execution_contract(),
+        RuntimeFilterExecutionContract::Membership { .. }
+    ) {
         return Err(format!(
             "native Join runtime-filter binding_id={} requires a Membership contract",
-            spec.binding_id
+            spec.binding_id()
         ));
-    };
-    let activation = match spec.activation {
-        ConsumerActivation::BlockingSnapshot => execution::ConsumerActivation::BlockingSnapshot,
-        ConsumerActivation::NonBlockingLive {
-            late_apply: LateApplyGranularity::Batch,
-        } => execution::ConsumerActivation::NonBlockingLive,
-        ConsumerActivation::NonBlockingLive { .. } => {
-            return Err(format!(
-                "native Join runtime-filter binding_id={} has unsupported activation",
-                spec.binding_id
-            ));
-        }
-    };
-    Ok(execution::RuntimeFilterConsumerContract::new(
-        execution::RuntimeFilterBindingId::new(spec.binding_id),
-        execution::RuntimeFilterChannelId::new(spec.channel_id),
-        activation,
-        execution::RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::clone(canonical_schema),
-            schema_digest: *schema_digest,
-        },
-    ))
+    }
+    Ok(spec.contract().clone())
 }
 
 fn execution_ordered_live_consumer_contract(
     spec: &RuntimeFilterConsumerBinding,
 ) -> Result<execution::RuntimeFilterConsumerContract, String> {
-    let RuntimeFilterExecutionContract::Ordered {
-        keys,
-        comparator_digest,
-        order_contract_digest,
-    } = &spec.contract
-    else {
+    if !matches!(
+        spec.execution_contract(),
+        RuntimeFilterExecutionContract::Ordered { .. }
+    ) {
         return Err(format!(
             "native ordered runtime-filter binding_id={} requires an Ordered contract",
-            spec.binding_id
+            spec.binding_id()
         ));
-    };
+    }
     if !matches!(
-        spec.activation,
-        ConsumerActivation::NonBlockingLive {
-            late_apply: LateApplyGranularity::Batch | LateApplyGranularity::Split,
+        spec.activation(),
+        execution::ConsumerActivation::NonBlockingLive {
+            late_apply: execution::RuntimeFilterLateApplyGranularity::Batch
+                | execution::RuntimeFilterLateApplyGranularity::Split,
         }
     ) {
         return Err(format!(
             "native ordered runtime-filter binding_id={} requires a non-blocking live activation",
-            spec.binding_id
+            spec.binding_id()
         ));
     }
-    Ok(execution::RuntimeFilterConsumerContract::new(
-        execution::RuntimeFilterBindingId::new(spec.binding_id),
-        execution::RuntimeFilterChannelId::new(spec.channel_id),
-        execution::ConsumerActivation::NonBlockingLive,
-        spec.contract.clone(),
-    ))
+    Ok(spec.contract().clone())
 }
 
 fn validate_unique_consumer_bindings(specs: &[RuntimeFilterConsumerBinding]) -> Result<(), String> {
     let mut bindings = BTreeSet::new();
     for spec in specs {
-        if !bindings.insert(spec.binding_id) {
+        if !bindings.insert(spec.binding_id()) {
             return Err(format!(
                 "duplicate native runtime-filter consumer binding_id={}",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
     }
@@ -1561,30 +1568,34 @@ fn validate_plan_specs(
 ) -> Result<(), String> {
     validate_unique_consumer_bindings(specs)?;
     for spec in specs {
-        if !spec.activation.is_blocking_or_batch_live() {
+        if !matches!(
+            spec.activation(),
+            execution::ConsumerActivation::BlockingSnapshot
+                | execution::ConsumerActivation::NonBlockingLive {
+                    late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
+                }
+        ) {
             return Err(format!(
                 "native Join runtime-filter binding_id={} requires BlockingSnapshot or Batch NonBlockingLive",
-                spec.binding_id
+                spec.binding_id()
             ));
         }
-        if spec.capabilities
-            != BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ])
+        if !matches!(
+            spec.execution_contract(),
+            RuntimeFilterExecutionContract::Membership { .. }
+        ) || spec.contract().reduction() != execution::RuntimeFilterReduction::SetUnion
         {
             return Err(format!(
-                "native Join runtime-filter binding_id={} has an unsupported artifact capability profile",
-                spec.binding_id
+                "native Join runtime-filter binding_id={} requires a membership SetUnion contract",
+                spec.binding_id()
             ));
         }
-        if spec.reduction != RuntimeFilterExecutionReduction::SetUnion {
+        if arena.data_type(spec.expr_id).is_none() {
             return Err(format!(
-                "native Join runtime-filter binding_id={} requires SetUnion",
-                spec.binding_id
+                "native Join runtime-filter binding_id={} expression is missing",
+                spec.binding_id()
             ));
         }
-        membership_predicate_contract_with_arena(spec, arena)?;
     }
     Ok(())
 }
@@ -1595,40 +1606,52 @@ fn validate_ordered_live_plan_specs(
 ) -> Result<(), String> {
     validate_unique_consumer_bindings(specs)?;
     for spec in specs {
-        match spec.activation {
-            ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch | LateApplyGranularity::Split,
+        match spec.activation() {
+            execution::ConsumerActivation::NonBlockingLive {
+                late_apply:
+                    execution::RuntimeFilterLateApplyGranularity::Batch
+                    | execution::RuntimeFilterLateApplyGranularity::Split,
             } => {}
-            ConsumerActivation::NonBlockingLive { .. } => {
+            execution::ConsumerActivation::NonBlockingLive { .. } => {
                 return Err(format!(
                     "native ordered runtime-filter binding_id={} has unsupported late-apply granularity",
-                    spec.binding_id
+                    spec.binding_id()
                 ));
             }
-            ConsumerActivation::BlockingSnapshot => {
+            execution::ConsumerActivation::BlockingSnapshot => {
                 return Err(format!(
                     "native ordered runtime-filter binding_id={} requires NonBlockingLive",
-                    spec.binding_id
+                    spec.binding_id()
                 ));
             }
         }
-        if spec.capabilities != BTreeSet::from([ArtifactCapability::OrderedRange]) {
+        if !matches!(
+            spec.execution_contract(),
+            RuntimeFilterExecutionContract::Ordered { .. }
+        ) || spec.contract().reduction()
+            != execution::RuntimeFilterReduction::TightenOrderedBound
+        {
             return Err(format!(
-                "native ordered runtime-filter binding_id={} requires exactly OrderedRange capability",
-                spec.binding_id
+                "native ordered runtime-filter binding_id={} requires an ordered TightenOrderedBound contract",
+                spec.binding_id()
             ));
         }
-        if spec.reduction != RuntimeFilterExecutionReduction::TightenOrderedBound {
+        let RuntimeFilterExecutionContract::Ordered { keys, .. } = spec.execution_contract() else {
+            unreachable!("ordered contract was checked above");
+        };
+        if keys.len() != 1
+            || arena.data_type(spec.expr_id) != keys.first().map(|key| key.data_type())
+        {
             return Err(format!(
-                "native ordered runtime-filter binding_id={} requires TightenOrderedBound",
-                spec.binding_id
+                "native ordered runtime-filter binding_id={} expression does not match its frozen single-key contract",
+                spec.binding_id()
             ));
         }
-        ordered_predicate_contract_with_arena(spec, arena, LogicalVersion::FIRST)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn ordered_runtime_contract(
     spec: &RuntimeFilterConsumerBinding,
 ) -> Result<Arc<RuntimeOrderContract>, String> {
@@ -1636,17 +1659,17 @@ fn ordered_runtime_contract(
         keys,
         comparator_digest,
         order_contract_digest,
-    } = &spec.contract
+    } = spec.execution_contract()
     else {
         return Err(format!(
             "native ordered runtime-filter binding_id={} requires an Ordered contract",
-            spec.binding_id
+            spec.binding_id()
         ));
     };
     if keys.len() != 1 {
         return Err(format!(
             "native ordered runtime-filter binding_id={} requires exactly one order key",
-            spec.binding_id
+            spec.binding_id()
         ));
     }
     let plan = OrderContract {
@@ -1665,7 +1688,7 @@ fn ordered_runtime_contract(
         RuntimeOrderContract::try_from_plan(&plan).map_err(|error| {
             format!(
                 "native ordered runtime-filter binding_id={} has invalid comparator contract: {error:?}",
-                spec.binding_id
+                spec.binding_id()
             )
         })?,
     );
@@ -1675,32 +1698,10 @@ fn ordered_runtime_contract(
     {
         return Err(format!(
             "native ordered runtime-filter binding_id={} contract digest mismatch",
-            spec.binding_id
+            spec.binding_id()
         ));
     }
     Ok(rebuilt)
-}
-
-fn ordered_predicate_contract_with_arena(
-    spec: &RuntimeFilterConsumerBinding,
-    arena: &ExprArena,
-    version: LogicalVersion,
-) -> Result<OrderedRangePredicateContract, String> {
-    let contract = ordered_runtime_contract(spec)?;
-    let expression_type = arena.data_type(spec.expr_id).ok_or_else(|| {
-        format!(
-            "native ordered runtime-filter expression {:?} is missing",
-            spec.expr_id
-        )
-    })?;
-    if expression_type != contract.keys()[0].data_type() {
-        return Err(format!(
-            "native ordered runtime-filter binding_id={} expression type does not match its order key",
-            spec.binding_id
-        ));
-    }
-    OrderedRangePredicateContract::new(ChannelId::new(spec.channel_id), contract, version)
-        .map_err(|error| format!("invalid native ordered predicate contract: {error:?}"))
 }
 
 #[cfg(test)]
@@ -1709,52 +1710,8 @@ fn ordered_predicate_contract_with_version(
     version: LogicalVersion,
 ) -> Result<OrderedRangePredicateContract, String> {
     let contract = ordered_runtime_contract(spec)?;
-    OrderedRangePredicateContract::new(ChannelId::new(spec.channel_id), contract, version)
+    OrderedRangePredicateContract::new(ChannelId::new(spec.channel_id()), contract, version)
         .map_err(|error| format!("invalid native ordered predicate contract: {error:?}"))
-}
-
-fn membership_predicate_contract_with_arena(
-    spec: &RuntimeFilterConsumerBinding,
-    arena: &ExprArena,
-) -> Result<MembershipPredicateContract, String> {
-    let RuntimeFilterExecutionContract::Membership {
-        canonical_schema,
-        schema_digest,
-    } = &spec.contract
-    else {
-        return Err(format!(
-            "native Join runtime-filter binding_id={} requires a Membership contract",
-            spec.binding_id
-        ));
-    };
-    let view = ArtifactMembershipSchema::view(canonical_schema)
-        .map_err(|error| format!("invalid native membership schema: {error:?}"))?;
-    let data_type = arena
-        .data_type(spec.expr_id)
-        .ok_or_else(|| {
-            format!(
-                "native runtime-filter expression {:?} is missing",
-                spec.expr_id
-            )
-        })?
-        .clone();
-    let rebuilt = ArtifactMembershipSchema::new(&data_type, view.null_semantics())
-        .map_err(|error| format!("invalid native membership expression type: {error:?}"))?;
-    if rebuilt.canonical_bytes() != canonical_schema.as_ref()
-        || rebuilt.digest().bytes() != *schema_digest
-    {
-        return Err(format!(
-            "native runtime-filter binding_id={} expression type/null contract does not match its canonical schema",
-            spec.binding_id
-        ));
-    }
-    MembershipPredicateContract::join(
-        ChannelId::new(spec.channel_id),
-        data_type,
-        view.null_semantics(),
-        LogicalVersion::FIRST,
-    )
-    .map_err(|error| format!("invalid native Join predicate contract: {error:?}"))
 }
 
 #[cfg(test)]
@@ -1763,7 +1720,7 @@ fn membership_predicate_contract(
 ) -> Result<MembershipPredicateContract, String> {
     let RuntimeFilterExecutionContract::Membership {
         canonical_schema, ..
-    } = &spec.contract
+    } = spec.execution_contract()
     else {
         unreachable!("plan validation accepts only Membership")
     };
@@ -1771,7 +1728,7 @@ fn membership_predicate_contract(
         .map_err(|error| format!("invalid native membership schema: {error:?}"))?;
     let data_type = data_type_from_schema_view(view)?;
     MembershipPredicateContract::join(
-        ChannelId::new(spec.channel_id),
+        ChannelId::new(spec.channel_id()),
         data_type,
         view.null_semantics(),
         LogicalVersion::FIRST,
@@ -1955,20 +1912,19 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use arrow::array::{Array, BooleanArray, Int32Array};
+    use arrow::array::{Array, Int32Array};
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime_filter as execution;
 
     use super::{
-        NativeConsumerBindingState, NativeConsumerTestSubscription, NativeExecutionPredicate,
-        RuntimeFilterConsumerSet, membership_predicate_contract, subscription_kind_for_activation,
+        NativeConsumerBindingState, NativeConsumerTestSubscription, RuntimeFilterConsumerSet,
+        membership_predicate_contract, subscription_kind_for_activation,
         validate_resolved_consumer_activation,
     };
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::runtime_filter::{
         RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
-        RuntimeFilterExecutionReduction,
     };
     use crate::exec::operators::runtime_filter::tests_support::{
         chunk, membership_bundle, membership_bundle_with_version,
@@ -1977,7 +1933,7 @@ mod tests {
     use crate::runtime::profile::{RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS};
     use crate::runtime_filter::exec::membership_predicate::NativeRuntimeFilterPredicate;
     use crate::runtime_filter::model::contract::{
-        ArtifactCapability, ConsumerActivation, LateApplyGranularity, NullSemantics,
+        ConsumerActivation, LateApplyGranularity, NullSemantics,
     };
     use crate::runtime_filter::port::artifact::ArtifactBundle;
     use crate::runtime_filter::port::identity::LogicalVersion;
@@ -2038,22 +1994,56 @@ mod tests {
             NullSemantics::NeverMatches,
         )
         .unwrap();
-        RuntimeFilterConsumerBinding {
-            binding_id: 11,
-            channel_id: 7,
+        RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        }
+            execution::RuntimeFilterConsumerContract::membership_blocking(
+                execution::RuntimeFilterBindingId::new(11),
+                execution::RuntimeFilterChannelId::new(7),
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(schema.canonical_bytes()),
+                    schema_digest: schema.digest().bytes(),
+                },
+            )
+            .expect("test membership contract"),
+            None,
+        )
+    }
+
+    fn consumer_spec_with_activation(
+        arena: &mut ExprArena,
+        activation: ConsumerActivation,
+    ) -> RuntimeFilterConsumerBinding {
+        let mut spec = consumer_spec(arena);
+        let contract = match activation {
+            ConsumerActivation::BlockingSnapshot => spec.contract().clone(),
+            ConsumerActivation::NonBlockingLive { late_apply } => {
+                execution::RuntimeFilterConsumerContract::membership_live(
+                    spec.contract().binding_id(),
+                    spec.contract().channel_id(),
+                    match late_apply {
+                        LateApplyGranularity::Row => {
+                            execution::RuntimeFilterLateApplyGranularity::Row
+                        }
+                        LateApplyGranularity::Batch => {
+                            execution::RuntimeFilterLateApplyGranularity::Batch
+                        }
+                        LateApplyGranularity::RowGroup => {
+                            execution::RuntimeFilterLateApplyGranularity::RowGroup
+                        }
+                        LateApplyGranularity::Split => {
+                            execution::RuntimeFilterLateApplyGranularity::Split
+                        }
+                        LateApplyGranularity::File => {
+                            execution::RuntimeFilterLateApplyGranularity::File
+                        }
+                    },
+                    spec.execution_contract().clone(),
+                )
+                .expect("test live membership contract")
+            }
+        };
+        spec = RuntimeFilterConsumerBinding::new(spec.expr_id, contract, None);
+        spec
     }
 
     #[test]
@@ -2065,8 +2055,7 @@ mod tests {
             },
         ] {
             let mut arena = ExprArena::default();
-            let mut spec = consumer_spec(&mut arena);
-            spec.activation = activation;
+            let spec = consumer_spec_with_activation(&mut arena, activation);
             assert!(RuntimeFilterConsumerSet::from_plan(&[spec], Arc::new(arena)).is_ok());
         }
 
@@ -2077,8 +2066,10 @@ mod tests {
             LateApplyGranularity::File,
         ] {
             let mut arena = ExprArena::default();
-            let mut spec = consumer_spec(&mut arena);
-            spec.activation = ConsumerActivation::NonBlockingLive { late_apply };
+            let spec = consumer_spec_with_activation(
+                &mut arena,
+                ConsumerActivation::NonBlockingLive { late_apply },
+            );
             assert!(RuntimeFilterConsumerSet::from_plan(&[spec], Arc::new(arena)).is_err());
         }
     }
@@ -2188,11 +2179,12 @@ mod tests {
     }
 
     fn live_spec(arena: &mut ExprArena) -> RuntimeFilterConsumerBinding {
-        let mut spec = consumer_spec(arena);
-        spec.activation = ConsumerActivation::NonBlockingLive {
-            late_apply: LateApplyGranularity::Batch,
-        };
-        spec
+        consumer_spec_with_activation(
+            arena,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+        )
     }
 
     fn live_fixture(
@@ -2254,35 +2246,99 @@ mod tests {
         spec: &RuntimeFilterConsumerBinding,
         bundle: Arc<ArtifactBundle>,
     ) -> Arc<execution::RuntimeFilterSnapshot> {
-        let predicate: Arc<dyn execution::RuntimeFilterPredicate> = if bundle.version()
+        let query: Arc<dyn execution::RuntimeFilterArtifactQuery> = if bundle.version()
             == LogicalVersion::FIRST
         {
-            Arc::new(NativeExecutionPredicate::Membership(
-                NativeRuntimeFilterPredicate::compile(
+            Arc::new(TestMembershipArtifactQuery {
+                predicate: NativeRuntimeFilterPredicate::compile(
                     &bundle,
                     &membership_predicate_contract(spec).expect("valid membership test contract"),
                 )
                 .expect("valid membership test artifact"),
-            ))
+            })
         } else {
-            Arc::new(AlwaysPassesTestPredicate)
+            Arc::new(AlwaysPassesTestArtifactQuery)
         };
         Arc::new(execution::RuntimeFilterSnapshot::new(
-            execution::RuntimeFilterBindingId::new(spec.binding_id),
+            execution::RuntimeFilterBindingId::new(spec.binding_id()),
             execution::LogicalVersion::new(bundle.version().get()),
             [0; 32],
-            predicate,
+            query,
         ))
     }
 
-    struct AlwaysPassesTestPredicate;
+    struct TestMembershipArtifactQuery {
+        predicate: NativeRuntimeFilterPredicate,
+    }
 
-    impl execution::RuntimeFilterPredicate for AlwaysPassesTestPredicate {
-        fn evaluate(
+    impl execution::RuntimeFilterArtifactQuery for TestMembershipArtifactQuery {
+        fn data_type(&self) -> &DataType {
+            &DataType::Int32
+        }
+
+        fn matches_null(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Ok(self
+                .predicate
+                .evaluate(&Int32Array::from(vec![None]))
+                .map_err(|_| execution::RuntimeFilterArtifactQueryError::ContractViolation)?
+                .value(0))
+        }
+
+        fn has_non_null_matches(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+
+        fn non_null_value_may_match(
             &self,
-            input: &arrow::array::ArrayRef,
-        ) -> Result<BooleanArray, execution::RuntimeFilterContractViolation> {
-            Ok(BooleanArray::from(vec![true; input.len()]))
+            value: execution::RuntimeFilterScalarRef<'_>,
+        ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            let execution::RuntimeFilterScalarRef::Int32(value) = value else {
+                return Err(execution::RuntimeFilterArtifactQueryError::Unsupported);
+            };
+            Ok(self
+                .predicate
+                .evaluate(&Int32Array::from(vec![value]))
+                .map_err(|_| execution::RuntimeFilterArtifactQueryError::ContractViolation)?
+                .value(0))
+        }
+
+        fn non_null_range_may_match(
+            &self,
+            _inclusive_min: &novarocks_spi::connector::ConnectorScalarValue,
+            _inclusive_max: &novarocks_spi::connector::ConnectorScalarValue,
+        ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Err(execution::RuntimeFilterArtifactQueryError::Unsupported)
+        }
+    }
+
+    struct AlwaysPassesTestArtifactQuery;
+
+    impl execution::RuntimeFilterArtifactQuery for AlwaysPassesTestArtifactQuery {
+        fn data_type(&self) -> &DataType {
+            &DataType::Int32
+        }
+
+        fn matches_null(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+
+        fn has_non_null_matches(&self) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+
+        fn non_null_value_may_match(
+            &self,
+            _value: execution::RuntimeFilterScalarRef<'_>,
+        ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+
+        fn non_null_range_may_match(
+            &self,
+            _inclusive_min: &novarocks_spi::connector::ConnectorScalarValue,
+            _inclusive_max: &novarocks_spi::connector::ConnectorScalarValue,
+        ) -> Result<bool, execution::RuntimeFilterArtifactQueryError> {
+            Ok(true)
         }
     }
 
@@ -2709,7 +2765,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_pass_through_records_equal_apply_counters() {
+    fn configured_not_evaluated_pass_through_does_not_record_apply_counters() {
         let (consumers, input) = fixture(vec![ArtifactAcquireOutcome::Unavailable(
             UnavailableReason::ProducerFailed,
         )]);
@@ -2727,11 +2783,11 @@ mod tests {
         assert_eq!(output.len(), 4);
         assert_eq!(
             profiles.common.counter_value(RUNTIME_FILTER_INPUT_ROWS),
-            Some(4)
+            None
         );
         assert_eq!(
             profiles.common.counter_value(RUNTIME_FILTER_OUTPUT_ROWS),
-            Some(4)
+            None
         );
     }
 
@@ -3135,20 +3191,20 @@ mod native_ordered_live_consumer_tests {
             ExprNode::SlotId(SlotId::new(1)),
             order.keys()[0].data_type().clone(),
         );
-        RuntimeFilterConsumerBinding {
-            binding_id: 2,
-            channel_id: 1,
+        RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation,
-            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                comparator_digest: order.plan_comparator_digest().get(),
-                order_contract_digest: order.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            scan_domain: None,
-        }
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                2,
+                1,
+                activation,
+                RuntimeFilterExecutionContract::Ordered {
+                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
+                    comparator_digest: order.plan_comparator_digest().get(),
+                    order_contract_digest: order.digest().bytes(),
+                },
+            ),
+            None,
+        )
     }
 
     fn live_fixture(
@@ -3423,21 +3479,21 @@ mod native_ordered_live_consumer_tests {
             membership_arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let schema =
             ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches).unwrap();
-        let membership = RuntimeFilterConsumerBinding {
-            binding_id: 2,
-            channel_id: 1,
+        let membership = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            capabilities: BTreeSet::from([ArtifactCapability::Membership]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                2,
+                1,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(schema.canonical_bytes()),
+                    schema_digest: schema.digest().bytes(),
+                },
+            ),
+            None,
+        );
         assert!(
             NativeOrderedLiveConsumerSet::from_plan(&[membership], Arc::new(membership_arena))
                 .err()
@@ -3622,22 +3678,19 @@ pub(crate) mod tests_support {
         let arena = Arc::new(arena);
         let schema =
             ArtifactMembershipSchema::new(&DataType::Int32, NullSemantics::NeverMatches).unwrap();
-        let spec = RuntimeFilterConsumerBinding {
-            binding_id: 11,
-            channel_id: 7,
+        let spec = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                11,
+                7,
+                ConsumerActivation::BlockingSnapshot,
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(schema.canonical_bytes()),
+                    schema_digest: schema.digest().bytes(),
+                },
+            ),
+            None,
+        );
         let subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(ObservedPublishedSubscription {
                 bundle,
@@ -3675,22 +3728,19 @@ pub(crate) mod tests_support {
         let arena = Arc::new(arena);
         let schema =
             ArtifactMembershipSchema::new(&data_type, NullSemantics::NeverMatches).unwrap();
-        let spec = RuntimeFilterConsumerBinding {
-            binding_id: 11,
-            channel_id: 7,
+        let spec = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                11,
+                7,
+                ConsumerActivation::BlockingSnapshot,
+                RuntimeFilterExecutionContract::Membership {
+                    canonical_schema: Arc::from(schema.canonical_bytes()),
+                    schema_digest: schema.digest().bytes(),
+                },
+            ),
+            None,
+        );
         let subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(PublishedSubscription(bundle));
         (

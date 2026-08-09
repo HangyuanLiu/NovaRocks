@@ -42,6 +42,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::runtime_filter::model::contract::{ConsumerActivation, LateApplyGranularity};
+
 use self::common::*;
 
 use super::layout::Layout;
@@ -1067,16 +1069,30 @@ fn attach_hash_join_producers(
                 ),
             )
         })?;
-        producers.push(JoinRuntimeFilterProducerBinding {
-            binding_id: binding.binding_id,
-            channel_id: binding.channel_id,
+        let contract = native_contract(&binding.contract);
+        let producer_contract =
+            novarocks_execution::runtime_filter::RuntimeFilterProducerContract::new(
+                novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(
+                    binding.binding_id,
+                ),
+                novarocks_execution::runtime_filter::RuntimeFilterChannelId::new(
+                    binding.channel_id,
+                ),
+                match &contract {
+                    RuntimeFilterExecutionContract::Membership { .. } => {
+                        novarocks_execution::runtime_filter::RuntimeFilterProducerKind::Membership
+                    }
+                    RuntimeFilterExecutionContract::Ordered { .. } => {
+                        novarocks_execution::runtime_filter::RuntimeFilterProducerKind::OrderedBound
+                    }
+                },
+                contract,
+            );
+        producers.push(JoinRuntimeFilterProducerBinding::new(
             build_expr_id,
             build_key_index,
-            contribution_kinds: contribution_kinds.clone(),
-            completion_requirement: *completion_requirement,
-            contract: native_contract(&binding.contract),
-            reduction: native_reduction(&binding.reduction),
-        });
+            producer_contract,
+        ));
     }
     join.runtime_filter_execution = JoinRuntimeFilterExecution { producers };
     Ok(())
@@ -1238,17 +1254,23 @@ fn attach_hash_aggregate_producers(
                 ),
             ));
         }
-        producers.push(AggregateTopNRuntimeFilterProducerBinding {
-            binding_id: binding.binding_id,
-            channel_id: binding.channel_id,
+        let producer_contract =
+            novarocks_execution::runtime_filter::RuntimeFilterProducerContract::new(
+                novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(
+                    binding.binding_id,
+                ),
+                novarocks_execution::runtime_filter::RuntimeFilterChannelId::new(
+                    binding.channel_id,
+                ),
+                novarocks_execution::runtime_filter::RuntimeFilterProducerKind::OrderedBound,
+                native_contract(&binding.contract),
+            );
+        producers.push(AggregateTopNRuntimeFilterProducerBinding::new(
             group_key_expr_id,
             group_key_ordinal,
             limit,
-            contract: native_contract(&binding.contract),
-            reduction: native_reduction(&binding.reduction),
-            contribution_kinds: contribution_kinds.clone(),
-            completion_requirement: *completion_requirement,
-        });
+            producer_contract,
+        ));
     }
     aggregate.runtime_filter_spec = AggregateRuntimeFilterSpec {
         topn_producers: producers,
@@ -1316,16 +1338,32 @@ fn consumer_spec(
             )
         }),
     };
-    Ok(RuntimeFilterConsumerBinding {
-        binding_id: binding.binding_id,
-        channel_id: binding.channel_id,
+    let activation = match activation {
+        ConsumerActivation::BlockingSnapshot => {
+            novarocks_execution::runtime_filter::ConsumerActivation::BlockingSnapshot
+        }
+        ConsumerActivation::NonBlockingLive { late_apply } => {
+            novarocks_execution::runtime_filter::ConsumerActivation::NonBlockingLive {
+                late_apply: match late_apply {
+                    LateApplyGranularity::Row => novarocks_execution::runtime_filter::RuntimeFilterLateApplyGranularity::Row,
+                    LateApplyGranularity::Batch => novarocks_execution::runtime_filter::RuntimeFilterLateApplyGranularity::Batch,
+                    LateApplyGranularity::RowGroup => novarocks_execution::runtime_filter::RuntimeFilterLateApplyGranularity::RowGroup,
+                    LateApplyGranularity::Split => novarocks_execution::runtime_filter::RuntimeFilterLateApplyGranularity::Split,
+                    LateApplyGranularity::File => novarocks_execution::runtime_filter::RuntimeFilterLateApplyGranularity::File,
+                },
+            }
+        }
+    };
+    Ok(RuntimeFilterConsumerBinding::new(
         expr_id,
-        activation: *activation,
-        capabilities: capabilities.clone(),
-        contract: native_contract(&binding.contract),
-        reduction: native_reduction(&binding.reduction),
+        novarocks_execution::runtime_filter::RuntimeFilterConsumerContract::new(
+            novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(binding.binding_id),
+            novarocks_execution::runtime_filter::RuntimeFilterChannelId::new(binding.channel_id),
+            activation,
+            native_contract(&binding.contract),
+        ),
         scan_domain,
-    })
+    ))
 }
 
 fn native_contract(contract: &DecodedRuntimeFilterContract) -> RuntimeFilterExecutionContract {
@@ -1357,7 +1395,7 @@ fn native_reduction(reduction: &DecodedRuntimeFilterReduction) -> RuntimeFilterE
         }
         DecodedRuntimeFilterReduction::MergeTopKSummary { k, contract_digest } => {
             RuntimeFilterExecutionReduction::MergeTopKSummary {
-                k: *k,
+                k: k.get(),
                 contract_digest: *contract_digest,
             }
         }

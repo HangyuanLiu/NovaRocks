@@ -1,27 +1,23 @@
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// regarding copyright ownership.  The ASF licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may not use this file
+// except in compliance with the License.  You may obtain a copy of the
+// License at
 //
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+// License for the specific language governing permissions and limitations
 // under the License.
+use novarocks_execution::runtime_filter::RuntimeFilterProducerContract;
+
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::exec::node::runtime_filter::{
-    CompletionRequirement, ContributionKind, RuntimeFilterExecutionContract,
-    RuntimeFilterExecutionReduction,
-};
-use std::collections::BTreeSet;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JoinType {
@@ -44,14 +40,9 @@ pub enum JoinDistributionMode {
 
 #[derive(Clone, Debug)]
 pub struct JoinRuntimeFilterProducerBinding {
-    pub(crate) binding_id: u32,
-    pub(crate) channel_id: u32,
     pub(crate) build_expr_id: ExprId,
     pub(crate) build_key_index: usize,
-    pub(crate) contribution_kinds: BTreeSet<ContributionKind>,
-    pub(crate) completion_requirement: CompletionRequirement,
-    pub(crate) contract: RuntimeFilterExecutionContract,
-    pub(crate) reduction: RuntimeFilterExecutionReduction,
+    pub(crate) contract: RuntimeFilterProducerContract,
 }
 
 #[derive(Clone, Debug)]
@@ -67,42 +58,34 @@ impl JoinRuntimeFilterExecution {
         }
     }
 
-    pub fn try_new(producers: Vec<JoinRuntimeFilterProducerBinding>) -> Result<Self, String> {
-        if producers
-            .iter()
-            .any(|producer| producer.contribution_kinds.is_empty())
-        {
-            return Err("runtime-filter join producer requires contribution kinds".to_string());
-        }
-        Ok(Self { producers })
+    pub const fn new(producers: Vec<JoinRuntimeFilterProducerBinding>) -> Self {
+        Self { producers }
     }
 }
 
 impl JoinRuntimeFilterProducerBinding {
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        binding_id: u32,
-        channel_id: u32,
+    pub const fn new(
         build_expr_id: ExprId,
         build_key_index: usize,
-        contribution_kinds: BTreeSet<ContributionKind>,
-        completion_requirement: CompletionRequirement,
-        contract: RuntimeFilterExecutionContract,
-        reduction: RuntimeFilterExecutionReduction,
-    ) -> Result<Self, String> {
-        if contribution_kinds.is_empty() {
-            return Err("runtime-filter join producer requires contribution kinds".to_string());
-        }
-        Ok(Self {
-            binding_id,
-            channel_id,
+        contract: RuntimeFilterProducerContract,
+    ) -> Self {
+        Self {
             build_expr_id,
             build_key_index,
-            contribution_kinds,
-            completion_requirement,
             contract,
-            reduction,
-        })
+        }
+    }
+
+    pub const fn contract(&self) -> &RuntimeFilterProducerContract {
+        &self.contract
+    }
+
+    pub const fn binding_id(&self) -> u32 {
+        self.contract.binding_id().get()
+    }
+
+    pub const fn channel_id(&self) -> u32 {
+        self.contract.channel_id().get()
     }
 }
 

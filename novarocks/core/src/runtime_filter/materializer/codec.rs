@@ -277,6 +277,81 @@ pub fn indexed_membership_contains(
     indexed_membership_contains_inner(encoded, index, probe, |_| {})
 }
 
+/// Tests whether the sorted resident value set has at least one entry in an
+/// inclusive closed range. This keeps scan-domain callers on the indexed
+/// artifact path rather than decoding or linearly walking the retained set.
+pub fn indexed_membership_range_may_match(
+    encoded: &[u8],
+    index: &ResidentMembershipIndex,
+    inclusive_min: MembershipProbe<'_>,
+    inclusive_max: MembershipProbe<'_>,
+) -> Result<bool, ArtifactCodecError> {
+    match index.view() {
+        ResidentMembershipIndexView::EmptyDomain => Ok(false),
+        ResidentMembershipIndexView::Utf8 { length_offsets, .. } => {
+            let (MembershipProbe::Utf8(min), MembershipProbe::Utf8(max)) =
+                (inclusive_min, inclusive_max)
+            else {
+                return Err(ArtifactCodecError::ContractViolation);
+            };
+            if min > max {
+                return Err(ArtifactCodecError::ContractViolation);
+            }
+            let mut low = 0usize;
+            let mut high = length_offsets.len();
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if read_indexed_utf8(encoded, length_offsets[middle])? < min {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            match length_offsets.get(low) {
+                Some(offset) => Ok(read_indexed_utf8(encoded, *offset)? <= max),
+                None => Ok(false),
+            }
+        }
+        ResidentMembershipIndexView::Fixed {
+            tag,
+            values,
+            count,
+            width,
+        } => {
+            let bytes = encoded
+                .get(values.clone())
+                .ok_or(ArtifactCodecError::Truncated)?;
+            let expected_len = count
+                .checked_mul(width)
+                .ok_or(ArtifactCodecError::LengthOverflow)?;
+            if bytes.len() != expected_len {
+                return Err(ArtifactCodecError::Truncated);
+            }
+            let min = fixed_probe(tag, inclusive_min)?;
+            let max = fixed_probe(tag, inclusive_max)?;
+            if compare_probe(tag, min, max)? == Ordering::Greater {
+                return Err(ArtifactCodecError::ContractViolation);
+            }
+            let mut low = 0usize;
+            let mut high = count;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let value = fixed_value_at(bytes, middle, width)?;
+                if compare_fixed(tag, value, min)? == Ordering::Less {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            match (low < count).then(|| fixed_value_at(bytes, low, width)) {
+                Some(Ok(value)) => Ok(compare_fixed(tag, value, max)? != Ordering::Greater),
+                Some(Err(error)) => Err(error),
+                None => Ok(false),
+            }
+        }
+    }
+}
+
 fn indexed_membership_contains_inner(
     encoded: &[u8],
     index: &ResidentMembershipIndex,
@@ -417,6 +492,38 @@ fn compare_fixed(
         (8, FixedProbe::U64(v)) => f64::from_bits(decode!(u64)).total_cmp(&f64::from_bits(v)),
         _ => return Err(ArtifactCodecError::ContractViolation),
     })
+}
+
+fn fixed_value_at(bytes: &[u8], index: usize, width: usize) -> Result<&[u8], ArtifactCodecError> {
+    let start = index
+        .checked_mul(width)
+        .ok_or(ArtifactCodecError::LengthOverflow)?;
+    let end = start
+        .checked_add(width)
+        .ok_or(ArtifactCodecError::LengthOverflow)?;
+    bytes.get(start..end).ok_or(ArtifactCodecError::Truncated)
+}
+
+fn compare_probe(
+    tag: u8,
+    left: FixedProbe,
+    right: FixedProbe,
+) -> Result<Ordering, ArtifactCodecError> {
+    match (tag, left, right) {
+        (1, FixedProbe::Bool(left), FixedProbe::Bool(right)) => Ok(left.cmp(&right)),
+        (2, FixedProbe::I8(left), FixedProbe::I8(right)) => Ok(left.cmp(&right)),
+        (3, FixedProbe::I16(left), FixedProbe::I16(right)) => Ok(left.cmp(&right)),
+        (4 | 10, FixedProbe::I32(left), FixedProbe::I32(right)) => Ok(left.cmp(&right)),
+        (5 | 11, FixedProbe::I64(left), FixedProbe::I64(right)) => Ok(left.cmp(&right)),
+        (6 | 12, FixedProbe::I128(left), FixedProbe::I128(right)) => Ok(left.cmp(&right)),
+        (7, FixedProbe::U32(left), FixedProbe::U32(right)) => {
+            Ok(f32::from_bits(left).total_cmp(&f32::from_bits(right)))
+        }
+        (8, FixedProbe::U64(left), FixedProbe::U64(right)) => {
+            Ok(f64::from_bits(left).total_cmp(&f64::from_bits(right)))
+        }
+        _ => Err(ArtifactCodecError::ContractViolation),
+    }
 }
 
 fn canonical_probe_f32(value: f32) -> u32 {
@@ -1875,7 +1982,8 @@ mod tests {
         ArtifactCodecError, ArtifactDecodeExpectations, MembershipProbe, RangeDecodeExpectations,
         decode_leaf, decode_leaf_unretained_for_test, decode_range, encode_membership_leaf,
         encode_physical_leaf, encode_range_leaf, indexed_membership_contains,
-        indexed_membership_contains_counted_for_test, inspect_membership_index,
+        indexed_membership_contains_counted_for_test, indexed_membership_range_may_match,
+        inspect_membership_index,
     };
 
     fn range_codec_fixture() -> (
@@ -2472,6 +2580,32 @@ mod tests {
             assert_eq!(found, expected);
             assert!(comparisons <= 13, "4096 values need at most 13 comparisons");
         }
+    }
+
+    #[test]
+    fn indexed_membership_range_detects_an_interior_value() {
+        let encoded = int64_leaf([1, 5, 9], false);
+        let plan = inspect_membership_index(&encoded).unwrap();
+        let index = super::build_membership_index(&encoded, &plan).unwrap();
+
+        assert!(
+            indexed_membership_range_may_match(
+                &encoded,
+                &index,
+                MembershipProbe::Int64(4),
+                MembershipProbe::Int64(6),
+            )
+            .unwrap()
+        );
+        assert!(
+            !indexed_membership_range_may_match(
+                &encoded,
+                &index,
+                MembershipProbe::Int64(6),
+                MembershipProbe::Int64(8),
+            )
+            .unwrap()
+        );
     }
 
     #[test]

@@ -304,7 +304,7 @@ impl AggregateTopNBoundaryBinding {
             keys,
             comparator_digest,
             order_contract_digest,
-        } = &spec.contract
+        } = spec.contract().contract()
         else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
@@ -342,7 +342,7 @@ pub(crate) fn validate_topn_boundary_specs(
             keys,
             comparator_digest,
             order_contract_digest,
-        } = &spec.contract
+        } = spec.contract().contract()
         else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
@@ -567,6 +567,7 @@ mod tests {
         TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+    use novarocks_execution::runtime_filter as execution;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
@@ -1178,24 +1179,21 @@ mod tests {
     fn topn_boundary_bindings_reconstruct_only_the_aggregate_candidate_contract() {
         let contract =
             runtime_contract(DataType::Int64, SortDirection::Descending, NullOrder::First);
-        let spec = AggregateTopNRuntimeFilterProducerBinding {
-            binding_id: 11,
-            channel_id: 12,
-            group_key_expr_id: crate::exec::expr::ExprId(13),
-            group_key_ordinal: 2,
-            limit: NonZeroU32::new(4).unwrap(),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(contract.keys()),
-                comparator_digest: contract.plan_comparator_digest().get(),
-                order_contract_digest: contract.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            contribution_kinds: BTreeSet::from([
-                ContributionKind::OrderedBoundUpdate,
-                ContributionKind::ProducerClosed,
-            ]),
-            completion_requirement: CompletionRequirement::ProducerClosed,
-        };
+        let spec = AggregateTopNRuntimeFilterProducerBinding::new(
+            crate::exec::expr::ExprId(13),
+            2,
+            NonZeroU32::new(4).unwrap(),
+            execution::RuntimeFilterProducerContract::ordered_bound(
+                execution::RuntimeFilterBindingId::new(11),
+                execution::RuntimeFilterChannelId::new(12),
+                RuntimeFilterExecutionContract::Ordered {
+                    keys: crate::exec::node::runtime_filter::execution_order_keys(contract.keys()),
+                    comparator_digest: contract.plan_comparator_digest().get(),
+                    order_contract_digest: contract.digest().bytes(),
+                },
+            )
+            .expect("ordered producer contract"),
+        );
 
         let bindings = build_topn_boundary_bindings(&[spec]).unwrap();
         assert_eq!(bindings.len(), 1);
