@@ -20,8 +20,10 @@ mod dedupe;
 mod events;
 mod identity;
 mod install;
+mod participant_install;
 mod reducer;
 mod reduction_state;
+mod routing;
 mod snapshot;
 mod subscription;
 mod transport;
@@ -44,9 +46,20 @@ pub(crate) use identity::{
     BackendProducerStreamIdentity, BackendRouteEdgeId, BackendTransportSequence,
 };
 pub(crate) use install::{BackendInstallPolicy, BackendInstallPolicyError};
+pub(crate) use participant_install::{
+    BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall,
+    BackendMaterializationOwner, BackendMaterializationPolicy,
+    BackendOutboundMaterializationGroup, BackendParticipantInstall,
+    BackendParticipantInstallError, BackendProducerInstall,
+};
 pub(crate) use reducer::{MembershipReducer, ReducerError};
 pub(crate) use reduction_state::{
     BackendReductionApply, BackendReductionState, BackendReductionStateError,
+};
+pub(crate) use routing::{
+    BackendRemoteRoute, BackendRouteDecision, BackendRouteEndpoint, BackendRoutePeer,
+    BackendRouteRole, BackendRoutingChannel, BackendRoutingEdge, BackendRoutingError,
+    BackendRoutingShard,
 };
 pub(crate) use snapshot::{
     BackendLogicalSnapshot, BackendLogicalSnapshotError, BackendReducedLogicalDomain,
