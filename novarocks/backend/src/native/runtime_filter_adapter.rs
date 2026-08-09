@@ -17,21 +17,335 @@
 
 use std::sync::Arc;
 
-use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
-use novarocks::runtime_filter_transition::port::identity::{
-    DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
-};
-use novarocks::runtime_filter_transition::port::transport::{
-    ContributionRouteIdentity, DeliveryRouteIdentity, ProducerInstanceRouteIdentity,
-    ProducerOpenMetadata, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
-    RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
-    RuntimeFilterTransportError,
+use novarocks_execution::runtime_filter::{
+    PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
 };
 use novarocks_protocol as proto;
 use novarocks_types::UniqueId;
 
+use crate::runtime_filter::domain::{
+    BackendAcceptStatus, BackendIngressResult, BackendParticipantIdentity,
+    BackendProducerOpenMetadata, BackendRouteEdgeId, BackendTransportSequence,
+};
+
+/// The native adapter's typed, Backend-owned ingress boundary. The query
+/// lifecycle registry owns the later install/routing authorization; this port
+/// only receives a wire-valid envelope and reports its exact ACK disposition.
+pub(crate) trait BackendRuntimeFilterEnvelopeIngress: Send + Sync {
+    fn accept(&self, envelope: BackendNativeRuntimeFilterEnvelope) -> BackendIngressResult;
+}
+
+/// Runtime-filter coordinates as they exist on the native wire before a
+/// participant resolves them against an installed route graph.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum BackendNativeRouteIdentity {
+    Contribution(BackendNativeContributionRouteIdentity),
+    Delivery(BackendNativeDeliveryRouteIdentity),
+    ProducerInstance(BackendNativeProducerInstanceRouteIdentity),
+}
+
+impl BackendNativeRouteIdentity {
+    pub(crate) const fn contribution(identity: BackendNativeContributionRouteIdentity) -> Self {
+        Self::Contribution(identity)
+    }
+
+    pub(crate) const fn delivery(identity: BackendNativeDeliveryRouteIdentity) -> Self {
+        Self::Delivery(identity)
+    }
+
+    pub(crate) const fn producer_instance(
+        identity: BackendNativeProducerInstanceRouteIdentity,
+    ) -> Self {
+        Self::ProducerInstance(identity)
+    }
+
+    pub(crate) const fn as_contribution(&self) -> Option<BackendNativeContributionRouteIdentity> {
+        match self {
+            Self::Contribution(identity) => Some(*identity),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_delivery(&self) -> Option<BackendNativeDeliveryRouteIdentity> {
+        match self {
+            Self::Delivery(identity) => Some(*identity),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_producer_instance(
+        &self,
+    ) -> Option<BackendNativeProducerInstanceRouteIdentity> {
+        match self {
+            Self::ProducerInstance(identity) => Some(*identity),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BackendNativeContributionRouteIdentity {
+    producer_binding_id: RuntimeFilterBindingId,
+    fragment_instance_id: UniqueId,
+    partition_id: PartitionId,
+    sequence: BackendTransportSequence,
+}
+
+impl BackendNativeContributionRouteIdentity {
+    pub(crate) const fn new(
+        producer_binding_id: RuntimeFilterBindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: BackendTransportSequence,
+    ) -> Self {
+        Self {
+            producer_binding_id,
+            fragment_instance_id,
+            partition_id,
+            sequence,
+        }
+    }
+
+    pub(crate) const fn producer_binding_id(self) -> RuntimeFilterBindingId {
+        self.producer_binding_id
+    }
+
+    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+        self.fragment_instance_id
+    }
+
+    pub(crate) const fn partition_id(self) -> PartitionId {
+        self.partition_id
+    }
+
+    pub(crate) const fn sequence(self) -> BackendTransportSequence {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BackendNativeDeliveryRouteIdentity {
+    route_edge_id: BackendRouteEdgeId,
+    sequence: BackendTransportSequence,
+}
+
+impl BackendNativeDeliveryRouteIdentity {
+    pub(crate) const fn new(
+        route_edge_id: BackendRouteEdgeId,
+        sequence: BackendTransportSequence,
+    ) -> Self {
+        Self {
+            route_edge_id,
+            sequence,
+        }
+    }
+
+    pub(crate) const fn route_edge_id(self) -> BackendRouteEdgeId {
+        self.route_edge_id
+    }
+
+    pub(crate) const fn sequence(self) -> BackendTransportSequence {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BackendNativeProducerInstanceRouteIdentity {
+    producer_binding_id: RuntimeFilterBindingId,
+    fragment_instance_id: UniqueId,
+}
+
+impl BackendNativeProducerInstanceRouteIdentity {
+    pub(crate) const fn new(
+        producer_binding_id: RuntimeFilterBindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Self {
+        Self {
+            producer_binding_id,
+            fragment_instance_id,
+        }
+    }
+
+    pub(crate) const fn producer_binding_id(self) -> RuntimeFilterBindingId {
+        self.producer_binding_id
+    }
+
+    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+        self.fragment_instance_id
+    }
+}
+
+/// Strictly decoded native envelope. It intentionally precedes route-graph
+/// authorization, so delivery routes do not invent a consumer binding absent
+/// from the frozen protobuf shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendNativeRuntimeFilterEnvelope {
+    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+    participant: BackendParticipantIdentity,
+    channel_id: RuntimeFilterChannelId,
+    route_identity: BackendNativeRouteIdentity,
+    producer_open: Option<BackendProducerOpenMetadata>,
+    accept_status: Option<BackendAcceptStatus>,
+    schema_digest: [u8; 32],
+    payload: Arc<[u8]>,
+}
+
+impl BackendNativeRuntimeFilterEnvelope {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+        participant: BackendParticipantIdentity,
+        channel_id: RuntimeFilterChannelId,
+        route_identity: BackendNativeRouteIdentity,
+        producer_open: Option<BackendProducerOpenMetadata>,
+        accept_status: Option<BackendAcceptStatus>,
+        schema_digest: [u8; 32],
+        payload: impl Into<Arc<[u8]>>,
+    ) -> Result<Self, String> {
+        validate_native_route(kind, route_identity)?;
+        validate_native_presence(kind, producer_open.is_some(), accept_status.is_some())?;
+        let payload = payload.into();
+        if native_kind_requires_payload(kind) && payload.is_empty() {
+            return Err(format!(
+                "runtime filter envelope kind {kind:?} requires a payload"
+            ));
+        }
+        if !native_kind_requires_payload(kind) && !payload.is_empty() {
+            return Err(format!(
+                "runtime filter envelope kind {kind:?} forbids a payload"
+            ));
+        }
+        Ok(Self {
+            kind,
+            participant,
+            channel_id,
+            route_identity,
+            producer_open,
+            accept_status,
+            schema_digest,
+            payload,
+        })
+    }
+
+    pub(crate) const fn kind(&self) -> crate::runtime_filter::domain::BackendEnvelopeKind {
+        self.kind
+    }
+
+    pub(crate) const fn participant(&self) -> BackendParticipantIdentity {
+        self.participant
+    }
+
+    pub(crate) const fn query_id(&self) -> UniqueId {
+        self.participant.query_id()
+    }
+
+    pub(crate) const fn deployment_epoch(&self) -> u64 {
+        self.participant.deployment_epoch()
+    }
+
+    pub(crate) const fn channel_id(&self) -> RuntimeFilterChannelId {
+        self.channel_id
+    }
+
+    pub(crate) const fn route_identity(&self) -> &BackendNativeRouteIdentity {
+        &self.route_identity
+    }
+
+    pub(crate) const fn producer_open(&self) -> Option<BackendProducerOpenMetadata> {
+        self.producer_open
+    }
+
+    pub(crate) const fn accept_status(&self) -> Option<BackendAcceptStatus> {
+        self.accept_status
+    }
+
+    pub(crate) const fn schema_digest(&self) -> &[u8; 32] {
+        &self.schema_digest
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        self.payload.as_ref()
+    }
+}
+
+fn native_kind_requires_payload(kind: crate::runtime_filter::domain::BackendEnvelopeKind) -> bool {
+    use crate::runtime_filter::domain::BackendEnvelopeKind;
+
+    matches!(
+        kind,
+        BackendEnvelopeKind::Contribution
+            | BackendEnvelopeKind::Artifact
+            | BackendEnvelopeKind::FinalArtifact
+            | BackendEnvelopeKind::ProducerUnavailable
+            | BackendEnvelopeKind::Unavailable
+            | BackendEnvelopeKind::DegradedLogical
+    )
+}
+
+fn validate_native_route(
+    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+    route: BackendNativeRouteIdentity,
+) -> Result<(), String> {
+    use crate::runtime_filter::domain::BackendEnvelopeKind;
+
+    let valid = match kind {
+        BackendEnvelopeKind::Contribution | BackendEnvelopeKind::ProducerClosed => {
+            matches!(route, BackendNativeRouteIdentity::Contribution(_))
+        }
+        BackendEnvelopeKind::ProducerUnavailable => {
+            matches!(route, BackendNativeRouteIdentity::ProducerInstance(_))
+        }
+        BackendEnvelopeKind::Artifact
+        | BackendEnvelopeKind::FinalArtifact
+        | BackendEnvelopeKind::Unavailable
+        | BackendEnvelopeKind::CompletedWithoutArtifact
+        | BackendEnvelopeKind::DegradedLogical => {
+            matches!(route, BackendNativeRouteIdentity::Delivery(_))
+        }
+        BackendEnvelopeKind::Ack => matches!(route, BackendNativeRouteIdentity::Contribution(_)),
+    };
+    valid.then_some(()).ok_or_else(|| {
+        format!("runtime filter envelope kind {kind:?} has an invalid route identity")
+    })
+}
+
+fn validate_native_presence(
+    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+    has_producer_open: bool,
+    has_accept_status: bool,
+) -> Result<(), String> {
+    use crate::runtime_filter::domain::BackendEnvelopeKind;
+
+    let producer_open_required = matches!(
+        kind,
+        BackendEnvelopeKind::Contribution | BackendEnvelopeKind::ProducerClosed
+    );
+    if producer_open_required && !has_producer_open {
+        return Err(format!(
+            "runtime filter envelope kind {kind:?} requires producer-open metadata"
+        ));
+    }
+    if !producer_open_required && has_producer_open {
+        return Err(format!(
+            "runtime filter envelope kind {kind:?} forbids producer-open metadata"
+        ));
+    }
+    let accept_status_required = kind == BackendEnvelopeKind::Ack;
+    if accept_status_required && !has_accept_status {
+        return Err(format!(
+            "runtime filter envelope kind {kind:?} requires an accept status"
+        ));
+    }
+    if !accept_status_required && has_accept_status {
+        return Err(format!(
+            "runtime filter envelope kind {kind:?} forbids an accept status"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_runtime_filter_envelope(
-    envelope: &RuntimeFilterEnvelope,
+    envelope: &BackendNativeRuntimeFilterEnvelope,
 ) -> proto::filter::RuntimeFilterEnvelope {
     proto::filter::RuntimeFilterEnvelope {
         kind: encode_kind(envelope.kind()) as i32,
@@ -40,7 +354,7 @@ pub(crate) fn encode_runtime_filter_envelope(
             lo: envelope.query_id().low(),
         }),
         channel_id: envelope.channel_id().get(),
-        deployment_epoch: envelope.deployment_epoch().get(),
+        deployment_epoch: envelope.deployment_epoch(),
         route_identity: Some(encode_route_identity(envelope.route_identity())),
         schema_digest: envelope.schema_digest().to_vec(),
         payload: envelope.payload().to_vec(),
@@ -54,34 +368,28 @@ pub(crate) fn encode_runtime_filter_envelope(
 
 pub(crate) fn decode_runtime_filter_envelope_response(
     response: proto::filter::RuntimeFilterEnvelopeResponse,
-) -> Result<(RuntimeFilterRouteIdentity, RuntimeFilterAcceptStatus), String> {
+) -> Result<(BackendNativeRouteIdentity, BackendAcceptStatus), String> {
     let identity = response
         .acked_route_identity
         .as_ref()
         .ok_or_else(|| "runtime filter ACK route identity is missing".to_string())
         .and_then(|identity| decode_route_identity(identity).map_err(|error| error.to_string()))?;
     let status = match proto::filter::RuntimeFilterAcceptStatus::try_from(response.accept_status) {
-        Ok(proto::filter::RuntimeFilterAcceptStatus::Accepted) => {
-            RuntimeFilterAcceptStatus::Accepted
-        }
-        Ok(proto::filter::RuntimeFilterAcceptStatus::Duplicate) => {
-            RuntimeFilterAcceptStatus::Duplicate
-        }
-        Ok(proto::filter::RuntimeFilterAcceptStatus::Rejected) => {
-            RuntimeFilterAcceptStatus::Rejected
-        }
+        Ok(proto::filter::RuntimeFilterAcceptStatus::Accepted) => BackendAcceptStatus::Accepted,
+        Ok(proto::filter::RuntimeFilterAcceptStatus::Duplicate) => BackendAcceptStatus::Duplicate,
+        Ok(proto::filter::RuntimeFilterAcceptStatus::Rejected) => BackendAcceptStatus::Rejected,
         Ok(proto::filter::RuntimeFilterAcceptStatus::Unspecified) => {
             return Err("runtime filter ACK accept status must be specified".to_string());
         }
         Err(_) => return Err("runtime filter ACK accept status is unknown".to_string()),
     };
     match status {
-        RuntimeFilterAcceptStatus::Accepted | RuntimeFilterAcceptStatus::Duplicate
+        BackendAcceptStatus::Accepted | BackendAcceptStatus::Duplicate
             if !response.rejection_reason.is_empty() =>
         {
             return Err("runtime filter successful ACK carried a rejection reason".to_string());
         }
-        RuntimeFilterAcceptStatus::Rejected if response.rejection_reason.trim().is_empty() => {
+        BackendAcceptStatus::Rejected if response.rejection_reason.trim().is_empty() => {
             return Err("runtime filter rejected ACK omitted its rejection reason".to_string());
         }
         _ => {}
@@ -90,7 +398,7 @@ pub(crate) fn decode_runtime_filter_envelope_response(
 }
 
 pub(crate) fn handle_runtime_filter_envelope(
-    ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+    ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
     request: proto::filter::RuntimeFilterEnvelope,
 ) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, tonic::Status> {
     let proto::filter::RuntimeFilterEnvelope {
@@ -108,43 +416,60 @@ pub(crate) fn handle_runtime_filter_envelope(
     let query_id =
         query_id.ok_or_else(|| invalid_argument("runtime filter query id is missing"))?;
     let query_id = UniqueId::new(query_id.hi, query_id.lo);
+    if query_id == UniqueId::new(0, 0) {
+        return Err(invalid_argument("runtime filter query id must be non-zero"));
+    }
+    if channel_id == 0 {
+        return Err(invalid_argument(
+            "runtime filter channel id must be non-zero",
+        ));
+    }
+    if deployment_epoch == 0 {
+        return Err(invalid_argument(
+            "runtime filter deployment epoch must be non-zero",
+        ));
+    }
     let route_identity = route_identity
         .ok_or_else(|| invalid_argument("runtime filter route identity is missing"))?;
     let domain_route_identity = decode_route_identity(&route_identity)?;
-    let producer_open = ProducerOpenMetadata::try_from_raw_for_kind(
-        kind,
-        producer_open.map(|metadata| metadata.local_partition_count),
-    )
-    .map_err(transport_error)?;
+    // Presence is a kind-level wire invariant. Validate it before parsing the
+    // metadata body so a forbidden field is never reported as a malformed
+    // producer-open value.
+    validate_native_presence(kind, producer_open.is_some(), false).map_err(invalid_argument)?;
+    let producer_open = producer_open
+        .map(|metadata| BackendProducerOpenMetadata::try_new(metadata.local_partition_count))
+        .transpose()
+        .map_err(transport_error)?;
     // `proto::filter::RuntimeFilterEnvelope` has no wire field for an Ack accept
     // status yet (RFD-4/M3 introduces the domain-level requirement; wiring a wire
     // representation for it is a later task), so this generic decode path can never
     // supply one. That is a no-op for every other kind, which forbids the field.
-    let envelope = RuntimeFilterEnvelope::try_new(
+    let envelope = BackendNativeRuntimeFilterEnvelope::new(
         kind,
-        query_id,
-        ChannelId::new(channel_id),
-        DeploymentEpoch::new(deployment_epoch),
+        BackendParticipantIdentity::new(query_id, deployment_epoch),
+        RuntimeFilterChannelId::new(channel_id),
         domain_route_identity,
         producer_open,
         None,
-        &schema_digest,
+        schema_digest.as_slice().try_into().map_err(|_| {
+            invalid_argument("runtime filter schema digest must be exactly 32 bytes")
+        })?,
         payload,
     )
     .map_err(transport_error)?;
 
     let acked_route_identity = Some(route_identity.clone());
     let result = ingress.accept(envelope);
-    let (accept_status, rejection_reason) = match result.accept_status() {
-        RuntimeFilterAcceptStatus::Accepted => (
+    let (accept_status, rejection_reason) = match result.status() {
+        BackendAcceptStatus::Accepted => (
             proto::filter::RuntimeFilterAcceptStatus::Accepted,
             String::new(),
         ),
-        RuntimeFilterAcceptStatus::Duplicate => (
+        BackendAcceptStatus::Duplicate => (
             proto::filter::RuntimeFilterAcceptStatus::Duplicate,
             String::new(),
         ),
-        RuntimeFilterAcceptStatus::Rejected => (
+        BackendAcceptStatus::Rejected => (
             proto::filter::RuntimeFilterAcceptStatus::Rejected,
             result
                 .rejection_reason()
@@ -160,7 +485,9 @@ pub(crate) fn handle_runtime_filter_envelope(
     })
 }
 
-fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
+fn decode_kind(
+    kind: i32,
+) -> Result<crate::runtime_filter::domain::BackendEnvelopeKind, tonic::Status> {
     let kind = proto::filter::RuntimeFilterEnvelopeKind::try_from(kind)
         .map_err(|_| invalid_argument("runtime filter envelope kind is unknown"))?;
     match kind {
@@ -168,99 +495,106 @@ fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
             "runtime filter envelope kind must be specified",
         )),
         proto::filter::RuntimeFilterEnvelopeKind::Contribution => {
-            Ok(RuntimeFilterEnvelopeKind::Contribution)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Contribution)
         }
         proto::filter::RuntimeFilterEnvelopeKind::Artifact => {
-            Ok(RuntimeFilterEnvelopeKind::Artifact)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Artifact)
         }
         proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => {
-            Ok(RuntimeFilterEnvelopeKind::ProducerClosed)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::ProducerClosed)
         }
         proto::filter::RuntimeFilterEnvelopeKind::ProducerUnavailable => {
-            Ok(RuntimeFilterEnvelopeKind::ProducerUnavailable)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::ProducerUnavailable)
         }
         proto::filter::RuntimeFilterEnvelopeKind::Unavailable => {
-            Ok(RuntimeFilterEnvelopeKind::Unavailable)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Unavailable)
         }
-        proto::filter::RuntimeFilterEnvelopeKind::Ack => Ok(RuntimeFilterEnvelopeKind::Ack),
+        proto::filter::RuntimeFilterEnvelopeKind::Ack => {
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Ack)
+        }
         proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
-            Ok(RuntimeFilterEnvelopeKind::CompletedWithoutArtifact)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::CompletedWithoutArtifact)
         }
         proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical => {
-            Ok(RuntimeFilterEnvelopeKind::DegradedLogical)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::DegradedLogical)
         }
         proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact => {
-            Ok(RuntimeFilterEnvelopeKind::FinalArtifact)
+            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::FinalArtifact)
         }
     }
 }
 
-fn encode_kind(kind: RuntimeFilterEnvelopeKind) -> proto::filter::RuntimeFilterEnvelopeKind {
+fn encode_kind(
+    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+) -> proto::filter::RuntimeFilterEnvelopeKind {
+    use crate::runtime_filter::domain::BackendEnvelopeKind;
+
     match kind {
-        RuntimeFilterEnvelopeKind::Contribution => {
-            proto::filter::RuntimeFilterEnvelopeKind::Contribution
-        }
-        RuntimeFilterEnvelopeKind::Artifact => proto::filter::RuntimeFilterEnvelopeKind::Artifact,
-        RuntimeFilterEnvelopeKind::ProducerClosed => {
+        BackendEnvelopeKind::Contribution => proto::filter::RuntimeFilterEnvelopeKind::Contribution,
+        BackendEnvelopeKind::Artifact => proto::filter::RuntimeFilterEnvelopeKind::Artifact,
+        BackendEnvelopeKind::ProducerClosed => {
             proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed
         }
-        RuntimeFilterEnvelopeKind::ProducerUnavailable => {
+        BackendEnvelopeKind::ProducerUnavailable => {
             proto::filter::RuntimeFilterEnvelopeKind::ProducerUnavailable
         }
-        RuntimeFilterEnvelopeKind::Unavailable => {
-            proto::filter::RuntimeFilterEnvelopeKind::Unavailable
-        }
-        RuntimeFilterEnvelopeKind::Ack => proto::filter::RuntimeFilterEnvelopeKind::Ack,
-        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+        BackendEnvelopeKind::Unavailable => proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
+        BackendEnvelopeKind::Ack => proto::filter::RuntimeFilterEnvelopeKind::Ack,
+        BackendEnvelopeKind::CompletedWithoutArtifact => {
             proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
         }
-        RuntimeFilterEnvelopeKind::DegradedLogical => {
+        BackendEnvelopeKind::DegradedLogical => {
             proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical
         }
-        RuntimeFilterEnvelopeKind::FinalArtifact => {
+        BackendEnvelopeKind::FinalArtifact => {
             proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact
         }
     }
 }
 
 fn encode_route_identity(
-    identity: &RuntimeFilterRouteIdentity,
+    identity: &BackendNativeRouteIdentity,
 ) -> proto::filter::RuntimeFilterRouteIdentity {
     use proto::filter::runtime_filter_route_identity::Value;
 
-    let value = if let Some(identity) = identity.as_contribution() {
-        Value::Contribution(proto::filter::RuntimeFilterContributionRouteIdentity {
-            producer_binding_id: identity.producer_binding_id().get(),
-            fragment_instance_id: Some(proto::common::UniqueId {
-                hi: identity.fragment_instance_id().high(),
-                lo: identity.fragment_instance_id().low(),
-            }),
-            partition_id: identity.partition_id().get(),
-            sequence: identity.sequence().get(),
-        })
-    } else if let Some(identity) = identity.as_delivery() {
-        Value::Delivery(proto::filter::RuntimeFilterDeliveryRouteIdentity {
-            route_edge_id: identity.route_edge_id().get(),
-            sequence: identity.sequence().get(),
-        })
-    } else {
-        let identity = identity
-            .as_producer_instance()
-            .expect("runtime filter route identity is typed");
-        Value::ProducerInstance(proto::filter::RuntimeFilterProducerInstanceRouteIdentity {
-            producer_binding_id: identity.producer_binding_id().get(),
-            fragment_instance_id: Some(proto::common::UniqueId {
-                hi: identity.fragment_instance_id().high(),
-                lo: identity.fragment_instance_id().low(),
-            }),
-        })
+    let value = match identity {
+        BackendNativeRouteIdentity::Contribution(identity) => {
+            Value::Contribution(proto::filter::RuntimeFilterContributionRouteIdentity {
+                producer_binding_id: identity.producer_binding_id().get(),
+                fragment_instance_id: Some(proto::common::UniqueId {
+                    hi: identity.fragment_instance_id().high(),
+                    lo: identity.fragment_instance_id().low(),
+                }),
+                partition_id: identity.partition_id().get(),
+                sequence: identity.sequence().get(),
+            })
+        }
+        BackendNativeRouteIdentity::Delivery(identity) => {
+            Value::Delivery(proto::filter::RuntimeFilterDeliveryRouteIdentity {
+                route_edge_id: identity
+                    .route_edge_id()
+                    .get()
+                    .try_into()
+                    .expect("native wire route-edge id is u32"),
+                sequence: identity.sequence().get(),
+            })
+        }
+        BackendNativeRouteIdentity::ProducerInstance(identity) => {
+            Value::ProducerInstance(proto::filter::RuntimeFilterProducerInstanceRouteIdentity {
+                producer_binding_id: identity.producer_binding_id().get(),
+                fragment_instance_id: Some(proto::common::UniqueId {
+                    hi: identity.fragment_instance_id().high(),
+                    lo: identity.fragment_instance_id().low(),
+                }),
+            })
+        }
     };
     proto::filter::RuntimeFilterRouteIdentity { value: Some(value) }
 }
 
 fn decode_route_identity(
     route_identity: &proto::filter::RuntimeFilterRouteIdentity,
-) -> Result<RuntimeFilterRouteIdentity, tonic::Status> {
+) -> Result<BackendNativeRouteIdentity, tonic::Status> {
     use proto::filter::runtime_filter_route_identity::Value;
 
     match route_identity.value.as_ref() {
@@ -268,33 +602,67 @@ fn decode_route_identity(
             let fragment_instance_id = identity.fragment_instance_id.ok_or_else(|| {
                 invalid_argument("runtime filter fragment instance id is missing")
             })?;
-            let identity = ContributionRouteIdentity::try_new(
-                BindingId::new(identity.producer_binding_id),
-                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
-                PartitionId::new(identity.partition_id),
-                ProducerSequence::new(identity.sequence),
-            )
-            .map_err(transport_error)?;
-            Ok(RuntimeFilterRouteIdentity::contribution(identity))
+            let fragment_instance_id =
+                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo);
+            if identity.producer_binding_id == 0 {
+                return Err(invalid_argument(
+                    "runtime filter producer binding id must be non-zero",
+                ));
+            }
+            if fragment_instance_id == UniqueId::new(0, 0) {
+                return Err(invalid_argument(
+                    "runtime filter fragment instance id must be non-zero",
+                ));
+            }
+            Ok(BackendNativeRouteIdentity::contribution(
+                BackendNativeContributionRouteIdentity::new(
+                    RuntimeFilterBindingId::new(identity.producer_binding_id),
+                    fragment_instance_id,
+                    PartitionId::new(identity.partition_id),
+                    BackendTransportSequence::new(identity.sequence),
+                ),
+            ))
         }
         Some(Value::Delivery(identity)) => {
-            let identity = DeliveryRouteIdentity::try_new(
-                RouteEdgeId::new(identity.route_edge_id),
-                ProducerSequence::new(identity.sequence),
-            )
-            .map_err(transport_error)?;
-            Ok(RuntimeFilterRouteIdentity::delivery(identity))
+            if identity.route_edge_id == 0 {
+                return Err(invalid_argument(
+                    "runtime filter route edge id must be non-zero",
+                ));
+            }
+            if identity.sequence == 0 {
+                return Err(invalid_argument(
+                    "runtime filter delivery sequence must be non-zero",
+                ));
+            }
+            Ok(BackendNativeRouteIdentity::delivery(
+                BackendNativeDeliveryRouteIdentity::new(
+                    BackendRouteEdgeId::new(u64::from(identity.route_edge_id)),
+                    BackendTransportSequence::new(identity.sequence),
+                ),
+            ))
         }
         Some(Value::ProducerInstance(identity)) => {
             let fragment_instance_id = identity.fragment_instance_id.ok_or_else(|| {
                 invalid_argument("runtime filter fragment instance id is missing")
             })?;
-            let identity = ProducerInstanceRouteIdentity::try_new(
-                BindingId::new(identity.producer_binding_id),
-                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
-            )
-            .map_err(transport_error)?;
-            Ok(RuntimeFilterRouteIdentity::producer_instance(identity))
+            let fragment_instance_id =
+                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo);
+            if identity.producer_binding_id == 0 {
+                return Err(invalid_argument(
+                    "runtime filter producer binding id must be non-zero",
+                ));
+            }
+            if fragment_instance_id == UniqueId::new(0, 0) {
+                return Err(invalid_argument(
+                    "runtime filter fragment instance id must be non-zero",
+                ));
+            }
+            Ok(BackendNativeRouteIdentity::producer_instance(
+                BackendNativeProducerInstanceRouteIdentity::new(
+                    RuntimeFilterBindingId::new(identity.producer_binding_id),
+                    fragment_instance_id,
+                ),
+            ))
         }
         None => Err(invalid_argument(
             "runtime filter route identity value is missing",
@@ -302,7 +670,7 @@ fn decode_route_identity(
     }
 }
 
-fn transport_error(error: RuntimeFilterTransportError) -> tonic::Status {
+fn transport_error(error: impl std::fmt::Display) -> tonic::Status {
     invalid_argument(error.to_string())
 }
 
@@ -316,18 +684,27 @@ mod tests {
 
     use tonic::Code;
 
-    use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
-    use novarocks::runtime_filter_transition::port::identity::{
-        DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
-    };
-    use novarocks::runtime_filter_transition::port::transport::{
-        RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
-        RuntimeFilterIngressResult,
+    use novarocks_execution::runtime_filter::{
+        PartitionId, RuntimeFilterBindingId as BindingId, RuntimeFilterChannelId as ChannelId,
     };
     use novarocks_protocol as proto;
     use novarocks_types::UniqueId;
 
-    use super::handle_runtime_filter_envelope;
+    use crate::runtime_filter::domain::{
+        BackendAcceptStatus as RuntimeFilterAcceptStatus,
+        BackendEnvelopeKind as RuntimeFilterEnvelopeKind,
+        BackendIngressResult as RuntimeFilterIngressResult, BackendParticipantIdentity,
+        BackendProducerOpenMetadata, BackendRouteEdgeId as RouteEdgeId,
+        BackendTransportSequence as ProducerSequence,
+    };
+
+    use super::{
+        BackendNativeContributionRouteIdentity, BackendNativeRouteIdentity,
+        BackendNativeRuntimeFilterEnvelope as RuntimeFilterEnvelope,
+        BackendRuntimeFilterEnvelopeIngress as RuntimeFilterEnvelopeIngress,
+        decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
+        handle_runtime_filter_envelope,
+    };
 
     #[derive(Debug)]
     struct RecordingIngress {
@@ -518,7 +895,7 @@ mod tests {
             assert_eq!(envelope.kind(), domain_kind);
             assert_eq!(envelope.query_id(), UniqueId::new(11, 12));
             assert_eq!(envelope.channel_id(), ChannelId::new(13));
-            assert_eq!(envelope.deployment_epoch(), DeploymentEpoch::new(14));
+            assert_eq!(envelope.deployment_epoch(), 14);
             assert_eq!(envelope.schema_digest(), &[15; 32]);
             assert_eq!(envelope.payload(), expected_payload);
 
@@ -800,6 +1177,63 @@ mod tests {
             assert_eq!(response.rejection_reason, expected_reason);
             assert_eq!(response.acked_route_identity, expected_route);
             assert_eq!(ingress.take().len(), 1);
+        }
+    }
+
+    #[test]
+    fn backend_native_envelope_preserves_the_frozen_wire_fields() {
+        let envelope = RuntimeFilterEnvelope::new(
+            RuntimeFilterEnvelopeKind::Contribution,
+            BackendParticipantIdentity::new(UniqueId::new(11, 12), 14),
+            ChannelId::new(13),
+            BackendNativeRouteIdentity::contribution(BackendNativeContributionRouteIdentity::new(
+                BindingId::new(17),
+                UniqueId::new(18, 19),
+                PartitionId::new(20),
+                ProducerSequence::new(21),
+            )),
+            Some(BackendProducerOpenMetadata::try_new(24).unwrap()),
+            None,
+            [15; 32],
+            b"contribution".as_slice(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            encode_runtime_filter_envelope(&envelope),
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution)
+        );
+    }
+
+    #[test]
+    fn ack_response_decode_preserves_route_and_accept_disposition() {
+        for (status, reason, expected) in [
+            (
+                proto::filter::RuntimeFilterAcceptStatus::Accepted,
+                "",
+                RuntimeFilterAcceptStatus::Accepted,
+            ),
+            (
+                proto::filter::RuntimeFilterAcceptStatus::Duplicate,
+                "",
+                RuntimeFilterAcceptStatus::Duplicate,
+            ),
+            (
+                proto::filter::RuntimeFilterAcceptStatus::Rejected,
+                "rejected by route authority",
+                RuntimeFilterAcceptStatus::Rejected,
+            ),
+        ] {
+            let (route, decoded) = decode_runtime_filter_envelope_response(
+                proto::filter::RuntimeFilterEnvelopeResponse {
+                    acked_route_identity: Some(contribution_route()),
+                    accept_status: status as i32,
+                    rejection_reason: reason.to_string(),
+                },
+            )
+            .unwrap();
+            assert_eq!(decoded, expected);
+            assert!(route.as_contribution().is_some());
         }
     }
 

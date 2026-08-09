@@ -12,7 +12,6 @@ use novarocks::query_execution::lifecycle::{
     QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
-use novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelopeIngress;
 use novarocks::service::MetricsHttpServer;
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
@@ -21,6 +20,7 @@ use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
     native_result_writer,
 };
+use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
 use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
@@ -380,7 +380,7 @@ impl BackendApplicationHost {
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
 
-        let runtime_filter_ingress: Arc<dyn RuntimeFilterEnvelopeIngress> =
+        let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
             services.query_lifecycle_registry.clone();
         let mut grpc_server = NativeGrpcServerHandle::start(
             &bind_host,

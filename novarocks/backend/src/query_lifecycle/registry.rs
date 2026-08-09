@@ -37,15 +37,15 @@ use novarocks::query_execution::lifecycle::{
 use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks::runtime::profile::RuntimeProfileTree;
 use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
-use novarocks::runtime_filter_transition::port::transport::{
-    RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
-};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 use crate::native::client::NativeGrpcClient;
+use crate::native::runtime_filter_adapter::{
+    BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
+};
 use crate::native::runtime_filter_install::decode_runtime_filter_contribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
@@ -70,8 +70,11 @@ fn send_reserved_control_event(
     }
 }
 
-impl RuntimeFilterEnvelopeIngress for QueryLifecycleRegistry {
-    fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
+impl BackendRuntimeFilterEnvelopeIngress for QueryLifecycleRegistry {
+    fn accept(
+        &self,
+        envelope: BackendNativeRuntimeFilterEnvelope,
+    ) -> crate::runtime_filter::domain::BackendIngressResult {
         self.dispatch_runtime_filter_envelope(envelope)
     }
 }
@@ -1658,8 +1661,8 @@ impl QueryLifecycleRegistry {
     /// attempt. A miss is deliberately lookup-only and cannot release a gate.
     pub(crate) fn dispatch_runtime_filter_envelope(
         &self,
-        envelope: RuntimeFilterEnvelope,
-    ) -> RuntimeFilterIngressResult {
+        envelope: BackendNativeRuntimeFilterEnvelope,
+    ) -> crate::runtime_filter::domain::BackendIngressResult {
         let participant = self
             .state
             .lock()
@@ -1667,9 +1670,9 @@ impl QueryLifecycleRegistry {
             .entries
             .iter()
             .find(|(execution_id, _)| {
-                execution_id.query_id().high() == envelope.query_id().high()
-                    && execution_id.query_id().low() == envelope.query_id().low()
-                    && execution_id.attempt_id().get() == envelope.deployment_epoch().get()
+                execution_id.query_id().high() == envelope.participant().query_id().high()
+                    && execution_id.query_id().low() == envelope.participant().query_id().low()
+                    && execution_id.attempt_id().get() == envelope.participant().deployment_epoch()
             })
             .map(|(_, entry)| entry)
             .and_then(|entry| {
@@ -1682,7 +1685,7 @@ impl QueryLifecycleRegistry {
             });
         match participant {
             Some(participant) => participant.dispatch_envelope(envelope),
-            None => RuntimeFilterIngressResult::rejected(
+            None => crate::runtime_filter::domain::BackendIngressResult::rejected(
                 "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace",
             ).expect("query-unavailable reason is non-empty"),
         }

@@ -119,8 +119,9 @@ mod tests {
     use novarocks::exec::node::scan::ScanMorsel;
     use novarocks::protocol::ProtocolErrorKind;
     use novarocks::runtime::query_options::{QueryOptions, QueryOptionsParts};
-    use novarocks::runtime_filter_transition::model::contract::NullSemantics;
-    use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
+    use novarocks_execution::runtime_filter::{
+        RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
+    };
     use novarocks_protocol::{common, expr, novarocks as native_proto, plan};
 
     struct TestNotCancelled;
@@ -712,8 +713,11 @@ mod tests {
     }
 
     fn membership_consumer_binding(binding_id: u32, node_id: i32) -> plan::RuntimeFilterBinding {
-        let schema = ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
-            .expect("membership schema");
+        let schema = RuntimeFilterMembershipSchema::new(
+            &DataType::Int64,
+            RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
         plan::RuntimeFilterBinding {
             binding_id,
             channel_id: 9,
@@ -724,7 +728,7 @@ mod tests {
                 kind: Some(plan::runtime_filter_contract::Kind::Membership(
                     plan::RuntimeFilterMembershipContract {
                         canonical_schema: schema.canonical_bytes().to_vec(),
-                        schema_digest: schema.digest().bytes().to_vec(),
+                        schema_digest: schema.digest().to_vec(),
                     },
                 )),
             }),

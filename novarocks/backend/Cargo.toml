@@ -8,9 +8,7 @@ build = "build.rs"
 doctest = false
 
 [dependencies]
-# Temporary migration support while RFO-7B moves the remaining participant
-# service paths into Backend. Removed together with the last transition import.
-novarocks = { path = "../core", features = ["runtime-filter-test-support"] }
+novarocks = { path = "../core" }
 novarocks-execution = { path = "../execution" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
@@ -29,7 +27,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
 
 [dev-dependencies]
-novarocks = { path = "../core", features = ["runtime-filter-test-support"] }
+novarocks = { path = "../core" }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

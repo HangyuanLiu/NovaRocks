@@ -29,9 +29,10 @@ use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
 
 use super::{
-    RuntimeFilterContractViolationKind, RuntimeFilterContribution as ExecutionContribution,
-    RuntimeFilterContributionKind, RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
-    RuntimeFilterProducerContract, RuntimeFilterProducerKind,
+    RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
+    RuntimeFilterContribution as ExecutionContribution, RuntimeFilterContributionKind,
+    RuntimeFilterExecutionContract, RuntimeFilterFinalDomain, RuntimeFilterProducerContract,
+    RuntimeFilterProducerKind,
 };
 
 pub const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
@@ -629,6 +630,69 @@ impl RuntimeOrderContract {
             digest: order_contract_digest,
         }
     }
+
+    /// Strictly reconstruct an ordered contract frozen in the native fragment
+    /// envelope.  The digests are verified from the canonical Execution key
+    /// sequence rather than trusted from the caller.
+    pub fn from_fragment_contract(
+        keys: impl IntoIterator<Item = RuntimeOrderKey>,
+        comparator_digest: [u8; 32],
+        order_contract_digest: [u8; 32],
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        const COMPARATOR_DOMAIN: &[u8] = b"novarocks.runtime-filter.comparator";
+        const ORDER_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.order-contract";
+        const VERSION: u16 = 1;
+        let keys: Vec<_> = keys.into_iter().collect();
+        if keys.is_empty() {
+            return Err(fragment_contract_error("ordered contract has no keys"));
+        }
+        let mut canonical_keys = Vec::with_capacity(64);
+        canonical_keys.extend_from_slice(
+            &u32::try_from(keys.len())
+                .map_err(|_| fragment_contract_error("ordered contract key count overflows"))?
+                .to_be_bytes(),
+        );
+        for key in &keys {
+            if !ordered_key_type_supported(key.data_type()) {
+                return Err(fragment_contract_error(
+                    "ordered contract has unsupported key type",
+                ));
+            }
+            super::encode_membership_schema_type(key.data_type(), &mut canonical_keys)?;
+            canonical_keys.push(match key.direction() {
+                RuntimeOrderSortDirection::Ascending => 1,
+                RuntimeOrderSortDirection::Descending => 2,
+            });
+            canonical_keys.push(match key.null_order() {
+                RuntimeOrderNullOrder::First => 1,
+                RuntimeOrderNullOrder::Last => 2,
+            });
+        }
+        let mut comparator = Sha256::new();
+        comparator.update(COMPARATOR_DOMAIN);
+        comparator.update(VERSION.to_be_bytes());
+        comparator.update(&canonical_keys);
+        if <[u8; 32]>::from(comparator.finalize()) != comparator_digest {
+            return Err(fragment_contract_error(
+                "ordered comparator digest mismatch",
+            ));
+        }
+        let mut order = Sha256::new();
+        order.update(ORDER_CONTRACT_DOMAIN);
+        order.update(VERSION.to_be_bytes());
+        order.update(&canonical_keys);
+        order.update([1]); // inclusive bounds are the only frozen v1 contract.
+        order.update(comparator_digest);
+        order.update(VERSION.to_be_bytes());
+        if <[u8; 32]>::from(order.finalize()) != order_contract_digest {
+            return Err(fragment_contract_error("ordered contract digest mismatch"));
+        }
+        Ok(Self::from_frozen(
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        ))
+    }
     pub fn keys(&self) -> &[RuntimeOrderKey] {
         &self.keys
     }
@@ -684,6 +748,28 @@ impl RuntimeOrderContract {
         Ok(Ordering::Equal)
     }
 }
+
+fn ordered_key_type_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+    ) || matches!(data_type, DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH)
+}
+
+fn fragment_contract_error(detail: &'static str) -> RuntimeFilterContractViolation {
+    RuntimeFilterContractViolation::new(
+        RuntimeFilterContractViolationKind::ContractMismatch,
+        detail,
+    )
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTopKSummaryContract {
     order: RuntimeOrderContract,
@@ -702,6 +788,25 @@ impl RuntimeTopKSummaryContract {
     }
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    pub fn validate_fragment_contract(
+        order: &RuntimeOrderContract,
+        k: u32,
+        digest: [u8; 32],
+    ) -> Result<(), RuntimeFilterContractViolation> {
+        if k == 0 {
+            return Err(fragment_contract_error("TopK contract has zero limit"));
+        }
+        let mut canonical = Sha256::new();
+        canonical.update(b"novarocks.runtime-filter.top-k-summary-contract");
+        canonical.update(1u16.to_be_bytes());
+        canonical.update(order.digest());
+        canonical.update(k.to_be_bytes());
+        if <[u8; 32]>::from(canonical.finalize()) != digest {
+            return Err(fragment_contract_error("TopK contract digest mismatch"));
+        }
+        Ok(())
     }
 }
 

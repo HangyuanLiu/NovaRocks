@@ -18,8 +18,3 @@
 //! Backend-owned validation entry point for decoded participant installs.
 
 pub(crate) use crate::native::runtime_filter_install::validate_participant_install;
-
-#[cfg(test)]
-pub(crate) use crate::native::runtime_filter_install::{
-    validate_channel_contract_for_test, validate_install_view_contract_for_test,
-};

@@ -24,6 +24,7 @@ mod participant_install;
 mod reducer;
 mod reduction_state;
 mod routing;
+mod session;
 mod snapshot;
 mod subscription;
 mod transport;
@@ -48,9 +49,8 @@ pub(crate) use identity::{
 pub(crate) use install::{BackendInstallPolicy, BackendInstallPolicyError};
 pub(crate) use participant_install::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall,
-    BackendMaterializationOwner, BackendMaterializationPolicy,
-    BackendOutboundMaterializationGroup, BackendParticipantInstall,
-    BackendParticipantInstallError, BackendProducerInstall,
+    BackendMaterializationOwner, BackendMaterializationPolicy, BackendOutboundMaterializationGroup,
+    BackendParticipantInstall, BackendParticipantInstallError, BackendProducerInstall,
 };
 pub(crate) use reducer::{MembershipReducer, ReducerError};
 pub(crate) use reduction_state::{
@@ -60,6 +60,10 @@ pub(crate) use routing::{
     BackendRemoteRoute, BackendRouteDecision, BackendRouteEndpoint, BackendRoutePeer,
     BackendRouteRole, BackendRoutingChannel, BackendRoutingEdge, BackendRoutingError,
     BackendRoutingShard,
+};
+pub(crate) use session::{
+    BackendRuntimeFilterSession, BackendRuntimeFilterSessionError,
+    BackendRuntimeFilterSessionSubmission,
 };
 pub(crate) use snapshot::{
     BackendLogicalSnapshot, BackendLogicalSnapshotError, BackendReducedLogicalDomain,
