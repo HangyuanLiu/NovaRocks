@@ -22251,6 +22251,29 @@ mod tests {
         );
     }
 
+    fn discover_lake_packages_for_test(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+    ) -> Result<Vec<crate::mv::storage_observation::MvLakePackageObservation>, String> {
+        let observer = IcebergMvStorageObservationAdapter::new(
+            Arc::clone(&state.iceberg_catalogs),
+            Arc::clone(&state.connector_control),
+        );
+        observer
+            .discover_lake_packages(crate::connector::test_request_context())
+            .map(|packages| {
+                packages
+                    .into_iter()
+                    .filter(|package| {
+                        package.table.instance_id.as_str() == catalog
+                            && package.table.namespace.as_ref() == namespace
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+
     #[test]
     fn discover_iceberg_mvs_recovers_single_table_descriptor_from_lake() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
@@ -22265,25 +22288,20 @@ mod tests {
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
 
-        let discovered = crate::engine::mv::iceberg_discovery::discover_iceberg_mvs(
-            &env.state,
-            "ice",
-            "analytics",
-        )
-        .expect("discover iceberg mvs");
+        let discovered = discover_lake_packages_for_test(&env.state, "ice", "analytics")
+            .expect("discover iceberg mvs");
         assert_eq!(discovered.len(), 1);
         assert_eq!(
             discovered
                 .iter()
-                .map(|mv| mv.table.as_str())
+                .map(|mv| mv.table.table.as_ref())
                 .collect::<Vec<_>>(),
             vec!["mv_orders"]
         );
         let mv = &discovered[0];
-        assert_eq!(mv.catalog, "ice");
-        assert_eq!(mv.namespace, "analytics");
-        assert_eq!(mv.table, "mv_orders");
-        assert_eq!(mv.public_name, "mv_orders");
+        assert_eq!(mv.table.instance_id.as_str(), "ice");
+        assert_eq!(mv.table.namespace.as_ref(), "analytics");
+        assert_eq!(mv.table.table.as_ref(), "mv_orders");
         assert_eq!(mv.descriptor.package_id, "analytics.mv_orders");
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
     }
@@ -22676,12 +22694,8 @@ mod tests {
         // Discover the MV descriptor straight off the MV table, the same way
         // `discover_iceberg_mvs_recovers_single_table_descriptor_from_lake`
         // does above.
-        let discovered = crate::engine::mv::iceberg_discovery::discover_iceberg_mvs(
-            &env.state,
-            "ice",
-            "analytics",
-        )
-        .expect("discover iceberg mvs");
+        let discovered = discover_lake_packages_for_test(&env.state, "ice", "analytics")
+            .expect("discover iceberg mvs");
         assert_eq!(discovered.len(), 1);
         let descriptor = &discovered[0].descriptor;
 
@@ -22727,12 +22741,8 @@ mod tests {
         )
         .expect("rewrite descriptor package id");
 
-        let err = crate::engine::mv::iceberg_discovery::discover_iceberg_mvs(
-            &env.state,
-            "ice",
-            "analytics",
-        )
-        .expect_err("package id mismatch should fail discovery");
+        let err = discover_lake_packages_for_test(&env.state, "ice", "analytics")
+            .expect_err("package id mismatch should fail discovery");
         assert!(
             err.contains("descriptor package id mismatch"),
             "unexpected discovery error: {err}"
