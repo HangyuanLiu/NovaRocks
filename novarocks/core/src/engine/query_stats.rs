@@ -283,29 +283,6 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
         binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
-        let iceberg_metadata_table_type = match metadata_table_type {
-            crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
-                crate::connector::iceberg::IcebergMetadataTableType::Snapshots
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::History => {
-                crate::connector::iceberg::IcebergMetadataTableType::History
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Refs => {
-                crate::connector::iceberg::IcebergMetadataTableType::Refs
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Files => {
-                crate::connector::iceberg::IcebergMetadataTableType::Files
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
-                crate::connector::iceberg::IcebergMetadataTableType::Manifests
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
-                crate::connector::iceberg::IcebergMetadataTableType::Partitions
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
-                crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
-            }
-        };
         let materialization =
             crate::connector::iceberg::provider::load_metadata_materialization_with_lease(
                 self.controls,
@@ -313,7 +290,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 catalog,
                 namespace,
                 table,
-                iceberg_metadata_table_type,
+                metadata_table_type,
             )?;
         let planner = crate::sql::planner::table::TableDef {
             name: materialization.table_name,

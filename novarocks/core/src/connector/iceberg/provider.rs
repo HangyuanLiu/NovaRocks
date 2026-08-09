@@ -7047,12 +7047,13 @@ pub(crate) fn load_metadata_materialization_with_lease(
     catalog: &str,
     namespace: &str,
     table: &str,
-    metadata_table_type: super::IcebergMetadataTableType,
+    metadata_table_kind: crate::sql::planner::table::SqlMetadataTableKind,
 ) -> Result<IcebergQueryTableMaterialization, String> {
     use novarocks_spi::connector::{
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
 
+    let metadata_table_type = iceberg_metadata_table_type_from_sql_kind(metadata_table_kind);
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
     let planning_lease = controls
         .acquire_current(&instance_id)
@@ -7076,6 +7077,34 @@ pub(crate) fn load_metadata_materialization_with_lease(
         planning_lease,
         IcebergDataFileBinding::CurrentSnapshot,
     )
+}
+
+fn iceberg_metadata_table_type_from_sql_kind(
+    kind: crate::sql::planner::table::SqlMetadataTableKind,
+) -> super::IcebergMetadataTableType {
+    match kind {
+        crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
+            super::IcebergMetadataTableType::Snapshots
+        }
+        crate::sql::planner::table::SqlMetadataTableKind::History => {
+            super::IcebergMetadataTableType::History
+        }
+        crate::sql::planner::table::SqlMetadataTableKind::Refs => {
+            super::IcebergMetadataTableType::Refs
+        }
+        crate::sql::planner::table::SqlMetadataTableKind::Files => {
+            super::IcebergMetadataTableType::Files
+        }
+        crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
+            super::IcebergMetadataTableType::Manifests
+        }
+        crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
+            super::IcebergMetadataTableType::Partitions
+        }
+        crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
+            super::IcebergMetadataTableType::LogicalIcebergMetadata
+        }
+    }
 }
 
 fn materialization_from_metadata(
