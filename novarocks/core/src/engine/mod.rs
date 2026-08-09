@@ -2138,6 +2138,7 @@ impl StandaloneSession {
                     &self.inner,
                     &statement,
                     current_database,
+                    connector_context,
                 );
             }
         }
