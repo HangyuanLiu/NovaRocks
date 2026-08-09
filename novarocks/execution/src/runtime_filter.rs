@@ -20,7 +20,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
+use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
+use sha2::{Digest, Sha256};
 
 pub mod contribution;
 pub mod evaluator;
@@ -65,59 +67,256 @@ impl LogicalVersion {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterExecutionContract {
-    Membership {
-        canonical_schema: Arc<[u8]>,
-        schema_digest: [u8; 32],
-    },
-    Ordered {
-        keys: Arc<[RuntimeOrderKey]>,
-        comparator_digest: [u8; 32],
-        order_contract_digest: [u8; 32],
-    },
+    Membership(RuntimeFilterMembershipSchema),
+    Ordered(Arc<contribution::RuntimeOrderContract>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeOrderSortDirection {
-    Ascending,
-    Descending,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeOrderNullOrder {
-    First,
-    Last,
+pub enum RuntimeFilterNullSemantics {
+    NeverMatches,
+    NullSafeEqual,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeOrderKey {
+pub struct RuntimeFilterMembershipSchema {
     data_type: DataType,
-    direction: RuntimeOrderSortDirection,
-    null_order: RuntimeOrderNullOrder,
+    null_semantics: RuntimeFilterNullSemantics,
+    canonical_bytes: Arc<[u8]>,
+    digest: [u8; 32],
 }
 
-impl RuntimeOrderKey {
-    pub const fn new(
-        data_type: DataType,
-        direction: RuntimeOrderSortDirection,
-        null_order: RuntimeOrderNullOrder,
-    ) -> Self {
-        Self {
-            data_type,
-            direction,
-            null_order,
+impl RuntimeFilterMembershipSchema {
+    pub fn new(
+        data_type: &DataType,
+        null_semantics: RuntimeFilterNullSemantics,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        let mut canonical = Vec::with_capacity(48);
+        canonical.extend_from_slice(b"novarocks.runtime-filter.artifact-schema");
+        canonical.push(1);
+        encode_membership_schema_type(data_type, &mut canonical)?;
+        canonical.push(match null_semantics {
+            RuntimeFilterNullSemantics::NeverMatches => 1,
+            RuntimeFilterNullSemantics::NullSafeEqual => 2,
+        });
+        let digest = Sha256::digest(&canonical).into();
+        Ok(Self {
+            data_type: data_type.clone(),
+            null_semantics,
+            canonical_bytes: canonical.into(),
+            digest,
+        })
+    }
+
+    pub fn from_canonical(
+        canonical_bytes: impl AsRef<[u8]>,
+        expected_digest: [u8; 32],
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        let canonical = canonical_bytes.as_ref();
+        let digest: [u8; 32] = Sha256::digest(canonical).into();
+        if digest != expected_digest {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::ContractMismatch,
+                "membership schema digest does not match canonical bytes",
+            ));
         }
+        const DOMAIN: &[u8] = b"novarocks.runtime-filter.artifact-schema";
+        let mut cursor = MembershipSchemaCursor::new(canonical);
+        if cursor.take(DOMAIN.len())? != DOMAIN || cursor.u8()? != 1 {
+            return Err(membership_schema_error(
+                "unknown canonical membership schema prefix",
+            ));
+        }
+        let data_type = decode_membership_schema_type(&mut cursor)?;
+        let null_semantics = match cursor.u8()? {
+            1 => RuntimeFilterNullSemantics::NeverMatches,
+            2 => RuntimeFilterNullSemantics::NullSafeEqual,
+            _ => return Err(membership_schema_error("invalid membership null semantics")),
+        };
+        if !cursor.empty() {
+            return Err(membership_schema_error(
+                "membership schema has trailing bytes",
+            ));
+        }
+        Ok(Self {
+            data_type,
+            null_semantics,
+            canonical_bytes: Arc::from(canonical),
+            digest,
+        })
     }
 
     pub const fn data_type(&self) -> &DataType {
         &self.data_type
     }
 
-    pub const fn direction(&self) -> RuntimeOrderSortDirection {
-        self.direction
+    pub const fn null_semantics(&self) -> RuntimeFilterNullSemantics {
+        self.null_semantics
     }
 
-    pub const fn null_order(&self) -> RuntimeOrderNullOrder {
-        self.null_order
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+fn membership_schema_error(detail: &'static str) -> RuntimeFilterContractViolation {
+    RuntimeFilterContractViolation::new(
+        RuntimeFilterContractViolationKind::ContractMismatch,
+        detail,
+    )
+}
+
+struct MembershipSchemaCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> MembershipSchemaCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+
+    const fn empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], RuntimeFilterContractViolation> {
+        let (value, remaining) = self
+            .remaining
+            .split_at_checked(length)
+            .ok_or_else(|| membership_schema_error("truncated membership schema"))?;
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, RuntimeFilterContractViolation> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, RuntimeFilterContractViolation> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .expect("schema cursor guarantees four bytes"),
+        ))
+    }
+}
+
+fn encode_membership_schema_type(
+    data_type: &DataType,
+    output: &mut Vec<u8>,
+) -> Result<(), RuntimeFilterContractViolation> {
+    match data_type {
+        DataType::Boolean => output.push(1),
+        DataType::Int8 => output.push(2),
+        DataType::Int16 => output.push(3),
+        DataType::Int32 => output.push(4),
+        DataType::Int64 => output.push(5),
+        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => output.push(6),
+        DataType::Float32 => output.push(7),
+        DataType::Float64 => output.push(8),
+        DataType::Utf8 => output.push(9),
+        DataType::Date32 => output.push(10),
+        DataType::Timestamp(unit, timezone) => {
+            output.extend_from_slice(&[
+                11,
+                match unit {
+                    TimeUnit::Second => 1,
+                    TimeUnit::Millisecond => 2,
+                    TimeUnit::Microsecond => 3,
+                    TimeUnit::Nanosecond => 4,
+                },
+            ]);
+            match timezone {
+                Some(timezone) => {
+                    output.push(1);
+                    let length = u32::try_from(timezone.len()).map_err(|_| {
+                        membership_schema_error("membership schema timezone length overflows u32")
+                    })?;
+                    output.extend_from_slice(&length.to_be_bytes());
+                    output.extend_from_slice(timezone.as_bytes());
+                }
+                None => output.push(0),
+            }
+        }
+        DataType::Decimal128(precision, scale)
+            if *precision != 0
+                && *precision <= DECIMAL128_MAX_PRECISION
+                && *scale <= DECIMAL128_MAX_SCALE
+                && (*scale <= 0 || (*scale as u8) <= *precision) =>
+        {
+            output.extend_from_slice(&[12, *precision, *scale as u8]);
+        }
+        _ => {
+            return Err(membership_schema_error(
+                "unsupported membership schema type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_membership_schema_type(
+    cursor: &mut MembershipSchemaCursor<'_>,
+) -> Result<DataType, RuntimeFilterContractViolation> {
+    match cursor.u8()? {
+        1 => Ok(DataType::Boolean),
+        2 => Ok(DataType::Int8),
+        3 => Ok(DataType::Int16),
+        4 => Ok(DataType::Int32),
+        5 => Ok(DataType::Int64),
+        6 => Ok(DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH)),
+        7 => Ok(DataType::Float32),
+        8 => Ok(DataType::Float64),
+        9 => Ok(DataType::Utf8),
+        10 => Ok(DataType::Date32),
+        11 => {
+            let unit = match cursor.u8()? {
+                1 => TimeUnit::Second,
+                2 => TimeUnit::Millisecond,
+                3 => TimeUnit::Microsecond,
+                4 => TimeUnit::Nanosecond,
+                _ => return Err(membership_schema_error("invalid timestamp time unit")),
+            };
+            let timezone = match cursor.u8()? {
+                0 => None,
+                1 => {
+                    let length = usize::try_from(cursor.u32()?).map_err(|_| {
+                        membership_schema_error("timestamp timezone length overflow")
+                    })?;
+                    Some(
+                        std::str::from_utf8(cursor.take(length)?)
+                            .map_err(|_| {
+                                membership_schema_error("timestamp timezone is not UTF-8")
+                            })?
+                            .into(),
+                    )
+                }
+                _ => {
+                    return Err(membership_schema_error(
+                        "invalid timestamp timezone metadata",
+                    ));
+                }
+            };
+            Ok(DataType::Timestamp(unit, timezone))
+        }
+        12 => {
+            let precision = cursor.u8()?;
+            let scale = cursor.u8()? as i8;
+            if precision == 0
+                || precision > DECIMAL128_MAX_PRECISION
+                || scale > DECIMAL128_MAX_SCALE
+                || (scale > 0 && scale as u8 > precision)
+            {
+                return Err(membership_schema_error("invalid decimal schema metadata"));
+            }
+            Ok(DataType::Decimal128(precision, scale))
+        }
+        _ => Err(membership_schema_error(
+            "unsupported membership schema type tag",
+        )),
     }
 }
 
@@ -364,16 +563,12 @@ impl RuntimeFilterProducerContract {
             RuntimeFilterProducerKind::TopKSummary,
             contract,
         )?;
-        let RuntimeFilterExecutionContract::Ordered {
-            order_contract_digest,
-            ..
-        } = producer.contract()
-        else {
+        let RuntimeFilterExecutionContract::Ordered(order_contract) = producer.contract() else {
             unreachable!("kind and contract were validated above")
         };
         producer.reduction = RuntimeFilterReduction::MergeTopKSummary {
             k,
-            contract_digest: *order_contract_digest,
+            contract_digest: order_contract.digest(),
         };
         Ok(producer)
     }
@@ -401,16 +596,16 @@ impl RuntimeFilterProducerContract {
             (kind, &contract),
             (
                 RuntimeFilterProducerKind::Membership,
-                RuntimeFilterExecutionContract::Membership { .. }
+                RuntimeFilterExecutionContract::Membership(_)
             ) | (
                 RuntimeFilterProducerKind::OrderedBound,
-                RuntimeFilterExecutionContract::Ordered { .. }
+                RuntimeFilterExecutionContract::Ordered(_)
             ) | (
                 RuntimeFilterProducerKind::TopKSummary,
-                RuntimeFilterExecutionContract::Ordered { .. }
+                RuntimeFilterExecutionContract::Ordered(_)
             ) | (
                 RuntimeFilterProducerKind::FinalDomain,
-                RuntimeFilterExecutionContract::Membership { .. }
+                RuntimeFilterExecutionContract::Membership(_)
             )
         );
         if !valid {
@@ -431,16 +626,12 @@ impl RuntimeFilterProducerContract {
                     RuntimeFilterReduction::TightenOrderedBound
                 }
                 RuntimeFilterProducerKind::TopKSummary => {
-                    let RuntimeFilterExecutionContract::Ordered {
-                        order_contract_digest,
-                        ..
-                    } = &contract
-                    else {
+                    let RuntimeFilterExecutionContract::Ordered(order_contract) = &contract else {
                         unreachable!("kind and contract were validated above")
                     };
                     RuntimeFilterReduction::MergeTopKSummary {
                         k: 0,
-                        contract_digest: *order_contract_digest,
+                        contract_digest: order_contract.digest(),
                     }
                 }
             },
@@ -574,11 +765,7 @@ impl RuntimeFilterConsumerContract {
         k: u32,
         contract: RuntimeFilterExecutionContract,
     ) -> Result<Self, RuntimeFilterContractViolation> {
-        let RuntimeFilterExecutionContract::Ordered {
-            order_contract_digest,
-            ..
-        } = &contract
-        else {
+        let RuntimeFilterExecutionContract::Ordered(order_contract) = &contract else {
             return Err(RuntimeFilterContractViolation::new(
                 RuntimeFilterContractViolationKind::RoleMismatch,
                 "top-k runtime-filter consumer requires an ordered contract",
@@ -590,7 +777,7 @@ impl RuntimeFilterConsumerContract {
                 "top-k runtime-filter consumer requires a non-zero K",
             ));
         }
-        let contract_digest = *order_contract_digest;
+        let contract_digest = order_contract.digest();
         Self::for_activation(
             binding_id,
             channel_id,
@@ -610,13 +797,13 @@ impl RuntimeFilterConsumerContract {
         let valid = matches!(
             (&contract, reduction),
             (
-                RuntimeFilterExecutionContract::Membership { .. },
+                RuntimeFilterExecutionContract::Membership(_),
                 RuntimeFilterReduction::SetUnion
             ) | (
-                RuntimeFilterExecutionContract::Ordered { .. },
+                RuntimeFilterExecutionContract::Ordered(_),
                 RuntimeFilterReduction::TightenOrderedBound
             ) | (
-                RuntimeFilterExecutionContract::Ordered { .. },
+                RuntimeFilterExecutionContract::Ordered(_),
                 RuntimeFilterReduction::MergeTopKSummary { .. }
             )
         );
@@ -627,7 +814,7 @@ impl RuntimeFilterConsumerContract {
             ));
         }
         if matches!(activation, ConsumerActivation::BlockingSnapshot)
-            && !matches!(contract, RuntimeFilterExecutionContract::Membership { .. })
+            && !matches!(contract, RuntimeFilterExecutionContract::Membership(_))
         {
             return Err(RuntimeFilterContractViolation::new(
                 RuntimeFilterContractViolationKind::RoleMismatch,
@@ -653,8 +840,8 @@ impl RuntimeFilterConsumerContract {
         contract: RuntimeFilterExecutionContract,
     ) -> Self {
         let reduction = match &contract {
-            RuntimeFilterExecutionContract::Membership { .. } => RuntimeFilterReduction::SetUnion,
-            RuntimeFilterExecutionContract::Ordered { .. } => {
+            RuntimeFilterExecutionContract::Membership(_) => RuntimeFilterReduction::SetUnion,
+            RuntimeFilterExecutionContract::Ordered(_) => {
                 RuntimeFilterReduction::TightenOrderedBound
             }
         };
@@ -1194,10 +1381,43 @@ mod tests {
         }
     }
     fn membership() -> RuntimeFilterExecutionContract {
-        RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::from([1_u8]),
-            schema_digest: [2; 32],
-        }
+        RuntimeFilterExecutionContract::Membership(
+            RuntimeFilterMembershipSchema::new(
+                &DataType::Int64,
+                RuntimeFilterNullSemantics::NeverMatches,
+            )
+            .expect("membership schema is canonical"),
+        )
+    }
+
+    #[test]
+    fn membership_schema_preserves_the_v1_canonical_bytes_and_digest() {
+        let schema = RuntimeFilterMembershipSchema::new(
+            &DataType::Int32,
+            RuntimeFilterNullSemantics::NullSafeEqual,
+        )
+        .expect("int32 null-safe schema is supported");
+
+        assert_eq!(
+            schema.canonical_bytes(),
+            b"novarocks.runtime-filter.artifact-schema\x01\x04\x02"
+        );
+        assert_eq!(
+            schema.digest(),
+            [
+                0x92, 0x5d, 0xde, 0xf2, 0x0b, 0x5b, 0xfa, 0x0e, 0xd3, 0xd6, 0xe3, 0x55, 0xf1, 0x18,
+                0x79, 0xba, 0xeb, 0x2a, 0x0c, 0x7d, 0x31, 0x0b, 0x56, 0xe2, 0xcc, 0x03, 0x55, 0x57,
+                0x10, 0xbf, 0x96, 0x41,
+            ]
+        );
+        assert_eq!(
+            RuntimeFilterMembershipSchema::from_canonical(
+                schema.canonical_bytes(),
+                schema.digest()
+            )
+            .expect("exact canonical bytes decode"),
+            schema
+        );
     }
 
     #[test]

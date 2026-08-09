@@ -1286,25 +1286,13 @@ pub fn encode_membership_contributions(
             "membership encoder requires a membership producer contract",
         ));
     }
-    let RuntimeFilterExecutionContract::Membership {
-        canonical_schema,
-        schema_digest,
-    } = producer.contract()
-    else {
+    let RuntimeFilterExecutionContract::Membership(schema) = producer.contract() else {
         return Err(contract_error(
             RuntimeFilterContractViolationKind::ContractMismatch,
             "membership producer does not carry a membership execution contract",
         ));
     };
-    if <[u8; 32]>::from(Sha256::digest(canonical_schema)) != *schema_digest {
-        return Err(contract_error(
-            RuntimeFilterContractViolationKind::ContractMismatch,
-            "membership canonical schema digest does not match the frozen contract",
-        ));
-    }
-    let expected = decode_membership_schema(canonical_schema).map_err(|detail| {
-        contract_error(RuntimeFilterContractViolationKind::ContractMismatch, detail)
-    })?;
+    let expected = schema.data_type().clone();
     if array.data_type() != &expected {
         return Err(MembershipContributionEncodingError::TypeMismatch {
             expected,
@@ -1320,7 +1308,7 @@ pub fn encode_membership_contributions(
     let typed = RuntimeFilterContribution::membership(domain);
     let encoded = match encode_contribution(
         &typed,
-        ContributionCodecExpectation::membership(&expected, *schema_digest),
+        ContributionCodecExpectation::membership(&expected, schema.digest()),
         max_encoded_bytes,
     ) {
         Ok(encoded) => encoded,
@@ -1525,85 +1513,6 @@ fn utf8_value<'a>(
 ) -> Result<&'a str, MembershipContributionEncodingError> {
     super::evaluator::utf8_value(data, row)
         .map_err(|error| invalid_array(expected, error.to_string()))
-}
-
-fn decode_membership_schema(canonical: &[u8]) -> Result<DataType, String> {
-    const DOMAIN: &[u8] = b"novarocks.runtime-filter.artifact-schema";
-    let mut reader = Reader::new(canonical);
-    if reader
-        .take(DOMAIN.len())
-        .map_err(|_| "truncated membership schema")?
-        != DOMAIN
-        || reader.u8().map_err(|_| "truncated membership schema")? != 1
-    {
-        return Err("membership schema has an unknown canonical prefix".to_string());
-    }
-    let tag = reader.u8().map_err(|_| "truncated membership schema")?;
-    let data_type = match tag {
-        1 => DataType::Boolean,
-        2 => DataType::Int8,
-        3 => DataType::Int16,
-        4 => DataType::Int32,
-        5 => DataType::Int64,
-        6 => DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH),
-        7 => DataType::Float32,
-        8 => DataType::Float64,
-        9 => DataType::Utf8,
-        10 => DataType::Date32,
-        11 => {
-            let unit = match reader.u8().map_err(|_| "truncated timestamp schema")? {
-                1 => TimeUnit::Second,
-                2 => TimeUnit::Millisecond,
-                3 => TimeUnit::Microsecond,
-                4 => TimeUnit::Nanosecond,
-                _ => return Err("timestamp schema has an invalid time unit".to_string()),
-            };
-            let timezone = match reader.u8().map_err(|_| "truncated timestamp schema")? {
-                0 => None,
-                1 => {
-                    let len = usize::try_from(u32::from_be_bytes(
-                        reader
-                            .take(4)
-                            .map_err(|_| "truncated timestamp timezone")?
-                            .try_into()
-                            .expect("four-byte schema length"),
-                    ))
-                    .map_err(|_| "timestamp timezone length overflow")?;
-                    Some(
-                        std::str::from_utf8(
-                            reader
-                                .take(len)
-                                .map_err(|_| "truncated timestamp timezone")?,
-                        )
-                        .map_err(|_| "timestamp timezone is not UTF-8")?
-                        .into(),
-                    )
-                }
-                _ => return Err("timestamp schema has invalid timezone metadata".to_string()),
-            };
-            DataType::Timestamp(unit, timezone)
-        }
-        12 => {
-            let precision = reader.u8().map_err(|_| "truncated decimal schema")?;
-            let scale = reader.u8().map_err(|_| "truncated decimal schema")? as i8;
-            let values = BTreeSet::new();
-            validate_decimal(precision, scale, &values)
-                .map_err(|_| "decimal schema metadata is invalid")?;
-            DataType::Decimal128(precision, scale)
-        }
-        _ => return Err("membership schema has an unsupported type tag".to_string()),
-    };
-    match reader
-        .u8()
-        .map_err(|_| "membership schema is missing null semantics")?
-    {
-        1 | 2 => {}
-        _ => return Err("membership schema has invalid null semantics".to_string()),
-    }
-    if !reader.empty() {
-        return Err("membership schema has trailing bytes".to_string());
-    }
-    Ok(data_type)
 }
 
 fn decode_tuple(
@@ -1905,7 +1814,7 @@ mod tests {
     use super::*;
     use crate::runtime_filter::{
         RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterExecutionContract,
-        RuntimeFilterProducerContract,
+        RuntimeFilterMembershipSchema, RuntimeFilterProducerContract,
     };
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::DataType;
@@ -1917,10 +1826,9 @@ mod tests {
         let producer = RuntimeFilterProducerContract::membership(
             RuntimeFilterBindingId::new(7),
             RuntimeFilterChannelId::new(9),
-            RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema),
-                schema_digest: digest,
-            },
+            RuntimeFilterExecutionContract::Membership(
+                RuntimeFilterMembershipSchema::from_canonical(schema, digest).unwrap(),
+            ),
         )
         .unwrap();
         let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(2), None, Some(1), Some(2)]));
@@ -1955,10 +1863,9 @@ mod tests {
         let producer = RuntimeFilterProducerContract::membership(
             RuntimeFilterBindingId::new(7),
             RuntimeFilterChannelId::new(9),
-            RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema),
-                schema_digest: digest,
-            },
+            RuntimeFilterExecutionContract::Membership(
+                RuntimeFilterMembershipSchema::from_canonical(schema, digest).unwrap(),
+            ),
         )
         .unwrap();
         let input: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1_i64, 2, 3]));
