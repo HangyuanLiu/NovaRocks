@@ -158,10 +158,11 @@ mod tests {
     use novarocks::connector::ConnectorRegistry;
     use novarocks::exec::expr::{ExprArena, ExprNode};
     use novarocks::exec::node::ExecNodeKind;
-    use novarocks::exec::node::runtime_filter::{ArtifactMembershipSchema, NullSemantics};
     use novarocks::exec::node::scan::ScanMorsel;
     use novarocks::protocol::ProtocolErrorKind;
     use novarocks::runtime::query_options::{QueryOptions, QueryOptionsParts};
+    use novarocks::runtime_filter_transition::model::contract::NullSemantics;
+    use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
     use novarocks_protocol::{common, expr, novarocks as native_proto, plan};
 
     struct TestNotCancelled;

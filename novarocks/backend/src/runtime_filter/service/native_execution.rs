@@ -505,7 +505,9 @@ impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
         let contract = request.contract();
         let requested_kind = match contract.activation() {
             execution::ConsumerActivation::BlockingSnapshot => SubscriptionKind::BlockingSnapshot,
-            execution::ConsumerActivation::NonBlockingLive => SubscriptionKind::NonBlockingLive,
+            execution::ConsumerActivation::NonBlockingLive { .. } => {
+                SubscriptionKind::NonBlockingLive
+            }
         };
         let resolved = self
             .resolve_consumer(
@@ -1337,10 +1339,10 @@ fn map_codec_query(error: ArtifactCodecError) -> execution::RuntimeFilterArtifac
     }
 }
 
-fn membership_probe(
-    value: execution::RuntimeFilterScalarRef<'_>,
+fn membership_probe<'a>(
+    value: execution::RuntimeFilterScalarRef<'a>,
     expected: &DataType,
-) -> Result<MembershipProbe<'_>, execution::RuntimeFilterArtifactQueryError> {
+) -> Result<MembershipProbe<'a>, execution::RuntimeFilterArtifactQueryError> {
     match (value, expected) {
         (execution::RuntimeFilterScalarRef::Boolean(value), DataType::Boolean) => {
             Ok(MembershipProbe::Boolean(value))
@@ -1375,10 +1377,10 @@ fn membership_probe(
     }
 }
 
-fn connector_membership_probe(
-    value: &ConnectorScalarValue,
+fn connector_membership_probe<'a>(
+    value: &'a ConnectorScalarValue,
     expected: &DataType,
-) -> Result<MembershipProbe<'_>, execution::RuntimeFilterArtifactQueryError> {
+) -> Result<MembershipProbe<'a>, execution::RuntimeFilterArtifactQueryError> {
     match (value, expected) {
         (ConnectorScalarValue::Boolean(value), DataType::Boolean) => {
             Ok(MembershipProbe::Boolean(*value))

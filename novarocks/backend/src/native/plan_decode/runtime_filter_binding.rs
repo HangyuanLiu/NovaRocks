@@ -22,11 +22,16 @@ use std::num::NonZeroU32;
 
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
-use novarocks::exec::node::runtime_filter::{
-    ArtifactMembershipSchema, ComparatorDigest, NullOrder, OrderContract, OrderKeyContract,
-    RuntimeOrderContract, RuntimeTopKSummaryContract, SortDirection, TopKSummaryRequirement,
-};
 use novarocks::protocol::{FieldPath, ProtocolErrorKind};
+use novarocks::runtime_filter_transition::model::contract::{
+    ComparatorDigest, NullOrder, OrderContract, OrderKeyContract, SortDirection,
+    TopKSummaryRequirement,
+};
+use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
+use novarocks::runtime_filter_transition::port::ordered_bound::{
+    RuntimeOrderContract, comparator_digest_for_plan,
+};
+use novarocks::runtime_filter_transition::port::topk_summary::RuntimeTopKSummaryContract;
 use novarocks_execution::runtime_filter as execution;
 use novarocks_protocol::{expr, plan};
 
@@ -1262,12 +1267,16 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use novarocks::exec::node::runtime_filter::{
-        ArtifactMembershipSchema, NullOrder, NullSemantics, OrderContract, OrderKeyContract,
-        RuntimeOrderContract, RuntimeTopKSummaryContract, SortDirection, TopKSummaryRequirement,
-        comparator_digest_for_plan,
-    };
     use novarocks::protocol::ProtocolErrorKind;
+    use novarocks::runtime_filter_transition::model::contract::{
+        NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
+        TopKSummaryRequirement,
+    };
+    use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
+    use novarocks::runtime_filter_transition::port::ordered_bound::{
+        RuntimeOrderContract, comparator_digest_for_plan,
+    };
+    use novarocks::runtime_filter_transition::port::topk_summary::RuntimeTopKSummaryContract;
     use novarocks_protocol::expr;
 
     fn int64_type() -> novarocks_protocol::common::TypeDesc {
@@ -1388,8 +1397,8 @@ mod tests {
         target: Option<plan::runtime_filter_producer_role::Target>,
     ) -> Result<super::ProducerBindingTarget, super::NativeFragmentDecodeError> {
         let role = producer_role_with_target(target);
-        let DecodedBindingRole::Producer { target, .. } =
-            decode_role(17, Some(&role), FieldPath::root("binding").field("role"))?
+        let DecodedWireBindingRole::Producer { target, .. } =
+            decode_wire_role(17, Some(&role), FieldPath::root("binding").field("role"))?
         else {
             unreachable!("fixture always carries a producer role")
         };
