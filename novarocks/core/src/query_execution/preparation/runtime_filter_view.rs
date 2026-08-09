@@ -117,7 +117,15 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
                 comparator_digest,
                 order_contract_digest,
             } => RuntimeFilterContractFacts::Ordered {
-                keys,
+                keys: keys
+                    .iter()
+                    .map(|key| RuntimeFilterOrderKeyFacts {
+                        r#type: encode_type(key.data_type())
+                            .expect("sealed order-key type is encodable"),
+                        direction: RuntimeFilterSortDirection::from_runtime(key.direction()),
+                        null_order: RuntimeFilterNullOrder::from_runtime(key.null_order()),
+                    })
+                    .collect(),
                 comparator_digest: comparator_digest.get(),
                 order_contract_digest: order_contract_digest.bytes(),
             },
@@ -185,25 +193,17 @@ pub enum RuntimeFilterContractFacts<'a> {
         schema_digest: [u8; 32],
     },
     Ordered {
-        keys: &'a [crate::runtime_filter::port::ordered_bound::RuntimeOrderKey],
+        keys: Vec<RuntimeFilterOrderKeyFacts>,
         comparator_digest: [u8; 32],
         order_contract_digest: [u8; 32],
     },
 }
 
 impl RuntimeFilterContractFacts<'_> {
-    pub fn ordered_keys(&self) -> Vec<RuntimeFilterOrderKeyFacts> {
+    pub fn ordered_keys(&self) -> &[RuntimeFilterOrderKeyFacts] {
         match self {
-            Self::Membership { .. } => Vec::new(),
-            Self::Ordered { keys, .. } => keys
-                .iter()
-                .map(|key| RuntimeFilterOrderKeyFacts {
-                    r#type: encode_type(key.data_type())
-                        .expect("sealed order-key type is encodable"),
-                    direction: RuntimeFilterSortDirection::from_runtime(key.direction()),
-                    null_order: RuntimeFilterNullOrder::from_runtime(key.null_order()),
-                })
-                .collect(),
+            Self::Membership { .. } => &[],
+            Self::Ordered { keys, .. } => keys,
         }
     }
 }

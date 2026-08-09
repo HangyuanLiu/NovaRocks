@@ -34,15 +34,13 @@ use arrow::array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use novarocks_execution::runtime_filter::contribution::{
+    OrderedScalar, OrderedTuple, OrderedTupleError, RuntimeOrderContract,
+};
 
 use crate::exec::hash_table::key_table::KeyLookup;
 use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
-use crate::runtime_filter::model::contract::ComparatorDigest;
-use crate::runtime_filter::port::ordered_bound::{
-    OrderContractDigest, OrderContractError, OrderedScalar, OrderedTuple, OrderedTupleError,
-    RuntimeOrderContract,
-};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AggregateTopNCandidate {
@@ -60,7 +58,6 @@ pub(crate) enum AggregateTopNBoundaryError {
     UnsupportedKeyArity {
         actual: usize,
     },
-    InvalidOrderContract(OrderContractError),
     NonOrderedContract,
     UnsupportedOrderKeyType {
         actual: DataType,
@@ -94,12 +91,6 @@ impl fmt::Display for AggregateTopNBoundaryError {
                 write!(
                     formatter,
                     "aggregate TopN boundary requires exactly one order key, got {actual}"
-                )
-            }
-            Self::InvalidOrderContract(error) => {
-                write!(
-                    formatter,
-                    "aggregate TopN boundary has invalid order contract: {error:?}"
                 )
             }
             Self::NonOrderedContract => {
@@ -150,12 +141,6 @@ impl fmt::Display for AggregateTopNBoundaryError {
 }
 
 impl std::error::Error for AggregateTopNBoundaryError {}
-
-impl From<OrderContractError> for AggregateTopNBoundaryError {
-    fn from(error: OrderContractError) -> Self {
-        Self::InvalidOrderContract(error)
-    }
-}
 
 impl From<OrderedTupleError> for AggregateTopNBoundaryError {
     fn from(error: OrderedTupleError) -> Self {
@@ -300,20 +285,10 @@ impl AggregateTopNBoundaryBinding {
     pub(crate) fn try_from_spec(
         spec: &AggregateTopNRuntimeFilterProducerBinding,
     ) -> Result<Self, AggregateTopNBoundaryError> {
-        let RuntimeFilterExecutionContract::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        } = spec.contract().contract()
-        else {
+        let RuntimeFilterExecutionContract::Ordered(contract) = spec.contract().contract() else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
-        let contract = Arc::new(RuntimeOrderContract::from_codec(
-            crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
-            ComparatorDigest::new(*comparator_digest),
-            OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
-        )?);
-        Self::try_new(spec.group_key_ordinal, spec.limit, contract)
+        Self::try_new(spec.group_key_ordinal, spec.limit, Arc::clone(contract))
     }
 
     pub(crate) const fn state(&self) -> &AggregateTopNBoundaryState {
@@ -338,20 +313,10 @@ pub(crate) fn validate_topn_boundary_specs(
     specs: &[AggregateTopNRuntimeFilterProducerBinding],
 ) -> Result<(), AggregateTopNBoundaryError> {
     for spec in specs {
-        let RuntimeFilterExecutionContract::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        } = spec.contract().contract()
-        else {
+        let RuntimeFilterExecutionContract::Ordered(contract) = spec.contract().contract() else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
-        let contract = RuntimeOrderContract::from_codec(
-            crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
-            ComparatorDigest::new(*comparator_digest),
-            OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
-        )?;
-        validate_topn_boundary_contract(&contract)?;
+        validate_topn_boundary_contract(contract)?;
     }
     Ok(())
 }
@@ -426,7 +391,7 @@ fn tuple_from_group_array(
         .expect("aggregate TopN state validates one order key")
         .data_type();
     let value = if expected == &DataType::Utf8 {
-        utf8_value(array, row)?.map(|value| OrderedScalar::Utf8(Arc::from(value)))
+        utf8_value(array, row)?.map(|value| OrderedScalar::Utf8(value.to_owned()))
     } else if array.is_null(row) {
         None
     } else {
@@ -587,8 +552,11 @@ mod tests {
         OrderKeyContract, SortDirection,
     };
     use crate::runtime_filter::port::ordered_bound::{
-        COMPARATOR_ALGORITHM_VERSION, OrderContractError, OrderedScalar, OrderedTuple,
-        RuntimeOrderContract, comparator_digest_for_test,
+        COMPARATOR_ALGORITHM_VERSION, OrderContractError,
+        RuntimeOrderContract as LegacyRuntimeOrderContract, comparator_digest_for_test,
+    };
+    use novarocks_execution::runtime_filter::contribution::{
+        OrderedScalar, OrderedTuple, RuntimeOrderContract,
     };
 
     fn order_plan(
@@ -618,8 +586,8 @@ mod tests {
         direction: SortDirection,
         null_order: NullOrder,
     ) -> Arc<RuntimeOrderContract> {
-        Arc::new(
-            RuntimeOrderContract::try_from_plan(&order_plan(
+        execution_contract_from_legacy(
+            &LegacyRuntimeOrderContract::try_from_plan(&order_plan(
                 [data_type],
                 direction,
                 null_order,
@@ -627,6 +595,38 @@ mod tests {
             ))
             .expect("valid runtime order contract"),
         )
+    }
+
+    fn execution_contract_from_legacy(
+        contract: &LegacyRuntimeOrderContract,
+    ) -> Arc<RuntimeOrderContract> {
+        Arc::new(RuntimeOrderContract::from_frozen(
+            contract.keys().iter().map(|key| {
+                execution::contribution::RuntimeOrderKey::with_order(
+                    key.data_type().clone(),
+                    match key.direction() {
+                        SortDirection::Ascending => {
+                            execution::contribution::RuntimeOrderSortDirection::Ascending
+                        }
+                        SortDirection::Descending => {
+                            execution::contribution::RuntimeOrderSortDirection::Descending
+                        }
+                    },
+                    match key.null_order() {
+                        NullOrder::First => execution::contribution::RuntimeOrderNullOrder::First,
+                        NullOrder::Last => execution::contribution::RuntimeOrderNullOrder::Last,
+                    },
+                )
+            }),
+            contract.plan_comparator_digest().get(),
+            contract.digest().bytes(),
+        ))
+    }
+
+    fn execution_ordered_contract_for_test(
+        contract: &RuntimeOrderContract,
+    ) -> RuntimeFilterExecutionContract {
+        RuntimeFilterExecutionContract::Ordered(Arc::new(contract.clone()))
     }
 
     fn tuple(contract: &RuntimeOrderContract, value: Option<OrderedScalar>) -> OrderedTuple {
@@ -819,8 +819,8 @@ mod tests {
             (
                 DataType::Utf8,
                 vec![
-                    OrderedScalar::Utf8(Arc::from("zeta")),
-                    OrderedScalar::Utf8(Arc::from("alpha")),
+                    OrderedScalar::Utf8("zeta".to_owned()),
+                    OrderedScalar::Utf8("alpha".to_owned()),
                 ],
             ),
             (
@@ -879,12 +879,12 @@ mod tests {
             comparator_digest: ComparatorDigest::new([0; 32]),
         };
         assert_eq!(
-            RuntimeOrderContract::try_from_plan(&float_plan),
+            LegacyRuntimeOrderContract::try_from_plan(&float_plan),
             Err(OrderContractError::UnsupportedSchema)
         );
 
-        let multi_key = Arc::new(
-            RuntimeOrderContract::try_from_plan(&order_plan(
+        let multi_key = execution_contract_from_legacy(
+            &LegacyRuntimeOrderContract::try_from_plan(&order_plan(
                 [DataType::Int64, DataType::Utf8],
                 SortDirection::Ascending,
                 NullOrder::Last,
@@ -904,7 +904,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            RuntimeOrderContract::try_from_plan(&exclusive),
+            LegacyRuntimeOrderContract::try_from_plan(&exclusive),
             Err(OrderContractError::ExclusiveBound)
         );
     }
@@ -1103,7 +1103,7 @@ mod tests {
             (
                 DataType::Utf8,
                 Arc::new(StringArray::from(vec!["alpha"])),
-                OrderedScalar::Utf8(Arc::from("alpha")),
+                OrderedScalar::Utf8("alpha".to_owned()),
             ),
             (
                 DataType::Utf8,
@@ -1112,7 +1112,7 @@ mod tests {
                         .into_iter()
                         .collect::<DictionaryArray<Int32Type>>(),
                 ),
-                OrderedScalar::Utf8(Arc::from("dictionary-alpha")),
+                OrderedScalar::Utf8("dictionary-alpha".to_owned()),
             ),
             (
                 DataType::Date32,
@@ -1186,11 +1186,7 @@ mod tests {
             execution::RuntimeFilterProducerContract::ordered_bound(
                 execution::RuntimeFilterBindingId::new(11),
                 execution::RuntimeFilterChannelId::new(12),
-                RuntimeFilterExecutionContract::Ordered {
-                    keys: crate::exec::node::runtime_filter::execution_order_keys(contract.keys()),
-                    comparator_digest: contract.plan_comparator_digest().get(),
-                    order_contract_digest: contract.digest().bytes(),
-                },
+                execution_ordered_contract_for_test(&contract),
             )
             .expect("ordered producer contract"),
         );

@@ -20,9 +20,9 @@ use std::fmt;
 
 use arrow::datatypes::DataType;
 
-use novarocks::runtime_filter_transition::model::contract::NullSemantics;
-use novarocks::runtime_filter_transition::port::value_domain::{
-    ContributionSizeError, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
+use novarocks_execution::runtime_filter::{
+    RuntimeFilterNullSemantics,
+    contribution::{MembershipValues, ValueDomainDelta},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,17 +46,13 @@ impl fmt::Display for ReducerError {
 
 impl std::error::Error for ReducerError {}
 
-impl From<ContributionSizeError> for ReducerError {
-    fn from(_: ContributionSizeError) -> Self {
-        Self::SizeOverflow
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct MembershipReducer {
     data_type: DataType,
-    null_semantics: NullSemantics,
-    domain: ReducedMembershipDomain,
+    null_semantics: RuntimeFilterNullSemantics,
+    /// Backend-owned mutable union state. Execution supplies canonical deltas;
+    /// it never owns this participant-local reduction or its retained bytes.
+    domain: ValueDomainDelta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,14 +69,13 @@ impl ReducerProjection {
 impl MembershipReducer {
     pub(crate) fn try_new(
         data_type: DataType,
-        null_semantics: NullSemantics,
+        null_semantics: RuntimeFilterNullSemantics,
     ) -> Result<Self, ReducerError> {
-        let values = MembershipValues::empty_for_data_type(&data_type)
-            .ok_or(ReducerError::UnsupportedType)?;
+        let values = empty_membership_values(&data_type).ok_or(ReducerError::UnsupportedType)?;
         Ok(Self {
             data_type,
             null_semantics,
-            domain: ReducedMembershipDomain::new(values, false),
+            domain: ValueDomainDelta::new(values, false),
         })
     }
 
@@ -92,8 +87,11 @@ impl MembershipReducer {
             return Err(ReducerError::TypeMismatch);
         }
         let value_growth = projected_value_growth(self.domain.values(), delta.values())?;
-        let null_growth =
-            usize::from(delta.retains_null(self.null_semantics) && !self.domain.contains_null());
+        let null_growth = usize::from(
+            delta.contains_null()
+                && self.null_semantics == RuntimeFilterNullSemantics::NullSafeEqual
+                && !self.domain.contains_null(),
+        );
         Ok(ReducerProjection {
             retained_growth: value_growth
                 .checked_add(null_growth)
@@ -105,17 +103,99 @@ impl MembershipReducer {
         &mut self,
         delta: &ValueDomainDelta,
     ) -> Result<(), ReducerError> {
-        self.domain
-            .union_prevalidated(delta.values(), delta.retains_null(self.null_semantics))
-            .map_err(|_| ReducerError::TypeMismatch)
+        let mut values = self.domain.values().clone();
+        union_membership_values(&mut values, delta.values())?;
+        let contains_null = self.domain.contains_null()
+            || (delta.contains_null()
+                && self.null_semantics == RuntimeFilterNullSemantics::NullSafeEqual);
+        self.domain = ValueDomainDelta::new(values, contains_null);
+        Ok(())
     }
 
-    pub(crate) const fn domain(&self) -> &ReducedMembershipDomain {
+    pub(crate) const fn domain(&self) -> &ValueDomainDelta {
         &self.domain
     }
 
-    pub(crate) fn into_domain(self) -> ReducedMembershipDomain {
+    pub(crate) fn into_domain(self) -> ValueDomainDelta {
         self.domain
+    }
+}
+
+fn empty_membership_values(data_type: &DataType) -> Option<MembershipValues> {
+    Some(match data_type {
+        DataType::Boolean => MembershipValues::boolean([]),
+        DataType::Int8 => MembershipValues::int8([]),
+        DataType::Int16 => MembershipValues::int16([]),
+        DataType::Int32 => MembershipValues::int32([]),
+        DataType::Int64 => MembershipValues::int64([]),
+        DataType::FixedSizeBinary(16) => MembershipValues::large_int([]),
+        DataType::Float32 => MembershipValues::float32([]),
+        DataType::Float64 => MembershipValues::float64([]),
+        DataType::Utf8 => MembershipValues::utf8(std::iter::empty::<String>()),
+        DataType::Date32 => MembershipValues::date32([]),
+        DataType::Timestamp(unit, timezone) => MembershipValues::timestamp(
+            unit.clone(),
+            timezone.as_ref().map(|value| value.to_string()),
+            [],
+        ),
+        DataType::Decimal128(precision, scale) => {
+            MembershipValues::decimal128(*precision, *scale, []).ok()?
+        }
+        _ => return None,
+    })
+}
+
+fn union_membership_values(
+    current: &mut MembershipValues,
+    incoming: &MembershipValues,
+) -> Result<(), ReducerError> {
+    macro_rules! union {
+        ($left:expr, $right:expr) => {{
+            $left.extend($right.iter().copied());
+            Ok(())
+        }};
+    }
+    match (current, incoming) {
+        (MembershipValues::Boolean(left), MembershipValues::Boolean(right)) => union!(left, right),
+        (MembershipValues::Int8(left), MembershipValues::Int8(right)) => union!(left, right),
+        (MembershipValues::Int16(left), MembershipValues::Int16(right)) => union!(left, right),
+        (MembershipValues::Int32(left), MembershipValues::Int32(right)) => union!(left, right),
+        (MembershipValues::Int64(left), MembershipValues::Int64(right)) => union!(left, right),
+        (MembershipValues::LargeInt(left), MembershipValues::LargeInt(right)) => {
+            union!(left, right)
+        }
+        (MembershipValues::Float32(left), MembershipValues::Float32(right)) => union!(left, right),
+        (MembershipValues::Float64(left), MembershipValues::Float64(right)) => union!(left, right),
+        (MembershipValues::Utf8(left), MembershipValues::Utf8(right)) => {
+            left.extend(right.iter().cloned());
+            Ok(())
+        }
+        (MembershipValues::Date32(left), MembershipValues::Date32(right)) => union!(left, right),
+        (
+            MembershipValues::Timestamp {
+                unit: left_unit,
+                timezone: left_timezone,
+                values: left,
+            },
+            MembershipValues::Timestamp {
+                unit: right_unit,
+                timezone: right_timezone,
+                values: right,
+            },
+        ) if left_unit == right_unit && left_timezone == right_timezone => union!(left, right),
+        (
+            MembershipValues::Decimal128 {
+                precision: left_precision,
+                scale: left_scale,
+                values: left,
+            },
+            MembershipValues::Decimal128 {
+                precision: right_precision,
+                scale: right_scale,
+                values: right,
+            },
+        ) if left_precision == right_precision && left_scale == right_scale => union!(left, right),
+        _ => Err(ReducerError::TypeMismatch),
     }
 }
 
@@ -184,10 +264,19 @@ fn projected_value_growth(
         ) if left_unit == right_unit && left_timezone == right_timezone => {
             missing_fixed_bytes(left, right, size_of::<i64>())
         }
-        (MembershipValues::Decimal128(left), MembershipValues::Decimal128(right))
-            if left.precision() == right.precision() && left.scale() == right.scale() =>
-        {
-            missing_fixed_bytes(left.values(), right.values(), size_of::<i128>())
+        (
+            MembershipValues::Decimal128 {
+                precision: left_precision,
+                scale: left_scale,
+                values: left,
+            },
+            MembershipValues::Decimal128 {
+                precision: right_precision,
+                scale: right_scale,
+                values: right,
+            },
+        ) if left_precision == right_precision && left_scale == right_scale => {
+            missing_fixed_bytes(left, right, size_of::<i128>())
         }
         _ => Err(ReducerError::TypeMismatch),
     }
@@ -197,9 +286,9 @@ fn projected_value_growth(
 mod tests {
     use arrow::datatypes::DataType;
 
-    use novarocks::runtime_filter_transition::model::contract::NullSemantics;
-    use novarocks::runtime_filter_transition::port::value_domain::{
-        MembershipValues, ValueDomainDelta,
+    use novarocks_execution::runtime_filter::{
+        RuntimeFilterNullSemantics,
+        contribution::{MembershipValues, ValueDomainDelta},
     };
 
     use super::MembershipReducer;
@@ -207,7 +296,8 @@ mod tests {
     #[test]
     fn value_domain_union_accepts_unseen_out_of_order_deltas() {
         let mut reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NeverMatches).unwrap();
+            MembershipReducer::try_new(DataType::Int64, RuntimeFilterNullSemantics::NeverMatches)
+                .unwrap();
         let first = ValueDomainDelta::new(MembershipValues::int64([30]), false);
         assert_eq!(reducer.preflight(&first).unwrap().retained_growth(), 8);
         reducer.commit_preflighted(&first).unwrap();
@@ -224,7 +314,8 @@ mod tests {
     #[test]
     fn reducer_deduplicates_values_and_retains_null_only_for_null_safe_equal() {
         let mut reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NullSafeEqual).unwrap();
+            MembershipReducer::try_new(DataType::Int64, RuntimeFilterNullSemantics::NullSafeEqual)
+                .unwrap();
         let first = ValueDomainDelta::new(MembershipValues::int64([1, 1]), true);
         assert_eq!(reducer.preflight(&first).unwrap().retained_growth(), 9);
         reducer.commit_preflighted(&first).unwrap();
@@ -239,7 +330,8 @@ mod tests {
     #[test]
     fn reducer_rejects_type_mismatch_before_mutation() {
         let reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NeverMatches).unwrap();
+            MembershipReducer::try_new(DataType::Int64, RuntimeFilterNullSemantics::NeverMatches)
+                .unwrap();
         assert!(
             reducer
                 .preflight(&ValueDomainDelta::new(MembershipValues::int32([1]), false))
@@ -251,7 +343,8 @@ mod tests {
     #[test]
     fn duplicate_value_projection_has_zero_growth() {
         let mut reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NeverMatches).unwrap();
+            MembershipReducer::try_new(DataType::Int64, RuntimeFilterNullSemantics::NeverMatches)
+                .unwrap();
         let delta = ValueDomainDelta::new(MembershipValues::int64([1]), false);
         reducer.commit_preflighted(&delta).unwrap();
         assert_eq!(reducer.preflight(&delta).unwrap().retained_growth(), 0);
@@ -261,9 +354,51 @@ mod tests {
     fn reducer_uses_port_owned_empty_largeint_construction() {
         let data_type = MembershipValues::large_int([]).data_type();
         let reducer =
-            MembershipReducer::try_new(data_type.clone(), NullSemantics::NeverMatches).unwrap();
+            MembershipReducer::try_new(data_type.clone(), RuntimeFilterNullSemantics::NeverMatches)
+                .unwrap();
 
         assert_eq!(reducer.domain().data_type(), data_type);
         assert!(reducer.domain().values().is_empty());
+    }
+
+    #[test]
+    fn backend_union_preserves_timestamp_and_decimal_contracts() {
+        let timestamp_type = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+        let mut timestamps =
+            MembershipReducer::try_new(timestamp_type, RuntimeFilterNullSemantics::NeverMatches)
+                .unwrap();
+        timestamps
+            .commit_preflighted(&ValueDomainDelta::new(
+                MembershipValues::timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    None::<String>,
+                    [7],
+                ),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(
+            timestamps.domain().values(),
+            &MembershipValues::timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                None::<String>,
+                [7],
+            )
+        );
+
+        let decimal_type = DataType::Decimal128(12, 3);
+        let mut decimals =
+            MembershipReducer::try_new(decimal_type, RuntimeFilterNullSemantics::NeverMatches)
+                .unwrap();
+        decimals
+            .commit_preflighted(&ValueDomainDelta::new(
+                MembershipValues::decimal128(12, 3, [42]).unwrap(),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(
+            decimals.domain().values(),
+            &MembershipValues::decimal128(12, 3, [42]).unwrap()
+        );
     }
 }

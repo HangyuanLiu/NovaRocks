@@ -55,7 +55,7 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime_filter::port::producer::ProducerFailureReason;
+use novarocks_execution::runtime_filter::RuntimeFilterProducerFailure;
 
 use super::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
@@ -241,15 +241,15 @@ impl Operator for AggregateStreamingSinkOperator {
     }
 
     fn cancel(&mut self) {
-        let _ = self.fail_native_topn_producers(ProducerFailureReason::Cancelled);
+        let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::Cancelled);
     }
 
     fn on_driver_failure(&mut self) {
-        let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
+        let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
     }
 
     fn close(&mut self) -> Result<(), String> {
-        self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed)
+        self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed)
     }
 
     fn is_finished(&self) -> bool {
@@ -307,7 +307,10 @@ impl AggregateStreamingSinkOperator {
         session.finish(&mut self.topn_boundary_bindings)
     }
 
-    fn fail_native_topn_producers(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    fn fail_native_topn_producers(
+        &mut self,
+        reason: RuntimeFilterProducerFailure,
+    ) -> Result<(), String> {
         let Some(session) = self.native_topn_session.as_mut() else {
             return Ok(());
         };
@@ -1033,7 +1036,7 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
             Ok(())
         })();
         if result.is_err() {
-            let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
+            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
         }
         result
     }
@@ -1058,7 +1061,7 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
             Ok(())
         })();
         if result.is_err() {
-            let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
+            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
         }
         result
     }

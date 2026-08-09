@@ -30,6 +30,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
+use novarocks_execution::runtime_filter::RuntimeFilterProducerFailure;
 
 use super::build_artifact::JoinBuildArtifact;
 use super::build_requirements::{NullKeyRequirement, required_build_components};
@@ -317,15 +318,11 @@ impl Operator for HashJoinBuildSinkOperator {
     }
 
     fn cancel(&mut self) {
-        let _ = self.fail_native_runtime_filters(
-            crate::runtime_filter::port::producer::ProducerFailureReason::Cancelled,
-        );
+        let _ = self.fail_native_runtime_filters(RuntimeFilterProducerFailure::Cancelled);
     }
 
     fn close(&mut self) -> Result<(), String> {
-        self.fail_native_runtime_filters(
-            crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed,
-        )
+        self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -454,9 +451,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             Ok(())
         })();
         if result.is_err() {
-            let _ = self.fail_native_runtime_filters(
-                crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed,
-            );
+            let _ = self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
         }
         result
     }
@@ -610,9 +605,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             Ok(())
         })();
         if result.is_err() {
-            let _ = self.fail_native_runtime_filters(
-                crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed,
-            );
+            let _ = self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
         }
         result
     }
@@ -652,7 +645,7 @@ impl HashJoinBuildSinkOperator {
 
     fn fail_native_runtime_filters(
         &mut self,
-        reason: crate::runtime_filter::port::producer::ProducerFailureReason,
+        reason: RuntimeFilterProducerFailure,
     ) -> Result<(), String> {
         match self.runtime_filter_execution.producers.as_mut() {
             Some(producers) => producers.fail(reason),

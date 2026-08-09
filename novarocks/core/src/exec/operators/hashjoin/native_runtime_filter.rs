@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
@@ -29,9 +28,7 @@ use novarocks_execution::runtime_filter as execution;
 
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
-use crate::exec::node::runtime_filter::{
-    RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
-};
+use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 #[cfg(test)]
 use crate::runtime_filter::codec::contribution::ContributionCodecError;
 #[cfg(test)]
@@ -40,17 +37,20 @@ use crate::runtime_filter::exec::membership_delta::{
 };
 #[cfg(test)]
 use crate::runtime_filter::model::contract::BindingId;
+#[cfg(test)]
 use crate::runtime_filter::model::contract::NullSemantics;
+#[cfg(test)]
 use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
+#[cfg(test)]
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::identity::PartitionId;
 #[cfg(test)]
 use crate::runtime_filter::port::identity::ProducerSequence;
-use crate::runtime_filter::port::producer::ProducerFailureReason;
 #[cfg(test)]
 use crate::runtime_filter::port::producer::{
     ProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
 };
+use execution::RuntimeFilterProducerFailure;
 
 #[derive(Default)]
 struct NativeProducerInstanceCoordinator {
@@ -69,15 +69,12 @@ enum NativeMembershipProducerSource {
 
 #[derive(Clone)]
 pub(crate) struct NativeMembershipProducerBinding {
-    binding_id: u32,
-    channel_id: u32,
     join_key_ordinal: usize,
+    contract: execution::RuntimeFilterProducerContract,
+    #[cfg(test)]
     data_type: DataType,
+    #[cfg(test)]
     membership_schema: ArtifactMembershipSchema,
-    contract: RuntimeFilterExecutionContract,
-    contribution_kinds: BTreeSet<ContributionKind>,
-    completion_requirement: CompletionRequirement,
-    reduction: RuntimeFilterExecutionReduction,
     source: NativeMembershipProducerSource,
     coordinator: Arc<NativeProducerInstanceCoordinator>,
 }
@@ -93,22 +90,21 @@ impl NativeMembershipProducerBinding {
     ) -> Self {
         let schema = ArtifactMembershipSchema::new(&data_type, NullSemantics::NeverMatches)
             .expect("test membership schema");
+        let execution_schema = execution::RuntimeFilterMembershipSchema::new(
+            &data_type,
+            execution::RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("test execution membership schema");
         Self {
-            binding_id,
-            channel_id: binding_id,
             join_key_ordinal,
             data_type,
             membership_schema: schema.clone(),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            },
-            contribution_kinds: BTreeSet::from([
-                ContributionKind::ValueDomainDelta,
-                ContributionKind::ProducerClosed,
-            ]),
-            completion_requirement: CompletionRequirement::ProducerClosed,
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
+            contract: execution::RuntimeFilterProducerContract::membership(
+                execution::RuntimeFilterBindingId::new(binding_id),
+                execution::RuntimeFilterChannelId::new(binding_id),
+                RuntimeFilterExecutionContract::Membership(execution_schema),
+            )
+            .expect("test membership producer contract"),
             source: NativeMembershipProducerSource::Prebound {
                 adapter,
                 max_contribution_bytes,
@@ -154,25 +150,17 @@ impl NativeMembershipProducerBinding {
                     spec.binding_id()
                 )
             })?;
-        let expected_schema = ArtifactMembershipSchema::new(&data_type, NullSemantics::NeverMatches)
-            .map_err(|error| {
-                format!(
-                    "native runtime-filter binding_id={} build expression has an unsupported membership schema: {error}",
-                    spec.binding_id()
-                )
-            })?;
-        let RuntimeFilterExecutionContract::Membership {
-            canonical_schema,
-            schema_digest,
-        } = spec.contract().contract()
+        let RuntimeFilterExecutionContract::Membership(membership_schema) =
+            spec.contract().contract()
         else {
             return Err(format!(
                 "native runtime-filter binding_id={} hash join producer requires a membership contract",
                 spec.binding_id()
             ));
         };
-        if canonical_schema.as_ref() != expected_schema.canonical_bytes()
-            || *schema_digest != expected_schema.digest().bytes()
+        if membership_schema.data_type() != &data_type
+            || membership_schema.null_semantics()
+                != execution::RuntimeFilterNullSemantics::NeverMatches
         {
             return Err(format!(
                 "native runtime-filter binding_id={} membership schema does not match build key ordinal {}",
@@ -180,30 +168,26 @@ impl NativeMembershipProducerBinding {
                 spec.build_key_index
             ));
         }
-        if spec.contract().reduction() != execution::RuntimeFilterReduction::SetUnion
-            || spec.contract().completion() != execution::RuntimeFilterCompletion::ProducerClosed
-        {
-            return Err(format!(
-                "native runtime-filter binding_id={} hash join producer contract is not Membership + SetUnion + ProducerClosed",
-                spec.binding_id()
-            ));
-        }
         Ok(Self {
-            binding_id: spec.binding_id(),
-            channel_id: spec.channel_id(),
             join_key_ordinal: spec.build_key_index,
-            data_type,
-            contract: spec.contract().contract().clone(),
-            contribution_kinds: BTreeSet::from([
-                ContributionKind::ValueDomainDelta,
-                ContributionKind::ProducerClosed,
-            ]),
-            completion_requirement: CompletionRequirement::ProducerClosed,
-            reduction: crate::exec::node::runtime_filter::RuntimeFilterExecutionReduction::SetUnion,
-            membership_schema: expected_schema,
+            contract: spec.contract().clone(),
+            #[cfg(test)]
+            data_type: data_type.clone(),
+            #[cfg(test)]
+            membership_schema: ArtifactMembershipSchema::new(
+                &data_type,
+                NullSemantics::NeverMatches,
+            )
+            .map_err(|error| error.to_string())?,
             source: NativeMembershipProducerSource::Session(session),
             coordinator: Arc::new(NativeProducerInstanceCoordinator::default()),
         })
+    }
+}
+
+impl NativeMembershipProducerBinding {
+    fn binding_id(&self) -> u32 {
+        self.contract.binding_id().get()
     }
 }
 
@@ -262,7 +246,7 @@ impl NativeRuntimeFilterProducerFactory {
     fn binding_ids(&self) -> Vec<u32> {
         self.bindings
             .iter()
-            .map(|binding| binding.binding_id)
+            .map(NativeMembershipProducerBinding::binding_id)
             .collect()
     }
 
@@ -310,7 +294,7 @@ impl NativeRuntimeFilterProducerSet {
     pub(crate) fn bind(&mut self, local_partition_count: u32) -> Result<(), String> {
         for index in 0..self.streams.len() {
             if let Err(error) = self.streams[index].bind(local_partition_count) {
-                let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
                 return Err(error);
             }
         }
@@ -322,10 +306,10 @@ impl NativeRuntimeFilterProducerSet {
             match self.streams[index].submit(key_arrays) {
                 Ok(NativeMembershipSubmitOutcome::Applied) => {}
                 Ok(NativeMembershipSubmitOutcome::Unavailable) => {
-                    self.streams[index].fail(ProducerFailureReason::UpstreamUnavailable)?;
+                    self.streams[index].fail(RuntimeFilterProducerFailure::UpstreamUnavailable)?;
                 }
                 Err(error) => {
-                    let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+                    let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
                     return Err(error);
                 }
             }
@@ -336,7 +320,7 @@ impl NativeRuntimeFilterProducerSet {
     pub(crate) fn finish(&mut self) -> Result<(), String> {
         for index in 0..self.streams.len() {
             if let Err(error) = self.streams[index].finish() {
-                let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
                 return Err(error);
             }
         }
@@ -344,14 +328,14 @@ impl NativeRuntimeFilterProducerSet {
         Ok(())
     }
 
-    pub(crate) fn fail(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    pub(crate) fn fail(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
         if self.completed {
             return Ok(());
         }
         self.fail_incomplete(reason)
     }
 
-    fn fail_incomplete(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    fn fail_incomplete(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
         let mut first_error = None;
         for stream in &mut self.streams {
             if let Err(error) = stream.fail(reason)
@@ -370,7 +354,7 @@ impl NativeRuntimeFilterProducerSet {
 impl Drop for NativeRuntimeFilterProducerSet {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+            let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
         }
     }
 }
@@ -471,11 +455,11 @@ impl NativeMembershipProducerStream {
         let NativeMembershipProducerSource::Session(session) = &self.binding.source else {
             return Err(format!(
                 "native runtime-filter binding_id={} has no execution producer session",
-                self.binding.binding_id
+                self.binding.binding_id()
             ));
         };
         let request = execution::RuntimeFilterProducerOpenRequest::new(
-            execution_membership_producer_contract(&self.binding)?,
+            self.binding.contract.clone(),
             local_partition_count,
         );
         let producer = match session.open_producer(request) {
@@ -487,7 +471,7 @@ impl NativeMembershipProducerStream {
             Err(error) => {
                 return Err(format!(
                     "native runtime-filter binding_id={} execution session open failed during operator bind: {error}",
-                    self.binding.binding_id
+                    self.binding.binding_id()
                 ));
             }
         };
@@ -503,13 +487,13 @@ impl NativeMembershipProducerStream {
         let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} producer was not bound before build input",
-                self.binding.binding_id
+                self.binding.binding_id()
             )
         })?;
         let max_contribution_bytes = self.max_contribution_bytes.ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} installed contribution budget is missing",
-                self.binding.binding_id
+                self.binding.binding_id()
             )
         })?;
         let array = key_arrays
@@ -517,20 +501,19 @@ impl NativeMembershipProducerStream {
             .ok_or_else(|| {
                 format!(
                     "native runtime-filter binding_id={} build key ordinal {} is missing from evaluated arrays",
-                    self.binding.binding_id, self.binding.join_key_ordinal
+                    self.binding.binding_id(), self.binding.join_key_ordinal
                 )
         })?;
         if let NativeMembershipProducerEndpoint::Execution(producer) = endpoint {
-            let producer_contract = execution_membership_producer_contract(&self.binding)?;
             let contributions = match execution::contribution::encode_membership_contributions(
-                &producer_contract,
+                &self.binding.contract,
                 array,
                 max_contribution_bytes,
             )
             .map_err(|error| {
                 format!(
                     "native runtime-filter binding_id={} membership encoding failed: {error}",
-                    self.binding.binding_id
+                    self.binding.binding_id()
                 )
             })? {
                 execution::contribution::MembershipContributionEncodingOutcome::Contributions(
@@ -565,14 +548,14 @@ impl NativeMembershipProducerStream {
                     Err(error) => {
                         return Err(format!(
                             "native runtime-filter binding_id={} contribution failed: {error}",
-                            self.binding.binding_id
+                            self.binding.binding_id()
                         ));
                     }
                 }
                 self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
                     format!(
                         "native runtime-filter binding_id={} producer sequence overflow",
-                        self.binding.binding_id
+                        self.binding.binding_id()
                     )
                 })?;
             }
@@ -591,7 +574,7 @@ impl NativeMembershipProducerStream {
         .map_err(|error| {
             format!(
                 "native runtime-filter binding_id={} membership encoding failed: {error}",
-                self.binding.binding_id
+                self.binding.binding_id()
             )
         })?;
         #[cfg(test)]
@@ -616,7 +599,7 @@ impl NativeMembershipProducerStream {
                 Err(error) => {
                     return Err(format!(
                         "native runtime-filter binding_id={} contribution failed: {error}",
-                        self.binding.binding_id
+                        self.binding.binding_id()
                     ));
                 }
             };
@@ -631,7 +614,7 @@ impl NativeMembershipProducerStream {
             self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
                 format!(
                     "native runtime-filter binding_id={} producer sequence overflow",
-                    self.binding.binding_id
+                    self.binding.binding_id()
                 )
             })?;
         }
@@ -653,7 +636,7 @@ impl NativeMembershipProducerStream {
         let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} producer was not bound before finish",
-                self.binding.binding_id
+                self.binding.binding_id()
             )
         })?;
         let terminal_noop = match endpoint {
@@ -673,7 +656,7 @@ impl NativeMembershipProducerStream {
                     Err(error) => {
                         return Err(format!(
                             "native runtime-filter binding_id={} close failed: {error}",
-                            self.binding.binding_id
+                            self.binding.binding_id()
                         ));
                     }
                 }
@@ -690,7 +673,7 @@ impl NativeMembershipProducerStream {
                 Err(error) => {
                     return Err(format!(
                         "native runtime-filter binding_id={} close failed: {error}",
-                        self.binding.binding_id
+                        self.binding.binding_id()
                     ));
                 }
             },
@@ -713,7 +696,7 @@ impl NativeMembershipProducerStream {
         self.terminal = true;
     }
 
-    fn fail(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    fn fail(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
         self.terminal = true;
         if self
             .binding
@@ -729,39 +712,46 @@ impl NativeMembershipProducerStream {
         };
         match endpoint {
             NativeMembershipProducerEndpoint::Execution(producer) => {
-                if let Err(error) = producer.fail(match reason {
-                    ProducerFailureReason::Cancelled => {
-                        execution::RuntimeFilterProducerFailure::Cancelled
-                    }
-                    ProducerFailureReason::ExecutionFailed => {
-                        execution::RuntimeFilterProducerFailure::ExecutionFailed
-                    }
-                    ProducerFailureReason::UpstreamUnavailable => {
-                        execution::RuntimeFilterProducerFailure::UpstreamUnavailable
-                    }
-                }) {
+                if let Err(error) = producer.fail(reason) {
                     if error.kind() != execution::RuntimeFilterContractViolationKind::SessionClosed
                     {
                         return Err(format!(
                             "native runtime-filter binding_id={} fail-open failed: {error}",
-                            self.binding.binding_id
+                            self.binding.binding_id()
                         ));
                     }
                 }
             }
             #[cfg(test)]
             NativeMembershipProducerEndpoint::Prebound(adapter) => {
-                if let Err(error) = adapter.fail(reason) {
+                if let Err(error) = adapter.fail(test_producer_failure(reason)) {
                     if error.kind() != RuntimeContractViolationKind::ServiceUnavailable {
                         return Err(format!(
                             "native runtime-filter binding_id={} fail-open failed: {error}",
-                            self.binding.binding_id
+                            self.binding.binding_id()
                         ));
                     }
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+fn test_producer_failure(
+    reason: RuntimeFilterProducerFailure,
+) -> crate::runtime_filter::port::producer::ProducerFailureReason {
+    match reason {
+        RuntimeFilterProducerFailure::Cancelled => {
+            crate::runtime_filter::port::producer::ProducerFailureReason::Cancelled
+        }
+        RuntimeFilterProducerFailure::ExecutionFailed => {
+            crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed
+        }
+        RuntimeFilterProducerFailure::UpstreamUnavailable => {
+            crate::runtime_filter::port::producer::ProducerFailureReason::UpstreamUnavailable
+        }
     }
 }
 
@@ -916,49 +906,13 @@ fn wait_at_native_producer_close_gate_for_test(
     }
 }
 
-fn execution_membership_producer_contract(
-    binding: &NativeMembershipProducerBinding,
-) -> Result<execution::RuntimeFilterProducerContract, String> {
-    let RuntimeFilterExecutionContract::Membership {
-        canonical_schema,
-        schema_digest,
-    } = &binding.contract
-    else {
-        return Err(format!(
-            "native runtime-filter binding_id={} hash join producer requires a membership contract",
-            binding.binding_id
-        ));
-    };
-    if binding.reduction != RuntimeFilterExecutionReduction::SetUnion
-        || binding.contribution_kinds
-            != BTreeSet::from([
-                ContributionKind::ValueDomainDelta,
-                ContributionKind::ProducerClosed,
-            ])
-        || binding.completion_requirement != CompletionRequirement::ProducerClosed
-    {
-        return Err(format!(
-            "native runtime-filter binding_id={} hash join producer has an invalid frozen contract",
-            binding.binding_id
-        ));
-    }
-    Ok(execution::RuntimeFilterProducerContract::new(
-        execution::RuntimeFilterBindingId::new(binding.binding_id),
-        execution::RuntimeFilterChannelId::new(binding.channel_id),
-        execution::RuntimeFilterProducerKind::Membership,
-        execution::RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::clone(canonical_schema),
-            schema_digest: *schema_digest,
-        },
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::DataType;
+    use novarocks_execution::runtime_filter as execution;
 
     use super::{
         NativeMembershipProducerBinding, NativeRuntimeFilterProducerFactory,
@@ -1365,11 +1319,7 @@ mod tests {
         let semantic_budget = delta.canonical_encoded_len().expect("semantic size");
 
         assert!(matches!(
-            encode_execution_membership_contribution(
-                CoreContribution::Membership(delta),
-                &schema,
-                semantic_budget,
-            ),
+            encode_execution_membership_contribution(delta, &schema, semantic_budget,),
             Ok(None)
         ));
     }
@@ -1452,10 +1402,10 @@ mod tests {
         let mut sibling = factory.create(1).expect("sibling partition");
 
         first
-            .fail(ProducerFailureReason::Cancelled)
+            .fail(execution::RuntimeFilterProducerFailure::Cancelled)
             .expect("first failure");
         sibling
-            .fail(ProducerFailureReason::ExecutionFailed)
+            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed)
             .expect("sibling failure");
 
         assert_eq!(
@@ -1480,7 +1430,7 @@ mod tests {
         let mut sibling = factory.create(1).expect("sibling partition");
 
         first
-            .fail(ProducerFailureReason::ExecutionFailed)
+            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed)
             .expect("first failure");
         sibling.finish().expect("sibling finish after failure");
         drop(sibling);

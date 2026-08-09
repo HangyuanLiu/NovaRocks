@@ -935,8 +935,7 @@ fn attach_hash_aggregate_producers(
                 ),
             )
         })?;
-        let execution::RuntimeFilterExecutionContract::Ordered { keys, .. } = contract.contract()
-        else {
+        let execution::RuntimeFilterExecutionContract::Ordered(order) = contract.contract() else {
             return Err(NativeFragmentDecodeError::inconsistent(
                 binding_path.clone(),
                 format!(
@@ -945,7 +944,7 @@ fn attach_hash_aggregate_producers(
                 ),
             ));
         };
-        if keys.len() != 1 || keys[0].data_type() != group_key_type {
+        if order.keys().len() != 1 || order.keys()[0].data_type() != group_key_type {
             return Err(NativeFragmentDecodeError::inconsistent(
                 binding_path.clone(),
                 format!(
@@ -1602,35 +1601,32 @@ mod tests {
 
     #[test]
     fn execution_contract_retains_ordered_key_semantics() {
-        let contract = execution::RuntimeFilterExecutionContract::Ordered {
-            keys: Arc::from([execution::RuntimeOrderKey::new(
-                DataType::Int64,
-                execution::RuntimeOrderSortDirection::Descending,
-                execution::RuntimeOrderNullOrder::First,
-            )]),
-            comparator_digest: [3; 32],
-            order_contract_digest: [4; 32],
-        };
+        let contract = execution::RuntimeFilterExecutionContract::Ordered(Arc::new(
+            execution::contribution::RuntimeOrderContract::from_frozen(
+                [execution::contribution::RuntimeOrderKey::with_order(
+                    DataType::Int64,
+                    execution::contribution::RuntimeOrderSortDirection::Descending,
+                    execution::contribution::RuntimeOrderNullOrder::First,
+                )],
+                [3; 32],
+                [4; 32],
+            ),
+        ));
 
-        let execution::RuntimeFilterExecutionContract::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        } = contract
-        else {
+        let execution::RuntimeFilterExecutionContract::Ordered(order) = contract else {
             panic!("ordered decoded contract must remain ordered")
         };
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].data_type(), &DataType::Int64);
+        assert_eq!(order.keys().len(), 1);
+        assert_eq!(order.keys()[0].data_type(), &DataType::Int64);
         assert_eq!(
-            keys[0].direction(),
-            execution::RuntimeOrderSortDirection::Descending
+            order.keys()[0].direction(),
+            execution::contribution::RuntimeOrderSortDirection::Descending
         );
         assert_eq!(
-            keys[0].null_order(),
-            execution::RuntimeOrderNullOrder::First
+            order.keys()[0].null_order(),
+            execution::contribution::RuntimeOrderNullOrder::First
         );
-        assert_eq!(comparator_digest, [3; 32]);
-        assert_eq!(order_contract_digest, [4; 32]);
+        assert_eq!(order.comparator_digest(), [3; 32]);
+        assert_eq!(order.digest(), [4; 32]);
     }
 }

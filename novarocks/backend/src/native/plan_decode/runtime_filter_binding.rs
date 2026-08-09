@@ -19,19 +19,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks::protocol::{FieldPath, ProtocolErrorKind};
-use novarocks::runtime_filter_transition::model::contract::{
-    ComparatorDigest, NullOrder, OrderContract, OrderKeyContract, SortDirection,
-    TopKSummaryRequirement,
-};
-use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
-use novarocks::runtime_filter_transition::port::ordered_bound::{
-    RuntimeOrderContract, comparator_digest_for_plan,
-};
-use novarocks::runtime_filter_transition::port::topk_summary::RuntimeTopKSummaryContract;
 use novarocks_execution::runtime_filter as execution;
 use novarocks_protocol::{expr, plan};
 
@@ -568,16 +560,6 @@ fn decode_contract(
                     ),
                 ));
             }
-            let view = ArtifactMembershipSchema::view(&membership.canonical_schema).map_err(
-                |error| {
-                    NativeFragmentDecodeError::invalid_value(
-                        path.clone().field("canonical_schema"),
-                        format!(
-                            "native runtime-filter binding_id={binding_id} membership schema is noncanonical: {error:?}"
-                        ),
-                    )
-                },
-            )?;
             let digest = digest32(
                 binding_id,
                 "membership schema_digest",
@@ -586,23 +568,30 @@ fn decode_contract(
             .map_err(|error| {
                 NativeFragmentDecodeError::invalid_value(path.clone().field("schema_digest"), error)
             })?;
-            if view.digest().bytes() != digest {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    path.clone().field("schema_digest"),
+            let schema = execution::RuntimeFilterMembershipSchema::from_canonical(
+                &membership.canonical_schema,
+                digest,
+            )
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("canonical_schema"),
                     format!(
-                        "native runtime-filter binding_id={binding_id} membership schema digest mismatch"
+                        "native runtime-filter binding_id={binding_id} membership schema is noncanonical: {error}"
                     ),
-                ));
-            }
-            let expected = ArtifactMembershipSchema::new(expression_type, view.null_semantics())
-                .map_err(|error| {
-                    NativeFragmentDecodeError::invalid_value(
-                        path.clone().field("canonical_schema"),
-                        format!(
-                            "native runtime-filter binding_id={binding_id} expression type cannot form membership schema: {error:?}"
-                        ),
-                    )
-                })?;
+                )
+            })?;
+            let expected = execution::RuntimeFilterMembershipSchema::new(
+                expression_type,
+                schema.null_semantics(),
+            )
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("canonical_schema"),
+                    format!(
+                        "native runtime-filter binding_id={binding_id} expression type cannot form membership schema: {error}"
+                    ),
+                )
+            })?;
             if expected.canonical_bytes() != membership.canonical_schema {
                 return Err(NativeFragmentDecodeError::inconsistent(
                     path.field("canonical_schema"),
@@ -611,10 +600,9 @@ fn decode_contract(
                     ),
                 ));
             }
-            Ok(execution::RuntimeFilterExecutionContract::Membership {
-                canonical_schema: membership.canonical_schema.clone().into(),
-                schema_digest: digest,
-            })
+            Ok(execution::RuntimeFilterExecutionContract::Membership(
+                schema,
+            ))
         }
         plan::runtime_filter_contract::Kind::Ordered(ordered) => {
             let path = path.field("ordered");
@@ -646,8 +634,12 @@ fn decode_contract(
                         )
                     })?;
                 let direction = match plan::RuntimeFilterSortDirection::try_from(key.direction) {
-                    Ok(plan::RuntimeFilterSortDirection::Ascending) => SortDirection::Ascending,
-                    Ok(plan::RuntimeFilterSortDirection::Descending) => SortDirection::Descending,
+                    Ok(plan::RuntimeFilterSortDirection::Ascending) => {
+                        execution::contribution::RuntimeOrderSortDirection::Ascending
+                    }
+                    Ok(plan::RuntimeFilterSortDirection::Descending) => {
+                        execution::contribution::RuntimeOrderSortDirection::Descending
+                    }
                     Ok(plan::RuntimeFilterSortDirection::Unspecified) | Err(_) => {
                         return Err(NativeFragmentDecodeError::invalid_enum(
                             key_path.clone().field("direction"),
@@ -659,8 +651,12 @@ fn decode_contract(
                     }
                 };
                 let null_order = match plan::RuntimeFilterNullOrder::try_from(key.null_order) {
-                    Ok(plan::RuntimeFilterNullOrder::First) => NullOrder::First,
-                    Ok(plan::RuntimeFilterNullOrder::Last) => NullOrder::Last,
+                    Ok(plan::RuntimeFilterNullOrder::First) => {
+                        execution::contribution::RuntimeOrderNullOrder::First
+                    }
+                    Ok(plan::RuntimeFilterNullOrder::Last) => {
+                        execution::contribution::RuntimeOrderNullOrder::Last
+                    }
                     Ok(plan::RuntimeFilterNullOrder::Unspecified) | Err(_) => {
                         return Err(NativeFragmentDecodeError::invalid_enum(
                             key_path.field("null_order"),
@@ -671,18 +667,17 @@ fn decode_contract(
                         ));
                     }
                 };
-                keys.push(OrderKeyContract {
-                    data_type,
-                    direction,
-                    null_order,
-                });
+                keys.push(execution::contribution::RuntimeOrderKey::with_order(
+                    data_type, direction, null_order,
+                ));
             }
-            if &keys[0].data_type != expression_type {
+            if keys[0].data_type() != expression_type {
                 return Err(NativeFragmentDecodeError::inconsistent(
                     path.clone().field("keys").index(0).field("type"),
                     format!(
                         "native runtime-filter binding_id={binding_id} ordered key type {:?} does not match expression type {:?}",
-                        keys[0].data_type, expression_type
+                        keys[0].data_type(),
+                        expression_type
                     ),
                 ));
             }
@@ -704,12 +699,11 @@ fn decode_contract(
                     error,
                 )
             })?;
-            let plan_contract = OrderContract {
-                keys: keys.clone(),
-                inclusive: true,
-                comparator_digest: ComparatorDigest::new(comparator),
-            };
-            let canonical = RuntimeOrderContract::try_from_plan(&plan_contract).map_err(|error| {
+            let canonical = execution::contribution::RuntimeOrderContract::from_fragment_contract(
+                keys,
+                comparator,
+                order_digest,
+            ).map_err(|error| {
                 NativeFragmentDecodeError::invalid_value(
                     path.clone(),
                     format!(
@@ -717,39 +711,9 @@ fn decode_contract(
                     ),
                 )
             })?;
-            if canonical.digest().bytes() != order_digest {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    path.field("order_contract_digest"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} order contract digest mismatch"
-                    ),
-                ));
-            }
-            Ok(execution::RuntimeFilterExecutionContract::Ordered {
-                keys: keys
-                    .iter()
-                    .map(|key| {
-                        execution::RuntimeOrderKey::new(
-                            key.data_type.clone(),
-                            match key.direction {
-                                SortDirection::Ascending => {
-                                    execution::RuntimeOrderSortDirection::Ascending
-                                }
-                                SortDirection::Descending => {
-                                    execution::RuntimeOrderSortDirection::Descending
-                                }
-                            },
-                            match key.null_order {
-                                NullOrder::First => execution::RuntimeOrderNullOrder::First,
-                                NullOrder::Last => execution::RuntimeOrderNullOrder::Last,
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .into(),
-                comparator_digest: comparator,
-                order_contract_digest: order_digest,
-            })
+            Ok(execution::RuntimeFilterExecutionContract::Ordered(
+                Arc::new(canonical),
+            ))
         }
     }
 }
@@ -803,12 +767,7 @@ fn decode_reduction(
                         error,
                     )
                 })?;
-            let execution::RuntimeFilterExecutionContract::Ordered {
-                keys,
-                comparator_digest,
-                ..
-            } = contract
-            else {
+            let execution::RuntimeFilterExecutionContract::Ordered(order) = contract else {
                 return Err(NativeFragmentDecodeError::inconsistent(
                     topk_path.clone(),
                     format!(
@@ -816,31 +775,10 @@ fn decode_reduction(
                     ),
                 ));
             };
-            let order = OrderContract {
-                keys: keys
-                    .iter()
-                    .map(|key| OrderKeyContract {
-                        data_type: key.data_type().clone(),
-                        direction: match key.direction() {
-                            execution::RuntimeOrderSortDirection::Ascending => {
-                                SortDirection::Ascending
-                            }
-                            execution::RuntimeOrderSortDirection::Descending => {
-                                SortDirection::Descending
-                            }
-                        },
-                        null_order: match key.null_order() {
-                            execution::RuntimeOrderNullOrder::First => NullOrder::First,
-                            execution::RuntimeOrderNullOrder::Last => NullOrder::Last,
-                        },
-                    })
-                    .collect(),
-                inclusive: true,
-                comparator_digest: ComparatorDigest::new(*comparator_digest),
-            };
-            let expected = RuntimeTopKSummaryContract::try_from_plan(
-                &order,
-                TopKSummaryRequirement::try_new(k.get()).expect("nonzero"),
+            execution::contribution::RuntimeTopKSummaryContract::validate_fragment_contract(
+                order,
+                k.get(),
+                digest,
             )
             .map_err(|error| {
                 NativeFragmentDecodeError::invalid_value(
@@ -848,14 +786,6 @@ fn decode_reduction(
                     format!("native runtime-filter binding_id={binding_id} TopK contract is noncanonical: {error:?}"),
                 )
             })?;
-            if expected.digest().bytes() != digest {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    topk_path.field("contract_digest"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} TopK contract digest mismatch"
-                    ),
-                ));
-            }
             Ok(execution::RuntimeFilterReduction::MergeTopKSummary {
                 k: k.get(),
                 contract_digest: digest,
@@ -1054,15 +984,15 @@ fn validate_role_contract(
 ) -> Result<(), String> {
     match (contract, reduction) {
         (
-            execution::RuntimeFilterExecutionContract::Membership { .. },
+            execution::RuntimeFilterExecutionContract::Membership(..),
             execution::RuntimeFilterReduction::SetUnion,
         )
         | (
-            execution::RuntimeFilterExecutionContract::Ordered { .. },
+            execution::RuntimeFilterExecutionContract::Ordered(..),
             execution::RuntimeFilterReduction::TightenOrderedBound,
         )
         | (
-            execution::RuntimeFilterExecutionContract::Ordered { .. },
+            execution::RuntimeFilterExecutionContract::Ordered(..),
             execution::RuntimeFilterReduction::MergeTopKSummary { .. },
         ) => {}
         _ => {
@@ -1074,11 +1004,11 @@ fn validate_role_contract(
     match role {
         DecodedWireBindingRole::Consumer { capabilities, .. } => {
             let expected = match contract {
-                execution::RuntimeFilterExecutionContract::Membership { .. } => BTreeSet::from([
+                execution::RuntimeFilterExecutionContract::Membership(..) => BTreeSet::from([
                     WireArtifactCapability::Membership,
                     WireArtifactCapability::EmptyDomain,
                 ]),
-                execution::RuntimeFilterExecutionContract::Ordered { .. } => {
+                execution::RuntimeFilterExecutionContract::Ordered(..) => {
                     BTreeSet::from([WireArtifactCapability::OrderedRange])
                 }
             };
@@ -1089,7 +1019,7 @@ fn validate_role_contract(
             }
             if matches!(
                 contract,
-                execution::RuntimeFilterExecutionContract::Ordered { .. }
+                execution::RuntimeFilterExecutionContract::Ordered(..)
             ) && matches!(
                 role,
                 DecodedWireBindingRole::Consumer {
@@ -1169,7 +1099,7 @@ fn into_execution_role(
         } => {
             let producer = match (&contract, reduction) {
                 (
-                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterExecutionContract::Membership(..),
                     execution::RuntimeFilterReduction::SetUnion,
                 ) => {
                     if contribution_kinds.contains(&WireContributionKind::FinalDomainShard) {
@@ -1183,13 +1113,13 @@ fn into_execution_role(
                     }
                 }
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::TightenOrderedBound,
                 ) => execution::RuntimeFilterProducerContract::ordered_bound(
                     binding_id, channel_id, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::MergeTopKSummary { k, .. },
                 ) => execution::RuntimeFilterProducerContract::top_k_summary(
                     binding_id, channel_id, k, contract,
@@ -1215,28 +1145,28 @@ fn into_execution_role(
         } => {
             let consumer = match (&contract, reduction, activation) {
                 (
-                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterExecutionContract::Membership(..),
                     execution::RuntimeFilterReduction::SetUnion,
                     execution::ConsumerActivation::BlockingSnapshot,
                 ) => execution::RuntimeFilterConsumerContract::membership_blocking(
                     binding_id, channel_id, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterExecutionContract::Membership(..),
                     execution::RuntimeFilterReduction::SetUnion,
                     execution::ConsumerActivation::NonBlockingLive { late_apply },
                 ) => execution::RuntimeFilterConsumerContract::membership_live(
                     binding_id, channel_id, late_apply, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::TightenOrderedBound,
                     execution::ConsumerActivation::NonBlockingLive { late_apply },
                 ) => execution::RuntimeFilterConsumerContract::ordered_live(
                     binding_id, channel_id, late_apply, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::MergeTopKSummary { k, .. },
                     execution::ConsumerActivation::NonBlockingLive { late_apply },
                 ) => execution::RuntimeFilterConsumerContract::top_k_live(
@@ -1265,18 +1195,10 @@ fn into_execution_role(
 mod tests {
     use arrow::datatypes::DataType;
     use prost::Message;
+    use sha2::{Digest, Sha256};
 
     use super::*;
     use novarocks::protocol::ProtocolErrorKind;
-    use novarocks::runtime_filter_transition::model::contract::{
-        NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
-        TopKSummaryRequirement,
-    };
-    use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
-    use novarocks::runtime_filter_transition::port::ordered_bound::{
-        RuntimeOrderContract, comparator_digest_for_plan,
-    };
-    use novarocks::runtime_filter_transition::port::topk_summary::RuntimeTopKSummaryContract;
     use novarocks_protocol::expr;
 
     fn int64_type() -> novarocks_protocol::common::TypeDesc {
@@ -1326,8 +1248,11 @@ mod tests {
     }
 
     fn membership_binding(binding_id: u32, node_id: i32) -> plan::RuntimeFilterBinding {
-        let schema = ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
-            .expect("schema");
+        let schema = execution::RuntimeFilterMembershipSchema::new(
+            &DataType::Int64,
+            execution::RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("schema");
         plan::RuntimeFilterBinding {
             binding_id,
             channel_id: 9,
@@ -1338,7 +1263,7 @@ mod tests {
                 kind: Some(plan::runtime_filter_contract::Kind::Membership(
                     plan::RuntimeFilterMembershipContract {
                         canonical_schema: schema.canonical_bytes().to_vec(),
-                        schema_digest: schema.digest().bytes().to_vec(),
+                        schema_digest: schema.digest().to_vec(),
                     },
                 )),
             }),
@@ -1468,31 +1393,39 @@ mod tests {
         ordered_topk_binding_with_keys(
             binding_id,
             node_id,
-            vec![OrderKeyContract {
-                data_type: DataType::Int64,
-                direction: SortDirection::Descending,
-                null_order: NullOrder::First,
-            }],
+            vec![execution::contribution::RuntimeOrderKey::with_order(
+                DataType::Int64,
+                execution::contribution::RuntimeOrderSortDirection::Descending,
+                execution::contribution::RuntimeOrderNullOrder::First,
+            )],
         )
     }
 
     fn ordered_topk_binding_with_keys(
         binding_id: u32,
         node_id: i32,
-        keys: Vec<OrderKeyContract>,
+        keys: Vec<execution::contribution::RuntimeOrderKey>,
     ) -> plan::RuntimeFilterBinding {
-        let comparator = comparator_digest_for_plan(&keys).expect("comparator");
-        let order = OrderContract {
-            keys: keys.clone(),
-            inclusive: true,
-            comparator_digest: comparator,
-        };
-        let canonical_order = RuntimeOrderContract::try_from_plan(&order).expect("order");
-        let canonical_topk = RuntimeTopKSummaryContract::try_from_plan(
-            &order,
-            TopKSummaryRequirement::try_new(13).expect("k"),
-        )
-        .expect("topk");
+        let canonical_keys = ordered_key_bytes(&keys);
+        let comparator = sha256_parts(&[
+            b"novarocks.runtime-filter.comparator",
+            &1u16.to_be_bytes(),
+            &canonical_keys,
+        ]);
+        let order_digest = sha256_parts(&[
+            b"novarocks.runtime-filter.order-contract",
+            &1u16.to_be_bytes(),
+            &canonical_keys,
+            &[1],
+            &comparator,
+            &1u16.to_be_bytes(),
+        ]);
+        let canonical_topk = sha256_parts(&[
+            b"novarocks.runtime-filter.top-k-summary-contract",
+            &1u16.to_be_bytes(),
+            &order_digest,
+            &13u32.to_be_bytes(),
+        ]);
         plan::RuntimeFilterBinding {
             binding_id,
             channel_id: 10,
@@ -1505,23 +1438,26 @@ mod tests {
                         keys: keys
                             .iter()
                             .map(|key| plan::RuntimeFilterOrderKey {
-                                r#type: Some(int64_type()),
-                                direction: i32::from(match key.direction {
-                                    SortDirection::Ascending => {
+                                r#type: Some(
+                                    crate::native::type_decode::encode_type(key.data_type())
+                                        .expect("test key type"),
+                                ),
+                                direction: i32::from(match key.direction() {
+                                    execution::contribution::RuntimeOrderSortDirection::Ascending => {
                                         plan::RuntimeFilterSortDirection::Ascending
                                     }
-                                    SortDirection::Descending => {
+                                    execution::contribution::RuntimeOrderSortDirection::Descending => {
                                         plan::RuntimeFilterSortDirection::Descending
                                     }
                                 }),
-                                null_order: i32::from(match key.null_order {
-                                    NullOrder::First => plan::RuntimeFilterNullOrder::First,
-                                    NullOrder::Last => plan::RuntimeFilterNullOrder::Last,
+                                null_order: i32::from(match key.null_order() {
+                                    execution::contribution::RuntimeOrderNullOrder::First => plan::RuntimeFilterNullOrder::First,
+                                    execution::contribution::RuntimeOrderNullOrder::Last => plan::RuntimeFilterNullOrder::Last,
                                 }),
                             })
                             .collect(),
-                        comparator_digest: comparator.get().to_vec(),
-                        order_contract_digest: canonical_order.digest().bytes().to_vec(),
+                        comparator_digest: comparator.to_vec(),
+                        order_contract_digest: order_digest.to_vec(),
                     },
                 )),
             }),
@@ -1530,7 +1466,7 @@ mod tests {
                     plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(
                         plan::RuntimeFilterTopKReduction {
                             k: 13,
-                            contract_digest: canonical_topk.digest().bytes().to_vec(),
+                            contract_digest: canonical_topk.to_vec(),
                         },
                     ),
                 ),
@@ -1551,6 +1487,37 @@ mod tests {
                 },
             )),
         }
+    }
+
+    fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        for part in parts {
+            digest.update(part);
+        }
+        digest.finalize().into()
+    }
+
+    fn ordered_key_bytes(keys: &[execution::contribution::RuntimeOrderKey]) -> Vec<u8> {
+        let mut bytes = u32::try_from(keys.len())
+            .expect("test key count")
+            .to_be_bytes()
+            .to_vec();
+        for key in keys {
+            bytes.push(match key.data_type() {
+                DataType::Int64 => 5,
+                DataType::Utf8 => 9,
+                other => panic!("test only encodes Int64 or Utf8 keys, got {other:?}"),
+            });
+            bytes.push(match key.direction() {
+                execution::contribution::RuntimeOrderSortDirection::Ascending => 1,
+                execution::contribution::RuntimeOrderSortDirection::Descending => 2,
+            });
+            bytes.push(match key.null_order() {
+                execution::contribution::RuntimeOrderNullOrder::First => 1,
+                execution::contribution::RuntimeOrderNullOrder::Last => 2,
+            });
+        }
+        bytes
     }
 
     #[test]
@@ -1643,16 +1610,16 @@ mod tests {
             1,
             11,
             vec![
-                OrderKeyContract {
-                    data_type: DataType::Int64,
-                    direction: SortDirection::Descending,
-                    null_order: NullOrder::First,
-                },
-                OrderKeyContract {
-                    data_type: DataType::Utf8,
-                    direction: SortDirection::Ascending,
-                    null_order: NullOrder::Last,
-                },
+                execution::contribution::RuntimeOrderKey::with_order(
+                    DataType::Int64,
+                    execution::contribution::RuntimeOrderSortDirection::Descending,
+                    execution::contribution::RuntimeOrderNullOrder::First,
+                ),
+                execution::contribution::RuntimeOrderKey::with_order(
+                    DataType::Utf8,
+                    execution::contribution::RuntimeOrderSortDirection::Ascending,
+                    execution::contribution::RuntimeOrderNullOrder::Last,
+                ),
             ],
         );
         assert!(
@@ -1666,11 +1633,11 @@ mod tests {
         let binding = ordered_topk_binding_with_keys(
             1,
             11,
-            vec![OrderKeyContract {
-                data_type: DataType::Utf8,
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::Last,
-            }],
+            vec![execution::contribution::RuntimeOrderKey::with_order(
+                DataType::Utf8,
+                execution::contribution::RuntimeOrderSortDirection::Ascending,
+                execution::contribution::RuntimeOrderNullOrder::Last,
+            )],
         );
         assert!(
             NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding]))).is_err(),
@@ -1847,11 +1814,10 @@ mod tests {
         let DecodedBindingRole::Consumer { contract, .. } = &record.role else {
             panic!("consumer")
         };
-        let execution::RuntimeFilterExecutionContract::Ordered { keys, .. } = contract.contract()
-        else {
+        let execution::RuntimeFilterExecutionContract::Ordered(order) = contract.contract() else {
             panic!("ordered")
         };
-        assert_eq!(keys.len(), 1);
+        assert_eq!(order.keys().len(), 1);
 
         let mut wrong_comparator = ordered.clone();
         let plan::runtime_filter_contract::Kind::Ordered(contract) = wrong_comparator
@@ -1925,7 +1891,7 @@ mod tests {
             panic!("consumer role")
         };
         assert_eq!(contract.binding_id().get(), 1);
-        assert_eq!(contract.channel_id().get(), 11);
+        assert_eq!(contract.channel_id().get(), 9);
         assert_eq!(
             contract.reduction(),
             execution::RuntimeFilterReduction::SetUnion
@@ -1936,7 +1902,7 @@ mod tests {
             panic!("producer role")
         };
         assert_eq!(contract.binding_id().get(), 2);
-        assert_eq!(contract.channel_id().get(), 12);
+        assert_eq!(contract.channel_id().get(), 9);
         assert_eq!(
             contract.kind(),
             execution::RuntimeFilterProducerKind::Membership

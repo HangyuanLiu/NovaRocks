@@ -139,9 +139,17 @@ pub(super) fn plan_connector_read(
     {
         return Err("connector read planned a split for another instance".to_string());
     }
+    let provider_field_ordinals = projection
+        .iter()
+        .map(|ordinal| {
+            u32::try_from(*ordinal)
+                .map_err(|_| "Iceberg provider field ordinal does not fit u32".to_string())
+        })
+        .collect::<Result<_, _>>()?;
     Ok(PlannedConnectorRead {
         declaration,
         scan: connector_scan,
+        provider_field_ordinals,
         splits: split_result.splits,
         planning_metrics: split_result.metrics,
         static_predicates,

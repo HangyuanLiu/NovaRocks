@@ -275,7 +275,7 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
             BackendRuntimeFilterParticipantFactory.install(execution_id, contribution)?;
         let state = Arc::clone(&self.state);
         Ok(
-            participant.with_close_hook_for_test(Arc::new(move |service, _reason| {
+            participant.with_close_hook_for_test(Arc::new(move |_participant, _reason| {
                 state
                     .abort_calls
                     .lock()
@@ -287,7 +287,6 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
                         "injected runtime-filter participant close failure",
                     ));
                 }
-                service.shutdown();
                 Ok(())
             })),
         )

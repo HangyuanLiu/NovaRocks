@@ -39,18 +39,20 @@ use crate::runtime_filter::model::contract::{CompletionRequirement, Contribution
 use crate::runtime_filter::port::identity::PartitionId;
 #[cfg(test)]
 use crate::runtime_filter::port::identity::ProducerSequence;
-use crate::runtime_filter::port::ordered_bound::OrderedTuple;
+#[cfg(test)]
+use crate::runtime_filter::port::ordered_bound::OrderedTuple as TestOrderedTuple;
 #[cfg(test)]
 use crate::runtime_filter::port::ordered_bound::{
     OrderContractDigest, OrderedBoundUpdate, RuntimeOrderContract,
 };
-use crate::runtime_filter::port::producer::ProducerFailureReason;
 #[cfg(test)]
 use crate::runtime_filter::port::producer::ProducerPortKind;
 #[cfg(test)]
 use crate::runtime_filter::port::producer::{
     OrderedBoundProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
 };
+use execution::RuntimeFilterProducerFailure;
+use novarocks_execution::runtime_filter::contribution::OrderedTuple;
 
 #[derive(Default)]
 struct AggregateTopNProducerInstanceCoordinator {
@@ -83,6 +85,8 @@ impl AggregateTopNProducerBinding {
         Ok(Self {
             binding_id: spec.binding_id(),
             channel_id: spec.channel_id(),
+            #[cfg(test)]
+            contract: test_legacy_order_contract(spec)?,
             execution_contract: frozen_execution_contract(spec)?,
             source: AggregateTopNProducerSource::Session(session),
             coordinator: Arc::new(AggregateTopNProducerInstanceCoordinator::default()),
@@ -113,12 +117,29 @@ impl AggregateTopNProducerBinding {
     }
 }
 
+#[cfg(test)]
+fn test_legacy_order_contract(
+    spec: &AggregateTopNRuntimeFilterProducerBinding,
+) -> Result<Arc<RuntimeOrderContract>, String> {
+    let execution::RuntimeFilterExecutionContract::Ordered(order) = spec.contract().contract()
+    else {
+        return Err("native aggregate TopN producer requires an ordered contract".to_string());
+    };
+    RuntimeOrderContract::from_codec(
+        crate::exec::node::runtime_filter::core_order_keys(order.keys()).to_vec(),
+        crate::runtime_filter::model::contract::ComparatorDigest::new(order.comparator_digest()),
+        OrderContractDigest::from_bytes_for_codec(order.digest()),
+    )
+    .map(Arc::new)
+    .map_err(|error| format!("invalid test ordered contract: {error:?}"))
+}
+
 fn frozen_execution_contract(
     spec: &AggregateTopNRuntimeFilterProducerBinding,
 ) -> Result<execution::RuntimeFilterProducerContract, String> {
     if !matches!(
         spec.contract().contract(),
-        RuntimeFilterExecutionContract::Ordered { .. }
+        RuntimeFilterExecutionContract::Ordered(_)
     ) {
         return Err(format!(
             "native aggregate TopN producer binding_id={} requires an ordered contract",
@@ -172,11 +193,7 @@ fn validate_binding_contract(
         ));
     }
     let (
-        RuntimeFilterExecutionContract::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        },
+        RuntimeFilterExecutionContract::Ordered(execution_order),
         TestInstalledRuntimeFilterExecutionContract::Ordered {
             keys: installed_keys,
             comparator_digest: installed_comparator_digest,
@@ -189,9 +206,10 @@ fn validate_binding_contract(
             spec.binding_id()
         ));
     };
-    if crate::exec::node::runtime_filter::core_order_keys(keys).as_ref() != installed_keys.as_ref()
-        || comparator_digest != installed_comparator_digest
-        || order_contract_digest != installed_order_contract_digest
+    if crate::exec::node::runtime_filter::core_order_keys(execution_order.keys()).as_ref()
+        != installed_keys.as_ref()
+        || &execution_order.comparator_digest() != installed_comparator_digest
+        || &execution_order.digest() != installed_order_contract_digest
     {
         return Err(format!(
             "native aggregate TopN producer binding_id={} ordered contract does not match the installed descriptor",
@@ -199,9 +217,11 @@ fn validate_binding_contract(
         ));
     }
     RuntimeOrderContract::from_codec(
-        crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
-        crate::runtime_filter::model::contract::ComparatorDigest::new(*comparator_digest),
-        OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
+        crate::exec::node::runtime_filter::core_order_keys(execution_order.keys()).to_vec(),
+        crate::runtime_filter::model::contract::ComparatorDigest::new(
+            execution_order.comparator_digest(),
+        ),
+        OrderContractDigest::from_bytes_for_codec(execution_order.digest()),
     )
     .map(Arc::new)
     .map_err(|error| {
@@ -341,7 +361,7 @@ impl AggregateTopNProducerSession {
     pub(crate) fn bind(&mut self) -> Result<(), String> {
         for index in 0..self.streams.len() {
             if let Err(error) = self.streams[index].bind() {
-                let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
                 return Err(error);
             }
         }
@@ -364,7 +384,7 @@ impl AggregateTopNProducerSession {
             if let Some(bound) = pending
                 && let Err(error) = self.streams[index].submit(bound)
             {
-                let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
                 self.completed = true;
                 return Err(error);
             }
@@ -388,14 +408,14 @@ impl AggregateTopNProducerSession {
             if let Some(bound) = pending
                 && let Err(error) = self.streams[index].submit(bound)
             {
-                let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
                 self.completed = true;
                 return Err(error);
             }
         }
         for index in 0..self.streams.len() {
             if let Err(error) = self.streams[index].close() {
-                let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
                 self.completed = true;
                 return Err(error);
             }
@@ -404,7 +424,7 @@ impl AggregateTopNProducerSession {
         Ok(())
     }
 
-    pub(crate) fn fail(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    pub(crate) fn fail(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
         if self.completed {
             return Ok(());
         }
@@ -425,12 +445,12 @@ impl AggregateTopNProducerSession {
             self.streams.len(),
             boundaries.len()
         );
-        let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+        let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
         self.completed = true;
         Err(error)
     }
 
-    fn fail_incomplete(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    fn fail_incomplete(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
         let mut first_error = None;
         for stream in &mut self.streams {
             if let Err(error) = stream.fail(reason)
@@ -449,7 +469,7 @@ impl AggregateTopNProducerSession {
 impl Drop for AggregateTopNProducerSession {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = self.fail_incomplete(ProducerFailureReason::ExecutionFailed);
+            let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
         }
     }
 }
@@ -587,14 +607,16 @@ impl AggregateTopNProducerStream {
             }
             #[cfg(test)]
             AggregateTopNProducerEndpoint::Prebound(adapter) => {
-                let update = OrderedBoundUpdate::new(&self.binding.contract, bound).map_err(
-                    |error| {
-                        format!(
-                            "native aggregate TopN producer binding_id={} update construction failed: {error:?}",
-                            self.binding.binding_id
-                        )
-                    },
-                )?;
+                let update = OrderedBoundUpdate::new(
+                    &self.binding.contract,
+                    test_ordered_tuple(&self.binding.contract, &bound)?,
+                )
+                .map_err(|error| {
+                    format!(
+                        "native aggregate TopN producer binding_id={} update construction failed: {error:?}",
+                        self.binding.binding_id
+                    )
+                })?;
                 match adapter.submit_bound(
                     self.partition_id,
                     ProducerSequence::new(self.next_sequence),
@@ -621,7 +643,7 @@ impl AggregateTopNProducerStream {
             }
         };
         if terminal_noop {
-            self.fail(ProducerFailureReason::ExecutionFailed)?;
+            self.fail(RuntimeFilterProducerFailure::ExecutionFailed)?;
             return Ok(());
         }
         self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
@@ -699,7 +721,7 @@ impl AggregateTopNProducerStream {
         Ok(())
     }
 
-    fn fail(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    fn fail(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
         if self.terminal {
             return Ok(());
         }
@@ -717,33 +739,23 @@ impl AggregateTopNProducerStream {
             return Ok(());
         }
         match endpoint {
-            AggregateTopNProducerEndpoint::Execution(producer) => {
-                match producer.fail(match reason {
-                    ProducerFailureReason::Cancelled => {
-                        execution::RuntimeFilterProducerFailure::Cancelled
-                    }
-                    ProducerFailureReason::ExecutionFailed => {
-                        execution::RuntimeFilterProducerFailure::ExecutionFailed
-                    }
-                    ProducerFailureReason::UpstreamUnavailable => {
-                        execution::RuntimeFilterProducerFailure::UpstreamUnavailable
-                    }
-                }) {
-                    Ok(_) => Ok(()),
-                    Err(error)
-                        if error.kind()
-                            == execution::RuntimeFilterContractViolationKind::SessionClosed =>
-                    {
-                        Ok(())
-                    }
-                    Err(error) => Err(format!(
-                        "native aggregate TopN producer binding_id={} fail-open failed: {error}",
-                        self.binding.binding_id
-                    )),
+            AggregateTopNProducerEndpoint::Execution(producer) => match producer.fail(reason) {
+                Ok(_) => Ok(()),
+                Err(error)
+                    if error.kind()
+                        == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                {
+                    Ok(())
                 }
-            }
+                Err(error) => Err(format!(
+                    "native aggregate TopN producer binding_id={} fail-open failed: {error}",
+                    self.binding.binding_id
+                )),
+            },
             #[cfg(test)]
-            AggregateTopNProducerEndpoint::Prebound(adapter) => match adapter.fail(reason) {
+            AggregateTopNProducerEndpoint::Prebound(adapter) => match adapter
+                .fail(test_producer_failure(reason))
+            {
                 Ok(_) => Ok(()),
                 Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
                     Ok(())
@@ -762,83 +774,19 @@ fn encode_execution_ordered_bound(
     bound: &OrderedTuple,
     max_contribution_bytes: usize,
 ) -> Result<execution::RuntimeFilterContribution, execution::contribution::ContributionCodecError> {
-    let execution::RuntimeFilterExecutionContract::Ordered {
-        keys,
-        comparator_digest,
-        order_contract_digest,
-    } = producer.contract()
-    else {
+    let execution::RuntimeFilterExecutionContract::Ordered(contract) = producer.contract() else {
         return Err(execution::contribution::ContributionCodecError::SchemaMismatch);
     };
-    let contract = execution::contribution::RuntimeOrderContract::from_frozen(
-        keys.iter().map(|key| {
-            execution::contribution::RuntimeOrderKey::with_order(
-                key.data_type().clone(),
-                match key.direction() {
-                    execution::RuntimeOrderSortDirection::Ascending => {
-                        execution::contribution::RuntimeOrderSortDirection::Ascending
-                    }
-                    execution::RuntimeOrderSortDirection::Descending => {
-                        execution::contribution::RuntimeOrderSortDirection::Descending
-                    }
-                },
-                match key.null_order() {
-                    execution::RuntimeOrderNullOrder::First => {
-                        execution::contribution::RuntimeOrderNullOrder::First
-                    }
-                    execution::RuntimeOrderNullOrder::Last => {
-                        execution::contribution::RuntimeOrderNullOrder::Last
-                    }
-                },
-            )
-        }),
-        *comparator_digest,
-        *order_contract_digest,
-    );
-    let tuple = execution::contribution::OrderedTuple::try_new(
-        &contract,
-        bound.values().iter().map(|value| match value {
-            None => None,
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean(value)) => {
-                Some(execution::contribution::OrderedScalar::Boolean(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8(value)) => {
-                Some(execution::contribution::OrderedScalar::Int8(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16(value)) => {
-                Some(execution::contribution::OrderedScalar::Int16(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32(value)) => {
-                Some(execution::contribution::OrderedScalar::Int32(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64(value)) => {
-                Some(execution::contribution::OrderedScalar::Int64(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt(value)) => {
-                Some(execution::contribution::OrderedScalar::LargeInt(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8(value)) => Some(
-                execution::contribution::OrderedScalar::Utf8(value.to_string()),
-            ),
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32(value)) => {
-                Some(execution::contribution::OrderedScalar::Date32(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp(value)) => {
-                Some(execution::contribution::OrderedScalar::Timestamp(*value))
-            }
-            Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128(value)) => {
-                Some(execution::contribution::OrderedScalar::Decimal128(*value))
-            }
-        }),
-    )
-    .map_err(|_| execution::contribution::ContributionCodecError::SchemaMismatch)?;
+    let tuple =
+        execution::contribution::OrderedTuple::try_new(contract, bound.values().iter().cloned())
+            .map_err(|_| execution::contribution::ContributionCodecError::SchemaMismatch)?;
     let typed = execution::contribution::RuntimeFilterContribution::ordered_bound(
-        execution::contribution::OrderedBoundUpdate::try_new(&contract, tuple)
+        execution::contribution::OrderedBoundUpdate::try_new(contract, tuple)
             .map_err(|_| execution::contribution::ContributionCodecError::SchemaMismatch)?,
     );
     let encoded = execution::contribution::encode_contribution(
         &typed,
-        execution::contribution::ContributionCodecExpectation::OrderedBound(&contract),
+        execution::contribution::ContributionCodecExpectation::OrderedBound(contract),
         max_contribution_bytes,
     )?;
     let (contract_digest, canonical_bytes) = encoded.into_parts();
@@ -847,6 +795,69 @@ fn encode_execution_ordered_bound(
         contract_digest,
         canonical_bytes,
     ))
+}
+
+#[cfg(test)]
+fn test_producer_failure(
+    reason: RuntimeFilterProducerFailure,
+) -> crate::runtime_filter::port::producer::ProducerFailureReason {
+    match reason {
+        RuntimeFilterProducerFailure::Cancelled => {
+            crate::runtime_filter::port::producer::ProducerFailureReason::Cancelled
+        }
+        RuntimeFilterProducerFailure::ExecutionFailed => {
+            crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed
+        }
+        RuntimeFilterProducerFailure::UpstreamUnavailable => {
+            crate::runtime_filter::port::producer::ProducerFailureReason::UpstreamUnavailable
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_ordered_tuple(
+    contract: &RuntimeOrderContract,
+    tuple: &OrderedTuple,
+) -> Result<TestOrderedTuple, String> {
+    TestOrderedTuple::try_new(
+        contract,
+        tuple.values().iter().map(|value| match value {
+            None => None,
+            Some(execution::contribution::OrderedScalar::Boolean(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean(*value))
+            }
+            Some(execution::contribution::OrderedScalar::Int8(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8(*value))
+            }
+            Some(execution::contribution::OrderedScalar::Int16(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16(*value))
+            }
+            Some(execution::contribution::OrderedScalar::Int32(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32(*value))
+            }
+            Some(execution::contribution::OrderedScalar::Int64(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64(*value))
+            }
+            Some(execution::contribution::OrderedScalar::LargeInt(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt(*value))
+            }
+            Some(execution::contribution::OrderedScalar::Utf8(value)) => Some(
+                crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8(
+                    value.clone().into(),
+                ),
+            ),
+            Some(execution::contribution::OrderedScalar::Date32(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32(*value))
+            }
+            Some(execution::contribution::OrderedScalar::Timestamp(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp(*value))
+            }
+            Some(execution::contribution::OrderedScalar::Decimal128(value)) => {
+                Some(crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128(*value))
+            }
+        }),
+    )
+    .map_err(|error| format!("test ordered tuple does not match legacy adapter: {error:?}"))
 }
 
 #[cfg(test)]
@@ -1021,6 +1032,36 @@ mod tests {
         )
     }
 
+    fn execution_ordered_contract_for_test(
+        contract: &RuntimeOrderContract,
+    ) -> RuntimeFilterExecutionContract {
+        RuntimeFilterExecutionContract::Ordered(Arc::new(
+            execution::contribution::RuntimeOrderContract::from_frozen(
+                contract.keys().iter().map(|key| {
+                    execution::contribution::RuntimeOrderKey::with_order(
+                        key.data_type().clone(),
+                        match key.direction() {
+                            SortDirection::Ascending => {
+                                execution::contribution::RuntimeOrderSortDirection::Ascending
+                            }
+                            SortDirection::Descending => {
+                                execution::contribution::RuntimeOrderSortDirection::Descending
+                            }
+                        },
+                        match key.null_order() {
+                            NullOrder::First => {
+                                execution::contribution::RuntimeOrderNullOrder::First
+                            }
+                            NullOrder::Last => execution::contribution::RuntimeOrderNullOrder::Last,
+                        },
+                    )
+                }),
+                contract.plan_comparator_digest().get(),
+                contract.digest().bytes(),
+            ),
+        ))
+    }
+
     fn spec(
         contract: &RuntimeOrderContract,
         limit: u32,
@@ -1032,11 +1073,7 @@ mod tests {
             execution::RuntimeFilterProducerContract::ordered_bound(
                 execution::RuntimeFilterBindingId::new(11),
                 execution::RuntimeFilterChannelId::new(12),
-                RuntimeFilterExecutionContract::Ordered {
-                    keys: crate::exec::node::runtime_filter::execution_order_keys(contract.keys()),
-                    comparator_digest: contract.plan_comparator_digest().get(),
-                    order_contract_digest: contract.digest().bytes(),
-                },
+                execution_ordered_contract_for_test(contract),
             )
             .expect("ordered producer contract"),
         )
@@ -1089,8 +1126,11 @@ mod tests {
             .state_mut()
             .observe_new_group(
                 group_id,
-                OrderedTuple::try_new(&contract, [Some(OrderedScalar::Int64(value))])
-                    .expect("ordered tuple"),
+                execution::contribution::OrderedTuple::try_new(
+                    &contract,
+                    [Some(execution::contribution::OrderedScalar::Int64(value))],
+                )
+                .expect("ordered tuple"),
             )
             .expect("new group");
     }
@@ -1109,8 +1149,17 @@ mod tests {
         )
         .expect("legacy canonical contribution");
 
-        let actual = encode_execution_ordered_bound(binding.contract(), &bound, usize::MAX)
-            .expect("execution canonical contribution");
+        let execution_bound = execution::contribution::OrderedTuple::try_new(
+            match binding.contract().contract() {
+                RuntimeFilterExecutionContract::Ordered(order) => order,
+                RuntimeFilterExecutionContract::Membership(_) => unreachable!("ordered producer"),
+            },
+            [Some(execution::contribution::OrderedScalar::Int64(42))],
+        )
+        .expect("execution ordered tuple");
+        let actual =
+            encode_execution_ordered_bound(binding.contract(), &execution_bound, usize::MAX)
+                .expect("execution canonical contribution");
 
         assert_eq!(actual.contract_digest(), *expected.schema_digest());
         assert_eq!(actual.canonical_bytes().as_ref(), expected.payload());
@@ -1296,9 +1345,11 @@ mod tests {
         let cancelled_factory = factory(&spec, &contract, Arc::clone(&cancelled_adapter), 1);
         let mut cancelled = cancelled_factory.create(0).unwrap();
         cancelled.bind().unwrap();
-        cancelled.fail(ProducerFailureReason::Cancelled).unwrap();
         cancelled
-            .fail(ProducerFailureReason::ExecutionFailed)
+            .fail(execution::RuntimeFilterProducerFailure::Cancelled)
+            .unwrap();
+        cancelled
+            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed)
             .unwrap();
         assert_eq!(
             cancelled_adapter.events(),
@@ -1342,11 +1393,7 @@ mod tests {
             execution::RuntimeFilterProducerContract::ordered_bound(
                 execution::RuntimeFilterBindingId::new(21),
                 execution::RuntimeFilterChannelId::new(22),
-                RuntimeFilterExecutionContract::Ordered {
-                    keys: crate::exec::node::runtime_filter::execution_order_keys(contract.keys()),
-                    comparator_digest: contract.plan_comparator_digest().get(),
-                    order_contract_digest: contract.digest().bytes(),
-                },
+                execution_ordered_contract_for_test(&contract),
             )
             .expect("ordered producer contract"),
         );
@@ -1504,13 +1551,13 @@ mod tests {
         unbound.streams[0].endpoint = None;
 
         unbound
-            .fail(ProducerFailureReason::ExecutionFailed)
+            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed)
             .expect("record pending failure");
         bound
-            .fail(ProducerFailureReason::ExecutionFailed)
+            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed)
             .expect("deliver pending failure");
         bound
-            .fail(ProducerFailureReason::Cancelled)
+            .fail(execution::RuntimeFilterProducerFailure::Cancelled)
             .expect("duplicate failure is idempotent");
 
         assert_eq!(

@@ -20,29 +20,38 @@
 //! only the expression and operator coordinates required to invoke that
 //! contract from a pipeline kernel.
 
-use std::sync::Arc;
-
 pub use execution::RuntimeFilterExecutionContract;
+#[cfg(test)]
 pub use execution::RuntimeFilterReduction as RuntimeFilterExecutionReduction;
 use novarocks_execution::runtime_filter as execution;
 
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
-use crate::runtime_filter::port::ordered_bound::RuntimeOrderKey;
 
-pub(crate) fn core_order_keys(keys: &[execution::RuntimeOrderKey]) -> Arc<[RuntimeOrderKey]> {
+/// Legacy Core order values remain available only to Core-local test doubles.
+/// Production carriers keep the frozen Execution order contract verbatim.
+#[cfg(test)]
+pub(crate) fn core_order_keys(
+    keys: &[execution::contribution::RuntimeOrderKey],
+) -> std::sync::Arc<[crate::runtime_filter::port::ordered_bound::RuntimeOrderKey]> {
+    use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
+    use crate::runtime_filter::port::ordered_bound::RuntimeOrderKey;
+
     keys.iter()
         .map(|key| {
             RuntimeOrderKey::new(
                 key.data_type().clone(),
                 match key.direction() {
-                    execution::RuntimeOrderSortDirection::Ascending => SortDirection::Ascending,
-                    execution::RuntimeOrderSortDirection::Descending => SortDirection::Descending,
+                    execution::contribution::RuntimeOrderSortDirection::Ascending => {
+                        SortDirection::Ascending
+                    }
+                    execution::contribution::RuntimeOrderSortDirection::Descending => {
+                        SortDirection::Descending
+                    }
                 },
                 match key.null_order() {
-                    execution::RuntimeOrderNullOrder::First => NullOrder::First,
-                    execution::RuntimeOrderNullOrder::Last => NullOrder::Last,
+                    execution::contribution::RuntimeOrderNullOrder::First => NullOrder::First,
+                    execution::contribution::RuntimeOrderNullOrder::Last => NullOrder::Last,
                 },
             )
         })
@@ -50,18 +59,27 @@ pub(crate) fn core_order_keys(keys: &[execution::RuntimeOrderKey]) -> Arc<[Runti
         .into()
 }
 
-pub(crate) fn execution_order_keys(keys: &[RuntimeOrderKey]) -> Arc<[execution::RuntimeOrderKey]> {
+#[cfg(test)]
+pub(crate) fn execution_order_keys(
+    keys: &[crate::runtime_filter::port::ordered_bound::RuntimeOrderKey],
+) -> std::sync::Arc<[execution::contribution::RuntimeOrderKey]> {
+    use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
+
     keys.iter()
         .map(|key| {
-            execution::RuntimeOrderKey::new(
+            execution::contribution::RuntimeOrderKey::with_order(
                 key.data_type().clone(),
                 match key.direction() {
-                    SortDirection::Ascending => execution::RuntimeOrderSortDirection::Ascending,
-                    SortDirection::Descending => execution::RuntimeOrderSortDirection::Descending,
+                    SortDirection::Ascending => {
+                        execution::contribution::RuntimeOrderSortDirection::Ascending
+                    }
+                    SortDirection::Descending => {
+                        execution::contribution::RuntimeOrderSortDirection::Descending
+                    }
                 },
                 match key.null_order() {
-                    NullOrder::First => execution::RuntimeOrderNullOrder::First,
-                    NullOrder::Last => execution::RuntimeOrderNullOrder::Last,
+                    NullOrder::First => execution::contribution::RuntimeOrderNullOrder::First,
+                    NullOrder::Last => execution::contribution::RuntimeOrderNullOrder::Last,
                 },
             )
         })
@@ -188,12 +206,11 @@ pub(crate) fn test_consumer_contract(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime_filter::{
         ConsumerActivation, RuntimeFilterBindingId, RuntimeFilterChannelId,
         RuntimeFilterConsumerContract, RuntimeFilterExecutionContract,
+        RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     };
 
     use super::*;
@@ -207,10 +224,13 @@ mod tests {
         let contract = RuntimeFilterConsumerContract::membership_blocking(
             RuntimeFilterBindingId::new(1),
             RuntimeFilterChannelId::new(2),
-            RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from([1_u8]),
-                schema_digest: [2; 32],
-            },
+            RuntimeFilterExecutionContract::Membership(
+                RuntimeFilterMembershipSchema::new(
+                    &DataType::Int64,
+                    RuntimeFilterNullSemantics::NeverMatches,
+                )
+                .expect("membership schema"),
+            ),
         )
         .expect("membership consumer contract");
         let binding = RuntimeFilterConsumerBinding::new(expr_id, contract, None);

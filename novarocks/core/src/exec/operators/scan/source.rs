@@ -89,12 +89,12 @@ impl ScanSourceFactory {
                 ));
             }
             match spec.execution_contract() {
-                crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership {
-                    ..
-                } => membership_specs.push(spec.clone()),
-                crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered {
-                    ..
-                } => ordered_live_specs.push(spec.clone()),
+                crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership(
+                    _,
+                ) => membership_specs.push(spec.clone()),
+                crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered(_) => {
+                    ordered_live_specs.push(spec.clone())
+                }
             }
         }
         let blocking_consumers =
@@ -816,6 +816,53 @@ mod tests {
         )
     }
 
+    fn execution_membership_contract_for_test(
+        data_type: DataType,
+        null_semantics: crate::runtime_filter::model::contract::NullSemantics,
+    ) -> crate::exec::node::runtime_filter::RuntimeFilterExecutionContract {
+        let null_semantics = match null_semantics {
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches => {
+                novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches
+            }
+            crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual => {
+                novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NullSafeEqual
+            }
+        };
+        crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership(
+            novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
+                &data_type,
+                null_semantics,
+            )
+            .expect("test membership schema"),
+        )
+    }
+
+    fn execution_ordered_contract_for_test(
+        order: &crate::runtime_filter::port::ordered_bound::RuntimeOrderContract,
+    ) -> crate::exec::node::runtime_filter::RuntimeFilterExecutionContract {
+        use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
+
+        crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered(Arc::new(
+            novarocks_execution::runtime_filter::contribution::RuntimeOrderContract::from_frozen(
+                order.keys().iter().map(|key| {
+                    novarocks_execution::runtime_filter::contribution::RuntimeOrderKey::with_order(
+                        key.data_type().clone(),
+                        match key.direction() {
+                            SortDirection::Ascending => novarocks_execution::runtime_filter::contribution::RuntimeOrderSortDirection::Ascending,
+                            SortDirection::Descending => novarocks_execution::runtime_filter::contribution::RuntimeOrderSortDirection::Descending,
+                        },
+                        match key.null_order() {
+                            NullOrder::First => novarocks_execution::runtime_filter::contribution::RuntimeOrderNullOrder::First,
+                            NullOrder::Last => novarocks_execution::runtime_filter::contribution::RuntimeOrderNullOrder::Last,
+                        },
+                    )
+                }),
+                order.plan_comparator_digest().get(),
+                order.digest().bytes(),
+            ),
+        ))
+    }
+
     struct PlainScanOp {
         plain_calls: AtomicUsize,
     }
@@ -1192,10 +1239,10 @@ mod tests {
                 1,
                 9,
                 ConsumerActivation::BlockingSnapshot,
-                RuntimeFilterExecutionContract::Membership {
-                    canonical_schema: Arc::from(membership_schema.canonical_bytes()),
-                    schema_digest: membership_schema.digest().bytes(),
-                },
+                execution_membership_contract_for_test(
+                    DataType::Int64,
+                    NullSemantics::NeverMatches,
+                ),
             ),
             None,
         );
@@ -1207,11 +1254,7 @@ mod tests {
                 ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
                 },
-                RuntimeFilterExecutionContract::Ordered {
-                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                    comparator_digest: order.plan_comparator_digest().get(),
-                    order_contract_digest: order.digest().bytes(),
-                },
+                execution_ordered_contract_for_test(&order),
             ),
             None,
         );
@@ -1254,10 +1297,10 @@ mod tests {
                 ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
                 },
-                RuntimeFilterExecutionContract::Membership {
-                    canonical_schema: Arc::from(membership_schema.canonical_bytes()),
-                    schema_digest: membership_schema.digest().bytes(),
-                },
+                execution_membership_contract_for_test(
+                    DataType::Int64,
+                    NullSemantics::NeverMatches,
+                ),
             ),
             None,
         )]);
@@ -1295,11 +1338,7 @@ mod tests {
                 ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
                 },
-                RuntimeFilterExecutionContract::Ordered {
-                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                    comparator_digest: order.plan_comparator_digest().get(),
-                    order_contract_digest: order.digest().bytes(),
-                },
+                execution_ordered_contract_for_test(&order),
             ),
             None,
         )]);
@@ -1361,11 +1400,7 @@ mod tests {
                     2,
                     1,
                     ConsumerActivation::NonBlockingLive { late_apply },
-                    RuntimeFilterExecutionContract::Ordered {
-                        keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                        comparator_digest: order.plan_comparator_digest().get(),
-                        order_contract_digest: order.digest().bytes(),
-                    },
+                    execution_ordered_contract_for_test(&order),
                 ),
                 None,
             )]);
@@ -1408,11 +1443,7 @@ mod tests {
                 ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
                 },
-                RuntimeFilterExecutionContract::Ordered {
-                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                    comparator_digest: order.plan_comparator_digest().get(),
-                    order_contract_digest: order.digest().bytes(),
-                },
+                execution_ordered_contract_for_test(&order),
             ),
             None,
         );

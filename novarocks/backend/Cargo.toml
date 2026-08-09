@@ -27,7 +27,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
 
 [dev-dependencies]
-novarocks = { path = "../core", features = ["runtime-filter-test-support"] }
+novarocks = { path = "../core" }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

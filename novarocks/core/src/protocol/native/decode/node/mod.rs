@@ -59,9 +59,10 @@ use crate::exec::node::aggregate::{
 };
 use crate::exec::node::join::{JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding};
 use crate::exec::node::limit::LimitNode;
+#[cfg(test)]
+use crate::exec::node::runtime_filter::RuntimeFilterExecutionReduction;
 use crate::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode, RuntimeFilterExecutionContract,
-    RuntimeFilterExecutionReduction,
 };
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -1079,10 +1080,10 @@ fn attach_hash_join_producers(
                     binding.channel_id,
                 ),
                 match &contract {
-                    RuntimeFilterExecutionContract::Membership { .. } => {
+                    RuntimeFilterExecutionContract::Membership(_) => {
                         novarocks_execution::runtime_filter::RuntimeFilterProducerKind::Membership
                     }
-                    RuntimeFilterExecutionContract::Ordered { .. } => {
+                    RuntimeFilterExecutionContract::Ordered(_) => {
                         novarocks_execution::runtime_filter::RuntimeFilterProducerKind::OrderedBound
                     }
                 },
@@ -1371,22 +1372,48 @@ fn native_contract(contract: &DecodedRuntimeFilterContract) -> RuntimeFilterExec
         DecodedRuntimeFilterContract::Membership {
             canonical_schema,
             schema_digest,
-        } => RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::clone(canonical_schema),
-            schema_digest: *schema_digest,
-        },
+        } => RuntimeFilterExecutionContract::Membership(
+            novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::from_canonical(
+                canonical_schema.as_ref(),
+                *schema_digest,
+            )
+            .expect("validated native membership contract"),
+        ),
         DecodedRuntimeFilterContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,
-        } => RuntimeFilterExecutionContract::Ordered {
-            keys: crate::exec::node::runtime_filter::execution_order_keys(keys),
-            comparator_digest: *comparator_digest,
-            order_contract_digest: *order_contract_digest,
-        },
+        } => RuntimeFilterExecutionContract::Ordered(Arc::new(
+            novarocks_execution::runtime_filter::contribution::RuntimeOrderContract::from_frozen(
+                keys.iter().map(|key| {
+                    novarocks_execution::runtime_filter::contribution::RuntimeOrderKey::with_order(
+                        key.data_type().clone(),
+                        match key.direction() {
+                            crate::runtime_filter::model::contract::SortDirection::Ascending => {
+                                novarocks_execution::runtime_filter::contribution::RuntimeOrderSortDirection::Ascending
+                            }
+                            crate::runtime_filter::model::contract::SortDirection::Descending => {
+                                novarocks_execution::runtime_filter::contribution::RuntimeOrderSortDirection::Descending
+                            }
+                        },
+                        match key.null_order() {
+                            crate::runtime_filter::model::contract::NullOrder::First => {
+                                novarocks_execution::runtime_filter::contribution::RuntimeOrderNullOrder::First
+                            }
+                            crate::runtime_filter::model::contract::NullOrder::Last => {
+                                novarocks_execution::runtime_filter::contribution::RuntimeOrderNullOrder::Last
+                            }
+                        },
+                    )
+                }),
+                *comparator_digest,
+                *order_contract_digest,
+            ),
+        )),
     }
 }
 
+#[cfg(test)]
 fn native_reduction(reduction: &DecodedRuntimeFilterReduction) -> RuntimeFilterExecutionReduction {
     match reduction {
         DecodedRuntimeFilterReduction::SetUnion => RuntimeFilterExecutionReduction::SetUnion,
@@ -2870,8 +2897,8 @@ mod tests {
         let AggregateRuntimeFilterSpec { topn_producers } = aggregate.runtime_filter_spec;
         assert_eq!(topn_producers.len(), 1);
         let spec = &topn_producers[0];
-        assert_eq!(spec.binding_id, 1);
-        assert_eq!(spec.channel_id, 11);
+        assert_eq!(spec.binding_id(), 1);
+        assert_eq!(spec.channel_id(), 11);
         assert_eq!(spec.group_key_ordinal, 0);
         assert_eq!(spec.group_key_expr_id, aggregate.group_by[0]);
         assert_eq!(
@@ -2879,40 +2906,29 @@ mod tests {
             Some(&DataType::Int64)
         );
         assert_eq!(spec.limit.get(), 5);
-        let RuntimeFilterExecutionContract::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        } = &spec.contract
+        let RuntimeFilterExecutionContract::Ordered(order_contract) = spec.contract().contract()
         else {
             panic!("aggregate TopN must keep the ordered contract")
         };
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].data_type(), &DataType::Int64);
+        assert_eq!(order_contract.keys().len(), 1);
+        assert_eq!(order_contract.keys()[0].data_type(), &DataType::Int64);
         assert_eq!(
-            keys[0].direction(),
-            novarocks_execution::runtime_filter::RuntimeOrderSortDirection::Descending
+            order_contract.keys()[0].direction(),
+            novarocks_execution::runtime_filter::contribution::RuntimeOrderSortDirection::Descending
         );
         assert_eq!(
-            keys[0].null_order(),
-            novarocks_execution::runtime_filter::RuntimeOrderNullOrder::First
+            order_contract.keys()[0].null_order(),
+            novarocks_execution::runtime_filter::contribution::RuntimeOrderNullOrder::First
         );
-        assert_ne!(*comparator_digest, [0; 32]);
-        assert_ne!(*order_contract_digest, [0; 32]);
+        assert_ne!(order_contract.comparator_digest(), [0; 32]);
+        assert_ne!(order_contract.digest(), [0; 32]);
         assert_eq!(
-            spec.reduction,
-            RuntimeFilterExecutionReduction::TightenOrderedBound
-        );
-        assert_eq!(
-            spec.contribution_kinds,
-            BTreeSet::from([
-                crate::runtime_filter::model::contract::ContributionKind::OrderedBoundUpdate,
-                crate::runtime_filter::model::contract::ContributionKind::ProducerClosed,
-            ])
+            spec.contract().reduction(),
+            novarocks_execution::runtime_filter::RuntimeFilterReduction::TightenOrderedBound
         );
         assert_eq!(
-            spec.completion_requirement,
-            crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
+            spec.contract().completion(),
+            novarocks_execution::runtime_filter::RuntimeFilterCompletion::ProducerClosed
         );
     }
 
@@ -2971,7 +2987,7 @@ mod tests {
         };
         let AggregateRuntimeFilterSpec { topn_producers } = aggregate.runtime_filter_spec;
         assert_eq!(topn_producers.len(), 1);
-        assert_eq!(topn_producers[0].binding_id, 1);
+        assert_eq!(topn_producers[0].binding_id(), 1);
     }
 
     fn native_aggregate_topn_binding_error(
@@ -3310,7 +3326,7 @@ mod tests {
         assert_eq!(
             producers
                 .iter()
-                .map(|binding| binding.binding_id)
+                .map(|binding| binding.binding_id())
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
@@ -3559,9 +3575,10 @@ mod tests {
             panic!("exchange");
         };
         assert_eq!(
-            exchange.native_runtime_filter_specs()[0].activation,
-            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
-                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            exchange.native_runtime_filter_specs()[0].activation(),
+            novarocks_execution::runtime_filter::ConsumerActivation::NonBlockingLive {
+                late_apply:
+                    novarocks_execution::runtime_filter::RuntimeFilterLateApplyGranularity::Batch,
             }
         );
     }

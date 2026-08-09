@@ -39,6 +39,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use novarocks_execution::runtime_filter as execution;
+use novarocks_execution::runtime_filter::RuntimeFilterProducerFailure;
 
 use crate::common::failpoint;
 use crate::common::ids::SlotId;
@@ -58,7 +59,6 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 #[cfg(test)]
 use crate::runtime_filter::port::identity::PartitionId;
-use crate::runtime_filter::port::producer::ProducerFailureReason;
 use crate::runtime_filter::port::value_domain::MembershipValues;
 #[cfg(test)]
 use crate::runtime_filter::port::value_domain::ValueDomainDelta;
@@ -675,15 +675,15 @@ impl Operator for AggregateProcessorOperator {
     }
 
     fn cancel(&mut self) {
-        let _ = self.fail_native_topn_producers(ProducerFailureReason::Cancelled);
+        let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::Cancelled);
     }
 
     fn on_driver_failure(&mut self) {
-        let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
+        let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
     }
 
     fn close(&mut self) -> Result<(), String> {
-        self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed)
+        self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed)
     }
 
     fn is_finished(&self) -> bool {
@@ -761,7 +761,10 @@ impl AggregateProcessorOperator {
         session.finish(&mut self.topn_boundary_bindings)
     }
 
-    fn fail_native_topn_producers(&mut self, reason: ProducerFailureReason) -> Result<(), String> {
+    fn fail_native_topn_producers(
+        &mut self,
+        reason: RuntimeFilterProducerFailure,
+    ) -> Result<(), String> {
         let Some(session) = self.native_topn_session.as_mut() else {
             return Ok(());
         };
@@ -1139,7 +1142,7 @@ impl ProcessorOperator for AggregateProcessorOperator {
         })();
         if result.is_err() {
             self.fail_final_domain();
-            let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
+            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
         }
         result
     }
@@ -1184,7 +1187,7 @@ impl ProcessorOperator for AggregateProcessorOperator {
         })();
         if result.is_err() {
             self.fail_final_domain();
-            let _ = self.fail_native_topn_producers(ProducerFailureReason::ExecutionFailed);
+            let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
         }
         result
     }
@@ -1233,7 +1236,8 @@ impl AggregateProcessorOperator {
                 .map(|table| table.key_columns())
                 .unwrap_or(&[]),
             max_domain_canonical_bytes,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let domain = match execution::contribution::encode_final_domain_from_array(
             &data_type,
             partition.contract_digest,
