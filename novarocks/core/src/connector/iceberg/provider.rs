@@ -5762,7 +5762,7 @@ pub(crate) struct IcebergQueryTableMaterialization {
     /// handle contained in this value.
     pub(crate) write_target_admission:
         Option<crate::engine::query_planning::bindings::QueryWriteTargetAdmission>,
-    pub(crate) table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     pub(crate) files: Vec<IcebergDataFileInfo>,
     pub(crate) binding: IcebergDataFileBinding,
     pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
@@ -5770,6 +5770,16 @@ pub(crate) struct IcebergQueryTableMaterialization {
 }
 
 impl IcebergQueryTableMaterialization {
+    /// SQL/application identity facts projected while the provider still owns
+    /// the concrete Iceberg table descriptor.
+    pub(crate) fn table_uuid(&self) -> Option<&str> {
+        self.table.table_uuid.as_deref()
+    }
+
+    pub(crate) fn current_snapshot_id(&self) -> Option<i64> {
+        self.table.current_snapshot_id
+    }
+
     /// Freeze an already admitted Iceberg file set into a new provider-owned
     /// opaque handle.  Callers never decode or rebuild the handle: MV target
     /// partition filtering may choose a subset of files, but only this
@@ -5823,6 +5833,19 @@ impl IcebergQueryTableMaterialization {
             planning_lease: self.planning_lease.clone(),
         })
     }
+
+    /// Freeze an explicit read set at a known snapshot without exposing the
+    /// provider table descriptor to the COW rewrite admission path.
+    pub(crate) fn with_frozen_files_at_snapshot(
+        &self,
+        files: Vec<IcebergDataFileInfo>,
+        snapshot_id: i64,
+    ) -> Result<Self, String> {
+        let mut snapshot_materialization = self.clone();
+        snapshot_materialization.table.current_snapshot_id = Some(snapshot_id);
+        snapshot_materialization
+            .with_frozen_files(files, ConnectorReadSelector::SnapshotId(snapshot_id))
+    }
 }
 
 /// Freeze the full and affected IMV target reads while the provider owns the
@@ -5848,6 +5871,25 @@ pub(crate) fn freeze_mv_target_reads(
         selector,
     )?;
     Ok((full, affected))
+}
+
+/// Freeze a delta snapshot window while the provider still owns the concrete
+/// Iceberg table identity.  The application receives only the resulting
+/// query-local runtime plan and never reads the provider table descriptor.
+pub(crate) fn freeze_delta_runtime_plan_from_materialization(
+    materialization: &IcebergQueryTableMaterialization,
+    entry: &super::catalog::IcebergCatalogEntry,
+    loaded: &novarocks_connector_iceberg::iceberg::table::Table,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> Result<crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan, String> {
+    crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(
+        &materialization.table,
+        entry,
+        loaded,
+        from_snapshot_id,
+        to_snapshot_id,
+    )
 }
 
 pub(crate) fn filter_frozen_mv_target_state_files(
@@ -8004,7 +8046,7 @@ mod tests {
             planning_lease: lease,
         };
         let frozen = materialization
-            .with_frozen_files(Vec::new(), ConnectorReadSelector::SnapshotId(7))
+            .with_frozen_files_at_snapshot(Vec::new(), 7)
             .expect("freeze empty target read");
         assert_eq!(frozen.read_selector, ConnectorReadSelector::SnapshotId(7));
         let payload: TablePayload = decode_payload(frozen.read_table.payload(), "frozen table")

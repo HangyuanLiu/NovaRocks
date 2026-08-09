@@ -2025,21 +2025,21 @@ fn build_cow_rewrite_query_local_overlay(
             data_file.path
         ));
     }
-    let mut materialization =
+    let materialization =
         crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
             planning_lease,
             connector_context.clone(),
             &target.namespace,
             &target.table,
         )?;
-    if target_ref == "main" && materialization.table.current_snapshot_id != Some(base_snapshot_id) {
+    if target_ref == "main" && materialization.current_snapshot_id() != Some(base_snapshot_id) {
         return Err(format!(
             "COW UPDATE source {}.{}.{} changed after admission: expected snapshot {}, got {:?}",
             target.catalog,
             target.namespace,
             target.table,
             base_snapshot_id,
-            materialization.table.current_snapshot_id,
+            materialization.current_snapshot_id(),
         ));
     }
     // The provider's strict-base materialization is rooted at the table's
@@ -2047,14 +2047,13 @@ fn build_cow_rewrite_query_local_overlay(
     // the admitted branch head, so carry that branch snapshot into the
     // request-local overlay instead of rejecting the schema-only materialization
     // because its default snapshot is main.
-    materialization.table.current_snapshot_id = Some(base_snapshot_id);
-    materialization = materialization.with_frozen_files(
+    let materialization = materialization.with_frozen_files_at_snapshot(
         vec![
             crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
                 data_file,
             ),
         ],
-        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(base_snapshot_id),
+        base_snapshot_id,
     )?;
     // The single-file scan must expose `_row_id` / `_last_updated_sequence_number`
     // for the rewrite projection; the table is v3 row-lineage (COW mode was

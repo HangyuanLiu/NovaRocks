@@ -14039,17 +14039,15 @@ fn compile_canonical_select_for_imv_for_maintenance(
             &target.table,
         )
         .map_err(|error| RefreshError::user(format!("admit IMV target planning lease: {error}")))?;
-    if target_planning_materialization.table.table_uuid.as_deref()
-        != Some(ctx.rewrite.target_table_uuid.as_str())
-        || target_planning_materialization.table.current_snapshot_id
-            != ctx.rewrite.target_snapshot_id
+    if target_planning_materialization.table_uuid() != Some(ctx.rewrite.target_table_uuid.as_str())
+        || target_planning_materialization.current_snapshot_id() != ctx.rewrite.target_snapshot_id
     {
         return Err(RefreshError::user(format!(
             "IMV target changed after admission: expected uuid={} snapshot={:?}, got uuid={:?} snapshot={:?}",
             ctx.rewrite.target_table_uuid,
             ctx.rewrite.target_snapshot_id,
-            target_planning_materialization.table.table_uuid,
-            target_planning_materialization.table.current_snapshot_id,
+            target_planning_materialization.table_uuid(),
+            target_planning_materialization.current_snapshot_id(),
         )));
     }
     let execution =
@@ -14279,12 +14277,13 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             &target.namespace,
             &target.table,
         )?;
-    if materialization.table.table_uuid.as_deref() != Some(target_table_uuid.as_str())
-        || materialization.table.current_snapshot_id != frozen_snapshot_id
+    if materialization.table_uuid() != Some(target_table_uuid.as_str())
+        || materialization.current_snapshot_id() != frozen_snapshot_id
     {
         return Err(format!(
             "IMV target changed after admission: expected uuid={target_table_uuid} snapshot={frozen_snapshot_id:?}, got uuid={:?} snapshot={:?}",
-            materialization.table.table_uuid, materialization.table.current_snapshot_id,
+            materialization.table_uuid(),
+            materialization.current_snapshot_id(),
         ));
     }
     let selector = frozen_snapshot_id
@@ -14487,14 +14486,13 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                 &base.table,
             )?;
             frozen_snapshot_ids.insert(*previous_snapshot_id);
-            let runtime_plan =
-                crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(
-                    &materialization.table,
-                    entry,
-                    &loaded.table,
-                    *previous_snapshot_id,
-                    snapshot_id,
-                )?;
+            let runtime_plan = crate::connector::iceberg::provider::freeze_delta_runtime_plan_from_materialization(
+                &materialization,
+                entry,
+                &loaded.table,
+                *previous_snapshot_id,
+                snapshot_id,
+            )?;
             delta_runtime_plans.insert((*previous_snapshot_id, snapshot_id), runtime_plan);
         }
 
@@ -15357,17 +15355,15 @@ fn execute_join_delta_branches_logical(
             &target.namespace,
             &target.table,
         )?;
-    if target_planning_materialization.table.table_uuid.as_deref()
-        != Some(ctx.rewrite.target_table_uuid.as_str())
-        || target_planning_materialization.table.current_snapshot_id
-            != ctx.rewrite.target_snapshot_id
+    if target_planning_materialization.table_uuid() != Some(ctx.rewrite.target_table_uuid.as_str())
+        || target_planning_materialization.current_snapshot_id() != ctx.rewrite.target_snapshot_id
     {
         return Err(format!(
             "IMV target changed after admission: expected uuid={} snapshot={:?}, got uuid={:?} snapshot={:?}",
             ctx.rewrite.target_table_uuid,
             ctx.rewrite.target_snapshot_id,
-            target_planning_materialization.table.table_uuid,
-            target_planning_materialization.table.current_snapshot_id,
+            target_planning_materialization.table_uuid(),
+            target_planning_materialization.current_snapshot_id(),
         )
         .into());
     }
@@ -17438,10 +17434,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 connector_context,
             )
         })?;
-    if target_planning_materialization.table.table_uuid.as_deref()
-        != Some(ctx.rewrite.target_table_uuid.as_str())
-        || target_planning_materialization.table.current_snapshot_id
-            != ctx.rewrite.target_snapshot_id
+    if target_planning_materialization.table_uuid() != Some(ctx.rewrite.target_table_uuid.as_str())
+        || target_planning_materialization.current_snapshot_id() != ctx.rewrite.target_snapshot_id
     {
         return Err(handle_iceberg_mv_commit_error(
             state,
@@ -17453,8 +17447,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 "IMV target changed after admission: expected uuid={} snapshot={:?}, got uuid={:?} snapshot={:?}",
                 ctx.rewrite.target_table_uuid,
                 ctx.rewrite.target_snapshot_id,
-                target_planning_materialization.table.table_uuid,
-                target_planning_materialization.table.current_snapshot_id,
+                target_planning_materialization.table_uuid(),
+                target_planning_materialization.current_snapshot_id(),
             ),
             connector_context,
         ));
