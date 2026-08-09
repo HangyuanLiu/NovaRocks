@@ -61,6 +61,7 @@ use crate::connector::iceberg::delete_visibility::{
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_position_delete_sink_handle_payload;
+use crate::connector::iceberg::write_contract::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::delete_engine::{
@@ -69,8 +70,7 @@ use crate::engine::delete_engine::{
 };
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkMode, IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_for_admitted_target,
+    admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;

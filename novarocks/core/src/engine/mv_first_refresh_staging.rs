@@ -20,11 +20,11 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::iceberg::commit::CommitOpKind;
+use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use crate::connector::iceberg::write_control::IcebergFirstRefreshWritePlanPayloadV2;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_for_admitted_target,
+    admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::engine::{
     StandaloneState, execute_query_as_iceberg_staging_in_operation_with_connector_context,

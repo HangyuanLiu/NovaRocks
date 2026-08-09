@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use arrow::datatypes::SchemaRef;
 use base64::Engine;
 use bytes::Bytes;
+use novarocks_catalog::schema::ColumnDef;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,10 @@ use novarocks_spi::connector::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCommittedVersion, ConnectorExecutionBindingKey,
     ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorWriteReceipt,
     ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+};
+
+use crate::sql::planner::distributed::write::contract::{
+    SqlPositionDeleteOutputDescriptor, SqlWriteSinkMode,
 };
 
 use super::commit::DeletionVector;
@@ -48,11 +53,113 @@ use super::write_descriptor::{
     IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, decode_partition_descriptor,
     encode_partition_descriptor,
 };
-use crate::engine::query_planning::write_sink::{
-    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
-};
 use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
-use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+use novarocks_connector_iceberg::scan_model::{
+    IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+};
+
+/// Provider-private facts retained until native writer registration. SQL
+/// receives only the separately admitted SQL contract.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergWriteSinkSpec {
+    pub(crate) mode: IcebergWriteSinkMode,
+    pub(crate) iceberg: IcebergTableInfo,
+    pub(crate) target_columns: Vec<ColumnDef>,
+    pub(crate) table_location: String,
+    pub(crate) data_location: String,
+    pub(crate) target_partition_spec_id: i32,
+    pub(crate) cloud_properties: BTreeMap<String, String>,
+    pub(crate) file_format: String,
+    pub(crate) compression: IcebergWriteFileCompression,
+    pub(crate) position_delete_output_descriptor: Option<
+        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
+    >,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergWriteSinkMode {
+    Data,
+    RowLineageData,
+    PositionDeletes,
+    DeletionVectors,
+    EqualityDeletes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergWriteFileCompression {
+    Snappy,
+}
+
+impl IcebergWriteSinkSpec {
+    pub(crate) fn set_planned_snapshot_id(
+        &mut self,
+        planned_snapshot_id: Option<i64>,
+    ) -> Result<(), String> {
+        self.iceberg.current_snapshot_id = planned_snapshot_id;
+        Ok(())
+    }
+
+    pub(crate) fn sql_mode(&self) -> SqlWriteSinkMode {
+        match self.mode {
+            IcebergWriteSinkMode::Data => SqlWriteSinkMode::Data,
+            IcebergWriteSinkMode::RowLineageData => SqlWriteSinkMode::RowLineageData,
+            IcebergWriteSinkMode::PositionDeletes => SqlWriteSinkMode::PositionDeletes,
+            IcebergWriteSinkMode::DeletionVectors => SqlWriteSinkMode::DeletionVectors,
+            IcebergWriteSinkMode::EqualityDeletes => SqlWriteSinkMode::EqualityDeletes,
+        }
+    }
+}
+
+pub(crate) fn transform_to_sink_string(
+    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
+) -> String {
+    transform.to_string()
+}
+
+pub(crate) fn iceberg_write_sink_mode(mode: SqlWriteSinkMode) -> IcebergWriteSinkMode {
+    match mode {
+        SqlWriteSinkMode::Data => IcebergWriteSinkMode::Data,
+        SqlWriteSinkMode::RowLineageData => IcebergWriteSinkMode::RowLineageData,
+        SqlWriteSinkMode::PositionDeletes => IcebergWriteSinkMode::PositionDeletes,
+        SqlWriteSinkMode::DeletionVectors => IcebergWriteSinkMode::DeletionVectors,
+        SqlWriteSinkMode::EqualityDeletes => IcebergWriteSinkMode::EqualityDeletes,
+    }
+}
+
+pub(crate) fn position_delete_descriptor_from_sql(
+    descriptor: &SqlPositionDeleteOutputDescriptor,
+) -> Result<
+    crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
+    String,
+> {
+    Ok(crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
+        file_path: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
+            output_expr_index: descriptor.file_path.output_expr_index,
+            name: descriptor.file_path.name.clone(),
+            data_type: descriptor.file_path.data_type.clone(),
+            field_id: descriptor.file_path.field_id,
+        },
+        pos: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
+            output_expr_index: descriptor.pos.output_expr_index,
+            name: descriptor.pos.name.clone(),
+            data_type: descriptor.pos.data_type.clone(),
+            field_id: descriptor.pos.field_id,
+        },
+        partition_source_fields: descriptor
+            .partition_source_fields
+            .iter()
+            .map(|field| crate::connector::iceberg::position_delete_descriptor::PositionDeletePartitionSourceField {
+                output_expr_index: field.output_expr_index,
+                source_column_name: field.source_column_name.clone(),
+                partition_field_name: field.partition_field_name.clone(),
+                transform_expr: field.transform.sql_name(),
+                source_field_id: field.source_field_id,
+                data_type: field.data_type.clone(),
+            })
+            .collect(),
+        target_partition_spec_id: descriptor.target_partition_spec_id,
+    })
+}
 
 pub(crate) const ICEBERG_WRITE_PAYLOAD_VERSION: u32 = 1;
 

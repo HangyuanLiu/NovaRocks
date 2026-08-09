@@ -34,12 +34,13 @@ use crate::connector::iceberg::commit::{
     select_iceberg_update_mode,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
+use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    row_lineage_sink_spec_from_frozen_materialization, sql_write_plan_input_for_admitted_target,
+    admit_frozen_iceberg_write_target, row_lineage_sink_spec_from_frozen_materialization,
+    sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;

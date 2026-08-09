@@ -22,8 +22,7 @@
 //! admission; it is not retained in the SQL plan and this module never
 //! performs a current/latest connector acquisition.
 
-use std::collections::BTreeMap;
-
+use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use arrow::datatypes::DataType;
 use novarocks_catalog::schema::ColumnDef;
 
@@ -33,71 +32,9 @@ use super::bindings::{
 use crate::sql::analysis::TypedExpr;
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::planner::distributed::write::contract::{
-    ConnectorWriteInputBinding, SqlPositionDeleteOutputDescriptor, SqlPositionDeleteOutputField,
-    SqlWritePlanInput, SqlWriteSinkContract, SqlWriteSinkMode, SqlWriteSinkTargetContract,
+    ConnectorWriteInputBinding, SqlWritePlanInput, SqlWriteSinkContract, SqlWriteSinkMode,
+    SqlWriteSinkTargetContract,
 };
-
-/// Provider-private write facts retained by the application until native
-/// writer registration.  SQL never receives this value: it sees the paired
-/// `SqlWritePlanInput` constructed from its exact request-local binding.
-#[derive(Clone, Debug)]
-pub(crate) struct IcebergWriteSinkSpec {
-    pub(crate) mode: IcebergWriteSinkMode,
-    pub(crate) iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    pub(crate) target_columns: Vec<ColumnDef>,
-    pub(crate) table_location: String,
-    pub(crate) data_location: String,
-    pub(crate) target_partition_spec_id: i32,
-    pub(crate) cloud_properties: BTreeMap<String, String>,
-    pub(crate) file_format: String,
-    pub(crate) compression: IcebergWriteFileCompression,
-    pub(crate) position_delete_output_descriptor: Option<
-        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
-    >,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergWriteSinkMode {
-    Data,
-    RowLineageData,
-    PositionDeletes,
-    DeletionVectors,
-    EqualityDeletes,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergWriteFileCompression {
-    Snappy,
-}
-
-impl IcebergWriteSinkSpec {
-    /// Update only application-owned frozen provider facts.  The SQL target
-    /// contract is rebuilt from the exact binding before planning, so there
-    /// is no second planner table or scan source to keep in sync.
-    pub(crate) fn set_planned_snapshot_id(
-        &mut self,
-        planned_snapshot_id: Option<i64>,
-    ) -> Result<(), String> {
-        self.iceberg.current_snapshot_id = planned_snapshot_id;
-        Ok(())
-    }
-
-    pub(crate) fn sql_mode(&self) -> SqlWriteSinkMode {
-        match self.mode {
-            IcebergWriteSinkMode::Data => SqlWriteSinkMode::Data,
-            IcebergWriteSinkMode::RowLineageData => SqlWriteSinkMode::RowLineageData,
-            IcebergWriteSinkMode::PositionDeletes => SqlWriteSinkMode::PositionDeletes,
-            IcebergWriteSinkMode::DeletionVectors => SqlWriteSinkMode::DeletionVectors,
-            IcebergWriteSinkMode::EqualityDeletes => SqlWriteSinkMode::EqualityDeletes,
-        }
-    }
-}
-
-pub(crate) fn transform_to_sink_string(
-    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
-) -> String {
-    transform.to_string()
-}
 
 /// Project one already-admitted write target into the SQL compiler boundary.
 ///
@@ -189,20 +126,6 @@ pub(crate) fn sql_write_plan_input_for_admitted_target(
 /// The legacy write lifecycle still owns its commit collector and provider
 /// payload, but cannot manufacture a SQL token: it must pair that frozen
 /// target with the exact control lease captured at admission.
-pub(crate) fn admit_frozen_iceberg_write_target(
-    bindings: &QueryTableBindingStore,
-    sink_spec: &IcebergWriteSinkSpec,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<SqlTableBindingId, String> {
-    admit_frozen_iceberg_write_target_materialization(
-        bindings,
-        crate::connector::iceberg::provider::iceberg_write_target_admission_from_frozen_table(
-            &sink_spec.iceberg,
-        )?,
-        planning_lease,
-    )
-}
-
 /// Build a row-lineage writer envelope from a connector materialization that
 /// was already resolved through an exact planning lease.
 ///
@@ -218,6 +141,20 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
     crate::connector::iceberg::provider::row_lineage_sink_spec_from_frozen_materialization(
         materialization,
         entry,
+    )
+}
+
+pub(crate) fn admit_frozen_iceberg_write_target(
+    bindings: &QueryTableBindingStore,
+    sink_spec: &IcebergWriteSinkSpec,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<SqlTableBindingId, String> {
+    admit_frozen_iceberg_write_target_materialization(
+        bindings,
+        crate::connector::iceberg::provider::iceberg_write_target_admission_from_frozen_table(
+            &sink_spec.iceberg,
+        )?,
+        planning_lease,
     )
 }
 
@@ -320,51 +257,6 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
         input,
         entry,
     )
-}
-
-pub(crate) fn iceberg_write_sink_mode(mode: SqlWriteSinkMode) -> IcebergWriteSinkMode {
-    match mode {
-        SqlWriteSinkMode::Data => IcebergWriteSinkMode::Data,
-        SqlWriteSinkMode::RowLineageData => IcebergWriteSinkMode::RowLineageData,
-        SqlWriteSinkMode::PositionDeletes => IcebergWriteSinkMode::PositionDeletes,
-        SqlWriteSinkMode::DeletionVectors => IcebergWriteSinkMode::DeletionVectors,
-        SqlWriteSinkMode::EqualityDeletes => IcebergWriteSinkMode::EqualityDeletes,
-    }
-}
-
-pub(crate) fn position_delete_descriptor_from_sql(
-    descriptor: &SqlPositionDeleteOutputDescriptor,
-) -> Result<
-    crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
-    String,
-> {
-    Ok(crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
-        file_path: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
-            output_expr_index: descriptor.file_path.output_expr_index,
-            name: descriptor.file_path.name.clone(),
-            data_type: descriptor.file_path.data_type.clone(),
-            field_id: descriptor.file_path.field_id,
-        },
-        pos: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
-            output_expr_index: descriptor.pos.output_expr_index,
-            name: descriptor.pos.name.clone(),
-            data_type: descriptor.pos.data_type.clone(),
-            field_id: descriptor.pos.field_id,
-        },
-        partition_source_fields: descriptor
-            .partition_source_fields
-            .iter()
-            .map(|field| crate::connector::iceberg::position_delete_descriptor::PositionDeletePartitionSourceField {
-                output_expr_index: field.output_expr_index,
-                source_column_name: field.source_column_name.clone(),
-                partition_field_name: field.partition_field_name.clone(),
-                transform_expr: field.transform.sql_name(),
-                source_field_id: field.source_field_id,
-                data_type: field.data_type.clone(),
-            })
-            .collect(),
-        target_partition_spec_id: descriptor.target_partition_spec_id,
-    })
 }
 
 fn admitted_write_target(

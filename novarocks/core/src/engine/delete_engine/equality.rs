@@ -34,6 +34,7 @@ use crate::connector::iceberg::commit::{
     ensure_equality_delete_single_partition_spec,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
+use crate::connector::iceberg::write_contract::IcebergWriteSinkMode;
 use crate::connector::iceberg::write_contract::encode_equality_delete_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
@@ -43,8 +44,7 @@ use crate::engine::delete_engine::{
 };
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkMode, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_from_admitted_binding,
+    admit_frozen_iceberg_write_target, sql_write_plan_input_from_admitted_binding,
 };
 use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::query_execution::outcome::QueryExecutionResult;

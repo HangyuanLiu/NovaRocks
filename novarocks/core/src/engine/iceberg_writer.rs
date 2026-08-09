@@ -51,6 +51,10 @@ use crate::connector::iceberg::position_delete_descriptor::{
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
+use crate::connector::iceberg::write_contract::{
+    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
+    transform_to_sink_string,
+};
 use crate::connector::iceberg::write_control::{
     IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
 };
@@ -62,9 +66,7 @@ use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
-    transform_to_sink_string,
 };
 use crate::engine::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,

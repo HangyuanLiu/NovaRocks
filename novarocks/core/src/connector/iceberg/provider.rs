@@ -89,6 +89,10 @@ use super::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
 use super::data_mutation::IcebergDataMutationAdapter;
 use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use super::reader::IcebergBatchReader;
+use super::write_contract::{
+    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
+    iceberg_write_sink_mode, position_delete_descriptor_from_sql,
+};
 use super::write_control::IcebergWriteControlAdapter;
 use super::write_execution::IcebergDataWriteExecution;
 use super::write_service::RegisteredIcebergWriteControlBackend;
@@ -7582,7 +7586,7 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_handle(
     handle: &ConnectorTableHandle,
     input: &crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     entry: &IcebergCatalogEntry,
-) -> Result<crate::engine::query_planning::write_sink::IcebergWriteSinkSpec, String> {
+) -> Result<IcebergWriteSinkSpec, String> {
     let payload: TablePayload = decode_payload(handle.payload(), "admitted Iceberg write handle")
         .map_err(|error| error.to_string())?;
     let mut iceberg = payload.table_info.ok_or_else(|| {
@@ -7608,12 +7612,8 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_handle(
     let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
         serde_json::from_str(serialized)
             .map_err(|error| format!("decode admitted Iceberg write handle metadata: {error}"))?;
-    let mode =
-        crate::engine::query_planning::write_sink::iceberg_write_sink_mode(input.contract.mode);
-    if matches!(
-        mode,
-        crate::engine::query_planning::write_sink::IcebergWriteSinkMode::RowLineageData
-    ) {
+    let mode = iceberg_write_sink_mode(input.contract.mode);
+    if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
         iceberg.schema.fields.extend([
             novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                 field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
@@ -7639,7 +7639,7 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_handle(
         .contract
         .position_delete_output
         .as_ref()
-        .map(crate::engine::query_planning::write_sink::position_delete_descriptor_from_sql)
+        .map(position_delete_descriptor_from_sql)
         .transpose()?;
     let table_location = metadata.location().to_string();
     let data_location = metadata
@@ -7647,27 +7647,24 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_handle(
         .get("write.data.path")
         .cloned()
         .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
-    Ok(
-        crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
-            mode,
-            iceberg,
-            target_columns: input.contract.input_columns.clone(),
-            table_location,
-            data_location,
-            target_partition_spec_id: metadata.default_partition_spec_id(),
-            cloud_properties: entry.cloud_properties_map(),
-            file_format: "parquet".to_string(),
-            compression:
-                crate::engine::query_planning::write_sink::IcebergWriteFileCompression::Snappy,
-            position_delete_output_descriptor,
-        },
-    )
+    Ok(IcebergWriteSinkSpec {
+        mode,
+        iceberg,
+        target_columns: input.contract.input_columns.clone(),
+        table_location,
+        data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+        cloud_properties: entry.cloud_properties_map(),
+        file_format: "parquet".to_string(),
+        compression: IcebergWriteFileCompression::Snappy,
+        position_delete_output_descriptor,
+    })
 }
 
 pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
     materialization: &IcebergQueryTableMaterialization,
     entry: &IcebergCatalogEntry,
-) -> Result<crate::engine::query_planning::write_sink::IcebergWriteSinkSpec, String> {
+) -> Result<IcebergWriteSinkSpec, String> {
     let serialized = materialization
         .table
         .serialized_metadata
@@ -7702,21 +7699,18 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
         .get("write.data.path")
         .cloned()
         .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
-    Ok(
-        crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
-            mode: crate::engine::query_planning::write_sink::IcebergWriteSinkMode::RowLineageData,
-            iceberg: materialization.table.clone(),
-            target_columns,
-            table_location,
-            data_location,
-            target_partition_spec_id: metadata.default_partition_spec_id(),
-            cloud_properties: entry.cloud_properties_map(),
-            file_format: "parquet".to_string(),
-            compression:
-                crate::engine::query_planning::write_sink::IcebergWriteFileCompression::Snappy,
-            position_delete_output_descriptor: None,
-        },
-    )
+    Ok(IcebergWriteSinkSpec {
+        mode: IcebergWriteSinkMode::RowLineageData,
+        iceberg: materialization.table.clone(),
+        target_columns,
+        table_location,
+        data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+        cloud_properties: entry.cloud_properties_map(),
+        file_format: "parquet".to_string(),
+        compression: IcebergWriteFileCompression::Snappy,
+        position_delete_output_descriptor: None,
+    })
 }
 
 fn columns_from_metadata(
