@@ -54,7 +54,7 @@ SELECT COUNT(*) FROM ${case_db}.kill_query;
 -- SPI-5B: metadata aliases use the generic ConnectorReadSource path.  Abort
 -- after its metadata reader opens and require that reader to close before the
 -- runner accepts cross-process resource convergence.
--- @kill_query_after_be_log_contains=split_id=iceberg-metadata-0
+-- @kill_query_after_be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN
 -- @expect_error=Query execution was interrupted
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,1
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,1
