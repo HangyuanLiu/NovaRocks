@@ -5825,6 +5825,158 @@ impl IcebergQueryTableMaterialization {
     }
 }
 
+/// Freeze the full and affected IMV target reads while the provider owns the
+/// Iceberg file representation.  Core receives only the two opaque read
+/// authorities; it does not inspect, filter, or encode Iceberg data files.
+pub(crate) fn freeze_mv_target_reads(
+    materialization: &IcebergQueryTableMaterialization,
+    target_runtime: &crate::mv::refresh::target_apply::IcebergMvTargetRuntimeBinding,
+    filter: &crate::mv::model::TargetPartitionFilter,
+    contract: Option<&crate::mv::persistence::schema::MvPartitionContract>,
+    selector: ConnectorReadSelector,
+) -> Result<
+    (
+        IcebergQueryTableMaterialization,
+        IcebergQueryTableMaterialization,
+    ),
+    String,
+> {
+    let files = target_runtime.data_files_at_frozen_snapshot()?;
+    let full = materialization.with_frozen_files(files.clone(), selector)?;
+    let affected = materialization.with_frozen_files(
+        filter_frozen_mv_target_state_files(files, filter, contract, 0)?,
+        selector,
+    )?;
+    Ok((full, affected))
+}
+
+pub(crate) fn filter_frozen_mv_target_state_files(
+    files: Vec<IcebergDataFileInfo>,
+    filter: &crate::mv::model::TargetPartitionFilter,
+    contract: Option<&crate::mv::persistence::schema::MvPartitionContract>,
+    node_id: i32,
+) -> Result<Vec<IcebergDataFileInfo>, String> {
+    let crate::mv::model::TargetPartitionFilter::AllowList(allow_list) = filter else {
+        return Ok(files);
+    };
+    if allow_list.is_empty() {
+        return Ok(Vec::new());
+    }
+    let contract = contract.ok_or_else(|| {
+        format!(
+            "Iceberg MV target-state scan node_id={node_id} requires an affected-partition allow-list but its frozen binding has no target partition contract"
+        )
+    })?;
+    files
+        .into_iter()
+        .filter_map(|file| match mv_target_partition_key(contract, &file) {
+            Ok(key) if allow_list.contains(&key) => Some(Ok(file)),
+            Ok(_) => None,
+            Err(error) => Some(Err(format!(
+                "Iceberg MV target-state scan node_id={node_id} cannot map frozen target file {} partition: {error}",
+                file.path
+            ))),
+        })
+        .collect()
+}
+
+fn mv_target_partition_key(
+    contract: &crate::mv::persistence::schema::MvPartitionContract,
+    file: &IcebergDataFileInfo,
+) -> Result<crate::mv::model::MvPartitionKey, String> {
+    let spec_id = file
+        .partition_spec_id
+        .ok_or_else(|| format!("target file {} is missing partition spec id", file.path))?;
+    let mut fields = Vec::with_capacity(contract.fields.len());
+    for partition_field in &contract.fields {
+        let transform = mv_target_transform_text(&partition_field.transform).ok_or_else(|| {
+            format!(
+                "MV partition field {} uses unsupported void transform",
+                partition_field.partition_field_name
+            )
+        })?;
+        let value = file
+            .partition_values
+            .iter()
+            .find(|value| {
+                value
+                    .source_column
+                    .eq_ignore_ascii_case(&partition_field.source_column_name)
+                    && value.transform.eq_ignore_ascii_case(&transform)
+            })
+            .or_else(|| {
+                file.partition_values.iter().find(|value| {
+                    value
+                        .field_name
+                        .eq_ignore_ascii_case(&partition_field.partition_field_name)
+                        && value.transform.eq_ignore_ascii_case(&transform)
+                })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "target file {} has no partition value for {} with transform {}",
+                    file.path, partition_field.partition_field_name, transform
+                )
+            })?;
+        fields.push(crate::mv::model::MvPartitionKeyField::new(
+            partition_field.partition_field_name.clone(),
+            mv_target_partition_value(value)?,
+        ));
+    }
+    Ok(crate::mv::model::MvPartitionKey::new(spec_id, fields))
+}
+
+fn mv_target_partition_value(
+    value: &novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue,
+) -> Result<crate::mv::model::MvPartitionValue, String> {
+    use novarocks_connector_iceberg::scan_model::IcebergPartitionValue;
+
+    match &value.value {
+        None => Ok(crate::mv::model::MvPartitionValue::Null),
+        Some(IcebergPartitionValue::Boolean(value)) => Ok(
+            crate::mv::model::MvPartitionValue::String(value.to_string()),
+        ),
+        Some(IcebergPartitionValue::Int32(value)) => Ok(
+            crate::mv::model::MvPartitionValue::String(value.to_string()),
+        ),
+        Some(IcebergPartitionValue::Int64(value)) => Ok(
+            crate::mv::model::MvPartitionValue::String(value.to_string()),
+        ),
+        Some(IcebergPartitionValue::Float(value)) => Ok(
+            crate::mv::model::MvPartitionValue::String(value.to_string()),
+        ),
+        Some(IcebergPartitionValue::Double(value)) => Ok(
+            crate::mv::model::MvPartitionValue::String(value.to_string()),
+        ),
+        Some(IcebergPartitionValue::String(value)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(value.clone()))
+        }
+        Some(IcebergPartitionValue::Binary(_)) => Err(format!(
+            "target partition field {} has unsupported binary value",
+            value.field_name
+        )),
+    }
+}
+
+fn mv_target_transform_text(
+    transform: &crate::mv::persistence::schema::MvPartitionTransformContract,
+) -> Option<String> {
+    use crate::mv::persistence::schema::MvPartitionTransformContract;
+
+    match transform {
+        MvPartitionTransformContract::Identity => Some("identity".to_string()),
+        MvPartitionTransformContract::Year => Some("year".to_string()),
+        MvPartitionTransformContract::Month => Some("month".to_string()),
+        MvPartitionTransformContract::Day => Some("day".to_string()),
+        MvPartitionTransformContract::Hour => Some("hour".to_string()),
+        MvPartitionTransformContract::Bucket { num_buckets } => {
+            Some(format!("bucket({num_buckets})"))
+        }
+        MvPartitionTransformContract::Truncate { width } => Some(format!("truncate({width})")),
+        MvPartitionTransformContract::Void => None,
+    }
+}
+
 /// Produce a neutral terminal-write admission from a provider-owned frozen
 /// table descriptor.  Legacy callers may still hold this descriptor while
 /// their own execution carrier is migrated, but the query binding receives

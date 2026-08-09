@@ -445,7 +445,7 @@ fn sqlx2_mv_target_state_uses_only_frozen_allow_list_files() {
         }],
     };
 
-    let files = super::super::filter_frozen_mv_target_state_files(
+    let files = crate::connector::iceberg::provider::filter_frozen_mv_target_state_files(
         vec![selected, skipped],
         &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::from([allow_key])),
         Some(&contract),
@@ -461,7 +461,7 @@ fn sqlx2_mv_target_state_uses_only_frozen_allow_list_files() {
 fn sqlx2_mv_target_state_empty_allow_list_reads_no_frozen_files() {
     use std::collections::BTreeSet;
 
-    let files = super::super::filter_frozen_mv_target_state_files(
+    let files = crate::connector::iceberg::provider::filter_frozen_mv_target_state_files(
         vec![data_file("s3://bucket/target.parquet")],
         &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::new()),
         None,

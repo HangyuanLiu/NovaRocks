@@ -14287,23 +14287,21 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             materialization.table.table_uuid, materialization.table.current_snapshot_id,
         ));
     }
-    let table = refresh.target_bindings.runtime().table_info()?;
-    let files = refresh
-        .target_bindings
-        .runtime()
-        .data_files_at_frozen_snapshot()?;
     let selector = frozen_snapshot_id
         .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
         .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
-    let full_materialization = materialization.with_frozen_files(files.clone(), selector)?;
-    let affected_files =
-        crate::query_execution::preparation::scan_preparation::filter_frozen_mv_target_state_files(
-            files,
+    let write_target_admission = materialization
+        .write_target_admission
+        .clone()
+        .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?;
+    let (full_materialization, affected_materialization) =
+        crate::connector::iceberg::provider::freeze_mv_target_reads(
+            &materialization,
+            refresh.target_bindings.runtime(),
             &refresh.affected_partitions_to_target_partition_filter(),
             refresh.rewrite.schema_contract.target.partition.as_ref(),
-            0,
+            selector,
         )?;
-    let affected_materialization = materialization.with_frozen_files(affected_files, selector)?;
     let to_read = |materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization| {
         QueryScanMaterialization {
             table: materialization.read_table.clone(),
@@ -14375,11 +14373,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             ),
             scan_materialization: Some(mv_target_read.full.clone()),
             mv_target_read: Some(mv_target_read),
-            write_target_admission: Some(
-                crate::connector::iceberg::provider::iceberg_write_target_admission_from_frozen_table(
-                    &table,
-                )?,
-            ),
+            write_target_admission: Some(write_target_admission.clone()),
             frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         })
@@ -16379,12 +16373,14 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     let target_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding =
         bind_imv_target_query_table_in_store(&refresh_context, &target_bindings, planning_lease)?;
-    let target_table_info = refresh_context.target_bindings.runtime().table_info()?;
+    let write_target_admission = target_bindings
+        .binding(target_binding)?
+        .write_target_admission
+        .clone()
+        .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         target_bindings.as_ref(),
-        crate::connector::iceberg::provider::iceberg_write_target_admission_from_frozen_table(
-            &target_table_info,
-        )?,
+        write_target_admission,
         planning_lease.clone(),
     )?;
     let rewrite_evidence = match evidence {
