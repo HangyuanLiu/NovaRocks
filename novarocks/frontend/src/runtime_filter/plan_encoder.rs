@@ -106,15 +106,14 @@ fn encode_contract(
             schema_digest: schema_digest.to_vec(),
         }),
         RuntimeFilterContractFacts::Ordered {
+            keys,
             comparator_digest,
             order_contract_digest,
-            ..
         } => Kind::Ordered(plan::RuntimeFilterOrderedContract {
-            keys: contract
-                .ordered_keys()
+            keys: keys
                 .into_iter()
                 .map(|key| plan::RuntimeFilterOrderKey {
-                    r#type: Some(key.r#type),
+                    r#type: Some(key.r#type.clone()),
                     direction: match key.direction {
                         RuntimeFilterSortDirection::Ascending => {
                             i32::from(plan::RuntimeFilterSortDirection::Ascending)
@@ -283,12 +282,8 @@ fn encode_role(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
-    use novarocks_execution::runtime_filter::contribution::{
-        RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
-    };
+    use novarocks::query_execution::{RuntimeFilterOrderKeyFacts, RuntimeFilterScanDomainTarget};
     use novarocks_protocol::common;
-    use novarocks_protocol::plan::RuntimeFilterScanDomainTarget;
     use plan::runtime_filter_binding::Role;
     use plan::runtime_filter_consumer_activation::Kind as ActivationKind;
     use plan::runtime_filter_reduction_contract::Kind as ReductionKind;
@@ -345,20 +340,19 @@ mod tests {
         assert_eq!(membership.canonical_schema, vec![1, 2, 3]);
         assert_eq!(membership.schema_digest, vec![4; 32]);
 
-        let keys = [
-            RuntimeOrderKey::with_order(
-                DataType::Int64,
-                RuntimeOrderSortDirection::Ascending,
-                RuntimeOrderNullOrder::First,
-            ),
-            RuntimeOrderKey::with_order(
-                DataType::Utf8,
-                RuntimeOrderSortDirection::Descending,
-                RuntimeOrderNullOrder::Last,
-            ),
-        ];
         let ordered = encode_contract(RuntimeFilterContractFacts::Ordered {
-            keys: &keys,
+            keys: vec![
+                RuntimeFilterOrderKeyFacts {
+                    r#type: common::TypeDesc { kind: None },
+                    direction: RuntimeFilterSortDirection::Ascending,
+                    null_order: RuntimeFilterNullOrder::First,
+                },
+                RuntimeFilterOrderKeyFacts {
+                    r#type: common::TypeDesc { kind: None },
+                    direction: RuntimeFilterSortDirection::Descending,
+                    null_order: RuntimeFilterNullOrder::Last,
+                },
+            ],
             comparator_digest: [5; 32],
             order_contract_digest: [6; 32],
         })
@@ -372,18 +366,9 @@ mod tests {
             i32::from(plan::RuntimeFilterSortDirection::Ascending)
         );
         assert_eq!(
-            ordered.keys[0].null_order,
-            i32::from(plan::RuntimeFilterNullOrder::First)
-        );
-        assert_eq!(
-            ordered.keys[1].direction,
-            i32::from(plan::RuntimeFilterSortDirection::Descending)
-        );
-        assert_eq!(
             ordered.keys[1].null_order,
             i32::from(plan::RuntimeFilterNullOrder::Last)
         );
-        assert!(ordered.keys.iter().all(|key| key.r#type.is_some()));
         assert_eq!(ordered.comparator_digest, vec![5; 32]);
         assert_eq!(ordered.order_contract_digest, vec![6; 32]);
     }
