@@ -108,10 +108,7 @@ mod tests {
     };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-    use super::super::node::{
-        NativePlanDecodeContext, decode_node, decode_node_with_runtime_filters,
-    };
-    use super::super::runtime_filter::NativeRuntimeFilterDecodeLedger;
+    use super::super::node::{NativePlanDecodeContext, decode_node};
     use crate::common::ids::SlotId;
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
@@ -121,8 +118,6 @@ mod tests {
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime_filter::model::contract::NullSemantics;
-    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
     use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use novarocks_connector_iceberg::delta::DeltaSourceRole;
     use novarocks_protocol::{common, expr, novarocks, plan};
@@ -681,84 +676,6 @@ mod tests {
                 })),
             })),
         }
-    }
-
-    fn column_ref(column_id: u32, name: &str, data_type: DataType) -> expr::Expr {
-        expr::Expr {
-            r#type: Some(type_desc(&data_type)),
-            nullable: true,
-            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
-                column_id,
-                qualifier: None,
-                column: Some(name.to_string()),
-            })),
-        }
-    }
-
-    fn membership_consumer_binding(binding_id: u32, node_id: i32) -> plan::RuntimeFilterBinding {
-        let schema = ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
-            .expect("membership schema");
-        plan::RuntimeFilterBinding {
-            binding_id,
-            channel_id: 9,
-            node_id,
-            apply_point: i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
-            expression: Some(column_ref(1, "id", DataType::Int64)),
-            contract: Some(plan::RuntimeFilterContract {
-                kind: Some(plan::runtime_filter_contract::Kind::Membership(
-                    plan::RuntimeFilterMembershipContract {
-                        canonical_schema: schema.canonical_bytes().to_vec(),
-                        schema_digest: schema.digest().bytes().to_vec(),
-                    },
-                )),
-            }),
-            reduction: Some(plan::RuntimeFilterReductionContract {
-                kind: Some(plan::runtime_filter_reduction_contract::Kind::SetUnion(
-                    true,
-                )),
-            }),
-            role: Some(plan::runtime_filter_binding::Role::Consumer(
-                plan::RuntimeFilterConsumerRole {
-                    capabilities: vec![
-                        i32::from(plan::RuntimeFilterArtifactCapability::Membership),
-                        i32::from(plan::RuntimeFilterArtifactCapability::EmptyDomain),
-                    ],
-                    activation: Some(plan::RuntimeFilterConsumerActivation {
-                        kind: Some(
-                            plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true),
-                        ),
-                    }),
-                    target: Some(
-                        plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
-                            plan::RuntimeFilterSourceBoundaryTarget {
-                                scan_domain_target: None,
-                            },
-                        ),
-                    ),
-                },
-            )),
-        }
-    }
-
-    fn lower_delta_scan_with_binding(
-        node: &mut plan::DistributedNode,
-    ) -> super::super::node::DecodedNode {
-        node.runtime_filter_binding_ids = vec![1];
-        let table = plan::RuntimeFilterBindingTable {
-            fragment_id: node.fragment_id,
-            bindings: vec![membership_consumer_binding(1, node.node_id)],
-        };
-        let mut ledger = NativeRuntimeFilterDecodeLedger::decode(node.fragment_id, Some(&table))
-            .expect("decode delta-scan consumer table");
-        let lowered = decode_node_with_runtime_filters(
-            node,
-            &mut ExprArena::default(),
-            &NativePlanDecodeContext::default(),
-            &mut ledger,
-        )
-        .expect("lower delta scan with dormant leaf-local consumer");
-        ledger.finish().expect("delta-scan consumer consumed");
-        lowered
     }
 
     fn file_range() -> novarocks::ScanRangeParams {

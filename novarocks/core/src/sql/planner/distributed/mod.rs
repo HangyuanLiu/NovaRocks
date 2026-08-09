@@ -24,9 +24,6 @@ pub(crate) use crate::sql::planner::runtime_filter::activation::{
 pub(crate) use activation_decision::DraftRuntimeFilterGraph;
 pub(crate) mod boundary;
 pub(crate) mod build;
-#[cfg(feature = "runtime-filter-test-support")]
-pub mod fragment;
-#[cfg(not(feature = "runtime-filter-test-support"))]
 mod fragment;
 mod node;
 pub(crate) mod output;

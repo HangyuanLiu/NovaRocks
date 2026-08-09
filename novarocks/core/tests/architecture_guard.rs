@@ -498,17 +498,8 @@ fn raw_identifier_planner_use_paths_are_rejected() {
 #[test]
 fn non_planner_use_path_is_accepted() {
     assert!(!contains_sql_planner_use_path(
-        "use crate::runtime_filter::model::contract::{BindingId, ChannelId};"
+        "use crate::runtime::query_context::QueryContext;"
     ));
-}
-
-#[test]
-fn runtime_filter_model_does_not_depend_on_sql_planner() {
-    let model_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime_filter/model");
-    assert!(
-        source_contains(rust_sources(&model_root), contains_sql_planner_use_path).is_none(),
-        "runtime-filter model must not depend on the SQL planner"
-    );
 }
 
 #[test]

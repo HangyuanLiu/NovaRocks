@@ -142,12 +142,72 @@ mod tests {
     }
 
     #[test]
-    fn permits_live_apply_feedback_edge() {
-        RuntimeFilterWaitGraph::new([
+    fn validates_blocking_and_live_apply_feedback_matrix() {
+        let cases = [
+            (
+                "acyclic blocking multicast",
+                vec![
+                    RuntimeFilterWaitEdge::new(1, 2, true),
+                    RuntimeFilterWaitEdge::new(1, 3, true),
+                    RuntimeFilterWaitEdge::new(2, 4, true),
+                    RuntimeFilterWaitEdge::new(3, 4, true),
+                ],
+                true,
+            ),
+            (
+                "all blocking multicast feedback",
+                vec![
+                    RuntimeFilterWaitEdge::new(1, 2, true),
+                    RuntimeFilterWaitEdge::new(1, 3, true),
+                    RuntimeFilterWaitEdge::new(3, 1, true),
+                ],
+                false,
+            ),
+            (
+                "live apply feedback is not a completion dependency",
+                vec![
+                    RuntimeFilterWaitEdge::new(1, 2, true),
+                    RuntimeFilterWaitEdge::new(2, 3, true),
+                    RuntimeFilterWaitEdge::new(3, 1, false),
+                ],
+                true,
+            ),
+            (
+                "a self cycle blocks startup",
+                vec![RuntimeFilterWaitEdge::new(7, 7, true)],
+                false,
+            ),
+        ];
+
+        for (name, edges, expected_live) in cases {
+            let result = RuntimeFilterWaitGraph::new(edges).validate();
+            assert_eq!(
+                result.is_ok(),
+                expected_live,
+                "{name} must have the expected liveness result"
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_witness_is_stable_when_edges_are_reordered() {
+        let ordered = RuntimeFilterWaitGraph::new([
+            RuntimeFilterWaitEdge::new(3, 1, true),
             RuntimeFilterWaitEdge::new(1, 2, true),
-            RuntimeFilterWaitEdge::new(2, 1, false),
-        ])
-        .validate()
-        .expect("a nonblocking live-apply edge cannot create a completion deadlock");
+            RuntimeFilterWaitEdge::new(2, 3, true),
+        ]);
+        let reordered = RuntimeFilterWaitGraph::new([
+            RuntimeFilterWaitEdge::new(2, 3, true),
+            RuntimeFilterWaitEdge::new(1, 2, true),
+            RuntimeFilterWaitEdge::new(3, 1, true),
+        ]);
+
+        let witness = |graph: RuntimeFilterWaitGraph| match graph
+            .validate()
+            .expect_err("the graph has an all-blocking cycle")
+        {
+            RuntimeFilterLivenessError::BlockingFeedbackCycle { witness } => witness,
+        };
+        assert_eq!(witness(ordered), witness(reordered));
     }
 }

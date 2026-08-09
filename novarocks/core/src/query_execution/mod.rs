@@ -35,26 +35,21 @@ pub use preparation::runtime_filter_view::{
     RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
     RuntimeFilterBindingFactsView, RuntimeFilterBindingFragmentFactsView,
     RuntimeFilterBindingRoleFacts, RuntimeFilterCompletionRequirement,
-    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContractFacts,
-    RuntimeFilterContributionKind, RuntimeFilterCoverageFacts, RuntimeFilterDeploymentBindingFacts,
+    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContributionKind,
+    RuntimeFilterCoverageFacts, RuntimeFilterDeploymentBindingFacts,
     RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
-    RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterDeploymentLogicalDomainFacts,
-    RuntimeFilterDeploymentReductionFacts, RuntimeFilterFragmentEdgeFacts,
+    RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterFragmentEdgeFacts,
     RuntimeFilterFrontierEdgeFacts, RuntimeFilterJoinProgressFacts,
-    RuntimeFilterJoinProgressSkipReason, RuntimeFilterLateApplyGranularity, RuntimeFilterNullOrder,
-    RuntimeFilterNullSemantics, RuntimeFilterOrderKeyFacts, RuntimeFilterPolicyFacts,
-    RuntimeFilterProducerTarget, RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget,
-    RuntimeFilterSortDirection, RuntimeFilterValidatedPlacementFacts,
+    RuntimeFilterJoinProgressSkipReason, RuntimeFilterLateApplyGranularity,
+    RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
+    RuntimeFilterOrderKeyFacts, RuntimeFilterPolicyFacts, RuntimeFilterProducerTarget,
+    RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget, RuntimeFilterSortDirection,
+    RuntimeFilterValidatedPlacementFacts,
 };
 pub mod prepared_write;
 pub(crate) mod profile;
 pub mod read_session;
 pub mod request_context;
-#[cfg(test)]
-mod runtime_filter;
-#[cfg(feature = "runtime-filter-test-support")]
-pub mod schedule;
-#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod schedule;
 pub mod service;
 pub mod session;

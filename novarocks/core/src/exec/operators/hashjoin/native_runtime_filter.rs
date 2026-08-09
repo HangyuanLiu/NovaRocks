@@ -17,40 +17,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
-use std::sync::{Condvar, Mutex, OnceLock, Weak};
-#[cfg(test)]
-use std::time::{Duration, Instant};
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
 
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
-#[cfg(test)]
-use crate::runtime_filter::codec::contribution::ContributionCodecError;
-#[cfg(test)]
-use crate::runtime_filter::exec::membership_delta::{
-    MembershipDeltaEncoder, MembershipEncodingOutcome,
-};
-#[cfg(test)]
-use crate::runtime_filter::model::contract::BindingId;
-#[cfg(test)]
-use crate::runtime_filter::model::contract::NullSemantics;
-#[cfg(test)]
-use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
-#[cfg(test)]
-use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-use crate::runtime_filter::port::identity::PartitionId;
-#[cfg(test)]
-use crate::runtime_filter::port::identity::ProducerSequence;
-#[cfg(test)]
-use crate::runtime_filter::port::producer::{
-    ProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
-};
-use execution::RuntimeFilterProducerFailure;
 
 #[derive(Default)]
 struct NativeProducerInstanceCoordinator {
@@ -58,57 +31,35 @@ struct NativeProducerInstanceCoordinator {
 }
 
 #[derive(Clone)]
-enum NativeMembershipProducerSource {
-    Session(execution::RuntimeFilterSessionRef),
-    #[cfg(test)]
-    Prebound {
-        adapter: Arc<dyn ProducerAdapter>,
-        max_contribution_bytes: usize,
-    },
-}
-
-#[derive(Clone)]
-pub(crate) struct NativeMembershipProducerBinding {
+struct NativeMembershipProducerBinding {
     join_key_ordinal: usize,
     contract: execution::RuntimeFilterProducerContract,
-    #[cfg(test)]
-    data_type: DataType,
-    #[cfg(test)]
-    membership_schema: ArtifactMembershipSchema,
-    source: NativeMembershipProducerSource,
+    session: execution::RuntimeFilterSessionRef,
     coordinator: Arc<NativeProducerInstanceCoordinator>,
 }
 
 impl NativeMembershipProducerBinding {
     #[cfg(test)]
-    pub(crate) fn for_test(
+    fn for_test(
         binding_id: u32,
         join_key_ordinal: usize,
-        data_type: DataType,
-        max_contribution_bytes: usize,
-        adapter: Arc<dyn ProducerAdapter>,
+        data_type: arrow::datatypes::DataType,
+        session: execution::RuntimeFilterSessionRef,
     ) -> Self {
-        let schema = ArtifactMembershipSchema::new(&data_type, NullSemantics::NeverMatches)
-            .expect("test membership schema");
-        let execution_schema = execution::RuntimeFilterMembershipSchema::new(
+        let schema = execution::RuntimeFilterMembershipSchema::new(
             &data_type,
             execution::RuntimeFilterNullSemantics::NeverMatches,
         )
-        .expect("test execution membership schema");
+        .expect("test membership schema");
         Self {
             join_key_ordinal,
-            data_type,
-            membership_schema: schema.clone(),
             contract: execution::RuntimeFilterProducerContract::membership(
                 execution::RuntimeFilterBindingId::new(binding_id),
                 execution::RuntimeFilterChannelId::new(binding_id),
-                RuntimeFilterExecutionContract::Membership(execution_schema),
+                RuntimeFilterExecutionContract::Membership(schema),
             )
             .expect("test membership producer contract"),
-            source: NativeMembershipProducerSource::Prebound {
-                adapter,
-                max_contribution_bytes,
-            },
+            session,
             coordinator: Arc::new(NativeProducerInstanceCoordinator::default()),
         }
     }
@@ -123,9 +74,7 @@ impl NativeMembershipProducerBinding {
         let build_expr = build_keys.get(spec.build_key_index).ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} join key ordinal {} is out of bounds for {} build keys",
-                spec.binding_id(),
-                spec.build_key_index,
-                build_keys.len()
+                spec.binding_id(), spec.build_key_index, build_keys.len()
             )
         })?;
         if *build_expr != spec.build_expr_id {
@@ -141,15 +90,12 @@ impl NativeMembershipProducerBinding {
                 spec.binding_id()
             ));
         }
-        let data_type = arena
-            .data_type(spec.build_expr_id)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "native runtime-filter binding_id={} build expression has no frozen data type",
-                    spec.binding_id()
-                )
-            })?;
+        let data_type = arena.data_type(spec.build_expr_id).ok_or_else(|| {
+            format!(
+                "native runtime-filter binding_id={} build expression has no frozen data type",
+                spec.binding_id()
+            )
+        })?;
         let RuntimeFilterExecutionContract::Membership(membership_schema) =
             spec.contract().contract()
         else {
@@ -158,7 +104,7 @@ impl NativeMembershipProducerBinding {
                 spec.binding_id()
             ));
         };
-        if membership_schema.data_type() != &data_type
+        if membership_schema.data_type() != data_type
             || membership_schema.null_semantics()
                 != execution::RuntimeFilterNullSemantics::NeverMatches
         {
@@ -171,21 +117,11 @@ impl NativeMembershipProducerBinding {
         Ok(Self {
             join_key_ordinal: spec.build_key_index,
             contract: spec.contract().clone(),
-            #[cfg(test)]
-            data_type: data_type.clone(),
-            #[cfg(test)]
-            membership_schema: ArtifactMembershipSchema::new(
-                &data_type,
-                NullSemantics::NeverMatches,
-            )
-            .map_err(|error| error.to_string())?,
-            source: NativeMembershipProducerSource::Session(session),
+            session,
             coordinator: Arc::new(NativeProducerInstanceCoordinator::default()),
         })
     }
-}
 
-impl NativeMembershipProducerBinding {
     fn binding_id(&self) -> u32 {
         self.contract.binding_id().get()
     }
@@ -231,46 +167,53 @@ impl NativeRuntimeFilterProducerFactory {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        bindings: Vec<NativeMembershipProducerBinding>,
-        local_partition_count: u32,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            bindings,
-            local_partition_count,
-        })
-    }
-
-    #[cfg(test)]
-    fn binding_ids(&self) -> Vec<u32> {
-        self.bindings
-            .iter()
-            .map(NativeMembershipProducerBinding::binding_id)
-            .collect()
-    }
-
     pub(crate) fn binding_count(&self) -> usize {
         self.bindings.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        session: execution::RuntimeFilterSessionRef,
+        local_partition_count: u32,
+    ) -> Result<Self, String> {
+        if local_partition_count == 0 {
+            return Err("native runtime-filter build DOP must be positive".to_string());
+        }
+        Ok(Self {
+            bindings: vec![NativeMembershipProducerBinding::for_test(
+                17,
+                0,
+                arrow::datatypes::DataType::Int32,
+                session,
+            )],
+            local_partition_count,
+        })
     }
 
     pub(crate) const fn local_partition_count(&self) -> u32 {
         self.local_partition_count
     }
 
-    pub(crate) fn create(
+    pub(crate) fn create_for_driver(
         &self,
+        actual_dop: i32,
         local_index: i32,
     ) -> Result<NativeRuntimeFilterProducerSet, String> {
-        let local_index = u32::try_from(local_index).map_err(|_| {
-            format!(
-                "native runtime-filter pipeline local index {local_index} cannot be represented as a partition id"
-            )
+        let actual_dop = u32::try_from(actual_dop).map_err(|_| {
+            format!("native runtime-filter actual DOP {actual_dop} cannot be represented")
         })?;
-        if local_index >= self.local_partition_count {
+        if actual_dop != self.local_partition_count {
             return Err(format!(
-                "native runtime-filter pipeline local index {local_index} is outside build DOP {}",
+                "native runtime-filter build DOP drifted between factory build and operator creation: expected={} actual={actual_dop}",
                 self.local_partition_count
+            ));
+        }
+        let local_index = u32::try_from(local_index).map_err(|_| {
+            format!("native runtime-filter local driver index {local_index} cannot be represented")
+        })?;
+        if local_index >= actual_dop {
+            return Err(format!(
+                "native runtime-filter local driver index {local_index} is outside DOP {actual_dop}"
             ));
         }
         Ok(NativeRuntimeFilterProducerSet {
@@ -292,9 +235,10 @@ pub(crate) struct NativeRuntimeFilterProducerSet {
 
 impl NativeRuntimeFilterProducerSet {
     pub(crate) fn bind(&mut self, local_partition_count: u32) -> Result<(), String> {
-        for index in 0..self.streams.len() {
-            if let Err(error) = self.streams[index].bind(local_partition_count) {
-                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
+        for stream in &mut self.streams {
+            if let Err(error) = stream.bind(local_partition_count) {
+                let _ =
+                    self.fail_incomplete(execution::RuntimeFilterProducerFailure::ExecutionFailed);
                 return Err(error);
             }
         }
@@ -302,14 +246,20 @@ impl NativeRuntimeFilterProducerSet {
     }
 
     pub(crate) fn submit(&mut self, key_arrays: &[ArrayRef]) -> Result<(), String> {
+        if self.completed {
+            return Ok(());
+        }
         for index in 0..self.streams.len() {
             match self.streams[index].submit(key_arrays) {
                 Ok(NativeMembershipSubmitOutcome::Applied) => {}
                 Ok(NativeMembershipSubmitOutcome::Unavailable) => {
-                    self.streams[index].fail(RuntimeFilterProducerFailure::UpstreamUnavailable)?;
+                    self.streams[index]
+                        .fail(execution::RuntimeFilterProducerFailure::UpstreamUnavailable)?;
                 }
                 Err(error) => {
-                    let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
+                    let _ = self
+                        .fail_incomplete(execution::RuntimeFilterProducerFailure::ExecutionFailed);
+                    self.completed = true;
                     return Err(error);
                 }
             }
@@ -318,9 +268,14 @@ impl NativeRuntimeFilterProducerSet {
     }
 
     pub(crate) fn finish(&mut self) -> Result<(), String> {
+        if self.completed {
+            return Ok(());
+        }
         for index in 0..self.streams.len() {
             if let Err(error) = self.streams[index].finish() {
-                let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
+                let _ =
+                    self.fail_incomplete(execution::RuntimeFilterProducerFailure::ExecutionFailed);
+                self.completed = true;
                 return Err(error);
             }
         }
@@ -328,14 +283,22 @@ impl NativeRuntimeFilterProducerSet {
         Ok(())
     }
 
-    pub(crate) fn fail(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
+    pub(crate) fn fail(
+        &mut self,
+        reason: execution::RuntimeFilterProducerFailure,
+    ) -> Result<(), String> {
         if self.completed {
             return Ok(());
         }
-        self.fail_incomplete(reason)
+        let result = self.fail_incomplete(reason);
+        self.completed = true;
+        result
     }
 
-    fn fail_incomplete(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
+    fn fail_incomplete(
+        &mut self,
+        reason: execution::RuntimeFilterProducerFailure,
+    ) -> Result<(), String> {
         let mut first_error = None;
         for stream in &mut self.streams {
             if let Err(error) = stream.fail(reason)
@@ -344,34 +307,24 @@ impl NativeRuntimeFilterProducerSet {
                 first_error = Some(error);
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
 impl Drop for NativeRuntimeFilterProducerSet {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = self.fail_incomplete(RuntimeFilterProducerFailure::ExecutionFailed);
+            let _ = self.fail_incomplete(execution::RuntimeFilterProducerFailure::ExecutionFailed);
         }
     }
 }
 
 struct NativeMembershipProducerStream {
     binding: NativeMembershipProducerBinding,
-    partition_id: PartitionId,
+    partition_id: execution::PartitionId,
     next_sequence: u64,
     terminal: bool,
-    endpoint: Option<NativeMembershipProducerEndpoint>,
-    max_contribution_bytes: Option<usize>,
-}
-
-enum NativeMembershipProducerEndpoint {
-    Execution(execution::RuntimeFilterProducerHandle),
-    #[cfg(test)]
-    Prebound(Arc<dyn ProducerAdapter>),
+    producer: Option<execution::RuntimeFilterProducerHandle>,
 }
 
 enum NativeMembershipSubmitOutcome {
@@ -379,220 +332,98 @@ enum NativeMembershipSubmitOutcome {
     Unavailable,
 }
 
-#[cfg(test)]
-fn encode_execution_membership_contribution(
-    delta: crate::runtime_filter::port::value_domain::ValueDomainDelta,
-    membership_schema: &ArtifactMembershipSchema,
-    max_contribution_bytes: usize,
-) -> Result<Option<execution::RuntimeFilterContribution>, ContributionCodecError> {
-    let mut canonical_domain = Vec::new();
-    delta
-        .encode_canonical_into(&mut canonical_domain)
-        .map_err(|_| ContributionCodecError::ResourceLimit)?;
-    let domain = execution::contribution::decode_value_domain(
-        &canonical_domain,
-        membership_schema.data_type(),
-        max_contribution_bytes,
-    )
-    .map_err(|_| ContributionCodecError::Malformed)?;
-    let typed = execution::contribution::RuntimeFilterContribution::membership(domain);
-    let encoded = match execution::contribution::encode_contribution(
-        &typed,
-        execution::contribution::ContributionCodecExpectation::membership(
-            membership_schema.data_type(),
-            membership_schema.digest().bytes(),
-        ),
-        max_contribution_bytes,
-    ) {
-        Ok(encoded) => encoded,
-        Err(
-            execution::contribution::ContributionCodecError::EncodedSizeExceeded
-            | execution::contribution::ContributionCodecError::ResourceLimit,
-        ) => {
-            return Ok(None);
-        }
-        Err(_) => return Err(ContributionCodecError::Malformed),
-    };
-    let (contract_digest, canonical_bytes) = encoded.into_parts();
-    Ok(Some(execution::RuntimeFilterContribution::new(
-        execution::RuntimeFilterContributionKind::Membership,
-        contract_digest,
-        canonical_bytes,
-    )))
-}
-
 impl NativeMembershipProducerStream {
     fn new(binding: NativeMembershipProducerBinding, local_index: u32) -> Self {
-        #[cfg(test)]
-        let (endpoint, max_contribution_bytes) = match &binding.source {
-            NativeMembershipProducerSource::Session(_) => (None, None),
-            NativeMembershipProducerSource::Prebound {
-                adapter,
-                max_contribution_bytes,
-            } => (
-                Some(NativeMembershipProducerEndpoint::Prebound(Arc::clone(
-                    adapter,
-                ))),
-                Some(*max_contribution_bytes),
-            ),
-        };
-        #[cfg(not(test))]
-        let (endpoint, max_contribution_bytes) = (None, None);
         Self {
             binding,
-            partition_id: PartitionId::new(local_index),
+            partition_id: execution::PartitionId::new(local_index),
             next_sequence: 0,
             terminal: false,
-            endpoint,
-            max_contribution_bytes,
+            producer: None,
         }
     }
 
     fn bind(&mut self, local_partition_count: u32) -> Result<(), String> {
-        if self.endpoint.is_some() {
+        if self.producer.is_some() || self.terminal {
             return Ok(());
         }
-        let NativeMembershipProducerSource::Session(session) = &self.binding.source else {
-            return Err(format!(
-                "native runtime-filter binding_id={} has no execution producer session",
-                self.binding.binding_id()
-            ));
-        };
         let request = execution::RuntimeFilterProducerOpenRequest::new(
             self.binding.contract.clone(),
             local_partition_count,
         );
-        let producer = match session.open_producer(request) {
-            Ok(execution::RuntimeFilterBindOutcome::Bound(producer)) => producer,
+        match self.binding.session.open_producer(request) {
+            Ok(execution::RuntimeFilterBindOutcome::Bound(producer)) => {
+                self.producer = Some(producer);
+                Ok(())
+            }
             Ok(execution::RuntimeFilterBindOutcome::Unavailable(_)) => {
                 self.mark_service_unavailable();
-                return Ok(());
+                Ok(())
             }
-            Err(error) => {
-                return Err(format!(
-                    "native runtime-filter binding_id={} execution session open failed during operator bind: {error}",
-                    self.binding.binding_id()
-                ));
+            Err(error)
+                if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+            {
+                self.mark_service_unavailable();
+                Ok(())
             }
-        };
-        self.max_contribution_bytes = Some(producer.max_contribution_bytes());
-        self.endpoint = Some(NativeMembershipProducerEndpoint::Execution(producer));
-        Ok(())
+            Err(error) => Err(format!(
+                "native runtime-filter binding_id={} execution session open failed during operator bind: {error}",
+                self.binding.binding_id()
+            )),
+        }
     }
 
     fn submit(&mut self, key_arrays: &[ArrayRef]) -> Result<NativeMembershipSubmitOutcome, String> {
         if self.terminal || self.binding.coordinator.failed.load(Ordering::Acquire) {
             return Ok(NativeMembershipSubmitOutcome::Applied);
         }
-        let endpoint = self.endpoint.as_ref().ok_or_else(|| {
+        let producer = self.producer.as_ref().ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} producer was not bound before build input",
                 self.binding.binding_id()
             )
         })?;
-        let max_contribution_bytes = self.max_contribution_bytes.ok_or_else(|| {
-            format!(
-                "native runtime-filter binding_id={} installed contribution budget is missing",
-                self.binding.binding_id()
-            )
-        })?;
-        let array = key_arrays
-            .get(self.binding.join_key_ordinal)
-            .ok_or_else(|| {
-                format!(
-                    "native runtime-filter binding_id={} build key ordinal {} is missing from evaluated arrays",
-                    self.binding.binding_id(), self.binding.join_key_ordinal
-                )
-        })?;
-        if let NativeMembershipProducerEndpoint::Execution(producer) = endpoint {
-            let contributions = match execution::contribution::encode_membership_contributions(
-                &self.binding.contract,
-                array,
-                max_contribution_bytes,
-            )
-            .map_err(|error| {
-                format!(
-                    "native runtime-filter binding_id={} membership encoding failed: {error}",
-                    self.binding.binding_id()
-                )
-            })? {
-                execution::contribution::MembershipContributionEncodingOutcome::Contributions(
-                    contributions,
-                ) => contributions,
-                execution::contribution::MembershipContributionEncodingOutcome::Unavailable(_) => {
-                    return Ok(NativeMembershipSubmitOutcome::Unavailable);
-                }
-            };
-            for contribution in contributions {
-                match producer.submit(
-                    execution::PartitionId::new(self.partition_id.get()),
-                    execution::ProducerSequence::new(self.next_sequence),
-                    contribution,
-                ) {
-                    Ok(execution::RuntimeFilterSubmitOutcome::TerminalNoop) => {
-                        self.binding
-                            .coordinator
-                            .failed
-                            .store(true, Ordering::Release);
-                        self.terminal = true;
-                        return Ok(NativeMembershipSubmitOutcome::Applied);
-                    }
-                    Ok(_) => {}
-                    Err(error)
-                        if error.kind()
-                            == execution::RuntimeFilterContractViolationKind::SessionClosed =>
-                    {
-                        self.mark_service_unavailable();
-                        return Ok(NativeMembershipSubmitOutcome::Applied);
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "native runtime-filter binding_id={} contribution failed: {error}",
-                            self.binding.binding_id()
-                        ));
-                    }
-                }
-                self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
-                    format!(
-                        "native runtime-filter binding_id={} producer sequence overflow",
-                        self.binding.binding_id()
-                    )
-                })?;
-            }
-            return Ok(NativeMembershipSubmitOutcome::Applied);
-        }
-        #[cfg(test)]
-        let NativeMembershipProducerEndpoint::Prebound(adapter) = endpoint else {
-            unreachable!("execution producer returns after execution-owned encoding");
-        };
-        #[cfg(test)]
-        let outcome = MembershipDeltaEncoder::encode(
-            array.as_ref(),
-            &self.binding.data_type,
-            max_contribution_bytes,
+        let array = key_arrays.get(self.binding.join_key_ordinal).ok_or_else(|| format!(
+            "native runtime-filter binding_id={} build key ordinal {} is missing from evaluated arrays",
+            self.binding.binding_id(), self.binding.join_key_ordinal
+        ))?;
+        let contributions = match execution::contribution::encode_membership_contributions(
+            &self.binding.contract,
+            array,
+            producer.max_contribution_bytes(),
         )
         .map_err(|error| {
             format!(
                 "native runtime-filter binding_id={} membership encoding failed: {error}",
                 self.binding.binding_id()
             )
-        })?;
-        #[cfg(test)]
-        let MembershipEncodingOutcome::Deltas(deltas) = outcome else {
-            return Ok(NativeMembershipSubmitOutcome::Unavailable);
-        };
-        #[cfg(test)]
-        for delta in deltas {
-            if delta.values().is_empty() && !delta.contains_null() {
-                continue;
+        })? {
+            execution::contribution::MembershipContributionEncodingOutcome::Contributions(
+                values,
+            ) => values,
+            execution::contribution::MembershipContributionEncodingOutcome::Unavailable(_) => {
+                return Ok(NativeMembershipSubmitOutcome::Unavailable);
             }
-            let outcome = match adapter.submit(
+        };
+        for contribution in contributions {
+            match producer.submit(
                 self.partition_id,
-                ProducerSequence::new(self.next_sequence),
-                delta,
+                execution::ProducerSequence::new(self.next_sequence),
+                contribution,
             ) {
-                Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
-                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                Ok(execution::RuntimeFilterSubmitOutcome::TerminalNoop) => {
+                    self.binding
+                        .coordinator
+                        .failed
+                        .store(true, Ordering::Release);
+                    self.terminal = true;
+                    return Ok(NativeMembershipSubmitOutcome::Applied);
+                }
+                Ok(_) => {}
+                Err(error)
+                    if error.kind()
+                        == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                {
                     self.mark_service_unavailable();
                     return Ok(NativeMembershipSubmitOutcome::Applied);
                 }
@@ -602,14 +433,6 @@ impl NativeMembershipProducerStream {
                         self.binding.binding_id()
                     ));
                 }
-            };
-            if outcome {
-                self.binding
-                    .coordinator
-                    .failed
-                    .store(true, Ordering::Release);
-                self.terminal = true;
-                return Ok(NativeMembershipSubmitOutcome::Applied);
             }
             self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
                 format!(
@@ -618,71 +441,43 @@ impl NativeMembershipProducerStream {
                 )
             })?;
         }
-        #[cfg(test)]
-        return Ok(NativeMembershipSubmitOutcome::Applied);
-
-        #[cfg(not(test))]
-        unreachable!("execution producer returns after execution-owned encoding");
+        Ok(NativeMembershipSubmitOutcome::Applied)
     }
 
     fn finish(&mut self) -> Result<(), String> {
-        if self.terminal {
-            return Ok(());
-        }
-        if self.binding.coordinator.failed.load(Ordering::Acquire) {
+        if self.terminal || self.binding.coordinator.failed.load(Ordering::Acquire) {
             self.terminal = true;
             return Ok(());
         }
-        let endpoint = self.endpoint.as_ref().ok_or_else(|| {
+        let producer = self.producer.as_ref().ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} producer was not bound before finish",
                 self.binding.binding_id()
             )
         })?;
-        let terminal_noop = match endpoint {
-            NativeMembershipProducerEndpoint::Execution(producer) => {
-                match producer.close_partition(
-                    execution::PartitionId::new(self.partition_id.get()),
-                    execution::ProducerSequence::new(self.next_sequence),
-                ) {
-                    Ok(outcome) => outcome == execution::RuntimeFilterSubmitOutcome::TerminalNoop,
-                    Err(error)
-                        if error.kind()
-                            == execution::RuntimeFilterContractViolationKind::SessionClosed =>
-                    {
-                        self.mark_service_unavailable();
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "native runtime-filter binding_id={} close failed: {error}",
-                            self.binding.binding_id()
-                        ));
-                    }
-                }
+        match producer.close_partition(
+            self.partition_id,
+            execution::ProducerSequence::new(self.next_sequence),
+        ) {
+            Ok(execution::RuntimeFilterSubmitOutcome::TerminalNoop) => {
+                self.binding
+                    .coordinator
+                    .failed
+                    .store(true, Ordering::Release);
             }
-            #[cfg(test)]
-            NativeMembershipProducerEndpoint::Prebound(adapter) => match adapter
-                .close_partition(self.partition_id, ProducerSequence::new(self.next_sequence))
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed =>
             {
-                Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
-                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
-                    self.mark_service_unavailable();
-                    return Ok(());
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "native runtime-filter binding_id={} close failed: {error}",
-                        self.binding.binding_id()
-                    ));
-                }
-            },
-        };
-        if terminal_noop {
-            self.binding
-                .coordinator
-                .failed
-                .store(true, Ordering::Release);
+                self.mark_service_unavailable();
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "native runtime-filter binding_id={} close failed: {error}",
+                    self.binding.binding_id()
+                ));
+            }
         }
         self.terminal = true;
         Ok(())
@@ -696,7 +491,7 @@ impl NativeMembershipProducerStream {
         self.terminal = true;
     }
 
-    fn fail(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
+    fn fail(&mut self, reason: execution::RuntimeFilterProducerFailure) -> Result<(), String> {
         self.terminal = true;
         if self
             .binding
@@ -707,202 +502,18 @@ impl NativeMembershipProducerStream {
         {
             return Ok(());
         }
-        let Some(endpoint) = self.endpoint.as_ref() else {
+        let Some(producer) = self.producer.as_ref() else {
             return Ok(());
         };
-        match endpoint {
-            NativeMembershipProducerEndpoint::Execution(producer) => {
-                if let Err(error) = producer.fail(reason) {
-                    if error.kind() != execution::RuntimeFilterContractViolationKind::SessionClosed
-                    {
-                        return Err(format!(
-                            "native runtime-filter binding_id={} fail-open failed: {error}",
-                            self.binding.binding_id()
-                        ));
-                    }
-                }
-            }
-            #[cfg(test)]
-            NativeMembershipProducerEndpoint::Prebound(adapter) => {
-                if let Err(error) = adapter.fail(test_producer_failure(reason)) {
-                    if error.kind() != RuntimeContractViolationKind::ServiceUnavailable {
-                        return Err(format!(
-                            "native runtime-filter binding_id={} fail-open failed: {error}",
-                            self.binding.binding_id()
-                        ));
-                    }
-                }
-            }
+        if let Err(error) = producer.fail(reason)
+            && error.kind() != execution::RuntimeFilterContractViolationKind::SessionClosed
+        {
+            return Err(format!(
+                "native runtime-filter binding_id={} fail-open failed: {error}",
+                self.binding.binding_id()
+            ));
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-fn test_producer_failure(
-    reason: RuntimeFilterProducerFailure,
-) -> crate::runtime_filter::port::producer::ProducerFailureReason {
-    match reason {
-        RuntimeFilterProducerFailure::Cancelled => {
-            crate::runtime_filter::port::producer::ProducerFailureReason::Cancelled
-        }
-        RuntimeFilterProducerFailure::ExecutionFailed => {
-            crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed
-        }
-        RuntimeFilterProducerFailure::UpstreamUnavailable => {
-            crate::runtime_filter::port::producer::ProducerFailureReason::UpstreamUnavailable
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct NativeProducerCloseGate {
-    state: Mutex<(bool, bool)>,
-    changed: Condvar,
-}
-
-#[cfg(test)]
-impl NativeProducerCloseGate {
-    pub(crate) fn wait_entered(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock().expect("native producer close gate lock");
-        while !state.0 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            let (next, result) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .expect("native producer close gate lock");
-            state = next;
-            if result.timed_out() && !state.0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub(crate) fn release(&self) {
-        let mut state = self.state.lock().expect("native producer close gate lock");
-        state.1 = true;
-        self.changed.notify_all();
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct NativeProducerCloseGateGuard {
-    key: (
-        crate::common::types::UniqueId,
-        BindingId,
-        crate::common::types::UniqueId,
-    ),
-    gate: Arc<NativeProducerCloseGate>,
-}
-
-#[cfg(test)]
-impl NativeProducerCloseGateGuard {
-    pub(crate) fn wait_entered(&self, timeout: Duration) -> bool {
-        self.gate.wait_entered(timeout)
-    }
-
-    pub(crate) fn release(&self) {
-        self.gate.release();
-    }
-}
-
-#[cfg(test)]
-impl Drop for NativeProducerCloseGateGuard {
-    fn drop(&mut self) {
-        self.gate.release();
-        let mut gates = native_producer_close_gates()
-            .lock()
-            .expect("native producer close gates lock");
-        if gates
-            .get(&self.key)
-            .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(&self.gate)))
-        {
-            gates.remove(&self.key);
-        }
-    }
-}
-
-#[cfg(test)]
-fn native_producer_close_gates() -> &'static Mutex<
-    std::collections::BTreeMap<
-        (
-            crate::common::types::UniqueId,
-            BindingId,
-            crate::common::types::UniqueId,
-        ),
-        Weak<NativeProducerCloseGate>,
-    >,
-> {
-    static GATES: OnceLock<
-        Mutex<
-            std::collections::BTreeMap<
-                (
-                    crate::common::types::UniqueId,
-                    BindingId,
-                    crate::common::types::UniqueId,
-                ),
-                Weak<NativeProducerCloseGate>,
-            >,
-        >,
-    > = OnceLock::new();
-    GATES.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
-}
-
-#[cfg(test)]
-pub(crate) fn install_native_producer_close_gate_for_test(
-    query_id: crate::common::types::UniqueId,
-    binding_id: BindingId,
-    fragment_instance_id: crate::common::types::UniqueId,
-) -> NativeProducerCloseGateGuard {
-    let key = (query_id, binding_id, fragment_instance_id);
-    let gate = Arc::new(NativeProducerCloseGate {
-        state: Mutex::new((false, false)),
-        changed: Condvar::new(),
-    });
-    native_producer_close_gates()
-        .lock()
-        .expect("native producer close gates lock")
-        .insert(key, Arc::downgrade(&gate));
-    NativeProducerCloseGateGuard { key, gate }
-}
-
-#[cfg(test)]
-fn wait_at_native_producer_close_gate_for_test(
-    query_id: crate::common::types::UniqueId,
-    binding_id: BindingId,
-    fragment_instance_id: crate::common::types::UniqueId,
-    timeout: Duration,
-) {
-    let gate = native_producer_close_gates()
-        .lock()
-        .expect("native producer close gates lock")
-        .get(&(query_id, binding_id, fragment_instance_id))
-        .and_then(Weak::upgrade);
-    let Some(gate) = gate else {
-        return;
-    };
-    let deadline = Instant::now() + timeout;
-    let mut state = gate.state.lock().expect("native producer close gate lock");
-    state.0 = true;
-    gate.changed.notify_all();
-    while !state.1 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return;
-        }
-        let (next, result) = gate
-            .changed
-            .wait_timeout(state, remaining)
-            .expect("native producer close gate lock");
-        state = next;
-        if result.timed_out() && !state.1 {
-            return;
-        }
     }
 }
 
@@ -910,38 +521,21 @@ fn wait_at_native_producer_close_gate_for_test(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
-    use arrow::datatypes::DataType;
-    use novarocks_execution::runtime_filter as execution;
+    use arrow::array::{ArrayRef, Int32Array};
 
-    use super::{
-        NativeMembershipProducerBinding, NativeRuntimeFilterProducerFactory,
-        encode_execution_membership_contribution, install_native_producer_close_gate_for_test,
-        native_producer_close_gates,
-    };
-    use crate::runtime_filter::codec::contribution::RuntimeFilterContribution as CoreContribution;
-    use crate::runtime_filter::exec::membership_delta::MembershipDeltaEncoder;
-    use crate::runtime_filter::model::contract::{BindingId, NullSemantics};
-    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-    use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
-    use crate::runtime_filter::port::producer::{
-        ProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
-        RuntimeContractViolationKind, SubmitOutcome,
-    };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use super::{NativeRuntimeFilterProducerFactory, execution};
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Debug, Eq, PartialEq)]
     enum Event {
         Submit {
             partition: u32,
             sequence: u64,
-            delta: ValueDomainDelta,
+            kind: execution::RuntimeFilterContributionKind,
         },
         Close {
             partition: u32,
-            terminal_sequence: u64,
+            sequence: u64,
         },
-        Fail(ProducerFailureReason),
     }
 
     #[derive(Default)]
@@ -949,606 +543,131 @@ mod tests {
         events: Mutex<Vec<Event>>,
     }
 
-    #[test]
-    fn native_producer_close_gate_guard_removes_registry_key() {
-        let query_id = novarocks_types::UniqueId::new(81, 82);
-        let binding_id = BindingId::new(83);
-        let finst_id = novarocks_types::UniqueId::new(84, 85);
-        let key = (query_id, binding_id, finst_id);
-        let guard = install_native_producer_close_gate_for_test(query_id, binding_id, finst_id);
-        assert!(
-            native_producer_close_gates()
-                .lock()
-                .unwrap()
-                .contains_key(&key)
-        );
-        drop(guard);
-        assert!(
-            !native_producer_close_gates()
-                .lock()
-                .unwrap()
-                .contains_key(&key)
-        );
-    }
-
     impl RecordingProducer {
         fn events(&self) -> Vec<Event> {
-            self.events.lock().expect("recording producer").clone()
+            self.events.lock().expect("events lock").drain(..).collect()
         }
     }
 
-    impl ProducerAdapter for RecordingProducer {
+    impl execution::RuntimeFilterProducer for RecordingProducer {
+        fn max_contribution_bytes(&self) -> usize {
+            1024
+        }
+
         fn submit(
             &self,
-            partition_id: PartitionId,
-            sequence: ProducerSequence,
-            delta: ValueDomainDelta,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            partition: execution::PartitionId,
+            sequence: execution::ProducerSequence,
+            contribution: execution::RuntimeFilterContribution,
+        ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+        {
             self.events
                 .lock()
-                .expect("recording producer")
+                .expect("events lock")
                 .push(Event::Submit {
-                    partition: partition_id.get(),
+                    partition: partition.get(),
                     sequence: sequence.get(),
-                    delta,
+                    kind: contribution.kind(),
                 });
-            Ok(SubmitOutcome::Applied)
+            Ok(execution::RuntimeFilterSubmitOutcome::Applied)
         }
 
         fn close_partition(
             &self,
-            partition_id: PartitionId,
-            terminal_sequence: ProducerSequence,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            self.events
-                .lock()
-                .expect("recording producer")
-                .push(Event::Close {
-                    partition: partition_id.get(),
-                    terminal_sequence: terminal_sequence.get(),
-                });
-            Ok(SubmitOutcome::Completed)
+            partition: execution::PartitionId,
+            sequence: execution::ProducerSequence,
+        ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+        {
+            self.events.lock().expect("events lock").push(Event::Close {
+                partition: partition.get(),
+                sequence: sequence.get(),
+            });
+            Ok(execution::RuntimeFilterSubmitOutcome::Completed)
         }
 
         fn fail(
             &self,
-            reason: ProducerFailureReason,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            self.events
-                .lock()
-                .expect("recording producer")
-                .push(Event::Fail(reason));
-            Ok(SubmitOutcome::CompletedWithoutArtifact)
+            _reason: execution::RuntimeFilterProducerFailure,
+        ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+        {
+            Ok(execution::RuntimeFilterSubmitOutcome::TerminalNoop)
         }
     }
 
-    struct TerminalNoopProducer {
-        recording: Arc<RecordingProducer>,
-    }
-
-    impl ProducerAdapter for TerminalNoopProducer {
-        fn submit(
-            &self,
-            partition_id: PartitionId,
-            sequence: ProducerSequence,
-            delta: ValueDomainDelta,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            self.recording.submit(partition_id, sequence, delta)?;
-            Ok(SubmitOutcome::TerminalNoop)
-        }
-
-        fn close_partition(
-            &self,
-            partition_id: PartitionId,
-            terminal_sequence: ProducerSequence,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            self.recording
-                .close_partition(partition_id, terminal_sequence)
-        }
-
-        fn fail(
-            &self,
-            reason: ProducerFailureReason,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            self.recording.fail(reason)
-        }
-    }
-
-    struct ServiceUnavailableProducer {
-        calls: Mutex<usize>,
-    }
-
-    impl ProducerAdapter for ServiceUnavailableProducer {
-        fn submit(
-            &self,
-            _partition_id: PartitionId,
-            _sequence: ProducerSequence,
-            _delta: ValueDomainDelta,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            *self.calls.lock().expect("unavailable calls") += 1;
-            Err(RuntimeContractViolation::new(
-                RuntimeContractViolationKind::ServiceUnavailable,
-                "injected service shutdown",
-            ))
-        }
-
-        fn close_partition(
-            &self,
-            _partition_id: PartitionId,
-            _terminal_sequence: ProducerSequence,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            *self.calls.lock().expect("unavailable calls") += 1;
-            Err(RuntimeContractViolation::new(
-                RuntimeContractViolationKind::ServiceUnavailable,
-                "injected service shutdown",
-            ))
-        }
-
-        fn fail(
-            &self,
-            _reason: ProducerFailureReason,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            *self.calls.lock().expect("unavailable calls") += 1;
-            Err(RuntimeContractViolation::new(
-                RuntimeContractViolationKind::ServiceUnavailable,
-                "injected service shutdown",
-            ))
-        }
-    }
-
-    struct CloseErrorProducer {
-        recording: Arc<RecordingProducer>,
-    }
-
-    impl ProducerAdapter for CloseErrorProducer {
-        fn submit(
-            &self,
-            partition_id: PartitionId,
-            sequence: ProducerSequence,
-            delta: ValueDomainDelta,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            self.recording.submit(partition_id, sequence, delta)
-        }
-
-        fn close_partition(
-            &self,
-            _partition_id: PartitionId,
-            _terminal_sequence: ProducerSequence,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            Err(RuntimeContractViolation::new(
-                RuntimeContractViolationKind::InvalidPartition,
-                "injected close failure",
-            ))
-        }
-
-        fn fail(
-            &self,
-            reason: ProducerFailureReason,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-            self.recording.fail(reason)
-        }
-    }
-
-    fn binding(
-        binding_id: u32,
-        join_key_ordinal: usize,
-        data_type: DataType,
-        max_contribution_bytes: usize,
+    struct Session {
         producer: Arc<RecordingProducer>,
-    ) -> NativeMembershipProducerBinding {
-        let adapter: Arc<dyn ProducerAdapter> = producer;
-        NativeMembershipProducerBinding::for_test(
-            binding_id,
-            join_key_ordinal,
-            data_type,
-            max_contribution_bytes,
-            adapter,
-        )
     }
 
-    fn int64(values: Vec<i64>) -> ArrayRef {
-        Arc::new(Int64Array::from(values))
-    }
-
-    #[test]
-    fn native_build_opens_exact_membership_binding() {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Int64, 1024, Arc::clone(&producer))],
-            1,
-        )
-        .expect("factory");
-        let mut stream = factory.create(0).expect("partition stream");
-
-        stream.submit(&[int64(vec![11])]).expect("submit");
-
-        assert_eq!(factory.binding_ids(), vec![17]);
-        assert!(matches!(
-            producer.events().as_slice(),
-            [Event::Submit {
-                partition: 0,
-                sequence: 0,
-                ..
-            }]
-        ));
-    }
-
-    #[test]
-    fn native_build_uses_pipeline_local_index_as_rf_partition() {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Int64, 1024, Arc::clone(&producer))],
-            4,
-        )
-        .expect("factory");
-        let mut stream = factory.create(2).expect("partition stream");
-
-        stream.submit(&[int64(vec![11])]).expect("submit");
-        stream.finish().expect("finish");
-
-        let events = producer.events();
-        assert_eq!(events.len(), 2, "events={events:?}");
-        assert!(events.iter().all(|event| match event {
-            Event::Submit { partition, .. } | Event::Close { partition, .. } => *partition == 2,
-            Event::Fail(_) => false,
-        }));
-    }
-
-    #[test]
-    fn broadcast_dop_gt_one_uses_rf_partitions_zero_through_dop_minus_one_even_when_hash_partition_is_zero()
-     {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Int64, 1024, Arc::clone(&producer))],
-            3,
-        )
-        .expect("factory");
-
-        for local_index in 0..3 {
-            let mut stream = factory.create(local_index).expect("partition stream");
-            stream
-                .submit(&[int64(vec![i64::from(local_index)])])
-                .expect("submit");
-            stream.finish().expect("finish");
+    impl execution::RuntimeFilterSession for Session {
+        fn open_producer(
+            &self,
+            _request: execution::RuntimeFilterProducerOpenRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+            execution::RuntimeFilterContractViolation,
+        > {
+            let producer = self.producer.clone() as execution::RuntimeFilterProducerHandle;
+            Ok(execution::RuntimeFilterBindOutcome::Bound(producer))
         }
 
-        let mut closed = producer
-            .events()
-            .into_iter()
-            .filter_map(|event| match event {
-                Event::Close { partition, .. } => Some(partition),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        closed.sort_unstable();
-        assert_eq!(closed, vec![0, 1, 2]);
-    }
+        fn subscribe(
+            &self,
+            _request: execution::RuntimeFilterSubscriptionRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+            execution::RuntimeFilterContractViolation,
+        > {
+            Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "producer test session has no subscriptions",
+            ))
+        }
 
-    #[test]
-    fn native_build_submits_each_join_key_ordinal_independently() {
-        let first = Arc::new(RecordingProducer::default());
-        let second = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![
-                binding(17, 0, DataType::Int64, 1024, Arc::clone(&first)),
-                binding(19, 1, DataType::Int64, 1024, Arc::clone(&second)),
-            ],
-            1,
-        )
-        .expect("factory");
-        let mut stream = factory.create(0).expect("partition stream");
-
-        stream
-            .submit(&[int64(vec![11]), int64(vec![29])])
-            .expect("submit");
-
-        assert!(matches!(
-            first.events().as_slice(),
-            [Event::Submit { sequence: 0, delta, .. }]
-                if delta.values() == &MembershipValues::int64([11])
-        ));
-        assert!(matches!(
-            second.events().as_slice(),
-            [Event::Submit { sequence: 0, delta, .. }]
-                if delta.values() == &MembershipValues::int64([29])
-        ));
-    }
-
-    #[test]
-    fn native_build_splits_bounded_deltas() {
-        let producer = Arc::new(RecordingProducer::default());
-        let exact_one =
-            crate::runtime_filter::exec::membership_delta::MembershipDeltaEncoder::encode(
-                &Int64Array::from(vec![1]),
-                &DataType::Int64,
-                usize::MAX,
-            )
-            .unwrap()
-            .into_deltas()
-            .unwrap()[0]
-                .canonical_encoded_len()
-                .unwrap();
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(
-                17,
-                0,
-                DataType::Int64,
-                exact_one,
-                Arc::clone(&producer),
-            )],
-            1,
-        )
-        .expect("factory");
-        let mut stream = factory.create(0).expect("partition stream");
-
-        stream.submit(&[int64(vec![1, 2, 3, 4])]).expect("submit");
-
-        let events = producer.events();
-        let submits = events
-            .iter()
-            .filter(|event| matches!(event, Event::Submit { .. }))
-            .collect::<Vec<_>>();
-        assert!(submits.len() > 1, "events={events:?}");
-        for (expected_sequence, event) in submits.into_iter().enumerate() {
-            let Event::Submit {
-                sequence, delta, ..
-            } = event
-            else {
-                unreachable!()
-            };
-            assert_eq!(*sequence, expected_sequence as u64);
-            assert!(delta.canonical_encoded_len().unwrap() <= exact_one);
+        fn open_final_domain_completion(
+            &self,
+            _request: execution::RuntimeFilterFinalDomainOpenRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<
+                execution::RuntimeFilterFinalDomainCompletionHandle,
+            >,
+            execution::RuntimeFilterContractViolation,
+        > {
+            Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "producer test session has no final-domain completion",
+            ))
         }
     }
 
     #[test]
-    fn native_membership_wire_budget_is_unavailable_not_a_fragment_error() {
-        let schema = ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
-            .expect("membership schema");
-        let delta = MembershipDeltaEncoder::encode(
-            &Int64Array::from(vec![1]),
-            &DataType::Int64,
-            usize::MAX,
-        )
-        .expect("membership delta")
-        .into_deltas()
-        .expect("membership deltas")
-        .into_iter()
-        .next()
-        .expect("one membership delta");
-        let semantic_budget = delta.canonical_encoded_len().expect("semantic size");
-
-        assert!(matches!(
-            encode_execution_membership_contribution(delta, &schema, semantic_budget,),
-            Ok(None)
-        ));
-    }
-
-    #[test]
-    fn native_oversized_scalar_fails_filter_open() {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Utf8, 64, Arc::clone(&producer))],
-            1,
-        )
-        .expect("factory");
-        let mut stream = factory.create(0).expect("partition stream");
-
-        stream
-            .submit(&[Arc::new(StringArray::from(vec!["x".repeat(512)]))])
-            .expect("runtime-filter size failure must not fail the join");
-
-        assert_eq!(
-            producer.events(),
-            vec![Event::Fail(ProducerFailureReason::UpstreamUnavailable)]
-        );
-    }
-
-    #[test]
-    fn native_empty_partition_closes_at_sequence_zero() {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Int64, 1024, Arc::clone(&producer))],
-            1,
-        )
-        .expect("factory");
-        let mut stream = factory.create(0).expect("partition stream");
-
-        stream.finish().expect("finish empty partition");
-
-        assert_eq!(
-            producer.events(),
-            vec![Event::Close {
-                partition: 0,
-                terminal_sequence: 0,
-            }]
-        );
-    }
-
-    #[test]
-    fn native_finish_closes_each_partition_once() {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Int64, 1024, Arc::clone(&producer))],
-            1,
-        )
-        .expect("factory");
-        let mut stream = factory.create(0).expect("partition stream");
-        stream.submit(&[int64(vec![11])]).expect("submit");
-
-        stream.finish().expect("first finish");
-        stream.finish().expect("duplicate finish");
-        drop(stream);
-
-        assert_eq!(
-            producer
-                .events()
-                .iter()
-                .filter(|event| matches!(event, Event::Close { .. }))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn native_first_cancel_or_error_fails_instance_once() {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Int64, 1024, Arc::clone(&producer))],
-            2,
-        )
-        .expect("factory");
-        let mut first = factory.create(0).expect("first partition");
-        let mut sibling = factory.create(1).expect("sibling partition");
-
-        first
-            .fail(execution::RuntimeFilterProducerFailure::Cancelled)
-            .expect("first failure");
-        sibling
-            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed)
-            .expect("sibling failure");
-
-        assert_eq!(
-            producer
-                .events()
-                .iter()
-                .filter(|event| matches!(event, Event::Fail(_)))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn native_sibling_finish_drop_after_failure_is_idempotent() {
-        let producer = Arc::new(RecordingProducer::default());
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![binding(17, 0, DataType::Int64, 1024, Arc::clone(&producer))],
-            2,
-        )
-        .expect("factory");
-        let mut first = factory.create(0).expect("first partition");
-        let mut sibling = factory.create(1).expect("sibling partition");
-
-        first
-            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed)
-            .expect("first failure");
-        sibling.finish().expect("sibling finish after failure");
-        drop(sibling);
-        drop(first);
-
-        assert_eq!(
-            producer.events(),
-            vec![Event::Fail(ProducerFailureReason::ExecutionFailed)]
-        );
-    }
-
-    #[test]
-    fn native_terminal_noop_stops_siblings_without_second_failure() {
+    fn membership_producer_encodes_and_closes_through_execution_capability() {
         let recording = Arc::new(RecordingProducer::default());
-        let adapter: Arc<dyn ProducerAdapter> = Arc::new(TerminalNoopProducer {
-            recording: Arc::clone(&recording),
+        let session: execution::RuntimeFilterSessionRef = Arc::new(Session {
+            producer: Arc::clone(&recording),
         });
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![NativeMembershipProducerBinding::for_test(
-                17,
-                0,
-                DataType::Int64,
-                1024,
-                adapter,
-            )],
-            2,
-        )
-        .expect("factory");
-        let mut first = factory.create(0).expect("first partition");
-        let mut sibling = factory.create(1).expect("sibling partition");
-
-        first.submit(&[int64(vec![11])]).expect("terminal noop");
-        sibling.submit(&[int64(vec![29])]).expect("sibling no-op");
-        sibling.finish().expect("sibling finish no-op");
+        let factory = NativeRuntimeFilterProducerFactory::for_test(session, 1)
+            .expect("test producer factory");
+        let mut producers = factory
+            .create_for_driver(1, 0)
+            .expect("test producer stream");
+        producers.bind(1).expect("bind producer");
+        let arrays = vec![Arc::new(Int32Array::from(vec![2, 4, 2])) as ArrayRef];
+        producers.submit(&arrays).expect("submit membership");
+        producers.finish().expect("close producer");
 
         assert_eq!(
             recording.events(),
-            vec![Event::Submit {
-                partition: 0,
-                sequence: 0,
-                delta: ValueDomainDelta::new(MembershipValues::int64([11]), false),
-            }]
-        );
-    }
-
-    #[test]
-    fn native_service_unavailable_is_terminal_fail_open_for_join() {
-        let adapter = Arc::new(ServiceUnavailableProducer {
-            calls: Mutex::new(0),
-        });
-        let producer: Arc<dyn ProducerAdapter> = adapter.clone();
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
-            vec![NativeMembershipProducerBinding::for_test(
-                17,
-                0,
-                DataType::Int64,
-                1024,
-                producer,
-            )],
-            2,
-        )
-        .expect("factory");
-        let mut first = factory.create(0).expect("first partition");
-        let mut sibling = factory.create(1).expect("sibling partition");
-
-        first
-            .submit(&[int64(vec![11])])
-            .expect("ServiceUnavailable must not fail the join");
-        sibling
-            .submit(&[int64(vec![29])])
-            .expect("terminal sibling is a no-op");
-        first.finish().expect("terminal finish");
-        sibling.finish().expect("terminal sibling finish");
-
-        assert_eq!(*adapter.calls.lock().expect("unavailable calls"), 1);
-    }
-
-    #[test]
-    fn native_multi_binding_close_error_rolls_back_already_closed_binding() {
-        let first = Arc::new(RecordingProducer::default());
-        let second = Arc::new(RecordingProducer::default());
-        let second_adapter: Arc<dyn ProducerAdapter> = Arc::new(CloseErrorProducer {
-            recording: Arc::clone(&second),
-        });
-        let factory = NativeRuntimeFilterProducerFactory::for_test(
             vec![
-                binding(17, 0, DataType::Int64, 1024, Arc::clone(&first)),
-                NativeMembershipProducerBinding::for_test(
-                    19,
-                    1,
-                    DataType::Int64,
-                    1024,
-                    second_adapter,
-                ),
-            ],
-            1,
-        )
-        .expect("factory");
-        let mut stream = factory.create(0).expect("partition stream");
-
-        let error = stream
-            .finish()
-            .expect_err("second binding close failure must be structural");
-
-        assert!(error.contains("injected close failure"), "{error}");
-        assert_eq!(
-            first.events(),
-            vec![
+                Event::Submit {
+                    partition: 0,
+                    sequence: 0,
+                    kind: execution::RuntimeFilterContributionKind::Membership,
+                },
                 Event::Close {
                     partition: 0,
-                    terminal_sequence: 0,
+                    sequence: 1,
                 },
-                Event::Fail(ProducerFailureReason::ExecutionFailed),
             ]
-        );
-        assert_eq!(
-            second.events(),
-            vec![Event::Fail(ProducerFailureReason::ExecutionFailed)]
         );
     }
 }

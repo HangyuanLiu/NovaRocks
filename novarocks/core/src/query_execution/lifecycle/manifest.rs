@@ -240,34 +240,6 @@ impl RuntimeFilterContribution {
         &self.wire.contribution_digest
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_compiled(
-        execution_id: QueryExecutionId,
-        participant_id: u32,
-        lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
-        install: crate::runtime_filter::port::install::RuntimeFilterParticipantInstall,
-    ) -> Result<Self, QueryLifecycleError> {
-        let envelope = crate::protocol::native::encode_participant_install(
-            UniqueId::new(
-                execution_id.query_id().high(),
-                execution_id.query_id().low(),
-            ),
-            lifecycle,
-            &install,
-        )
-        .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?;
-        let mut digest = sha2::Sha256::new();
-        use sha2::Digest;
-        digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
-        digest.update(prost::Message::encode_to_vec(&envelope));
-        Self::from_wire(novarocks_protocol::novarocks::RuntimeFilterContribution {
-            participant_id,
-            lifecycle: envelope.lifecycle,
-            install: envelope.install,
-            contribution_digest: digest.finalize().to_vec(),
-        })
-    }
-
     /// Construct an opaque owner-level contract fixture. It deliberately has no
     /// typed install: Core only verifies carrier shape.
     pub fn empty_for_contract_test(

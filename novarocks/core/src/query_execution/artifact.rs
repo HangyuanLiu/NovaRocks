@@ -439,31 +439,13 @@ impl ScheduleBoundDistributedQuery {
         self,
         query_id: QueryId,
         options: &ResolvedQueryOptions,
-        live_backends: &[LiveBackendTarget],
+        _live_backends: &[LiveBackendTarget],
     ) -> Result<InProcessTestArtifact, DistributedQueryError> {
         let connector_write_plan = self.connector_write_plan;
-        let runtime_filters = crate::query_execution::runtime_filter::compile_contribution_plan(
-            self.schedule.execution_id,
-            self.prepared.runtime_filter_graph(),
-            self.prepared.runtime_filter_join_progress(),
-            self.prepared.scheduling_view().edges(),
-            &self.schedule.inner,
-            live_backends,
-            1,
-            options.runtime_filter_lifecycle(),
-        )?
-        .into_iter()
-        .map(|contribution| {
-            let (_, participant_id, lifecycle, install) = contribution.into_parts();
-            RuntimeFilterContribution::from_compiled(
-                self.schedule.execution_id,
-                participant_id,
-                lifecycle,
-                install,
-            )
-            .map_err(|error| contract_error(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        // `in_process_test::bind_empty_runtime_filter_tables_for_test` rejects
+        // RF-bound plans before this assembly seam.  Keep this core-only test
+        // runtime carrier-neutral: it never compiles or installs RF semantics.
+        let runtime_filters = Vec::new();
         let install_plan = crate::query_execution::connector_binding::compile_install_plan(
             &self.prepared,
             &self.schedule.inner,

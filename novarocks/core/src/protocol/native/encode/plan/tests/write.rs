@@ -139,7 +139,6 @@ fn encode_scan_node_with_admitted_read(
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: None,
         },
     )
 }
@@ -211,7 +210,6 @@ fn change_stream_router_encoder_materializes_partition_exprs() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: Some(plan.write_contracts()),
-            runtime_filter_bindings: None,
         },
     )
     .expect("encode change-stream router sink");
@@ -251,7 +249,6 @@ fn change_stream_router_encoder_preserves_wire_bytes() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: Some(plan.write_contracts()),
-            runtime_filter_bindings: None,
         },
     )
     .expect("encode change-stream router sink");

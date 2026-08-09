@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -23,8 +23,7 @@ use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-    FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract, RuntimeFilterId,
-    ScanSourceContract,
+    FragmentProgramOptions, FragmentSinkSpec, ScanSourceContract,
 };
 use crate::exec::node::ExecPlan;
 use crate::protocol::common::error::FieldPath;
@@ -32,7 +31,6 @@ use crate::protocol::native::test_assembly::{
     NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
     NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
     NativeFragmentSubmissionValidator, NativeOutputLayoutDecoder, NativeScanSourceContractDecoder,
-    RuntimeFilterExecutionContractDecoder,
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -48,9 +46,8 @@ use novarocks_protocol::{novarocks, plan};
 use super::decode_fragment_sink_assignment;
 use super::instance::{NativeSubmissionMetadata, decode_scan_range_params_at};
 use super::{
-    NativeFragmentDecodeError, NativePlanDecodeContext, NativeRuntimeFilterDecodeLedger,
-    decode_fragment_sink_program_with_context, decode_node_with_runtime_filters,
-    decode_query_options,
+    NativeFragmentDecodeError, NativePlanDecodeContext, decode_fragment_sink_program_with_context,
+    decode_node, decode_query_options,
 };
 
 #[derive(Debug)]
@@ -121,7 +118,6 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         None,
         |root, path| decode_scan_source_contracts(root, path),
         |root, path| decode_exchange_contracts(root, path),
-        |fragment| decode_runtime_filter_contract(fragment),
     )
 }
 
@@ -136,7 +132,6 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     output_layout_decoder: Arc<dyn NativeOutputLayoutDecoder>,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
-    runtime_filter_contract_decoder: &dyn RuntimeFilterExecutionContractDecoder,
     connectors: Arc<crate::connector::ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
@@ -173,11 +168,6 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
                 .decode_exchange_contracts(root, path)
                 .map_err(NativeFragmentDecodeError::from)
         },
-        |fragment| {
-            runtime_filter_contract_decoder
-                .decode_runtime_filter_contract(fragment)
-                .map_err(NativeFragmentDecodeError::from)
-        },
     )
 }
 
@@ -206,12 +196,6 @@ fn assemble_fragment_submission_with_sink_assignment<F>(
         FieldPath,
     ) -> Result<
         BTreeMap<FragmentNodeId, ExchangeInputContract>,
-        NativeFragmentDecodeError,
-    >,
-    decode_runtime_filter_contract: impl FnOnce(
-        &plan::PlanFragment,
-    ) -> Result<
-        RuntimeFilterContract,
         NativeFragmentDecodeError,
     >,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError>
@@ -246,6 +230,7 @@ where
             "native DataSink requires kind",
         ));
     }
+    reject_runtime_filter_bindings(fragment)?;
     if let Some(submission_validator) = submission_validator {
         submission_validator
             .validate_fragment_expressions(fragment)
@@ -261,7 +246,6 @@ where
                         .index(index),
                 )?;
             }
-            validate_runtime_filter_binding_expressions(fragment)?;
         }
         #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
         return Err(NativeFragmentDecodeError::unsupported(
@@ -299,13 +283,7 @@ where
     if let Some(output_layout_decoder) = output_layout_decoder {
         context = context.with_output_layout_decoder(output_layout_decoder);
     }
-    let mut runtime_filter_ledger = NativeRuntimeFilterDecodeLedger::decode(
-        fragment.fragment_id,
-        fragment.runtime_filter_bindings.as_ref(),
-    )?;
-    let decoded_root =
-        decode_node_with_runtime_filters(root, &mut arena, &context, &mut runtime_filter_ledger)?;
-    runtime_filter_ledger.finish()?;
+    let decoded_root = decode_node(root, &mut arena, &context)?;
     // Drain the per-node enriched `BoundScanRanges` captured during decode into
     // the instance's scan assignments (`materialize_scan_bindings` binds these).
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
@@ -316,7 +294,6 @@ where
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let exchange_inputs = decode_exchange_contracts(root, root_path)?;
-    let runtime_filters = decode_runtime_filter_contract(fragment)?;
     let program = crate::exec::fragment::program::FragmentProgramBuilder::new(
         plan,
         sink_spec,
@@ -324,7 +301,6 @@ where
     )
     .scan_sources(scan_sources)
     .exchange_inputs(exchange_inputs)
-    .runtime_filters(runtime_filters)
     .finish()?;
     let metadata = NativeSubmissionMetadata::new(
         instance_parts.backend_num.get(),
@@ -445,25 +421,17 @@ fn validate_node_required_fields(
     Ok(())
 }
 
-fn validate_runtime_filter_binding_expressions(
+fn reject_runtime_filter_bindings(
     fragment: &plan::PlanFragment,
 ) -> Result<(), NativeFragmentDecodeError> {
     let Some(table) = fragment.runtime_filter_bindings.as_ref() else {
         return Ok(());
     };
-    for (index, binding) in table.bindings.iter().enumerate() {
-        let path = FieldPath::root("plan_fragment")
-            .field("runtime_filter_bindings")
-            .field("bindings")
-            .index(index)
-            .field("expression");
-        let expression = binding.expression.as_ref().ok_or_else(|| {
-            NativeFragmentDecodeError::missing(
-                path.clone(),
-                "native runtime-filter binding requires expression",
-            )
-        })?;
-        super::expr::validate_proto_expr_shape_at(expression, path)?;
+    if !table.bindings.is_empty() {
+        return Err(NativeFragmentDecodeError::unsupported(
+            FieldPath::root("plan_fragment").field("runtime_filter_bindings"),
+            "core native test decoder does not decode runtime-filter bindings; use the backend decoder",
+        ));
     }
     Ok(())
 }
@@ -647,44 +615,6 @@ fn decode_exchange_contracts(
     let mut contracts = BTreeMap::new();
     visit(root, path, &mut contracts)?;
     Ok(contracts)
-}
-
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-fn decode_runtime_filter_contract(
-    fragment: &plan::PlanFragment,
-) -> Result<RuntimeFilterContract, NativeFragmentDecodeError> {
-    let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
-    let table = fragment.runtime_filter_bindings.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(path.clone(), "runtime_filter_bindings are required")
-    })?;
-    let mut build_filters = BTreeSet::new();
-    let mut probe_filters = BTreeSet::new();
-    for (index, binding) in table.bindings.iter().enumerate() {
-        let raw_id = i32::try_from(binding.channel_id).map_err(|_| {
-            NativeFragmentDecodeError::out_of_range(
-                path.clone()
-                    .field("bindings")
-                    .index(index)
-                    .field("channel_id"),
-                format!("channel_id {} exceeds i32 range", binding.channel_id),
-            )
-        })?;
-        match binding.role.as_ref() {
-            Some(plan::runtime_filter_binding::Role::Producer(_)) => {
-                build_filters.insert(RuntimeFilterId::new(raw_id));
-            }
-            Some(plan::runtime_filter_binding::Role::Consumer(_)) => {
-                probe_filters.insert(RuntimeFilterId::new(raw_id));
-            }
-            None => {
-                return Err(NativeFragmentDecodeError::missing(
-                    path.clone().field("bindings").index(index).field("role"),
-                    "runtime-filter binding role is required",
-                ));
-            }
-        }
-    }
-    Ok(RuntimeFilterContract::new(build_filters, probe_filters))
 }
 
 fn unique_id_from_native(src: &novarocks_protocol::common::UniqueId) -> UniqueId {

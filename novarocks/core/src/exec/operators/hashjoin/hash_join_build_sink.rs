@@ -45,19 +45,10 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::runtime_filter::{
-    MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger,
-    RUNTIME_FILTER_JOIN_MODE_BROADCAST, RUNTIME_FILTER_JOIN_MODE_PARTITIONED, RuntimeBloomFilter,
-    RuntimeEmptyFilter, RuntimeFilterMergeDropCounters, RuntimeFilterType, RuntimeInFilter,
-    RuntimeMembershipBuildOptions, RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam,
-    RuntimeMinMaxFilter, encode_starrocks_bitset_filter, encode_starrocks_bloom_filter,
-    encode_starrocks_empty_filter, maybe_build_runtime_bitset_filter,
-};
 use crate::novarocks_logging::debug;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_state::RuntimeState;
-use std::collections::{HashMap, HashSet};
 
 /// Factory for hash-join build sinks that construct build-side hash structures.
 pub struct HashJoinBuildSinkFactory {
@@ -194,7 +185,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
                             "native runtime-filter build DOP {dop} cannot be represented as a partition count"
                         )),
                     };
-                    match factory.create(driver_id) {
+                    match factory.create_for_driver(dop, driver_id) {
                         Ok(producers) => (Some(producers), dop_error, Some(expected)),
                         Err(error) => (None, Some(error), Some(expected)),
                     }
@@ -774,18 +765,9 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
-    use crate::exec::operators::hashjoin::native_runtime_filter::{
-        NativeMembershipProducerBinding, NativeRuntimeFilterProducerFactory,
-    };
-    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory;
     use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
-    use crate::runtime::query_context::QueryId;
-    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
-    use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
-    use crate::runtime_filter::port::producer::{
-        ProducerAdapter, ProducerFailureReason, RuntimeContractViolation, SubmitOutcome,
-    };
-    use crate::runtime_filter::port::value_domain::ValueDomainDelta;
+    use novarocks_execution::runtime_filter as execution;
 
     #[derive(Default)]
     struct TestBuildState {
@@ -840,7 +822,7 @@ mod tests {
     enum NativeProducerEvent {
         Submit(u32),
         Close(u32),
-        Fail(ProducerFailureReason),
+        Fail(execution::RuntimeFilterProducerFailure),
     }
 
     #[derive(Default)]
@@ -854,41 +836,93 @@ mod tests {
         }
     }
 
-    impl ProducerAdapter for RecordingNativeProducer {
+    impl execution::RuntimeFilterProducer for RecordingNativeProducer {
+        fn max_contribution_bytes(&self) -> usize {
+            1024
+        }
+
         fn submit(
             &self,
-            partition_id: PartitionId,
-            _sequence: ProducerSequence,
-            _delta: ValueDomainDelta,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            partition_id: execution::PartitionId,
+            _sequence: execution::ProducerSequence,
+            _contribution: execution::RuntimeFilterContribution,
+        ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+        {
             self.events
                 .lock()
                 .expect("producer events")
                 .push(NativeProducerEvent::Submit(partition_id.get()));
-            Ok(SubmitOutcome::Applied)
+            Ok(execution::RuntimeFilterSubmitOutcome::Applied)
         }
 
         fn close_partition(
             &self,
-            partition_id: PartitionId,
-            _terminal_sequence: ProducerSequence,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            partition_id: execution::PartitionId,
+            _terminal_sequence: execution::ProducerSequence,
+        ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+        {
             self.events
                 .lock()
                 .expect("producer events")
                 .push(NativeProducerEvent::Close(partition_id.get()));
-            Ok(SubmitOutcome::Completed)
+            Ok(execution::RuntimeFilterSubmitOutcome::Completed)
         }
 
         fn fail(
             &self,
-            reason: ProducerFailureReason,
-        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            reason: execution::RuntimeFilterProducerFailure,
+        ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+        {
             self.events
                 .lock()
                 .expect("producer events")
                 .push(NativeProducerEvent::Fail(reason));
-            Ok(SubmitOutcome::CompletedWithoutArtifact)
+            Ok(execution::RuntimeFilterSubmitOutcome::CompletedWithoutArtifact)
+        }
+    }
+
+    struct RecordingNativeSession {
+        producer: Arc<RecordingNativeProducer>,
+    }
+
+    impl execution::RuntimeFilterSession for RecordingNativeSession {
+        fn open_producer(
+            &self,
+            _request: execution::RuntimeFilterProducerOpenRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+            execution::RuntimeFilterContractViolation,
+        > {
+            let producer = self.producer.clone() as execution::RuntimeFilterProducerHandle;
+            Ok(execution::RuntimeFilterBindOutcome::Bound(producer))
+        }
+
+        fn subscribe(
+            &self,
+            _request: execution::RuntimeFilterSubscriptionRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+            execution::RuntimeFilterContractViolation,
+        > {
+            Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "recording test session has no subscriptions",
+            ))
+        }
+
+        fn open_final_domain_completion(
+            &self,
+            _request: execution::RuntimeFilterFinalDomainOpenRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<
+                execution::RuntimeFilterFinalDomainCompletionHandle,
+            >,
+            execution::RuntimeFilterContractViolation,
+        > {
+            Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "recording test session has no final-domain completion",
+            ))
         }
     }
 
@@ -896,19 +930,11 @@ mod tests {
         producer: Arc<RecordingNativeProducer>,
         dop: u32,
     ) -> Arc<NativeRuntimeFilterProducerFactory> {
-        let adapter: Arc<dyn ProducerAdapter> = producer;
+        let session: execution::RuntimeFilterSessionRef =
+            Arc::new(RecordingNativeSession { producer });
         Arc::new(
-            NativeRuntimeFilterProducerFactory::for_test(
-                vec![NativeMembershipProducerBinding::for_test(
-                    17,
-                    0,
-                    DataType::Int32,
-                    1024,
-                    adapter,
-                )],
-                dop,
-            )
-            .expect("native producer factory"),
+            NativeRuntimeFilterProducerFactory::for_test(session, dop)
+                .expect("native producer factory"),
         )
     }
 
@@ -1022,7 +1048,11 @@ mod tests {
         let mut operator = direct_int_build_operator(state);
         operator.eq_null_safe.clear();
         operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution {
-            producers: Some(producer_factory.create(0).expect("producer stream")),
+            producers: Some(
+                producer_factory
+                    .create_for_driver(1, 0)
+                    .expect("producer stream"),
+            ),
             bind_error: None,
             local_partition_count: Some(1),
         };
@@ -1039,7 +1069,7 @@ mod tests {
         assert_eq!(
             producer.events(),
             vec![NativeProducerEvent::Fail(
-                ProducerFailureReason::ExecutionFailed
+                execution::RuntimeFilterProducerFailure::ExecutionFailed
             )]
         );
     }
@@ -1052,7 +1082,11 @@ mod tests {
         let mut operator = direct_int_build_operator(state);
         operator.state = Arc::new(FailingBuildState);
         operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution {
-            producers: Some(producer_factory.create(0).expect("producer stream")),
+            producers: Some(
+                producer_factory
+                    .create_for_driver(1, 0)
+                    .expect("producer stream"),
+            ),
             bind_error: None,
             local_partition_count: Some(1),
         };
@@ -1068,7 +1102,7 @@ mod tests {
         assert_eq!(
             producer.events(),
             vec![NativeProducerEvent::Fail(
-                ProducerFailureReason::ExecutionFailed
+                execution::RuntimeFilterProducerFailure::ExecutionFailed
             )]
         );
     }
@@ -1113,7 +1147,9 @@ mod tests {
 
         assert_eq!(
             producer.events(),
-            vec![NativeProducerEvent::Fail(ProducerFailureReason::Cancelled)]
+            vec![NativeProducerEvent::Fail(
+                execution::RuntimeFilterProducerFailure::Cancelled
+            )]
         );
     }
 

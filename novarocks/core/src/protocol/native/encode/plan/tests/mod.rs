@@ -27,7 +27,6 @@ use arrow::datatypes::DataType;
 
 mod output;
 mod relational;
-mod runtime_filter;
 mod scan;
 mod topology;
 mod write;

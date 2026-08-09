@@ -16,9 +16,6 @@
 // under the License.
 
 pub(crate) mod change_stream;
-#[cfg(feature = "runtime-filter-test-support")]
-pub mod expr;
-#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod expr;
 pub(crate) mod imv;
 pub(crate) mod plan_hints;
