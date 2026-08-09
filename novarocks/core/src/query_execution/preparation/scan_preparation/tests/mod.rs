@@ -249,7 +249,7 @@ fn fixture_query_table_bindings_with_materialized_files(
                         ),
                         _ => None,
                     },
-                    iceberg_write_table: None,
+                    write_target_admission: None,
                     frozen_snapshot_materializations,
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })

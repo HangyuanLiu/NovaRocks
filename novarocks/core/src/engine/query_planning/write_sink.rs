@@ -34,11 +34,8 @@ use crate::sql::analysis::TypedExpr;
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::planner::distributed::write::contract::{
     ConnectorWriteInputBinding, SqlPositionDeleteOutputDescriptor, SqlPositionDeleteOutputField,
-    SqlPositionDeletePartitionSourceField, SqlWritePartitionContract, SqlWritePartitionField,
-    SqlWritePartitionTransform, SqlWritePlanInput, SqlWriteSinkContract, SqlWriteSinkMode,
-    SqlWriteSinkTargetContract, SqlWriteTargetField,
+    SqlWritePlanInput, SqlWriteSinkContract, SqlWriteSinkMode, SqlWriteSinkTargetContract,
 };
-use crate::sql::planner::table::SqlTableIdentity;
 
 /// Provider-private write facts retained by the application until native
 /// writer registration.  SQL never receives this value: it sees the paired
@@ -120,12 +117,8 @@ pub(crate) fn sql_write_plan_input_from_admitted_binding(
     captured.admission.exact_planning_lease().map_err(|_| {
         "SQL write target binding is missing its admission planning lease".to_string()
     })?;
-    let table = admitted_iceberg_table(&captured)?;
-    let identity = SqlTableIdentity {
-        catalog: table.catalog.clone(),
-        namespace: table.namespace.clone(),
-        table: table.table.clone(),
-    };
+    let admission = admitted_write_target(&captured)?;
+    let identity = admission.identity.clone();
     let resolved_identity = &captured.resolved.catalog.identity;
     if !resolved_identity
         .catalog
@@ -141,28 +134,16 @@ pub(crate) fn sql_write_plan_input_from_admitted_binding(
             "SQL write target binding identity differs from its admitted table".to_string(),
         );
     }
-    let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
-        "SQL write target binding is missing frozen Iceberg table metadata".to_string()
-    })?;
-    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
-        serde_json::from_str(serialized)
-            .map_err(|error| format!("decode admitted Iceberg write target metadata: {error}"))?;
-    let fields = sql_write_target_fields(&captured.resolved.planner.columns, table)?;
-    let partition = sql_write_partition_contract(&metadata)?;
     let target = SqlWriteSinkTargetContract::try_new(
         binding,
         identity,
-        table.current_snapshot_id,
-        fields,
-        partition.clone(),
+        admission.snapshot_id,
+        admission.fields.clone(),
+        admission.partition.clone(),
     )?;
     let position_delete_output = match mode {
         SqlWriteSinkMode::PositionDeletes | SqlWriteSinkMode::DeletionVectors => {
-            Some(sql_position_delete_descriptor(
-                &metadata,
-                &captured.resolved.planner.columns,
-                &partition,
-            )?)
+            Some(admission.position_delete_output.clone())
         }
         SqlWriteSinkMode::Data
         | SqlWriteSinkMode::RowLineageData
@@ -192,10 +173,8 @@ pub(crate) fn sql_write_plan_input_for_admitted_target(
     root_output_exprs: Option<Vec<TypedExpr>>,
 ) -> Result<SqlWritePlanInput, String> {
     let captured = bindings.binding(binding)?;
-    let table = admitted_iceberg_table(&captured)?;
-    let metadata = admitted_iceberg_metadata(table)?;
-    let input_columns =
-        admitted_write_input_columns(mode, &captured.resolved.planner.columns, &metadata)?;
+    let admission = admitted_write_target(&captured)?;
+    let input_columns = admitted_write_input_columns(mode, admission)?;
     sql_write_plan_input_from_admitted_binding(
         bindings,
         binding,
@@ -217,7 +196,9 @@ pub(crate) fn admit_frozen_iceberg_write_target(
 ) -> Result<SqlTableBindingId, String> {
     admit_frozen_iceberg_write_target_materialization(
         bindings,
-        sink_spec.iceberg.clone(),
+        crate::connector::iceberg::provider::iceberg_write_target_admission_from_frozen_table(
+            &sink_spec.iceberg,
+        )?,
         planning_lease,
     )
 }
@@ -234,42 +215,10 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
     materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<IcebergWriteSinkSpec, String> {
-    let metadata = admitted_iceberg_metadata(&materialization.table)?;
-    let mut target_columns = materialization.columns.clone();
-    target_columns.extend([
-        ColumnDef {
-            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-        ColumnDef {
-            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        },
-    ]);
-    let table_location = metadata.location().to_string();
-    let data_location = metadata
-        .properties()
-        .get("write.data.path")
-        .cloned()
-        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
-    Ok(IcebergWriteSinkSpec {
-        mode: IcebergWriteSinkMode::RowLineageData,
-        iceberg: materialization.table.clone(),
-        target_columns,
-        table_location,
-        data_location,
-        target_partition_spec_id: metadata.default_partition_spec_id(),
-        cloud_properties: entry.cloud_properties_map(),
-        file_format: "parquet".to_string(),
-        compression: IcebergWriteFileCompression::Snappy,
-        position_delete_output_descriptor: None,
-    })
+    crate::connector::iceberg::provider::row_lineage_sink_spec_from_frozen_materialization(
+        materialization,
+        entry,
+    )
 }
 
 /// Admit a writer token from an already frozen target materialization.
@@ -280,14 +229,14 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
 /// cannot be confused with the locator scan's schema.
 pub(crate) fn admit_frozen_iceberg_write_target_materialization(
     bindings: &QueryTableBindingStore,
-    table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    admission: crate::engine::query_planning::bindings::QueryWriteTargetAdmission,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
     let descriptor = planning_lease.binding().descriptor();
     if !descriptor
         .instance_id
         .as_str()
-        .eq_ignore_ascii_case(&table.catalog)
+        .eq_ignore_ascii_case(&admission.identity.catalog)
     {
         return Err(
             "frozen Iceberg write target does not match its admission planning lease".to_string(),
@@ -298,22 +247,22 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
     // `_file` and `_pos`, while MV targets carry hidden apply/lineage/state
     // fields in their physical table schema. Both facts are frozen in the
     // admitted metadata and must remain distinct.
-    let columns = admitted_write_target_columns(&table)?;
-    let key = QueryTableBindingKey::write_target(&table.catalog, &table.namespace, &table.table);
+    let columns = admission.target_columns.clone();
+    let key = QueryTableBindingKey::write_target(
+        &admission.identity.catalog,
+        &admission.identity.namespace,
+        &admission.identity.table,
+    );
     bindings.resolve_or_insert_with_id(key, |binding| {
-        let identity = SqlTableIdentity {
-            catalog: table.catalog.clone(),
-            namespace: table.namespace.clone(),
-            table: table.table.clone(),
-        };
+        let identity = admission.identity.clone();
         let planner = crate::sql::planner::table::TableDef {
-            name: table.table.clone(),
+            name: identity.table.clone(),
             columns,
             iceberg_row_lineage_metadata_columns: Vec::new(),
             source: crate::sql::planner::table::ScanSource::Sql(
                 crate::sql::planner::table::SqlScanSource::new(
                     binding,
-                    identity,
+                    identity.clone(),
                     crate::sql::planner::table::SqlScanKind::Data {
                         version: crate::sql::planner::table::SqlTableVersionSelector::Current,
                     },
@@ -322,8 +271,8 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
         };
         Ok(QueryTableBinding {
             resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
-                Some(&table.catalog),
-                &table.namespace,
+                Some(&identity.catalog),
+                &identity.namespace,
                 planner,
             ),
             statistics_pin: None,
@@ -334,29 +283,11 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
             // exact SQL write-target contract.
             scan_materialization: None,
             mv_target_read: None,
-            iceberg_write_table: Some(table),
+            write_target_admission: Some(admission),
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
     })
-}
-
-/// Preserve the complete physical writer schema selected by admission.
-///
-/// SQL visibility is a catalog-resolution concern.  A terminal write instead
-/// needs every field the exact writer contract consumes, including SQL-owned
-/// hidden row-lineage and MV state columns.
-fn admitted_write_target_columns(
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> Result<Vec<ColumnDef>, String> {
-    let metadata = admitted_iceberg_metadata(table)?;
-    write_target_columns_from_iceberg_schema(metadata.current_schema())
-}
-
-fn write_target_columns_from_iceberg_schema(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> Result<Vec<ColumnDef>, String> {
-    crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(schema)
 }
 
 /// Rehydrate the provider-private writer carrier only after SQL planning has
@@ -368,71 +299,30 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let captured = bindings.binding(input.contract.target.binding)?;
-    let table = admitted_iceberg_table(&captured)?.clone();
-    let metadata = admitted_iceberg_metadata(&table)?;
-    if !table
+    let admission = admitted_write_target(&captured)?;
+    if !admission
+        .identity
         .catalog
         .eq_ignore_ascii_case(&input.contract.target.table.catalog)
-        || !table
+        || !admission
+            .identity
             .namespace
             .eq_ignore_ascii_case(&input.contract.target.table.namespace)
-        || !table
+        || !admission
+            .identity
             .table
             .eq_ignore_ascii_case(&input.contract.target.table.table)
     {
         return Err("SQL write contract target differs from its admitted binding".to_string());
     }
-    let mode = iceberg_write_sink_mode(input.contract.mode);
-    let mut iceberg = table;
-    if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
-        iceberg.schema.fields.extend([
-            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: None,
-                write_default_json: None,
-                children: Vec::new(),
-            },
-            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: None,
-                write_default_json: None,
-                children: Vec::new(),
-            },
-        ]);
-    }
-    let position_delete_output_descriptor = input
-        .contract
-        .position_delete_output
-        .as_ref()
-        .map(position_delete_descriptor_from_sql)
-        .transpose()?;
-    let table_location = metadata.location().to_string();
-    let data_location = metadata
-        .properties()
-        .get("write.data.path")
-        .cloned()
-        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
-    Ok(IcebergWriteSinkSpec {
-        mode,
-        iceberg,
-        target_columns: input.contract.input_columns.clone(),
-        table_location,
-        data_location,
-        target_partition_spec_id: metadata.default_partition_spec_id(),
-        cloud_properties: entry.cloud_properties_map(),
-        file_format: "parquet".to_string(),
-        compression: IcebergWriteFileCompression::Snappy,
-        position_delete_output_descriptor,
-    })
+    crate::connector::iceberg::provider::iceberg_write_sink_spec_from_admitted_handle(
+        &admission.table,
+        input,
+        entry,
+    )
 }
 
-fn iceberg_write_sink_mode(mode: SqlWriteSinkMode) -> IcebergWriteSinkMode {
+pub(crate) fn iceberg_write_sink_mode(mode: SqlWriteSinkMode) -> IcebergWriteSinkMode {
     match mode {
         SqlWriteSinkMode::Data => IcebergWriteSinkMode::Data,
         SqlWriteSinkMode::RowLineageData => IcebergWriteSinkMode::RowLineageData,
@@ -442,7 +332,7 @@ fn iceberg_write_sink_mode(mode: SqlWriteSinkMode) -> IcebergWriteSinkMode {
     }
 }
 
-fn position_delete_descriptor_from_sql(
+pub(crate) fn position_delete_descriptor_from_sql(
     descriptor: &SqlPositionDeleteOutputDescriptor,
 ) -> Result<
     crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
@@ -477,34 +367,25 @@ fn position_delete_descriptor_from_sql(
     })
 }
 
-fn admitted_iceberg_metadata(
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> Result<novarocks_connector_iceberg::iceberg::spec::TableMetadata, String> {
-    let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
-        "SQL write target binding is missing frozen Iceberg table metadata".to_string()
-    })?;
-    serde_json::from_str(serialized)
-        .map_err(|error| format!("decode admitted Iceberg write target metadata: {error}"))
-}
-
-fn admitted_iceberg_table(
+fn admitted_write_target(
     binding: &QueryTableBinding,
-) -> Result<&novarocks_connector_iceberg::scan_model::IcebergTableInfo, String> {
+) -> Result<&crate::engine::query_planning::bindings::QueryWriteTargetAdmission, String> {
     binding
-        .iceberg_write_table
+        .write_target_admission
         .as_ref()
-        .ok_or_else(|| "SQL write target binding is not an admitted Iceberg table".to_string())
+        .ok_or_else(|| "SQL write target binding is missing admitted write facts".to_string())
 }
 
 fn admitted_write_input_columns(
     mode: SqlWriteSinkMode,
-    target_columns: &[ColumnDef],
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+    admission: &crate::engine::query_planning::bindings::QueryWriteTargetAdmission,
 ) -> Result<Vec<ColumnDef>, String> {
     match mode {
-        SqlWriteSinkMode::Data | SqlWriteSinkMode::EqualityDeletes => Ok(target_columns.to_vec()),
+        SqlWriteSinkMode::Data | SqlWriteSinkMode::EqualityDeletes => {
+            Ok(admission.target_columns.clone())
+        }
         SqlWriteSinkMode::RowLineageData => {
-            let mut columns = target_columns.to_vec();
+            let mut columns = admission.target_columns.clone();
             columns.push(ColumnDef {
                 name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
                 data_type: DataType::Int64,
@@ -538,171 +419,18 @@ fn admitted_write_input_columns(
                     logical_type: None,
                 },
             ];
-            let schema = metadata.current_schema();
-            for field in metadata.default_partition_spec().fields() {
-                let source = schema.field_by_id(field.source_id).ok_or_else(|| {
-                    format!(
-                        "admitted Iceberg write target partition source field id {} is missing",
-                        field.source_id
-                    )
-                })?;
-                let column = target_columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(&source.name))
-                    .ok_or_else(|| {
-                        format!(
-                            "admitted Iceberg write target partition source {} is absent from its SQL schema",
-                            source.name
-                        )
-                    })?;
-                columns.push(column.clone());
+            for field in &admission.position_delete_output.partition_source_fields {
+                columns.push(ColumnDef {
+                    name: field.source_column_name.clone(),
+                    data_type: field.data_type.clone(),
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                });
             }
             Ok(columns)
         }
     }
-}
-
-fn sql_write_target_fields(
-    columns: &[ColumnDef],
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> Result<Vec<SqlWriteTargetField>, String> {
-    let mut fields = Vec::with_capacity(columns.len());
-    for column in columns {
-        let field = table
-            .schema
-            .fields
-            .iter()
-            .find(|field| field.name.eq_ignore_ascii_case(&column.name))
-            .ok_or_else(|| {
-                format!(
-                    "admitted Iceberg write target is missing field identity for column {}",
-                    column.name
-                )
-            })?;
-        fields.push(SqlWriteTargetField {
-            field_id: field.field_id,
-            column: column.clone(),
-            is_hidden: false,
-        });
-    }
-    Ok(fields)
-}
-
-fn sql_write_partition_contract(
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-) -> Result<SqlWritePartitionContract, String> {
-    let partition_spec = metadata.default_partition_spec();
-    let fields = partition_spec
-        .fields()
-        .iter()
-        .map(|field| {
-            Ok(SqlWritePartitionField {
-                name: field.name.clone(),
-                source_field_id: field.source_id,
-                transform: sql_write_partition_transform(&field.transform)?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(SqlWritePartitionContract {
-        spec_id: metadata.default_partition_spec_id(),
-        fields,
-    })
-}
-
-fn sql_position_delete_descriptor(
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    columns: &[ColumnDef],
-    partition: &SqlWritePartitionContract,
-) -> Result<SqlPositionDeleteOutputDescriptor, String> {
-    let schema = metadata.current_schema();
-    let partition_source_fields = partition
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            let source = schema.field_by_id(field.source_field_id).ok_or_else(|| {
-                format!(
-                    "admitted Iceberg write target partition field {} has unknown source id {}",
-                    field.name, field.source_field_id
-                )
-            })?;
-            let column = columns
-                .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(&source.name))
-                .ok_or_else(|| {
-                    format!(
-                        "admitted Iceberg write target partition source {} is absent from its SQL schema",
-                        source.name
-                    )
-                })?;
-            Ok(SqlPositionDeletePartitionSourceField {
-                output_expr_index: index + 2,
-                source_column_name: source.name.clone(),
-                partition_field_name: field.name.clone(),
-                transform: field.transform.clone(),
-                source_field_id: field.source_field_id,
-                data_type: column.data_type.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(SqlPositionDeleteOutputDescriptor {
-        file_path: SqlPositionDeleteOutputField {
-            output_expr_index: 0,
-            name: "file_path".to_string(),
-            data_type: DataType::Utf8,
-            field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-        },
-        pos: SqlPositionDeleteOutputField {
-            output_expr_index: 1,
-            name: "pos".to_string(),
-            data_type: DataType::Int64,
-            field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        },
-        partition_source_fields,
-        target_partition_spec_id: partition.spec_id,
-    })
-}
-
-fn sql_write_partition_transform(
-    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
-) -> Result<SqlWritePartitionTransform, String> {
-    Ok(match transform {
-        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
-            SqlWritePartitionTransform::Identity
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
-            SqlWritePartitionTransform::Year
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
-            SqlWritePartitionTransform::Month
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
-            SqlWritePartitionTransform::Day
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
-            SqlWritePartitionTransform::Hour
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(buckets) => {
-            SqlWritePartitionTransform::Bucket {
-                buckets: u32::try_from(*buckets)
-                    .map_err(|_| format!("Iceberg partition bucket count {buckets} is invalid"))?,
-            }
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
-            SqlWritePartitionTransform::Truncate {
-                width: u32::try_from(*width)
-                    .map_err(|_| format!("Iceberg partition truncate width {width} is invalid"))?,
-            }
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
-            SqlWritePartitionTransform::Void
-        }
-        unsupported => {
-            return Err(format!(
-                "Iceberg write target uses unsupported partition transform {unsupported}"
-            ));
-        }
-    })
 }
 
 #[cfg(test)]
@@ -792,7 +520,8 @@ mod tests {
             ])
             .build()
             .expect("target schema");
-        let fields = write_target_columns_from_iceberg_schema(&schema).expect("target columns");
+        let fields = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(&schema)
+            .expect("target columns");
 
         assert_eq!(
             fields

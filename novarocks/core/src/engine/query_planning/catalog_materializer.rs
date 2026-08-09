@@ -79,52 +79,44 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
     };
-    use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 
-    let version = match materialization.binding {
-        IcebergDataFileBinding::CurrentSnapshot => SqlTableVersionSelector::Current,
-        IcebergDataFileBinding::ExplicitFiles => SqlTableVersionSelector::Snapshot(
-            materialization.table.current_snapshot_id.ok_or_else(|| {
-                format!(
-                    "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
-                    materialization.table.catalog,
-                    materialization.table.namespace,
-                    materialization.table.table
-                )
-            })?,
+    let (version, kind, frozen_snapshot_id) = match materialization.read_selector {
+        novarocks_spi::connector::ConnectorReadSelector::Current => (
+            SqlTableVersionSelector::Current,
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+            None,
         ),
-    };
-    let kind = match materialization.binding {
-        IcebergDataFileBinding::CurrentSnapshot => SqlScanKind::Data { version },
-        IcebergDataFileBinding::ExplicitFiles => SqlScanKind::FrozenInputSet { version },
+        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id) => {
+            let version = SqlTableVersionSelector::Snapshot(snapshot_id);
+            (
+                version.clone(),
+                SqlScanKind::FrozenInputSet { version },
+                Some(snapshot_id),
+            )
+        }
+        novarocks_spi::connector::ConnectorReadSelector::TimestampMicros(timestamp_micros) => {
+            return Err(format!(
+                "connector read selector timestamp {timestamp_micros} must resolve to a snapshot before SQL materialization"
+            ));
+        }
     };
     let table_identity = SqlTableIdentity {
-        catalog: materialization.table.catalog.clone(),
-        namespace: materialization.table.namespace.clone(),
-        table: materialization.table.table.clone(),
+        catalog: catalog.to_string(),
+        namespace: namespace.to_string(),
+        table: sql_table_name.to_string(),
     };
     let planner = TableDef {
         name: sql_table_name.to_string(),
         columns: materialization.columns,
         iceberg_row_lineage_metadata_columns: materialization.iceberg_row_lineage_metadata_columns,
         source: ScanSource::Sql(
-            SqlScanSource::new(binding, table_identity, kind).with_ukfk_facts(
-                super::bindings::sql_ukfk_facts_from_admitted_table(&materialization.table),
-            ),
+            SqlScanSource::new(binding, table_identity, kind)
+                .with_ukfk_facts(materialization.sql_ukfk_facts.clone()),
         ),
     };
-    if matches!(
-        materialization.binding,
-        IcebergDataFileBinding::ExplicitFiles
-    ) {
-        let snapshot_id = materialization.table.current_snapshot_id.ok_or_else(|| {
-            format!(
-                "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
-                materialization.table.catalog,
-                materialization.table.namespace,
-                materialization.table.table
-            )
-        })?;
+    if let Some(snapshot_id) = frozen_snapshot_id {
         frozen_snapshot_ids.insert(snapshot_id);
     }
     let frozen_snapshot_materializations = frozen_snapshot_ids
@@ -156,7 +148,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
             planning_lease: materialization.planning_lease.clone(),
         }),
         mv_target_read: None,
-        iceberg_write_table: Some(materialization.table),
+        write_target_admission: materialization.write_target_admission,
         frozen_snapshot_materializations,
         delta_runtime_plans,
     })
@@ -506,7 +498,7 @@ mod tests {
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Local,
             scan_materialization: None,
-            iceberg_write_table: None,
+            write_target_admission: None,
             mv_target_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),

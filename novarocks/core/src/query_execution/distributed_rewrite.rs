@@ -173,7 +173,7 @@ pub(crate) fn admit_frozen_rewrite_scan_binding(
                 admission: QueryTableBindingAdmission::Local,
                 scan_materialization: None,
                 mv_target_read: None,
-                iceberg_write_table: None,
+                write_target_admission: None,
                 frozen_snapshot_materializations: BTreeMap::new(),
                 delta_runtime_plans: BTreeMap::new(),
             })

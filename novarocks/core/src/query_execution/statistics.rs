@@ -498,7 +498,7 @@ fn admit_statistics_scan_binding(
                         crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local,
                     scan_materialization: None,
                     mv_target_read: None,
-                    iceberg_write_table: None,
+                    write_target_admission: None,
                     frozen_snapshot_materializations: BTreeMap::new(),
                     delta_runtime_plans: BTreeMap::new(),
                 })

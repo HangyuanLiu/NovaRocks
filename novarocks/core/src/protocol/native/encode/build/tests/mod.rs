@@ -175,7 +175,7 @@ pub(super) fn fixture_query_table_bindings(
                         statistics_pin: None,
                         planning_lease: lease,
                     }),
-                    iceberg_write_table: None,
+                    write_target_admission: None,
                     mv_target_read: None,
                     frozen_snapshot_materializations: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),

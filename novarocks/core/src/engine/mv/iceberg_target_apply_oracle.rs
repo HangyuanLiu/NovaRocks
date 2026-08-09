@@ -923,7 +923,7 @@ fn framework_locator_query_local_overlay(
                             planning_lease.clone(),
                         ),
                     scan_materialization: Some(scan_materialization.clone()),
-                    iceberg_write_table: None,
+                    write_target_admission: None,
                     mv_target_read: None,
                     frozen_snapshot_materializations: std::collections::BTreeMap::from([(
                         snapshot_id,

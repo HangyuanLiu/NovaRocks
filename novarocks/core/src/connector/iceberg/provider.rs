@@ -5753,6 +5753,15 @@ pub(crate) struct IcebergQueryTableMaterialization {
     pub(crate) read_table: ConnectorTableHandle,
     pub(crate) read_schema: SchemaRef,
     pub(crate) read_selector: ConnectorReadSelector,
+    /// SQL-owned optimizer facts projected while the provider still owns the
+    /// frozen metadata.  Core receives this value without decoding the table
+    /// handle or serialized Iceberg metadata.
+    pub(crate) sql_ukfk_facts: crate::sql::planner::table::SqlUkFkTableFacts,
+    /// SQL-owned terminal write facts projected while this provider still
+    /// owns the frozen Iceberg metadata.  Core retains only the opaque table
+    /// handle contained in this value.
+    pub(crate) write_target_admission:
+        Option<crate::engine::query_planning::bindings::QueryWriteTargetAdmission>,
     pub(crate) table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     pub(crate) files: Vec<IcebergDataFileInfo>,
     pub(crate) binding: IcebergDataFileBinding,
@@ -5791,6 +5800,12 @@ impl IcebergQueryTableMaterialization {
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        let write_target_admission = self
+            .table
+            .serialized_metadata
+            .as_deref()
+            .map(|_| iceberg_write_target_admission(&self.table, table.clone()))
+            .transpose()?;
         Ok(Self {
             table_name: self.table_name.clone(),
             schema_id: self.schema_id,
@@ -5799,6 +5814,8 @@ impl IcebergQueryTableMaterialization {
             read_table: table,
             read_schema: self.read_schema.clone(),
             read_selector: selector,
+            sql_ukfk_facts: self.sql_ukfk_facts.clone(),
+            write_target_admission,
             table: self.table.clone(),
             files: Vec::new(),
             binding: IcebergDataFileBinding::ExplicitFiles,
@@ -5806,6 +5823,39 @@ impl IcebergQueryTableMaterialization {
             planning_lease: self.planning_lease.clone(),
         })
     }
+}
+
+/// Produce a neutral terminal-write admission from a provider-owned frozen
+/// table descriptor.  Legacy callers may still hold this descriptor while
+/// their own execution carrier is migrated, but the query binding receives
+/// only the opaque handle and SQL-owned facts.
+pub(crate) fn iceberg_write_target_admission_from_frozen_table(
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+) -> Result<crate::engine::query_planning::bindings::QueryWriteTargetAdmission, String> {
+    let owner = ConnectorInstanceId::parse(&table.catalog)
+        .map_err(|error| format!("invalid frozen Iceberg write target catalog: {error}"))?;
+    let handle = ConnectorTableHandle::try_new(
+        owner,
+        encode_payload(
+            &TablePayload {
+                namespace: table.namespace.clone(),
+                table: table.table.clone(),
+                table_info: Some(table.clone()),
+                metadata_columns: Vec::new(),
+                metadata_table_type: None,
+                prepared_files: Vec::new(),
+                explicit_files: None,
+                logical_type_columns: BTreeMap::new(),
+                hidden_columns: Vec::new(),
+                frozen_rewrite: None,
+            },
+            "Iceberg frozen write target",
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        )
+        .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    iceberg_write_target_admission(table, handle)
 }
 
 /// A bounded reference to an Iceberg-owned rewrite artifact.  It is the only
@@ -6870,6 +6920,7 @@ fn materialization_from_metadata(
     let table = payload
         .table_info
         .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
+    let sql_ukfk_facts = sql_ukfk_facts_from_frozen_table(&table);
     let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
         .into_iter()
         .filter(|column| {
@@ -6883,6 +6934,11 @@ fn materialization_from_metadata(
                     .any(|metadata| column.name.eq_ignore_ascii_case(metadata))
         })
         .collect();
+    let write_target_admission = table
+        .serialized_metadata
+        .as_deref()
+        .map(|_| iceberg_write_target_admission(&table, metadata.table.clone()))
+        .transpose()?;
     Ok(IcebergQueryTableMaterialization {
         table_name: payload.table,
         schema_id,
@@ -6891,12 +6947,341 @@ fn materialization_from_metadata(
         read_table: metadata.table,
         read_schema: metadata.schema,
         read_selector,
+        sql_ukfk_facts,
+        write_target_admission,
         table,
         files: payload.prepared_files,
         binding,
         statistics_pin,
         planning_lease,
     })
+}
+
+fn sql_ukfk_facts_from_frozen_table(
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+) -> crate::sql::planner::table::SqlUkFkTableFacts {
+    let Some(serialized) = table.serialized_metadata.as_deref() else {
+        return crate::sql::planner::table::SqlUkFkTableFacts::default();
+    };
+    let Ok(metadata) = serde_json::from_str::<
+        novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+    >(serialized) else {
+        return crate::sql::planner::table::SqlUkFkTableFacts::default();
+    };
+    let properties = metadata
+        .properties()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    crate::sql::planner::table::SqlUkFkTableFacts::from_frozen_properties(&properties)
+}
+
+/// Project a frozen Iceberg target into the SQL-owned write facts retained by
+/// a query binding.  This is intentionally adjacent to payload decoding: the
+/// provider is the only owner allowed to interpret serialized Iceberg
+/// metadata or field identifiers.
+pub(crate) fn iceberg_write_target_admission(
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    handle: ConnectorTableHandle,
+) -> Result<crate::engine::query_planning::bindings::QueryWriteTargetAdmission, String> {
+    let serialized = table
+        .serialized_metadata
+        .as_deref()
+        .ok_or_else(|| "frozen Iceberg write target is missing serialized metadata".to_string())?;
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized)
+            .map_err(|error| format!("decode frozen Iceberg write target metadata: {error}"))?;
+    let target_columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
+        metadata.current_schema(),
+    )?;
+    let fields = target_columns
+        .iter()
+        .map(|column| {
+            let field = table
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.name.eq_ignore_ascii_case(&column.name))
+                .ok_or_else(|| {
+                    format!(
+                        "frozen Iceberg write target is missing field identity for column {}",
+                        column.name
+                    )
+                })?;
+            Ok(
+                crate::sql::planner::distributed::write::contract::SqlWriteTargetField {
+                    field_id: field.field_id,
+                    column: column.clone(),
+                    is_hidden: false,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let partition = crate::sql::planner::distributed::write::contract::SqlWritePartitionContract {
+        spec_id: metadata.default_partition_spec_id(),
+        fields: metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| {
+                Ok(
+                    crate::sql::planner::distributed::write::contract::SqlWritePartitionField {
+                        name: field.name.clone(),
+                        source_field_id: field.source_id,
+                        transform: iceberg_write_partition_transform(&field.transform)?,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    };
+    let partition_source_fields = partition
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let source = metadata
+                .current_schema()
+                .field_by_id(field.source_field_id)
+                .ok_or_else(|| {
+                    format!(
+                        "frozen Iceberg write target partition field {} has unknown source id {}",
+                        field.name, field.source_field_id
+                    )
+                })?;
+            let column = target_columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&source.name))
+                .ok_or_else(|| {
+                    format!(
+                        "frozen Iceberg write target partition source {} is absent from its SQL schema",
+                        source.name
+                    )
+                })?;
+            Ok(crate::sql::planner::distributed::write::contract::SqlPositionDeletePartitionSourceField {
+                output_expr_index: index + 2,
+                source_column_name: source.name.clone(),
+                partition_field_name: field.name.clone(),
+                transform: field.transform.clone(),
+                source_field_id: field.source_field_id,
+                data_type: column.data_type.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::engine::query_planning::bindings::QueryWriteTargetAdmission {
+        table: handle,
+        identity: crate::sql::planner::table::SqlTableIdentity {
+            catalog: table.catalog.clone(),
+            namespace: table.namespace.clone(),
+            table: table.table.clone(),
+        },
+        snapshot_id: table.current_snapshot_id,
+        fields,
+        partition: partition.clone(),
+        position_delete_output: crate::sql::planner::distributed::write::contract::SqlPositionDeleteOutputDescriptor {
+            file_path: crate::sql::planner::distributed::write::contract::SqlPositionDeleteOutputField {
+                output_expr_index: 0,
+                name: "file_path".to_string(),
+                data_type: DataType::Utf8,
+                field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            },
+            pos: crate::sql::planner::distributed::write::contract::SqlPositionDeleteOutputField {
+                output_expr_index: 1,
+                name: "pos".to_string(),
+                data_type: DataType::Int64,
+                field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+            },
+            partition_source_fields,
+            target_partition_spec_id: partition.spec_id,
+        },
+        target_columns,
+    })
+}
+
+fn iceberg_write_partition_transform(
+    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
+) -> Result<crate::sql::planner::distributed::write::contract::SqlWritePartitionTransform, String> {
+    use crate::sql::planner::distributed::write::contract::SqlWritePartitionTransform;
+    Ok(match transform {
+        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+            SqlWritePartitionTransform::Identity
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+            SqlWritePartitionTransform::Year
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+            SqlWritePartitionTransform::Month
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+            SqlWritePartitionTransform::Day
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+            SqlWritePartitionTransform::Hour
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(buckets) => {
+            SqlWritePartitionTransform::Bucket {
+                buckets: u32::try_from(*buckets)
+                    .map_err(|_| format!("Iceberg partition bucket count {buckets} is invalid"))?,
+            }
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
+            SqlWritePartitionTransform::Truncate {
+                width: u32::try_from(*width)
+                    .map_err(|_| format!("Iceberg partition truncate width {width} is invalid"))?,
+            }
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+            SqlWritePartitionTransform::Void
+        }
+        unsupported => {
+            return Err(format!(
+                "Iceberg write target uses unsupported partition transform {unsupported}"
+            ));
+        }
+    })
+}
+
+/// Rehydrate the provider-private writer carrier after SQL has sealed the
+/// tokenized target contract.  The handle originated from the exact admission
+/// lease; no catalog lookup or Core-side payload decoding is involved.
+pub(crate) fn iceberg_write_sink_spec_from_admitted_handle(
+    handle: &ConnectorTableHandle,
+    input: &crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    entry: &IcebergCatalogEntry,
+) -> Result<crate::engine::query_planning::write_sink::IcebergWriteSinkSpec, String> {
+    let payload: TablePayload = decode_payload(handle.payload(), "admitted Iceberg write handle")
+        .map_err(|error| error.to_string())?;
+    let mut iceberg = payload.table_info.ok_or_else(|| {
+        "admitted Iceberg write handle is missing its provider table descriptor".to_string()
+    })?;
+    if !iceberg
+        .catalog
+        .eq_ignore_ascii_case(&input.contract.target.table.catalog)
+        || !iceberg
+            .namespace
+            .eq_ignore_ascii_case(&input.contract.target.table.namespace)
+        || !iceberg
+            .table
+            .eq_ignore_ascii_case(&input.contract.target.table.table)
+    {
+        return Err(
+            "SQL write contract target differs from its admitted provider handle".to_string(),
+        );
+    }
+    let serialized = iceberg.serialized_metadata.as_deref().ok_or_else(|| {
+        "admitted Iceberg write handle is missing frozen table metadata".to_string()
+    })?;
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized)
+            .map_err(|error| format!("decode admitted Iceberg write handle metadata: {error}"))?;
+    let mode =
+        crate::engine::query_planning::write_sink::iceberg_write_sink_mode(input.contract.mode);
+    if matches!(
+        mode,
+        crate::engine::query_planning::write_sink::IcebergWriteSinkMode::RowLineageData
+    ) {
+        iceberg.schema.fields.extend([
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
+                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
+                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+        ]);
+    }
+    let position_delete_output_descriptor = input
+        .contract
+        .position_delete_output
+        .as_ref()
+        .map(crate::engine::query_planning::write_sink::position_delete_descriptor_from_sql)
+        .transpose()?;
+    let table_location = metadata.location().to_string();
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
+    Ok(
+        crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
+            mode,
+            iceberg,
+            target_columns: input.contract.input_columns.clone(),
+            table_location,
+            data_location,
+            target_partition_spec_id: metadata.default_partition_spec_id(),
+            cloud_properties: entry.cloud_properties_map(),
+            file_format: "parquet".to_string(),
+            compression:
+                crate::engine::query_planning::write_sink::IcebergWriteFileCompression::Snappy,
+            position_delete_output_descriptor,
+        },
+    )
+}
+
+pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
+    materialization: &IcebergQueryTableMaterialization,
+    entry: &IcebergCatalogEntry,
+) -> Result<crate::engine::query_planning::write_sink::IcebergWriteSinkSpec, String> {
+    let serialized = materialization
+        .table
+        .serialized_metadata
+        .as_deref()
+        .ok_or_else(|| {
+            "frozen Iceberg row-lineage target is missing serialized metadata".to_string()
+        })?;
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized).map_err(|error| {
+            format!("decode frozen Iceberg row-lineage target metadata: {error}")
+        })?;
+    let mut target_columns = materialization.columns.clone();
+    target_columns.extend([
+        novarocks_catalog::schema::ColumnDef {
+            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
+    ]);
+    let table_location = metadata.location().to_string();
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
+    Ok(
+        crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
+            mode: crate::engine::query_planning::write_sink::IcebergWriteSinkMode::RowLineageData,
+            iceberg: materialization.table.clone(),
+            target_columns,
+            table_location,
+            data_location,
+            target_partition_spec_id: metadata.default_partition_spec_id(),
+            cloud_properties: entry.cloud_properties_map(),
+            file_format: "parquet".to_string(),
+            compression:
+                crate::engine::query_planning::write_sink::IcebergWriteFileCompression::Snappy,
+            position_delete_output_descriptor: None,
+        },
+    )
 }
 
 fn columns_from_metadata(
@@ -7458,6 +7843,8 @@ mod tests {
             read_table,
             read_schema: Arc::new(Schema::empty()),
             read_selector: ConnectorReadSelector::Current,
+            sql_ukfk_facts: crate::sql::planner::table::SqlUkFkTableFacts::default(),
+            write_target_admission: None,
             table,
             files: Vec::new(),
             binding: IcebergDataFileBinding::CurrentSnapshot,

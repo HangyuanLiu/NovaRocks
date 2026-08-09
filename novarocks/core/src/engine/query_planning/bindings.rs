@@ -31,12 +31,14 @@ use std::sync::{Arc, Mutex};
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::ResolvedAnalyzerTable;
+use crate::sql::planner::distributed::write::contract::{
+    SqlPositionDeleteOutputDescriptor, SqlWritePartitionContract, SqlWriteTargetField,
+};
 use crate::sql::planner::table::{
     ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
-    SqlUkFkTableFacts,
 };
 use arrow::datatypes::SchemaRef;
-use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
+use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
 };
@@ -223,10 +225,11 @@ pub(crate) struct QueryTableBinding {
     /// target-state scan may choose the pre-filtered read, while its locator
     /// always uses the full read; neither lane receives provider file facts.
     pub(crate) mv_target_read: Option<MvTargetReadAdmission>,
-    /// Provider-private facts retained only for terminal write projection.
-    /// Read preparation must use `scan_materialization`'s opaque handle.
-    pub(crate) iceberg_write_table:
-        Option<novarocks_connector_iceberg::scan_model::IcebergTableInfo>,
+    /// SQL-owned write facts projected at connector admission.  The opaque
+    /// handle is retained solely for the provider to rehydrate its execution
+    /// carrier after SQL planning; Core never parses it or serializes provider
+    /// metadata while preparing a terminal write.
+    pub(crate) write_target_admission: Option<QueryWriteTargetAdmission>,
     /// Exact file sets captured for the snapshot selectors emitted by one
     /// admitted logical plan.  A binding can serve both sides of an IMV
     /// from/to comparison, so the primary materialization alone is not
@@ -242,6 +245,22 @@ pub(crate) struct QueryTableBinding {
         (i64, i64),
         crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
     >,
+}
+
+/// One terminal write target captured under an exact connector lease.
+///
+/// The target contract's SQL facts are projected while the provider owns the
+/// frozen metadata.  `table` stays opaque through Core and is returned to the
+/// provider only when its writer execution carrier is built.
+#[derive(Clone)]
+pub(crate) struct QueryWriteTargetAdmission {
+    pub(crate) table: ConnectorTableHandle,
+    pub(crate) identity: SqlTableIdentity,
+    pub(crate) snapshot_id: Option<i64>,
+    pub(crate) fields: Vec<SqlWriteTargetField>,
+    pub(crate) partition: SqlWritePartitionContract,
+    pub(crate) position_delete_output: SqlPositionDeleteOutputDescriptor,
+    pub(crate) target_columns: Vec<ColumnDef>,
 }
 
 /// Exact provider scan facts retained after admission.  The concrete Iceberg
@@ -296,7 +315,7 @@ impl QueryTableBinding {
             admission: QueryTableBindingAdmission::Local,
             scan_materialization: None,
             mv_target_read: None,
-            iceberg_write_table: None,
+            write_target_admission: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }
@@ -318,28 +337,6 @@ impl QueryTableBinding {
             ),
         }
     }
-}
-
-/// Convert only the two optimizer constraint properties while this
-/// application binding still owns the admitted provider descriptor.  Parse
-/// failures preserve the historical conservative behavior: the SQL scan gets
-/// no UK/FK facts instead of a guessed constraint.  The serialized metadata
-/// itself never crosses into the SQL scan source.
-pub(crate) fn sql_ukfk_facts_from_admitted_table(table: &IcebergTableInfo) -> SqlUkFkTableFacts {
-    let Some(serialized) = table.serialized_metadata.as_deref() else {
-        return SqlUkFkTableFacts::default();
-    };
-    let Ok(metadata) = serde_json::from_str::<
-        novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    >(serialized) else {
-        return SqlUkFkTableFacts::default();
-    };
-    let properties = metadata
-        .properties()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    SqlUkFkTableFacts::from_frozen_properties(&properties)
 }
 
 struct StoredBinding {
@@ -575,7 +572,7 @@ impl QueryTableBindingStore {
                 "SQL write target {catalog}.{namespace}.{table} was not admitted into this query binding store"
             ));
         };
-        match binding.iceberg_write_table.as_ref() {
+        match binding.write_target_admission.as_ref() {
             Some(_) => {
                 let ScanSource::Sql(source) = &binding.resolved.planner.source;
                 Ok(source.binding)
@@ -584,55 +581,6 @@ impl QueryTableBindingStore {
                 "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"
             )),
         }
-    }
-
-    /// Transitional lookup for legacy physical scan facts.  It resolves only
-    /// the request-local key already captured by admission; no provider call
-    /// or latest-generation acquire is possible here.
-    pub(crate) fn iceberg_data_file_binding_id(
-        &self,
-        table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-        binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
-    ) -> Option<SqlTableBindingId> {
-        use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
-
-        let key = match binding {
-            IcebergDataFileBinding::ExplicitFiles => table.current_snapshot_id.map(|snapshot_id| {
-                QueryTableBindingKey::snapshot(
-                    &table.catalog,
-                    &table.namespace,
-                    &table.table,
-                    snapshot_id,
-                )
-            }),
-            _ => Some(QueryTableBindingKey::strict_base(
-                &table.catalog,
-                &table.namespace,
-                &table.table,
-            )),
-        }?;
-        self.entries
-            .lock()
-            .expect("query table binding lock")
-            .get(&key)
-            .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))
-    }
-
-    /// Return the admission-frozen binding for one metadata alias.  Metadata
-    /// scans must not reuse a base-table token: the provider may resolve the
-    /// alias through a distinct table handle and schema version.
-    pub(crate) fn metadata_binding_id(
-        &self,
-        table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-        kind: SqlMetadataTableKind,
-    ) -> Option<SqlTableBindingId> {
-        let key =
-            QueryTableBindingKey::metadata(&table.catalog, &table.namespace, &table.table, kind);
-        self.entries
-            .lock()
-            .expect("query table binding lock")
-            .get(&key)
-            .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))
     }
 
     /// Return the one admission-frozen MV target binding.  The UUID and
