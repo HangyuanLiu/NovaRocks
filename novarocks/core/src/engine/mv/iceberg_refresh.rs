@@ -14325,10 +14325,6 @@ pub(crate) fn bind_imv_target_query_table_in_store(
     let selector = frozen_snapshot_id
         .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
         .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
-    let write_target_admission = materialization
-        .write_target_admission
-        .clone()
-        .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?;
     let (full_materialization, affected_materialization) =
         crate::connector::iceberg::provider::freeze_mv_target_reads(
             &materialization,
@@ -14408,7 +14404,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             ),
             scan_materialization: Some(mv_target_read.full.clone()),
             mv_target_read: Some(mv_target_read),
-            write_target_admission: Some(write_target_admission.clone()),
+            write_target_admission: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         })
