@@ -62,7 +62,8 @@ use crate::engine::mv::schema_validation_adapter::{
     validate_current_join_schema_contract, validate_current_schema_contract,
 };
 use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
+    QueryTableBindingStore,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
@@ -180,7 +181,6 @@ use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
-use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,
 };
@@ -344,6 +344,18 @@ fn prepare_frontend_first_refresh_write(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive MV first-refresh write lease: {error}"))?;
+    if write_lease.binding_key() != &observed_binding {
+        return Err(
+            "MV first-refresh target connector generation changed during admission".to_string(),
+        );
+    }
     let definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     let definition = rebind_mv_definition_before_refresh_derivation(
@@ -480,13 +492,14 @@ fn prepare_frontend_first_refresh_write(
         // artifact now so activation cannot resolve a later base generation.
         context.connector_context = Some(connector_context.clone());
         let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+            &write_lease,
             &crate::engine::backend_resolver::TargetBackend {
                 backend_name: "iceberg",
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
             },
-            &attempt.staging_branch,
+            connector_context.clone(),
         )?;
         let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
             definition.select_sql.clone(),
@@ -608,13 +621,14 @@ fn prepare_frontend_first_refresh_write(
         )
     };
     let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+        &write_lease,
         &crate::engine::backend_resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: target.catalog.clone(),
             namespace: target.namespace.clone(),
             table: target.table.clone(),
         },
-        &attempt.staging_branch,
+        connector_context.clone(),
     )?;
     let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
         definition.select_sql,
@@ -14025,17 +14039,15 @@ fn compile_canonical_select_for_imv_for_maintenance(
             &target.table,
         )
         .map_err(|error| RefreshError::user(format!("admit IMV target planning lease: {error}")))?;
-    if target_planning_materialization.table.table_uuid.as_deref()
-        != Some(ctx.rewrite.target_table_uuid.as_str())
-        || target_planning_materialization.table.current_snapshot_id
-            != ctx.rewrite.target_snapshot_id
+    if target_planning_materialization.table_uuid() != Some(ctx.rewrite.target_table_uuid.as_str())
+        || target_planning_materialization.current_snapshot_id() != ctx.rewrite.target_snapshot_id
     {
         return Err(RefreshError::user(format!(
             "IMV target changed after admission: expected uuid={} snapshot={:?}, got uuid={:?} snapshot={:?}",
             ctx.rewrite.target_table_uuid,
             ctx.rewrite.target_snapshot_id,
-            target_planning_materialization.table.table_uuid,
-            target_planning_materialization.table.current_snapshot_id,
+            target_planning_materialization.table_uuid(),
+            target_planning_materialization.current_snapshot_id(),
         )));
     }
     let execution =
@@ -14044,12 +14056,17 @@ fn compile_canonical_select_for_imv_for_maintenance(
     bind_imv_target_query_table_in_store(
         ctx,
         &bindings,
-        Some(&target_planning_materialization.planning_lease),
+        &target_planning_materialization.planning_lease,
     )
     .map_err(RefreshError::user)?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         bindings.as_ref(),
-        target_planning_materialization.table.clone(),
+        target_planning_materialization
+            .write_target_admission
+            .clone()
+            .ok_or_else(|| {
+                RefreshError::user("IMV target is missing admitted Iceberg write facts")
+            })?,
         target_planning_materialization.planning_lease.clone(),
     )
     .map_err(RefreshError::user)?;
@@ -14246,16 +14263,59 @@ pub(crate) fn sql_imv_planning_input(
 pub(crate) fn bind_imv_target_query_table_in_store(
     refresh: &IcebergMvRefreshContext,
     store: &Arc<QueryTableBindingStore>,
-    planning_lease: Option<&novarocks_spi::connector::ConnectorControlPlanningLease>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<crate::sql::binding::SqlTableBindingId, String> {
     let target = &refresh.rewrite.target;
     let target_table_uuid = refresh.rewrite.target_table_uuid.clone();
     let frozen_snapshot_id = refresh.rewrite.target_snapshot_id;
-    let table = refresh.target_bindings.runtime().table_info()?;
-    let files = refresh
-        .target_bindings
-        .runtime()
-        .data_files_at_frozen_snapshot()?;
+    let planning_lease = planning_lease.clone();
+    let context = refresh_connector_context(refresh)?.clone();
+    let materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+            planning_lease.clone(),
+            context,
+            &target.namespace,
+            &target.table,
+        )?;
+    if materialization.table_uuid() != Some(target_table_uuid.as_str())
+        || materialization.current_snapshot_id() != frozen_snapshot_id
+    {
+        return Err(format!(
+            "IMV target changed after admission: expected uuid={target_table_uuid} snapshot={frozen_snapshot_id:?}, got uuid={:?} snapshot={:?}",
+            materialization.table_uuid(),
+            materialization.current_snapshot_id(),
+        ));
+    }
+    let selector = frozen_snapshot_id
+        .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
+        .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
+    let write_target_admission = materialization
+        .write_target_admission
+        .clone()
+        .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?;
+    let (full_materialization, affected_materialization) =
+        crate::connector::iceberg::provider::freeze_mv_target_reads(
+            &materialization,
+            refresh.target_bindings.runtime(),
+            &refresh.affected_partitions_to_target_partition_filter(),
+            refresh.rewrite.schema_contract.target.partition.as_ref(),
+            selector,
+        )?;
+    let to_read = |materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization| {
+        QueryScanMaterialization {
+            table: materialization.read_table.clone(),
+            schema: materialization.read_schema.clone(),
+            selector: materialization.read_selector,
+            statistics_pin: materialization.statistics_pin.clone(),
+            planning_lease: materialization.planning_lease.clone(),
+        }
+    };
+    let mv_target_read = MvTargetReadAdmission {
+        full: to_read(&full_materialization),
+        affected_partitions: to_read(&affected_materialization),
+        target_table_uuid: target_table_uuid.clone(),
+        frozen_snapshot_id,
+    };
     let key = QueryTableBindingKey::mv_target(
         &target.catalog,
         &target.namespace,
@@ -14307,18 +14367,13 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             // optimizer statistics are resolved for this target as a side
             // channel during refresh preparation.
             statistics_pin: None,
-            planning_lease: planning_lease.cloned(),
-            scan_materialization: Some(QueryScanMaterialization::IcebergMvTarget {
-                table: table.clone(),
-                files: files.clone(),
-                binding: IcebergDataFileBinding::ExplicitFiles,
-                target_table_uuid: target_table_uuid.clone(),
-                frozen_snapshot_id,
-                target_state_partition_filter: refresh
-                    .affected_partitions_to_target_partition_filter(),
-                target_partition_contract: refresh.rewrite.schema_contract.target.partition.clone(),
-            }),
-            frozen_snapshot_files: BTreeMap::new(),
+            admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                planning_lease,
+            ),
+            scan_materialization: Some(mv_target_read.full.clone()),
+            mv_target_read: Some(mv_target_read),
+            write_target_admission: Some(write_target_admission.clone()),
+            frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         })
     })?;
@@ -14327,7 +14382,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
 
 fn bind_imv_target_query_table(
     refresh: &IcebergMvRefreshContext,
-    planning_lease: Option<&novarocks_spi::connector::ConnectorControlPlanningLease>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     (
         Arc<QueryTableBindingStore>,
@@ -14400,65 +14455,44 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
         if !seen.insert(identity) {
             continue;
         }
-        let catalog_key = normalize_identifier(&base.catalog)?;
-        let entry = base_catalog_entries.get(&catalog_key).ok_or_else(|| {
-            format!(
-                "IMV query binding is missing frozen catalog entry for {}",
-                base.fqn()
-            )
-        })?;
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(entry, &base.namespace, &base.table)?;
-        let files = crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
-            &loaded.table,
-            snapshot_id,
-        )?
-        .into_iter()
-        .map(
-            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&base.catalog)
+            .map_err(|error| error.to_string())?;
+        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            state.connector_control.as_ref(),
+            &instance_id,
         )
-        .collect();
-        let mut materialization =
-            crate::connector::iceberg::provider::load_schema_materialization_with_lease(
-                state.connector_control.as_ref(),
+        .map_err(|error| error.to_string())?;
+        let materialization =
+            crate::connector::iceberg::provider::load_snapshot_materialization_from_exact_lease(
+                planning_lease,
                 connector_context.clone(),
-                &base.catalog,
+                &base.namespace,
+                &base.table,
+                snapshot_id,
+            )?;
+        let mut frozen_snapshot_ids = std::collections::BTreeSet::from([snapshot_id]);
+        let mut delta_runtime_plans = BTreeMap::new();
+        if let Some(previous_snapshot_id) = previous_snapshot_ids.get(&base.fqn()) {
+            let catalog_key = normalize_identifier(&base.catalog)?;
+            let entry = base_catalog_entries.get(&catalog_key).ok_or_else(|| {
+                format!(
+                    "IMV query binding is missing frozen catalog entry for {}",
+                    base.fqn()
+                )
+            })?;
+            let loaded = crate::connector::iceberg::catalog::load_table(
+                entry,
                 &base.namespace,
                 &base.table,
             )?;
-        if materialization.table.current_snapshot_id != Some(snapshot_id) {
-            return Err(format!(
-                "IMV query binding for {} changed after snapshot pin: expected snapshot {}, got {:?}",
-                base.fqn(),
-                snapshot_id,
-                materialization.table.current_snapshot_id
-            ));
-        }
-        materialization.table.current_snapshot_id = Some(snapshot_id);
-        materialization.files = files;
-        materialization.binding = IcebergDataFileBinding::ExplicitFiles;
-        let mut frozen_snapshot_files =
-            BTreeMap::from([(snapshot_id, materialization.files.clone())]);
-        let mut delta_runtime_plans = BTreeMap::new();
-        if let Some(previous_snapshot_id) = previous_snapshot_ids.get(&base.fqn()) {
-            let previous_files = crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+            frozen_snapshot_ids.insert(*previous_snapshot_id);
+            let runtime_plan = crate::connector::iceberg::provider::freeze_delta_runtime_plan_from_materialization(
+                &materialization,
+                entry,
                 &loaded.table,
                 *previous_snapshot_id,
-            )?
-            .into_iter()
-            .map(
-                crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
-            )
-            .collect();
-            frozen_snapshot_files.insert(*previous_snapshot_id, previous_files);
-            let runtime_plan =
-                crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(
-                    &materialization.table,
-                    entry,
-                    &loaded.table,
-                    *previous_snapshot_id,
-                    snapshot_id,
-                )?;
+                snapshot_id,
+            )?;
             delta_runtime_plans.insert((*previous_snapshot_id, snapshot_id), runtime_plan);
         }
 
@@ -14479,7 +14513,7 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                         &table,
                         binding,
                         delta_runtime_plans.clone(),
-                        frozen_snapshot_files.clone(),
+                        frozen_snapshot_ids.clone(),
                     )
                 },
             ),
@@ -15099,7 +15133,19 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     };
     ctx.connector_context = Some(connector_context.clone());
     let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = bind_imv_target_query_table_in_store(&ctx, &bindings, None)?;
+    let target_materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_with_lease(
+            state.connector_control.as_ref(),
+            connector_context.clone(),
+            &ctx.rewrite.target.catalog,
+            &ctx.rewrite.target.namespace,
+            &ctx.rewrite.target.table,
+        )?;
+    let target_binding = bind_imv_target_query_table_in_store(
+        &ctx,
+        &bindings,
+        &target_materialization.planning_lease,
+    )?;
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
     let overlays = freeze_imv_base_query_local_overlays(state, &ctx)?;
     let materializer = crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
@@ -15309,17 +15355,15 @@ fn execute_join_delta_branches_logical(
             &target.namespace,
             &target.table,
         )?;
-    if target_planning_materialization.table.table_uuid.as_deref()
-        != Some(ctx.rewrite.target_table_uuid.as_str())
-        || target_planning_materialization.table.current_snapshot_id
-            != ctx.rewrite.target_snapshot_id
+    if target_planning_materialization.table_uuid() != Some(ctx.rewrite.target_table_uuid.as_str())
+        || target_planning_materialization.current_snapshot_id() != ctx.rewrite.target_snapshot_id
     {
         return Err(format!(
             "IMV target changed after admission: expected uuid={} snapshot={:?}, got uuid={:?} snapshot={:?}",
             ctx.rewrite.target_table_uuid,
             ctx.rewrite.target_snapshot_id,
-            target_planning_materialization.table.table_uuid,
-            target_planning_materialization.table.current_snapshot_id,
+            target_planning_materialization.table_uuid(),
+            target_planning_materialization.current_snapshot_id(),
         )
         .into());
     }
@@ -15328,11 +15372,14 @@ fn execute_join_delta_branches_logical(
     let target_binding = bind_imv_target_query_table_in_store(
         ctx,
         &target_bindings,
-        Some(&target_planning_materialization.planning_lease),
+        &target_planning_materialization.planning_lease,
     )?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         target_bindings.as_ref(),
-        target_planning_materialization.table.clone(),
+        target_planning_materialization
+            .write_target_admission
+            .clone()
+            .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?,
         target_planning_materialization.planning_lease.clone(),
     )?;
     let (plan, factory) = compile_canonical_select_for_imv_with_bindings(
@@ -16117,6 +16164,13 @@ fn execute_imv_change_stream_writer(
                 commit_executor: Arc::clone(&commit_executor),
             },
         )?;
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive Iceberg MV change-stream write lease: {error}"))?;
     let connector_write =
         crate::engine::iceberg_writer::register_iceberg_change_stream_provider_binding(
             state,
@@ -16124,6 +16178,7 @@ fn execute_imv_change_stream_writer(
             &binding,
             refresh_plan.connector_operation_id,
             connector_context.clone(),
+            &write_lease,
         )?;
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
         state,
@@ -16312,18 +16367,16 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         table: request.target_name,
     };
     let target_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = bind_imv_target_query_table_in_store(
-        &refresh_context,
-        &target_bindings,
-        Some(planning_lease),
-    )?;
+    let target_binding =
+        bind_imv_target_query_table_in_store(&refresh_context, &target_bindings, planning_lease)?;
+    let write_target_admission = target_bindings
+        .binding(target_binding)?
+        .write_target_admission
+        .clone()
+        .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         target_bindings.as_ref(),
-        refresh_context
-            .target_bindings
-            .runtime()
-            .table_info()?
-            .clone(),
+        write_target_admission,
         planning_lease.clone(),
     )?;
     let rewrite_evidence = match evidence {
@@ -17381,10 +17434,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 connector_context,
             )
         })?;
-    if target_planning_materialization.table.table_uuid.as_deref()
-        != Some(ctx.rewrite.target_table_uuid.as_str())
-        || target_planning_materialization.table.current_snapshot_id
-            != ctx.rewrite.target_snapshot_id
+    if target_planning_materialization.table_uuid() != Some(ctx.rewrite.target_table_uuid.as_str())
+        || target_planning_materialization.current_snapshot_id() != ctx.rewrite.target_snapshot_id
     {
         return Err(handle_iceberg_mv_commit_error(
             state,
@@ -17396,8 +17447,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 "IMV target changed after admission: expected uuid={} snapshot={:?}, got uuid={:?} snapshot={:?}",
                 ctx.rewrite.target_table_uuid,
                 ctx.rewrite.target_snapshot_id,
-                target_planning_materialization.table.table_uuid,
-                target_planning_materialization.table.current_snapshot_id,
+                target_planning_materialization.table_uuid(),
+                target_planning_materialization.current_snapshot_id(),
             ),
             connector_context,
         ));
@@ -17406,11 +17457,14 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let target_binding = bind_imv_target_query_table_in_store(
         &ctx,
         &target_bindings,
-        Some(&target_planning_materialization.planning_lease),
+        &target_planning_materialization.planning_lease,
     )?;
     crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
         target_bindings.as_ref(),
-        target_planning_materialization.table.clone(),
+        target_planning_materialization
+            .write_target_admission
+            .clone()
+            .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?,
         target_planning_materialization.planning_lease.clone(),
     )?;
     let imv_rewrite_input = sql_imv_planning_input(&ctx, target_binding, rewrite_evidence)?;
@@ -21625,18 +21679,20 @@ mod tests {
             } if snapshot_id == frozen_snapshot_id
         ));
         let lease = bindings
-            .planning_lease(source.binding)
-            .expect("read frozen overlay lease")
+            .exact_planning_lease(source.binding)
             .expect("frozen overlay must retain planning lease");
         assert_eq!(lease.binding().incarnation(), original_incarnation);
         assert_ne!(lease.binding().incarnation(), replacement_incarnation);
-        let Some(QueryScanMaterialization::IcebergDataFiles { table, .. }) = bindings
+        let Some(materialization) = bindings
             .scan_materialization(source.binding)
             .expect("read frozen overlay materialization")
         else {
-            panic!("frozen overlay must retain Iceberg data-file facts");
+            panic!("frozen overlay must retain a connector read handle");
         };
-        assert_eq!(table.current_snapshot_id, Some(frozen_snapshot_id));
+        assert_eq!(
+            materialization.selector,
+            novarocks_spi::connector::ConnectorReadSelector::SnapshotId(frozen_snapshot_id)
+        );
     }
 
     fn create_mv_and_refresh_once(

@@ -21,8 +21,8 @@ use novarocks::engine::table_maintenance::{
     MaintenanceTarget, TableMaintenanceEngine,
 };
 use novarocks::engine::view::{
-    CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
-    ViewRequestContext, ViewSqlDialect, ViewTarget,
+    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    ViewEngine, ViewRequestContext, ViewSqlDialect, ViewTarget,
 };
 use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
 use novarocks_frontend::view::repository::database_key;
@@ -104,28 +104,12 @@ impl TableMaintenanceEngine for SessionMaintenanceEngine {
 }
 
 impl ViewEngine for SessionViewEngine {
-    fn validate_iceberg_catalog(&self, _catalog: &str) -> Result<(), String> {
-        unreachable!("session view must not access an external catalog")
-    }
-
-    fn is_rest_iceberg_catalog(&self, _catalog: &str) -> bool {
-        false
-    }
-
-    fn table_exists(
+    fn resolve_external_view(
         &self,
         _target: &ViewTarget,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<bool, String> {
-        unreachable!("session view must not probe external tables")
-    }
-
-    fn view_exists(
-        &self,
-        _target: &ViewTarget,
-        _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<bool, String> {
-        unreachable!("session view must not probe external views")
+    ) -> Result<ExternalViewResolution, String> {
+        unreachable!("session view must not resolve external views")
     }
 
     fn create_external_view(
@@ -148,11 +132,17 @@ impl ViewEngine for SessionViewEngine {
     fn load_external_view(
         &self,
         _target: &ViewTarget,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String> {
         Ok(None)
     }
 
-    fn list_external_views(&self, _catalog: &str, _database: &str) -> Result<Vec<String>, String> {
+    fn list_external_views(
+        &self,
+        _catalog: &str,
+        _database: &str,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Vec<String>, String> {
         unreachable!("session view must not list external views")
     }
 

@@ -31,9 +31,8 @@ use crate::protocol::native::encode::plan as native_plan;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason,
-    ResolvedScanBinding, ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution,
-    ScanExecutionBindings,
+    ResolvedIcebergDeltaScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
+    ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
@@ -188,7 +187,7 @@ fn planned_connector_read_for_test()
             max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
             max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
         },
-        planning_lease: None,
+        planning_lease: crate::connector::iceberg::provider::fixture_planning_lease("ice"),
         read_session: None,
     }
 }
@@ -476,9 +475,9 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
             runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
         },
     )
-    .expect_err("delta source with file binding must fail");
+    .expect_err("delta source with admitted connector binding must fail");
     assert!(err.contains("execution variant mismatch"), "{err}");
-    assert!(err.contains("IcebergFiles"), "{err}");
+    assert!(err.contains("AdmittedConnectorRead"), "{err}");
 }
 
 #[test]
@@ -588,18 +587,16 @@ fn encoded_root_scan_for_test(plan: &plan::DistributedPlan) -> &plan::ScanNode {
 
 fn file_binding_for_test(
     node_id: i32,
-    table: iceberg_scan_model::IcebergTableInfo,
-    file_binding: iceberg_scan_model::IcebergDataFileBinding,
+    _table: iceberg_scan_model::IcebergTableInfo,
+    _file_binding: iceberg_scan_model::IcebergDataFileBinding,
     physical_columns: Vec<ResolvedScanColumn>,
     required_reads: Vec<ResolvedReadColumn>,
 ) -> ResolvedScanBinding {
     ResolvedScanBinding {
         node_id,
-        execution: ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-            table,
-            files: Vec::new(),
-            binding: file_binding,
-        }),
+        execution: ResolvedScanExecution::AdmittedConnectorRead(
+            crate::connector::iceberg::provider::fixture_query_scan_materialization("ice"),
+        ),
         physical_columns,
         required_reads,
     }

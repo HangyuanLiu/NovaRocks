@@ -46,8 +46,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorCancellation, ConnectorInstanceId, ConnectorListNamespacesRequest,
+    ConnectorNamespaceIdentity, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
 };
 
 struct RequestConnectorCancellation {
@@ -234,6 +236,18 @@ pub(crate) fn metadata_table_exists(
     table: &str,
 ) -> Result<bool, String> {
     let binding = metadata_binding(controls, catalog)?;
+    metadata_table_exists_with_planning_lease(binding, context, namespace, table)
+}
+
+/// Resolve table existence through an admission-frozen planning lease.  A
+/// caller that performs a table-or-view decision must retain this lease for
+/// every metadata lookup in that decision.
+pub(crate) fn metadata_table_exists_with_planning_lease(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     binding
         .binding()
@@ -245,6 +259,47 @@ pub(crate) fn metadata_table_exists(
                 table: Arc::from(table),
             },
             resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Enumerate namespaces through an admission-frozen connector control lease.
+/// Ordering and duplicate handling stay application-owned so providers only
+/// expose their authoritative catalog facts.
+pub(crate) fn metadata_list_namespaces_with_planning_lease(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
+        .metadata()
+        .list_namespaces(ConnectorListNamespacesRequest {
+            instance_id,
+            context,
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Read immutable branch/tag/snapshot facts through the same exact lease that
+/// admitted the table.  SQL owns the projection of these neutral facts.
+pub(crate) fn metadata_read_reference_facts_with_planning_lease(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<ConnectorReadReferenceFacts, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
+        .metadata()
+        .read_reference_facts(ConnectorReadReferenceFactsRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
             context,
         })
         .map_err(|error| error.to_string())
@@ -286,18 +341,7 @@ pub(crate) fn metadata_load_table_with_planning_lease(
             context,
         })
         .map_err(|error| error.to_string())?;
-    let columns = metadata
-        .schema
-        .fields()
-        .iter()
-        .map(|field| novarocks_catalog::schema::ColumnDef {
-            name: field.name().clone(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect();
+    let columns = sql_columns_from_connector_schema(&metadata.schema);
     let schema_id = metadata.version.as_ref().and_then(|version| {
         <[u8; 4]>::try_from(version.as_ref())
             .ok()
@@ -321,6 +365,28 @@ pub(crate) fn metadata_load_table_with_planning_lease(
     ))
 }
 
+fn sql_columns_from_connector_schema(
+    schema: &arrow::datatypes::Schema,
+) -> Vec<novarocks_catalog::schema::ColumnDef> {
+    schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            field
+                .metadata()
+                .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
+        })
+        .map(|field| novarocks_catalog::schema::ColumnDef {
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect()
+}
+
 pub(crate) fn acquire_metadata_planning_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     catalog: &str,
@@ -342,7 +408,10 @@ mod runtime_test;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
     fn standalone_catalog_service_keeps_internal_entry_after_backend_registration() {
@@ -355,6 +424,21 @@ mod tests {
             .read()
             .expect("catalog service registry");
         assert!(registry.get_catalog("default_catalog").is_ok());
+    }
+
+    #[test]
+    fn spi5b_sql_target_columns_exclude_connector_hidden_read_fields() {
+        let schema = Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("_row_id", DataType::Int64, false).with_metadata(HashMap::from([(
+                novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
+                "true".to_string(),
+            )])),
+        ]);
+
+        let columns = super::sql_columns_from_connector_schema(&schema);
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "value");
     }
 }
 

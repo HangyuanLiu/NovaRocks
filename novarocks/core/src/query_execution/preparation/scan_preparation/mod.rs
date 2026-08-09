@@ -17,8 +17,7 @@
 
 use crate::engine::query_planning::bindings::{QueryScanMaterialization, QueryTableBindingStore};
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergFileScan, ResolvedIcebergMetadataScan, ResolvedScanBinding,
-    ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
+    ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
@@ -31,8 +30,7 @@ mod projection;
 mod pruning;
 mod static_predicate;
 
-pub(crate) use iceberg::build_iceberg_metadata_scan_range_params;
-use iceberg::{plan_iceberg_connector_read, plan_iceberg_delta_connector_read};
+use iceberg::{plan_connector_read, plan_iceberg_delta_connector_read};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
 use static_predicate::lower_static_connector_predicates;
 
@@ -175,22 +173,17 @@ fn prepare_scan_node(
                             source.table.catalog, source.table.namespace, source.table.table
                         )
                     })?;
-                let QueryScanMaterialization::IcebergDataFiles {
-                    table,
-                    files,
-                    binding,
-                } = materialization
-                else {
-                    return Err(format!(
-                        "SQL data scan binding for '{}.{}.{}' has non-data materialization",
-                        source.table.catalog, source.table.namespace, source.table.table
-                    ));
-                };
-                ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-                    table,
-                    files,
-                    binding,
-                })
+                match materialization {
+                    connector @ QueryScanMaterialization { .. } => {
+                        ResolvedScanExecution::AdmittedConnectorRead(connector)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "SQL data scan binding for '{}.{}.{}' is missing its admitted connector read",
+                            source.table.catalog, source.table.namespace, source.table.table
+                        ));
+                    }
+                }
             }
             crate::sql::planner::table::SqlScanKind::FrozenInputSet {
                 version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
@@ -202,22 +195,17 @@ fn prepare_scan_node(
                 })?;
                 let materialization = query_table_bindings
                     .frozen_snapshot_materialization(source.binding, *snapshot_id)?;
-                let QueryScanMaterialization::IcebergDataFiles {
-                    table,
-                    files,
-                    binding,
-                } = materialization
-                else {
-                    return Err(format!(
-                        "SQL frozen scan binding for '{}.{}.{}' has non-data materialization",
-                        source.table.catalog, source.table.namespace, source.table.table
-                    ));
-                };
-                ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-                    table,
-                    files,
-                    binding,
-                })
+                match materialization {
+                    connector @ QueryScanMaterialization { .. } => {
+                        ResolvedScanExecution::AdmittedConnectorRead(connector)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "SQL frozen scan binding for '{}.{}.{}' has non-neutral materialization",
+                            source.table.catalog, source.table.namespace, source.table.table
+                        ));
+                    }
+                }
             }
             crate::sql::planner::table::SqlScanKind::FrozenInputSet {
                 version:
@@ -241,24 +229,17 @@ fn prepare_scan_node(
                             source.table.catalog, source.table.namespace, source.table.table
                         )
                     })?;
-                let QueryScanMaterialization::IcebergMetadata {
-                    table,
-                    metadata_table_type,
-                    serialized_table,
-                    metadata_payload,
-                } = materialization
-                else {
-                    return Err(format!(
-                        "SQL metadata scan binding for '{}.{}.{}' has non-metadata materialization",
-                        source.table.catalog, source.table.namespace, source.table.table
-                    ));
-                };
-                ResolvedScanExecution::IcebergMetadata(ResolvedIcebergMetadataScan {
-                    table,
-                    metadata_table_type,
-                    serialized_table,
-                    metadata_payload,
-                })
+                match materialization {
+                    connector @ QueryScanMaterialization { .. } => {
+                        ResolvedScanExecution::AdmittedConnectorRead(connector)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "SQL metadata scan binding for '{}.{}.{}' has non-metadata materialization",
+                            source.table.catalog, source.table.namespace, source.table.table
+                        ));
+                    }
+                }
             }
             crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => {
                 resolve_frozen_mv_target_scan(
@@ -327,45 +308,32 @@ fn prepare_scan_node(
                 })?;
             (Vec::new(), Vec::new(), Some(read))
         }
-        ResolvedScanExecution::IcebergFiles(files) => {
-            // Design: ADR-0018 (docs/adr/ADR-0018-static-connector-predicate-disposition.md)
+        ResolvedScanExecution::AdmittedConnectorRead(materialization) => {
             let static_predicates = options
                 .enable_connector_static_predicate_pushdown
                 .then(|| {
-                    let connector_schema_fields = files
-                        .table
-                        .schema
-                        .fields
+                    let QueryScanMaterialization { schema, .. } = materialization else {
+                        return Vec::new();
+                    };
+                    let connector_schema_fields = schema
+                        .fields()
                         .iter()
-                        .map(|field| field.name.as_str())
+                        .map(|field| field.name().as_str())
                         .collect::<Vec<_>>();
                     lower_static_connector_predicates(scan, &connector_schema_fields)
                 })
                 .unwrap_or_default();
-            let exact_lease = query_table_bindings
-                .map(|bindings| exact_query_binding_lease_for_source(bindings, &scan.table.source))
-                .transpose()?;
-            let planned = plan_iceberg_connector_read(
-                controls,
-                exact_lease,
+            let planned = plan_connector_read(
                 context.clone(),
                 scan,
-                &execution,
+                materialization,
                 static_predicates,
                 options.connector_target_parallelism,
                 options.connector_max_split_bytes,
             )
             .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
-            // The provider reader projects physical equality keys internally
-            // and drops them before delivery. Core therefore never owns a
-            // hidden Iceberg delete column or file range.
             (Vec::new(), Vec::new(), Some(planned))
         }
-        ResolvedScanExecution::IcebergMetadata(_) => (
-            vec![build_iceberg_metadata_scan_range_params()],
-            Vec::new(),
-            None,
-        ),
         ResolvedScanExecution::IcebergDelta(_) => {
             let ScanSource::Sql(source) = &scan.table.source;
             if !matches!(
@@ -389,9 +357,9 @@ fn prepare_scan_node(
                         source.table.catalog, source.table.namespace, source.table.table
                     )
                 })?;
-            let QueryScanMaterialization::IcebergDataFiles { table, .. } = materialization else {
+            let QueryScanMaterialization { table, .. } = materialization else {
                 return Err(format!(
-                    "SQL delta scan binding for '{}.{}.{}' has non-data materialization",
+                    "SQL delta scan binding for '{}.{}.{}' is missing its admitted connector read",
                     source.table.catalog, source.table.namespace, source.table.table
                 ));
             };
@@ -443,196 +411,30 @@ fn resolve_frozen_mv_target_scan(
             "SQL MV {lane} scan node_id={node_id} has binding token but no query-local binding store"
         )
     })?;
-    let materialization = query_table_bindings
-        .scan_materialization(source.binding)?
-        .ok_or_else(|| {
-            format!(
-                "SQL MV {lane} scan binding for '{}.{}.{}' has no frozen target materialization",
-                source.table.catalog, source.table.namespace, source.table.table
-            )
-        })?;
-    let QueryScanMaterialization::IcebergMvTarget {
-        table,
-        files,
-        binding,
-        target_table_uuid,
-        frozen_snapshot_id,
-        target_state_partition_filter,
-        target_partition_contract,
-    } = materialization
-    else {
-        return Err(format!(
-            "SQL MV {lane} scan binding for '{}.{}.{}' has non-target materialization",
+    let binding = query_table_bindings.binding(source.binding)?;
+    let materialization = binding.mv_target_read.as_ref().ok_or_else(|| {
+        format!(
+            "SQL MV {lane} scan binding for '{}.{}.{}' has no frozen target materialization",
             source.table.catalog, source.table.namespace, source.table.table
-        ));
-    };
-    if !table.catalog.eq_ignore_ascii_case(&source.table.catalog)
-        || !table
-            .namespace
-            .eq_ignore_ascii_case(&source.table.namespace)
-        || !table.table.eq_ignore_ascii_case(&source.table.table)
+        )
+    })?;
+    if materialization.target_table_uuid != expected_uuid
+        || materialization.frozen_snapshot_id != expected_snapshot_id
     {
-        return Err(format!(
-            "SQL MV {lane} scan node_id={node_id} identity does not match its frozen target binding"
-        ));
-    }
-    if target_table_uuid != expected_uuid || frozen_snapshot_id != expected_snapshot_id {
         return Err(format!(
             "SQL MV {lane} scan node_id={node_id} target UUID or snapshot does not match its frozen binding"
         ));
     }
-    let files = match target_state_partition_constraint {
+    let connector_read = match target_state_partition_constraint {
         Some(
             crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
-        ) => filter_frozen_mv_target_state_files(
-            files,
-            &target_state_partition_filter,
-            target_partition_contract.as_ref(),
-            node_id,
-        )?,
+        ) => &materialization.affected_partitions,
         Some(crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned)
-        | None => files,
+        | None => &materialization.full,
     };
-    Ok(ResolvedScanExecution::IcebergFiles(
-        ResolvedIcebergFileScan {
-            table,
-            files,
-            binding,
-        },
+    Ok(ResolvedScanExecution::AdmittedConnectorRead(
+        connector_read.clone(),
     ))
-}
-
-/// Apply the admitted affected-partition allow-list to the already frozen MV
-/// target files.  The SQL plan deliberately carries only the requirement for
-/// an allow-list; the keys and partition contract remain application-owned
-/// binding facts.  This must not consult a catalog, a provider, or a current
-/// connector generation.
-fn filter_frozen_mv_target_state_files(
-    files: Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>,
-    filter: &crate::mv::model::TargetPartitionFilter,
-    contract: Option<&crate::mv::persistence::schema::MvPartitionContract>,
-    node_id: i32,
-) -> Result<Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>, String> {
-    let crate::mv::model::TargetPartitionFilter::AllowList(allow_list) = filter else {
-        return Ok(files);
-    };
-    if allow_list.is_empty() {
-        return Ok(Vec::new());
-    }
-    let contract = contract.ok_or_else(|| {
-        format!(
-            "SQL MV target-state scan node_id={node_id} requires an affected-partition allow-list but its frozen binding has no target partition contract"
-        )
-    })?;
-    files
-        .into_iter()
-        .filter_map(|file| match frozen_mv_target_partition_key(contract, &file) {
-            Ok(key) if allow_list.contains(&key) => Some(Ok(file)),
-            Ok(_) => None,
-            Err(err) => Some(Err(format!(
-                "SQL MV target-state scan node_id={node_id} cannot map frozen target file {} partition: {err}",
-                file.path
-            ))),
-        })
-        .collect()
-}
-
-fn frozen_mv_target_partition_key(
-    contract: &crate::mv::persistence::schema::MvPartitionContract,
-    file: &novarocks_connector_iceberg::scan_model::IcebergDataFileInfo,
-) -> Result<crate::mv::model::MvPartitionKey, String> {
-    let spec_id = file
-        .partition_spec_id
-        .ok_or_else(|| format!("target file {} is missing partition spec id", file.path))?;
-    let mut fields = Vec::with_capacity(contract.fields.len());
-    for partition_field in &contract.fields {
-        let expected_transform = frozen_mv_target_transform_text(&partition_field.transform)
-            .ok_or_else(|| {
-                format!(
-                    "MV partition field {} uses unsupported void transform",
-                    partition_field.partition_field_name
-                )
-            })?;
-        let value = file
-            .partition_values
-            .iter()
-            .find(|value| {
-                value
-                    .source_column
-                    .eq_ignore_ascii_case(&partition_field.source_column_name)
-                    && value.transform.eq_ignore_ascii_case(&expected_transform)
-            })
-            .or_else(|| {
-                file.partition_values.iter().find(|value| {
-                    value
-                        .field_name
-                        .eq_ignore_ascii_case(&partition_field.partition_field_name)
-                        && value.transform.eq_ignore_ascii_case(&expected_transform)
-                })
-            })
-            .ok_or_else(|| {
-                format!(
-                    "target file {} has no partition value for {} with transform {}",
-                    file.path, partition_field.partition_field_name, expected_transform
-                )
-            })?;
-        fields.push(crate::mv::model::MvPartitionKeyField::new(
-            partition_field.partition_field_name.clone(),
-            frozen_mv_target_partition_value(value)?,
-        ));
-    }
-    Ok(crate::mv::model::MvPartitionKey::new(spec_id, fields))
-}
-
-fn frozen_mv_target_partition_value(
-    value: &novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue,
-) -> Result<crate::mv::model::MvPartitionValue, String> {
-    use novarocks_connector_iceberg::scan_model::IcebergPartitionValue;
-
-    match &value.value {
-        None => Ok(crate::mv::model::MvPartitionValue::Null),
-        Some(IcebergPartitionValue::Boolean(value)) => Ok(
-            crate::mv::model::MvPartitionValue::String(value.to_string()),
-        ),
-        Some(IcebergPartitionValue::Int32(value)) => Ok(
-            crate::mv::model::MvPartitionValue::String(value.to_string()),
-        ),
-        Some(IcebergPartitionValue::Int64(value)) => Ok(
-            crate::mv::model::MvPartitionValue::String(value.to_string()),
-        ),
-        Some(IcebergPartitionValue::Float(value)) => Ok(
-            crate::mv::model::MvPartitionValue::String(value.to_string()),
-        ),
-        Some(IcebergPartitionValue::Double(value)) => Ok(
-            crate::mv::model::MvPartitionValue::String(value.to_string()),
-        ),
-        Some(IcebergPartitionValue::String(value)) => {
-            Ok(crate::mv::model::MvPartitionValue::String(value.clone()))
-        }
-        Some(IcebergPartitionValue::Binary(_)) => Err(format!(
-            "target partition field {} has unsupported binary value",
-            value.field_name
-        )),
-    }
-}
-
-fn frozen_mv_target_transform_text(
-    transform: &crate::mv::persistence::schema::MvPartitionTransformContract,
-) -> Option<String> {
-    use crate::mv::persistence::schema::MvPartitionTransformContract;
-
-    match transform {
-        MvPartitionTransformContract::Identity => Some("identity".to_string()),
-        MvPartitionTransformContract::Year => Some("year".to_string()),
-        MvPartitionTransformContract::Month => Some("month".to_string()),
-        MvPartitionTransformContract::Day => Some("day".to_string()),
-        MvPartitionTransformContract::Hour => Some("hour".to_string()),
-        MvPartitionTransformContract::Bucket { num_buckets } => {
-            Some(format!("bucket({num_buckets})"))
-        }
-        MvPartitionTransformContract::Truncate { width } => Some(format!("truncate({width})")),
-        MvPartitionTransformContract::Void => None,
-    }
 }
 
 /// Once SQL catalog resolution selected a query binding, preparation must use
@@ -654,9 +456,9 @@ fn exact_query_binding_lease_for_source(
     };
     let binding_id = binding_id
         .ok_or_else(|| format!("scan preparation has no exact query binding for {source_name}"))?;
-    let lease = bindings.planning_lease(binding_id)?.ok_or_else(|| {
-        format!("query binding for {source_name} has no connector planning lease")
-    })?;
+    let lease = bindings
+        .exact_planning_lease(binding_id)
+        .map_err(|_| format!("query binding for {source_name} has no connector planning lease"))?;
     if lease.binding().descriptor().instance_id.as_str() != expected_catalog {
         return Err(format!(
             "query binding lease owner '{:?}' does not match scan catalog '{}'",
@@ -681,13 +483,15 @@ fn validate_resolved_execution_kind(
                 matches!(execution, ResolvedScanExecution::IcebergDelta(_))
             }
             crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
+            }
+            crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
             | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
-                matches!(execution, ResolvedScanExecution::IcebergFiles(_))
+                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
             }
             crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
-                matches!(execution, ResolvedScanExecution::IcebergMetadata(_))
+                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
             }
         },
     };
@@ -698,11 +502,15 @@ fn validate_resolved_execution_kind(
         ScanSource::Sql(sql_source) => match sql_source.kind {
             crate::sql::planner::table::SqlScanKind::ConnectorRead => "ConnectorRead",
             crate::sql::planner::table::SqlScanKind::Delta { .. } => "IcebergDelta",
-            crate::sql::planner::table::SqlScanKind::Metadata { .. } => "IcebergMetadata",
+            crate::sql::planner::table::SqlScanKind::Metadata { .. } => "AdmittedConnectorRead",
             crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => "IcebergFiles",
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+                "AdmittedConnectorRead"
+            }
+            crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
+            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+                "AdmittedConnectorRead"
+            }
         },
     };
     Err(format!(
@@ -727,21 +535,10 @@ fn reject_target_equality_deletes(
         }) => "target-locator",
         _ => return Ok(()),
     };
-    let ResolvedScanExecution::IcebergFiles(files) = execution else {
-        return Err(format!(
-            "Iceberg {target_kind} scan node_id={node_id} requires IcebergFiles execution"
-        ));
-    };
-    if files.files.iter().any(|file| {
-        file.delete_files.iter().any(|delete| {
-            delete.file_content
-                == novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality
-        })
-    }) {
-        return Err(format!(
-            "Iceberg {target_kind} scan node_id={node_id} does not support equality deletes yet"
-        ));
-    }
+    // Query-local neutral reads are deliberately opaque to Core. The provider
+    // validates delete visibility encoded in the admitted handle while
+    // planning its split set.
+    let _ = (node_id, target_kind, execution);
     Ok(())
 }
 

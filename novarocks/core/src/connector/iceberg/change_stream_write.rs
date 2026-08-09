@@ -42,10 +42,9 @@ use super::write_service::{
     IcebergChangeStreamWriteReportCommitter, IcebergWriteControlService,
     IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
 };
+use crate::connector::iceberg::write_contract::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
-use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkMode, IcebergWriteSinkSpec, iceberg_write_sink_spec_from_admitted_sql_input,
-};
+use crate::engine::query_planning::write_sink::iceberg_write_sink_spec_from_admitted_sql_input;
 use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
 use novarocks_spi::connector::{ConnectorError, ConnectorWriteOperationId};
 

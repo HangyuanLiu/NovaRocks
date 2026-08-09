@@ -34,6 +34,7 @@ use crate::connector::iceberg::commit::{
     ensure_equality_delete_single_partition_spec,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
+use crate::connector::iceberg::write_contract::IcebergWriteSinkMode;
 use crate::connector::iceberg::write_contract::encode_equality_delete_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
@@ -43,8 +44,7 @@ use crate::engine::delete_engine::{
 };
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkMode, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_from_admitted_binding,
+    admit_frozen_iceberg_write_target, sql_write_plan_input_from_admitted_binding,
 };
 use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -223,8 +223,14 @@ fn prepare_equality_delete_distributed_write(
     sink_spec.mode = IcebergWriteSinkMode::EqualityDeletes;
     sink_spec.set_planned_snapshot_id(current_snapshot_id)?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding =
-        admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
+    let target_binding = admit_frozen_iceberg_write_target(
+        table_bindings.as_ref(),
+        &sink_spec,
+        planning_lease.clone(),
+    )?;
     let input_columns = delete_columns
         .iter()
         .map(|column| ColumnDef {
@@ -299,6 +305,7 @@ fn prepare_equality_delete_distributed_write(
         Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
+        &write_lease,
     )?;
     let executor = DistributedEqualityDeleteWriteExecutor {
         state: Arc::clone(state),

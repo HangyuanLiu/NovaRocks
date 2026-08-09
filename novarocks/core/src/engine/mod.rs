@@ -75,7 +75,7 @@ pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
 pub(crate) mod query_planning;
 pub(crate) mod query_prep;
-mod query_stats;
+pub(crate) mod query_stats;
 pub(crate) mod statement;
 pub mod statistics;
 pub mod statistics_application;
@@ -9069,9 +9069,9 @@ path = "meta/operations.sqlite"
 
     #[allow(dead_code)]
     fn test_iceberg_write_sink_spec()
-    -> crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
-        crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
-            mode: crate::engine::query_planning::write_sink::IcebergWriteSinkMode::Data,
+    -> crate::connector::iceberg::write_contract::IcebergWriteSinkSpec {
+        crate::connector::iceberg::write_contract::IcebergWriteSinkSpec {
+            mode: crate::connector::iceberg::write_contract::IcebergWriteSinkMode::Data,
             iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo {
                 catalog: "test_catalog".to_string(),
                 namespace: "test_db".to_string(),
@@ -9109,7 +9109,7 @@ path = "meta/operations.sqlite"
             cloud_properties: BTreeMap::new(),
             file_format: "parquet".to_string(),
             compression:
-                crate::engine::query_planning::write_sink::IcebergWriteFileCompression::Snappy,
+                crate::connector::iceberg::write_contract::IcebergWriteFileCompression::Snappy,
             position_delete_output_descriptor: None,
         }
     }

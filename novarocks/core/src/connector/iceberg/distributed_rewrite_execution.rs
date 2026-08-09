@@ -13,12 +13,12 @@ use std::sync::Arc;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorWriteCohortId};
 
 use crate::connector::backend::ResolvedTable;
+use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_for_admitted_target,
+    admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::distributed_rewrite::{
     ConnectorDistributedRewriteSession, FrozenRewriteReadResolver,

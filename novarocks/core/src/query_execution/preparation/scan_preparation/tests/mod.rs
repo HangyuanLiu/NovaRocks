@@ -27,7 +27,7 @@ use arrow::datatypes::DataType;
 
 use crate::connector::ConnectorRegistry;
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergFileScan, ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
+    ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
@@ -80,8 +80,8 @@ fn prepare_scan_bindings_with_materialized_files(
 }
 
 /// The shared fixture deliberately allocates the same token that the SQL
-/// test scan carrier embeds.  Concrete Iceberg files remain in the
-/// application-owned store, never in `TableDef::source`.
+/// test scan carrier embeds. Concrete Iceberg files remain in the
+/// provider-owned opaque handle, never in `TableDef::source`.
 fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
@@ -96,13 +96,16 @@ fn fixture_query_table_bindings(
 fn fixture_query_table_bindings_with_materialized_files(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-    materialized_files: Vec<IcebergDataFileInfo>,
+    _materialized_files: Vec<IcebergDataFileInfo>,
 ) -> crate::engine::query_planning::bindings::QueryTableBindingStore {
     use crate::engine::query_planning::bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
     use crate::sql::planner::table::{SqlScanKind, SqlScanSource, SqlTableIdentity};
-    use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+    use novarocks_spi::connector::{
+        ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity,
+        ConnectorTableRequest, ConnectorTableResolution,
+    };
 
     let scan = plan
         .fragments()
@@ -113,19 +116,28 @@ fn fixture_query_table_bindings_with_materialized_files(
         })
         .expect("shared fixture plan must have a root scan");
     let ScanSource::Sql(source) = &scan.table.source;
+    let store = QueryTableBindingStore::try_new_with_scope_for_test(
+        NonZeroU64::new(1).expect("fixture scope"),
+    );
+    if matches!(source.kind, SqlScanKind::ConnectorRead) {
+        // This source kind is supplied by its dedicated resolver tests;
+        // no catalog admission is expected before resolver dispatch.
+        return store;
+    }
     let planning_lease = controls
         .acquire_current(
             &ConnectorInstanceId::parse(&source.table.catalog)
                 .expect("fixture catalog must be a valid connector instance"),
         )
         .ok();
+    if planning_lease.is_none() && matches!(&source.kind, SqlScanKind::Delta { .. }) {
+        // Resolver-only negative tests deliberately omit connector admission so
+        // they can assert the resolver error before generic read planning.
+        return store;
+    }
     let source = source.clone();
     let planner = scan.table.clone();
-    let materialized_table = iceberg_table_for_planner(&planner);
 
-    let store = QueryTableBindingStore::try_new_with_scope_for_test(
-        NonZeroU64::new(1).expect("fixture scope"),
-    );
     store
         .resolve_or_insert_with_id(
             QueryTableBindingKey::strict_base(
@@ -134,7 +146,6 @@ fn fixture_query_table_bindings_with_materialized_files(
                 &source.table.table,
             ),
             |binding| {
-                let table = materialized_table.clone();
                 let mut resolved_planner = planner.clone();
                 resolved_planner.source = ScanSource::Sql(SqlScanSource::new(
                     binding,
@@ -145,51 +156,66 @@ fn fixture_query_table_bindings_with_materialized_files(
                     },
                     source.kind.clone(),
                 ));
-                let scan_materialization = match &source.kind {
-                    SqlScanKind::MvTargetState { facts } => {
-                        QueryScanMaterialization::IcebergMvTarget {
-                            table,
-                            files: materialized_files.clone(),
-                            binding: IcebergDataFileBinding::CurrentSnapshot,
-                            target_table_uuid: facts.target_table_uuid.clone(),
-                            frozen_snapshot_id: facts.target_snapshot_id,
-                            target_state_partition_filter:
-                                crate::mv::model::TargetPartitionFilter::None,
-                            target_partition_contract: None,
-                        }
-                    }
-                    SqlScanKind::MvTargetLocator { facts } => {
-                        QueryScanMaterialization::IcebergMvTarget {
-                            table,
-                            files: materialized_files.clone(),
-                            binding: IcebergDataFileBinding::CurrentSnapshot,
-                            target_table_uuid: facts.target_table_uuid.clone(),
-                            frozen_snapshot_id: facts.target_snapshot_id,
-                            target_state_partition_filter:
-                                crate::mv::model::TargetPartitionFilter::None,
-                            target_partition_contract: None,
-                        }
-                    }
-                    _ => QueryScanMaterialization::IcebergDataFiles {
-                        table,
-                        files: materialized_files.clone(),
-                        binding: match &source.kind {
-                            SqlScanKind::FrozenInputSet { .. } => {
-                                IcebergDataFileBinding::ExplicitFiles
-                            }
-                            _ => IcebergDataFileBinding::CurrentSnapshot,
+                let lease = planning_lease.clone().ok_or_else(|| {
+                    "scan fixture must acquire an exact connector lease".to_string()
+                })?;
+                let metadata = lease
+                    .binding()
+                    .metadata()
+                    .load_table(ConnectorTableRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                                .expect("fixture catalog must be valid"),
+                            namespace: Arc::from(source.table.namespace.as_str()),
+                            table: Arc::from(source.table.table.as_str()),
                         },
-                    },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: crate::connector::test_request_context(),
+                    })
+                    .map_err(|error| error.to_string())?;
+                let scan_materialization = QueryScanMaterialization {
+                    table: metadata.table,
+                    schema: metadata.schema,
+                    selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+                    statistics_pin: None,
+                    planning_lease: lease.clone(),
                 };
-                let frozen_snapshot_files = match &source.kind {
+                let frozen_snapshot_materializations = match &source.kind {
                     SqlScanKind::FrozenInputSet {
                         version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
                             snapshot_id,
                         ),
-                    } => std::collections::BTreeMap::from([(
-                        *snapshot_id,
-                        materialized_files.clone(),
-                    )]),
+                    } => {
+                        let lease = planning_lease.clone().ok_or_else(|| {
+                            "frozen scan fixture must acquire an exact connector lease".to_string()
+                        })?;
+                        let metadata = lease
+                            .binding()
+                            .metadata()
+                            .load_table(ConnectorTableRequest {
+                                table: ConnectorTableIdentity {
+                                    instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                                        .expect("fixture catalog must be valid"),
+                                    namespace: Arc::from(source.table.namespace.as_str()),
+                                    table: Arc::from(source.table.table.as_str()),
+                                },
+                                resolution: ConnectorTableResolution::StrictBaseTable,
+                                context: crate::connector::test_request_context(),
+                            })
+                            .map_err(|error| error.to_string())?;
+                        std::collections::BTreeMap::from([(
+                            *snapshot_id,
+                            QueryScanMaterialization {
+                                table: metadata.table,
+                                schema: metadata.schema,
+                                selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
+                                    *snapshot_id,
+                                ),
+                                statistics_pin: None,
+                                planning_lease: lease,
+                            },
+                        )])
+                    }
                     _ => std::collections::BTreeMap::new(),
                 };
                 Ok(QueryTableBinding {
@@ -199,9 +225,32 @@ fn fixture_query_table_bindings_with_materialized_files(
                         resolved_planner,
                     ),
                     statistics_pin: None,
-                    planning_lease: planning_lease.clone(),
-                    scan_materialization: Some(scan_materialization),
-                    frozen_snapshot_files,
+                    admission: planning_lease
+                        .clone()
+                        .map(crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact)
+                        .unwrap_or(crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local),
+                    scan_materialization: Some(scan_materialization.clone()),
+                    mv_target_read: match &source.kind {
+                        SqlScanKind::MvTargetState { facts } => Some(
+                            crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                                full: scan_materialization.clone(),
+                                affected_partitions: scan_materialization.clone(),
+                                target_table_uuid: facts.target_table_uuid.clone(),
+                                frozen_snapshot_id: facts.target_snapshot_id,
+                            },
+                        ),
+                        SqlScanKind::MvTargetLocator { facts } => Some(
+                            crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                                full: scan_materialization.clone(),
+                                affected_partitions: scan_materialization.clone(),
+                                target_table_uuid: facts.target_table_uuid.clone(),
+                                frozen_snapshot_id: facts.target_snapshot_id,
+                            },
+                        ),
+                        _ => None,
+                    },
+                    write_target_admission: None,
+                    frozen_snapshot_materializations,
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },
@@ -430,14 +479,6 @@ fn recording_registry(
     (registry, seen_projections)
 }
 
-fn resolved_files(files: Vec<IcebergDataFileInfo>) -> ResolvedScanExecution {
-    ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-        table: iceberg_table(),
-        files,
-        binding: IcebergDataFileBinding::ExplicitFiles,
-    })
-}
-
 fn resolved_delta() -> ResolvedScanExecution {
     ResolvedScanExecution::IcebergDelta(
         crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
@@ -454,9 +495,8 @@ fn resolved_delta() -> ResolvedScanExecution {
 fn resolved_data_delta() -> ResolvedScanExecution {
     let mut delta = match resolved_delta() {
         ResolvedScanExecution::IcebergDelta(delta) => delta,
-        ResolvedScanExecution::IcebergFiles(_) => unreachable!("fixture is delta"),
-        ResolvedScanExecution::IcebergMetadata(_) => unreachable!("fixture is delta"),
         ResolvedScanExecution::ConnectorRead => unreachable!("fixture is delta"),
+        ResolvedScanExecution::AdmittedConnectorRead(_) => unreachable!("fixture is delta"),
     };
     delta.runtime_plan.change_files = vec![novarocks_connector_iceberg::delta::DeltaSourceFile {
         path: "s3://bucket/delta-added.parquet".to_string(),

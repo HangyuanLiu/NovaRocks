@@ -49,3 +49,22 @@ WHERE sleep(delay_s);
 -- query 6
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.kill_query;
+
+-- query 7
+-- SPI-5B: metadata aliases use the generic ConnectorReadSource path.  Abort
+-- after its metadata reader opens and require that reader to close before the
+-- runner accepts cross-process resource convergence.
+-- @kill_query_after_be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN
+-- @expect_error=Query execution was interrupted
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,1
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,1
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
+-- @be_log_count_at_least=reason=CoordinatorAbort,3
+SELECT COUNT(*)
+FROM ${case_db}.kill_query$files AS metadata
+JOIN ${case_db}.kill_query AS data ON TRUE
+WHERE sleep(data.delay_s);
+
+-- query 8
+-- @result_contains=3
+SELECT COUNT(*) FROM ${case_db}.kill_query;

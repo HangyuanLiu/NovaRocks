@@ -103,6 +103,8 @@ pub struct QueryMeta {
     pub restart_be_after_init_ack_index: Option<usize>,
     /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
     pub kill_query_after_control_ready_count: Option<usize>,
+    /// Execute KILL QUERY after a new matching line is observed in a runner-owned BE log.
+    pub kill_query_after_be_log_contains: Option<String>,
     /// Fail the local StageFragments build at this one-based fragment ordinal.
     pub fail_stage_prepare_ordinal: Option<usize>,
     pub drop_next_stage_ack_be_index: Option<usize>,

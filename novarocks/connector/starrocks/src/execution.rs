@@ -564,6 +564,7 @@ mod tests {
                     projection: vec![0],
                     static_predicates: vec![],
                     selector: ConnectorReadSelector::Current,
+                    purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                     limit: None,
                     batch: ConnectorBatchBudget {
                         max_rows: NonZeroUsize::new(32).unwrap(),

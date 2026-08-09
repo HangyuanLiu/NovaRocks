@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::engine::query_planning::bindings::{
-    QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
 };
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{
@@ -75,6 +75,7 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
             projection,
             static_predicates: Vec::new(),
             selector: ConnectorReadSelector::Current,
+            purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
             limit: None,
             batch,
             context: context.clone(),
@@ -112,7 +113,7 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
         // This clone is derived from the composite rewrite lease, so the
         // generic ensure barrier retains the same exact generation without a
         // later current-generation lookup.
-        planning_lease: Some(lease.planning_lease()),
+        planning_lease: lease.planning_lease(),
         read_session: split_result.session,
     })
 }
@@ -169,9 +170,11 @@ pub(crate) fn admit_frozen_rewrite_scan_binding(
                     },
                 ),
                 statistics_pin: None,
-                planning_lease: None,
+                admission: QueryTableBindingAdmission::Local,
                 scan_materialization: None,
-                frozen_snapshot_files: BTreeMap::new(),
+                mv_target_read: None,
+                write_target_admission: None,
+                frozen_snapshot_materializations: BTreeMap::new(),
                 delta_runtime_plans: BTreeMap::new(),
             })
         },

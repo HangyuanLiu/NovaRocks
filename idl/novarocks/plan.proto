@@ -1056,15 +1056,15 @@ message ColumnDef {
 // future BE/native plan prepare layer.
 message ScanSource {
   oneof kind {
-    IcebergDataFiles iceberg_data_files = 1;              // Iceberg data-file scan.
-    IcebergMetadataTable iceberg_metadata_table = 2;      // Iceberg metadata-table scan.
-    IcebergVersionTable iceberg_version_table = 4;        // pinned Iceberg snapshot scan.
     IcebergMvTargetState iceberg_mv_target_state = 5;     // IMV target-state scan.
     IcebergMvTargetLocator iceberg_mv_target_locator = 6; // IMV target-locator scan.
     ConnectorReadSource connector_read = 8;                // provider-owned opaque scan and splits.
   }
-  reserved 3;
+  reserved 1, 2, 3, 4;
   reserved 7;
+  reserved "iceberg_data_files";
+  reserved "iceberg_metadata_table";
+  reserved "iceberg_version_table";
   reserved "iceberg_delta_table"; // former core-owned Iceberg delta carrier.
   reserved "starrocks_table"; // former Core-owned StarRocks tablet carrier.
 }
@@ -1094,47 +1094,6 @@ message ConnectorReadSplit {
   optional uint64 estimated_bytes = 3; // optional scheduler hint.
   reserved 4;
   reserved "file_execution"; // provider payload owns file semantics.
-}
-
-// Iceberg data-file scan source.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergDataFiles {
-  IcebergTableInfo table = 1;                      // Iceberg table identity and schema.
-  repeated IcebergDataFileInfo files = 2;          // explicit data files, possibly empty.
-  IcebergDataFileBinding binding = 4;              // current-snapshot vs explicit-file binding.
-  reserved 3;
-  reserved "cloud_properties"; // credentials never enter a read carrier.
-}
-
-// Iceberg data-file binding provenance.
-enum IcebergDataFileBinding {
-  ICEBERG_DATA_FILE_BINDING_UNSPECIFIED = 0;
-  ICEBERG_DATA_FILE_BINDING_CURRENT_SNAPSHOT = 1;
-  ICEBERG_DATA_FILE_BINDING_EXPLICIT_FILES = 2;
-}
-
-// Iceberg metadata-table scan source.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergMetadataTable {
-  IcebergTableInfo table = 1;                         // underlying Iceberg table.
-  IcebergMetadataTableType metadata_table_type = 2;   // metadata table flavor.
-  string serialized_table = 3;                        // JSON-serialized Iceberg TableMetadata.
-  map<string, string> cloud_properties = 4;           // object-store properties.
-  optional string metadata_payload = 5;               // optional native metadata payload JSON.
-}
-
-// Iceberg metadata-table type.
-enum IcebergMetadataTableType {
-  ICEBERG_METADATA_TABLE_TYPE_UNSPECIFIED = 0;
-  ICEBERG_METADATA_TABLE_TYPE_FILES = 1;
-  ICEBERG_METADATA_TABLE_TYPE_MANIFESTS = 2;
-  ICEBERG_METADATA_TABLE_TYPE_LOGICAL_ICEBERG_METADATA = 3;
-  ICEBERG_METADATA_TABLE_TYPE_SNAPSHOTS = 4;
-  ICEBERG_METADATA_TABLE_TYPE_HISTORY = 5;
-  ICEBERG_METADATA_TABLE_TYPE_REFS = 6;
-  ICEBERG_METADATA_TABLE_TYPE_PARTITIONS = 7;
 }
 
 // Iceberg delta table scan source.
@@ -1254,14 +1213,6 @@ message IcebergDeltaDeleteVisibilityDeleteFile {
   optional int64 length = 4;                    // delete file length.
   optional int64 content_offset = 5;            // Puffin blob offset.
   optional int64 content_size_in_bytes = 6;     // Puffin blob size.
-}
-
-// Pinned Iceberg snapshot scan source.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergVersionTable {
-  IcebergTableInfo table = 1; // underlying Iceberg table.
-  int64 snapshot_id = 2;      // pinned snapshot id.
 }
 
 // IMV target-state scan source.

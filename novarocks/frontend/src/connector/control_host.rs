@@ -1659,6 +1659,7 @@ pub(crate) mod tests {
                     projection: vec![],
                     static_predicates: vec![],
                     selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+                    purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                     limit: None,
                     batch: ConnectorBatchBudget {
                         max_rows: NonZeroUsize::new(16).unwrap(),

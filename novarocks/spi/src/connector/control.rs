@@ -27,8 +27,9 @@ use super::{
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
     ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorViewMetadata,
+    ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -234,6 +235,7 @@ pub struct ConnectorControlBinding {
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
+    view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
 impl ConnectorControlBinding {
@@ -417,6 +419,7 @@ impl ConnectorControlBinding {
             write,
             statistics,
             staged_publication_recovery: None,
+            view_metadata: None,
         })
     }
 
@@ -661,6 +664,27 @@ impl ConnectorControlBinding {
         self.statistics.as_ref()
     }
 
+    pub fn view_metadata(&self) -> Option<&Arc<dyn ConnectorViewMetadata>> {
+        self.view_metadata.as_ref()
+    }
+
+    /// Attaches the optional view metadata capability to this exact control
+    /// generation after the common mandatory capabilities have been validated.
+    pub fn try_with_view_metadata(
+        mut self,
+        view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(capability) = &view_metadata {
+            super::view_metadata::validate_view_metadata_owner(
+                &self.descriptor,
+                self.incarnation,
+                capability.as_ref(),
+            )?;
+        }
+        self.view_metadata = view_metadata;
+        Ok(self)
+    }
+
     /// Installs the provider-owned historical staged-publication inspector.
     /// It is a builder to preserve existing control-binding constructors and
     /// to keep recovery independent from ordinary write capability setup.
@@ -785,6 +809,28 @@ impl ConnectorControlPlanningLease {
         let key = write.binding_key().clone();
         let retained_planning_lease = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(key, write, distribution, move || {
+            drop(retained_planning_lease)
+        })
+        .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
+    }
+
+    /// Derive a statistics lease from this retained control generation.
+    ///
+    /// Statistics collection first asks the provider to pin a data version and
+    /// then executes a normal connector read.  Both operations must therefore
+    /// be fenced by the same generation; acquiring a new statistics or
+    /// planning lease between them could silently mix provider incarnations.
+    pub fn derive_statistics_lease(&self) -> Result<ConnectorStatisticsLease, ConnectorError> {
+        let statistics = self.binding.statistics().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation has no statistics capability",
+            )
+        })?;
+        let descriptor = self.binding.descriptor().clone();
+        let incarnation = self.binding.incarnation();
+        let retained_planning_lease = self.clone();
+        ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
             drop(retained_planning_lease)
         })
     }

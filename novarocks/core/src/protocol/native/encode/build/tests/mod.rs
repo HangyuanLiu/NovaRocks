@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::DataType;
@@ -36,7 +37,10 @@ use crate::sql::planner::distributed::{
 use crate::sql::planner::payload::{PlanScanNode, PlanValuesNode};
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use crate::sql::planner::table::{ScanSource, SqlScanSource, SqlTableIdentity, TableDef};
-use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+use novarocks_spi::connector::{
+    ConnectorControlResolver, ConnectorInstanceId, ConnectorReadSelector, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution,
+};
 
 struct EmptyCatalog;
 
@@ -92,41 +96,6 @@ fn physical_values_node(
     }
 }
 
-fn iceberg_schema_field(
-    field_id: i32,
-    name: &str,
-) -> novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-    novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-        field_id,
-        name: name.to_string(),
-        initial_default: None,
-        write_default: None,
-        initial_default_json: None,
-        write_default_json: None,
-        children: Vec::new(),
-    }
-}
-
-fn iceberg_table_info() -> novarocks_connector_iceberg::scan_model::IcebergTableInfo {
-    novarocks_connector_iceberg::scan_model::IcebergTableInfo {
-        catalog: "test_catalog".to_string(),
-        namespace: "test_db".to_string(),
-        table: "test_table".to_string(),
-        table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-        current_snapshot_id: Some(7),
-        schema_id: 1,
-        location: "s3://bucket/test_table".to_string(),
-        schema: novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
-            fields: vec![
-                iceberg_schema_field(1, "id"),
-                iceberg_schema_field(3, "category"),
-            ],
-        },
-        serialized_metadata: None,
-        serialized_metadata_rows: None,
-    }
-}
-
 /// Build-only tests model the application admission boundary explicitly: the
 /// sealed SQL source carries a token, while the exact provider lease and scan
 /// facts stay in a request-local binding store.
@@ -171,6 +140,23 @@ pub(super) fn fixture_query_table_bindings(
                     },
                     source.kind.clone(),
                 ));
+                let lease = planning_lease.clone().ok_or_else(|| {
+                    "build fixture must acquire an exact connector lease".to_string()
+                })?;
+                let metadata = lease
+                    .binding()
+                    .metadata()
+                    .load_table(ConnectorTableRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                                .expect("fixture catalog must be valid"),
+                            namespace: Arc::from(source.table.namespace.as_str()),
+                            table: Arc::from(source.table.table.as_str()),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: crate::connector::test_request_context(),
+                    })
+                    .map_err(|error| error.to_string())?;
                 Ok(QueryTableBinding {
                     resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                         Some(&source.table.catalog),
@@ -178,13 +164,20 @@ pub(super) fn fixture_query_table_bindings(
                         resolved_planner,
                     ),
                     statistics_pin: None,
-                    planning_lease: planning_lease.clone(),
-                    scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-                        table: iceberg_table_info(),
-                        files: Vec::new(),
-                        binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                    admission:
+                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                            lease.clone(),
+                        ),
+                    scan_materialization: Some(QueryScanMaterialization {
+                        table: metadata.table,
+                        schema: metadata.schema,
+                        selector: ConnectorReadSelector::Current,
+                        statistics_pin: None,
+                        planning_lease: lease,
                     }),
-                    frozen_snapshot_files: std::collections::BTreeMap::new(),
+                    write_target_admission: None,
+                    mv_target_read: None,
+                    frozen_snapshot_materializations: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },

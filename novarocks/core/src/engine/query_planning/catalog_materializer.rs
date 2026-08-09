@@ -30,7 +30,8 @@ use novarocks_catalog::provider::CatalogProvider;
 use novarocks_catalog::table::CatalogTable;
 
 use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
+    QueryTableBindingStore,
 };
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::catalog::{
@@ -56,7 +57,7 @@ pub(crate) fn iceberg_query_binding_from_materialization(
         sql_table_name,
         binding,
         BTreeMap::new(),
-        BTreeMap::new(),
+        std::collections::BTreeSet::new(),
     )
 }
 
@@ -73,74 +74,82 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
         (i64, i64),
         crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
     >,
-    mut frozen_snapshot_files: BTreeMap<
-        i64,
-        Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>,
-    >,
+    mut frozen_snapshot_ids: std::collections::BTreeSet<i64>,
 ) -> Result<QueryTableBinding, String> {
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
     };
-    use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 
-    let version = match materialization.binding {
-        IcebergDataFileBinding::CurrentSnapshot => SqlTableVersionSelector::Current,
-        IcebergDataFileBinding::ExplicitFiles => SqlTableVersionSelector::Snapshot(
-            materialization.table.current_snapshot_id.ok_or_else(|| {
-                format!(
-                    "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
-                    materialization.table.catalog,
-                    materialization.table.namespace,
-                    materialization.table.table
-                )
-            })?,
+    let (version, kind, frozen_snapshot_id) = match materialization.read_selector {
+        novarocks_spi::connector::ConnectorReadSelector::Current => (
+            SqlTableVersionSelector::Current,
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+            None,
         ),
-    };
-    let kind = match materialization.binding {
-        IcebergDataFileBinding::CurrentSnapshot => SqlScanKind::Data { version },
-        IcebergDataFileBinding::ExplicitFiles => SqlScanKind::FrozenInputSet { version },
+        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id) => {
+            let version = SqlTableVersionSelector::Snapshot(snapshot_id);
+            (
+                version.clone(),
+                SqlScanKind::FrozenInputSet { version },
+                Some(snapshot_id),
+            )
+        }
+        novarocks_spi::connector::ConnectorReadSelector::TimestampMicros(timestamp_micros) => {
+            return Err(format!(
+                "connector read selector timestamp {timestamp_micros} must resolve to a snapshot before SQL materialization"
+            ));
+        }
     };
     let table_identity = SqlTableIdentity {
-        catalog: materialization.table.catalog.clone(),
-        namespace: materialization.table.namespace.clone(),
-        table: materialization.table.table.clone(),
+        catalog: catalog.to_string(),
+        namespace: namespace.to_string(),
+        table: sql_table_name.to_string(),
     };
     let planner = TableDef {
         name: sql_table_name.to_string(),
         columns: materialization.columns,
         iceberg_row_lineage_metadata_columns: materialization.iceberg_row_lineage_metadata_columns,
         source: ScanSource::Sql(
-            SqlScanSource::new(binding, table_identity, kind).with_ukfk_facts(
-                super::bindings::sql_ukfk_facts_from_admitted_table(&materialization.table),
-            ),
+            SqlScanSource::new(binding, table_identity, kind)
+                .with_ukfk_facts(materialization.sql_ukfk_facts.clone()),
         ),
     };
-    if matches!(
-        materialization.binding,
-        IcebergDataFileBinding::ExplicitFiles
-    ) {
-        let snapshot_id = materialization.table.current_snapshot_id.ok_or_else(|| {
-            format!(
-                "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
-                materialization.table.catalog,
-                materialization.table.namespace,
-                materialization.table.table
-            )
-        })?;
-        frozen_snapshot_files
-            .entry(snapshot_id)
-            .or_insert_with(|| materialization.files.clone());
+    if let Some(snapshot_id) = frozen_snapshot_id {
+        frozen_snapshot_ids.insert(snapshot_id);
     }
+    let frozen_snapshot_materializations = frozen_snapshot_ids
+        .into_iter()
+        .map(|snapshot_id| {
+            (
+                snapshot_id,
+                QueryScanMaterialization {
+                    table: materialization.read_table.clone(),
+                    schema: materialization.read_schema.clone(),
+                    selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
+                        snapshot_id,
+                    ),
+                    statistics_pin: materialization.statistics_pin.clone(),
+                    planning_lease: materialization.planning_lease.clone(),
+                },
+            )
+        })
+        .collect();
     Ok(QueryTableBinding {
         resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-        statistics_pin: materialization.statistics_pin,
-        planning_lease: Some(materialization.planning_lease),
-        scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-            table: materialization.table,
-            files: materialization.files,
-            binding: materialization.binding,
+        statistics_pin: materialization.statistics_pin.clone(),
+        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+        scan_materialization: Some(QueryScanMaterialization {
+            table: materialization.read_table,
+            schema: materialization.read_schema,
+            selector: materialization.read_selector,
+            statistics_pin: materialization.statistics_pin.clone(),
+            planning_lease: materialization.planning_lease.clone(),
         }),
-        frozen_snapshot_files,
+        mv_target_read: None,
+        write_target_admission: materialization.write_target_admission,
+        frozen_snapshot_materializations,
         delta_runtime_plans,
     })
 }
@@ -439,9 +448,6 @@ mod tests {
     use super::*;
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::ScanSource;
-    use novarocks_connector_iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
         SqlTableBindingId::new(
@@ -471,18 +477,6 @@ mod tests {
     }
 
     fn frozen_overlay_binding(binding: SqlTableBindingId) -> QueryTableBinding {
-        let table = IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "orders".to_string(),
-            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: "file:///tmp/orders".to_string(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        };
         let planner = TableDef {
             name: "__nr_cow_orders".to_string(),
             columns: vec![],
@@ -502,13 +496,11 @@ mod tests {
         QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some("ice"), "db", planner),
             statistics_pin: None,
-            planning_lease: None,
-            scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-                table,
-                files: vec![],
-                binding: IcebergDataFileBinding::ExplicitFiles,
-            }),
-            frozen_snapshot_files: BTreeMap::new(),
+            admission: QueryTableBindingAdmission::Local,
+            scan_materialization: None,
+            write_target_admission: None,
+            mv_target_read: None,
+            frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }
     }
@@ -617,12 +609,13 @@ mod tests {
             source.kind,
             crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
         ));
-        assert!(matches!(
+        assert!(
             bindings
                 .scan_materialization(source.binding)
-                .expect("binding materialization"),
-            Some(QueryScanMaterialization::IcebergDataFiles { .. })
-        ));
+                .expect("binding materialization")
+                .is_none(),
+            "analysis-only overlays do not manufacture a provider read handle"
+        );
         assert!(
             service
                 .local()

@@ -30,9 +30,9 @@ use crate::runtime::query_result::QueryResult;
 /// Shared StarRocks SQL parser contract for view DDL, storage, and rewrite.
 pub use crate::sql::parser::dialect::StarRocksDialect as ViewSqlDialect;
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRequestContext,
-    ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity, CreateOrReplacePolicy,
-    DropPolicy,
+    ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
+    ConnectorViewRequest, CreateOrReplacePolicy, DropPolicy,
 };
 
 #[derive(Clone, Copy)]
@@ -84,6 +84,13 @@ pub struct ResolvedExternalView {
     pub properties: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExternalViewResolution {
+    Table,
+    View(ResolvedExternalView),
+    Missing,
+}
+
 pub trait ViewService: Send + Sync {
     fn try_handle_statement(
         &self,
@@ -103,18 +110,14 @@ pub trait ViewService: Send + Sync {
 }
 
 pub trait ViewEngine: Send + Sync {
-    fn validate_iceberg_catalog(&self, catalog: &str) -> Result<(), String>;
-    fn is_rest_iceberg_catalog(&self, catalog: &str) -> bool;
-    fn table_exists(
+    /// Resolve a table-or-view name through exactly one connector control
+    /// generation.  Missing view metadata is not equivalent to an undeclared
+    /// view capability; the latter remains a typed Unsupported error.
+    fn resolve_external_view(
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
-    ) -> Result<bool, String>;
-    fn view_exists(
-        &self,
-        target: &ViewTarget,
-        context: &ConnectorRequestContext,
-    ) -> Result<bool, String>;
+    ) -> Result<ExternalViewResolution, String>;
     fn create_external_view(
         &self,
         request: CreateExternalViewRequest,
@@ -129,8 +132,14 @@ pub trait ViewEngine: Send + Sync {
     fn load_external_view(
         &self,
         target: &ViewTarget,
+        context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String>;
-    fn list_external_views(&self, catalog: &str, database: &str) -> Result<Vec<String>, String>;
+    fn list_external_views(
+        &self,
+        catalog: &str,
+        database: &str,
+        context: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, String>;
     fn analyze_external_view(
         &self,
         catalog: &str,
@@ -178,50 +187,46 @@ impl ViewService for EmptyViewService {
 }
 
 impl ViewEngine for StandaloneState {
-    fn validate_iceberg_catalog(&self, catalog: &str) -> Result<(), String> {
-        self.iceberg_catalogs
-            .read()
-            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
-            .get(catalog)
-            .map(|_| ())
-    }
-
-    fn is_rest_iceberg_catalog(&self, catalog: &str) -> bool {
-        self.iceberg_catalogs
-            .read()
-            .expect("iceberg catalog registry read lock")
-            .get(catalog)
-            .is_ok_and(|entry| entry.rest_uri.is_some())
-    }
-
-    fn table_exists(
+    fn resolve_external_view(
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
-    ) -> Result<bool, String> {
-        crate::connector::metadata_table_exists(
+    ) -> Result<ExternalViewResolution, String> {
+        let lease = crate::connector::acquire_metadata_planning_lease(
             self.connector_control.as_ref(),
-            context.clone(),
             &target.catalog,
+        )?;
+        if crate::connector::metadata_table_exists_with_planning_lease(
+            lease.clone(),
+            context.clone(),
             &target.database,
             &target.view,
-        )
-    }
-
-    fn view_exists(
-        &self,
-        target: &ViewTarget,
-        _context: &ConnectorRequestContext,
-    ) -> Result<bool, String> {
-        let registry = self
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
-        crate::connector::iceberg::catalog::views::view_exists(
-            &registry.get(&target.catalog)?,
-            &target.database,
-            &target.view,
-        )
+        )? {
+            return Ok(ExternalViewResolution::Table);
+        }
+        let binding = lease.binding();
+        let Some(capability) = binding.view_metadata() else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation does not declare view metadata",
+            )
+            .to_string());
+        };
+        let instance_id = binding.descriptor().instance_id.clone();
+        match capability.load_view(ConnectorViewRequest {
+            view: ConnectorViewIdentity {
+                instance_id,
+                namespace: Arc::from(target.database.as_str()),
+                view: Arc::from(target.view.as_str()),
+            },
+            context: context.clone(),
+        }) {
+            Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(view))),
+            Err(error) if error.kind() == ConnectorErrorKind::NotFound => {
+                Ok(ExternalViewResolution::Missing)
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     fn create_external_view(
@@ -305,36 +310,72 @@ impl ViewEngine for StandaloneState {
     fn load_external_view(
         &self,
         target: &ViewTarget,
+        context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String> {
-        let registry = self
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
-        let result = crate::connector::iceberg::catalog::views::load_view(
-            &registry.get(&target.catalog)?,
-            &target.database,
-            &target.view,
-        );
-        match result {
-            Ok(view) => Ok(Some(ResolvedExternalView {
-                sql: view.sql,
-                dialect: view.dialect,
-                default_database: view.default_namespace,
-                column_names: view.column_names,
-                comment: view.comment,
-                properties: view.properties,
-            })),
-            Err(error) if error.contains("unknown view") => Ok(None),
-            Err(error) => Err(error),
+        let lease = crate::connector::acquire_metadata_planning_lease(
+            self.connector_control.as_ref(),
+            &target.catalog,
+        )?;
+        let binding = lease.binding();
+        let Some(capability) = binding.view_metadata() else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation does not declare view metadata",
+            )
+            .to_string());
+        };
+        let instance_id = binding.descriptor().instance_id.clone();
+        match capability.load_view(ConnectorViewRequest {
+            view: ConnectorViewIdentity {
+                instance_id,
+                namespace: Arc::from(target.database.as_str()),
+                view: Arc::from(target.view.as_str()),
+            },
+            context: context.clone(),
+        }) {
+            Ok(view) => Ok(Some(resolved_external_view(view))),
+            Err(error) if error.kind() == ConnectorErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
         }
     }
 
-    fn list_external_views(&self, catalog: &str, database: &str) -> Result<Vec<String>, String> {
-        let registry = self
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
-        crate::connector::iceberg::catalog::views::list_views(&registry.get(catalog)?, database)
+    fn list_external_views(
+        &self,
+        catalog: &str,
+        database: &str,
+        context: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, String> {
+        let lease = crate::connector::acquire_metadata_planning_lease(
+            self.connector_control.as_ref(),
+            catalog,
+        )?;
+        let binding = lease.binding();
+        let Some(capability) = binding.view_metadata() else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation does not declare view metadata",
+            )
+            .to_string());
+        };
+        let instance_id = binding.descriptor().instance_id.clone();
+        capability
+            .list_views(novarocks_spi::connector::ConnectorListViewsRequest {
+                namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                    instance_id,
+                    namespace: Arc::from(database),
+                },
+                context: context.clone(),
+            })
+            .map(|views| {
+                let mut names = views
+                    .into_iter()
+                    .map(|view| view.view.to_string())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names.dedup();
+                names
+            })
+            .map_err(|error| error.to_string())
     }
 
     fn analyze_external_view(
@@ -379,6 +420,29 @@ impl ViewEngine for StandaloneState {
             return Err("CREATE VIEW: SELECT produced no output columns".to_string());
         }
         Ok(columns)
+    }
+}
+
+fn resolved_external_view(
+    view: novarocks_spi::connector::ConnectorViewMetadataValue,
+) -> ResolvedExternalView {
+    ResolvedExternalView {
+        sql: view.definition.sql.to_string(),
+        dialect: match view.definition.dialect {
+            ConnectorViewDialect::StarRocks => "starrocks".to_string(),
+        },
+        default_database: view.default_namespace.to_string(),
+        column_names: view
+            .column_names
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect(),
+        comment: view.comment.map(|comment| comment.to_string()),
+        properties: view
+            .properties
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
     }
 }
 
@@ -457,27 +521,11 @@ mod tests {
     struct FakeViewEngine;
 
     impl ViewEngine for FakeViewEngine {
-        fn validate_iceberg_catalog(&self, _catalog: &str) -> Result<(), String> {
-            unreachable!("empty view service must not access the engine")
-        }
-
-        fn is_rest_iceberg_catalog(&self, _catalog: &str) -> bool {
-            unreachable!("empty view service must not access the engine")
-        }
-
-        fn table_exists(
+        fn resolve_external_view(
             &self,
             _target: &ViewTarget,
             _context: &ConnectorRequestContext,
-        ) -> Result<bool, String> {
-            unreachable!("empty view service must not access the engine")
-        }
-
-        fn view_exists(
-            &self,
-            _target: &ViewTarget,
-            _context: &ConnectorRequestContext,
-        ) -> Result<bool, String> {
+        ) -> Result<ExternalViewResolution, String> {
             unreachable!("empty view service must not access the engine")
         }
 
@@ -501,6 +549,7 @@ mod tests {
         fn load_external_view(
             &self,
             _target: &ViewTarget,
+            _context: &ConnectorRequestContext,
         ) -> Result<Option<ResolvedExternalView>, String> {
             unreachable!("empty view service must not access the engine")
         }
@@ -509,6 +558,7 @@ mod tests {
             &self,
             _catalog: &str,
             _database: &str,
+            _context: &ConnectorRequestContext,
         ) -> Result<Vec<String>, String> {
             unreachable!("empty view service must not access the engine")
         }

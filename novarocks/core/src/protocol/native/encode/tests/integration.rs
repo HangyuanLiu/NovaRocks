@@ -222,7 +222,7 @@ fn prepared_connector_scan_bindings(
                     max_rows: NonZeroUsize::new(1024).expect("nonzero row budget"),
                     max_bytes: NonZeroUsize::new(1024).expect("nonzero byte budget"),
                 },
-                planning_lease: None,
+                planning_lease: crate::connector::iceberg::provider::fixture_planning_lease("ice"),
                 read_session: None,
             },
         )

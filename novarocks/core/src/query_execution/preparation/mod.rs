@@ -22,7 +22,7 @@ mod projection;
 pub(crate) mod runtime_filter_binding;
 pub(crate) mod runtime_filter_view;
 pub(crate) mod scan;
-mod scan_preparation;
+pub(crate) mod scan_preparation;
 mod topology;
 
 use std::collections::{BTreeMap, BTreeSet};

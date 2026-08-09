@@ -18,9 +18,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
-use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, TableMetadata, Type};
-
+use arrow::datatypes::DataType;
 use novarocks_spi::connector::{
     ConnectorControlResolver, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState,
     StatisticsMetricValue, StatisticsProvenance,
@@ -30,8 +28,8 @@ use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
 use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingStore,
-    parse_time_travel_overlay_identity,
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
+    QueryTableBindingStore, parse_time_travel_overlay_identity,
 };
 use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
@@ -44,8 +42,7 @@ use crate::sql::optimizer::stats_input::{
     StatsSource,
 };
 use crate::sql::planner::table::{
-    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
-    SqlTableVersionSelector,
+    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
 };
 
 #[derive(Clone, Default)]
@@ -129,9 +126,10 @@ fn project_binding_statistics(
             ),
         ));
     };
-    let Some(planning_lease) = binding.planning_lease.as_ref() else {
-        return Err(SqlStatisticsFatalError::BindingMissing);
-    };
+    let planning_lease = binding
+        .admission
+        .exact_planning_lease()
+        .map_err(|_| SqlStatisticsFatalError::BindingMissing)?;
     let control_binding = planning_lease.binding();
     if control_binding.descriptor().instance_id != *pin.table.owner() {
         return Err(SqlStatisticsFatalError::OwnerMismatch);
@@ -282,29 +280,6 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
         binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
-        let iceberg_metadata_table_type = match metadata_table_type {
-            crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
-                crate::connector::iceberg::IcebergMetadataTableType::Snapshots
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::History => {
-                crate::connector::iceberg::IcebergMetadataTableType::History
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Refs => {
-                crate::connector::iceberg::IcebergMetadataTableType::Refs
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Files => {
-                crate::connector::iceberg::IcebergMetadataTableType::Files
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
-                crate::connector::iceberg::IcebergMetadataTableType::Manifests
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
-                crate::connector::iceberg::IcebergMetadataTableType::Partitions
-            }
-            crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
-                crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
-            }
-        };
         let materialization =
             crate::connector::iceberg::provider::load_metadata_materialization_with_lease(
                 self.controls,
@@ -312,30 +287,11 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 catalog,
                 namespace,
                 table,
-                iceberg_metadata_table_type,
+                metadata_table_type,
             )?;
-        let table_info = materialization.table;
-        let files = materialization.files;
-        let columns = metadata_columns_for_table(metadata_table_type, &table_info)?;
-        let columns = columns
-            .into_iter()
-            .map(|column| novarocks_catalog::schema::ColumnDef {
-                name: column.name,
-                data_type: column.data_type,
-                nullable: column.nullable,
-                write_default: None,
-                logical_type: None,
-            })
-            .collect::<Vec<_>>();
-        let serialized_table = table_info.serialized_metadata.clone().ok_or_else(|| {
-            format!(
-                "iceberg metadata table {catalog}.{namespace}.{table} has no serialized metadata"
-            )
-        })?;
-        let metadata_payload = metadata_payload(metadata_table_type, &table_info, &files)?;
         let planner = crate::sql::planner::table::TableDef {
             name: materialization.table_name,
-            columns,
+            columns: materialization.columns,
             iceberg_row_lineage_metadata_columns: materialization
                 .iceberg_row_lineage_metadata_columns,
             source: ScanSource::Sql(SqlScanSource::new(
@@ -353,237 +309,21 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         };
         Ok(QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-            statistics_pin: materialization.statistics_pin,
-            planning_lease: Some(materialization.planning_lease),
-            scan_materialization: Some(QueryScanMaterialization::IcebergMetadata {
-                table: table_info,
-                metadata_table_type,
-                serialized_table,
-                metadata_payload,
+            statistics_pin: materialization.statistics_pin.clone(),
+            admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+            scan_materialization: Some(QueryScanMaterialization {
+                table: materialization.read_table,
+                schema: materialization.read_schema,
+                selector: materialization.read_selector,
+                statistics_pin: materialization.statistics_pin,
+                planning_lease: materialization.planning_lease,
             }),
-            frozen_snapshot_files: std::collections::BTreeMap::new(),
+            mv_target_read: None,
+            write_target_admission: None,
+            frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
     }
-}
-
-fn metadata_payload(
-    kind: SqlMetadataTableKind,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    files: &[novarocks_connector_iceberg::scan_model::IcebergDataFileInfo],
-) -> Result<Option<String>, String> {
-    match kind {
-        SqlMetadataTableKind::Partitions => {
-            let mut groups = std::collections::BTreeMap::<
-                (i32, String),
-                (
-                    i64,
-                    i64,
-                    i64,
-                    std::collections::BTreeSet<String>,
-                    std::collections::BTreeSet<String>,
-                ),
-            >::new();
-            for file in files {
-                let spec_id = file.partition_spec_id.ok_or_else(|| {
-                    format!(
-                        "iceberg partitions metadata requires partition spec id for data file {}",
-                        file.path
-                    )
-                })?;
-                let rows = file.row_count.ok_or_else(|| {
-                    format!(
-                        "iceberg partitions metadata requires record_count for data file {}",
-                        file.path
-                    )
-                })?;
-                let entry = groups
-                    .entry((
-                        spec_id,
-                        file.partition_key
-                            .clone()
-                            .unwrap_or_else(|| "Struct([])".to_string()),
-                    ))
-                    .or_default();
-                entry.0 = entry.0.checked_add(rows).ok_or_else(|| {
-                    "iceberg partitions metadata record_count overflow".to_string()
-                })?;
-                entry.1 = entry
-                    .1
-                    .checked_add(1)
-                    .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
-                entry.2 = entry.2.checked_add(file.size).ok_or_else(|| {
-                    "iceberg partitions metadata total_data_file_size_in_bytes overflow".to_string()
-                })?;
-                for delete in &file.delete_files {
-                    match delete.file_content {
-                        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position => {
-                            entry.3.insert(delete.path.clone());
-                        }
-                        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality => {
-                            entry.4.insert(delete.path.clone());
-                        }
-                    }
-                }
-            }
-            let rows = groups.into_iter().map(|((spec_id, partition), (record_count, file_count, total_data_file_size_in_bytes, position_delete_files, equality_delete_files))| {
-                Ok(serde_json::json!({
-                    "spec_id": spec_id,
-                    "partition": partition,
-                    "record_count": record_count,
-                    "file_count": file_count,
-                    "total_data_file_size_in_bytes": total_data_file_size_in_bytes,
-                    "position_delete_file_count": i64::try_from(position_delete_files.len()).map_err(|_| "iceberg partitions metadata position_delete_file_count overflow".to_string())?,
-                    "equality_delete_file_count": i64::try_from(equality_delete_files.len()).map_err(|_| "iceberg partitions metadata equality_delete_file_count overflow".to_string())?,
-                }))
-            }).collect::<Result<Vec<_>, String>>()?;
-            serde_json::to_string(&serde_json::json!({ "version": 1, "rows": rows }))
-                .map(Some)
-                .map_err(|error| {
-                    format!("serialize iceberg partitions metadata payload failed: {error}")
-                })
-        }
-        SqlMetadataTableKind::Files
-        | SqlMetadataTableKind::Manifests
-        | SqlMetadataTableKind::LogicalIcebergMetadata => table
-            .serialized_metadata_rows
-            .clone()
-            .map(Some)
-            .ok_or_else(|| {
-                "iceberg metadata rows were not resolved at catalog lookup time".to_string()
-            }),
-        SqlMetadataTableKind::Snapshots
-        | SqlMetadataTableKind::History
-        | SqlMetadataTableKind::Refs => Ok(None),
-    }
-}
-
-fn metadata_columns_for_table(
-    kind: SqlMetadataTableKind,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> Result<Vec<crate::sql::analyzer::iceberg_metadata::MetadataColumn>, String> {
-    let mut columns = crate::sql::analyzer::iceberg_metadata::metadata_table_schema(kind);
-    if matches!(
-        kind,
-        SqlMetadataTableKind::Files | SqlMetadataTableKind::LogicalIcebergMetadata
-    ) {
-        let partition = partition_struct_type(table)?;
-        let column = columns
-            .iter_mut()
-            .find(|column| column.name.eq_ignore_ascii_case("partition"))
-            .ok_or_else(|| "Iceberg metadata schema is missing partition column".to_string())?;
-        column.data_type = partition;
-    }
-    Ok(columns)
-}
-
-fn iceberg_type_to_arrow_type(ty: &Type) -> Result<DataType, String> {
-    match ty {
-        Type::Primitive(primitive) => Ok(match primitive {
-            PrimitiveType::Boolean => DataType::Boolean,
-            PrimitiveType::Int => DataType::Int32,
-            PrimitiveType::Long => DataType::Int64,
-            PrimitiveType::Float => DataType::Float32,
-            PrimitiveType::Double => DataType::Float64,
-            PrimitiveType::Decimal { precision, scale } => DataType::Decimal128(
-                u8::try_from(*precision)
-                    .map_err(|_| format!("iceberg decimal precision out of range: {precision}"))?,
-                i8::try_from(*scale)
-                    .map_err(|_| format!("iceberg decimal scale out of range: {scale}"))?,
-            ),
-            PrimitiveType::Date => DataType::Date32,
-            PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
-            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
-                DataType::Timestamp(TimeUnit::Microsecond, None)
-            }
-            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
-                DataType::Timestamp(TimeUnit::Nanosecond, None)
-            }
-            PrimitiveType::String | PrimitiveType::Uuid => DataType::Utf8,
-            PrimitiveType::Fixed(width) => DataType::FixedSizeBinary(
-                i32::try_from(*width)
-                    .map_err(|_| format!("iceberg fixed width out of range: {width}"))?,
-            ),
-            PrimitiveType::Binary | PrimitiveType::Variant => DataType::Binary,
-        }),
-        other => Err(format!(
-            "iceberg metadata partition field must be primitive, got {other:?}"
-        )),
-    }
-}
-
-fn partition_source_type<'a>(metadata: &'a TableMetadata, source_id: i32) -> Option<&'a Type> {
-    metadata
-        .current_schema()
-        .field_by_id(source_id)
-        .map(|field| field.field_type.as_ref())
-        .or_else(|| {
-            metadata.schemas_iter().find_map(|schema| {
-                schema
-                    .field_by_id(source_id)
-                    .map(|field| field.field_type.as_ref())
-            })
-        })
-}
-
-fn partition_struct_type(
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> Result<DataType, String> {
-    let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
-        format!(
-            "iceberg metadata table {}.{} requires serialized metadata to type partition struct",
-            table.namespace, table.table
-        )
-    })?;
-    let metadata: TableMetadata = serde_json::from_str(serialized).map_err(|error| {
-        format!("parse iceberg table metadata for partition schema failed: {error}")
-    })?;
-    let mut specs = metadata.partition_specs_iter().cloned().collect::<Vec<_>>();
-    specs.sort_by_key(|spec| spec.spec_id());
-
-    let mut fields: Vec<Arc<Field>> = Vec::new();
-    for spec in specs {
-        for partition_field in spec.fields() {
-            let source_type = partition_source_type(&metadata, partition_field.source_id)
-                .ok_or_else(|| {
-                    format!(
-                        "iceberg partition field {} references missing source field id {}",
-                        partition_field.name, partition_field.source_id
-                    )
-                })?;
-            let result_type =
-                partition_field
-                    .transform
-                    .result_type(source_type)
-                    .map_err(|error| {
-                        format!(
-                            "infer iceberg partition field {} type: {error}",
-                            partition_field.name
-                        )
-                    })?;
-            let arrow_type = iceberg_type_to_arrow_type(&result_type)?;
-            if let Some(existing) = fields
-                .iter()
-                .find(|field| field.name().eq_ignore_ascii_case(&partition_field.name))
-            {
-                if existing.data_type() != &arrow_type {
-                    return Err(format!(
-                        "iceberg partition field {} has incompatible types across specs: {:?} vs {:?}",
-                        partition_field.name,
-                        existing.data_type(),
-                        arrow_type
-                    ));
-                }
-                continue;
-            }
-            fields.push(Arc::new(Field::new(
-                partition_field.name.clone(),
-                arrow_type,
-                true,
-            )));
-        }
-    }
-    Ok(DataType::Struct(Fields::from(fields)))
 }
 
 pub(crate) type QueryStatsPlan = crate::sql::compiler::SqlStatisticsPlan;
@@ -766,21 +506,28 @@ fn evidence_to_base_statistics(
             name.clone(),
             BaseColumnStatistics {
                 nulls_fraction,
-                average_row_size: metric_f64(evidence.metrics.get(
-                    &StatisticsMetric::AverageSize {
+                average_row_size: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::AverageSize {
                         column: Arc::clone(&key),
-                    },
-                ))
+                    }),
+                    None,
+                )
                 .map(|value| StatValue::known(value, Confidence::Exact, source))
                 .unwrap_or_else(|| StatValue::missing(missing())),
-                min_value: metric_f64(evidence.metrics.get(&StatisticsMetric::Minimum {
-                    column: Arc::clone(&key),
-                }))
+                min_value: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::Minimum {
+                        column: Arc::clone(&key),
+                    }),
+                    Some(&column.data_type),
+                )
                 .map(|value| StatValue::known(value, Confidence::Exact, source))
                 .unwrap_or_else(|| StatValue::missing(missing())),
-                max_value: metric_f64(evidence.metrics.get(&StatisticsMetric::Maximum {
-                    column: Arc::clone(&key),
-                }))
+                max_value: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::Maximum {
+                        column: Arc::clone(&key),
+                    }),
+                    Some(&column.data_type),
+                )
                 .map(|value| StatValue::known(value, Confidence::Exact, source))
                 .unwrap_or_else(|| StatValue::missing(missing())),
                 // Theta is a mergeable approximate sketch. It is useful to
@@ -816,11 +563,22 @@ fn metric_u64(state: Option<&StatisticsMetricState>) -> Option<u64> {
     }
 }
 
-fn metric_f64(state: Option<&StatisticsMetricState>) -> Option<f64> {
+fn metric_f64(state: Option<&StatisticsMetricState>, data_type: Option<&DataType>) -> Option<f64> {
     let value = match state {
         Some(StatisticsMetricState::Available(StatisticsMetricValue::U64(value))) => *value as f64,
         Some(StatisticsMetricState::Available(StatisticsMetricValue::I64(value))) => *value as f64,
         Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) => *value,
+        // The provider artifact keeps LARGEINT bounds as exact i128 bytes.
+        // Optimizer cardinality estimation is currently f64-only, so make the
+        // approximation explicit at this terminal heuristic boundary rather
+        // than losing information in collection or persistence.
+        Some(StatisticsMetricState::Available(StatisticsMetricValue::Bytes(value)))
+            if matches!(data_type, Some(DataType::FixedSizeBinary(width)) if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+                && value.len()
+                    == usize::try_from(novarocks_types::largeint::LARGEINT_BYTE_WIDTH).ok()? =>
+        {
+            novarocks_types::largeint::i128_from_be_bytes(value).ok()? as f64
+        }
         _ => return None,
     };
     value.is_finite().then_some(value)
@@ -857,6 +615,20 @@ mod unified_tests {
             write_default: None,
             logical_type: None,
         }
+    }
+
+    #[test]
+    fn spi5b_largeint_artifact_bound_is_projected_only_for_optimizer_estimation() {
+        let state = StatisticsMetricState::Available(StatisticsMetricValue::Bytes(
+            Bytes::copy_from_slice(&i128::MIN.to_be_bytes()),
+        ));
+        let data_type = DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH);
+
+        assert_eq!(
+            metric_f64(Some(&state), Some(&data_type)),
+            Some(i128::MIN as f64)
+        );
+        assert_eq!(metric_f64(Some(&state), Some(&DataType::Binary)), None);
     }
 
     fn evidence(coverage: StatisticsCoverage, accuracy: StatisticsAccuracy) -> StatisticsEvidence {

@@ -23,6 +23,7 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicate,
 };
 
+use crate::engine::query_planning::bindings::QueryScanMaterialization;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::TypedExpr;
@@ -30,9 +31,6 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
-};
 
 pub(crate) use super::iceberg_delta::IcebergDeltaScanRuntimePlan;
 
@@ -60,26 +58,10 @@ pub(crate) trait ScanBindingResolver: Send + Sync {
 #[derive(Clone, Debug)]
 pub(crate) enum ResolvedScanExecution {
     ConnectorRead,
-    IcebergFiles(ResolvedIcebergFileScan),
-    IcebergMetadata(ResolvedIcebergMetadataScan),
+    /// A query-local opaque read admission.  Core may inspect only its SPI
+    /// schema and selector while preparation asks the exact lease to plan it.
+    AdmittedConnectorRead(QueryScanMaterialization),
     IcebergDelta(ResolvedIcebergDeltaScan),
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedIcebergFileScan {
-    pub table: IcebergTableInfo,
-    pub files: Vec<IcebergDataFileInfo>,
-    pub binding: IcebergDataFileBinding,
-}
-
-/// FE-local recovery of one metadata-table materialization.  This remains
-/// outside SQL artifacts and is encoded only at the native application edge.
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedIcebergMetadataScan {
-    pub table: IcebergTableInfo,
-    pub metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
-    pub serialized_table: String,
-    pub metadata_payload: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,7 +91,7 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) batch: ConnectorBatchBudget,
     /// Keeps the exact FE control generation alive through the BE ensure
     /// barrier. It is never encoded into a fragment carrier.
-    pub(crate) planning_lease: Option<ConnectorControlPlanningLease>,
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
     /// FE-local remote read ownership. This never enters a native carrier.
     pub(crate) read_session: Option<novarocks_spi::connector::ConnectorReadSessionLease>,
 }

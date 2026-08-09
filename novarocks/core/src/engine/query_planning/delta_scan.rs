@@ -312,9 +312,11 @@ mod tests {
                 },
             ),
             statistics_pin: None,
-            planning_lease: None,
+            admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local,
             scan_materialization: None,
-            frozen_snapshot_files: BTreeMap::new(),
+            write_target_admission: None,
+            mv_target_read: None,
+            frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::from([((10, 20), delta_plan())]),
         }
     }

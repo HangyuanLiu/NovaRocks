@@ -540,9 +540,12 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
         let (table, data_version) = Self::table_and_version(request)?;
         let metrics = Self::metrics(request)?;
         let context = Self::collection_context()?;
-        let lease = state
+        let planning_lease = state
             .connector_control
-            .acquire_current_statistics(table.owner())
+            .acquire_current(table.owner())
+            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        let lease = planning_lease
+            .derive_statistics_lease()
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
         let plan = lease
             .prepare_collection(StatisticsCollectionRequest {
@@ -585,7 +588,7 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
             &execution,
             context.clone(),
             program,
-            Some(&lease),
+            planning_lease,
         )
         .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
         let result = state

@@ -8,6 +8,7 @@
 //! MVX-2W exercises it through the native fixture; MVX-2 will make the route
 //! switch only after that fixture proves the data plane.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
 use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
@@ -19,11 +20,11 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::iceberg::commit::CommitOpKind;
+use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use crate::connector::iceberg::write_control::IcebergFirstRefreshWritePlanPayloadV2;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_for_admitted_target,
+    admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::engine::{
     StandaloneState, execute_query_as_iceberg_staging_in_operation_with_connector_context,
@@ -133,6 +134,7 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
         execution,
         move |operation_id, observed_binding| {
             prepare_mv_first_refresh_sql_write(
+                state,
                 ctx,
                 shape,
                 physical_sql,
@@ -375,6 +377,7 @@ pub(crate) fn build_mv_first_refresh_sink_spec(
 /// lease, writer service, fragment or backend work.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_mv_first_refresh_sql_write(
+    state: &Arc<StandaloneState>,
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
     shape: MvFirstRefreshShape,
     physical_sql: MvFirstRefreshPhysicalSql,
@@ -388,8 +391,14 @@ pub(crate) fn prepare_mv_first_refresh_sql_write(
     ) {
         return Err("join first-refresh must use the typed append logical artifact".to_string());
     }
-    let request =
-        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
+    let request = mv_first_refresh_request(
+        state,
+        ctx,
+        shape,
+        staging_branch,
+        operation_id,
+        observed_binding,
+    )?;
     MvFirstRefreshWritePreparer::prepare(request, physical_sql)
 }
 
@@ -411,8 +420,14 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
     ) {
         return Err("typed first-refresh append artifact requires a join shape".to_string());
     }
-    let request =
-        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
+    let request = mv_first_refresh_request(
+        state,
+        ctx,
+        shape,
+        staging_branch,
+        operation_id,
+        observed_binding,
+    )?;
     MvFirstRefreshWritePreparer::prepare_join_logical(
         request,
         frozen_logical_context_with_base_overlays(state, ctx)?,
@@ -454,6 +469,7 @@ pub(crate) fn frozen_logical_context_with_base_overlays(
 
 #[allow(clippy::too_many_arguments)]
 fn mv_first_refresh_request(
+    state: &Arc<StandaloneState>,
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
     shape: MvFirstRefreshShape,
     staging_branch: &str,
@@ -469,6 +485,18 @@ fn mv_first_refresh_request(
         namespace: ctx.rewrite.target.namespace.clone(),
         table: ctx.rewrite.target.table.clone(),
     };
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive MV first-refresh request write lease: {error}"))?;
+    if write_lease.binding_key() != &observed_binding {
+        return Err(
+            "MV first-refresh target connector generation changed during admission".to_string(),
+        );
+    }
     let runtime = ctx.target_bindings.runtime();
     let persisted_partition_spec_id = ctx
         .rewrite
@@ -522,8 +550,11 @@ fn mv_first_refresh_request(
         persisted_partition_spec_id,
         hidden_hash_key,
     )?;
-    let table =
-        crate::engine::iceberg_writer::iceberg_connector_table_handle(&target, staging_branch)?;
+    let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+        &write_lease,
+        &target,
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?,
+    )?;
     MvFirstRefreshWriteRequest::try_new(
         ctx.rewrite.canonical_select_query.to_string(),
         shape,
@@ -809,7 +840,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 crate::engine::mv::iceberg_refresh::bind_imv_target_query_table_in_store(
                     &refresh_context,
                     &bindings,
-                    Some(planning_lease),
+                    planning_lease,
                 )?;
             let write_target_binding = admit_frozen_iceberg_write_target(
                 bindings.as_ref(),

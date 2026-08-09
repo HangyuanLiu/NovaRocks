@@ -16,10 +16,12 @@
 // under the License.
 
 use novarocks_spi::connector::{
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticPredicate,
-    normalize_predicate_dispositions,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorReadPurpose, ConnectorSplitPlanningRequest,
+    ConnectorStaticPredicate, normalize_predicate_dispositions,
 };
 
+use crate::engine::query_planning::bindings::QueryScanMaterialization;
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
 use crate::sql::analysis::TypedExpr;
 use crate::sql::planner::payload::PlanScanNode;
@@ -27,120 +29,141 @@ use crate::sql::planner::table::ScanSource;
 
 use super::projection::effective_scan_column_names;
 
-pub(crate) fn build_iceberg_metadata_scan_range_params()
--> crate::runtime::scan_range::ScanRangeParams {
-    use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRangeParams};
-
-    ScanRangeParams::file(FileScanRange {
-        file_format: FileFormat::Parquet,
-        full_path: Some("iceberg-metadata".to_string()),
-        relative_path: None,
-        table_id: None,
-        offset: 0,
-        length: 0,
-        file_length: 0,
-        delete_files: Vec::new(),
-        deletion_vector_descriptor: None,
-        first_row_id: None,
-        data_sequence_number: None,
-        modification_time: None,
-        datacache_options: None,
-        candidate_node: None,
-        included_positions: Vec::new(),
-        serialized_split: Some(String::new()),
-        use_iceberg_jni_metadata_reader: true,
-        ivm_change_op: None,
-        file_pruning_min_max_values: None,
-    })
-}
-
-/// Plans executable opaque splits through the real Iceberg connector instance.
-/// Native scheduling owns only the resulting SPI identities and byte-size
-/// hints; it must not lower these splits back into `FileScanRange`.
-pub(super) fn plan_iceberg_connector_read(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    exact_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+/// Plan an admitted connector read without decoding or reconstructing a
+/// provider handle.  Projection ordinals are derived exclusively from the
+/// schema frozen by `ConnectorMetadata::load_table`; a missing or ambiguous
+/// column is a preparation error rather than an opportunity for Core to map
+/// provider field identities.
+pub(super) fn plan_connector_read(
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
-    execution: &ResolvedScanExecution,
+    materialization: &QueryScanMaterialization,
     static_predicates: Vec<ConnectorStaticPredicate>,
     target_parallelism: std::num::NonZeroUsize,
     max_split_bytes: Option<std::num::NonZeroU64>,
 ) -> Result<PlannedConnectorRead, String> {
-    let ResolvedScanExecution::IcebergFiles(files) = execution else {
-        return Err("Iceberg connector planning requires IcebergFiles execution".to_string());
+    let QueryScanMaterialization {
+        table,
+        schema,
+        selector,
+        planning_lease,
+        ..
+    } = materialization
+    else {
+        return Err(
+            "generic connector planning requires a connector-read materialization".to_string(),
+        );
     };
-    let requested_projection = effective_scan_column_names(scan)
+    let projection_names = effective_scan_column_names(scan);
+    let mut projection = Vec::with_capacity(projection_names.len());
+    for name in projection_names {
+        let mut matching = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name().eq_ignore_ascii_case(&name));
+        let Some((ordinal, _)) = matching.next() else {
+            return Err(format!(
+                "connector read schema is missing projected column '{name}'"
+            ));
+        };
+        if matching.next().is_some() {
+            return Err(format!(
+                "connector read schema has ambiguous projected column '{name}'"
+            ));
+        }
+        projection.push(ordinal);
+    }
+    let binding = planning_lease.binding();
+    if table.owner() != &binding.descriptor().instance_id {
+        return Err(
+            "connector read table handle owner does not match its planning lease".to_string(),
+        );
+    }
+    let declaration = binding
+        .execution_declaration(&context)
+        .map_err(|error| error.to_string())?;
+    let batch = ConnectorBatchBudget {
+        max_rows: std::num::NonZeroUsize::new(4096).expect("batch rows are nonzero"),
+        max_bytes: std::num::NonZeroUsize::new(
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        )
+        .expect("batch bytes are nonzero"),
+    };
+    let connector_scan = binding
+        .planning()
+        .begin_scan(
+            table,
+            ConnectorBeginScanRequest {
+                projection: projection.clone(),
+                static_predicates: static_predicates.clone(),
+                selector: *selector,
+                purpose: connector_read_purpose(scan),
+                limit: None,
+                batch,
+                context: context.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let expected_fields = projection
         .iter()
-        .filter_map(|name| {
-            files
-                .table
-                .schema
-                .fields
-                .iter()
-                .position(|field| field.name.eq_ignore_ascii_case(name))
-        })
+        .map(|ordinal| schema.fields()[*ordinal].clone())
         .collect::<Vec<_>>();
-    // The connector treats an empty projection as all provider fields.  Make
-    // that implicit choice explicit before sealing the read so every output
-    // field has a stable ordinal for scan-domain evaluation.
-    let projection = if requested_projection.is_empty() {
-        (0..files.table.schema.fields.len()).collect()
-    } else {
-        requested_projection
-    };
-    let planned = match exact_lease {
-        Some(lease) => crate::connector::iceberg::provider::plan_native_iceberg_read_with_lease(
-            lease,
-            context,
-            &files.table,
-            files.binding,
-            &files.files,
-            &projection,
-            static_predicates.clone(),
-            target_parallelism,
-            max_split_bytes,
-        )?,
-        // Callers that construct plans outside SQL compilation (test-only
-        // native encoding fixtures and legacy internal statistics plans) do
-        // not own a query catalog binding. Production SQL preparation passes
-        // an exact lease above and never reaches this fallback.
-        None => crate::connector::iceberg::provider::plan_native_iceberg_read(
-            controls,
-            context,
-            &files.table,
-            files.binding,
-            &files.files,
-            &projection,
-            static_predicates.clone(),
-            target_parallelism,
-            max_split_bytes,
-        )?,
-    };
-    let predicate_dispositions =
-        normalize_predicate_dispositions(&static_predicates, &planned.scan.predicate_dispositions)
-            .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
+    if connector_scan.output_schema.fields().as_ref() != expected_fields.as_slice() {
+        return Err(
+            "connector read returned a schema that does not match the admitted projection"
+                .to_string(),
+        );
+    }
+    let predicate_dispositions = normalize_predicate_dispositions(
+        &static_predicates,
+        &connector_scan.predicate_dispositions,
+    )
+    .map_err(|error| format!("connector static predicate response: {error}"))?;
     let residual_predicates = residual_predicates(&scan.predicates, &predicate_dispositions)?;
-    let provider_field_ordinals = projection
-        .into_iter()
-        .map(|ordinal| {
-            u32::try_from(ordinal)
-                .map_err(|_| "Iceberg provider field ordinal does not fit u32".to_string())
-        })
-        .collect::<Result<_, _>>()?;
+    let split_result = binding
+        .planning()
+        .plan_splits(
+            &connector_scan.handle,
+            ConnectorSplitPlanningRequest {
+                target_parallelism,
+                max_split_bytes,
+                context,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    if split_result
+        .splits
+        .iter()
+        .any(|split| split.owner() != &binding.descriptor().instance_id)
+    {
+        return Err("connector read planned a split for another instance".to_string());
+    }
     Ok(PlannedConnectorRead {
-        declaration: planned.declaration,
-        scan: planned.scan,
-        provider_field_ordinals,
-        splits: planned.splits,
-        planning_metrics: planned.planning_metrics,
+        declaration,
+        scan: connector_scan,
+        splits: split_result.splits,
+        planning_metrics: split_result.metrics,
         static_predicates,
         predicate_dispositions,
         residual_predicates,
-        batch: planned.batch,
-        planning_lease: Some(planned.planning_lease),
-        read_session: None,
+        batch,
+        planning_lease: planning_lease.clone(),
+        read_session: split_result.session,
     })
+}
+
+fn connector_read_purpose(scan: &PlanScanNode) -> ConnectorReadPurpose {
+    let ScanSource::Sql(source) = &scan.table.source;
+    match source.kind {
+        crate::sql::planner::table::SqlScanKind::MvTargetState { .. } => {
+            ConnectorReadPurpose::MvTargetState
+        }
+        crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+            ConnectorReadPurpose::MvTargetLocator
+        }
+        _ => ConnectorReadPurpose::Query,
+    }
 }
 
 /// Plans every Iceberg snapshot-delta role through opaque provider-owned
@@ -149,7 +172,7 @@ pub(super) fn plan_iceberg_connector_read(
 pub(super) fn plan_iceberg_delta_connector_read(
     exact_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_spi::connector::ConnectorTableHandle,
     predicates: &[TypedExpr],
     execution: &ResolvedScanExecution,
     target_parallelism: std::num::NonZeroUsize,
@@ -183,7 +206,7 @@ pub(super) fn plan_iceberg_delta_connector_read(
         predicate_dispositions: Vec::new(),
         residual_predicates: predicates.to_vec(),
         batch: planned.batch,
-        planning_lease: Some(planned.planning_lease),
+        planning_lease: planned.planning_lease,
         read_session: None,
     })
 }

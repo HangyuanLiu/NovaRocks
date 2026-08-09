@@ -17,7 +17,6 @@
 
 mod common;
 mod generic;
-mod iceberg_metadata;
 mod variant_path;
 
 use super::context::NativePlanDecodeContext;
@@ -59,31 +58,6 @@ pub(crate) fn lower_scan_node(
     let source_path = path.clone().field("table").field("source");
     let output_columns = common::decode_scan_output_columns(scan, path.clone())?;
     match source {
-        plan::scan_source::Kind::IcebergDataFiles(_) => {
-            Err(NativeFragmentDecodeError::unsupported(
-                source_path.field("iceberg_data_files"),
-                "legacy IcebergDataFiles must be materialized as ConnectorReadSource before native decoding",
-            ))
-        }
-        plan::scan_source::Kind::IcebergMetadataTable(source) => {
-            reject_variant_columns_for_source(scan, "IcebergMetadataTable")
-                .map_err(|error| error.into_native(path.clone()))?;
-            iceberg_metadata::lower_iceberg_metadata_scan(
-                node,
-                scan,
-                source,
-                &output_columns,
-                ctx,
-                arena,
-            )
-            .map_err(|error| error.into_native(source_path.field("iceberg_metadata_table")))
-        }
-        plan::scan_source::Kind::IcebergVersionTable(_) => {
-            Err(NativeFragmentDecodeError::unsupported(
-                source_path.field("iceberg_version_table"),
-                "IcebergVersionTable native scan source is not implemented",
-            ))
-        }
         plan::scan_source::Kind::IcebergMvTargetState(_) => {
             Err(NativeFragmentDecodeError::unsupported(
                 source_path.field("iceberg_mv_target_state"),
@@ -117,23 +91,9 @@ pub(crate) fn lower_scan_node(
     }
 }
 
-fn reject_variant_columns_for_source(
-    scan: &plan::ScanNode,
-    source_name: &str,
-) -> Result<(), NativeFragmentLeafDecodeError> {
-    if scan.variant_columns.is_empty() {
-        return Ok(());
-    }
-    Err(NativeFragmentLeafDecodeError::at_field(
-        ProtocolErrorKind::Unsupported,
-        "variant_columns",
-        format!("{source_name} native scan does not support variant_columns"),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use arrow::datatypes::{DataType, Field, Schema};
@@ -154,9 +114,7 @@ mod tests {
     use super::super::node::{decode_node, decode_node_with_runtime_filters};
     use super::super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
     use crate::native::type_decode::encode_type;
-    use novarocks::common::ids::SlotId;
-    use novarocks::connector::ConnectorRegistry;
-    use novarocks::exec::expr::{ExprArena, ExprNode};
+    use novarocks::exec::expr::ExprArena;
     use novarocks::exec::node::ExecNodeKind;
     use novarocks::exec::node::scan::ScanMorsel;
     use novarocks::protocol::ProtocolErrorKind;
@@ -439,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn native_connector_read_carrier_resolves_the_typed_host_and_executes_its_split() {
+    fn spi5b_native_connector_read_carrier_resolves_the_typed_host_and_executes_its_split() {
         let node = scan_node(plan::scan_source::Kind::ConnectorRead(
             plan::ConnectorReadSource {
                 instance_id: "test.native".to_string(),
@@ -673,7 +631,7 @@ mod tests {
             columns,
             Vec::new(),
             required_columns,
-            iceberg_metadata_table_source(),
+            test_connector_read_source(),
         );
         let error = decode_node(&node, &mut ExprArena::default(), &test_decode_context())
             .expect_err("invalid scan column type must fail");
@@ -718,13 +676,7 @@ mod tests {
                         ],
                         iceberg_row_lineage_metadata_columns: Vec::new(),
                         source: Some(plan::ScanSource {
-                            kind: Some(plan::scan_source::Kind::IcebergDataFiles(
-                                plan::IcebergDataFiles {
-                                    table: Some(variant_table_info()),
-                                    files: Vec::new(),
-                                    binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
-                                },
-                            )),
+                            kind: Some(test_connector_read_source()),
                         }),
                     }),
                     alias: None,
@@ -905,13 +857,17 @@ mod tests {
         }
     }
 
-    fn iceberg_metadata_table_source() -> plan::scan_source::Kind {
-        plan::scan_source::Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
-            table: Some(table_info()),
-            metadata_table_type: plan::IcebergMetadataTableType::Snapshots as i32,
-            serialized_table: "{}".to_string(),
-            cloud_properties: HashMap::new(),
-            metadata_payload: None,
+    fn test_connector_read_source() -> plan::scan_source::Kind {
+        plan::scan_source::Kind::ConnectorRead(plan::ConnectorReadSource {
+            instance_id: "test.connector".to_string(),
+            instance_incarnation: vec![1; 16],
+            scan_payload: Vec::new(),
+            splits: Vec::new(),
+            max_batch_rows: 1,
+            max_batch_bytes: 1,
+            max_handle_payload_bytes: 1024,
+            max_total_payload_bytes: 1024,
+            expected_schema_ipc: expected_connector_schema_ipc(),
         })
     }
 
@@ -956,100 +912,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_iceberg_data_file_scan_before_provider_binding() {
-        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
-            plan::IcebergDataFiles {
-                table: Some(table_info()),
-                files: Vec::new(),
-                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
-            },
-        ));
-        let ctx = test_decode_context()
-            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_query_options(Some(QueryOptions::from_parts(QueryOptionsParts {
-                connector_io_tasks_per_scan_operator: Some(1),
-                ..Default::default()
-            })))
-            .with_scan_ranges(10, vec![file_range()]);
-        let error = decode_node(&node, &mut ExprArena::default(), &ctx)
-            .expect_err("legacy Iceberg source must not bypass ConnectorReadSource");
-        assert!(
-            error
-                .to_string()
-                .contains("legacy IcebergDataFiles must be materialized as ConnectorReadSource")
-        );
-    }
-
-    #[test]
     fn iceberg_metadata_invalid_column_type_uses_scan_columns_wire_path() {
         let mut invalid = output_column(1, "id", DataType::Int64);
         invalid.r#type = Some(common::TypeDesc::default());
         assert_scan_column_type_error(vec![invalid], Vec::new(), 0);
-    }
-
-    #[test]
-    fn lowers_iceberg_metadata_scan_predicate_to_scan_conjunct() {
-        let node = scan_node_with(
-            vec![output_column(1, "snapshot_id", DataType::Int64)],
-            vec![greater_than(
-                column_ref(1, "snapshot_id", DataType::Int64),
-                int_literal(0),
-            )],
-            Vec::new(),
-            iceberg_metadata_table_source(),
-        );
-        let ctx = test_decode_context()
-            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_scan_ranges(10, vec![file_range()]);
-        let mut arena = ExprArena::default();
-
-        let lowered =
-            decode_node(&node, &mut arena, &ctx).expect("lower metadata scan with predicate");
-        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
-            panic!("expected Scan");
-        };
-        assert!(scan.conjunct_predicate().is_some());
-    }
-
-    #[test]
-    fn legacy_iceberg_scan_rejects_before_scan_range_validation() {
-        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
-            plan::IcebergDataFiles {
-                table: Some(table_info()),
-                files: Vec::new(),
-                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
-            },
-        ));
-        let ctx =
-            test_decode_context().with_connector_registry(Arc::new(ConnectorRegistry::default()));
-        let mut arena = ExprArena::default();
-        let err = decode_node(&node, &mut arena, &ctx).unwrap_err();
-        assert!(
-            err.contains("legacy IcebergDataFiles must be materialized as ConnectorReadSource"),
-            "err={err}"
-        );
-    }
-
-    #[test]
-    fn legacy_iceberg_scan_rejects_even_with_predicate_only_required_columns() {
-        let node = scan_node_with(
-            vec![output_column(1, "id", DataType::Int64)],
-            vec![column_ref(2, "flag", DataType::Boolean)],
-            vec!["id".to_string(), "flag".to_string()],
-            plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
-                table: Some(table_info()),
-                files: Vec::new(),
-                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
-            }),
-        );
-        let ctx = test_decode_context()
-            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
-            .with_scan_ranges(10, vec![file_range()]);
-        let mut arena = ExprArena::default();
-        let err = decode_node(&node, &mut arena, &ctx).unwrap_err();
-        assert!(
-            err.contains("legacy IcebergDataFiles must be materialized as ConnectorReadSource"),
-            "err={err}"
-        );
     }
 }

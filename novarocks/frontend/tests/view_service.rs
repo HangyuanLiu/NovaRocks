@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use arrow::array::{Array, StringArray};
 use bytes::Bytes;
 use novarocks::engine::view::{
-    CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
-    ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
+    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };
 use novarocks_frontend::FrontendViewService;
 use novarocks_spi::{
@@ -74,35 +74,28 @@ impl FakeViewEngine {
 }
 
 impl ViewEngine for FakeViewEngine {
-    fn validate_iceberg_catalog(&self, catalog: &str) -> Result<(), String> {
-        if self.rest_catalogs.lock().unwrap().contains(catalog) {
-            Ok(())
-        } else {
-            Err(format!("unknown iceberg catalog: {catalog}"))
-        }
-    }
-
-    fn is_rest_iceberg_catalog(&self, catalog: &str) -> bool {
-        self.rest_catalogs.lock().unwrap().contains(catalog)
-    }
-
-    fn table_exists(
+    fn resolve_external_view(
         &self,
         target: &ViewTarget,
         _context: &ConnectorRequestContext,
-    ) -> Result<bool, String> {
+    ) -> Result<ExternalViewResolution, String> {
+        if !self.rest_catalogs.lock().unwrap().contains(&target.catalog) {
+            return Err("Unsupported: connector has no view metadata capability".to_string());
+        }
         if self.table_probe_failures.lock().unwrap().contains(target) {
             return Err("table probe failed".to_string());
         }
-        Ok(self.tables.lock().unwrap().contains(target))
-    }
-
-    fn view_exists(
-        &self,
-        target: &ViewTarget,
-        _context: &ConnectorRequestContext,
-    ) -> Result<bool, String> {
-        Ok(self.views.lock().unwrap().contains_key(target))
+        if self.tables.lock().unwrap().contains(target) {
+            return Ok(ExternalViewResolution::Table);
+        }
+        Ok(self
+            .views
+            .lock()
+            .unwrap()
+            .get(target)
+            .cloned()
+            .map(ExternalViewResolution::View)
+            .unwrap_or(ExternalViewResolution::Missing))
     }
 
     fn create_external_view(
@@ -164,11 +157,17 @@ impl ViewEngine for FakeViewEngine {
     fn load_external_view(
         &self,
         target: &ViewTarget,
+        _context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String> {
         Ok(self.views.lock().unwrap().get(target).cloned())
     }
 
-    fn list_external_views(&self, catalog: &str, database: &str) -> Result<Vec<String>, String> {
+    fn list_external_views(
+        &self,
+        catalog: &str,
+        database: &str,
+        _context: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, String> {
         Ok(self
             .views
             .lock()
@@ -725,7 +724,7 @@ async fn external_view_qualification_preserves_ctes_inside_nested_queries() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rewrite_keeps_tables_and_table_probe_failures_and_reports_view_cycles() {
+async fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_result() {
     let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
         .await
         .unwrap();

@@ -588,7 +588,7 @@ pub(crate) fn row_lineage_enabled(
 
 /// Storage marker for an Iceberg table that has no data files yet.
 ///
-/// The scan path treats `IcebergDataFiles { files: vec![] }` as "no
+/// The scan path treats an opaque handle with no planned files as "no
 /// ranges to read"; the runtime returns an empty result without ever
 /// touching the filesystem. This keeps empty Iceberg tables represented as
 /// catalog-owned scan sources instead of synthetic placeholder files.

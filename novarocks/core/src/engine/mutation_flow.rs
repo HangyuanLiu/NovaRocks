@@ -34,12 +34,13 @@ use crate::connector::iceberg::commit::{
     select_iceberg_update_mode,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
+use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    row_lineage_sink_spec_from_frozen_materialization, sql_write_plan_input_for_admitted_target,
+    admit_frozen_iceberg_write_target, row_lineage_sink_spec_from_frozen_materialization,
+    sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -273,6 +274,8 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) target_ref: String,
+    /// The one exact connector generation admitted with this statement.
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     pub(crate) mor_write_target: Option<PreparedMorUpdateWriteTarget>,
     pub(crate) mode: IcebergUpdateMode,
     pub(crate) execution: QueryExecutionContext,
@@ -306,6 +309,8 @@ pub(crate) struct PreparedMergeMutation {
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) table_write_mode: IcebergUpdateMode,
+    /// The one exact connector generation admitted with this statement.
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     pub(crate) mor_write_target: Option<PreparedMorMergeWriteTarget>,
     pub(crate) insert_columns_resolved: Option<MergeInsertColumns>,
     pub(crate) execution: QueryExecutionContext,
@@ -398,6 +403,10 @@ pub(crate) fn prepare_update_mutation(
     validate_update_assignments(&stmt.assignments, &target_columns, &partition_columns)?;
 
     let mode = select_iceberg_update_mode(&table)?;
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
     let mor_write_target = if mode == IcebergUpdateMode::MergeOnRead {
         let read_snapshot_id = if target_ref != "main" {
             novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
@@ -413,13 +422,9 @@ pub(crate) fn prepare_update_mutation(
         // Freeze the writer target at admission, alongside the prepared
         // mutation. Stage runs after frontend lifecycle persistence and must
         // never reopen the connector generation or observe a later snapshot.
-        let planning_lease = crate::connector::acquire_metadata_planning_lease(
-            state.connector_control.as_ref(),
-            &target.catalog,
-        )?;
         let materialization =
             crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
-                planning_lease,
+                planning_lease.clone(),
                 connector_context.clone(),
                 &target.namespace,
                 &target.table,
@@ -449,6 +454,7 @@ pub(crate) fn prepare_update_mutation(
         target_columns,
         entry,
         target_ref,
+        planning_lease,
         mor_write_target,
         mode,
         execution: execution.clone(),
@@ -457,7 +463,8 @@ pub(crate) fn prepare_update_mutation(
 }
 
 /// Resolve and validate MERGE without materializing source rows, registering a
-/// cohort, acquiring a write lease, or creating a staging artifact.
+/// cohort, or creating a staging artifact. It retains one exact planning lease
+/// for every later read or writer admission.
 pub(crate) fn prepare_merge_mutation(
     state: &Arc<StandaloneState>,
     stmt: &MergeStmt,
@@ -511,18 +518,18 @@ pub(crate) fn prepare_merge_mutation(
         .as_ref()
         .map(|clause| resolve_merge_insert_columns(&clause.action, &target_columns))
         .transpose()?;
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
     let mor_write_target = if table_write_mode == IcebergUpdateMode::MergeOnRead
         || matches!(
             stmt.matched.as_ref().map(|clause| &clause.action),
             Some(MergeMatchedAction::Delete)
         ) {
-        let planning_lease = crate::connector::acquire_metadata_planning_lease(
-            state.connector_control.as_ref(),
-            &target.catalog,
-        )?;
         let materialization =
             crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
-                planning_lease,
+                planning_lease.clone(),
                 connector_context.clone(),
                 &target.namespace,
                 &target.table,
@@ -547,6 +554,7 @@ pub(crate) fn prepare_merge_mutation(
         target_columns,
         entry,
         table_write_mode,
+        planning_lease,
         mor_write_target,
         insert_columns_resolved,
         execution: execution.clone(),
@@ -572,6 +580,7 @@ pub(crate) fn stage_prepared_update_mutation(
         target_columns,
         entry,
         target_ref,
+        planning_lease,
         mor_write_target,
         mode,
         execution,
@@ -620,7 +629,6 @@ pub(crate) fn stage_prepared_update_mutation(
                 .with_table_metadata(metadata.clone()),
             );
             let write = build_cow_update_distributed_write(
-                state,
                 &target,
                 &table,
                 &matched,
@@ -628,7 +636,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 &entry,
                 base_snapshot_id,
                 &target_ref,
-                None,
+                planning_lease,
                 &connector_context,
             )?;
             let execution_handle = build_cow_update_distributed_execution(
@@ -672,6 +680,9 @@ pub(crate) fn stage_prepared_update_mutation(
             } = mor_write_target.ok_or_else(|| {
                 "MOR UPDATE reached stage without an admitted frozen write target".to_string()
             })?;
+            let write_lease = write_planning_lease
+                .derive_write_lease()
+                .map_err(|error| format!("derive MOR UPDATE write lease: {error}"))?;
             let metadata = table.metadata();
             let collector = Arc::new(
                 IcebergCommitCollector::new(
@@ -735,10 +746,12 @@ pub(crate) fn stage_prepared_update_mutation(
             );
             let connector_write =
                 crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
+                    state,
                     &target,
                     &provider_binding,
                     operation_id,
                     connector_context.clone(),
+                    &write_lease,
                 )?;
             let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
                 state: Arc::clone(state),
@@ -1899,7 +1912,6 @@ struct CowUpdateDistributedWrite {
 
 #[allow(clippy::too_many_arguments)]
 fn build_cow_update_distributed_write(
-    state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     matched: &MatchedUpdateBatch,
@@ -1907,18 +1919,11 @@ fn build_cow_update_distributed_write(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
     target_ref: &str,
-    planning_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowUpdateDistributedWrite, String> {
     let base_snapshot_id =
         base_snapshot_id.ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
-    let planning_lease = match planning_lease {
-        Some(lease) => lease,
-        None => crate::connector::acquire_metadata_planning_lease(
-            state.connector_control.as_ref(),
-            &target.catalog,
-        )?,
-    };
     let resolved = crate::connector::metadata_load_table_with_planning_lease(
         planning_lease.clone(),
         connector_context.clone(),
@@ -2021,21 +2026,21 @@ fn build_cow_rewrite_query_local_overlay(
             data_file.path
         ));
     }
-    let mut materialization =
+    let materialization =
         crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
             planning_lease,
             connector_context.clone(),
             &target.namespace,
             &target.table,
         )?;
-    if target_ref == "main" && materialization.table.current_snapshot_id != Some(base_snapshot_id) {
+    if target_ref == "main" && materialization.current_snapshot_id() != Some(base_snapshot_id) {
         return Err(format!(
             "COW UPDATE source {}.{}.{} changed after admission: expected snapshot {}, got {:?}",
             target.catalog,
             target.namespace,
             target.table,
             base_snapshot_id,
-            materialization.table.current_snapshot_id,
+            materialization.current_snapshot_id(),
         ));
     }
     // The provider's strict-base materialization is rooted at the table's
@@ -2043,14 +2048,14 @@ fn build_cow_rewrite_query_local_overlay(
     // the admitted branch head, so carry that branch snapshot into the
     // request-local overlay instead of rejecting the schema-only materialization
     // because its default snapshot is main.
-    materialization.table.current_snapshot_id = Some(base_snapshot_id);
-    materialization.files = vec![
-        crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
-            data_file,
-        ),
-    ];
-    materialization.binding =
-        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles;
+    let materialization = materialization.with_frozen_files_at_snapshot(
+        vec![
+            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
+                data_file,
+            ),
+        ],
+        base_snapshot_id,
+    )?;
     // The single-file scan must expose `_row_id` / `_last_updated_sequence_number`
     // for the rewrite projection; the table is v3 row-lineage (COW mode was
     // selected) and the file carries `first_row_id`, so the builder advertises
@@ -2456,6 +2461,10 @@ fn build_cow_update_distributed_execution(
         snapshot_properties: BTreeMap::new(),
     });
     let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+    let write_lease = write
+        .planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive COW UPDATE write lease: {error}"))?;
     let mut write = write;
     write
         .file_plans
@@ -2545,6 +2554,7 @@ fn build_cow_update_distributed_execution(
         target_ref,
         service,
         operation_id,
+        &write_lease,
         cohort_templates,
     )?;
     let registration =
@@ -2901,6 +2911,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         target_columns,
         entry,
         table_write_mode,
+        planning_lease,
         mor_write_target,
         insert_columns_resolved,
         execution,
@@ -2930,6 +2941,9 @@ pub(crate) fn stage_prepared_merge_mutation(
         } = mor_write_target.ok_or_else(|| {
             "MOR MERGE reached stage without an admitted frozen write target".to_string()
         })?;
+        let write_lease = write_planning_lease
+            .derive_write_lease()
+            .map_err(|error| format!("derive MOR MERGE write lease: {error}"))?;
         let collector = Arc::new(
             IcebergCommitCollector::new(
                 CommitOpKind::RowDeltaDvFromFiles,
@@ -2993,10 +3007,12 @@ pub(crate) fn stage_prepared_merge_mutation(
         );
         let connector_write =
             crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
+                state,
                 &target,
                 &provider_binding,
                 operation_id,
                 connector_context.clone(),
+                &write_lease,
             )?;
         let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
             state: Arc::clone(state),
@@ -3126,7 +3142,6 @@ pub(crate) fn stage_prepared_merge_mutation(
             match &clause.action {
                 MergeMatchedAction::Update { .. } => {
                     MergeMatchedBranch::CowUpdate(build_cow_update_distributed_write(
-                        state,
                         &target,
                         &table,
                         &matched,
@@ -3137,7 +3152,7 @@ pub(crate) fn stage_prepared_merge_mutation(
                             .current_snapshot()
                             .map(|snapshot| snapshot.snapshot_id()),
                         "main",
-                        insert_branch.as_ref().map(|(_, _, lease)| lease.clone()),
+                        planning_lease.clone(),
                         &connector_context,
                     )?)
                 }
@@ -3417,12 +3432,17 @@ fn prepare_cow_merge_operation(
         )
         .map_err(|error| format!("build MERGE COW operation service: {error}"))?,
     );
+    let write_lease = write
+        .planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive COW MERGE write lease: {error}"))?;
     let templates = crate::engine::iceberg_writer::register_iceberg_connector_write_cohort_service(
         state,
         target,
         target_ref,
         service,
         operation_id,
+        &write_lease,
         templates,
     )?;
     let registration =

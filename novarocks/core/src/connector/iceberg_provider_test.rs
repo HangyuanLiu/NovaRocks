@@ -564,6 +564,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
@@ -722,7 +723,15 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
         })
         .expect("load table");
     assert_eq!(resolved.table.owner(), &instance_id);
-    assert_eq!(resolved.schema.fields().len(), 1);
+    assert_eq!(
+        resolved
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "_file", "_pos"]
+    );
 
     let scan = instance
         .planning()
@@ -732,6 +741,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
@@ -766,7 +776,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
             &execution,
             &splits[0],
             ConnectorOpenReaderRequest {
-                expected_schema: Arc::clone(&resolved.schema),
+                expected_schema: Arc::clone(&scan.output_schema),
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
                     max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
@@ -817,6 +827,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
@@ -930,6 +941,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),

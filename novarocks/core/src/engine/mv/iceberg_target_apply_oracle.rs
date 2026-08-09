@@ -850,7 +850,6 @@ fn framework_locator_query_local_overlay(
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
     };
-    use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 
     let snapshot_id = target_table
         .metadata()
@@ -874,22 +873,23 @@ fn framework_locator_query_local_overlay(
         &instance_id,
     )
     .map_err(|error| error.to_string())?;
-    let table = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
-        catalog: target_catalog_name.to_string(),
-        namespace: target_namespace.to_string(),
-        table: target_table_name.to_string(),
-        table_uuid: Some(target_table.metadata().uuid().to_string()),
-        current_snapshot_id: Some(snapshot_id),
-        schema_id: target_table.metadata().current_schema_id(),
-        location: target_table.metadata().location().to_string(),
-        schema: crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen(
-            target_table.metadata().current_schema(),
-        ),
-        serialized_metadata: Some(
-            serde_json::to_string(target_table.metadata())
-                .map_err(|error| format!("serialize framework locator target metadata: {error}"))?,
-        ),
-        serialized_metadata_rows: None,
+    let materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+            planning_lease.clone(),
+            crate::connector::test_request_context(),
+            target_namespace,
+            target_table_name,
+        )?;
+    let materialization = materialization.with_frozen_files(
+        files,
+        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id),
+    )?;
+    let scan_materialization = QueryScanMaterialization {
+        table: materialization.read_table,
+        schema: materialization.read_schema,
+        selector: materialization.read_selector,
+        statistics_pin: materialization.statistics_pin,
+        planning_lease: materialization.planning_lease,
     };
     let locator_table_name = locator_table_def.name.clone();
     let catalog = target_catalog_name.to_string();
@@ -918,13 +918,17 @@ fn framework_locator_query_local_overlay(
                 Ok(QueryTableBinding {
                     resolved: ResolvedAnalyzerTable::from_planner(None, &namespace, planner),
                     statistics_pin: None,
-                    planning_lease: Some(planning_lease.clone()),
-                    scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-                        table: table.clone(),
-                        files: files.clone(),
-                        binding: IcebergDataFileBinding::ExplicitFiles,
-                    }),
-                    frozen_snapshot_files: std::collections::BTreeMap::new(),
+                    admission:
+                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                            planning_lease.clone(),
+                        ),
+                    scan_materialization: Some(scan_materialization.clone()),
+                    write_target_admission: None,
+                    mv_target_read: None,
+                    frozen_snapshot_materializations: std::collections::BTreeMap::from([(
+                        snapshot_id,
+                        scan_materialization.clone(),
+                    )]),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },
@@ -3384,7 +3388,7 @@ mod tests {
             &fixture.table,
             "ice",
             "db",
-            "mv_target",
+            &fixture.table.identifier().name,
             JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::BranchUtf8(&branch_string_keys),
             &referenced,
@@ -3419,7 +3423,7 @@ mod tests {
             &fixture.table,
             "ice",
             "db",
-            "mv_target",
+            &fixture.table.identifier().name,
             HIDDEN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::BranchInt64(&branch_i64_keys),
             &referenced,

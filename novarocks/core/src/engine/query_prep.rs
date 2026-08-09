@@ -31,6 +31,7 @@ use crate::sql::parser::ast::ObjectName;
 #[cfg(test)]
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergFileForQuery {
@@ -67,23 +68,17 @@ pub(crate) fn delete_temp_iceberg_file_for_query(
 /// Project provider metadata into the immutable facts required by SQL
 /// time-travel analysis.  This conversion is intentionally application-owned:
 /// the compiler never receives an Iceberg `TableMetadata` object.
-fn project_iceberg_ref_metadata(
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-) -> SqlIcebergRefMetadata {
-    let refs = metadata
-        .refs()
+fn project_iceberg_ref_metadata(facts: &ConnectorReadReferenceFacts) -> SqlIcebergRefMetadata {
+    let refs = facts
+        .named_references()
         .iter()
-        .map(|(name, reference)| {
-            let kind = match reference.retention {
-                novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Branch {
-                    ..
-                } => IcebergRefKind::Branch,
-                novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Tag { .. } => {
-                    IcebergRefKind::Tag
-                }
+        .map(|reference| {
+            let kind = match reference.kind {
+                ConnectorReadReferenceKind::Branch => IcebergRefKind::Branch,
+                ConnectorReadReferenceKind::Tag => IcebergRefKind::Tag,
             };
             (
-                name.clone(),
+                reference.name.to_string(),
                 SqlIcebergNamedRef {
                     snapshot_id: reference.snapshot_id,
                     kind,
@@ -92,19 +87,17 @@ fn project_iceberg_ref_metadata(
         })
         .collect();
     SqlIcebergRefMetadata::new(
-        metadata.snapshots().map(|snapshot| snapshot.snapshot_id()),
-        metadata
-            .history()
+        facts.snapshot_ids().iter().copied(),
+        facts
+            .snapshot_log()
             .iter()
             .map(|entry| SqlIcebergSnapshotLog {
                 snapshot_id: entry.snapshot_id,
-                timestamp_ms: entry.timestamp_ms,
+                timestamp_ms: entry.timestamp_millis,
             })
             .collect(),
         refs,
-        metadata
-            .current_snapshot()
-            .map(|snapshot| snapshot.snapshot_id()),
+        facts.current_snapshot_id(),
     )
 }
 
@@ -314,23 +307,21 @@ fn rewrite_time_travel_in_factor(
                 ));
             }
 
-            // Load metadata to resolve the version clause
-            let metadata = {
-                let registry = state
-                    .iceberg_catalogs
-                    .read()
-                    .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-                let entry = registry.get(&target.catalog)?;
-                let loaded = crate::connector::iceberg::catalog::load_table(
-                    &entry,
-                    &target.namespace,
-                    &target.table,
-                )?;
-                loaded.table.metadata().clone()
-            };
-
             let fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
-            let metadata = project_iceberg_ref_metadata(&metadata);
+            // Time-travel fact resolution is catalog admission.  Resolve all
+            // facts from one exact control generation; the synthetic table is
+            // subsequently admitted by the query-local materializer.
+            let lease = crate::connector::acquire_metadata_planning_lease(
+                state.connector_control.as_ref(),
+                &target.catalog,
+            )?;
+            let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
+                lease,
+                connector_context.clone(),
+                &target.namespace,
+                &target.table,
+            )?;
+            let metadata = project_iceberg_ref_metadata(&facts);
             let binding = resolve_read_binding(&version_clause, &metadata, &fqn)?;
             let snapshot_id = binding.snapshot_id;
 
@@ -777,9 +768,9 @@ mod tests {
     #[test]
     fn delta_table_builder_accepts_empty_iceberg_storage() {
         // The IVM-A1 delta source `stamp_delta_table_def_change_ops`
-        // requires the base table to be backed by `IcebergDataFiles`
-        // (real or synthetic). An empty Iceberg snapshot legitimately
-        // produces `IcebergDataFiles { files: vec![] }` (see
+        // requires the base table to be backed by an admitted connector read
+        // handle. An empty Iceberg snapshot legitimately
+        // produces an opaque connector read whose split plan is empty (see
         // `connector/iceberg/catalog/backend.rs::empty_iceberg_scan_source`);
         // ensure that path round-trips correctly when stamping with an
         // empty change-op slice.

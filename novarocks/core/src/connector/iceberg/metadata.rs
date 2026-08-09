@@ -306,6 +306,66 @@ struct IcebergMetadataBatchReader {
     closed: bool,
 }
 
+/// Open one provider-owned metadata reader under the ordinary Iceberg
+/// execution binding.  The generic carrier supplies the expected Arrow
+/// schema; the opaque split supplies only metadata facts, so Core never has
+/// to reconstruct a metadata-table decoder or a second execution binding.
+pub(crate) fn open_metadata_connector_reader(
+    metadata_table_type: IcebergMetadataTableType,
+    serialized_table: String,
+    serialized_payload: String,
+    expected_schema: SchemaRef,
+    batch: ConnectorBatchBudget,
+    context: ConnectorRequestContext,
+) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+    let output_columns = expected_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            Ok(IcebergMetadataOutputColumn {
+                name: field.name().to_string(),
+                slot_id: SlotId::new(u32::try_from(ordinal + 1).map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "Iceberg metadata projection has too many columns",
+                    )
+                })?),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let reader = IcebergMetadataReader::new(IcebergMetadataScanConfig {
+        metadata_table_type,
+        serialized_table,
+        serialized_predicate: serialized_payload,
+        load_column_stats: false,
+        ranges: Vec::new(),
+        batch_size: batch.max_rows.get(),
+        output_columns,
+        profile_label: None,
+    })
+    .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
+    if reader.output_schema.as_ref() != expected_schema.as_ref() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg metadata reader schema differs from connector expected schema",
+        ));
+    }
+    let batches = reader
+        .read_chunks()
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?
+        .into_iter()
+        .map(|chunk| chunk.batch)
+        .collect::<Vec<_>>();
+    Ok(Box::new(IcebergMetadataBatchReader {
+        batches: batches.into_iter(),
+        context,
+        closed: false,
+    }))
+}
+
 impl ConnectorBatchReader for IcebergMetadataBatchReader {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.closed {

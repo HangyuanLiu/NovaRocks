@@ -51,6 +51,10 @@ use crate::connector::iceberg::position_delete_descriptor::{
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
+use crate::connector::iceberg::write_contract::{
+    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
+    transform_to_sink_string,
+};
 use crate::connector::iceberg::write_control::{
     IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
 };
@@ -62,9 +66,7 @@ use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
-    transform_to_sink_string,
 };
 use crate::engine::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
@@ -81,8 +83,8 @@ use novarocks_connector_iceberg::scan_model::{
     IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use novarocks_spi::connector::{
-    ConnectorInstanceId, ConnectorTableHandle, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId,
+    ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,6 +269,9 @@ fn prepare_iceberg_distributed_write(
     options: IcebergWritePreparationOptions,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedIcebergWrite, String> {
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive Iceberg write admission lease: {error}"))?;
     let metadata = table.metadata();
     let (query, sink_spec) =
         build_iceberg_write_plan(target, resolved, insert_columns, source, &table, entry)?;
@@ -327,6 +332,7 @@ fn prepare_iceberg_distributed_write(
         Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
+        &write_lease,
     )?;
     let executor = PreparedIcebergWriteExecutor {
         state: Arc::clone(state),
@@ -374,6 +380,7 @@ fn register_insert_connector_write(
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     let writer_handle_payload = encode_data_sink_spec_handle_payload(sink_spec)?;
     let input_schema = Arc::new(Schema::new(
@@ -398,6 +405,7 @@ fn register_insert_connector_write(
         commit_executor,
         operation_id,
         context,
+        exact_lease,
     )
 }
 
@@ -412,6 +420,7 @@ pub(crate) fn register_iceberg_connector_write(
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     let plan_payload = IcebergWritePlanPayloadV1 {
         version: 1,
@@ -438,6 +447,7 @@ pub(crate) fn register_iceberg_connector_write(
         service,
         operation_id,
         context,
+        exact_lease,
     )
 }
 
@@ -447,6 +457,7 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
     binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     register_iceberg_connector_write_service(
         state,
@@ -461,6 +472,7 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
             .map_err(|error| format!("build Iceberg change-stream write service: {error}"))?,
         operation_id,
         context,
+        exact_lease,
     )
 }
 
@@ -468,16 +480,18 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
 /// provider service is intentionally not registered here; DML activates the
 /// binding only after it retains the exact session that will stage it.
 pub(crate) fn iceberg_change_stream_provider_binding_template(
+    state: &Arc<StandaloneState>,
     target: &TargetBackend,
     binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
     let mut templates = build_iceberg_connector_write_templates(
         target,
-        binding.target_ref(),
         operation_id,
+        exact_lease,
         vec![(
             cohort_id,
             ConnectorWriteIntent::RowDelta,
@@ -661,8 +675,8 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
     let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
     let mut templates = build_iceberg_connector_write_templates(
         target,
-        target_ref,
         operation_id,
+        exact_lease,
         vec![(cohort_id, intent, input_schema, provider_payload, context)],
     )?;
     Ok(templates
@@ -681,6 +695,7 @@ pub(crate) fn register_iceberg_connector_write_service<S>(
     service: S,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String>
 where
     S: crate::connector::iceberg::write_control::IcebergWriteControlBackend + 'static,
@@ -695,6 +710,7 @@ where
         target_ref,
         service,
         operation_id,
+        exact_lease,
         vec![(cohort_id, intent, input_schema, payload, context)],
     )?;
     Ok(templates
@@ -709,6 +725,7 @@ pub(crate) fn register_iceberg_connector_write_cohort_service<S>(
     target_ref: &str,
     service: S,
     operation_id: ConnectorWriteOperationId,
+    exact_lease: &ConnectorWriteLease,
     cohorts: Vec<(
         novarocks_spi::connector::ConnectorWriteCohortId,
         ConnectorWriteIntent,
@@ -734,7 +751,7 @@ where
         .register(operation_id, service)
         .map_err(|error| format!("register Iceberg connector write service: {error}"))?;
 
-    build_iceberg_connector_write_templates(target, target_ref, operation_id, cohorts)
+    build_iceberg_connector_write_templates(target, operation_id, exact_lease, cohorts)
 }
 
 /// Reserve an Iceberg write service only after the application has retained
@@ -782,14 +799,14 @@ where
     services
         .register_lazy(operation_id, activation_digest, factory)
         .map_err(|error| format!("reserve Iceberg connector write service: {error}"))?;
-    build_iceberg_connector_write_templates(target, target_ref, operation_id, cohorts)
+    build_iceberg_connector_write_templates(target, operation_id, exact_lease, cohorts)
 }
 
 #[allow(clippy::type_complexity)]
 fn build_iceberg_connector_write_templates(
     target: &TargetBackend,
-    target_ref: &str,
     operation_id: ConnectorWriteOperationId,
+    exact_lease: &ConnectorWriteLease,
     cohorts: Vec<(
         novarocks_spi::connector::ConnectorWriteCohortId,
         ConnectorWriteIntent,
@@ -798,7 +815,12 @@ fn build_iceberg_connector_write_templates(
         novarocks_spi::connector::ConnectorRequestContext,
     )>,
 ) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
-    let table = iceberg_connector_table_handle(target, target_ref)?;
+    let context = cohorts
+        .first()
+        .ok_or_else(|| "Iceberg connector write operation has no cohorts".to_string())?
+        .4
+        .clone();
+    let table = iceberg_connector_table_handle(exact_lease, target, context)?;
     cohorts
         .into_iter()
         .map(
@@ -819,27 +841,33 @@ fn build_iceberg_connector_write_templates(
         .collect()
 }
 
-/// Construct the provider-neutral SPI table identity used by an Iceberg
-/// writer. Callers may freeze it during SQL/application preparation, but the
-/// payload contains no catalog client or provider receipt decoder.
+/// Resolve an opaque Iceberg write target through the connector metadata
+/// capability owned by the exact generation observed at write admission.
+/// Core only forwards the target identity; it never builds a handle payload.
 pub(crate) fn iceberg_connector_table_handle(
+    exact_lease: &ConnectorWriteLease,
     target: &TargetBackend,
-    target_ref: &str,
+    context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorTableHandle, String> {
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let table_payload = Bytes::from(
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "catalog": target.catalog,
-            "namespace": target.namespace,
-            "table": target.table,
-            "ref": target_ref,
-        }))
-        .map_err(|error| format!("encode connector table identity: {error}"))?,
-    );
-    ConnectorTableHandle::try_new(instance_id, table_payload)
-        .map_err(|error| format!("build connector table handle: {error}"))
+    if exact_lease.binding_key().instance_id != instance_id {
+        return Err("Iceberg write lease does not match the target connector instance".to_string());
+    }
+    let metadata = exact_lease
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| {
+            format!("load Iceberg write target through connector metadata: {error}")
+        })?;
+    Ok(metadata.table)
 }
 
 pub(crate) struct PreparedIcebergWrite {
@@ -1066,14 +1094,30 @@ pub(crate) fn build_iceberg_write_plan(
     entry: &IcebergCatalogEntry,
 ) -> Result<(sqlparser::ast::Query, IcebergWriteSinkSpec), String> {
     let write_columns = iceberg_insert_columns_from_schema(table.metadata().current_schema())?;
-    let query = append_source_to_query_for_write(
-        source,
-        insert_columns,
-        &resolved.columns,
-        &write_columns,
-    )?;
+    let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
+    let query =
+        append_source_to_query_for_write(source, insert_columns, &source_columns, &write_columns)?;
     let sink_spec = build_insert_write_sink_spec(target, resolved, table, entry, &write_columns)?;
     Ok((query, sink_spec))
+}
+
+/// A connector read schema can carry execution-only fields (for example
+/// row-lineage fields) alongside SQL target columns.  INSERT shaping is owned
+/// by the SQL write target contract, so retain only the columns that exist in
+/// that contract before assigning derived-query aliases.
+fn sql_write_source_columns(
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+) -> Vec<ColumnDef> {
+    source_columns
+        .iter()
+        .filter(|source| {
+            write_columns
+                .iter()
+                .any(|target| target.name.eq_ignore_ascii_case(&source.name))
+        })
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn build_insert_write_sink_spec(
@@ -2677,6 +2721,29 @@ mod tests {
         assert_eq!(
             row,
             vec!["CAST(1 AS INT)", "CAST(NULL AS STRING)", "CAST(10 AS INT)"]
+        );
+    }
+
+    #[test]
+    fn spi5b_write_projection_excludes_execution_only_read_fields() {
+        let source_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("value", DataType::Utf8, None),
+            test_column("_file", DataType::Utf8, None),
+            test_column("_pos", DataType::Int64, None),
+        ];
+        let write_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("value", DataType::Utf8, None),
+        ];
+
+        let source = sql_write_source_columns(&source_columns, &write_columns);
+        assert_eq!(
+            source
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "value"]
         );
     }
 
