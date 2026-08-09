@@ -18,18 +18,19 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use novarocks_spi::connector::{
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteReceipt,
+    ExternalMutationEvidence,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use novarocks::connector::iceberg::commit::{
-    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, RecoveryEvidence,
-};
-
-pub const DML_OPERATION_SCHEMA_VERSION: u8 = 3;
-pub const DML_PREVIOUS_OPERATION_SCHEMA_VERSION: u8 = 2;
-pub const DML_LEGACY_OPERATION_SCHEMA_VERSION: u8 = 1;
+/// Ordinary DML journal values are intentionally an atomic format. There is
+/// no persisted predecessor to read or migrate.
+pub const DML_OPERATION_SCHEMA_VERSION: u8 = 4;
 pub const DML_UNFINISHED_SCHEMA_VERSION: u8 = 1;
 pub const DML_EXTERNAL_FACT_ENCODED_LIMIT: usize = 16 * 1024;
+pub const DML_CONNECTOR_WRITE_WIRE_LIMIT: usize = 128 * 1024;
 /// CTAS retains four phase facts in one StateStore value. Bound each complete
 /// fact envelope, not each individual string, so the four-fact maximum leaves
 /// room for operation identity, target facts, digests, and JSON framing.
@@ -153,6 +154,10 @@ pub fn validate_operation_transition(
             | (OperationState::Committing, OperationState::CommitUnknown)
             | (
                 OperationState::Committing,
+                OperationState::FinalizeFailedKnownCommitted
+            )
+            | (
+                OperationState::Committing,
                 OperationState::FailedKnownUncommitted
             )
             | (OperationState::CommitUnknown, OperationState::Committed)
@@ -175,6 +180,10 @@ pub fn validate_operation_transition(
             | (OperationState::Aborting, OperationState::Aborted)
             | (OperationState::Aborting, OperationState::Committed)
             | (OperationState::Aborting, OperationState::CommitUnknown)
+            | (
+                OperationState::Aborting,
+                OperationState::FinalizeFailedKnownCommitted
+            )
             | (
                 OperationState::Aborting,
                 OperationState::FailedKnownUncommitted
@@ -237,59 +246,153 @@ pub struct OperationTarget {
     pub ref_name: Option<String>,
 }
 
+/// A bounded SPI-owned receipt envelope stored without inspecting its provider
+/// payload. JSON serializes the opaque wire as a byte array; decoding uses the
+/// SPI envelope codec only and never projects provider facts into the frontend.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConnectorWriteReceiptWire(pub Vec<u8>);
+
+impl ConnectorWriteReceiptWire {
+    pub fn try_from_receipt(receipt: &ConnectorWriteReceipt) -> Result<Self, String> {
+        let wire = receipt
+            .try_to_wire_v1()
+            .map_err(|error| error.to_string())?;
+        Self::try_from_wire(wire.to_vec())
+    }
+
+    pub fn try_from_wire(wire: Vec<u8>) -> Result<Self, String> {
+        if wire.is_empty() || wire.len() > DML_CONNECTOR_WRITE_WIRE_LIMIT {
+            return Err(
+                "connector write receipt wire is empty or exceeds journal bound".to_string(),
+            );
+        }
+        ConnectorWriteReceipt::try_from_wire_v1(&wire).map_err(|error| error.to_string())?;
+        Ok(Self(wire))
+    }
+
+    pub fn try_decode(&self) -> Result<ConnectorWriteReceipt, String> {
+        ConnectorWriteReceipt::try_from_wire_v1(&self.0).map_err(|error| error.to_string())
+    }
+}
+
+/// A bounded SPI-owned reconciliation envelope stored without inspecting its
+/// provider payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExternalMutationEvidenceWire(pub Vec<u8>);
+
+impl ExternalMutationEvidenceWire {
+    pub fn try_from_evidence(evidence: &ExternalMutationEvidence) -> Result<Self, String> {
+        let wire = evidence
+            .try_to_wire_v1()
+            .map_err(|error| error.to_string())?;
+        Self::try_from_wire(wire.to_vec())
+    }
+
+    pub fn try_from_wire(wire: Vec<u8>) -> Result<Self, String> {
+        if wire.is_empty() || wire.len() > DML_CONNECTOR_WRITE_WIRE_LIMIT {
+            return Err(
+                "external mutation evidence wire is empty or exceeds journal bound".to_string(),
+            );
+        }
+        ExternalMutationEvidence::try_from_wire_v1(&wire).map_err(|error| error.to_string())?;
+        Ok(Self(wire))
+    }
+
+    pub fn try_decode(&self) -> Result<ExternalMutationEvidence, String> {
+        ExternalMutationEvidence::try_from_wire_v1(&self.0).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum IcebergOperationFailureKind {
-    KnownUncommitted,
-    Unknown,
-    FinalizeKnownCommitted,
+pub enum ConnectorWriteFailureKind {
+    InvalidRequest,
+    NotFound,
+    AlreadyExists,
+    Conflict,
+    Unauthenticated,
+    PermissionDenied,
+    Unsupported,
+    Cancelled,
+    DeadlineExceeded,
+    ResourceExhausted,
+    Unavailable,
+    CorruptData,
+    Internal,
+}
+
+impl From<ConnectorMutationFailureKind> for ConnectorWriteFailureKind {
+    fn from(value: ConnectorMutationFailureKind) -> Self {
+        match value {
+            ConnectorMutationFailureKind::InvalidRequest => Self::InvalidRequest,
+            ConnectorMutationFailureKind::NotFound => Self::NotFound,
+            ConnectorMutationFailureKind::AlreadyExists => Self::AlreadyExists,
+            ConnectorMutationFailureKind::Conflict => Self::Conflict,
+            ConnectorMutationFailureKind::Unauthenticated => Self::Unauthenticated,
+            ConnectorMutationFailureKind::PermissionDenied => Self::PermissionDenied,
+            ConnectorMutationFailureKind::Unsupported => Self::Unsupported,
+            ConnectorMutationFailureKind::Cancelled => Self::Cancelled,
+            ConnectorMutationFailureKind::DeadlineExceeded => Self::DeadlineExceeded,
+            ConnectorMutationFailureKind::ResourceExhausted => Self::ResourceExhausted,
+            ConnectorMutationFailureKind::Unavailable => Self::Unavailable,
+            ConnectorMutationFailureKind::CorruptData => Self::CorruptData,
+            ConnectorMutationFailureKind::Internal => Self::Internal,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum IcebergOperationNextAction {
-    None,
-    RetryAbort,
-    RetryFinalize,
-    ManualInspect,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IcebergOperationFailureRecord {
-    pub kind: IcebergOperationFailureKind,
+pub struct ConnectorWriteFailureRecord {
+    pub kind: ConnectorWriteFailureKind,
     pub message: String,
-    pub next_action: IcebergOperationNextAction,
+}
+
+impl From<&ConnectorMutationFailure> for ConnectorWriteFailureRecord {
+    fn from(value: &ConnectorMutationFailure) -> Self {
+        Self {
+            kind: value.kind().into(),
+            message: value.message().to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IcebergCommitOutcomeRecord {
-    pub snapshot_id: i64,
-    pub written_manifest_paths: Vec<String>,
+#[serde(
+    tag = "status",
+    content = "failure",
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+pub enum ConnectorWriteFinalizationRecord {
+    Complete,
+    Failed(ConnectorWriteFailureRecord),
 }
 
+/// The sole ordinary-DML durable terminal fact. Its tagged form makes all
+/// impossible receipt/evidence combinations unrepresentable.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IcebergCleanupOutcomeRecord {
-    pub attempted: bool,
-    pub error_count: i64,
-    pub error_paths: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IcebergRecoveryEvidenceRecord {
-    pub table_ident: String,
-    pub commit_op_kind: String,
-    pub base_snapshot_id: Option<i64>,
-    pub base_sequence_number: Option<i64>,
-    pub staging_dir: String,
+#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ConnectorWriteLifecycleRecord {
+    Pending,
+    KnownEmpty,
+    KnownCommitted {
+        receipt_wire: ConnectorWriteReceiptWire,
+        finalization: ConnectorWriteFinalizationRecord,
+    },
+    KnownUncommitted {
+        failure: ConnectorWriteFailureRecord,
+    },
+    CommitUnknown {
+        evidence_wire: ExternalMutationEvidenceWire,
+        failure: ConnectorWriteFailureRecord,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationFact {
     pub state: OperationState,
-    pub commit_outcome: Option<IcebergCommitOutcomeRecord>,
-    pub cleanup_outcome: Option<IcebergCleanupOutcomeRecord>,
-    pub recovery_evidence: Option<IcebergRecoveryEvidenceRecord>,
-    pub failure: Option<IcebergOperationFailureRecord>,
+    pub lifecycle: ConnectorWriteLifecycleRecord,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -512,7 +615,7 @@ pub struct TruncateLifecycleRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "details", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OperationPayload {
-    WriteV1,
+    ConnectorWriteLifecycle(ConnectorWriteLifecycleRecord),
     CtasSaga(CtasSagaRecord),
     TruncateLifecycle(TruncateLifecycleRecord),
     AddFilesLifecycle(AddFilesLifecycleRecord),
@@ -577,14 +680,6 @@ pub struct StoredOperation {
     pub base_snapshot_id: Option<i64>,
     pub base_snapshot_map: BTreeMap<String, i64>,
     pub staged_artifacts: Vec<String>,
-    #[serde(default)]
-    pub commit_outcome: Option<IcebergCommitOutcomeRecord>,
-    #[serde(default)]
-    pub cleanup_outcome: Option<IcebergCleanupOutcomeRecord>,
-    #[serde(default)]
-    pub recovery_evidence: Option<IcebergRecoveryEvidenceRecord>,
-    #[serde(default)]
-    pub failure: Option<IcebergOperationFailureRecord>,
     pub payload: OperationPayload,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -615,10 +710,8 @@ pub struct OperationMutationRequest {
 pub struct WriteTransactionSpec {
     pub target: OperationTarget,
     pub operation_kind: OperationKind,
-    /// Stable statement refinement retained in the existing WriteV1 journal
-    /// envelope. `None` preserves INSERT/DELETE compatibility.
+    /// Stable statement refinement retained by the frontend lifecycle.
     pub operation_subkind: Option<String>,
-    pub commit_op_kind: CommitOpKind,
     pub attempt_id: String,
     pub base_snapshot_id: Option<i64>,
     pub base_snapshot_map: BTreeMap<String, i64>,
@@ -627,12 +720,39 @@ pub struct WriteTransactionSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteTransactionOutcome {
     pub operation_id: Option<DmlOperationId>,
-    pub committed_snapshot_id: Option<i64>,
+    pub committed_receipt: Option<ConnectorWriteReceipt>,
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
+
+    #[test]
+    fn connector_write_lifecycle_uses_only_opaque_spi_wire() {
+        let receipt =
+            ConnectorWriteReceipt::try_new(Bytes::from_static(b"opaque")).expect("receipt");
+        let lifecycle = ConnectorWriteLifecycleRecord::KnownCommitted {
+            receipt_wire: ConnectorWriteReceiptWire::try_from_receipt(&receipt).expect("wire"),
+            finalization: ConnectorWriteFinalizationRecord::Complete,
+        };
+        let encoded = serde_json::to_vec(&lifecycle).expect("JSON");
+        assert!(!String::from_utf8_lossy(&encoded).contains("snapshot_id"));
+        assert_eq!(
+            serde_json::from_slice::<ConnectorWriteLifecycleRecord>(&encoded).expect("decode"),
+            lifecycle
+        );
+    }
+
+    #[test]
+    fn lifecycle_tag_rejects_a_receipt_evidence_hybrid() {
+        let hybrid = br#"{
+            "outcome":"KNOWN_COMMITTED",
+            "evidence_wire":[1,2,3]
+        }"#;
+        assert!(serde_json::from_slice::<ConnectorWriteLifecycleRecord>(hybrid).is_err());
+    }
 
     #[test]
     fn statement_payload_json_round_trips() {

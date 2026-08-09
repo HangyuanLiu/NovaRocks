@@ -19,7 +19,8 @@ use super::{
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorRequestContext,
     ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteAttemptCompletion,
     ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
+    ConnectorWriteReceipt,
 };
 
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
@@ -188,11 +189,15 @@ impl ConnectorDistributedRewritePlanSummary {
 #[derive(Clone)]
 pub struct ConnectorDistributedRewriteCohortPlan {
     cohort_id: ConnectorWriteCohortId,
+    /// Opaque frozen source used only to plan the rewrite scan.  It is not a
+    /// write target and must not be substituted for `preparation.table()`.
     source: ConnectorTableHandle,
-    intent: ConnectorWriteIntent,
-    input_schema: SchemaRef,
-    input_schema_digest: [u8; 32],
-    provider_payload: Bytes,
+    /// Schema of the frozen scan output.  SQL needs this to build the
+    /// read-side physical carrier, but it is deliberately not the writer
+    /// contract: the Provider-signed preparation below owns input shape.
+    scan_schema: SchemaRef,
+    scan_schema_digest: [u8; 32],
+    preparation: ConnectorWritePreparation,
     group_digest: [u8; 32],
 }
 
@@ -201,20 +206,23 @@ impl ConnectorDistributedRewriteCohortPlan {
     pub fn try_new(
         cohort_id: ConnectorWriteCohortId,
         source: ConnectorTableHandle,
-        intent: ConnectorWriteIntent,
-        input_schema: SchemaRef,
-        input_schema_digest: [u8; 32],
-        provider_payload: Bytes,
+        scan_schema: SchemaRef,
+        scan_schema_digest: [u8; 32],
+        preparation: ConnectorWritePreparation,
         group_digest: [u8; 32],
     ) -> Result<Self, ConnectorError> {
-        validate_payload(&provider_payload, "cohort")?;
+        preparation.validate()?;
+        if source.owner() != preparation.table().owner() {
+            return Err(invalid(
+                "distributed rewrite cohort source does not match preparation owner",
+            ));
+        }
         Ok(Self {
             cohort_id,
             source,
-            intent,
-            input_schema,
-            input_schema_digest,
-            provider_payload,
+            scan_schema,
+            scan_schema_digest,
+            preparation,
             group_digest,
         })
     }
@@ -224,20 +232,17 @@ impl ConnectorDistributedRewriteCohortPlan {
     pub fn source(&self) -> &ConnectorTableHandle {
         &self.source
     }
-    pub const fn intent(&self) -> ConnectorWriteIntent {
-        self.intent
+    pub fn scan_schema(&self) -> &SchemaRef {
+        &self.scan_schema
     }
-    pub fn input_schema(&self) -> &SchemaRef {
-        &self.input_schema
+    /// Provider-owned canonical digest of the frozen scan Arrow schema.
+    pub const fn scan_schema_digest(&self) -> [u8; 32] {
+        self.scan_schema_digest
     }
-    /// Provider-owned canonical digest of the Arrow input schema.  The SPI
-    /// carries the concrete schema for C1 planning, while this digest makes
-    /// that schema an immutable part of the durable rewrite plan.
-    pub const fn input_schema_digest(&self) -> [u8; 32] {
-        self.input_schema_digest
-    }
-    pub fn provider_payload(&self) -> &Bytes {
-        &self.provider_payload
+    /// Provider-signed writer contract. Generic orchestration must pass this
+    /// through unchanged and never infer a `Data` shape from the scan schema.
+    pub fn preparation(&self) -> &ConnectorWritePreparation {
+        &self.preparation
     }
     pub const fn group_digest(&self) -> [u8; 32] {
         self.group_digest
@@ -245,11 +250,10 @@ impl ConnectorDistributedRewriteCohortPlan {
     fn digest_into(&self, hash: &mut Sha256) {
         hash.update(self.cohort_id.to_bytes());
         hash.update(self.group_digest);
-        hash.update([self.intent as u8]);
-        hash.update(self.input_schema_digest);
+        hash.update(self.scan_schema_digest);
         digest_bytes(hash, self.source.owner().as_str().as_bytes());
         digest_bytes(hash, self.source.payload());
-        digest_bytes(hash, &self.provider_payload);
+        hash.update(self.preparation.digest());
     }
 }
 
@@ -257,9 +261,9 @@ impl fmt::Debug for ConnectorDistributedRewriteCohortPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectorDistributedRewriteCohortPlan")
             .field("cohort_id", &self.cohort_id)
-            .field("intent", &self.intent)
+            .field("preparation_owner", self.preparation.owner())
+            .field("preparation_digest", &self.preparation.digest())
             .field("group_digest", &self.group_digest)
-            .field("provider_payload_len", &self.provider_payload.len())
             .finish_non_exhaustive()
     }
 }
@@ -298,9 +302,13 @@ impl ConnectorDistributedRewritePlan {
         if cohorts
             .windows(2)
             .any(|pair| pair[0].cohort_id == pair[1].cohort_id)
-            || cohorts
-                .iter()
-                .any(|cohort| cohort.source.owner() != &request.owner.instance_id)
+            || cohorts.iter().any(|cohort| {
+                cohort.source.owner() != &request.owner.instance_id
+                    || cohort.preparation.owner() != &request.owner
+                    || cohort.preparation.table() != request.operation.table()
+                    || cohort.preparation.intent()
+                        != rewrite_operation_intent(request.operation.kind())
+            })
         {
             return Err(invalid(
                 "distributed rewrite cohorts are invalid or foreign",
@@ -379,10 +387,14 @@ impl ConnectorDistributedRewritePlan {
             return Err(invalid("distributed rewrite plan is invalid"));
         }
         if self.target.owner() != &self.owner.instance_id
-            || self
-                .cohorts
-                .iter()
-                .any(|cohort| cohort.source.owner() != &self.owner.instance_id)
+            || self.cohorts.iter().any(|cohort| {
+                cohort.source.owner() != &self.owner.instance_id
+                    || cohort.preparation.validate().is_err()
+                    || cohort.preparation.owner() != &self.owner
+                    || cohort.preparation.table() != &self.target
+                    || cohort.preparation.intent()
+                        != rewrite_operation_intent(self.operation_kind())
+            })
         {
             return Err(invalid("distributed rewrite plan contains foreign cohort"));
         }
@@ -827,6 +839,15 @@ fn request_digest(
     operation.digest_into(&mut hash);
     hash.finalize().into()
 }
+
+fn rewrite_operation_intent(kind: &str) -> ConnectorWriteIntent {
+    match kind {
+        REWRITE_DATA_FILES_KIND => ConnectorWriteIntent::Overwrite,
+        REWRITE_POSITION_DELETES_KIND => ConnectorWriteIntent::RowDelta,
+        _ => unreachable!("validated distributed rewrite operation kind"),
+    }
+}
+
 fn plan_digest(
     request: [u8; 32],
     target: &ConnectorTableHandle,
@@ -899,6 +920,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+    use crate::connector::{
+        ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteInputShape,
+    };
 
     struct NotCancelled;
 
@@ -933,6 +958,34 @@ mod tests {
         .unwrap()
     }
 
+    fn preparation(
+        request: &ConnectorDistributedRewritePlanningRequest,
+        table: ConnectorTableHandle,
+        intent: ConnectorWriteIntent,
+        schema: &SchemaRef,
+    ) -> ConnectorWritePreparation {
+        let fields = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([index as u8 + 1; 32]),
+                    field.as_ref().clone(),
+                )
+            })
+            .collect();
+        ConnectorWritePreparation::try_new(
+            request.owner().clone(),
+            table,
+            intent,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap(),
+            ConnectorWriteInputShape::Data { fields },
+            Bytes::from_static(b"prepared"),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn cohort_schema_digest_is_part_of_the_frozen_plan_digest() {
         let request = request();
@@ -947,10 +1000,14 @@ mod tests {
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
                 request.operation().table().clone(),
-                ConnectorWriteIntent::RowDelta,
                 Arc::clone(&schema),
                 schema_digest,
-                Bytes::from_static(b"group"),
+                preparation(
+                    &request,
+                    request.operation().table().clone(),
+                    ConnectorWriteIntent::Overwrite,
+                    &schema,
+                ),
                 [7; 32],
             )
             .unwrap()
@@ -975,6 +1032,60 @@ mod tests {
         .unwrap();
 
         assert_ne!(first.plan_digest(), second.plan_digest());
+    }
+
+    #[test]
+    fn plan_rejects_cohort_preparation_with_wrong_target_or_intent() {
+        let request = request();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let cohort_id =
+            ConnectorWriteCohortId::derive(request.operation_id(), b"test", [7; 32]).unwrap();
+        let cohort = |preparation| {
+            ConnectorDistributedRewriteCohortPlan::try_new(
+                cohort_id,
+                request.operation().table().clone(),
+                Arc::clone(&schema),
+                [3; 32],
+                preparation,
+                [7; 32],
+            )
+            .unwrap()
+        };
+        let wrong_target = ConnectorTableHandle::try_new(
+            request.owner().instance_id.clone(),
+            Bytes::from_static(b"other-table"),
+        )
+        .unwrap();
+        for preparation in [
+            preparation(
+                &request,
+                wrong_target,
+                ConnectorWriteIntent::Overwrite,
+                &schema,
+            ),
+            preparation(
+                &request,
+                request.operation().table().clone(),
+                ConnectorWriteIntent::RowDelta,
+                &schema,
+            ),
+        ] {
+            assert!(
+                ConnectorDistributedRewritePlan::try_new(
+                    &request,
+                    [1; 32],
+                    [2; 32],
+                    ConnectorDistributedRewritePlanSummary::default(),
+                    Bytes::new(),
+                    vec![cohort(preparation)],
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

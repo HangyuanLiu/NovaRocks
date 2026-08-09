@@ -10,15 +10,14 @@
 
 use std::sync::Arc;
 
-use novarocks_spi::connector::{ConnectorRequestContext, ConnectorWriteCohortId};
+use novarocks_spi::connector::{
+    ConnectorRequestContext, ConnectorWriteCohortId, ConnectorWriteInputShape,
+};
 
-use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use crate::engine::StandaloneState;
-use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
+    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::distributed_rewrite::{
     ConnectorDistributedRewriteSession, FrozenRewriteReadResolver,
@@ -27,7 +26,6 @@ use crate::query_execution::distributed_rewrite::{
 use crate::query_execution::outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
 use crate::query_execution::request_context::QueryExecutionContext;
 
-use super::catalog::registry::load_table;
 /// Stage one sealed frozen cohort.  The caller is responsible for recording
 /// the returned completion as accepted or superseded before any aggregate
 /// commit is attempted.
@@ -48,7 +46,7 @@ pub(crate) fn stage_frozen_rewrite_cohort(
         session.lease(),
         execution.topology(),
         cohort.source(),
-        (0..cohort.input_schema().fields().len()).collect(),
+        (0..cohort.scan_schema().fields().len()).collect(),
         context.clone(),
     )
     .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
@@ -56,20 +54,20 @@ pub(crate) fn stage_frozen_rewrite_cohort(
     let source_binding =
         crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
             table_bindings.as_ref(),
-            cohort.input_schema(),
+            cohort.scan_schema(),
         )?;
     let resolver = FrozenRewriteReadResolver::new(read);
-    let physical_plan = frozen_rewrite_scan_physical_plan(cohort.input_schema(), source_binding);
-    let sink_spec = build_rewrite_sink_spec(state, session, cohort_id)?;
-    let target_binding = admit_frozen_iceberg_write_target(
+    let physical_plan = frozen_rewrite_scan_physical_plan(cohort.scan_schema(), source_binding);
+    let target_binding = admit_prepared_connector_write_target(
         table_bindings.as_ref(),
-        &sink_spec,
+        rewrite_target_identity(session, cohort_id),
+        cohort.preparation().clone(),
         session.lease().planning_lease(),
     )?;
     let sink = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
-        sink_spec.sql_mode(),
+        rewrite_sink_mode(cohort.preparation().input())?,
         crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
@@ -88,89 +86,32 @@ pub(crate) fn stage_frozen_rewrite_cohort(
     )
 }
 
-fn build_rewrite_sink_spec(
-    state: &Arc<StandaloneState>,
+fn rewrite_target_identity(
     session: &ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
-) -> Result<IcebergWriteSinkSpec, String> {
-    let (namespace, table_name) =
-        super::provider::decode_data_mutation_table_target(session.plan().target())
-            .map_err(|error| format!("decode distributed rewrite target: {error}"))?;
-    let catalog = session
-        .lease()
-        .binding_key()
-        .instance_id
-        .as_str()
-        .to_string();
-    let entry = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("read Iceberg rewrite catalog registry: {error}"))?
-        .get(&catalog)?;
-    let loaded = load_table(&entry, &namespace, &table_name)
-        .map_err(|error| format!("load distributed rewrite target table: {error}"))?;
-    let target = TargetBackend {
-        backend_name: "iceberg",
-        catalog: catalog.clone(),
-        namespace: namespace.clone(),
-        table: table_name.clone(),
-    };
-    let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
-        loaded.table.metadata().current_schema(),
-    )?;
-    let resolved = ResolvedTable {
-        catalog,
-        namespace,
-        table: table_name,
-        columns: columns.clone(),
-        statistics_pin: None,
-    };
-    match session.plan().operation_kind() {
-        novarocks_spi::connector::REWRITE_DATA_FILES_KIND => {
-            let cohort = session
-                .plan()
-                .cohorts()
-                .iter()
-                .find(|candidate| candidate.cohort_id() == cohort_id)
-                .ok_or_else(|| {
-                    "distributed rewrite execution names an unknown cohort".to_string()
-                })?;
-            let sink_spec = if super::catalog::backend::row_lineage_enabled(loaded.table.metadata())
-            {
-                crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
-                    &target,
-                    &resolved,
-                    &loaded.table,
-                    &entry,
-                )
-            } else {
-                crate::engine::iceberg_writer::build_insert_write_sink_spec(
-                    &target,
-                    &resolved,
-                    &loaded.table,
-                    &entry,
-                    &columns,
-                )
-            }?;
-            if cohort.input_schema().fields().len() != sink_spec.target_columns.len() {
-                return Err(format!(
-                    "frozen data rewrite input schema does not match target schema (cohort fields={}, sink fields={})",
-                    cohort.input_schema().fields().len(),
-                    sink_spec.target_columns.len(),
-                ));
-            }
-            Ok(sink_spec)
-        }
-        novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND => {
-            crate::engine::iceberg_writer::build_position_delete_sink_spec(
-                &target,
-                &resolved,
-                &loaded.table,
-                &entry,
-            )
-        }
-        kind => Err(format!(
-            "unsupported distributed rewrite operation kind `{kind}`"
-        )),
+) -> crate::sql::planner::table::SqlTableIdentity {
+    crate::sql::planner::table::SqlTableIdentity {
+        catalog: session
+            .lease()
+            .binding_key()
+            .instance_id
+            .as_str()
+            .to_string(),
+        namespace: "__connector_rewrite".to_string(),
+        table: format!("cohort_{}", hex::encode(cohort_id.to_bytes())),
+    }
+}
+
+fn rewrite_sink_mode(
+    input: &ConnectorWriteInputShape,
+) -> Result<crate::sql::planner::distributed::write::contract::SqlWriteSinkMode, String> {
+    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
+
+    match input {
+        ConnectorWriteInputShape::Data { .. } => Ok(SqlWriteSinkMode::Data),
+        ConnectorWriteInputShape::RowLineage { .. } => Ok(SqlWriteSinkMode::RowLineageData),
+        ConnectorWriteInputShape::PositionDelete { .. } => Ok(SqlWriteSinkMode::PositionDeletes),
+        ConnectorWriteInputShape::DeletionVector { .. } => Ok(SqlWriteSinkMode::DeletionVectors),
+        ConnectorWriteInputShape::EqualityDelete { .. } => Ok(SqlWriteSinkMode::EqualityDeletes),
     }
 }

@@ -169,7 +169,9 @@ pub struct IcebergInsertOperation {
     pub table: String,
     pub target_ref: String,
     pub attempt_id: String,
-    pub commit_op_kind: CommitOpKind,
+    /// Application-visible statement classification; the provider commit mode
+    /// remains private to Core and the connector.
+    pub is_overwrite: bool,
     pub base_snapshot_id: Option<i64>,
 }
 
@@ -209,6 +211,19 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
         prepared: &dyn IcebergPreparedInsert,
         commit: &dyn IcebergInsertCommit,
     ) -> Result<CommitOutcome, CommitServiceError>;
+
+    fn commit_iceberg_write_terminal(
+        &self,
+        _prepared: &dyn IcebergPreparedInsert,
+        _commit: &dyn IcebergInsertCommit,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        Err("Iceberg INSERT engine does not expose a connector terminal outcome".to_string())
+    }
 
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String>;
 }
@@ -336,7 +351,7 @@ impl InsertEngine for Arc<StandaloneState> {
             table: prepared.target().table.clone(),
             target_ref: request.target_ref,
             attempt_id: prepared.attempt_id().to_string(),
-            commit_op_kind: prepared.commit_op_kind(),
+            is_overwrite: !matches!(prepared.commit_op_kind(), CommitOpKind::FastAppend),
             base_snapshot_id: prepared.base_snapshot_id(),
         };
         Ok(PreparedIcebergInsert {
@@ -377,6 +392,24 @@ impl InsertEngine for Arc<StandaloneState> {
                 )
             })?;
         prepared.prepared.commit(&commit.completion)
+    }
+
+    fn commit_iceberg_write_terminal(
+        &self,
+        prepared: &dyn IcebergPreparedInsert,
+        commit: &dyn IcebergInsertCommit,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let prepared = downcast_prepared(prepared)?;
+        let commit = commit
+            .as_any()
+            .downcast_ref::<CoreIcebergInsertCommit>()
+            .ok_or_else(|| "foreign Iceberg INSERT commit handle".to_string())?;
+        prepared.prepared.commit_terminal(&commit.completion)
     }
 
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String> {

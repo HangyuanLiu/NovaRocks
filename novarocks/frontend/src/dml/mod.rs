@@ -43,14 +43,13 @@ pub use journal::OperationJournal;
 pub use model::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
-    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
+    ConnectorWriteFailureKind, ConnectorWriteFailureRecord, ConnectorWriteFinalizationRecord,
+    ConnectorWriteLifecycleRecord, ConnectorWriteReceiptWire, CreatePreparingRequest,
     CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlOperationId,
-    DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, IcebergCleanupOutcomeRecord,
-    IcebergCommitOutcomeRecord, IcebergOperationFailureKind, IcebergOperationFailureRecord,
-    IcebergOperationNextAction, IcebergRecoveryEvidenceRecord, OperationFact, OperationKind,
-    OperationMutationRequest, OperationPayload, OperationState, OperationTarget, RecoveryEvidence,
-    SourceScopeOwnership, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
-    TruncateLifecycleRecord, WriteTransactionOutcome, WriteTransactionSpec,
+    DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, ExternalMutationEvidenceWire,
+    OperationFact, OperationKind, OperationMutationRequest, OperationPayload, OperationState,
+    OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
+    TruncateLifecyclePhase, TruncateLifecycleRecord, WriteTransactionOutcome, WriteTransactionSpec,
 };
 pub use runner::{
     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,

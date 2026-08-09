@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use novarocks::common::app_config::ClusterRole;
+use novarocks::connector::iceberg::commit::CommitOpKind;
 use novarocks::engine::delete_engine::{
     DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatementKind,
     DeleteWriteReport, PrepareDeleteRequest, PreparedDelete,
@@ -30,9 +32,12 @@ use novarocks::query_execution::cancellation::QueryCancellationSource;
 use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
 use novarocks_frontend::dml::model::DML_OPERATION_SCHEMA_VERSION;
 use novarocks_frontend::dml::{
-    CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest, DmlError,
-    DmlErrorKind, DmlOperationId, DmlService, OperationFact, OperationJournal, OperationKind,
-    OperationState, StoredOperation,
+    CreatePreparingRequest, DmlError, DmlErrorKind, DmlOperationId, DmlService, OperationFact,
+    OperationJournal, OperationKind, OperationState, StoredOperation,
+};
+use novarocks_spi::connector::{
+    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 use uuid::Uuid;
 
@@ -120,11 +125,28 @@ impl DeleteEngine for FakeDeleteEngine {
         &self,
         _prepared: &dyn DeletePrepared,
         _commit: &dyn DeleteCommit,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<
+        novarocks::connector::iceberg::commit::CommitOutcome,
+        novarocks::connector::iceberg::commit::CommitServiceError,
+    > {
+        Err(
+            novarocks::connector::iceberg::commit::CommitServiceError::invalid_input(
+                "test engine exposes only the terminal commit contract".to_string(),
+            ),
+        )
+    }
+
+    fn commit_delete_terminal(
+        &self,
+        _prepared: &dyn DeletePrepared,
+        _commit: &dyn DeleteCommit,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
         *self.commit_calls.lock().unwrap() += 1;
-        Ok(CommitOutcome {
-            new_snapshot_id: 8,
-            written_manifest_paths: Vec::new(),
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: ConnectorWriteReceipt::try_new(Bytes::from_static(b"delete-commit"))
+                .expect("test receipt"),
+            finalization: ExternalMutationFinalization::Complete,
         })
     }
 
@@ -171,11 +193,9 @@ impl OperationJournal for FakeJournal {
                 base_snapshot_id: request.base_snapshot_id,
                 base_snapshot_map: request.base_snapshot_map,
                 staged_artifacts: request.staged_artifacts,
-                commit_outcome: None,
-                cleanup_outcome: None,
-                recovery_evidence: None,
-                failure: None,
-                payload: novarocks_frontend::dml::model::OperationPayload::WriteV1,
+                payload: novarocks_frontend::dml::model::OperationPayload::ConnectorWriteLifecycle(
+                    novarocks_frontend::dml::model::ConnectorWriteLifecycleRecord::Pending,
+                ),
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,
@@ -204,10 +224,10 @@ impl OperationJournal for FakeJournal {
             .get_mut(operation_id.as_uuid())
             .expect("fake operation");
         operation.state = fact.state;
-        operation.commit_outcome = fact.commit_outcome;
-        operation.cleanup_outcome = fact.cleanup_outcome;
-        operation.recovery_evidence = fact.recovery_evidence;
-        operation.failure = fact.failure;
+        operation.payload =
+            novarocks_frontend::dml::model::OperationPayload::ConnectorWriteLifecycle(
+                fact.lifecycle,
+            );
         operation.revision += 1;
         Ok(())
     }
@@ -286,7 +306,7 @@ fn delete_requires_journal_before_prepare() {
 }
 
 #[test]
-fn delete_uses_admitted_context_and_records_noop_as_aborted() {
+fn delete_uses_admitted_context_and_records_noop_as_known_empty() {
     let engine = FakeDeleteEngine::new(WriteBehavior::NoOp);
     let journal = Arc::new(FakeJournal::default());
     let service = DmlService::new(Arc::clone(&journal) as Arc<dyn OperationJournal>);
@@ -301,7 +321,7 @@ fn delete_uses_admitted_context_and_records_noop_as_aborted() {
         engine.prepare_calls.lock().unwrap().as_slice(),
         &[(DeleteStatementKind::Predicate, 91, Some(deadline))],
     );
-    assert_eq!(journal.states(), vec![OperationState::Aborted]);
+    assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert_eq!(*engine.commit_calls.lock().unwrap(), 0);
     assert_eq!(*engine.finalize_calls.lock().unwrap(), 0);
 }
@@ -342,7 +362,7 @@ fn aborted_delete_does_not_commit() {
     let error = service
         .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
         .unwrap_err();
-    assert!(error.to_string().contains("aborted before commit"));
+    assert!(error.to_string().contains("writer aborted"));
     assert_eq!(
         journal.states(),
         vec![OperationState::FailedKnownUncommitted]

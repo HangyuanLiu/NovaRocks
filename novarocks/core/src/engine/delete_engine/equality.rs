@@ -34,8 +34,6 @@ use crate::connector::iceberg::commit::{
     ensure_equality_delete_single_partition_spec,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
-use crate::connector::iceberg::write_contract::IcebergWriteSinkMode;
-use crate::connector::iceberg::write_contract::encode_equality_delete_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::delete_engine::{
@@ -44,7 +42,7 @@ use crate::engine::delete_engine::{
 };
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    admit_frozen_iceberg_write_target, sql_write_plan_input_from_admitted_binding,
+    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -52,7 +50,10 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_spi::connector::{ConnectorWriteIntent, ConnectorWriteOperationId};
+use novarocks_spi::connector::{
+    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, ConnectorWriteOperationId,
+};
 
 pub(crate) fn prepare_equality_delete_statement(
     state: &Arc<StandaloneState>,
@@ -186,6 +187,22 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         )
     }
 
+    fn commit_terminal(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
+            self.connector_write.preparation().owner(),
+            self.connector_write.operation_id(),
+            self.commit(completion),
+        )
+    }
+
     fn finalize(&self) -> Result<(), String> {
         crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)
     }
@@ -205,47 +222,43 @@ fn prepare_equality_delete_distributed_write(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedDelete, String> {
-    let resolved = crate::connector::metadata_load_table_with_planning_lease(
-        planning_lease.clone(),
-        connector_context.clone(),
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?
-    .0;
-    let mut sink_spec = crate::engine::iceberg_writer::build_equality_delete_sink_spec(
-        target,
-        &resolved,
-        &table,
-        &entry,
-        delete_columns,
-    )?;
-    sink_spec.mode = IcebergWriteSinkMode::EqualityDeletes;
-    sink_spec.set_planned_snapshot_id(current_snapshot_id)?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
-    let target_binding = admit_frozen_iceberg_write_target(
+    let preparation = crate::engine::iceberg_writer::prepare_iceberg_connector_write(
+        &write_lease,
+        target,
+        ConnectorWriteIntent::RowDelta,
+        ConnectorWriteInputRequest::EqualityDelete {
+            equality_fields: delete_columns
+                .iter()
+                .map(|column| {
+                    ConnectorWriteFieldRequest::new(Field::new(
+                        &column.name,
+                        column.data_type.clone(),
+                        column.nullable,
+                    ))
+                })
+                .collect(),
+        },
+        ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        connector_context.clone(),
+    )?;
+    let target_binding = admit_prepared_connector_write_target(
         table_bindings.as_ref(),
-        &sink_spec,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        preparation.clone(),
         planning_lease.clone(),
     )?;
-    let input_columns = delete_columns
-        .iter()
-        .map(|column| ColumnDef {
-            name: column.name.clone(),
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
-            write_default: None,
-            logical_type: None,
-        })
-        .collect();
-    let sql_write_input = sql_write_plan_input_from_admitted_binding(
+    let sql_write_input = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
-        sink_spec.sql_mode(),
-        input_columns,
+        crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::EqualityDeletes,
         crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
@@ -286,22 +299,12 @@ fn prepare_equality_delete_distributed_write(
         snapshot_properties: BTreeMap::new(),
     });
     let connector_operation_id = ConnectorWriteOperationId::new();
-    let writer_handle_payload =
-        encode_equality_delete_sink_spec_handle_payload(&sink_spec, delete_columns)?;
-    let input_schema = Arc::new(ArrowSchema::new(
-        sink_spec
-            .target_columns
-            .iter()
-            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-            .collect::<Vec<_>>(),
-    ));
-    let connector_write = crate::engine::iceberg_writer::register_iceberg_connector_write(
+    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_connector_write(
         state,
-        target,
         "main",
-        ConnectorWriteIntent::RowDelta,
-        input_schema,
-        writer_handle_payload,
+        preparation,
+        &entry,
+        &table,
         Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),

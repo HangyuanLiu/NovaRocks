@@ -25,18 +25,17 @@ use bytes::Bytes;
 use novarocks_frontend::dml::model::{
     CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
     DML_CTAS_FACT_ENCODED_LIMIT, DML_CTAS_TOTAL_FACT_ENCODED_LIMIT,
-    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_LEGACY_OPERATION_SCHEMA_VERSION,
-    DML_OPERATION_SCHEMA_VERSION,
+    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_OPERATION_SCHEMA_VERSION,
 };
 use novarocks_frontend::dml::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
+    ConnectorWriteFailureKind, ConnectorWriteFailureRecord, ConnectorWriteLifecycleRecord,
     CreatePreparingRequest, CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
     DmlErrorKind, DmlOperationId, DurableExternalFact, DurableMutationSummary, ExternalFactOutcome,
-    IcebergCommitOutcomeRecord, OperationFact, OperationJournal, OperationKind,
-    OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
-    SourceScopeOwnership, StateStoreOperationJournal, StatementNextAction, StoredOperation,
-    TruncateLifecyclePhase, TruncateLifecycleRecord,
+    OperationFact, OperationJournal, OperationKind, OperationMutationRequest, OperationPayload,
+    OperationState, OperationTarget, SourceScopeOwnership, StateStoreOperationJournal,
+    StatementNextAction, StoredOperation, TruncateLifecyclePhase, TruncateLifecycleRecord,
 };
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome as StateStoreCommitOutcome, CommitResolution,
@@ -184,10 +183,7 @@ fn raw_operation_with_kind(operation_id: Uuid, schema_version: u8, operation_kin
         "base_snapshot_id": null,
         "base_snapshot_map": {},
         "staged_artifacts": [],
-        "commit_outcome": null,
-        "cleanup_outcome": null,
-        "recovery_evidence": null,
-        "failure": null,
+        "payload": {"kind": "CONNECTOR_WRITE_LIFECYCLE", "details": {"outcome": "PENDING"}},
         "created_at_ms": 1,
         "updated_at_ms": 1,
         "finished_at_ms": null
@@ -430,13 +426,7 @@ async fn typed_abort_known_committed_removes_unfinished_index() {
             operation_id,
             OperationFact {
                 state: OperationState::Committed,
-                commit_outcome: Some(IcebergCommitOutcomeRecord {
-                    snapshot_id: 11,
-                    written_manifest_paths: vec![],
-                }),
-                cleanup_outcome: None,
-                recovery_evidence: None,
-                failure: None,
+                lifecycle: ConnectorWriteLifecycleRecord::KnownEmpty,
             },
         )
         .unwrap();
@@ -451,7 +441,7 @@ async fn typed_abort_known_committed_removes_unfinished_index() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn typed_abort_unknown_remains_in_unfinished_index_after_restart() {
+async fn typed_abort_known_uncommitted_removes_unfinished_index_after_restart() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.sqlite");
     let (mut host, store, journal) = open_store(&path).await;
@@ -463,11 +453,13 @@ async fn typed_abort_unknown_remains_in_unfinished_index_after_restart() {
         .record_fact(
             operation_id,
             OperationFact {
-                state: OperationState::CommitUnknown,
-                commit_outcome: None,
-                cleanup_outcome: None,
-                recovery_evidence: None,
-                failure: None,
+                state: OperationState::FailedKnownUncommitted,
+                lifecycle: ConnectorWriteLifecycleRecord::KnownUncommitted {
+                    failure: ConnectorWriteFailureRecord {
+                        kind: ConnectorWriteFailureKind::Internal,
+                        message: "connector outcome unavailable".to_string(),
+                    },
+                },
             },
         )
         .unwrap();
@@ -478,10 +470,7 @@ async fn typed_abort_unknown_remains_in_unfinished_index_after_restart() {
         .unwrap();
 
     let (_host, _store, reopened) = open_store(&path).await;
-    let unfinished = reopened.list_unfinished().unwrap();
-    assert_eq!(unfinished.len(), 1);
-    assert_eq!(unfinished[0].operation_id, operation_id);
-    assert_eq!(unfinished[0].state, OperationState::CommitUnknown);
+    assert!(reopened.list_unfinished().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -494,25 +483,13 @@ async fn identical_fact_replay_is_idempotent() {
         .unwrap();
     let fact = OperationFact {
         state: OperationState::Committed,
-        commit_outcome: Some(IcebergCommitOutcomeRecord {
-            snapshot_id: 7,
-            written_manifest_paths: vec!["m.avro".to_string()],
-        }),
-        cleanup_outcome: None,
-        recovery_evidence: None,
-        failure: None,
+        lifecycle: ConnectorWriteLifecycleRecord::KnownEmpty,
     };
     journal.record_fact(operation_id, fact.clone()).unwrap();
-    journal.record_fact(operation_id, fact).unwrap();
+    journal.record_fact(operation_id, fact.clone()).unwrap();
     assert_eq!(
-        journal
-            .load(operation_id)
-            .unwrap()
-            .unwrap()
-            .commit_outcome
-            .unwrap()
-            .snapshot_id,
-        7
+        journal.load(operation_id).unwrap().unwrap().payload,
+        OperationPayload::ConnectorWriteLifecycle(fact.lifecycle),
     );
 }
 
@@ -524,18 +501,20 @@ async fn conflicting_fact_replay_is_rejected() {
     journal
         .transition(operation_id, OperationState::Committing)
         .unwrap();
-    let fact = |snapshot_id| OperationFact {
-        state: OperationState::Committed,
-        commit_outcome: Some(IcebergCommitOutcomeRecord {
-            snapshot_id,
-            written_manifest_paths: Vec::new(),
-        }),
-        cleanup_outcome: None,
-        recovery_evidence: None,
-        failure: None,
+    let fact = OperationFact {
+        state: OperationState::Committing,
+        lifecycle: ConnectorWriteLifecycleRecord::Pending,
     };
-    journal.record_fact(operation_id, fact(7)).unwrap();
-    let error = journal.record_fact(operation_id, fact(8)).unwrap_err();
+    journal.record_fact(operation_id, fact).unwrap();
+    let error = journal
+        .record_fact(
+            operation_id,
+            OperationFact {
+                state: OperationState::Committing,
+                lifecycle: ConnectorWriteLifecycleRecord::KnownEmpty,
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(error.to_string().contains("conflicting"));
 }
@@ -583,7 +562,7 @@ async fn key_value_operation_identity_mismatch_is_corruption() {
     raw_put(
         store.as_ref(),
         key(OPERATION_PREFIX, key_id),
-        raw_operation(value_id, 1),
+        raw_operation(value_id, DML_OPERATION_SCHEMA_VERSION),
     )
     .await;
     let error =
@@ -868,10 +847,6 @@ fn stored_statement_operation(
         base_snapshot_id: None,
         base_snapshot_map: BTreeMap::new(),
         staged_artifacts: Vec::new(),
-        commit_outcome: None,
-        cleanup_outcome: None,
-        recovery_evidence: None,
-        failure: None,
         payload,
         created_at_ms: 200,
         updated_at_ms: 200,
@@ -1070,92 +1045,21 @@ async fn add_files_atomic_reservation_rejects_conflicts_and_restart_releases_und
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn literal_v1_record_decodes_to_normalized_write_payload() {
+async fn prior_schema_record_is_rejected_without_compatibility_decode() {
     let temp = TempDir::new().unwrap();
     let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
     let operation_id = Uuid::now_v7();
     raw_put(
         store.as_ref(),
         key(OPERATION_PREFIX, operation_id),
-        raw_operation(operation_id, DML_LEGACY_OPERATION_SCHEMA_VERSION),
+        raw_operation(operation_id, DML_OPERATION_SCHEMA_VERSION - 1),
     )
     .await;
 
-    let stored = journal
+    let error = journal
         .load(DmlOperationId::from(operation_id))
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.schema_version, DML_LEGACY_OPERATION_SCHEMA_VERSION);
-    assert_eq!(stored.payload, OperationPayload::WriteV1);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn literal_v1_record_without_subkind_decodes_as_none() {
-    let temp = TempDir::new().unwrap();
-    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
-    let operation_id = Uuid::now_v7();
-    let value = json!({
-        "schema_version": DML_LEGACY_OPERATION_SCHEMA_VERSION,
-        "operation_id": operation_id,
-        "revision": 1,
-        "last_mutation_id": Uuid::now_v7(),
-        "operation_kind": "ROW_DELTA",
-        "target": {
-            "catalog": "cat",
-            "namespace": "ns",
-            "table": "tbl",
-            "ref_name": null
-        },
-        "state": "PREPARING",
-        "attempt_id": "attempt-1",
-        "base_snapshot_id": null,
-        "base_snapshot_map": {},
-        "staged_artifacts": [],
-        "commit_outcome": null,
-        "cleanup_outcome": null,
-        "recovery_evidence": null,
-        "failure": null,
-        "created_at_ms": 1,
-        "updated_at_ms": 1,
-        "finished_at_ms": null
-    });
-    raw_put(
-        store.as_ref(),
-        key(OPERATION_PREFIX, operation_id),
-        Value::try_from(Bytes::from(serde_json::to_vec(&value).unwrap())).unwrap(),
-    )
-    .await;
-
-    let stored = journal
-        .load(DmlOperationId::from(operation_id))
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.operation_kind, OperationKind::RowDelta);
-    assert_eq!(stored.operation_subkind, None);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn literal_v1_delete_record_decodes_to_normalized_write_payload() {
-    let temp = TempDir::new().unwrap();
-    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
-    let operation_id = Uuid::now_v7();
-    raw_put(
-        store.as_ref(),
-        key(OPERATION_PREFIX, operation_id),
-        raw_operation_with_kind(
-            operation_id,
-            DML_LEGACY_OPERATION_SCHEMA_VERSION,
-            "ROW_DELTA",
-        ),
-    )
-    .await;
-
-    let stored = journal
-        .load(DmlOperationId::from(operation_id))
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.operation_kind, OperationKind::RowDelta);
-    assert_eq!(stored.payload, OperationPayload::WriteV1);
+        .expect_err("prior schema must not be decoded");
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1314,37 +1218,6 @@ async fn statement_create_replay_is_idempotent_and_conflict_is_unresolved() {
             .kind(),
         DmlErrorKind::JournalUnresolved
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn literal_v1_mutation_upgrades_record_to_current_schema() {
-    let temp = TempDir::new().unwrap();
-    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
-    let operation_uuid = Uuid::now_v7();
-    raw_put(
-        store.as_ref(),
-        key(OPERATION_PREFIX, operation_uuid),
-        raw_operation(operation_uuid, DML_LEGACY_OPERATION_SCHEMA_VERSION),
-    )
-    .await;
-    raw_put(
-        store.as_ref(),
-        key(UNFINISHED_PREFIX, operation_uuid),
-        raw_unfinished(operation_uuid),
-    )
-    .await;
-    let operation_id = DmlOperationId::from(operation_uuid);
-    let upgraded = journal
-        .mutate_statement_operation(OperationMutationRequest {
-            operation_id,
-            expected_revision: 1,
-            mutation_id: Uuid::now_v7(),
-            state: OperationState::Writing,
-            payload: OperationPayload::WriteV1,
-        })
-        .unwrap();
-    assert_eq!(upgraded.schema_version, DML_OPERATION_SCHEMA_VERSION);
-    assert_eq!(journal.load(operation_id).unwrap().unwrap(), upgraded);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -33,12 +33,10 @@ pub use crate::query_execution::statistics::StatisticsCollectionProgram;
 pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
 use crate::runtime::query_options::QueryOptions;
-use arrow::datatypes::SchemaRef;
-use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWritePlanningRequest,
+    ConnectorError, ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorWriteCohortId,
+    ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWritePlanningRequest, ConnectorWritePreparation,
 };
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
@@ -144,50 +142,43 @@ pub enum DistributedQueryIntent {
 pub struct ConnectorWritePlanningTemplate {
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
-    table: ConnectorTableHandle,
-    intent: ConnectorWriteIntent,
-    input_schema: SchemaRef,
-    provider_payload: Bytes,
+    preparation: ConnectorWritePreparation,
     context: ConnectorRequestContext,
+    // This lease is derived from the planning generation that accepted the
+    // preparation.  Keeping it with the inert planning template prevents an
+    // execution handoff from replacing it with a current-generation lookup.
+    lease: ConnectorWriteLease,
 }
 
 impl ConnectorWritePlanningTemplate {
     pub fn new(
         operation_id: ConnectorWriteOperationId,
-        table: ConnectorTableHandle,
-        intent: ConnectorWriteIntent,
-        input_schema: SchemaRef,
-        provider_payload: Bytes,
+        preparation: ConnectorWritePreparation,
         context: ConnectorRequestContext,
+        lease: ConnectorWriteLease,
     ) -> Self {
         Self::new_in_cohort(
             operation_id,
             ConnectorWriteCohortId::primary(operation_id),
-            table,
-            intent,
-            input_schema,
-            provider_payload,
+            preparation,
             context,
+            lease,
         )
     }
 
     pub fn new_in_cohort(
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
-        table: ConnectorTableHandle,
-        intent: ConnectorWriteIntent,
-        input_schema: SchemaRef,
-        provider_payload: Bytes,
+        preparation: ConnectorWritePreparation,
         context: ConnectorRequestContext,
+        lease: ConnectorWriteLease,
     ) -> Self {
         Self {
             operation_id,
             cohort_id,
-            table,
-            intent,
-            input_schema,
-            provider_payload,
+            preparation,
             context,
+            lease,
         }
     }
 
@@ -200,15 +191,30 @@ impl ConnectorWritePlanningTemplate {
     }
 
     pub fn connector_instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
-        self.table.owner()
+        self.preparation.table().owner()
     }
 
-    pub const fn intent(&self) -> ConnectorWriteIntent {
-        self.intent
+    pub fn preparation(&self) -> &ConnectorWritePreparation {
+        &self.preparation
+    }
+
+    pub fn intent(&self) -> novarocks_spi::connector::ConnectorWriteIntent {
+        self.preparation.intent()
     }
 
     pub fn context(&self) -> &ConnectorRequestContext {
         &self.context
+    }
+
+    /// The exact write lease derived by the planning generation that signed
+    /// this preparation.  A caller must retain this capability through bind;
+    /// it must never reacquire a current generation.
+    pub fn lease(&self) -> ConnectorWriteLease {
+        self.lease.clone()
+    }
+
+    pub fn retains_lease_generation(&self, lease: &ConnectorWriteLease) -> bool {
+        self.lease.retains_same_generation(lease)
     }
 
     pub fn stable_digest(
@@ -228,11 +234,8 @@ impl ConnectorWritePlanningTemplate {
             operation_id: self.operation_id,
             cohort_id: self.cohort_id,
             execution_id,
-            table: self.table,
-            intent: self.intent,
-            input_schema: self.input_schema,
+            preparation: self.preparation,
             expected_writers: Vec::new(),
-            provider_payload: self.provider_payload,
             context: self.context,
         }
     }
@@ -244,7 +247,7 @@ impl ConnectorWritePlanningTemplate {
 #[derive(Clone)]
 pub struct ConnectorWriteOperationRegistration {
     operation_id: ConnectorWriteOperationId,
-    connector_instance_id: novarocks_spi::connector::ConnectorInstanceId,
+    owner: ConnectorExecutionBindingKey,
     cohorts: Vec<ConnectorWritePlanningTemplate>,
 }
 
@@ -259,11 +262,13 @@ impl ConnectorWriteOperationRegistration {
             )
         })?;
         let operation_id = first.operation_id();
-        let connector_instance_id = first.connector_instance_id().clone();
+        let owner = first.preparation().owner().clone();
+        let lease = first.lease();
         let mut cohort_ids = std::collections::BTreeSet::new();
         for cohort in &cohorts {
             if cohort.operation_id() != operation_id
-                || cohort.connector_instance_id() != &connector_instance_id
+                || cohort.preparation().owner() != &owner
+                || !cohort.retains_lease_generation(&lease)
                 || !cohort_ids.insert(cohort.cohort_id())
             {
                 return Err(DistributedQueryError::new(
@@ -274,7 +279,7 @@ impl ConnectorWriteOperationRegistration {
         }
         Ok(Self {
             operation_id,
-            connector_instance_id,
+            owner,
             cohorts,
         })
     }
@@ -287,8 +292,8 @@ impl ConnectorWriteOperationRegistration {
         self.operation_id
     }
 
-    pub fn connector_instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
-        &self.connector_instance_id
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
     }
 
     pub fn into_cohorts(self) -> Vec<ConnectorWritePlanningTemplate> {
@@ -522,23 +527,11 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
     fn begin_write_operation(
         &self,
         _registration: ConnectorWriteOperationRegistration,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "distributed query coordinator has no connector write operation service",
-        ))
-    }
-
-    /// Seal a distributed writer against a lease acquired by the application
-    /// from the exact control generation used during planning.
-    fn begin_write_operation_with_lease(
-        &self,
-        _registration: ConnectorWriteOperationRegistration,
         _lease: ConnectorWriteLease,
     ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
         Err(DistributedQueryError::new(
             DistributedQueryErrorKind::Rejected,
-            "distributed query coordinator does not accept caller-retained connector write leases",
+            "distributed query coordinator has no connector write operation service",
         ))
     }
 

@@ -24,6 +24,7 @@ use novarocks_connector_iceberg::commit::AbortLog;
 use novarocks_connector_iceberg::iceberg::{
     Catalog, ErrorKind, TableCommit, TableRequirement, TableUpdate,
 };
+use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
     ConnectorInstanceIncarnation, ConnectorMutationFailure, ConnectorMutationFailureKind,
@@ -38,14 +39,61 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization,
 };
 
+use super::catalog::backend::iceberg_schema_def_for_codegen;
 use super::catalog::registry::{
     IcebergCatalogEntry, RestStagedPrepareFailure, RestStagedTableCreate, block_on_iceberg,
     prepare_rest_staged_table,
+};
+use super::write_contract::{
+    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 use super::write_service::IcebergWriteServiceRegistry;
 
 const EVIDENCE_VERSION: u16 = 1;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
+
+fn staged_data_sink_spec(
+    catalog: &str,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
+) -> Result<IcebergWriteSinkSpec, ConnectorError> {
+    let metadata = table.metadata();
+    let ident = table.identifier();
+    let iceberg = IcebergTableInfo {
+        catalog: catalog.to_string(),
+        namespace: ident.namespace.to_url_string(),
+        table: ident.name.clone(),
+        table_uuid: Some(metadata.uuid().to_string()),
+        current_snapshot_id: metadata.current_snapshot_id(),
+        schema_id: metadata.current_schema_id(),
+        location: metadata.location().to_string(),
+        schema: iceberg_schema_def_for_codegen(metadata.current_schema()),
+        serialized_metadata: Some(
+            serde_json::to_string(metadata)
+                .map_err(|error| internal(format!("serialize staged table metadata: {error}")))?,
+        ),
+        serialized_metadata_rows: None,
+    };
+    let table_location = metadata.location().to_string();
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
+    Ok(IcebergWriteSinkSpec {
+        mode: IcebergWriteSinkMode::Data,
+        iceberg,
+        target_columns: target_columns.to_vec(),
+        table_location,
+        data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+        cloud_properties: entry.cloud_properties_map(),
+        file_format: "parquet".to_string(),
+        compression: IcebergWriteFileCompression::Snappy,
+        position_delete_output_descriptor: None,
+    })
+}
 
 #[derive(Clone)]
 pub(crate) struct IcebergStagedCreateAdapter {
@@ -552,31 +600,16 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             let entry = &self.entry;
             let staged_table = &prepared.staged.table;
             let ident = staged_table.identifier();
-            let target = crate::engine::backend_resolver::TargetBackend {
-                backend_name: "iceberg",
-                catalog: self.descriptor.instance_id.as_str().to_string(),
-                namespace: ident.namespace.to_url_string(),
-                table: ident.name.clone(),
-            };
             let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
                 staged_table.metadata().current_schema(),
             )
             .map_err(internal)?;
-            let resolved = crate::connector::backend::ResolvedTable {
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-                columns: columns.clone(),
-                statistics_pin: None,
-            };
-            let sink_spec = crate::engine::iceberg_writer::build_insert_write_sink_spec(
-                &target,
-                &resolved,
+            let sink_spec = staged_data_sink_spec(
+                self.descriptor.instance_id.as_str(),
                 staged_table,
                 entry,
                 &columns,
-            )
-            .map_err(internal)?;
+            )?;
             let writer_handle_payload =
                 super::write_contract::encode_data_sink_spec_handle_payload(&sink_spec)
                     .map_err(internal)?;
@@ -616,7 +649,12 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             });
             let plan_payload = super::write_control::IcebergWritePlanPayloadV1 {
                 version: 1,
-                target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+                target: format!(
+                    "{}.{}.{}",
+                    self.descriptor.instance_id.as_str(),
+                    ident.namespace,
+                    ident.name
+                ),
                 target_ref: "main".to_string(),
             };
             let provider_payload = plan_payload.encode()?;

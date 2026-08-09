@@ -115,6 +115,15 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError>;
+    fn commit_terminal(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    >;
     fn finalize(&self) -> Result<(), String>;
 }
 
@@ -128,6 +137,18 @@ pub trait DeleteEngine: Send + Sync {
         prepared: &dyn DeletePrepared,
         commit: &dyn DeleteCommit,
     ) -> Result<CommitOutcome, CommitServiceError>;
+    fn commit_delete_terminal(
+        &self,
+        _prepared: &dyn DeletePrepared,
+        _commit: &dyn DeleteCommit,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        Err("DELETE engine does not expose a connector terminal outcome".to_string())
+    }
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String>;
 }
 
@@ -213,6 +234,24 @@ impl DeleteEngine for Arc<StandaloneState> {
                 )
             })?;
         prepared.execution.commit(&commit.completion)
+    }
+
+    fn commit_delete_terminal(
+        &self,
+        prepared: &dyn DeletePrepared,
+        commit: &dyn DeleteCommit,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let prepared = downcast_prepared(prepared)?;
+        let commit = commit
+            .as_any()
+            .downcast_ref::<CoreDeleteCommit>()
+            .ok_or_else(|| "foreign DELETE commit handle".to_string())?;
+        prepared.execution.commit_terminal(&commit.completion)
     }
 
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {

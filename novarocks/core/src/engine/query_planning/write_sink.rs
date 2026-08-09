@@ -17,23 +17,26 @@
 
 //! Application projection for SQL terminal write contracts.
 //!
-//! The compiler receives the resulting [`SqlWritePlanInput`] only.  Iceberg
-//! metadata is read here from the exact request-local binding selected during
-//! admission; it is not retained in the SQL plan and this module never
-//! performs a current/latest connector acquisition.
+//! The compiler receives the resulting [`SqlWritePlanInput`] only. Provider
+//! metadata never crosses this boundary: the request-local binding retains a
+//! sealed write preparation and SQL sees only its Arrow layout and field
+//! tokens.
 
-use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
-use arrow::datatypes::DataType;
 use novarocks_catalog::schema::ColumnDef;
 
 use super::bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
+    QueryWriteTargetAdmission,
 };
 use crate::sql::analysis::TypedExpr;
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::planner::distributed::write::contract::{
     ConnectorWriteInputBinding, SqlWritePlanInput, SqlWriteSinkContract, SqlWriteSinkMode,
-    SqlWriteSinkTargetContract,
+    SqlWriteSinkTargetContract, SqlWriteTargetField,
+};
+use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, TableDef};
+use novarocks_spi::connector::{
+    ConnectorControlPlanningLease, ConnectorWriteInputShape, ConnectorWritePreparation,
 };
 
 /// Project one already-admitted write target into the SQL compiler boundary.
@@ -54,45 +57,37 @@ pub(crate) fn sql_write_plan_input_from_admitted_binding(
     captured.admission.exact_planning_lease().map_err(|_| {
         "SQL write target binding is missing its admission planning lease".to_string()
     })?;
-    let admission = admitted_write_target(&captured)?;
-    let identity = admission.identity.clone();
-    let resolved_identity = &captured.resolved.catalog.identity;
-    if !resolved_identity
-        .catalog
-        .eq_ignore_ascii_case(&identity.catalog)
-        || !resolved_identity
-            .namespace
-            .eq_ignore_ascii_case(&identity.namespace)
-        || !resolved_identity
-            .table
-            .eq_ignore_ascii_case(&identity.table)
-    {
-        return Err(
-            "SQL write target binding identity differs from its admitted table".to_string(),
-        );
-    }
+    let preparation = &admitted_write_target(&captured)?.preparation;
+    preparation
+        .validate()
+        .map_err(|error| format!("validate SQL write preparation: {error}"))?;
+    validate_mode(mode, preparation.input())?;
     let target = SqlWriteSinkTargetContract::try_new(
         binding,
-        identity,
-        admission.snapshot_id,
-        admission.fields.clone(),
-        admission.partition.clone(),
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: captured.resolved.catalog.identity.catalog.clone(),
+            namespace: captured.resolved.catalog.identity.namespace.clone(),
+            table: captured.resolved.catalog.identity.table.clone(),
+        },
+        preparation
+            .input()
+            .fields()
+            .into_iter()
+            .map(|field| SqlWriteTargetField {
+                token: field.token(),
+                column: ColumnDef {
+                    name: field.field().name().to_string(),
+                    data_type: field.field().data_type().clone(),
+                    nullable: field.field().is_nullable(),
+                    write_default: None,
+                    logical_type: None,
+                },
+                is_hidden: false,
+            })
+            .collect(),
     )?;
-    let position_delete_output = match mode {
-        SqlWriteSinkMode::PositionDeletes | SqlWriteSinkMode::DeletionVectors => {
-            Some(admission.position_delete_output.clone())
-        }
-        SqlWriteSinkMode::Data
-        | SqlWriteSinkMode::RowLineageData
-        | SqlWriteSinkMode::EqualityDeletes => None,
-    };
     Ok(SqlWritePlanInput {
-        contract: SqlWriteSinkContract::try_new(
-            mode,
-            target,
-            input_columns,
-            position_delete_output,
-        )?,
+        contract: SqlWriteSinkContract::try_new(mode, target, input_columns)?,
         input,
         root_output_exprs,
     })
@@ -110,8 +105,8 @@ pub(crate) fn sql_write_plan_input_for_admitted_target(
     root_output_exprs: Option<Vec<TypedExpr>>,
 ) -> Result<SqlWritePlanInput, String> {
     let captured = bindings.binding(binding)?;
-    let admission = admitted_write_target(&captured)?;
-    let input_columns = admitted_write_input_columns(mode, admission)?;
+    let preparation = &admitted_write_target(&captured)?.preparation;
+    let input_columns = admitted_write_input_columns(preparation)?;
     sql_write_plan_input_from_admitted_binding(
         bindings,
         binding,
@@ -122,76 +117,32 @@ pub(crate) fn sql_write_plan_input_for_admitted_target(
     )
 }
 
-/// Admit a frozen application-owned Iceberg write target before SQL planning.
-/// The legacy write lifecycle still owns its commit collector and provider
-/// payload, but cannot manufacture a SQL token: it must pair that frozen
-/// target with the exact control lease captured at admission.
-/// Build a row-lineage writer envelope from a connector materialization that
-/// was already resolved through an exact planning lease.
-///
-/// This is intentionally an application-only adapter.  It keeps concrete
-/// metadata out of SQL while ensuring a DML change-stream writer cannot mix a
-/// catalog-loaded table with a newer provider generation.  The caller admits
-/// the returned envelope into its query-local store before invoking the SQL
-/// compiler.
-pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
-    materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-) -> Result<IcebergWriteSinkSpec, String> {
-    crate::connector::iceberg::provider::row_lineage_sink_spec_from_frozen_materialization(
-        materialization,
-        entry,
-    )
-}
-
-pub(crate) fn admit_frozen_iceberg_write_target(
+/// Reserve a SQL write token for a sealed Provider preparation.  The exact
+/// planning lease and opaque table handle remain paired by the preparation;
+/// this function does not inspect either provider-owned value.
+pub(crate) fn admit_prepared_connector_write_target(
     bindings: &QueryTableBindingStore,
-    sink_spec: &IcebergWriteSinkSpec,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    identity: crate::sql::planner::table::SqlTableIdentity,
+    preparation: ConnectorWritePreparation,
+    planning_lease: ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
-    admit_frozen_iceberg_write_target_materialization(
-        bindings,
-        crate::connector::iceberg::provider::iceberg_write_target_admission_from_frozen_table(
-            &sink_spec.iceberg,
-        )?,
-        planning_lease,
-    )
-}
-
-/// Admit a writer token from an already frozen target materialization.
-///
-/// MV refresh has a target-state locator scan before it constructs a terminal
-/// write.  The write must retain the same frozen table identity and planning
-/// lease, but it deliberately receives its own token so its physical schema
-/// cannot be confused with the locator scan's schema.
-pub(crate) fn admit_frozen_iceberg_write_target_materialization(
-    bindings: &QueryTableBindingStore,
-    admission: crate::engine::query_planning::bindings::QueryWriteTargetAdmission,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<SqlTableBindingId, String> {
+    preparation
+        .validate()
+        .map_err(|error| format!("validate connector write preparation: {error}"))?;
     let descriptor = planning_lease.binding().descriptor();
     if !descriptor
         .instance_id
         .as_str()
-        .eq_ignore_ascii_case(&admission.identity.catalog)
+        .eq_ignore_ascii_case(preparation.table().owner().as_str())
     {
         return Err(
-            "frozen Iceberg write target does not match its admission planning lease".to_string(),
+            "connector write preparation does not match its admission planning lease".to_string(),
         );
     }
-    // The binding carries the actual table schema, not the writer-input
-    // layout. Position/DV writers consume row-identity columns such as
-    // `_file` and `_pos`, while MV targets carry hidden apply/lineage/state
-    // fields in their physical table schema. Both facts are frozen in the
-    // admitted metadata and must remain distinct.
-    let columns = admission.target_columns.clone();
-    let key = QueryTableBindingKey::write_target(
-        &admission.identity.catalog,
-        &admission.identity.namespace,
-        &admission.identity.table,
-    );
+    let columns = admitted_write_input_columns(&preparation)?;
+    let key =
+        QueryTableBindingKey::write_target(&identity.catalog, &identity.namespace, &identity.table);
     bindings.resolve_or_insert_with_id(key, |binding| {
-        let identity = admission.identity.clone();
         let planner = crate::sql::planner::table::TableDef {
             name: identity.table.clone(),
             columns,
@@ -220,43 +171,13 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
             // exact SQL write-target contract.
             scan_materialization: None,
             mv_target_read: None,
-            write_target_admission: Some(admission),
+            write_target_admission: Some(QueryWriteTargetAdmission {
+                preparation: preparation.clone(),
+            }),
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
     })
-}
-
-/// Rehydrate the provider-private writer carrier only after SQL planning has
-/// sealed its tokenized contract.  This adapter reads no catalog state: all
-/// table metadata comes from the exact binding selected at admission.
-pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
-    bindings: &QueryTableBindingStore,
-    input: &SqlWritePlanInput,
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-) -> Result<IcebergWriteSinkSpec, String> {
-    let captured = bindings.binding(input.contract.target.binding)?;
-    let admission = admitted_write_target(&captured)?;
-    if !admission
-        .identity
-        .catalog
-        .eq_ignore_ascii_case(&input.contract.target.table.catalog)
-        || !admission
-            .identity
-            .namespace
-            .eq_ignore_ascii_case(&input.contract.target.table.namespace)
-        || !admission
-            .identity
-            .table
-            .eq_ignore_ascii_case(&input.contract.target.table.table)
-    {
-        return Err("SQL write contract target differs from its admitted binding".to_string());
-    }
-    crate::connector::iceberg::provider::iceberg_write_sink_spec_from_admitted_handle(
-        &admission.table,
-        input,
-        entry,
-    )
 }
 
 fn admitted_write_target(
@@ -269,65 +190,51 @@ fn admitted_write_target(
 }
 
 fn admitted_write_input_columns(
-    mode: SqlWriteSinkMode,
-    admission: &crate::engine::query_planning::bindings::QueryWriteTargetAdmission,
+    preparation: &ConnectorWritePreparation,
 ) -> Result<Vec<ColumnDef>, String> {
-    match mode {
-        SqlWriteSinkMode::Data | SqlWriteSinkMode::EqualityDeletes => {
-            Ok(admission.target_columns.clone())
-        }
-        SqlWriteSinkMode::RowLineageData => {
-            let mut columns = admission.target_columns.clone();
-            columns.push(ColumnDef {
-                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            });
-            columns.push(ColumnDef {
-                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                write_default: None,
-                logical_type: None,
-            });
-            Ok(columns)
-        }
-        SqlWriteSinkMode::PositionDeletes | SqlWriteSinkMode::DeletionVectors => {
-            let mut columns = vec![
-                ColumnDef {
-                    name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    write_default: None,
-                    logical_type: None,
-                },
-                ColumnDef {
-                    name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                    logical_type: None,
-                },
-            ];
-            for field in &admission.position_delete_output.partition_source_fields {
-                columns.push(ColumnDef {
-                    name: field.source_column_name.clone(),
-                    data_type: field.data_type.clone(),
-                    nullable: true,
-                    write_default: None,
-                    logical_type: None,
-                });
-            }
-            Ok(columns)
-        }
-    }
+    Ok(preparation
+        .input()
+        .fields()
+        .into_iter()
+        .map(|field| ColumnDef {
+            name: field.field().name().to_string(),
+            data_type: field.field().data_type().clone(),
+            nullable: field.field().is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect())
+}
+
+fn validate_mode(mode: SqlWriteSinkMode, input: &ConnectorWriteInputShape) -> Result<(), String> {
+    let matches = matches!(
+        (mode, input),
+        (
+            SqlWriteSinkMode::Data,
+            ConnectorWriteInputShape::Data { .. }
+        ) | (
+            SqlWriteSinkMode::RowLineageData,
+            ConnectorWriteInputShape::RowLineage { .. }
+        ) | (
+            SqlWriteSinkMode::PositionDeletes,
+            ConnectorWriteInputShape::PositionDelete { .. }
+        ) | (
+            SqlWriteSinkMode::DeletionVectors,
+            ConnectorWriteInputShape::DeletionVector { .. }
+        ) | (
+            SqlWriteSinkMode::EqualityDeletes,
+            ConnectorWriteInputShape::EqualityDelete { .. }
+        )
+    );
+    matches.then_some(()).ok_or_else(|| {
+        "SQL write sink mode does not match its Provider-signed input shape".to_string()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::DataType;
     use std::sync::Arc;
 
     use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingKey};

@@ -14059,15 +14059,13 @@ fn compile_canonical_select_for_imv_for_maintenance(
         &target_planning_materialization.planning_lease,
     )
     .map_err(RefreshError::user)?;
-    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+    admit_mv_data_write_target(
         bindings.as_ref(),
-        target_planning_materialization
-            .write_target_admission
-            .clone()
-            .ok_or_else(|| {
-                RefreshError::user("IMV target is missing admitted Iceberg write facts")
-            })?,
-        target_planning_materialization.planning_lease.clone(),
+        &target_planning_materialization,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        connector_context.clone(),
     )
     .map_err(RefreshError::user)?;
     let (plan, factory) = compile_canonical_select_for_imv_with_bindings(
@@ -14077,6 +14075,44 @@ fn compile_canonical_select_for_imv_for_maintenance(
         &execution,
     )?;
     Ok((bindings, plan, factory))
+}
+
+fn admit_mv_data_write_target(
+    bindings: &QueryTableBindingStore,
+    materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    let fields = materialization
+        .columns
+        .iter()
+        .map(|column| {
+            novarocks_spi::connector::ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                &column.name,
+                column.data_type.clone(),
+                column.nullable,
+            ))
+        })
+        .collect();
+    let (_, preparation) = materialization.prepare_write(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+        novarocks_spi::connector::ConnectorWriteInputRequest::Data { fields },
+        context,
+    )?;
+    crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+        bindings,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+        },
+        preparation,
+        materialization.planning_lease.clone(),
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -15374,13 +15410,13 @@ fn execute_join_delta_branches_logical(
         &target_bindings,
         &target_planning_materialization.planning_lease,
     )?;
-    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+    admit_mv_data_write_target(
         target_bindings.as_ref(),
-        target_planning_materialization
-            .write_target_admission
-            .clone()
-            .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?,
-        target_planning_materialization.planning_lease.clone(),
+        &target_planning_materialization,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        connector_context.clone(),
     )?;
     let (plan, factory) = compile_canonical_select_for_imv_with_bindings(
         state,
@@ -16369,15 +16405,20 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     let target_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding =
         bind_imv_target_query_table_in_store(&refresh_context, &target_bindings, planning_lease)?;
-    let write_target_admission = target_bindings
-        .binding(target_binding)?
-        .write_target_admission
-        .clone()
-        .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?;
-    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+    let target_materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+            planning_lease.clone(),
+            crate::connector::connector_request_context_for_execution(None, execution)?,
+            &target.namespace,
+            &target.table,
+        )?;
+    admit_mv_data_write_target(
         target_bindings.as_ref(),
-        write_target_admission,
-        planning_lease.clone(),
+        &target_materialization,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        crate::connector::connector_request_context_for_execution(None, execution)?,
     )?;
     let rewrite_evidence = match evidence {
         crate::mv::application::MvIncrementalRewriteEvidence::None => {
@@ -16969,31 +17010,10 @@ fn target_partition_source_ordinals_for_sql_sink(
     sink: &crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     output_columns: &[OutputColumn],
 ) -> Result<Vec<usize>, String> {
-    sink.contract
-        .target
-        .partition
-        .fields
-        .iter()
-        .map(|field| {
-            let source = sink
-                .contract
-                .target
-                .fields
-                .iter()
-                .find(|candidate| candidate.field_id == field.source_field_id)
-                .ok_or_else(|| {
-                    format!(
-                        "IMV change-stream partition source field id {} not found in target schema",
-                        field.source_field_id
-                    )
-                })?;
-            output_ordinal_by_name(
-                output_columns,
-                &source.column.name,
-                "target partition source column",
-            )
-        })
-        .collect()
+    // The provider consumes partition transforms from its sealed preparation;
+    // SQL only preserves the tokenized Arrow input layout.
+    let _ = (sink, output_columns);
+    Ok(Vec::new())
 }
 
 fn output_ordinal_by_column_id(
@@ -17459,13 +17479,13 @@ fn incremental_refresh_iceberg_mv_with_changes(
         &target_bindings,
         &target_planning_materialization.planning_lease,
     )?;
-    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+    admit_mv_data_write_target(
         target_bindings.as_ref(),
-        target_planning_materialization
-            .write_target_admission
-            .clone()
-            .ok_or_else(|| "IMV target is missing admitted Iceberg write facts".to_string())?,
-        target_planning_materialization.planning_lease.clone(),
+        &target_planning_materialization,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        connector_context.clone(),
     )?;
     let imv_rewrite_input = sql_imv_planning_input(&ctx, target_binding, rewrite_evidence)?;
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);

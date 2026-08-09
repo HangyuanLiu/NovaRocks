@@ -52,11 +52,12 @@ use novarocks_spi::connector::{
     ConnectorProviderId, ConnectorReadExecution, ConnectorReadNamedReference, ConnectorReadPurpose,
     ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
     ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
-    ConnectorRefreshPublicationGuard, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanUnitColumn,
-    ConnectorScanUnitColumnDomain, ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsEvidence, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain, ConnectorScanUnitColumnFacts,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
+    ConnectorScanUnitFactsMissingReason, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
     ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
@@ -64,7 +65,12 @@ use novarocks_spi::connector::{
     ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
     ConnectorStatistics, ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
     ConnectorTableResolution, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
-    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest, CreateOrReplacePolicy,
+    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteCohortId,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, CreateOrReplacePolicy,
     CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
     StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
@@ -91,11 +97,20 @@ use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use super::reader::IcebergBatchReader;
 use super::write_contract::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
-    iceberg_write_sink_mode, position_delete_descriptor_from_sql,
+    encode_data_sink_spec_handle_payload, encode_deletion_vector_sink_handle_payload,
+    encode_equality_delete_sink_spec_handle_payload, encode_position_delete_sink_handle_payload,
+    iceberg_write_sink_mode,
 };
-use super::write_control::IcebergWriteControlAdapter;
+use super::write_control::{
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWriteControlAdapter, IcebergWritePlanPayloadV1,
+    IcebergWritePreparationFactory,
+};
 use super::write_execution::IcebergDataWriteExecution;
-use super::write_service::RegisteredIcebergWriteControlBackend;
+use super::write_service::{
+    IcebergFirstRefreshWriteReportCommitter, IcebergMvPrimaryEmptyInputPolicy,
+    IcebergWriteCohortContext, IcebergWriteControlService, IcebergWriteControlServiceContext,
+    IcebergWriteReportCommitter, IcebergWriteServiceRegistry, RegisteredIcebergWriteControlBackend,
+};
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
 use novarocks_connector_iceberg::scan_model::{
@@ -1019,9 +1034,10 @@ impl IcebergControlProvider {
             )),
             recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
         });
-        let write = Arc::new(IcebergWriteControlAdapter::new(
+        let write = Arc::new(IcebergWriteControlAdapter::new_with_preparation(
             write_key.clone(),
             Arc::new(RegisteredIcebergWriteControlBackend::new(services.clone())),
+            Arc::new(prepare_iceberg_write) as Arc<IcebergWritePreparationFactory>,
         )?);
         let data_mutation = Arc::new(IcebergDataMutationAdapter::new_registered(
             write_key.clone(),
@@ -5950,6 +5966,988 @@ struct TablePayload {
     frozen_rewrite: Option<FrozenRewriteSourcePayloadV1>,
 }
 
+/// Sign the SQL-proposed Arrow input while the Iceberg provider still owns the
+/// exact admitted table.  This is intentionally close to `TablePayload`: no
+/// application layer can decode the handle, substitute a catalog field ID, or
+/// recreate a preparation for another connector incarnation.
+pub(crate) fn prepare_iceberg_write(
+    request: ConnectorWritePreparationRequest,
+    owner: &ConnectorExecutionBindingKey,
+) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+    request.validate(owner)?;
+    let payload: TablePayload =
+        decode_payload(request.table.payload(), "admitted Iceberg write table")?;
+    if payload.metadata_table_type.is_some() {
+        return Ok(ConnectorWritePreparationOutcome::Denied(
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata tables cannot be write targets",
+            ),
+        ));
+    }
+    let table = payload.table_info.as_ref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg write table is missing its frozen table descriptor",
+        )
+    })?;
+    let serialized_metadata = table.serialized_metadata.as_deref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg write table is missing frozen metadata",
+        )
+    })?;
+    let metadata: TableMetadata = serde_json::from_str(serialized_metadata).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode admitted Iceberg write metadata: {error}"),
+        )
+    })?;
+    if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml)
+        && metadata
+            .properties()
+            .contains_key(crate::mv::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP)
+    {
+        return Ok(ConnectorWritePreparationOutcome::Denied(
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "table {}.{}.{} is a materialized view; use REFRESH MATERIALIZED VIEW to update it",
+                    table.catalog, table.namespace, table.table
+                ),
+            ),
+        ));
+    }
+
+    let input = bind_iceberg_write_input(&request, owner, &metadata)?;
+    let table_uuid = table.table_uuid.as_deref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "admitted Iceberg write table is missing its table UUID",
+        )
+    })?;
+    let snapshot = table
+        .current_snapshot_id
+        .map_or_else(|| "none".to_string(), |id| id.to_string());
+    let base_version = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
+        "iceberg/write-base/v1/{table_uuid}/{snapshot}"
+    )))?;
+    let preparation_payload = Bytes::from(format!(
+        "iceberg/write-preparation/v1/{}/{}/{snapshot}",
+        owner.instance_id.as_str(),
+        table_uuid
+    ));
+    Ok(ConnectorWritePreparationOutcome::Prepared(
+        ConnectorWritePreparation::try_new(
+            owner.clone(),
+            request.table,
+            request.intent,
+            base_version,
+            input,
+            preparation_payload,
+        )?,
+    ))
+}
+
+fn bind_iceberg_write_input(
+    request: &ConnectorWritePreparationRequest,
+    owner: &ConnectorExecutionBindingKey,
+    metadata: &TableMetadata,
+) -> Result<ConnectorWriteInputShape, ConnectorError> {
+    Ok(match &request.input {
+        ConnectorWriteInputRequest::Data { fields } => ConnectorWriteInputShape::Data {
+            fields: bind_iceberg_write_fields(fields, owner, &request.table, request.intent, 1)?,
+        },
+        ConnectorWriteInputRequest::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } => ConnectorWriteInputShape::RowLineage {
+            data_fields: bind_iceberg_write_fields(
+                data_fields,
+                owner,
+                &request.table,
+                request.intent,
+                2,
+            )?,
+            row_identity_fields: bind_iceberg_write_fields(
+                row_identity_fields,
+                owner,
+                &request.table,
+                request.intent,
+                3,
+            )?,
+        },
+        ConnectorWriteInputRequest::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        } => {
+            let partition_source_fields = if partition_source_fields.is_empty() {
+                iceberg_position_delete_partition_field_requests(metadata)?
+            } else {
+                partition_source_fields.clone()
+            };
+            ConnectorWriteInputShape::PositionDelete {
+                identity_fields: bind_iceberg_write_fields(
+                    identity_fields,
+                    owner,
+                    &request.table,
+                    request.intent,
+                    4,
+                )?,
+                partition_source_fields: bind_iceberg_write_fields(
+                    &partition_source_fields,
+                    owner,
+                    &request.table,
+                    request.intent,
+                    5,
+                )?,
+            }
+        }
+        ConnectorWriteInputRequest::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } => {
+            let partition_source_fields = if partition_source_fields.is_empty() {
+                iceberg_position_delete_partition_field_requests(metadata)?
+            } else {
+                partition_source_fields.clone()
+            };
+            ConnectorWriteInputShape::DeletionVector {
+                identity_fields: bind_iceberg_write_fields(
+                    identity_fields,
+                    owner,
+                    &request.table,
+                    request.intent,
+                    6,
+                )?,
+                partition_source_fields: bind_iceberg_write_fields(
+                    &partition_source_fields,
+                    owner,
+                    &request.table,
+                    request.intent,
+                    7,
+                )?,
+            }
+        }
+        ConnectorWriteInputRequest::EqualityDelete { equality_fields } => {
+            ConnectorWriteInputShape::EqualityDelete {
+                equality_fields: bind_iceberg_write_fields(
+                    equality_fields,
+                    owner,
+                    &request.table,
+                    request.intent,
+                    8,
+                )?,
+            }
+        }
+    })
+}
+
+/// Position-delete and deletion-vector SQL only name the fixed row identity.
+/// The exact partition-source projection is provider-owned and is added while
+/// the frozen Iceberg metadata is still available.
+fn iceberg_position_delete_partition_field_requests(
+    metadata: &TableMetadata,
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .map(|partition| {
+            let source = metadata
+                .current_schema()
+                .field_by_id(partition.source_id)
+                .ok_or_else(|| {
+                    invalid_iceberg_write_activation(format!(
+                        "Iceberg position-delete partition source field id {} is absent from the frozen schema",
+                        partition.source_id
+                    ))
+                })?;
+            let data_type = iceberg_type_to_arrow_type(source.field_type.as_ref())
+                .map_err(invalid_iceberg_write_activation)?;
+            Ok(ConnectorWriteFieldRequest::new(Field::new(
+                &source.name,
+                data_type,
+                !source.required,
+            )))
+        })
+        .collect()
+}
+
+fn bind_iceberg_write_fields(
+    fields: &[ConnectorWriteFieldRequest],
+    owner: &ConnectorExecutionBindingKey,
+    table: &ConnectorTableHandle,
+    intent: novarocks_spi::connector::ConnectorWriteIntent,
+    domain: u8,
+) -> Result<Vec<ConnectorWriteFieldBinding>, ConnectorError> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(ordinal, request)| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"novarocks.iceberg.write-field-token.v1\0");
+            hasher.update(owner.instance_id.as_str().as_bytes());
+            hasher.update(owner.incarnation.to_bytes());
+            hasher.update(table.payload());
+            hasher.update(format!("{intent:?}").as_bytes());
+            hasher.update([domain]);
+            hasher.update((ordinal as u64).to_be_bytes());
+            hasher.update(format!("{:?}", request.field()).as_bytes());
+            Ok(ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes(hasher.finalize().into()),
+                request.field().clone(),
+            ))
+        })
+        .collect()
+}
+
+/// Reserve a provider-owned data writer service after the generic operation
+/// has retained the exact lease and sealed its preparation.  SQL/Core pass
+/// only the sealed preparation and their generic commit seam: this boundary
+/// derives the private sink specification, writer payload, and control plan
+/// payload from the admitted Iceberg table.
+pub(crate) fn register_iceberg_data_write_service_from_preparation(
+    services: IcebergWriteServiceRegistry,
+    operation_id: ConnectorWriteOperationId,
+    preparation: &ConnectorWritePreparation,
+    target_ref: &str,
+    entry: &IcebergCatalogEntry,
+    commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+) -> Result<(), ConnectorError> {
+    preparation.validate()?;
+    let sink_spec = iceberg_data_sink_spec_from_preparation(preparation, entry)?;
+    let writer_handle_payload = encode_data_sink_spec_handle_payload(&sink_spec)
+        .map_err(|error| invalid_iceberg_write_activation(error))?;
+    register_iceberg_write_service_from_preparation_payload(
+        services,
+        operation_id,
+        preparation,
+        target_ref,
+        sink_spec,
+        writer_handle_payload,
+        commit_executor,
+    )
+}
+
+/// Reserve a first-refresh writer from a sealed preparation.  The refresh
+/// adapter supplies its opaque commit seam, while this provider boundary owns
+/// the Iceberg sink/handle and the durable payload used by the control service.
+pub(crate) fn register_iceberg_first_refresh_write_service_from_preparation(
+    services: IcebergWriteServiceRegistry,
+    operation_id: ConnectorWriteOperationId,
+    preparation: &ConnectorWritePreparation,
+    payload: IcebergFirstRefreshWritePlanPayloadV2,
+    entry: &IcebergCatalogEntry,
+    commit_executor: Arc<super::write_commit::IcebergWriteCommitExecutor>,
+    empty_input_policy: IcebergMvPrimaryEmptyInputPolicy,
+) -> Result<(), ConnectorError> {
+    preparation.validate()?;
+    let sink_spec = iceberg_data_sink_spec_from_preparation(preparation, entry)?;
+    let writer_handle_payload = encode_data_sink_spec_handle_payload(&sink_spec)
+        .map_err(|error| invalid_iceberg_write_activation(error))?;
+    let expected_target = format!(
+        "{}.{}.{}",
+        sink_spec.iceberg.catalog, sink_spec.iceberg.namespace, sink_spec.iceberg.table
+    );
+    let observed_snapshot_id = if payload.target_ref == "main" {
+        commit_executor
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id())
+    } else {
+        commit_executor
+            .table
+            .metadata()
+            .refs()
+            .get(&payload.target_ref)
+            .map(|reference| reference.snapshot_id)
+    };
+    if payload.target != expected_target
+        || payload.expected_snapshot_id != observed_snapshot_id
+        || payload.staging_path != commit_executor.collector.staging_dir
+    {
+        return Err(invalid_iceberg_write_activation(
+            "first-refresh payload drifted from the provider-admitted target",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.first-refresh-preparation-activation.v1\0");
+    hasher.update(operation_id.to_bytes());
+    hasher.update(preparation.digest());
+    hasher.update(payload.encode()?.as_ref());
+    let activation_digest: [u8; 32] = hasher.finalize().into();
+    let preparation_digest = preparation.digest();
+    let committer: Arc<dyn IcebergWriteReportCommitter> =
+        Arc::new(IcebergFirstRefreshWriteReportCommitter::new(
+            commit_executor,
+            payload.provenance_properties.clone(),
+            empty_input_policy,
+        )?);
+    services.register_lazy(operation_id, activation_digest, move || {
+        let context =
+            IcebergWriteControlServiceContext::new_with_first_refresh_preparation_handle_payload(
+                writer_handle_payload.clone(),
+                payload.clone(),
+                preparation_digest,
+                Arc::clone(&committer),
+            )?;
+        Ok(Arc::new(IcebergWriteControlService::new(context)))
+    })
+}
+
+/// Reserve a row-level writer service from a sealed Iceberg preparation.
+///
+/// The caller provides the already-opened table only for provider-local
+/// deletion-vector state inspection.  This function compares it with the
+/// preparation's frozen table before any writer payload is created, then
+/// derives all field IDs, partition transforms, position descriptors, and
+/// previous DV facts on the provider side.  Core and SQL therefore retain no
+/// Iceberg sink specification or writer payload.
+pub(crate) fn register_iceberg_row_write_service_from_preparation(
+    services: IcebergWriteServiceRegistry,
+    operation_id: ConnectorWriteOperationId,
+    preparation: &ConnectorWritePreparation,
+    target_ref: &str,
+    entry: &IcebergCatalogEntry,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+) -> Result<(), ConnectorError> {
+    preparation.validate()?;
+    let (sink_spec, equality_columns) =
+        iceberg_row_write_sink_spec_from_preparation(preparation, entry, table.metadata())?;
+    validate_preparation_table_against_open_table(preparation, table.metadata())?;
+    let snapshot_id = sink_spec.iceberg.current_snapshot_id;
+    let writer_handle_payload = match sink_spec.mode {
+        IcebergWriteSinkMode::PositionDeletes => {
+            let position_index_storage =
+                super::change_stream_write::position_delete_index_storage_config(
+                    entry,
+                    table.metadata().location(),
+                )
+                .map_err(invalid_iceberg_write_activation)?;
+            let partitions = super::sink::build_position_delete_data_file_partition_index(
+                table.metadata(),
+                snapshot_id,
+                table.metadata().location(),
+                position_index_storage.as_ref(),
+            )
+            .map_err(invalid_iceberg_write_activation)?;
+            encode_position_delete_sink_handle_payload(&sink_spec, table.metadata(), &partitions)
+                .map_err(invalid_iceberg_write_activation)?
+        }
+        IcebergWriteSinkMode::DeletionVectors => {
+            super::change_stream_write::frozen_deletion_vector_handle_payload(
+                &sink_spec,
+                table,
+                entry,
+                snapshot_id,
+            )
+            .map_err(invalid_iceberg_write_activation)?
+        }
+        IcebergWriteSinkMode::EqualityDeletes => encode_equality_delete_sink_spec_handle_payload(
+            &sink_spec,
+            equality_columns.as_deref().ok_or_else(|| {
+                invalid_iceberg_write_activation(
+                    "equality-delete preparation is missing provider field bindings",
+                )
+            })?,
+        )
+        .map_err(invalid_iceberg_write_activation)?,
+        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
+            return Err(invalid_iceberg_write_activation(
+                "row-level Iceberg writer activation requires a row-level preparation shape",
+            ));
+        }
+    };
+    register_iceberg_write_service_from_preparation_payload(
+        services,
+        operation_id,
+        preparation,
+        target_ref,
+        sink_spec,
+        writer_handle_payload,
+        commit_executor,
+    )
+}
+
+/// Provider-facing COW cohort facts.  The mutation kernel supplies only the
+/// logical rewrite membership it computed from the admitted rows; this
+/// adapter owns all Iceberg payload construction, field IDs, and writer
+/// handles for those cohorts.
+pub(crate) enum IcebergCowWriteCohort {
+    Rewrite {
+        cohort_id: ConnectorWriteCohortId,
+        preparation: ConnectorWritePreparation,
+        base_snapshot_id: i64,
+        old_file: String,
+        matched_row_ids: Vec<i64>,
+    },
+    Append {
+        cohort_id: ConnectorWriteCohortId,
+        preparation: ConnectorWritePreparation,
+        base_snapshot_id: i64,
+    },
+}
+
+impl IcebergCowWriteCohort {
+    fn cohort_id(&self) -> ConnectorWriteCohortId {
+        match self {
+            Self::Rewrite { cohort_id, .. } | Self::Append { cohort_id, .. } => *cohort_id,
+        }
+    }
+
+    fn preparation(&self) -> &ConnectorWritePreparation {
+        match self {
+            Self::Rewrite { preparation, .. } | Self::Append { preparation, .. } => preparation,
+        }
+    }
+}
+
+/// Activate a multi-cohort COW operation from sealed preparations.
+///
+/// No application caller is allowed to encode an Iceberg sink specification
+/// or canonical cohort control payload.  Each cohort is bound to the digest
+/// of the exact preparation that created it, so a same-operation substitution
+/// fails before writer activation.
+pub(crate) fn register_iceberg_cow_write_service_from_preparations(
+    services: IcebergWriteServiceRegistry,
+    operation_id: ConnectorWriteOperationId,
+    cohorts: Vec<IcebergCowWriteCohort>,
+    target_ref: &str,
+    entry: &IcebergCatalogEntry,
+    commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+) -> Result<(), ConnectorError> {
+    if cohorts.is_empty() {
+        return Err(invalid_iceberg_write_activation(
+            "Iceberg COW write operation has no cohorts",
+        ));
+    }
+    let mut private_contexts = BTreeMap::new();
+    let mut preparation_digests = BTreeMap::new();
+    for cohort in cohorts {
+        let cohort_id = cohort.cohort_id();
+        let (sink_spec, preparation_digest) = {
+            let preparation = cohort.preparation();
+            preparation.validate()?;
+            (
+                iceberg_data_sink_spec_from_preparation(preparation, entry)?,
+                preparation.digest(),
+            )
+        };
+        if !matches!(
+            sink_spec.mode,
+            IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData
+        ) {
+            return Err(invalid_iceberg_write_activation(
+                "Iceberg COW cohort preparation must be Data or RowLineage",
+            ));
+        }
+        let writer_handle_payload = encode_data_sink_spec_handle_payload(&sink_spec)
+            .map_err(|error| invalid_iceberg_write_activation(error))?;
+        let plan_payload = IcebergWritePlanPayloadV1 {
+            version: 1,
+            target: format!(
+                "{}.{}.{}",
+                sink_spec.iceberg.catalog, sink_spec.iceberg.namespace, sink_spec.iceberg.table
+            ),
+            target_ref: target_ref.to_string(),
+        };
+        let private = match cohort {
+            IcebergCowWriteCohort::Rewrite {
+                base_snapshot_id,
+                old_file,
+                matched_row_ids,
+                ..
+            } => IcebergWriteCohortContext::cow_rewrite(
+                writer_handle_payload,
+                &plan_payload,
+                base_snapshot_id,
+                old_file,
+                matched_row_ids,
+            )?,
+            IcebergCowWriteCohort::Append {
+                base_snapshot_id, ..
+            } => IcebergWriteCohortContext::cow_append(
+                writer_handle_payload,
+                &plan_payload,
+                base_snapshot_id,
+            )?,
+        };
+        if private_contexts.insert(cohort_id, private).is_some()
+            || preparation_digests
+                .insert(cohort_id, preparation_digest)
+                .is_some()
+        {
+            return Err(invalid_iceberg_write_activation(
+                "Iceberg COW write operation has duplicate cohort IDs",
+            ));
+        }
+    }
+    let context = IcebergWriteControlServiceContext::new_with_prepared_cohorts(
+        private_contexts,
+        preparation_digests,
+        commit_executor,
+    )?;
+    let service = IcebergWriteControlService::new(context);
+    services.register(operation_id, service)
+}
+
+fn register_iceberg_write_service_from_preparation_payload(
+    services: IcebergWriteServiceRegistry,
+    operation_id: ConnectorWriteOperationId,
+    preparation: &ConnectorWritePreparation,
+    target_ref: &str,
+    sink_spec: IcebergWriteSinkSpec,
+    writer_handle_payload: Bytes,
+    commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+) -> Result<(), ConnectorError> {
+    let plan_payload = IcebergWritePlanPayloadV1 {
+        version: 1,
+        target: format!(
+            "{}.{}.{}",
+            sink_spec.iceberg.catalog, sink_spec.iceberg.namespace, sink_spec.iceberg.table
+        ),
+        target_ref: target_ref.to_string(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.write-preparation-activation.v1\0");
+    hasher.update(operation_id.to_bytes());
+    hasher.update(preparation.digest());
+    let activation_digest: [u8; 32] = hasher.finalize().into();
+    let preparation_digest = preparation.digest();
+    services.register_lazy(operation_id, activation_digest, move || {
+        let context = IcebergWriteControlServiceContext::new_with_preparation_handle_payload(
+            writer_handle_payload.clone(),
+            plan_payload.clone(),
+            preparation_digest,
+            Arc::clone(&commit_executor),
+        )?;
+        Ok(Arc::new(IcebergWriteControlService::new(context)))
+    })
+}
+
+/// Rehydrate a data-file sink entirely within the Iceberg provider.  The
+/// preparation's tagged input shape selects the generic writer mode; all
+/// catalog field IDs, partition transforms, storage, and compression facts
+/// stay in this module.
+pub(crate) fn iceberg_data_sink_spec_from_preparation(
+    preparation: &ConnectorWritePreparation,
+    entry: &IcebergCatalogEntry,
+) -> Result<IcebergWriteSinkSpec, ConnectorError> {
+    let payload: TablePayload = decode_payload(
+        preparation.table().payload(),
+        "admitted Iceberg write preparation table",
+    )?;
+    let mut iceberg = payload.table_info.ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg write preparation is missing its frozen table descriptor",
+        )
+    })?;
+    let serialized = iceberg.serialized_metadata.as_deref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg write preparation is missing frozen metadata",
+        )
+    })?;
+    let metadata: TableMetadata = serde_json::from_str(serialized).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode admitted Iceberg write preparation metadata: {error}"),
+        )
+    })?;
+    let mode = match preparation.input() {
+        ConnectorWriteInputShape::Data { .. } => IcebergWriteSinkMode::Data,
+        ConnectorWriteInputShape::RowLineage { .. } => IcebergWriteSinkMode::RowLineageData,
+        ConnectorWriteInputShape::PositionDelete { .. }
+        | ConnectorWriteInputShape::DeletionVector { .. }
+        | ConnectorWriteInputShape::EqualityDelete { .. } => {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "row-level Iceberg writer activation remains owned by the SPI-5C1 row-DML adapter",
+            ));
+        }
+    };
+    if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
+        iceberg.schema.fields.extend([
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
+                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
+                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+        ]);
+    }
+    let target_columns = preparation
+        .input()
+        .fields()
+        .into_iter()
+        .map(|binding| novarocks_catalog::schema::ColumnDef {
+            name: binding.field().name().to_string(),
+            data_type: binding.field().data_type().clone(),
+            nullable: binding.field().is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect();
+    let table_location = metadata.location().to_string();
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
+    Ok(IcebergWriteSinkSpec {
+        mode,
+        iceberg,
+        target_columns,
+        table_location,
+        data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+        cloud_properties: entry.cloud_properties_map(),
+        file_format: "parquet".to_string(),
+        compression: IcebergWriteFileCompression::Snappy,
+        position_delete_output_descriptor: None,
+    })
+}
+
+/// Derive an Iceberg row-level sink from the signed, tagged input shape.
+/// Each shape is validated against the frozen metadata before the descriptor
+/// is serialized into the writer handle.  In particular, generic field names
+/// never become Iceberg field IDs without this provider-owned lookup.
+pub(crate) fn iceberg_row_write_sink_spec_from_preparation(
+    preparation: &ConnectorWritePreparation,
+    entry: &IcebergCatalogEntry,
+    open_metadata: &TableMetadata,
+) -> Result<
+    (
+        IcebergWriteSinkSpec,
+        Option<Vec<super::commit::EqualityDeleteColumn>>,
+    ),
+    ConnectorError,
+> {
+    let payload: TablePayload = decode_payload(
+        preparation.table().payload(),
+        "admitted Iceberg row-write preparation table",
+    )?;
+    let mut iceberg = payload.table_info.ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg row-write preparation is missing its frozen table descriptor",
+        )
+    })?;
+    let serialized = iceberg.serialized_metadata.as_deref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg row-write preparation is missing frozen metadata",
+        )
+    })?;
+    let metadata: TableMetadata = serde_json::from_str(serialized).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode admitted Iceberg row-write preparation metadata: {error}"),
+        )
+    })?;
+    validate_row_write_metadata_matches_open_table(&metadata, open_metadata)?;
+
+    let (mode, target_columns, position_delete_output_descriptor, equality_columns) =
+        match preparation.input() {
+            ConnectorWriteInputShape::PositionDelete {
+                identity_fields,
+                partition_source_fields,
+            } => {
+                let (columns, descriptor) = position_delete_columns_and_descriptor(
+                    &metadata,
+                    identity_fields,
+                    partition_source_fields,
+                )?;
+                (
+                    IcebergWriteSinkMode::PositionDeletes,
+                    columns,
+                    Some(descriptor),
+                    None,
+                )
+            }
+            ConnectorWriteInputShape::DeletionVector {
+                identity_fields,
+                partition_source_fields,
+            } => {
+                let (columns, descriptor) = position_delete_columns_and_descriptor(
+                    &metadata,
+                    identity_fields,
+                    partition_source_fields,
+                )?;
+                (
+                    IcebergWriteSinkMode::DeletionVectors,
+                    columns,
+                    Some(descriptor),
+                    None,
+                )
+            }
+            ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
+                let (columns, equality_columns) =
+                    equality_delete_columns_from_preparation(&metadata, equality_fields)?;
+                (
+                    IcebergWriteSinkMode::EqualityDeletes,
+                    columns,
+                    None,
+                    Some(equality_columns),
+                )
+            }
+            ConnectorWriteInputShape::Data { .. } | ConnectorWriteInputShape::RowLineage { .. } => {
+                return Err(invalid_iceberg_write_activation(
+                    "row-level Iceberg writer activation requires PositionDelete, DeletionVector, or EqualityDelete input",
+                ));
+            }
+        };
+
+    iceberg.current_snapshot_id = metadata.current_snapshot_id();
+    let table_location = metadata.location().to_string();
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
+    Ok((
+        IcebergWriteSinkSpec {
+            mode,
+            iceberg,
+            target_columns,
+            table_location,
+            data_location,
+            target_partition_spec_id: metadata.default_partition_spec_id(),
+            cloud_properties: entry.cloud_properties_map(),
+            file_format: "parquet".to_string(),
+            compression: IcebergWriteFileCompression::Snappy,
+            position_delete_output_descriptor,
+        },
+        equality_columns,
+    ))
+}
+
+fn validate_preparation_table_against_open_table(
+    preparation: &ConnectorWritePreparation,
+    open_metadata: &TableMetadata,
+) -> Result<(), ConnectorError> {
+    let payload: TablePayload = decode_payload(
+        preparation.table().payload(),
+        "admitted Iceberg row-write preparation table",
+    )?;
+    let iceberg = payload.table_info.ok_or_else(|| {
+        invalid_iceberg_write_activation(
+            "admitted Iceberg row-write preparation is missing its frozen table descriptor",
+        )
+    })?;
+    let serialized = iceberg.serialized_metadata.as_deref().ok_or_else(|| {
+        invalid_iceberg_write_activation(
+            "admitted Iceberg row-write preparation is missing frozen metadata",
+        )
+    })?;
+    let metadata: TableMetadata = serde_json::from_str(serialized).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode admitted Iceberg row-write preparation metadata: {error}"),
+        )
+    })?;
+    validate_row_write_metadata_matches_open_table(&metadata, open_metadata)
+}
+
+fn validate_row_write_metadata_matches_open_table(
+    prepared: &TableMetadata,
+    open: &TableMetadata,
+) -> Result<(), ConnectorError> {
+    if prepared.uuid() != open.uuid()
+        || prepared.current_snapshot_id() != open.current_snapshot_id()
+        || prepared.current_schema_id() != open.current_schema_id()
+        || prepared.default_partition_spec_id() != open.default_partition_spec_id()
+    {
+        return Err(invalid_iceberg_write_activation(
+            "opened Iceberg table no longer matches the sealed row-write preparation",
+        ));
+    }
+    Ok(())
+}
+
+fn position_delete_columns_and_descriptor(
+    metadata: &TableMetadata,
+    identity_fields: &[ConnectorWriteFieldBinding],
+    partition_source_fields: &[ConnectorWriteFieldBinding],
+) -> Result<
+    (
+        Vec<novarocks_catalog::schema::ColumnDef>,
+        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
+    ),
+    ConnectorError,
+> {
+    use crate::connector::iceberg::position_delete_descriptor::{
+        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+        ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        PositionDeleteOutputField, PositionDeletePartitionSourceField,
+    };
+
+    if identity_fields.len() != 2 {
+        return Err(invalid_iceberg_write_activation(
+            "Iceberg row-level write preparation requires exactly file-path and position identity fields",
+        ));
+    }
+    let file = identity_fields[0].field();
+    let pos = identity_fields[1].field();
+    if !file
+        .name()
+        .eq_ignore_ascii_case(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN)
+        || file.data_type() != &DataType::Utf8
+        || file.is_nullable()
+        || !pos
+            .name()
+            .eq_ignore_ascii_case(ICEBERG_POSITION_DELETE_POS_COLUMN)
+        || pos.data_type() != &DataType::Int64
+        || pos.is_nullable()
+    {
+        return Err(invalid_iceberg_write_activation(
+            "Iceberg row-level write identity must be non-null `_file` UTF-8 followed by non-null `_pos` INT64",
+        ));
+    }
+    let partition_fields = metadata.default_partition_spec().fields();
+    if partition_source_fields.len() != partition_fields.len() {
+        return Err(invalid_iceberg_write_activation(format!(
+            "Iceberg row-level write preparation has {} partition source fields but the frozen table requires {}",
+            partition_source_fields.len(),
+            partition_fields.len()
+        )));
+    }
+
+    let mut target_columns = Vec::with_capacity(2 + partition_source_fields.len());
+    target_columns.push(column_def_from_binding(&identity_fields[0]));
+    target_columns.push(column_def_from_binding(&identity_fields[1]));
+    let schema = metadata.current_schema();
+    let mut descriptor_fields = Vec::with_capacity(partition_source_fields.len());
+    for (index, (partition, binding)) in partition_fields
+        .iter()
+        .zip(partition_source_fields.iter())
+        .enumerate()
+    {
+        let source = schema.field_by_id(partition.source_id).ok_or_else(|| {
+            invalid_iceberg_write_activation(format!(
+                "Iceberg row-level write partition source field id {} is absent from the frozen schema",
+                partition.source_id
+            ))
+        })?;
+        let field = binding.field();
+        if !field.name().eq_ignore_ascii_case(&source.name) {
+            return Err(invalid_iceberg_write_activation(format!(
+                "Iceberg row-level write partition source `{}` does not match frozen source `{}`",
+                field.name(),
+                source.name
+            )));
+        }
+        target_columns.push(column_def_from_binding(binding));
+        descriptor_fields.push(PositionDeletePartitionSourceField {
+            output_expr_index: index + 2,
+            source_column_name: source.name.clone(),
+            partition_field_name: partition.name.clone(),
+            transform_expr: super::write_contract::transform_to_sink_string(&partition.transform),
+            source_field_id: partition.source_id,
+            data_type: field.data_type().clone(),
+        });
+    }
+    Ok((
+        target_columns,
+        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
+            file_path: PositionDeleteOutputField {
+                output_expr_index: 0,
+                name: ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
+                data_type: DataType::Utf8,
+                field_id: ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+            },
+            pos: PositionDeleteOutputField {
+                output_expr_index: 1,
+                name: ICEBERG_POSITION_DELETE_POS_COLUMN.to_string(),
+                data_type: DataType::Int64,
+                field_id: ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+            },
+            partition_source_fields: descriptor_fields,
+            target_partition_spec_id: metadata.default_partition_spec_id(),
+        },
+    ))
+}
+
+fn equality_delete_columns_from_preparation(
+    metadata: &TableMetadata,
+    fields: &[ConnectorWriteFieldBinding],
+) -> Result<
+    (
+        Vec<novarocks_catalog::schema::ColumnDef>,
+        Vec<super::commit::EqualityDeleteColumn>,
+    ),
+    ConnectorError,
+> {
+    if fields.is_empty() {
+        return Err(invalid_iceberg_write_activation(
+            "Iceberg equality-delete write preparation requires at least one equality field",
+        ));
+    }
+    if !metadata.default_partition_spec().is_unpartitioned() {
+        return Err(invalid_iceberg_write_activation(
+            "Iceberg connector equality-delete writer supports only unpartitioned tables",
+        ));
+    }
+    let schema = metadata.current_schema();
+    let mut columns = Vec::with_capacity(fields.len());
+    let mut equality_columns = Vec::with_capacity(fields.len());
+    for binding in fields {
+        let field = binding.field();
+        let iceberg_field = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(field.name()))
+            .ok_or_else(|| {
+                invalid_iceberg_write_activation(format!(
+                    "Iceberg equality-delete field `{}` is absent from the frozen schema",
+                    field.name()
+                ))
+            })?;
+        columns.push(column_def_from_binding(binding));
+        equality_columns.push(super::commit::EqualityDeleteColumn {
+            name: field.name().to_string(),
+            field_id: iceberg_field.id,
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+        });
+    }
+    Ok((columns, equality_columns))
+}
+
+fn column_def_from_binding(
+    binding: &ConnectorWriteFieldBinding,
+) -> novarocks_catalog::schema::ColumnDef {
+    let field = binding.field();
+    novarocks_catalog::schema::ColumnDef {
+        name: field.name().to_string(),
+        data_type: field.data_type().clone(),
+        nullable: field.is_nullable(),
+        write_default: None,
+        logical_type: None,
+    }
+}
+
+fn invalid_iceberg_write_activation(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+
 /// Provider facts admitted for one query table.  This is deliberately an
 /// application/provider envelope rather than a SQL table: it preserves the
 /// exact Iceberg descriptor, prepared files, statistics identity, and control
@@ -5996,6 +6994,38 @@ impl IcebergQueryTableMaterialization {
         self.table.current_snapshot_id
     }
 
+    /// Ask the exact generation that produced this materialization to sign a
+    /// terminal write.  The opaque table handle is carried directly into the
+    /// request; Core neither decodes it nor reacquires a current generation.
+    pub(crate) fn prepare_write(
+        &self,
+        intent: ConnectorWriteIntent,
+        purpose: ConnectorWriteAdmissionPurpose,
+        input: ConnectorWriteInputRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<(ConnectorWriteLease, ConnectorWritePreparation), String> {
+        let lease = self
+            .planning_lease
+            .derive_write_lease()
+            .map_err(|error| format!("derive Iceberg materialization write lease: {error}"))?;
+        let outcome = lease
+            .control()
+            .prepare_write(ConnectorWritePreparationRequest {
+                table: self.read_table.clone(),
+                intent,
+                purpose,
+                input,
+                context,
+            })
+            .map_err(|error| format!("prepare Iceberg materialization write: {error}"))?;
+        match outcome {
+            ConnectorWritePreparationOutcome::Prepared(preparation) => Ok((lease, preparation)),
+            ConnectorWritePreparationOutcome::Denied(error) => Err(format!(
+                "Iceberg materialization write admission denied: {error}"
+            )),
+        }
+    }
+
     /// Freeze an already admitted Iceberg file set into a new provider-owned
     /// opaque handle.  Callers never decode or rebuild the handle: MV target
     /// partition filtering may choose a subset of files, but only this
@@ -6026,12 +7056,6 @@ impl IcebergQueryTableMaterialization {
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let write_target_admission = self
-            .table
-            .serialized_metadata
-            .as_deref()
-            .map(|_| iceberg_write_target_admission(&self.table, table.clone()))
-            .transpose()?;
         Ok(Self {
             table_name: self.table_name.clone(),
             schema_id: self.schema_id,
@@ -6041,7 +7065,7 @@ impl IcebergQueryTableMaterialization {
             read_schema: self.read_schema.clone(),
             read_selector: selector,
             sql_ukfk_facts: self.sql_ukfk_facts.clone(),
-            write_target_admission,
+            write_target_admission: None,
             table: self.table.clone(),
             files: Vec::new(),
             binding: IcebergDataFileBinding::ExplicitFiles,
@@ -6233,39 +7257,6 @@ fn mv_target_transform_text(
         MvPartitionTransformContract::Truncate { width } => Some(format!("truncate({width})")),
         MvPartitionTransformContract::Void => None,
     }
-}
-
-/// Produce a neutral terminal-write admission from a provider-owned frozen
-/// table descriptor.  Legacy callers may still hold this descriptor while
-/// their own execution carrier is migrated, but the query binding receives
-/// only the opaque handle and SQL-owned facts.
-pub(crate) fn iceberg_write_target_admission_from_frozen_table(
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> Result<crate::engine::query_planning::bindings::QueryWriteTargetAdmission, String> {
-    let owner = ConnectorInstanceId::parse(&table.catalog)
-        .map_err(|error| format!("invalid frozen Iceberg write target catalog: {error}"))?;
-    let handle = ConnectorTableHandle::try_new(
-        owner,
-        encode_payload(
-            &TablePayload {
-                namespace: table.namespace.clone(),
-                table: table.table.clone(),
-                table_info: Some(table.clone()),
-                metadata_columns: Vec::new(),
-                metadata_table_type: None,
-                prepared_files: Vec::new(),
-                explicit_files: None,
-                logical_type_columns: BTreeMap::new(),
-                hidden_columns: Vec::new(),
-                frozen_rewrite: None,
-            },
-            "Iceberg frozen write target",
-            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        )
-        .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    iceberg_write_target_admission(table, handle)
 }
 
 /// A bounded reference to an Iceberg-owned rewrite artifact.  It is the only
@@ -7373,11 +8364,6 @@ fn materialization_from_metadata(
                     .any(|metadata| column.name.eq_ignore_ascii_case(metadata))
         })
         .collect();
-    let write_target_admission = table
-        .serialized_metadata
-        .as_deref()
-        .map(|_| iceberg_write_target_admission(&table, metadata.table.clone()))
-        .transpose()?;
     Ok(IcebergQueryTableMaterialization {
         table_name: payload.table,
         schema_id,
@@ -7387,7 +8373,7 @@ fn materialization_from_metadata(
         read_schema: metadata.schema,
         read_selector,
         sql_ukfk_facts,
-        write_target_admission,
+        write_target_admission: None,
         table,
         files: payload.prepared_files,
         binding,
@@ -7413,252 +8399,6 @@ fn sql_ukfk_facts_from_frozen_table(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     crate::sql::planner::table::SqlUkFkTableFacts::from_frozen_properties(&properties)
-}
-
-/// Project a frozen Iceberg target into the SQL-owned write facts retained by
-/// a query binding.  This is intentionally adjacent to payload decoding: the
-/// provider is the only owner allowed to interpret serialized Iceberg
-/// metadata or field identifiers.
-pub(crate) fn iceberg_write_target_admission(
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    handle: ConnectorTableHandle,
-) -> Result<crate::engine::query_planning::bindings::QueryWriteTargetAdmission, String> {
-    let serialized = table
-        .serialized_metadata
-        .as_deref()
-        .ok_or_else(|| "frozen Iceberg write target is missing serialized metadata".to_string())?;
-    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
-        serde_json::from_str(serialized)
-            .map_err(|error| format!("decode frozen Iceberg write target metadata: {error}"))?;
-    let target_columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
-        metadata.current_schema(),
-    )?;
-    let fields = target_columns
-        .iter()
-        .map(|column| {
-            let field = table
-                .schema
-                .fields
-                .iter()
-                .find(|field| field.name.eq_ignore_ascii_case(&column.name))
-                .ok_or_else(|| {
-                    format!(
-                        "frozen Iceberg write target is missing field identity for column {}",
-                        column.name
-                    )
-                })?;
-            Ok(
-                crate::sql::planner::distributed::write::contract::SqlWriteTargetField {
-                    field_id: field.field_id,
-                    column: column.clone(),
-                    is_hidden: false,
-                },
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let partition = crate::sql::planner::distributed::write::contract::SqlWritePartitionContract {
-        spec_id: metadata.default_partition_spec_id(),
-        fields: metadata
-            .default_partition_spec()
-            .fields()
-            .iter()
-            .map(|field| {
-                Ok(
-                    crate::sql::planner::distributed::write::contract::SqlWritePartitionField {
-                        name: field.name.clone(),
-                        source_field_id: field.source_id,
-                        transform: iceberg_write_partition_transform(&field.transform)?,
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-    };
-    let partition_source_fields = partition
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            let source = metadata
-                .current_schema()
-                .field_by_id(field.source_field_id)
-                .ok_or_else(|| {
-                    format!(
-                        "frozen Iceberg write target partition field {} has unknown source id {}",
-                        field.name, field.source_field_id
-                    )
-                })?;
-            let column = target_columns
-                .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(&source.name))
-                .ok_or_else(|| {
-                    format!(
-                        "frozen Iceberg write target partition source {} is absent from its SQL schema",
-                        source.name
-                    )
-                })?;
-            Ok(crate::sql::planner::distributed::write::contract::SqlPositionDeletePartitionSourceField {
-                output_expr_index: index + 2,
-                source_column_name: source.name.clone(),
-                partition_field_name: field.name.clone(),
-                transform: field.transform.clone(),
-                source_field_id: field.source_field_id,
-                data_type: column.data_type.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(crate::engine::query_planning::bindings::QueryWriteTargetAdmission {
-        table: handle,
-        identity: crate::sql::planner::table::SqlTableIdentity {
-            catalog: table.catalog.clone(),
-            namespace: table.namespace.clone(),
-            table: table.table.clone(),
-        },
-        snapshot_id: table.current_snapshot_id,
-        fields,
-        partition: partition.clone(),
-        position_delete_output: crate::sql::planner::distributed::write::contract::SqlPositionDeleteOutputDescriptor {
-            file_path: crate::sql::planner::distributed::write::contract::SqlPositionDeleteOutputField {
-                output_expr_index: 0,
-                name: "file_path".to_string(),
-                data_type: DataType::Utf8,
-                field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-            },
-            pos: crate::sql::planner::distributed::write::contract::SqlPositionDeleteOutputField {
-                output_expr_index: 1,
-                name: "pos".to_string(),
-                data_type: DataType::Int64,
-                field_id: crate::connector::iceberg::position_delete_descriptor::ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-            },
-            partition_source_fields,
-            target_partition_spec_id: partition.spec_id,
-        },
-        target_columns,
-    })
-}
-
-fn iceberg_write_partition_transform(
-    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
-) -> Result<crate::sql::planner::distributed::write::contract::SqlWritePartitionTransform, String> {
-    use crate::sql::planner::distributed::write::contract::SqlWritePartitionTransform;
-    Ok(match transform {
-        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
-            SqlWritePartitionTransform::Identity
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
-            SqlWritePartitionTransform::Year
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
-            SqlWritePartitionTransform::Month
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
-            SqlWritePartitionTransform::Day
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
-            SqlWritePartitionTransform::Hour
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(buckets) => {
-            SqlWritePartitionTransform::Bucket {
-                buckets: u32::try_from(*buckets)
-                    .map_err(|_| format!("Iceberg partition bucket count {buckets} is invalid"))?,
-            }
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
-            SqlWritePartitionTransform::Truncate {
-                width: u32::try_from(*width)
-                    .map_err(|_| format!("Iceberg partition truncate width {width} is invalid"))?,
-            }
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
-            SqlWritePartitionTransform::Void
-        }
-        unsupported => {
-            return Err(format!(
-                "Iceberg write target uses unsupported partition transform {unsupported}"
-            ));
-        }
-    })
-}
-
-/// Rehydrate the provider-private writer carrier after SQL has sealed the
-/// tokenized target contract.  The handle originated from the exact admission
-/// lease; no catalog lookup or Core-side payload decoding is involved.
-pub(crate) fn iceberg_write_sink_spec_from_admitted_handle(
-    handle: &ConnectorTableHandle,
-    input: &crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    entry: &IcebergCatalogEntry,
-) -> Result<IcebergWriteSinkSpec, String> {
-    let payload: TablePayload = decode_payload(handle.payload(), "admitted Iceberg write handle")
-        .map_err(|error| error.to_string())?;
-    let mut iceberg = payload.table_info.ok_or_else(|| {
-        "admitted Iceberg write handle is missing its provider table descriptor".to_string()
-    })?;
-    if !iceberg
-        .catalog
-        .eq_ignore_ascii_case(&input.contract.target.table.catalog)
-        || !iceberg
-            .namespace
-            .eq_ignore_ascii_case(&input.contract.target.table.namespace)
-        || !iceberg
-            .table
-            .eq_ignore_ascii_case(&input.contract.target.table.table)
-    {
-        return Err(
-            "SQL write contract target differs from its admitted provider handle".to_string(),
-        );
-    }
-    let serialized = iceberg.serialized_metadata.as_deref().ok_or_else(|| {
-        "admitted Iceberg write handle is missing frozen table metadata".to_string()
-    })?;
-    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
-        serde_json::from_str(serialized)
-            .map_err(|error| format!("decode admitted Iceberg write handle metadata: {error}"))?;
-    let mode = iceberg_write_sink_mode(input.contract.mode);
-    if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
-        iceberg.schema.fields.extend([
-            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: None,
-                write_default_json: None,
-                children: Vec::new(),
-            },
-            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: None,
-                write_default_json: None,
-                children: Vec::new(),
-            },
-        ]);
-    }
-    let position_delete_output_descriptor = input
-        .contract
-        .position_delete_output
-        .as_ref()
-        .map(position_delete_descriptor_from_sql)
-        .transpose()?;
-    let table_location = metadata.location().to_string();
-    let data_location = metadata
-        .properties()
-        .get("write.data.path")
-        .cloned()
-        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
-    Ok(IcebergWriteSinkSpec {
-        mode,
-        iceberg,
-        target_columns: input.contract.input_columns.clone(),
-        table_location,
-        data_location,
-        target_partition_spec_id: metadata.default_partition_spec_id(),
-        cloud_properties: entry.cloud_properties_map(),
-        file_format: "parquet".to_string(),
-        compression: IcebergWriteFileCompression::Snappy,
-        position_delete_output_descriptor,
-    })
 }
 
 pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
@@ -8219,6 +8959,62 @@ mod tests {
     fn unknown_table_catalog_error_is_not_found() {
         let error = map_iceberg_error("unknown table: analytics.orders".to_string());
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    }
+
+    #[test]
+    fn spi5c1_row_write_input_keeps_identity_and_partition_tokens_separate() {
+        let lease = fixture_planning_lease("iceberg");
+        let owner = ConnectorExecutionBindingKey {
+            instance_id: ConnectorInstanceId::parse("iceberg").expect("fixture instance ID"),
+            incarnation: lease.binding().incarnation(),
+        };
+        let metadata = lease
+            .binding()
+            .metadata()
+            .load_table(ConnectorTableRequest {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: owner.instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("orders"),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: crate::connector::test_request_context(),
+            })
+            .expect("fixture table admission");
+        let request = ConnectorWritePreparationRequest {
+            table: metadata.table,
+            intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: ConnectorWriteInputRequest::PositionDelete {
+                identity_fields: vec![
+                    ConnectorWriteFieldRequest::new(Field::new("_file", DataType::Utf8, false)),
+                    ConnectorWriteFieldRequest::new(Field::new("_pos", DataType::Int64, false)),
+                ],
+                partition_source_fields: vec![ConnectorWriteFieldRequest::new(Field::new(
+                    "id",
+                    DataType::Int32,
+                    false,
+                ))],
+            },
+            context: crate::connector::test_request_context(),
+        };
+
+        let frozen_metadata = super::super::test_metadata::metadata_with_two_snapshots();
+        let shape = bind_iceberg_write_input(&request, &owner, &frozen_metadata)
+            .expect("bind row-write input");
+        let ConnectorWriteInputShape::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        } = shape
+        else {
+            panic!("expected position-delete input shape");
+        };
+        assert_eq!(identity_fields.len(), 2);
+        assert_eq!(partition_source_fields.len(), 1);
+        assert_ne!(
+            identity_fields[0].token(),
+            partition_source_fields[0].token()
+        );
     }
 
     #[test]

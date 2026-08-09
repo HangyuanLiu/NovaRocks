@@ -29,9 +29,7 @@ use novarocks::query_execution::request_context::RequestContext;
 use novarocks::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
-use crate::dml::model::{
-    CommitOutcome, CommitServiceError, OperationKind, OperationTarget, WriteTransactionSpec,
-};
+use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
 use crate::dml::service::DmlService;
 
@@ -50,13 +48,9 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
     ) -> Result<CoordinatedWriteReport<Self::CommitHandle>, String> {
         Ok(
             match self.engine.run_delete(self.prepared.handle.as_ref())? {
-                DeleteWriteReport::Aborted {
-                    reason,
-                    has_staged_files,
-                } => CoordinatedWriteReport::Aborted {
-                    reason,
-                    has_staged: has_staged_files,
-                },
+                DeleteWriteReport::Aborted { reason, .. } => {
+                    CoordinatedWriteReport::Aborted { reason }
+                }
                 DeleteWriteReport::NoOp => CoordinatedWriteReport::NoOp,
                 DeleteWriteReport::CommitRequired(handle) => {
                     CoordinatedWriteReport::CommitRequired(handle)
@@ -69,7 +63,7 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
         &self,
         _spec: &WriteTransactionSpec,
         handle: &Self::AbortHandle,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
         match *handle {}
     }
 
@@ -77,9 +71,14 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
         &self,
         _spec: &WriteTransactionSpec,
         handle: &Self::CommitHandle,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
         self.engine
-            .commit_delete(self.prepared.handle.as_ref(), handle.as_ref())
+            .commit_delete_terminal(self.prepared.handle.as_ref(), handle.as_ref())
     }
 
     fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
@@ -98,7 +97,6 @@ fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
         },
         operation_kind: OperationKind::RowDelta,
         operation_subkind: None,
-        commit_op_kind: operation.commit_op_kind,
         attempt_id: operation.attempt_id.clone(),
         base_snapshot_id: operation.base_snapshot_id,
         base_snapshot_map: BTreeMap::new(),

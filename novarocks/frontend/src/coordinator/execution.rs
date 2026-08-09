@@ -41,7 +41,7 @@ use novarocks::query_execution::lifecycle::{
 };
 use novarocks::query_execution::write::WriteTerminalBuilder;
 use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
-use novarocks_spi::connector::{ConnectorWriteLease, ConnectorWriteResolver};
+use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::QueryId;
 
 use super::backend_events::BackendQueryActivity;
@@ -1068,21 +1068,9 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
     fn begin_write_operation(
         &self,
         registration: ConnectorWriteOperationRegistration,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        let lease = self
-            .connector_control
-            .acquire_current_write(registration.connector_instance_id())
-            .map_err(|error| failed(format!("acquire connector write operation lease: {error}")))?;
-        ConnectorWriteOperationSession::try_begin(registration, lease)
-            .map_err(|error| failed(format!("seal connector write operation cohorts: {error}")))
-    }
-
-    fn begin_write_operation_with_lease(
-        &self,
-        registration: ConnectorWriteOperationRegistration,
         lease: ConnectorWriteLease,
     ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        if registration.connector_instance_id() != &lease.binding_key().instance_id {
+        if registration.owner() != lease.binding_key() {
             return Err(failed(
                 "connector write registration does not match caller-retained lease",
             ));

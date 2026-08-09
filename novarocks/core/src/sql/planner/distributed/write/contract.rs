@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 
 use arrow::datatypes::DataType;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::ConnectorWriteFieldToken;
 
 use crate::sql::analysis::TypedExpr;
 use crate::sql::binding::SqlTableBindingId;
@@ -64,86 +65,14 @@ pub(crate) enum SqlWriteSinkMode {
     EqualityDeletes,
 }
 
-/// A SQL-level target field. `field_id` is the target schema identity, not a
-/// fragment output ordinal and not a provider object reference.
+/// A Provider-signed SQL-visible target field.  The token binds this Arrow
+/// field to one sealed write preparation without exposing a table-format field
+/// ID to SQL planning.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SqlWriteTargetField {
-    pub(crate) field_id: i32,
+    pub(crate) token: ConnectorWriteFieldToken,
     pub(crate) column: ColumnDef,
     pub(crate) is_hidden: bool,
-}
-
-/// A partition transform exposed to SQL planning. Provider encoders translate
-/// this closed vocabulary explicitly; they do not recover it from metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SqlWritePartitionTransform {
-    Identity,
-    Year,
-    Month,
-    Day,
-    Hour,
-    Bucket { buckets: u32 },
-    Truncate { width: u32 },
-    Void,
-}
-
-impl SqlWritePartitionTransform {
-    /// Stable SQL spelling used by typed position-delete and write contracts.
-    pub(crate) fn sql_name(&self) -> String {
-        match self {
-            Self::Identity => "identity".to_string(),
-            Self::Year => "year".to_string(),
-            Self::Month => "month".to_string(),
-            Self::Day => "day".to_string(),
-            Self::Hour => "hour".to_string(),
-            Self::Bucket { buckets } => format!("bucket[{buckets}]"),
-            Self::Truncate { width } => format!("truncate[{width}]"),
-            Self::Void => "void".to_string(),
-        }
-    }
-}
-
-/// One SQL-visible partition field of the write target.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SqlWritePartitionField {
-    pub(crate) name: String,
-    pub(crate) source_field_id: i32,
-    pub(crate) transform: SqlWritePartitionTransform,
-}
-
-/// Immutable partition layout selected by the frozen catalog binding.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SqlWritePartitionContract {
-    pub(crate) spec_id: i32,
-    pub(crate) fields: Vec<SqlWritePartitionField>,
-}
-
-/// SQL facts for the two physical position-delete columns and any partition
-/// source columns emitted by the terminal plan.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SqlPositionDeleteOutputDescriptor {
-    pub(crate) file_path: SqlPositionDeleteOutputField,
-    pub(crate) pos: SqlPositionDeleteOutputField,
-    pub(crate) partition_source_fields: Vec<SqlPositionDeletePartitionSourceField>,
-    pub(crate) target_partition_spec_id: i32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SqlPositionDeleteOutputField {
-    pub(crate) output_expr_index: usize,
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) field_id: i32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SqlPositionDeletePartitionSourceField {
-    pub(crate) output_expr_index: usize,
-    pub(crate) source_column_name: String,
-    pub(crate) partition_field_name: String,
-    pub(crate) transform: SqlWritePartitionTransform,
-    pub(crate) source_field_id: i32,
-    pub(crate) data_type: DataType,
 }
 
 /// The compiler-visible write target. The binding token is the sole route back
@@ -153,18 +82,14 @@ pub(crate) struct SqlPositionDeletePartitionSourceField {
 pub(crate) struct SqlWriteSinkTargetContract {
     pub(crate) binding: SqlTableBindingId,
     pub(crate) table: SqlTableIdentity,
-    pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) fields: Vec<SqlWriteTargetField>,
-    pub(crate) partition: SqlWritePartitionContract,
 }
 
 impl SqlWriteSinkTargetContract {
     pub(crate) fn try_new(
         binding: SqlTableBindingId,
         table: SqlTableIdentity,
-        target_snapshot_id: Option<i64>,
         fields: Vec<SqlWriteTargetField>,
-        partition: SqlWritePartitionContract,
     ) -> Result<Self, String> {
         if table.catalog.is_empty() || table.namespace.is_empty() || table.table.is_empty() {
             return Err("SQL write target requires a canonical table identity".to_string());
@@ -173,14 +98,11 @@ impl SqlWriteSinkTargetContract {
             return Err("SQL write target requires at least one target field".to_string());
         }
 
-        let mut field_ids = BTreeSet::new();
+        let mut field_tokens = BTreeSet::new();
         let mut names = BTreeSet::new();
         for field in &fields {
-            if !field_ids.insert(field.field_id) {
-                return Err(format!(
-                    "SQL write target contains duplicate field id {}",
-                    field.field_id
-                ));
+            if !field_tokens.insert(field.token) {
+                return Err("SQL write target contains duplicate provider field token".to_string());
             }
             if !names.insert(field.column.name.clone()) {
                 return Err(format!(
@@ -190,32 +112,10 @@ impl SqlWriteSinkTargetContract {
             }
         }
 
-        let target_field_ids = fields
-            .iter()
-            .map(|field| field.field_id)
-            .collect::<BTreeSet<_>>();
-        let mut partition_names = BTreeSet::new();
-        for field in &partition.fields {
-            if !target_field_ids.contains(&field.source_field_id) {
-                return Err(format!(
-                    "SQL write partition field {} references unknown target field id {}",
-                    field.name, field.source_field_id
-                ));
-            }
-            if !partition_names.insert(field.name.clone()) {
-                return Err(format!(
-                    "SQL write target contains duplicate partition field {}",
-                    field.name
-                ));
-            }
-        }
-
         Ok(Self {
             binding,
             table,
-            target_snapshot_id,
             fields,
-            partition,
         })
     }
 }
@@ -228,7 +128,6 @@ pub(crate) struct SqlWriteSinkContract {
     pub(crate) mode: SqlWriteSinkMode,
     pub(crate) target: SqlWriteSinkTargetContract,
     pub(crate) input_columns: Vec<ColumnDef>,
-    pub(crate) position_delete_output: Option<SqlPositionDeleteOutputDescriptor>,
 }
 
 impl SqlWriteSinkContract {
@@ -236,79 +135,16 @@ impl SqlWriteSinkContract {
         mode: SqlWriteSinkMode,
         target: SqlWriteSinkTargetContract,
         input_columns: Vec<ColumnDef>,
-        position_delete_output: Option<SqlPositionDeleteOutputDescriptor>,
     ) -> Result<Self, String> {
         if input_columns.is_empty() {
             return Err("SQL write sink requires at least one input column".to_string());
-        }
-        let position_delete_mode = matches!(
-            mode,
-            SqlWriteSinkMode::PositionDeletes | SqlWriteSinkMode::DeletionVectors
-        );
-        if position_delete_mode != position_delete_output.is_some() {
-            return Err(
-                "SQL write sink position-delete descriptor does not match write mode".to_string(),
-            );
-        }
-        if let Some(descriptor) = &position_delete_output {
-            validate_position_delete_descriptor(descriptor, &target.partition)?;
         }
         Ok(Self {
             mode,
             target,
             input_columns,
-            position_delete_output,
         })
     }
-}
-
-fn validate_position_delete_descriptor(
-    descriptor: &SqlPositionDeleteOutputDescriptor,
-    partition: &SqlWritePartitionContract,
-) -> Result<(), String> {
-    if descriptor.target_partition_spec_id != partition.spec_id {
-        return Err(format!(
-            "SQL position-delete descriptor partition spec id {} does not match target spec id {}",
-            descriptor.target_partition_spec_id, partition.spec_id
-        ));
-    }
-    if descriptor.file_path.output_expr_index != 0
-        || descriptor.file_path.name != "file_path"
-        || descriptor.file_path.data_type != DataType::Utf8
-    {
-        return Err("SQL position-delete descriptor has invalid file_path output".to_string());
-    }
-    if descriptor.pos.output_expr_index != 1
-        || descriptor.pos.name != "pos"
-        || descriptor.pos.data_type != DataType::Int64
-    {
-        return Err("SQL position-delete descriptor has invalid pos output".to_string());
-    }
-    if descriptor.partition_source_fields.len() != partition.fields.len() {
-        return Err(format!(
-            "SQL position-delete descriptor partition source count {} does not match target partition field count {}",
-            descriptor.partition_source_fields.len(),
-            partition.fields.len()
-        ));
-    }
-    for (index, (source, target)) in descriptor
-        .partition_source_fields
-        .iter()
-        .zip(&partition.fields)
-        .enumerate()
-    {
-        if source.output_expr_index != index + 2
-            || source.partition_field_name != target.name
-            || source.source_field_id != target.source_field_id
-            || source.transform != target.transform
-        {
-            return Err(format!(
-                "SQL position-delete descriptor partition source {} does not match target partition contract",
-                target.name
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -341,26 +177,16 @@ pub(crate) mod test_support {
                 namespace: "analytics".to_string(),
                 table: "orders".to_string(),
             },
-            Some(42),
             vec![SqlWriteTargetField {
-                field_id: 1,
+                token: ConnectorWriteFieldToken::from_bytes([1; 32]),
                 column: column.clone(),
                 is_hidden: false,
             }],
-            SqlWritePartitionContract {
-                spec_id: 7,
-                fields: Vec::new(),
-            },
         )
         .expect("valid SQL target");
         SqlWritePlanInput {
-            contract: SqlWriteSinkContract::try_new(
-                SqlWriteSinkMode::Data,
-                target,
-                vec![column],
-                None,
-            )
-            .expect("valid SQL write contract"),
+            contract: SqlWriteSinkContract::try_new(SqlWriteSinkMode::Data, target, vec![column])
+                .expect("valid SQL write contract"),
             input,
             root_output_exprs: None,
         }
@@ -401,20 +227,11 @@ mod tests {
                 namespace: "analytics".to_string(),
                 table: "orders".to_string(),
             },
-            Some(42),
             vec![SqlWriteTargetField {
-                field_id: 1,
+                token: ConnectorWriteFieldToken::from_bytes([1; 32]),
                 column: column("order_id", DataType::Int64),
                 is_hidden: false,
             }],
-            SqlWritePartitionContract {
-                spec_id: 7,
-                fields: vec![SqlWritePartitionField {
-                    name: "order_id_bucket".to_string(),
-                    source_field_id: 1,
-                    transform: SqlWritePartitionTransform::Bucket { buckets: 16 },
-                }],
-            },
         )
         .expect("valid SQL target")
     }
@@ -426,48 +243,41 @@ mod tests {
             SqlWriteSinkMode::Data,
             target.clone(),
             vec![column("order_id", DataType::Int64)],
-            None,
         )
         .expect("valid write contract");
 
         assert_eq!(contract.target.binding, binding());
         assert_eq!(contract.target.table.table, "orders");
-        assert_eq!(contract.target.target_snapshot_id, Some(42));
         assert_eq!(
-            contract.target.partition.fields[0].transform.sql_name(),
-            "bucket[16]"
+            contract.target.fields[0].token,
+            ConnectorWriteFieldToken::from_bytes([1; 32])
         );
     }
 
     #[test]
-    fn sqlx2_write_sink_contract_rejects_mismatched_position_descriptor() {
-        let descriptor = SqlPositionDeleteOutputDescriptor {
-            file_path: SqlPositionDeleteOutputField {
-                output_expr_index: 0,
-                name: "file_path".to_string(),
-                data_type: DataType::Utf8,
-                field_id: 2_147_483_546,
+    fn sqlx2_write_sink_contract_rejects_duplicate_provider_token() {
+        let error = SqlWriteSinkTargetContract::try_new(
+            binding(),
+            SqlTableIdentity {
+                catalog: "iceberg".to_string(),
+                namespace: "analytics".to_string(),
+                table: "orders".to_string(),
             },
-            pos: SqlPositionDeleteOutputField {
-                output_expr_index: 1,
-                name: "pos".to_string(),
-                data_type: DataType::Int64,
-                field_id: 2_147_483_545,
-            },
-            partition_source_fields: Vec::new(),
-            target_partition_spec_id: 8,
-        };
-        let error = SqlWriteSinkContract::try_new(
-            SqlWriteSinkMode::PositionDeletes,
-            target(),
             vec![
-                column("file_path", DataType::Utf8),
-                column("pos", DataType::Int64),
+                SqlWriteTargetField {
+                    token: ConnectorWriteFieldToken::from_bytes([9; 32]),
+                    column: column("order_id", DataType::Int64),
+                    is_hidden: false,
+                },
+                SqlWriteTargetField {
+                    token: ConnectorWriteFieldToken::from_bytes([9; 32]),
+                    column: column("customer_id", DataType::Int64),
+                    is_hidden: false,
+                },
             ],
-            Some(descriptor),
         )
-        .expect_err("mismatched target partition spec must fail");
+        .expect_err("duplicate provider token must fail");
 
-        assert!(error.contains("partition spec id 8 does not match target spec id 7"));
+        assert!(error.contains("duplicate provider field token"));
     }
 }

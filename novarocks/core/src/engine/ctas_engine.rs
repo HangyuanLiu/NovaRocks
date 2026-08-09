@@ -35,8 +35,10 @@ use novarocks_spi::connector::{
     ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreateReceipt, ConnectorStagedCreateReconcileOutcome,
     ConnectorStagedCreateReconcilePhase, ConnectorStagedCreateReconcileRequest,
-    ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
+    ConnectorWriteOperationId, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
     CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization,
 };
 
@@ -383,12 +385,14 @@ fn prepare_planned_ctas_connector_write(
     let native_bundle =
         crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)?;
     let cohort_id = template.cohort_id();
+    let exact_lease = template.lease();
     crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
         cohort_id,
+        exact_lease,
     )
     .map_err(|error| error.to_string())
 }
@@ -534,21 +538,44 @@ impl CoreCtasTargetSession {
                 "CTAS staged target write has already been prepared",
             ));
         }
+        // Staged-create remains the provider-only bridge that proves this
+        // invisible table belongs to the retained create lease.  Immediately
+        // turn that bridge result into a normal Provider-signed preparation:
+        // generic CTAS orchestration must not retain its table payload or
+        // provider-private plan payload.
         let binding = self.lease.plan_write(ConnectorStagedWritePlanningRequest {
             handle: self.exact_handle()?,
             operation_id,
             intent: ConnectorWriteIntent::Append,
-            input_schema,
+            input_schema: Arc::clone(&input_schema),
             context,
         })?;
+        let outcome =
+            self.write_lease
+                .control()
+                .prepare_write(ConnectorWritePreparationRequest {
+                    table: binding.table().clone(),
+                    intent: binding.intent(),
+                    purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                    input: ConnectorWriteInputRequest::Data {
+                        fields: input_schema
+                            .fields()
+                            .iter()
+                            .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
+                            .collect(),
+                    },
+                    context: binding.context().clone(),
+                })?;
+        let preparation = match outcome {
+            ConnectorWritePreparationOutcome::Prepared(preparation) => preparation,
+            ConnectorWritePreparationOutcome::Denied(error) => return Err(error),
+        };
         Ok(
             crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
                 binding.operation_id(),
-                binding.table().clone(),
-                binding.intent(),
-                Arc::clone(binding.input_schema()),
-                binding.provider_payload().clone(),
+                preparation,
                 binding.context().clone(),
+                self.write_lease.clone(),
             ),
         )
     }
@@ -1302,13 +1329,11 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                     .take()
                     .ok_or_else(|| "CTAS prepared write was already consumed".to_string())?;
                 let cohort_id = request.write_cohort_id();
+                let exact_lease = request.lease();
                 let session = prepared
                     .state
                     .query_execution
-                    .begin_write_operation_with_lease(
-                        request.registration(),
-                        prepared.target.write_lease(),
-                    )
+                    .begin_write_operation(request.registration(), exact_lease)
                     .map_err(|error| error.to_string())?;
                 *prepared
                     .write_session

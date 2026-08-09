@@ -34,13 +34,10 @@ use crate::connector::iceberg::commit::{
     select_iceberg_update_mode,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
-use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
-use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    admit_frozen_iceberg_write_target, row_lineage_sink_spec_from_frozen_materialization,
-    sql_write_plan_input_for_admitted_target,
+    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -55,6 +52,37 @@ fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCom
         .writers
         .iter()
         .any(|writer| !writer.connector_staged_report_frames.is_empty())
+}
+
+fn row_lineage_input_request(
+    columns: &[novarocks_catalog::schema::ColumnDef],
+) -> novarocks_spi::connector::ConnectorWriteInputRequest {
+    use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
+
+    ConnectorWriteInputRequest::RowLineage {
+        data_fields: columns
+            .iter()
+            .map(|column| {
+                ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                ))
+            })
+            .collect(),
+        row_identity_fields: vec![
+            ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+            )),
+            ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                DataType::Int64,
+                true,
+            )),
+        ],
+    }
 }
 
 /// Logical change-stream branches remain a mutation-kernel decision. SQL owns
@@ -210,28 +238,11 @@ fn target_partition_source_column_names(
     let Some(data_sink) = data_sink else {
         return Ok(Vec::new());
     };
-    data_sink
-        .contract
-        .target
-        .partition
-        .fields
-        .iter()
-        .map(|partition| {
-            data_sink
-                .contract
-                .target
-                .fields
-                .iter()
-                .find(|field| field.field_id == partition.source_field_id)
-                .map(|field| field.column.name.clone())
-                .ok_or_else(|| {
-                    format!(
-                        "DML change-stream partition source field id {} is absent from the admitted SQL write target",
-                        partition.source_field_id
-                    )
-                })
-        })
-        .collect()
+    // Partition transforms are Provider-owned.  The signed input shape
+    // already contains the complete Arrow layout SQL must produce; it must
+    // not reconstruct partition source field IDs from Iceberg metadata.
+    let _ = data_sink;
+    Ok(Vec::new())
 }
 
 /// Core-private staged mutation execution retained behind `MutationEngine`'s
@@ -246,6 +257,21 @@ pub(crate) trait MutationExecution: Send + Sync {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError>;
+    fn commit_terminal(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
+            completion.session().owner(),
+            completion.session().operation_id(),
+            self.commit(completion),
+        )
+    }
     fn finalize(&self) -> Result<(), String>;
 }
 
@@ -292,10 +318,10 @@ pub(crate) struct PreparedMorUpdateWriteTarget {
     /// planning must not observe a later branch head after the frontend has
     /// recorded the mutation intent.
     pub(crate) read_snapshot_id: Option<i64>,
-    /// Application-owned writer facts frozen with `planning_lease`. They are
+    /// Provider-signed writer facts frozen with `planning_lease`. They are
     /// admitted into the same query-local store as the producer compile, never
     /// rebuilt during stage/preparation.
-    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) preparation: novarocks_spi::connector::ConnectorWritePreparation,
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
@@ -320,7 +346,7 @@ pub(crate) struct PreparedMergeMutation {
 /// Frozen MOR writer facts for MERGE.  The producer query and its terminal
 /// sink must use the same admission lease and physical target envelope.
 pub(crate) struct PreparedMorMergeWriteTarget {
-    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) preparation: novarocks_spi::connector::ConnectorWritePreparation,
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
@@ -433,12 +459,15 @@ pub(crate) fn prepare_update_mutation(
         // independent clone, so the stored writer envelope has one explicit
         // generation authority.
         let planning_lease = materialization.planning_lease.clone();
-        let mut sink_spec =
-            row_lineage_sink_spec_from_frozen_materialization(&materialization, &entry)?;
-        sink_spec.set_planned_snapshot_id(read_snapshot_id)?;
+        let (_, preparation) = materialization.prepare_write(
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            row_lineage_input_request(&materialization.columns),
+            connector_context.clone(),
+        )?;
         Some(PreparedMorUpdateWriteTarget {
             read_snapshot_id,
-            sink_spec,
+            preparation,
             planning_lease,
         })
     } else {
@@ -535,10 +564,14 @@ pub(crate) fn prepare_merge_mutation(
                 &target.table,
             )?;
         let planning_lease = materialization.planning_lease.clone();
-        let sink_spec =
-            row_lineage_sink_spec_from_frozen_materialization(&materialization, &entry)?;
+        let (_, preparation) = materialization.prepare_write(
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            row_lineage_input_request(&materialization.columns),
+            connector_context.clone(),
+        )?;
         Some(PreparedMorMergeWriteTarget {
-            sink_spec,
+            preparation,
             planning_lease,
         })
     } else {
@@ -675,7 +708,7 @@ pub(crate) fn stage_prepared_update_mutation(
         IcebergUpdateMode::MergeOnRead => {
             let PreparedMorUpdateWriteTarget {
                 read_snapshot_id,
-                sink_spec: write_sink_spec,
+                preparation,
                 planning_lease: write_planning_lease,
             } = mor_write_target.ok_or_else(|| {
                 "MOR UPDATE reached stage without an admitted frozen write target".to_string()
@@ -711,7 +744,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 metadata.last_sequence_number() + 1,
                 &execution,
                 &connector_context,
-                &write_sink_spec,
+                &preparation,
                 write_planning_lease,
             )?;
             let abort_cleanup =
@@ -762,6 +795,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 commit_executor,
                 execution,
                 connector_context,
+                write_lease,
                 operation_session: Mutex::new(None),
             });
             let result = match execution_handle.stage() {
@@ -939,7 +973,7 @@ fn build_update_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_sink_spec: &IcebergWriteSinkSpec,
+    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
@@ -982,9 +1016,14 @@ fn build_update_mor_change_stream_write_plan(
     // intentionally precedes compilation, so `build_dml_change_stream_write_plan`
     // can recover the write token from the same store that resolves producer
     // scans. No preparation phase is allowed to reacquire current/latest.
-    admit_frozen_iceberg_write_target(
+    crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
         table_bindings.as_ref(),
-        write_sink_spec,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        preparation.clone(),
         write_planning_lease,
     )?;
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -1659,6 +1698,10 @@ struct MorUpdateChangeStreamExecutor {
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    /// Exact write authority derived during admission.  Staging must seal the
+    /// operation against this lease; it must not reacquire a current control
+    /// generation after frontend durable intent.
+    write_lease: novarocks_spi::connector::ConnectorWriteLease,
     operation_session:
         Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
 }
@@ -1673,6 +1716,9 @@ struct MorMergeChangeStreamExecutor {
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    /// Exact write authority derived during admission.  See the corresponding
+    /// UPDATE executor for why this is retained through staging.
+    write_lease: novarocks_spi::connector::ConnectorWriteLease,
     operation_session:
         Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
 }
@@ -1713,10 +1759,11 @@ impl MorUpdateChangeStreamExecutor {
                 self.connector_write.clone(),
             )),
         )?;
+        let exact_lease = prepared_request.lease();
         let session = self
             .state
             .query_execution
-            .begin_write_operation(prepared_request.registration())
+            .begin_write_operation(prepared_request.registration(), exact_lease)
             .map_err(|error| error.to_string())?;
         *self
             .operation_session
@@ -1820,10 +1867,11 @@ impl MorMergeChangeStreamExecutor {
                 self.connector_write.clone(),
             )),
         )?;
+        let exact_lease = prepared_request.lease();
         let session = self
             .state
             .query_execution
-            .begin_write_operation(prepared_request.registration())
+            .begin_write_operation(prepared_request.registration(), exact_lease)
             .map_err(|error| error.to_string())?;
         *self
             .operation_session
@@ -1905,7 +1953,7 @@ struct CowFileRewritePlan {
 /// sealed cohort has staged successfully.
 struct CowUpdateDistributedWrite {
     file_plans: Vec<CowFileRewritePlan>,
-    data_sink_spec: IcebergWriteSinkSpec,
+    rewrite_preparation: novarocks_spi::connector::ConnectorWritePreparation,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     base_snapshot_id: i64,
 }
@@ -1924,16 +1972,18 @@ fn build_cow_update_distributed_write(
 ) -> Result<CowUpdateDistributedWrite, String> {
     let base_snapshot_id =
         base_snapshot_id.ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
-    let resolved = crate::connector::metadata_load_table_with_planning_lease(
-        planning_lease.clone(),
+    let materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+            planning_lease.clone(),
+            connector_context.clone(),
+            &target.namespace,
+            &target.table,
+        )?;
+    let (_, rewrite_preparation) = materialization.prepare_write(
+        novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        row_lineage_input_request(target_columns),
         connector_context.clone(),
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?
-    .0;
-    let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
-        target, &resolved, table, entry,
     )?;
 
     // Index the snapshot's data files by path so each touched file inherits its
@@ -2002,7 +2052,7 @@ fn build_cow_update_distributed_write(
 
     Ok(CowUpdateDistributedWrite {
         file_plans,
-        data_sink_spec,
+        rewrite_preparation,
         planning_lease,
         base_snapshot_id,
     })
@@ -2343,7 +2393,7 @@ fn run_cow_update_file_rewrites(
             state,
             target,
             &plan,
-            &write.data_sink_spec,
+            &write.rewrite_preparation,
             &write.planning_lease,
             registration,
             execution,
@@ -2368,22 +2418,27 @@ fn run_one_cow_file_rewrite(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     plan: &CowFileRewritePlan,
-    data_sink_spec: &IcebergWriteSinkSpec,
+    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryExecutionResult, String> {
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = admit_frozen_iceberg_write_target(
+    let target_binding = admit_prepared_connector_write_target(
         table_bindings.as_ref(),
-        data_sink_spec,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        preparation.clone(),
         planning_lease.clone(),
     )?;
     let sink = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
-        data_sink_spec.sql_mode(),
+        crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::RowLineageData,
         crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
@@ -2469,27 +2524,7 @@ fn build_cow_update_distributed_execution(
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
-    let handle_payload = encode_data_sink_spec_handle_payload(&write.data_sink_spec)?;
-    let input_schema = Arc::new(Schema::new(
-        write
-            .data_sink_spec
-            .target_columns
-            .iter()
-            .map(|column| {
-                arrow::datatypes::Field::new(
-                    &column.name,
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-            })
-            .collect::<Vec<_>>(),
-    ));
-    let plan_payload = crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1 {
-        version: 1,
-        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
-        target_ref: target_ref.to_string(),
-    };
-    let mut private_contexts = BTreeMap::new();
+    let mut provider_cohorts = Vec::with_capacity(write.file_plans.len());
     let mut cohort_templates = Vec::with_capacity(write.file_plans.len());
     let mut cohort_by_old_file = BTreeMap::new();
     for file_plan in &mut write.file_plans {
@@ -2511,26 +2546,27 @@ fn build_cow_update_distributed_execution(
             semantic_digest,
         )
         .map_err(|error| format!("derive COW rewrite cohort: {error}"))?;
-        let private =
-            crate::connector::iceberg::write_service::IcebergWriteCohortContext::cow_rewrite(
-                handle_payload.clone(),
-                &plan_payload,
-                write.base_snapshot_id,
-                file_plan.old_file.clone(),
-                file_plan.matched_row_ids.clone(),
-            )
-            .map_err(|error| format!("build COW rewrite cohort context: {error}"))?;
-        cohort_templates.push((
-            cohort_id,
-            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            Arc::clone(&input_schema),
-            private.planning_payload(),
-            connector_context.clone(),
-        ));
-        if private_contexts.insert(cohort_id, private).is_some()
-            || cohort_by_old_file
-                .insert(file_plan.old_file.clone(), cohort_id)
-                .is_some()
+        provider_cohorts.push(
+            crate::connector::iceberg::provider::IcebergCowWriteCohort::Rewrite {
+                cohort_id,
+                preparation: write.rewrite_preparation.clone(),
+                base_snapshot_id: write.base_snapshot_id,
+                old_file: file_plan.old_file.clone(),
+                matched_row_ids: file_plan.matched_row_ids.clone(),
+            },
+        );
+        cohort_templates.push(
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
+                operation_id,
+                cohort_id,
+                write.rewrite_preparation.clone(),
+                connector_context.clone(),
+                write_lease.clone(),
+            ),
+        );
+        if cohort_by_old_file
+            .insert(file_plan.old_file.clone(), cohort_id)
+            .is_some()
         {
             return Err("COW UPDATE generated a duplicate rewrite cohort".to_string());
         }
@@ -2541,28 +2577,28 @@ fn build_cow_update_distributed_execution(
                 Arc::clone(&commit_executor),
             ),
         );
-    let service = crate::connector::iceberg::write_service::IcebergWriteControlService::new(
-        crate::connector::iceberg::write_service::IcebergWriteControlServiceContext::new_with_cohorts(
-            private_contexts,
-            committer,
-        )
-        .map_err(|error| format!("build COW write operation service: {error}"))?,
-    );
-    let templates = crate::engine::iceberg_writer::register_iceberg_connector_write_cohort_service(
-        state,
-        target,
-        target_ref,
-        service,
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    crate::connector::iceberg::provider::register_iceberg_cow_write_service_from_preparations(
+        services,
         operation_id,
-        &write_lease,
-        cohort_templates,
-    )?;
+        provider_cohorts,
+        target_ref,
+        &entry,
+        committer,
+    )
+    .map_err(|error| format!("activate Iceberg COW provider service: {error}"))?;
     let registration =
-        crate::query_execution::contract::ConnectorWriteOperationRegistration::try_new(templates)
-            .map_err(|error| error.to_string())?;
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::try_new(
+            cohort_templates,
+        )
+        .map_err(|error| error.to_string())?;
     let operation_session = state
         .query_execution
-        .begin_write_operation(registration)
+        .begin_write_operation(registration, write_lease)
         .map_err(|error| error.to_string())?;
     Ok(Arc::new(DistributedCowUpdateExecutor {
         state: Arc::clone(state),
@@ -2936,7 +2972,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             .map(|snapshot| snapshot.snapshot_id());
         let metadata = table.metadata();
         let PreparedMorMergeWriteTarget {
-            sink_spec: write_sink_spec,
+            preparation,
             planning_lease: write_planning_lease,
         } = mor_write_target.ok_or_else(|| {
             "MOR MERGE reached stage without an admitted frozen write target".to_string()
@@ -2972,7 +3008,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             metadata.last_sequence_number() + 1,
             &execution,
             &connector_context,
-            &write_sink_spec,
+            &preparation,
             write_planning_lease,
         )?;
         let abort_cleanup =
@@ -3023,6 +3059,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             commit_executor,
             execution,
             connector_context,
+            write_lease,
             operation_session: Mutex::new(None),
         });
         let result = match execution_handle.stage() {
@@ -3110,23 +3147,33 @@ pub(crate) fn stage_prepared_merge_mutation(
                 state.connector_control.as_ref(),
                 &target.catalog,
             )?;
-            let resolved = crate::connector::metadata_load_table_with_planning_lease(
-                planning_lease.clone(),
+            let materialization =
+                crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+                    planning_lease.clone(),
+                    connector_context.clone(),
+                    &target.namespace,
+                    &target.table,
+                )?;
+            let (_, preparation) = materialization.prepare_write(
+                novarocks_spi::connector::ConnectorWriteIntent::Append,
+                novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                    fields: target_columns
+                        .iter()
+                        .map(|column| {
+                            novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                                arrow::datatypes::Field::new(
+                                    &column.name,
+                                    column.data_type.clone(),
+                                    column.nullable,
+                                ),
+                            )
+                        })
+                        .collect(),
+                },
                 connector_context.clone(),
-                &target.namespace,
-                &target.table,
-                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-            )?
-            .0;
-            let (query, sink_spec) = crate::engine::iceberg_writer::build_iceberg_write_plan(
-                &target,
-                &resolved,
-                &[],
-                &crate::engine::iceberg_writer::IcebergWriteInput::Query(Box::new(insert_query)),
-                &table,
-                &entry,
             )?;
-            Some((query, sink_spec, planning_lease))
+            Some((insert_query, preparation, planning_lease))
         } else {
             None
         }
@@ -3255,6 +3302,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             "main",
             write,
             insert_branch.as_ref(),
+            &entry,
             Arc::clone(&commit_executor),
             operation_id,
             &connector_context,
@@ -3308,37 +3356,23 @@ fn prepare_cow_merge_operation(
     write: &mut CowUpdateDistributedWrite,
     insert: Option<&(
         sqlparser::ast::Query,
-        IcebergWriteSinkSpec,
+        novarocks_spi::connector::ConnectorWritePreparation,
         novarocks_spi::connector::ConnectorControlPlanningLease,
     )>,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowMergeOperation, String> {
+    let write_lease = write
+        .planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive COW MERGE write lease: {error}"))?;
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
-    let rewrite_handle = encode_data_sink_spec_handle_payload(&write.data_sink_spec)?;
-    let rewrite_schema = Arc::new(Schema::new(
-        write
-            .data_sink_spec
-            .target_columns
-            .iter()
-            .map(|column| {
-                arrow::datatypes::Field::new(
-                    &column.name,
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-            })
-            .collect::<Vec<_>>(),
-    ));
-    let plan_payload = crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1 {
-        version: 1,
-        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
-        target_ref: target_ref.to_string(),
-    };
-    let mut private_contexts = BTreeMap::new();
+    let mut provider_cohorts =
+        Vec::with_capacity(write.file_plans.len() + usize::from(insert.is_some()));
     let mut templates = Vec::with_capacity(write.file_plans.len() + usize::from(insert.is_some()));
     let mut cohort_by_old_file = BTreeMap::new();
     for file_plan in &mut write.file_plans {
@@ -3360,26 +3394,27 @@ fn prepare_cow_merge_operation(
             semantic_digest,
         )
         .map_err(|error| format!("derive MERGE COW rewrite cohort: {error}"))?;
-        let private =
-            crate::connector::iceberg::write_service::IcebergWriteCohortContext::cow_rewrite(
-                rewrite_handle.clone(),
-                &plan_payload,
-                write.base_snapshot_id,
-                file_plan.old_file.clone(),
-                file_plan.matched_row_ids.clone(),
-            )
-            .map_err(|error| format!("build MERGE COW rewrite cohort: {error}"))?;
-        templates.push((
-            cohort_id,
-            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            Arc::clone(&rewrite_schema),
-            private.planning_payload(),
-            connector_context.clone(),
-        ));
-        private_contexts.insert(cohort_id, private);
+        provider_cohorts.push(
+            crate::connector::iceberg::provider::IcebergCowWriteCohort::Rewrite {
+                cohort_id,
+                preparation: write.rewrite_preparation.clone(),
+                base_snapshot_id: write.base_snapshot_id,
+                old_file: file_plan.old_file.clone(),
+                matched_row_ids: file_plan.matched_row_ids.clone(),
+            },
+        );
+        templates.push(
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
+                operation_id,
+                cohort_id,
+                write.rewrite_preparation.clone(),
+                connector_context.clone(),
+                write_lease.clone(),
+            ),
+        );
         cohort_by_old_file.insert(file_plan.old_file.clone(), cohort_id);
     }
-    let append_cohort = if let Some((_, sink_spec, _)) = insert {
+    let append_cohort = if let Some((_, preparation, _)) = insert {
         let semantic_digest: [u8; 32] = Sha256::digest(b"cow-append").into();
         let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::derive(
             operation_id,
@@ -3387,34 +3422,22 @@ fn prepare_cow_merge_operation(
             semantic_digest,
         )
         .map_err(|error| format!("derive MERGE COW append cohort: {error}"))?;
-        let private =
-            crate::connector::iceberg::write_service::IcebergWriteCohortContext::cow_append(
-                encode_data_sink_spec_handle_payload(sink_spec)?,
-                &plan_payload,
-                write.base_snapshot_id,
-            )
-            .map_err(|error| format!("build MERGE COW append cohort: {error}"))?;
-        let schema = Arc::new(Schema::new(
-            sink_spec
-                .target_columns
-                .iter()
-                .map(|column| {
-                    arrow::datatypes::Field::new(
-                        &column.name,
-                        column.data_type.clone(),
-                        column.nullable,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        ));
-        templates.push((
-            cohort_id,
-            novarocks_spi::connector::ConnectorWriteIntent::Append,
-            schema,
-            private.planning_payload(),
-            connector_context.clone(),
-        ));
-        private_contexts.insert(cohort_id, private);
+        provider_cohorts.push(
+            crate::connector::iceberg::provider::IcebergCowWriteCohort::Append {
+                cohort_id,
+                preparation: preparation.clone(),
+                base_snapshot_id: write.base_snapshot_id,
+            },
+        );
+        templates.push(
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
+                operation_id,
+                cohort_id,
+                preparation.clone(),
+                connector_context.clone(),
+                write_lease.clone(),
+            ),
+        );
         Some(cohort_id)
     } else {
         None
@@ -3425,32 +3448,26 @@ fn prepare_cow_merge_operation(
                 commit_executor,
             ),
         );
-    let service = crate::connector::iceberg::write_service::IcebergWriteControlService::new(
-        crate::connector::iceberg::write_service::IcebergWriteControlServiceContext::new_with_cohorts(
-            private_contexts,
-            committer,
-        )
-        .map_err(|error| format!("build MERGE COW operation service: {error}"))?,
-    );
-    let write_lease = write
-        .planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive COW MERGE write lease: {error}"))?;
-    let templates = crate::engine::iceberg_writer::register_iceberg_connector_write_cohort_service(
-        state,
-        target,
-        target_ref,
-        service,
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    crate::connector::iceberg::provider::register_iceberg_cow_write_service_from_preparations(
+        services,
         operation_id,
-        &write_lease,
-        templates,
-    )?;
+        provider_cohorts,
+        target_ref,
+        entry,
+        committer,
+    )
+    .map_err(|error| format!("activate MERGE COW provider service: {error}"))?;
     let registration =
         crate::query_execution::contract::ConnectorWriteOperationRegistration::try_new(templates)
             .map_err(|error| error.to_string())?;
     let session = state
         .query_execution
-        .begin_write_operation(registration)
+        .begin_write_operation(registration, write_lease)
         .map_err(|error| error.to_string())?;
     Ok(CowMergeOperation {
         session,
@@ -3795,7 +3812,7 @@ fn build_merge_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_sink_spec: &IcebergWriteSinkSpec,
+    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt
@@ -3925,9 +3942,14 @@ fn build_merge_mor_change_stream_write_plan(
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let table_bindings = analyzer_provider.query_table_bindings();
-    admit_frozen_iceberg_write_target(
+    crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
         table_bindings.as_ref(),
-        write_sink_spec,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        preparation.clone(),
         write_planning_lease,
     )?;
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -4191,7 +4213,7 @@ struct MergeBranchSet {
     /// FRESH (net-new rows, no preserved `_row_id`).
     insert: Option<(
         sqlparser::ast::Query,
-        IcebergWriteSinkSpec,
+        novarocks_spi::connector::ConnectorWritePreparation,
         novarocks_spi::connector::ConnectorControlPlanningLease,
     )>,
     matched: MergeMatchedBranch,
@@ -4221,7 +4243,8 @@ struct CowMergeOperation {
 }
 
 fn admitted_merge_write_input(
-    sink_spec: &IcebergWriteSinkSpec,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     (
@@ -4231,15 +4254,20 @@ fn admitted_merge_write_input(
     String,
 > {
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = admit_frozen_iceberg_write_target(
+    let target_binding = admit_prepared_connector_write_target(
         table_bindings.as_ref(),
-        sink_spec,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        preparation.clone(),
         planning_lease.clone(),
     )?;
     let sink = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
-        sink_spec.sql_mode(),
+        crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
         crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
@@ -4250,10 +4278,11 @@ impl DistributedMergeExecutor {
     fn run_insert_cohort(
         &self,
         query: &sqlparser::ast::Query,
-        sink_spec: &IcebergWriteSinkSpec,
+        preparation: &novarocks_spi::connector::ConnectorWritePreparation,
         registration: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     ) -> Result<QueryExecutionResult, String> {
-        let (sink, table_bindings) = admitted_merge_write_input(sink_spec, &self.planning_lease)?;
+        let (sink, table_bindings) =
+            admitted_merge_write_input(&self.target, preparation, &self.planning_lease)?;
         let result =
             crate::engine::execute_query_as_iceberg_write_in_operation_with_connector_context(
                 &self.state,
@@ -4291,9 +4320,10 @@ impl DistributedMergeExecutor {
     fn run_insert_branch(
         &self,
         query: &sqlparser::ast::Query,
-        sink_spec: &IcebergWriteSinkSpec,
+        preparation: &novarocks_spi::connector::ConnectorWritePreparation,
     ) -> Result<QueryExecutionResult, String> {
-        let (sink, table_bindings) = admitted_merge_write_input(sink_spec, &self.planning_lease)?;
+        let (sink, table_bindings) =
+            admitted_merge_write_input(&self.target, preparation, &self.planning_lease)?;
         let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
@@ -4342,7 +4372,7 @@ impl DistributedMergeExecutor {
                     &self.execution,
                     &self.connector_context,
                 )?;
-                if let Some((query, sink_spec, _)) = branches.insert.as_ref() {
+                if let Some((query, preparation, _)) = branches.insert.as_ref() {
                     let cohort_id = cow.append_cohort.ok_or_else(|| {
                         "MERGE COW append branch has no sealed append cohort".to_string()
                     })?;
@@ -4351,20 +4381,20 @@ impl DistributedMergeExecutor {
                         cohort_id,
                     )
                     .map_err(|error| error.to_string())?;
-                    final_result = self.run_insert_cohort(query, sink_spec, registration)?;
+                    final_result = self.run_insert_cohort(query, preparation, registration)?;
                 }
                 return Ok(final_result);
             }
         }
 
-        if let Some((query, sink_spec, _)) = branches.insert.as_ref() {
+        if let Some((query, preparation, _)) = branches.insert.as_ref() {
             if self.commit_op_kind != CommitOpKind::FastAppend {
                 return Err(format!(
                     "MERGE not-matched INSERT fold does not support commit op {:?}",
                     self.commit_op_kind
                 ));
             }
-            return self.run_insert_branch(query, sink_spec);
+            return self.run_insert_branch(query, preparation);
         }
         Err("MERGE operation produced no writable branch".to_string())
     }

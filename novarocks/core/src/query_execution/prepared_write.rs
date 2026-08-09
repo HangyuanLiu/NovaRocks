@@ -26,18 +26,21 @@ use crate::query_execution::contract::{
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;
-use novarocks_spi::connector::{ConnectorWriteCohortId, ConnectorWriteOperationId};
+use novarocks_spi::connector::{
+    ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId,
+};
 
 /// SQL-owned prepared fragments and native bundle for one connector write.
-/// It deliberately contains no backend topology, control lease, writer handle,
-/// or execution attempt. The application owner admits execution and seals the
-/// registration before calling [`Self::into_request`].
+/// It deliberately contains no backend topology, writer handle, or execution
+/// attempt. It does retain the exact write lease that admitted the sealed
+/// preparation; bind must never reacquire a later current generation.
 pub struct PreparedDistributedWriteRequest {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     query_options: Option<QueryOptions>,
     registration: ConnectorWriteOperationRegistration,
     cohort_id: ConnectorWriteCohortId,
+    lease: ConnectorWriteLease,
 }
 
 impl PreparedDistributedWriteRequest {
@@ -47,6 +50,7 @@ impl PreparedDistributedWriteRequest {
         query_options: Option<QueryOptions>,
         registration: ConnectorWriteOperationRegistration,
         cohort_id: ConnectorWriteCohortId,
+        lease: ConnectorWriteLease,
     ) -> Result<Self, DistributedQueryError> {
         if registration
             .clone()
@@ -59,12 +63,30 @@ impl PreparedDistributedWriteRequest {
                 "prepared connector write request references a cohort outside its sealed registration",
             ));
         }
+        if registration.owner() != lease.binding_key() {
+            return Err(DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                "prepared connector write request registration does not match its retained lease",
+            ));
+        }
+        if registration
+            .clone()
+            .into_cohorts()
+            .iter()
+            .any(|template| !template.retains_lease_generation(&lease))
+        {
+            return Err(DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                "prepared connector write request does not retain the planning template lease generation",
+            ));
+        }
         Ok(Self {
             prepared,
             native_bundle,
             query_options,
             registration,
             cohort_id,
+            lease,
         })
     }
 
@@ -80,6 +102,10 @@ impl PreparedDistributedWriteRequest {
     /// owner to begin through its retained exact-generation write lease.
     pub fn registration(&self) -> ConnectorWriteOperationRegistration {
         self.registration.clone()
+    }
+
+    pub fn lease(&self) -> ConnectorWriteLease {
+        self.lease.clone()
     }
 
     /// Bind the precomputed artifact to one admitted query execution and one

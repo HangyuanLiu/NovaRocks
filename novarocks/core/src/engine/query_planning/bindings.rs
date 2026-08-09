@@ -31,9 +31,6 @@ use std::sync::{Arc, Mutex};
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::ResolvedAnalyzerTable;
-use crate::sql::planner::distributed::write::contract::{
-    SqlPositionDeleteOutputDescriptor, SqlWritePartitionContract, SqlWriteTargetField,
-};
 use crate::sql::planner::table::{
     ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
 };
@@ -41,6 +38,7 @@ use arrow::datatypes::SchemaRef;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
+    ConnectorWritePreparation,
 };
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -247,20 +245,13 @@ pub(crate) struct QueryTableBinding {
     >,
 }
 
-/// One terminal write target captured under an exact connector lease.
-///
-/// The target contract's SQL facts are projected while the provider owns the
-/// frozen metadata.  `table` stays opaque through Core and is returned to the
-/// provider only when its writer execution carrier is built.
+/// One Provider-signed terminal write preparation retained beside the SQL
+/// binding token.  Field identity, input shape and opaque table authority are
+/// all sealed by the provider; SQL may project its Arrow layout and field
+/// tokens but must not reconstruct table-format metadata.
 #[derive(Clone)]
 pub(crate) struct QueryWriteTargetAdmission {
-    pub(crate) table: ConnectorTableHandle,
-    pub(crate) identity: SqlTableIdentity,
-    pub(crate) snapshot_id: Option<i64>,
-    pub(crate) fields: Vec<SqlWriteTargetField>,
-    pub(crate) partition: SqlWritePartitionContract,
-    pub(crate) position_delete_output: SqlPositionDeleteOutputDescriptor,
-    pub(crate) target_columns: Vec<ColumnDef>,
+    pub(crate) preparation: ConnectorWritePreparation,
 }
 
 /// Exact provider scan facts retained after admission.  The concrete Iceberg

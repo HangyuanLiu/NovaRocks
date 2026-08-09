@@ -1625,6 +1625,8 @@ impl IcebergWriteCohortContext {
 pub(crate) struct IcebergWriteControlServiceContext {
     cohorts: IcebergWriteCohortContexts,
     commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+    preparation_digest: Option<[u8; 32]>,
+    cohort_preparation_digests: Option<BTreeMap<ConnectorWriteCohortId, [u8; 32]>>,
 }
 
 #[derive(Clone)]
@@ -1657,6 +1659,8 @@ impl IcebergWriteControlServiceContext {
                 )?,
             ),
             commit_executor,
+            preparation_digest: None,
+            cohort_preparation_digests: None,
         })
     }
 
@@ -1673,7 +1677,24 @@ impl IcebergWriteControlServiceContext {
                 )?,
             ),
             commit_executor,
+            preparation_digest: None,
+            cohort_preparation_digests: None,
         })
+    }
+
+    pub(crate) fn new_with_first_refresh_preparation_handle_payload(
+        writer_handle_payload: bytes::Bytes,
+        plan_payload: IcebergFirstRefreshWritePlanPayloadV2,
+        preparation_digest: [u8; 32],
+        commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+    ) -> Result<Self, ConnectorError> {
+        let mut context = Self::new_with_first_refresh_handle_payload(
+            writer_handle_payload,
+            plan_payload,
+            commit_executor,
+        )?;
+        context.preparation_digest = Some(preparation_digest);
+        Ok(context)
     }
 
     pub(crate) fn new_with_fragment_handle_payloads(
@@ -1692,6 +1713,8 @@ impl IcebergWriteControlServiceContext {
                 )?,
             ),
             commit_executor,
+            preparation_digest: None,
+            cohort_preparation_digests: None,
         })
     }
 
@@ -1705,7 +1728,72 @@ impl IcebergWriteControlServiceContext {
         Ok(Self {
             cohorts: IcebergWriteCohortContexts::Sealed(cohorts),
             commit_executor,
+            preparation_digest: None,
+            cohort_preparation_digests: None,
         })
+    }
+
+    /// Bind every sealed cohort to its own Provider-signed preparation.
+    pub(crate) fn new_with_prepared_cohorts(
+        cohorts: BTreeMap<ConnectorWriteCohortId, IcebergWriteCohortContext>,
+        preparation_digests: BTreeMap<ConnectorWriteCohortId, [u8; 32]>,
+        commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+    ) -> Result<Self, ConnectorError> {
+        let mut context = Self::new_with_cohorts(cohorts, commit_executor)?;
+        let IcebergWriteCohortContexts::Sealed(cohorts) = &context.cohorts else {
+            unreachable!("prepared cohorts are sealed")
+        };
+        if cohorts.len() != preparation_digests.len()
+            || cohorts
+                .keys()
+                .any(|cohort| !preparation_digests.contains_key(cohort))
+        {
+            return Err(invalid(
+                "Iceberg prepared cohort digests do not match registered cohorts",
+            ));
+        }
+        context.cohort_preparation_digests = Some(preparation_digests);
+        Ok(context)
+    }
+
+    /// Bind a single data-file service to the exact preparation that admitted
+    /// its table, base version, and Arrow field tokens.  Planning must not
+    /// activate this service for a different sealed preparation.
+    pub(crate) fn new_with_preparation_handle_payload(
+        writer_handle_payload: bytes::Bytes,
+        plan_payload: IcebergWritePlanPayloadV1,
+        preparation_digest: [u8; 32],
+        commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+    ) -> Result<Self, ConnectorError> {
+        let mut context =
+            Self::new_with_handle_payload(writer_handle_payload, plan_payload, commit_executor)?;
+        context.preparation_digest = Some(preparation_digest);
+        Ok(context)
+    }
+
+    fn validate_preparation(
+        &self,
+        request: &ConnectorWritePlanningRequest,
+    ) -> Result<(), ConnectorError> {
+        if self
+            .preparation_digest
+            .is_some_and(|expected| expected != request.preparation.digest())
+        {
+            return Err(invalid(
+                "Iceberg write service was activated for a different provider preparation",
+            ));
+        }
+        if self
+            .cohort_preparation_digests
+            .as_ref()
+            .and_then(|digests| digests.get(&request.cohort_id))
+            .is_some_and(|expected| *expected != request.preparation.digest())
+        {
+            return Err(invalid(
+                "Iceberg write cohort was activated for a different provider preparation",
+            ));
+        }
+        Ok(())
     }
 
     fn cohort(
@@ -1833,10 +1921,15 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
         &self,
         request: &ConnectorWritePlanningRequest,
     ) -> Result<IcebergWriteControlPlan, ConnectorError> {
+        self.context.validate_preparation(request)?;
         let cohort = self
             .context
             .cohort(request.operation_id, request.cohort_id)?;
-        cohort.ensure_control_payload(&request.provider_payload)?;
+        // The provider-signed preparation is validated by the outer control
+        // adapter before this operation-local service is activated.  The
+        // legacy cohort control payload remains private to the registered
+        // service and is returned only with the writer plan; callers cannot
+        // supply a second, caller-authored payload through the SPI request.
         let owner = request
             .expected_writers
             .first()
@@ -2006,7 +2099,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType,
@@ -2016,9 +2109,11 @@ mod tests {
         ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
         ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorSealedWriteCohortSet,
         ConnectorStagedReportSummary, ConnectorTableHandle, ConnectorWriteAttemptCompletion,
-        ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteExecutionId,
-        ConnectorWriteIntent, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
-        ConnectorWriterIdentity, ConnectorWriterTerminalState,
+        ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor,
+        ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteOperationCompletion,
+        ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWriterIdentity,
+        ConnectorWriterTerminalState,
     };
     use parquet::basic::Compression;
 
@@ -2225,13 +2320,22 @@ mod tests {
             operation_id,
             cohort_id,
             execution_id,
-            table: ConnectorTableHandle::try_new(
-                owner.instance_id.clone(),
-                Bytes::from_static(b"t"),
+            preparation: ConnectorWritePreparation::try_new(
+                owner.clone(),
+                ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::from_static(b"t"))
+                    .expect("table"),
+                ConnectorWriteIntent::Append,
+                ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
+                    .expect("base version"),
+                ConnectorWriteInputShape::Data {
+                    fields: vec![ConnectorWriteFieldBinding::new(
+                        ConnectorWriteFieldToken::from_bytes([1; 32]),
+                        Field::new("id", DataType::Int32, false),
+                    )],
+                },
+                Bytes::from_static(b"provider-signed-preparation"),
             )
-            .expect("table"),
-            intent: ConnectorWriteIntent::Append,
-            input_schema: Arc::new(Schema::empty()),
+            .expect("preparation"),
             expected_writers: vec![ConnectorWriterIdentity::new(
                 operation_id,
                 cohort_id,
@@ -2242,7 +2346,6 @@ mod tests {
                 0,
                 owner,
             )],
-            provider_payload: payload().encode().expect("payload"),
             context: context(),
         }
     }
@@ -2255,7 +2358,7 @@ mod tests {
     ) -> (ConnectorWriteCommitRequest, ConnectorWriteAbortRequest) {
         let descriptor = ConnectorWriteCohortDescriptor::new(
             request.cohort_id,
-            request.intent,
+            request.preparation.intent(),
             request.stable_digest(&owner).expect("planning digest"),
         );
         let sealed = ConnectorSealedWriteCohortSet::try_new(request.operation_id, vec![descriptor])
@@ -2375,21 +2478,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_a_different_or_noncanonical_operation_payload() {
+    fn plan_uses_provider_signed_preparation_without_a_caller_payload() {
         let fake = Arc::new(FakeCommitter {
             metadata: metadata(),
             committed: Mutex::new(Vec::new()),
             aborted: Mutex::new(Vec::new()),
         });
         let service = service(fake);
-        let mut request = request(key());
-        request.provider_payload =
-            Bytes::from_static(b"{\"target_ref\":\"main\",\"target\":\"ice.db.t\",\"version\":1}");
-        let error = match service.plan(&request) {
-            Ok(_) => panic!("noncanonical payload must fail closed"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let plan = service
+            .plan(&request(key()))
+            .expect("provider-signed preparation plans");
+        assert_eq!(plan.control_payload, payload().encode().expect("payload"));
     }
 
     #[test]
