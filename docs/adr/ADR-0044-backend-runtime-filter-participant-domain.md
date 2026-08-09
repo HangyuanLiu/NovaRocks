@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-08-09
 provenance:
-  - "PR: pending"
+  - "PR: #848 https://github.com/NovaRocks/NovaRocks/pull/848"
   - "discussion: 2026-08-09 runtime-filter participant ownership migration"
 code-anchors:
   - "novarocks/backend/src/runtime_filter/participant.rs (BackendRuntimeFilterParticipantFactory)"
