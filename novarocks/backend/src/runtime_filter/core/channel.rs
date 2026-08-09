@@ -51,9 +51,10 @@ use novarocks::runtime_filter_transition::port::support::{
 use novarocks::runtime_filter_transition::port::topk_summary::{
     RuntimeTopKSummaryContract, TopKSummary,
 };
+use novarocks::runtime_filter_transition::port::value_domain::LogicalSnapshot;
 #[cfg(test)]
 use novarocks::runtime_filter_transition::port::value_domain::MembershipValues;
-use novarocks::runtime_filter_transition::port::value_domain::{LogicalSnapshot, ValueDomainDelta};
+use novarocks::runtime_filter_transition::port::value_domain::ValueDomainDelta;
 use novarocks_types::UniqueId;
 
 use super::coverage::{CoverageProgress, WitnessProgress, evaluate};

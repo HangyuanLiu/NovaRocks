@@ -44,23 +44,15 @@ use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 const QUERY_UNAVAILABLE_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace";
 const ACK_UNSUPPORTED_REJECTION: &str = "runtime filter ingress rejected [ack-unsupported]: runtime filter ack ingress is not supported";
 
-struct BackendRuntimeFilterEventObserver {
-    diagnostic_sink:
-        Arc<dyn novarocks::runtime_filter_transition::port::events::RuntimeFilterEventSink>,
-}
+/// Transitional discard sink while the remaining Service event emitter is
+/// moved to Backend's native vocabulary. It deliberately keeps no Core-wide
+/// observation state or lookup path alive.
+struct LegacyDiscardRuntimeFilterEventSink;
 
 impl novarocks::runtime_filter_transition::port::events::RuntimeFilterEventSink
-    for BackendRuntimeFilterEventObserver
+    for LegacyDiscardRuntimeFilterEventSink
 {
-    fn record(
-        &self,
-        event: novarocks::runtime_filter_transition::port::events::RuntimeFilterEvent,
-    ) {
-        // Core's legacy registry is an append-only diagnostic observer. The
-        // Backend-owned Service never receives it back as a lookup or control
-        // dependency.
-        self.diagnostic_sink.record(event);
-    }
+    fn record(&self, _: novarocks::runtime_filter_transition::port::events::RuntimeFilterEvent) {}
 }
 
 /// Backend-private factory injected into the lifecycle registry. The entry
@@ -101,16 +93,9 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
             query_id.low(),
             execution_id.attempt_id().get()
         ));
-        let diagnostic_sink =
-            novarocks::runtime::runtime_filter_observability::backend_participant_event_sink(
-                novarocks::runtime::runtime_filter_observability::QueryKey::from_hi_lo(
-                    query_id.high(),
-                    query_id.low(),
-                ),
-            );
         let service = Arc::new(RuntimeFilterService::new_for_query(
             query_id,
-            Arc::new(BackendRuntimeFilterEventObserver { diagnostic_sink }),
+            Arc::new(LegacyDiscardRuntimeFilterEventSink),
             &memory,
         ));
         if let Err(error) = service.install(contribution.install.clone()) {

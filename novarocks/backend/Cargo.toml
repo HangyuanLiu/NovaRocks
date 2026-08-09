@@ -8,7 +8,9 @@ build = "build.rs"
 doctest = false
 
 [dependencies]
-novarocks = { path = "../core" }
+# Temporary migration support while RFO-7B moves the remaining participant
+# service paths into Backend. Removed together with the last transition import.
+novarocks = { path = "../core", features = ["runtime-filter-test-support"] }
 novarocks-execution = { path = "../execution" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }

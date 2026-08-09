@@ -284,8 +284,9 @@ fn encode_role(
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use novarocks::runtime_filter_transition::model::contract::{NullOrder, SortDirection};
-    use novarocks::runtime_filter_transition::port::ordered_bound::RuntimeOrderKey;
+    use novarocks_execution::runtime_filter::contribution::{
+        RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
+    };
     use novarocks_protocol::common;
     use novarocks_protocol::plan::RuntimeFilterScanDomainTarget;
     use plan::runtime_filter_binding::Role;
@@ -345,8 +346,16 @@ mod tests {
         assert_eq!(membership.schema_digest, vec![4; 32]);
 
         let keys = [
-            RuntimeOrderKey::new(DataType::Int64, SortDirection::Ascending, NullOrder::First),
-            RuntimeOrderKey::new(DataType::Utf8, SortDirection::Descending, NullOrder::Last),
+            RuntimeOrderKey::with_order(
+                DataType::Int64,
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderNullOrder::First,
+            ),
+            RuntimeOrderKey::with_order(
+                DataType::Utf8,
+                RuntimeOrderSortDirection::Descending,
+                RuntimeOrderNullOrder::Last,
+            ),
         ];
         let ordered = encode_contract(RuntimeFilterContractFacts::Ordered {
             keys: &keys,

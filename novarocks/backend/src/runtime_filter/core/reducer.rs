@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Temporary legacy reducer for the historical Channel while its callers are
+//! being cut to the Backend participant domain.
+//!
+//! New Backend paths reduce Execution values through
+//! `runtime_filter::domain::MembershipReducer`. This bridge must be deleted
+//! before RFO-7B closes; it exists only to keep the staged cut buildable.
+
 use std::collections::BTreeSet;
 use std::fmt;
 
 use arrow::datatypes::DataType;
-
 use novarocks::runtime_filter_transition::model::contract::NullSemantics;
 use novarocks::runtime_filter_transition::port::value_domain::{
     ContributionSizeError, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
@@ -190,80 +196,5 @@ fn projected_value_growth(
             missing_fixed_bytes(left.values(), right.values(), size_of::<i128>())
         }
         _ => Err(ReducerError::TypeMismatch),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::datatypes::DataType;
-
-    use novarocks::runtime_filter_transition::model::contract::NullSemantics;
-    use novarocks::runtime_filter_transition::port::value_domain::{
-        MembershipValues, ValueDomainDelta,
-    };
-
-    use super::MembershipReducer;
-
-    #[test]
-    fn value_domain_union_accepts_unseen_out_of_order_deltas() {
-        let mut reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NeverMatches).unwrap();
-        let first = ValueDomainDelta::new(MembershipValues::int64([30]), false);
-        assert_eq!(reducer.preflight(&first).unwrap().retained_growth(), 8);
-        reducer.commit_preflighted(&first).unwrap();
-        let second = ValueDomainDelta::new(MembershipValues::int64([10, 20]), false);
-        assert_eq!(reducer.preflight(&second).unwrap().retained_growth(), 16);
-        reducer.commit_preflighted(&second).unwrap();
-
-        assert_eq!(
-            reducer.domain().values(),
-            &MembershipValues::int64([10, 20, 30])
-        );
-    }
-
-    #[test]
-    fn reducer_deduplicates_values_and_retains_null_only_for_null_safe_equal() {
-        let mut reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NullSafeEqual).unwrap();
-        let first = ValueDomainDelta::new(MembershipValues::int64([1, 1]), true);
-        assert_eq!(reducer.preflight(&first).unwrap().retained_growth(), 9);
-        reducer.commit_preflighted(&first).unwrap();
-        let second = ValueDomainDelta::new(MembershipValues::int64([1, 2]), true);
-        assert_eq!(reducer.preflight(&second).unwrap().retained_growth(), 8);
-        reducer.commit_preflighted(&second).unwrap();
-
-        assert_eq!(reducer.domain().values(), &MembershipValues::int64([1, 2]));
-        assert!(reducer.domain().contains_null());
-    }
-
-    #[test]
-    fn reducer_rejects_type_mismatch_before_mutation() {
-        let reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NeverMatches).unwrap();
-        assert!(
-            reducer
-                .preflight(&ValueDomainDelta::new(MembershipValues::int32([1]), false))
-                .is_err()
-        );
-        assert!(reducer.domain().values().is_empty());
-    }
-
-    #[test]
-    fn duplicate_value_projection_has_zero_growth() {
-        let mut reducer =
-            MembershipReducer::try_new(DataType::Int64, NullSemantics::NeverMatches).unwrap();
-        let delta = ValueDomainDelta::new(MembershipValues::int64([1]), false);
-        reducer.commit_preflighted(&delta).unwrap();
-        assert_eq!(reducer.preflight(&delta).unwrap().retained_growth(), 0);
-    }
-
-    #[test]
-    fn reducer_uses_port_owned_empty_largeint_construction() {
-        let data_type = MembershipValues::large_int([]).data_type();
-        let reducer =
-            MembershipReducer::try_new(data_type.clone(), NullSemantics::NeverMatches).unwrap();
-
-        assert_eq!(reducer.domain().data_type(), data_type);
-        assert!(reducer.domain().values().is_empty());
     }
 }

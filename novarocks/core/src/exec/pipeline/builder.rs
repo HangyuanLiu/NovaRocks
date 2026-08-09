@@ -46,8 +46,7 @@ use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::runtime_filter::{
-    RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
-    execution_order_keys,
+    RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
 };
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::sort::SortNode;
@@ -745,14 +744,16 @@ fn validate_native_aggregate_topn_specs(
                 spec.binding_id()
             )
         })?;
-        let RuntimeFilterExecutionContract::Ordered { keys, .. } = spec.contract().contract()
+        let RuntimeFilterExecutionContract::Ordered(order_contract) = spec.contract().contract()
         else {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} requires an ordered contract",
                 spec.binding_id()
             ));
         };
-        if keys.len() != 1 || keys[0].data_type() != group_key_type {
+        if order_contract.keys().len() != 1
+            || order_contract.keys()[0].data_type() != group_key_type
+        {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} ordered contract must contain exactly one key matching group key type={group_key_type:?}",
                 spec.binding_id()
@@ -1952,7 +1953,7 @@ mod tests {
         build_native_pipeline_graph_for_exec_plan_with_dop,
         build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
         build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context,
-        execution_order_keys, resolve_aggregate_topn_producer_site,
+        resolve_aggregate_topn_producer_site,
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
@@ -2067,36 +2068,29 @@ mod tests {
     fn installed_native_membership_contract_for_activation(
         activation: crate::runtime_filter::model::contract::ConsumerActivation,
     ) -> RuntimeFilterExecutionContract {
-        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-
-        let installed_schema = ArtifactMembershipSchema::new(
+        let membership_schema = execution::RuntimeFilterMembershipSchema::new(
             &DataType::Int64,
             if matches!(
                 activation,
                 crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. }
             ) {
-                crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+                execution::RuntimeFilterNullSemantics::NullSafeEqual
             } else {
-                crate::runtime_filter::model::contract::NullSemantics::NeverMatches
+                execution::RuntimeFilterNullSemantics::NeverMatches
             },
         )
         .expect("membership schema");
-        RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::from(installed_schema.canonical_bytes()),
-            schema_digest: installed_schema.digest().bytes(),
-        }
+        RuntimeFilterExecutionContract::Membership(membership_schema)
     }
 
-    fn native_consumer_plan(schema_digest: [u8; 32]) -> ExecPlan {
-        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-
+    fn native_consumer_plan() -> ExecPlan {
         let arrow_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let chunk_schema = chunk_schema_of(&arrow_schema, &[SlotId::new(1)]);
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        let installed_schema = ArtifactMembershipSchema::new(
+        let membership_schema = execution::RuntimeFilterMembershipSchema::new(
             &DataType::Int64,
-            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+            execution::RuntimeFilterNullSemantics::NeverMatches,
         )
         .expect("membership schema");
         ExecPlan {
@@ -2119,10 +2113,7 @@ mod tests {
                             4,
                             1,
                             crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
-                            RuntimeFilterExecutionContract::Membership {
-                                canonical_schema: Arc::from(installed_schema.canonical_bytes()),
-                                schema_digest,
-                            },
+                            RuntimeFilterExecutionContract::Membership(membership_schema),
                         ),
                         None,
                     )],
@@ -2134,7 +2125,7 @@ mod tests {
     #[test]
     fn native_direct_consumer_builder_appends_runtime_filter_factory() {
         let runtime_filter_context = installed_native_consumer_context();
-        let RuntimeFilterExecutionContract::Membership { schema_digest, .. } =
+        let RuntimeFilterExecutionContract::Membership(_) =
             installed_native_membership_contract_for_activation(
                 crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
             )
@@ -2142,7 +2133,7 @@ mod tests {
             panic!("installed Join contract must be Membership")
         };
         let graph = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_consumer_plan(schema_digest),
+            &native_consumer_plan(),
             false,
             DependencyManager::new(),
             None,
@@ -2165,8 +2156,6 @@ mod tests {
 
     fn native_join_producer_plan(distribution_mode: JoinDistributionMode) -> ExecPlan {
         use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
-        use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
-        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
         let left_schema = Arc::new(Schema::new(vec![Field::new(
             "probe",
@@ -2188,15 +2177,12 @@ mod tests {
         let mut arena = ExprArena::default();
         let probe_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let build_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
-        let membership_schema = ArtifactMembershipSchema::new(
+        let membership_schema = execution::RuntimeFilterMembershipSchema::new(
             &DataType::Int64,
-            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+            execution::RuntimeFilterNullSemantics::NeverMatches,
         )
         .expect("membership schema");
-        let contract = RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::from(membership_schema.canonical_bytes()),
-            schema_digest: membership_schema.digest().bytes(),
-        };
+        let contract = RuntimeFilterExecutionContract::Membership(membership_schema);
 
         ExecPlan {
             arena,
@@ -2270,11 +2256,25 @@ mod tests {
                 execution::RuntimeFilterBindingId::new(binding_id),
                 execution::RuntimeFilterChannelId::new(1),
                 5,
-                RuntimeFilterExecutionContract::Ordered {
-                    keys: execution_order_keys(runtime.keys()),
-                    comparator_digest: runtime.plan_comparator_digest().get(),
-                    order_contract_digest: runtime.digest().bytes(),
-                },
+                RuntimeFilterExecutionContract::Ordered(Arc::new(
+                    execution::contribution::RuntimeOrderContract::from_frozen(
+                        runtime.keys().iter().map(|key| {
+                            execution::contribution::RuntimeOrderKey::with_order(
+                                key.data_type().clone(),
+                                match key.direction() {
+                                    SortDirection::Ascending => execution::contribution::RuntimeOrderSortDirection::Ascending,
+                                    SortDirection::Descending => execution::contribution::RuntimeOrderSortDirection::Descending,
+                                },
+                                match key.null_order() {
+                                    NullOrder::First => execution::contribution::RuntimeOrderNullOrder::First,
+                                    NullOrder::Last => execution::contribution::RuntimeOrderNullOrder::Last,
+                                },
+                            )
+                        }),
+                        runtime.plan_comparator_digest().get(),
+                        runtime.digest().bytes(),
+                    ),
+                )),
             )
             .expect("test top-k producer contract"),
         )
@@ -2396,7 +2396,7 @@ mod tests {
         )
         .expect("membership schema");
         let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_consumer_plan(schema.digest().bytes()),
+            &native_consumer_plan(),
             false,
             DependencyManager::new(),
             None,
@@ -2418,7 +2418,7 @@ mod tests {
     fn native_runtime_filter_binding_contract_mismatch_fails_before_subscribe() {
         let context = installed_native_consumer_context();
         let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_consumer_plan([9; 32]),
+            &native_consumer_plan(),
             false,
             DependencyManager::new(),
             None,

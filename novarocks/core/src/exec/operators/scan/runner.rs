@@ -948,6 +948,53 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
+    fn execution_membership_contract_for_test(
+        data_type: DataType,
+        null_semantics: crate::runtime_filter::model::contract::NullSemantics,
+    ) -> crate::exec::node::runtime_filter::RuntimeFilterExecutionContract {
+        let null_semantics = match null_semantics {
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches => {
+                novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches
+            }
+            crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual => {
+                novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NullSafeEqual
+            }
+        };
+        crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership(
+            novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
+                &data_type,
+                null_semantics,
+            )
+            .expect("test membership schema"),
+        )
+    }
+
+    fn execution_ordered_contract_for_test(
+        order: &crate::runtime_filter::port::ordered_bound::RuntimeOrderContract,
+    ) -> crate::exec::node::runtime_filter::RuntimeFilterExecutionContract {
+        use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
+
+        crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered(Arc::new(
+            novarocks_execution::runtime_filter::contribution::RuntimeOrderContract::from_frozen(
+                order.keys().iter().map(|key| {
+                    novarocks_execution::runtime_filter::contribution::RuntimeOrderKey::with_order(
+                        key.data_type().clone(),
+                        match key.direction() {
+                            SortDirection::Ascending => novarocks_execution::runtime_filter::contribution::RuntimeOrderSortDirection::Ascending,
+                            SortDirection::Descending => novarocks_execution::runtime_filter::contribution::RuntimeOrderSortDirection::Descending,
+                        },
+                        match key.null_order() {
+                            NullOrder::First => novarocks_execution::runtime_filter::contribution::RuntimeOrderNullOrder::First,
+                            NullOrder::Last => novarocks_execution::runtime_filter::contribution::RuntimeOrderNullOrder::Last,
+                        },
+                    )
+                }),
+                order.plan_comparator_digest().get(),
+                order.digest().bytes(),
+            ),
+        ))
+    }
+
     fn ordered_live_spec(
         arena: &mut ExprArena,
         order: &Arc<crate::runtime_filter::port::ordered_bound::RuntimeOrderContract>,
@@ -959,20 +1006,16 @@ mod tests {
         };
 
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        RuntimeFilterConsumerBinding {
-            binding_id: 2,
-            channel_id: 7,
+        RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::NonBlockingLive { late_apply },
-            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                comparator_digest: order.plan_comparator_digest().get(),
-                order_contract_digest: order.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            scan_domain: None,
-        }
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                2,
+                7,
+                ConsumerActivation::NonBlockingLive { late_apply },
+                execution_ordered_contract_for_test(order),
+            ),
+            None,
+        )
     }
 
     fn ordered_live_bundle(
@@ -1130,22 +1173,19 @@ mod tests {
         let membership_schema =
             ArtifactMembershipSchema::new(&DataType::Int32, NullSemantics::NeverMatches)
                 .expect("membership schema");
-        let blocking_spec = RuntimeFilterConsumerBinding {
-            binding_id: 11,
-            channel_id: 7,
+        let blocking_spec = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::BlockingSnapshot,
-            capabilities: BTreeSet::from([
-                ArtifactCapability::Membership,
-                ArtifactCapability::EmptyDomain,
-            ]),
-            contract: RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(membership_schema.canonical_bytes()),
-                schema_digest: membership_schema.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::SetUnion,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                11,
+                7,
+                ConsumerActivation::BlockingSnapshot,
+                execution_membership_contract_for_test(
+                    DataType::Int32,
+                    NullSemantics::NeverMatches,
+                ),
+            ),
+            None,
+        );
         let blocking_subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(PublishedBlockingSubscription(
                 crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[]),
@@ -1166,22 +1206,18 @@ mod tests {
             SortDirection::Ascending,
             NullOrder::Last,
         );
-        let ordered_spec = RuntimeFilterConsumerBinding {
-            binding_id: 12,
-            channel_id: 7,
+        let ordered_spec = RuntimeFilterConsumerBinding::new(
             expr_id,
-            activation: ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
-                comparator_digest: order.plan_comparator_digest().get(),
-                order_contract_digest: order.digest().bytes(),
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-            scan_domain: None,
-        };
+            crate::exec::node::runtime_filter::test_consumer_contract(
+                12,
+                7,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+                execution_ordered_contract_for_test(&order),
+            ),
+            None,
+        );
         let live = Arc::new(ControllableOrderedLiveSubscription::new());
         let typed: Arc<dyn NonBlockingLiveSubscription> = live.clone();
         let ordered_consumers =

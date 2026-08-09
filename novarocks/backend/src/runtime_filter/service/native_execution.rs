@@ -867,43 +867,47 @@ fn to_execution_contract(
         InstalledRuntimeFilterExecutionContract::Membership {
             canonical_schema,
             schema_digest,
-        } => execution::RuntimeFilterExecutionContract::Membership {
-            canonical_schema: Arc::clone(canonical_schema),
-            schema_digest: *schema_digest,
-        },
+        } => execution::RuntimeFilterExecutionContract::Membership(
+            execution::RuntimeFilterMembershipSchema::from_canonical(
+                canonical_schema.as_ref(),
+                *schema_digest,
+            )
+            .expect("installed membership schema was validated at installation"),
+        ),
         InstalledRuntimeFilterExecutionContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,
-        } => execution::RuntimeFilterExecutionContract::Ordered {
-            keys: keys
+        } => execution::RuntimeFilterExecutionContract::Ordered(Arc::new(
+            execution::contribution::RuntimeOrderContract::from_frozen(
+                keys
                 .iter()
                 .map(|key| {
-                    execution::RuntimeOrderKey::new(
+                    execution::contribution::RuntimeOrderKey::with_order(
                         key.data_type().clone(),
                         match key.direction() {
                             novarocks::runtime_filter_transition::model::contract::SortDirection::Ascending => {
-                                execution::RuntimeOrderSortDirection::Ascending
+                                execution::contribution::RuntimeOrderSortDirection::Ascending
                             }
                             novarocks::runtime_filter_transition::model::contract::SortDirection::Descending => {
-                                execution::RuntimeOrderSortDirection::Descending
+                                execution::contribution::RuntimeOrderSortDirection::Descending
                             }
                         },
                         match key.null_order() {
                             novarocks::runtime_filter_transition::model::contract::NullOrder::First => {
-                                execution::RuntimeOrderNullOrder::First
+                                execution::contribution::RuntimeOrderNullOrder::First
                             }
                             novarocks::runtime_filter_transition::model::contract::NullOrder::Last => {
-                                execution::RuntimeOrderNullOrder::Last
+                                execution::contribution::RuntimeOrderNullOrder::Last
                             }
                         },
                     )
                 })
-                .collect::<Vec<_>>()
-                .into(),
-            comparator_digest: *comparator_digest,
-            order_contract_digest: *order_contract_digest,
-        },
+                .collect::<Vec<_>>(),
+                *comparator_digest,
+                *order_contract_digest,
+            ),
+        )),
     }
 }
 
@@ -1672,13 +1676,8 @@ fn snapshot_predicate_compiler(
 
 fn execution_contract_digest(contract: &execution::RuntimeFilterExecutionContract) -> [u8; 32] {
     match contract {
-        execution::RuntimeFilterExecutionContract::Membership { schema_digest, .. } => {
-            *schema_digest
-        }
-        execution::RuntimeFilterExecutionContract::Ordered {
-            order_contract_digest,
-            ..
-        } => *order_contract_digest,
+        execution::RuntimeFilterExecutionContract::Membership(schema) => schema.digest(),
+        execution::RuntimeFilterExecutionContract::Ordered(order) => order.digest(),
     }
 }
 

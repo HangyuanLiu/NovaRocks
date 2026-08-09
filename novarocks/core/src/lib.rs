@@ -32,6 +32,7 @@ pub mod query_execution;
 pub mod runtime;
 pub(crate) mod runtime_filter;
 #[doc(hidden)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 pub mod runtime_filter_transition;
 pub mod server;
 pub mod service;

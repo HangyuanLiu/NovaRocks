@@ -3650,10 +3650,13 @@ pub(crate) mod tests {
             let schema =
                 ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
                     .expect("installed membership schema");
-            let contract = RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            };
+            let contract = RuntimeFilterExecutionContract::Membership(
+                novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::from_canonical(
+                    schema.canonical_bytes(),
+                    schema.digest().bytes(),
+                )
+                .expect("installed membership schema is canonical"),
+            );
             let request = RuntimeFilterProducerOpenRequest::new(
                 RuntimeFilterProducerContract::new(
                     novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(10),
@@ -3673,10 +3676,13 @@ pub(crate) mod tests {
                     novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(10),
                     novarocks_execution::runtime_filter::RuntimeFilterChannelId::new(1),
                     RuntimeFilterProducerKind::Membership,
-                    RuntimeFilterExecutionContract::Membership {
-                        canonical_schema: Arc::from(schema.canonical_bytes()),
-                        schema_digest: [0; 32],
-                    },
+                    RuntimeFilterExecutionContract::Membership(
+                        novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
+                            &DataType::Int32,
+                            novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches,
+                        )
+                        .expect("alternate membership schema"),
+                    ),
                 ),
                 1,
             );
@@ -3708,10 +3714,13 @@ pub(crate) mod tests {
             let schema =
                 ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
                     .expect("installed membership schema");
-            let contract = RuntimeFilterExecutionContract::Membership {
-                canonical_schema: Arc::from(schema.canonical_bytes()),
-                schema_digest: schema.digest().bytes(),
-            };
+            let contract = RuntimeFilterExecutionContract::Membership(
+                novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::from_canonical(
+                    schema.canonical_bytes(),
+                    schema.digest().bytes(),
+                )
+                .expect("installed membership schema is canonical"),
+            );
             let request =
                 RuntimeFilterSubscriptionRequest::new(RuntimeFilterConsumerContract::new(
                     novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(30),
@@ -3733,10 +3742,13 @@ pub(crate) mod tests {
                     novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(30),
                     novarocks_execution::runtime_filter::RuntimeFilterChannelId::new(1),
                     ExecutionConsumerActivation::BlockingSnapshot,
-                    RuntimeFilterExecutionContract::Membership {
-                        canonical_schema: Arc::from(schema.canonical_bytes()),
-                        schema_digest: [0; 32],
-                    },
+                    RuntimeFilterExecutionContract::Membership(
+                        novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
+                            &DataType::Int32,
+                            novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches,
+                        )
+                        .expect("alternate membership schema"),
+                    ),
                 ));
             let error = match RuntimeFilterSession::subscribe(&context, mismatched) {
                 Err(error) => error,

@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
@@ -611,10 +612,21 @@ fn decode_contract(
                     ),
                 ));
             }
-            Ok(execution::RuntimeFilterExecutionContract::Membership {
-                canonical_schema: membership.canonical_schema.clone().into(),
-                schema_digest: digest,
-            })
+            let schema = execution::RuntimeFilterMembershipSchema::from_canonical(
+                &membership.canonical_schema,
+                digest,
+            )
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    path.field("canonical_schema"),
+                    format!(
+                        "native runtime-filter binding_id={binding_id} membership schema is noncanonical: {error}"
+                    ),
+                )
+            })?;
+            Ok(execution::RuntimeFilterExecutionContract::Membership(
+                schema,
+            ))
         }
         plan::runtime_filter_contract::Kind::Ordered(ordered) => {
             let path = path.field("ordered");
@@ -725,31 +737,32 @@ fn decode_contract(
                     ),
                 ));
             }
-            Ok(execution::RuntimeFilterExecutionContract::Ordered {
-                keys: keys
+            Ok(execution::RuntimeFilterExecutionContract::Ordered(Arc::new(
+                execution::contribution::RuntimeOrderContract::from_frozen(
+                    keys
                     .iter()
                     .map(|key| {
-                        execution::RuntimeOrderKey::new(
+                        execution::contribution::RuntimeOrderKey::with_order(
                             key.data_type.clone(),
                             match key.direction {
                                 SortDirection::Ascending => {
-                                    execution::RuntimeOrderSortDirection::Ascending
+                                    execution::contribution::RuntimeOrderSortDirection::Ascending
                                 }
                                 SortDirection::Descending => {
-                                    execution::RuntimeOrderSortDirection::Descending
+                                    execution::contribution::RuntimeOrderSortDirection::Descending
                                 }
                             },
                             match key.null_order {
-                                NullOrder::First => execution::RuntimeOrderNullOrder::First,
-                                NullOrder::Last => execution::RuntimeOrderNullOrder::Last,
+                                NullOrder::First => execution::contribution::RuntimeOrderNullOrder::First,
+                                NullOrder::Last => execution::contribution::RuntimeOrderNullOrder::Last,
                             },
                         )
                     })
-                    .collect::<Vec<_>>()
-                    .into(),
-                comparator_digest: comparator,
-                order_contract_digest: order_digest,
-            })
+                    .collect::<Vec<_>>(),
+                    comparator,
+                    order_digest,
+                ),
+            )))
         }
     }
 }
@@ -803,12 +816,7 @@ fn decode_reduction(
                         error,
                     )
                 })?;
-            let execution::RuntimeFilterExecutionContract::Ordered {
-                keys,
-                comparator_digest,
-                ..
-            } = contract
-            else {
+            let execution::RuntimeFilterExecutionContract::Ordered(order) = contract else {
                 return Err(NativeFragmentDecodeError::inconsistent(
                     topk_path.clone(),
                     format!(
@@ -817,26 +825,29 @@ fn decode_reduction(
                 ));
             };
             let order = OrderContract {
-                keys: keys
+                keys: order
+                    .keys()
                     .iter()
                     .map(|key| OrderKeyContract {
                         data_type: key.data_type().clone(),
                         direction: match key.direction() {
-                            execution::RuntimeOrderSortDirection::Ascending => {
+                            execution::contribution::RuntimeOrderSortDirection::Ascending => {
                                 SortDirection::Ascending
                             }
-                            execution::RuntimeOrderSortDirection::Descending => {
+                            execution::contribution::RuntimeOrderSortDirection::Descending => {
                                 SortDirection::Descending
                             }
                         },
                         null_order: match key.null_order() {
-                            execution::RuntimeOrderNullOrder::First => NullOrder::First,
-                            execution::RuntimeOrderNullOrder::Last => NullOrder::Last,
+                            execution::contribution::RuntimeOrderNullOrder::First => {
+                                NullOrder::First
+                            }
+                            execution::contribution::RuntimeOrderNullOrder::Last => NullOrder::Last,
                         },
                     })
                     .collect(),
                 inclusive: true,
-                comparator_digest: ComparatorDigest::new(*comparator_digest),
+                comparator_digest: ComparatorDigest::new(order.comparator_digest()),
             };
             let expected = RuntimeTopKSummaryContract::try_from_plan(
                 &order,
@@ -1054,15 +1065,15 @@ fn validate_role_contract(
 ) -> Result<(), String> {
     match (contract, reduction) {
         (
-            execution::RuntimeFilterExecutionContract::Membership { .. },
+            execution::RuntimeFilterExecutionContract::Membership(..),
             execution::RuntimeFilterReduction::SetUnion,
         )
         | (
-            execution::RuntimeFilterExecutionContract::Ordered { .. },
+            execution::RuntimeFilterExecutionContract::Ordered(..),
             execution::RuntimeFilterReduction::TightenOrderedBound,
         )
         | (
-            execution::RuntimeFilterExecutionContract::Ordered { .. },
+            execution::RuntimeFilterExecutionContract::Ordered(..),
             execution::RuntimeFilterReduction::MergeTopKSummary { .. },
         ) => {}
         _ => {
@@ -1074,11 +1085,11 @@ fn validate_role_contract(
     match role {
         DecodedWireBindingRole::Consumer { capabilities, .. } => {
             let expected = match contract {
-                execution::RuntimeFilterExecutionContract::Membership { .. } => BTreeSet::from([
+                execution::RuntimeFilterExecutionContract::Membership(..) => BTreeSet::from([
                     WireArtifactCapability::Membership,
                     WireArtifactCapability::EmptyDomain,
                 ]),
-                execution::RuntimeFilterExecutionContract::Ordered { .. } => {
+                execution::RuntimeFilterExecutionContract::Ordered(..) => {
                     BTreeSet::from([WireArtifactCapability::OrderedRange])
                 }
             };
@@ -1089,7 +1100,7 @@ fn validate_role_contract(
             }
             if matches!(
                 contract,
-                execution::RuntimeFilterExecutionContract::Ordered { .. }
+                execution::RuntimeFilterExecutionContract::Ordered(..)
             ) && matches!(
                 role,
                 DecodedWireBindingRole::Consumer {
@@ -1169,7 +1180,7 @@ fn into_execution_role(
         } => {
             let producer = match (&contract, reduction) {
                 (
-                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterExecutionContract::Membership(..),
                     execution::RuntimeFilterReduction::SetUnion,
                 ) => {
                     if contribution_kinds.contains(&WireContributionKind::FinalDomainShard) {
@@ -1183,13 +1194,13 @@ fn into_execution_role(
                     }
                 }
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::TightenOrderedBound,
                 ) => execution::RuntimeFilterProducerContract::ordered_bound(
                     binding_id, channel_id, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::MergeTopKSummary { k, .. },
                 ) => execution::RuntimeFilterProducerContract::top_k_summary(
                     binding_id, channel_id, k, contract,
@@ -1215,28 +1226,28 @@ fn into_execution_role(
         } => {
             let consumer = match (&contract, reduction, activation) {
                 (
-                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterExecutionContract::Membership(..),
                     execution::RuntimeFilterReduction::SetUnion,
                     execution::ConsumerActivation::BlockingSnapshot,
                 ) => execution::RuntimeFilterConsumerContract::membership_blocking(
                     binding_id, channel_id, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Membership { .. },
+                    execution::RuntimeFilterExecutionContract::Membership(..),
                     execution::RuntimeFilterReduction::SetUnion,
                     execution::ConsumerActivation::NonBlockingLive { late_apply },
                 ) => execution::RuntimeFilterConsumerContract::membership_live(
                     binding_id, channel_id, late_apply, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::TightenOrderedBound,
                     execution::ConsumerActivation::NonBlockingLive { late_apply },
                 ) => execution::RuntimeFilterConsumerContract::ordered_live(
                     binding_id, channel_id, late_apply, contract,
                 ),
                 (
-                    execution::RuntimeFilterExecutionContract::Ordered { .. },
+                    execution::RuntimeFilterExecutionContract::Ordered(..),
                     execution::RuntimeFilterReduction::MergeTopKSummary { k, .. },
                     execution::ConsumerActivation::NonBlockingLive { late_apply },
                 ) => execution::RuntimeFilterConsumerContract::top_k_live(
@@ -1847,11 +1858,10 @@ mod tests {
         let DecodedBindingRole::Consumer { contract, .. } = &record.role else {
             panic!("consumer")
         };
-        let execution::RuntimeFilterExecutionContract::Ordered { keys, .. } = contract.contract()
-        else {
+        let execution::RuntimeFilterExecutionContract::Ordered(order) = contract.contract() else {
             panic!("ordered")
         };
-        assert_eq!(keys.len(), 1);
+        assert_eq!(order.keys().len(), 1);
 
         let mut wrong_comparator = ordered.clone();
         let plan::runtime_filter_contract::Kind::Ordered(contract) = wrong_comparator
