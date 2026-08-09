@@ -736,6 +736,16 @@ mod tests {
     }
 
     #[test]
+    fn spi5b_local_binding_cannot_supply_a_connector_planning_lease() {
+        let error = match local_binding().admission.exact_planning_lease() {
+            Ok(_) => panic!("local SQL bindings cannot admit a connector read"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "query binding has no connector planning lease");
+    }
+
+    #[test]
     fn sqlx2_binding_store_memoizes_failure_once_per_request() {
         let store = QueryTableBindingStore::try_new().expect("store");
         let attempts = AtomicUsize::new(0);
