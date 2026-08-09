@@ -128,15 +128,18 @@ struct BackendInstalledConsumer {
 /// by every installed producer binding only after construction verifies they
 /// have identical Execution semantics and contribution budget.
 pub(crate) struct BackendRuntimeFilterSession {
-    policy: BackendInstallPolicy,
+    // A participant that only consumes a remotely materialized artifact has
+    // no local producer/reducer authority. Its subscription state remains a
+    // first-class installed session, but every producer-side field is absent.
+    policy: Option<BackendInstallPolicy>,
     participant: BackendParticipantIdentity,
     channel: BackendChannelInstall,
     producers: BTreeMap<RuntimeFilterBindingId, BackendProducerInstall>,
     producer_progress: Mutex<BTreeMap<RuntimeFilterBindingId, BackendProducerBindingProgress>>,
     consumers: BTreeMap<RuntimeFilterBindingId, BackendInstalledConsumer>,
-    reduction: Mutex<BackendReductionState>,
-    availability: Mutex<BackendCoverageState>,
-    terminal: Mutex<BackendCoverageState>,
+    reduction: Option<Mutex<BackendReductionState>>,
+    availability: Option<Mutex<BackendCoverageState>>,
+    terminal: Option<Mutex<BackendCoverageState>>,
 }
 
 impl BackendRuntimeFilterSession {
@@ -149,32 +152,42 @@ impl BackendRuntimeFilterSession {
         channel: BackendChannelInstall,
         events: Arc<dyn BackendRuntimeFilterEventObserver>,
     ) -> Result<Self, BackendRuntimeFilterSessionError> {
-        let first = channel
-            .producers()
-            .values()
-            .next()
-            .ok_or(BackendRuntimeFilterSessionError::MissingProducer)?;
-        validate_producer_shape(&channel, first, first)?;
-        for producer in channel.producers().values() {
-            validate_producer_shape(&channel, first, producer)?;
-        }
-        let policy = BackendInstallPolicy::new(
-            participant,
-            first.contract().clone(),
-            channel.availability_coverage().clone(),
-            first.max_contribution_bytes(),
-        )
-        .map_err(BackendRuntimeFilterSessionError::InstallPolicy)?;
-        let reduction = BackendReductionState::new(policy.clone())
-            .map_err(BackendRuntimeFilterSessionError::Reduction)?;
-        let availability = BackendCoverageState::new(channel.availability_coverage())
-            .expect("BackendChannelInstall has validated coverage");
-        let terminal = BackendCoverageState::new(channel.terminal_coverage())
-            .expect("BackendChannelInstall has validated coverage");
+        let first = channel.producers().values().next();
+        let (policy, reduction, availability, terminal) = if let Some(first) = first {
+            validate_producer_shape(&channel, first, first)?;
+            for producer in channel.producers().values() {
+                validate_producer_shape(&channel, first, producer)?;
+            }
+            let policy = BackendInstallPolicy::new(
+                participant,
+                first.contract().clone(),
+                channel.availability_coverage().clone(),
+                first.max_contribution_bytes(),
+            )
+            .map_err(BackendRuntimeFilterSessionError::InstallPolicy)?;
+            let reduction = BackendReductionState::new(policy.clone())
+                .map_err(BackendRuntimeFilterSessionError::Reduction)?;
+            let availability = BackendCoverageState::new(channel.availability_coverage())
+                .expect("BackendChannelInstall has validated coverage");
+            let terminal = BackendCoverageState::new(channel.terminal_coverage())
+                .expect("BackendChannelInstall has validated coverage");
+            (
+                Some(policy),
+                Some(Mutex::new(reduction)),
+                Some(Mutex::new(availability)),
+                Some(Mutex::new(terminal)),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         let mut consumers = BTreeMap::new();
         for (binding_id, consumer) in channel.consumers() {
-            validate_consumer_shape(&channel, first, consumer)?;
+            if let Some(first) = first {
+                validate_consumer_shape(&channel, first, consumer)?;
+            } else {
+                validate_consumer_only_shape(&channel, consumer)?;
+            }
             let session_channel =
                 BackendChannelIdentity::new(participant, *binding_id, channel.channel_id());
             consumers.insert(
@@ -202,14 +215,16 @@ impl BackendRuntimeFilterSession {
             channel,
             producer_progress: Mutex::new(BTreeMap::new()),
             consumers,
-            reduction: Mutex::new(reduction),
-            availability: Mutex::new(availability),
-            terminal: Mutex::new(terminal),
+            reduction,
+            availability,
+            terminal,
         })
     }
 
     pub(crate) const fn policy(&self) -> &BackendInstallPolicy {
-        &self.policy
+        self.policy
+            .as_ref()
+            .expect("only an installed producer binding can request a contribution budget")
     }
 
     pub(crate) const fn channel(&self) -> &BackendChannelInstall {
@@ -218,16 +233,24 @@ impl BackendRuntimeFilterSession {
 
     pub(crate) fn availability_progress(&self) -> BackendCoverageProgress {
         self.availability
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .progress(self.channel.availability_coverage())
+            .as_ref()
+            .map_or(BackendCoverageProgress::Satisfied, |availability| {
+                availability
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .progress(self.channel.availability_coverage())
+            })
     }
 
     pub(crate) fn terminal_progress(&self) -> BackendCoverageProgress {
         self.terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .progress(self.channel.terminal_coverage())
+            .as_ref()
+            .map_or(BackendCoverageProgress::Satisfied, |terminal| {
+                terminal
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .progress(self.channel.terminal_coverage())
+            })
     }
 
     /// Opens one authorized producer binding/instance. Binding, witness, and
@@ -294,8 +317,13 @@ impl BackendRuntimeFilterSession {
         contribution: RuntimeFilterContribution,
     ) -> Result<BackendRuntimeFilterSessionSubmission, RuntimeFilterContractViolation> {
         let stream = self.open_stream(binding_id, fragment_instance_id, partition)?;
-        let (apply, publication) = self
-            .reduction
+        let reduction = self.reduction.as_ref().ok_or_else(|| {
+            contract_violation(
+                RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "consumer-only Backend channel cannot accept a producer contribution",
+            )
+        })?;
+        let (apply, publication) = reduction
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .submit(stream, sequence, contribution)
@@ -663,25 +691,33 @@ impl BackendRuntimeFilterSession {
     }
 
     fn mark_satisfied(&self, witness: super::BackendCoverageWitnessId) {
-        self.availability
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .mark_satisfied(witness);
-        self.terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .mark_satisfied(witness);
+        if let Some(availability) = &self.availability {
+            availability
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .mark_satisfied(witness);
+        }
+        if let Some(terminal) = &self.terminal {
+            terminal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .mark_satisfied(witness);
+        }
     }
 
     fn mark_impossible(&self, witness: super::BackendCoverageWitnessId) {
-        self.availability
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .mark_impossible(witness);
-        self.terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .mark_impossible(witness);
+        if let Some(availability) = &self.availability {
+            availability
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .mark_impossible(witness);
+        }
+        if let Some(terminal) = &self.terminal {
+            terminal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .mark_impossible(witness);
+        }
     }
 }
 
@@ -693,7 +729,7 @@ struct BackendRuntimeFilterProducer {
 
 impl RuntimeFilterProducer for BackendRuntimeFilterProducer {
     fn max_contribution_bytes(&self) -> usize {
-        self.session.policy.max_contribution_bytes()
+        self.session.policy().max_contribution_bytes()
     }
 
     fn submit(
@@ -760,6 +796,18 @@ fn validate_consumer_shape(
     if consumer.contract().channel_id() != channel.channel_id()
         || consumer.contract().contract() != channel.execution_contract()
         || consumer.contract().reduction() != producer.contract().reduction()
+    {
+        return Err(BackendRuntimeFilterSessionError::ConsumerContractMismatch);
+    }
+    Ok(())
+}
+
+fn validate_consumer_only_shape(
+    channel: &BackendChannelInstall,
+    consumer: &BackendConsumerInstall,
+) -> Result<(), BackendRuntimeFilterSessionError> {
+    if consumer.contract().channel_id() != channel.channel_id()
+        || consumer.contract().contract() != channel.execution_contract()
     {
         return Err(BackendRuntimeFilterSessionError::ConsumerContractMismatch);
     }
@@ -920,6 +968,67 @@ mod tests {
             ),
             fixture,
         )
+    }
+
+    #[test]
+    fn consumer_only_channel_installs_and_accepts_remote_publication() {
+        let fixture = BackendRuntimeFilterFixture::membership();
+        let schema = fixture.producer_contract().contract().clone();
+        let consumer = BackendConsumerInstall::new(
+            RuntimeFilterConsumerContract::membership_blocking(
+                RuntimeFilterBindingId::new(70),
+                RuntimeFilterChannelId::new(11),
+                schema.clone(),
+            )
+            .unwrap(),
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap(),
+            [BackendRouteEdgeId::new(101)],
+            [instance(51)],
+        )
+        .unwrap();
+        let channel = BackendChannelInstall::new(
+            RuntimeFilterChannelId::new(11),
+            schema.clone(),
+            BackendChannelLifecycle::CompleteOnce,
+            BackendCoverage::witness(BackendCoverageWitnessId::new(29)),
+            BackendCoverage::witness(BackendCoverageWitnessId::new(29)),
+            BackendMaterializationPolicy::new(8, 3, 5, 1, 1024, 1024, 1).unwrap(),
+            1024,
+            1024,
+            [],
+            [consumer],
+            [],
+        )
+        .unwrap();
+        let session = BackendRuntimeFilterSession::from_channel_install(
+            fixture.identity(),
+            channel,
+            Arc::new(CollectingBackendRuntimeFilterEventObserver::default()),
+        )
+        .expect("consumer-only channel is a valid remote artifact endpoint");
+        let binding = RuntimeFilterConsumerContract::membership_blocking(
+            RuntimeFilterBindingId::new(70),
+            RuntimeFilterChannelId::new(11),
+            schema,
+        )
+        .unwrap();
+        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(handle)) =
+            session
+                .subscribe(instance(51), RuntimeFilterSubscriptionRequest::new(binding))
+                .unwrap()
+        else {
+            panic!("installed consumer-only binding must subscribe")
+        };
+        session
+            .publish_materialized(
+                BackendRouteEdgeId::new(101),
+                SnapshotAcquireOutcome::Unavailable(UnavailableReason::ProducerFailed),
+            )
+            .unwrap();
+        assert!(matches!(
+            handle.acquire(Duration::ZERO),
+            SnapshotAcquireOutcome::Unavailable(UnavailableReason::ProducerFailed)
+        ));
     }
 
     #[test]

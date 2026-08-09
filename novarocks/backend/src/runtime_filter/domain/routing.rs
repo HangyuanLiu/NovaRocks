@@ -136,6 +136,11 @@ impl BackendRoutingEdge {
     pub(crate) fn allows(&self, kind: BackendEnvelopeKind) -> bool {
         self.allowed_kinds.contains(&kind)
     }
+
+    fn is_loopback_self(&self) -> bool {
+        matches!(self.peer, BackendRoutePeer::Loopback)
+            && self.source.participant_id() == self.target.participant_id()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,10 +208,26 @@ impl BackendRoutingChannel {
         }
         let inbound_edges = inbound_edges.into_iter().collect::<Vec<_>>();
         let outbound_edges = outbound_edges.into_iter().collect::<Vec<_>>();
-        let mut seen_edges = BTreeSet::new();
-        for edge in inbound_edges.iter().chain(outbound_edges.iter()) {
-            if !seen_edges.insert(edge.id()) {
+        // A loopback route deliberately appears in both projections of the
+        // local routing shard: it is an outbound materialization edge and an
+        // inbound consumer-delivery edge at the same time. Keep duplicate
+        // rejection within either projection, but accept the one valid
+        // cross-projection duplicate only when it is the identical self edge.
+        let mut inbound_by_id = BTreeMap::new();
+        for edge in &inbound_edges {
+            if inbound_by_id.insert(edge.id(), edge).is_some() {
                 return Err(BackendRoutingError::DuplicateRouteEdge(edge.id()));
+            }
+        }
+        let mut outbound_ids = BTreeSet::new();
+        for edge in &outbound_edges {
+            if !outbound_ids.insert(edge.id()) {
+                return Err(BackendRoutingError::DuplicateRouteEdge(edge.id()));
+            }
+            if let Some(inbound) = inbound_by_id.get(&edge.id()) {
+                if *inbound != edge || !edge.is_loopback_self() {
+                    return Err(BackendRoutingError::DuplicateRouteEdge(edge.id()));
+                }
             }
         }
         let mut participants = BTreeMap::new();
@@ -676,5 +697,78 @@ mod tests {
             ),
             Err(BackendRoutingError::ForbiddenInboundKind { .. })
         ));
+    }
+
+    #[test]
+    fn accepts_an_identical_loopback_edge_in_both_projections() {
+        let producer = BackendRouteEndpoint::new(
+            1,
+            BackendRouteRole::Producer(RuntimeFilterBindingId::new(7)),
+        )
+        .unwrap();
+        let consumer = BackendRouteEndpoint::new(
+            1,
+            BackendRouteRole::Consumer(RuntimeFilterBindingId::new(8)),
+        )
+        .unwrap();
+        let loopback = BackendRoutingEdge::new(
+            BackendRouteEdgeId::new(13),
+            producer,
+            consumer,
+            BackendRoutePeer::Loopback,
+            [BackendEnvelopeKind::Artifact],
+        )
+        .unwrap();
+
+        assert!(
+            BackendRoutingChannel::new(
+                RuntimeFilterChannelId::new(9),
+                [BackendRouteRole::Producer(RuntimeFilterBindingId::new(7))],
+                [loopback.clone()],
+                [loopback],
+                [],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_a_nonidentical_cross_projection_duplicate() {
+        let producer = BackendRouteEndpoint::new(
+            1,
+            BackendRouteRole::Producer(RuntimeFilterBindingId::new(7)),
+        )
+        .unwrap();
+        let consumer = BackendRouteEndpoint::new(
+            1,
+            BackendRouteRole::Consumer(RuntimeFilterBindingId::new(8)),
+        )
+        .unwrap();
+        let inbound = BackendRoutingEdge::new(
+            BackendRouteEdgeId::new(13),
+            producer.clone(),
+            consumer.clone(),
+            BackendRoutePeer::Loopback,
+            [BackendEnvelopeKind::Artifact],
+        )
+        .unwrap();
+        let outbound = BackendRoutingEdge::new(
+            BackendRouteEdgeId::new(13),
+            producer,
+            consumer,
+            BackendRoutePeer::Loopback,
+            [BackendEnvelopeKind::FinalArtifact],
+        )
+        .unwrap();
+
+        let error = BackendRoutingChannel::new(
+            RuntimeFilterChannelId::new(9),
+            [BackendRouteRole::Producer(RuntimeFilterBindingId::new(7))],
+            [inbound],
+            [outbound],
+            [],
+        )
+        .expect_err("mismatched cross-projection route must be rejected");
+        assert!(matches!(error, BackendRoutingError::DuplicateRouteEdge(_)));
     }
 }
