@@ -97,12 +97,10 @@ use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
-    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
+    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue, IcebergTableInfo,
 };
 #[cfg(test)]
-use novarocks_connector_iceberg::scan_model::{
-    IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-};
+use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
 #[derive(Clone, Deserialize, Serialize)]
 struct IcebergDeltaSplitPayload {
@@ -5242,13 +5240,9 @@ impl IcebergControlProvider {
             | super::metadata::IcebergMetadataTableType::History
             | super::metadata::IcebergMetadataTableType::Refs => String::new(),
             super::metadata::IcebergMetadataTableType::Partitions => {
-                crate::engine::query_stats::metadata_payload(
-                    crate::sql::planner::table::SqlMetadataTableKind::Partitions,
-                    table,
-                    &scan.table.prepared_files,
-                )
-                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?
-                .unwrap_or_default()
+                Self::metadata_payload(&metadata_table_type, table, &scan.table.prepared_files)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?
+                    .unwrap_or_default()
             }
         };
         let payload = SplitPayload {
@@ -5294,6 +5288,97 @@ impl IcebergControlProvider {
                 scan_units_planned: 1,
             },
         )
+    }
+
+    fn metadata_payload(
+        kind: &super::metadata::IcebergMetadataTableType,
+        table: &IcebergTableInfo,
+        files: &[IcebergDataFileInfo],
+    ) -> Result<Option<String>, String> {
+        match kind {
+            super::metadata::IcebergMetadataTableType::Partitions => {
+                let mut groups = std::collections::BTreeMap::<
+                    (i32, String),
+                    (
+                        i64,
+                        i64,
+                        i64,
+                        std::collections::BTreeSet<String>,
+                        std::collections::BTreeSet<String>,
+                    ),
+                >::new();
+                for file in files {
+                    let spec_id = file.partition_spec_id.ok_or_else(|| {
+                    format!(
+                        "iceberg partitions metadata requires partition spec id for data file {}",
+                        file.path
+                    )
+                })?;
+                    let rows = file.row_count.ok_or_else(|| {
+                        format!(
+                            "iceberg partitions metadata requires record_count for data file {}",
+                            file.path
+                        )
+                    })?;
+                    let entry = groups
+                        .entry((
+                            spec_id,
+                            file.partition_key
+                                .clone()
+                                .unwrap_or_else(|| "Struct([])".to_string()),
+                        ))
+                        .or_default();
+                    entry.0 = entry.0.checked_add(rows).ok_or_else(|| {
+                        "iceberg partitions metadata record_count overflow".to_string()
+                    })?;
+                    entry.1 = entry.1.checked_add(1).ok_or_else(|| {
+                        "iceberg partitions metadata file_count overflow".to_string()
+                    })?;
+                    entry.2 = entry.2.checked_add(file.size).ok_or_else(|| {
+                        "iceberg partitions metadata total_data_file_size_in_bytes overflow"
+                            .to_string()
+                    })?;
+                    for delete in &file.delete_files {
+                        match delete.file_content {
+                            IcebergDeleteFileContent::Position => {
+                                entry.3.insert(delete.path.clone());
+                            }
+                            IcebergDeleteFileContent::Equality => {
+                                entry.4.insert(delete.path.clone());
+                            }
+                        }
+                    }
+                }
+                let rows = groups.into_iter().map(|((spec_id, partition), (record_count, file_count, total_data_file_size_in_bytes, position_delete_files, equality_delete_files))| {
+                Ok(serde_json::json!({
+                    "spec_id": spec_id,
+                    "partition": partition,
+                    "record_count": record_count,
+                    "file_count": file_count,
+                    "total_data_file_size_in_bytes": total_data_file_size_in_bytes,
+                    "position_delete_file_count": i64::try_from(position_delete_files.len()).map_err(|_| "iceberg partitions metadata position_delete_file_count overflow".to_string())?,
+                    "equality_delete_file_count": i64::try_from(equality_delete_files.len()).map_err(|_| "iceberg partitions metadata equality_delete_file_count overflow".to_string())?,
+                }))
+            }).collect::<Result<Vec<_>, String>>()?;
+                serde_json::to_string(&serde_json::json!({ "version": 1, "rows": rows }))
+                    .map(Some)
+                    .map_err(|error| {
+                        format!("serialize iceberg partitions metadata payload failed: {error}")
+                    })
+            }
+            super::metadata::IcebergMetadataTableType::Files
+            | super::metadata::IcebergMetadataTableType::Manifests
+            | super::metadata::IcebergMetadataTableType::LogicalIcebergMetadata => table
+                .serialized_metadata_rows
+                .clone()
+                .map(Some)
+                .ok_or_else(|| {
+                    "iceberg metadata rows were not resolved at catalog lookup time".to_string()
+                }),
+            super::metadata::IcebergMetadataTableType::Snapshots
+            | super::metadata::IcebergMetadataTableType::History
+            | super::metadata::IcebergMetadataTableType::Refs => Ok(None),
+        }
     }
 
     fn plan_frozen_rewrite_position_splits(

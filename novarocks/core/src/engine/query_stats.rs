@@ -42,8 +42,7 @@ use crate::sql::optimizer::stats_input::{
     StatsSource,
 };
 use crate::sql::planner::table::{
-    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
-    SqlTableVersionSelector,
+    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
 };
 
 #[derive(Clone, Default)]
@@ -324,97 +323,6 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
-    }
-}
-
-pub(crate) fn metadata_payload(
-    kind: SqlMetadataTableKind,
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-    files: &[novarocks_connector_iceberg::scan_model::IcebergDataFileInfo],
-) -> Result<Option<String>, String> {
-    match kind {
-        SqlMetadataTableKind::Partitions => {
-            let mut groups = std::collections::BTreeMap::<
-                (i32, String),
-                (
-                    i64,
-                    i64,
-                    i64,
-                    std::collections::BTreeSet<String>,
-                    std::collections::BTreeSet<String>,
-                ),
-            >::new();
-            for file in files {
-                let spec_id = file.partition_spec_id.ok_or_else(|| {
-                    format!(
-                        "iceberg partitions metadata requires partition spec id for data file {}",
-                        file.path
-                    )
-                })?;
-                let rows = file.row_count.ok_or_else(|| {
-                    format!(
-                        "iceberg partitions metadata requires record_count for data file {}",
-                        file.path
-                    )
-                })?;
-                let entry = groups
-                    .entry((
-                        spec_id,
-                        file.partition_key
-                            .clone()
-                            .unwrap_or_else(|| "Struct([])".to_string()),
-                    ))
-                    .or_default();
-                entry.0 = entry.0.checked_add(rows).ok_or_else(|| {
-                    "iceberg partitions metadata record_count overflow".to_string()
-                })?;
-                entry.1 = entry
-                    .1
-                    .checked_add(1)
-                    .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
-                entry.2 = entry.2.checked_add(file.size).ok_or_else(|| {
-                    "iceberg partitions metadata total_data_file_size_in_bytes overflow".to_string()
-                })?;
-                for delete in &file.delete_files {
-                    match delete.file_content {
-                        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position => {
-                            entry.3.insert(delete.path.clone());
-                        }
-                        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality => {
-                            entry.4.insert(delete.path.clone());
-                        }
-                    }
-                }
-            }
-            let rows = groups.into_iter().map(|((spec_id, partition), (record_count, file_count, total_data_file_size_in_bytes, position_delete_files, equality_delete_files))| {
-                Ok(serde_json::json!({
-                    "spec_id": spec_id,
-                    "partition": partition,
-                    "record_count": record_count,
-                    "file_count": file_count,
-                    "total_data_file_size_in_bytes": total_data_file_size_in_bytes,
-                    "position_delete_file_count": i64::try_from(position_delete_files.len()).map_err(|_| "iceberg partitions metadata position_delete_file_count overflow".to_string())?,
-                    "equality_delete_file_count": i64::try_from(equality_delete_files.len()).map_err(|_| "iceberg partitions metadata equality_delete_file_count overflow".to_string())?,
-                }))
-            }).collect::<Result<Vec<_>, String>>()?;
-            serde_json::to_string(&serde_json::json!({ "version": 1, "rows": rows }))
-                .map(Some)
-                .map_err(|error| {
-                    format!("serialize iceberg partitions metadata payload failed: {error}")
-                })
-        }
-        SqlMetadataTableKind::Files
-        | SqlMetadataTableKind::Manifests
-        | SqlMetadataTableKind::LogicalIcebergMetadata => table
-            .serialized_metadata_rows
-            .clone()
-            .map(Some)
-            .ok_or_else(|| {
-                "iceberg metadata rows were not resolved at catalog lookup time".to_string()
-            }),
-        SqlMetadataTableKind::Snapshots
-        | SqlMetadataTableKind::History
-        | SqlMetadataTableKind::Refs => Ok(None),
     }
 }
 
