@@ -135,6 +135,21 @@ pub async fn build_hms_catalog(
         .map_err(|error| format!("build HMS iceberg catalog: {error}"))
 }
 
+/// Construct the concrete catalog client for one provider control generation.
+///
+/// The returned client remains provider-private.  In particular, the caller
+/// supplies both the configuration and the runtime that polls this future;
+/// this helper never discovers either from process-global state.
+pub async fn build_catalog(
+    configuration: &IcebergCatalogConfiguration,
+) -> Result<Arc<dyn crate::iceberg::Catalog>, String> {
+    match configuration.kind {
+        IcebergCatalogKind::Hadoop => Ok(Arc::new(build_hadoop_catalog(configuration)?)),
+        IcebergCatalogKind::Rest => Ok(Arc::new(build_rest_catalog(configuration).await?)),
+        IcebergCatalogKind::Hive => Ok(Arc::new(build_hms_catalog(configuration).await?)),
+    }
+}
+
 fn storage_factory(
     configuration: &IcebergCatalogConfiguration,
 ) -> Arc<dyn crate::iceberg::io::StorageFactory> {
@@ -142,4 +157,26 @@ fn storage_factory(
         &configuration.warehouse_uri,
         configuration.object_store_config.as_ref(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dispatches_hadoop_catalog_from_provider_configuration() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+
+        build_catalog(&configuration)
+            .await
+            .expect("provider catalog");
+    }
 }

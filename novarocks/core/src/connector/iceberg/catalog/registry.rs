@@ -1420,20 +1420,9 @@ fn provider_catalog_configuration(entry: &IcebergCatalogEntry) -> IcebergCatalog
 pub(crate) fn build_iceberg_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>, String> {
-    match entry.kind {
-        IcebergCatalogKind::Hadoop => {
-            let hadoop = build_hadoop_catalog(entry)?;
-            Ok(Arc::new(hadoop) as Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>)
-        }
-        IcebergCatalogKind::Rest => {
-            let rest = block_on_iceberg(async { build_rest_catalog(entry).await })??;
-            Ok(Arc::new(rest) as Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>)
-        }
-        IcebergCatalogKind::Hive => {
-            let hms = block_on_iceberg(async { build_hms_catalog(entry).await })??;
-            Ok(Arc::new(hms) as Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>)
-        }
-    }
+    block_on_iceberg(novarocks_connector_iceberg::catalog_runtime::build_catalog(
+        entry.configuration(),
+    ))?
 }
 
 /// Authoritative, typed existence check shared by staged CREATE application
