@@ -174,15 +174,20 @@ impl FrontendCatalogApplicationPort {
 
     /// Rebuild this process's control projection from the authoritative
     /// attachment scan. A change hint never carries attachment state; callers
-    /// always invoke this method after rereading StateStore.
-    pub(crate) async fn reconcile(&self) -> Result<(), CatalogApplicationError> {
-        self.reconcile_with_page_size(256).await
-    }
-
+    /// always invoke this method after rereading StateStore. Factory and
+    /// registration work is bounded because provider materialization can
+    /// synchronously perform remote validation.
     pub(crate) async fn reconcile_with_page_size(
-        &self,
+        self: &Arc<Self>,
         page_size: usize,
+        worker_count: usize,
     ) -> Result<(), CatalogApplicationError> {
+        if worker_count == 0 {
+            return Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::InvalidRequest,
+                "catalog projection worker count must be positive",
+            ));
+        }
         let repository = self.repository()?;
         let attachments = repository
             .list_with_page_size(page_size)
@@ -215,49 +220,75 @@ impl FrontendCatalogApplicationPort {
             self.retire_projection(&instance_id);
         }
 
-        for attachment in desired.values() {
-            let installed = self
-                .projections
-                .lock()
-                .map_err(|_| {
+        let mut workers = tokio::task::JoinSet::new();
+        for attachment in desired.into_values() {
+            if workers.len() >= worker_count {
+                let completed = workers.join_next().await.ok_or_else(|| {
                     CatalogApplicationError::new(
                         CatalogApplicationErrorKind::Internal,
-                        "catalog projection lock is poisoned",
+                        "catalog projection worker exited unexpectedly",
                     )
-                })?
-                .get(&attachment.instance_id)
-                .is_some_and(|projection| projection.attachment_id == attachment.attachment_id)
-                && self
-                    .control
-                    .observe_current_binding(&attachment.instance_id)
-                    .is_ok();
-            if installed {
-                continue;
+                })?;
+                completed.map_err(|error| {
+                    CatalogApplicationError::new(
+                        CatalogApplicationErrorKind::Internal,
+                        format!("catalog projection worker failed: {error}"),
+                    )
+                })?;
             }
-
-            self.retire_projection(&attachment.instance_id);
-            let installed = (|| {
-                let request = ConnectorControlFactoryRequest::try_new(
-                    attachment.provider_id.clone(),
-                    attachment.instance_id.clone(),
-                    attachment.durable_properties.clone(),
+            let projection = Arc::clone(self);
+            workers.spawn_blocking(move || projection.reconcile_attachment(attachment));
+        }
+        while let Some(completed) = workers.join_next().await {
+            completed.map_err(|error| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Internal,
+                    format!("catalog projection worker failed: {error}"),
                 )
-                .map_err(connector_error)?;
-                let creation = self
-                    .control
-                    .create_control(request)
-                    .map_err(connector_error)?;
-                let (binding, _) = creation.into_parts();
-                self.install_created(attachment, binding).map(|_| ())
-            })();
-            if let Err(error) = installed {
-                // A single provider failure must not make durable truth
-                // disappear or prevent unrelated catalog projections. Its
-                // admission remains Unavailable until a later resync works.
-                tracing::warn!(%error, catalog = attachment.instance_id.as_str(), "catalog attachment remains unavailable after projection attempt");
-            }
+            })?;
         }
         Ok(())
+    }
+
+    fn reconcile_attachment(&self, attachment: CatalogAttachment) {
+        let installed = self
+            .projections
+            .lock()
+            .map(|projections| {
+                projections
+                    .get(&attachment.instance_id)
+                    .is_some_and(|projection| projection.attachment_id == attachment.attachment_id)
+            })
+            .unwrap_or(false)
+            && self
+                .control
+                .observe_current_binding(&attachment.instance_id)
+                .is_ok();
+        if installed {
+            return;
+        }
+
+        self.retire_projection(&attachment.instance_id);
+        let installed = (|| {
+            let request = ConnectorControlFactoryRequest::try_new(
+                attachment.provider_id.clone(),
+                attachment.instance_id.clone(),
+                attachment.durable_properties.clone(),
+            )
+            .map_err(connector_error)?;
+            let creation = self
+                .control
+                .create_control(request)
+                .map_err(connector_error)?;
+            let (binding, _) = creation.into_parts();
+            self.install_created(&attachment, binding).map(|_| ())
+        })();
+        if let Err(error) = installed {
+            // A single provider failure must not make durable truth disappear
+            // or prevent unrelated catalog projections. Its admission remains
+            // Unavailable until a later resync works.
+            tracing::warn!(%error, catalog = attachment.instance_id.as_str(), "catalog attachment remains unavailable after projection attempt");
+        }
     }
 
     /// Stops all local admission before retiring existing leases. Durable

@@ -108,7 +108,7 @@ impl FrontendCatalogController {
             .await
             .map_err(|error| error.to_string())?;
         self.projection
-            .reconcile_with_page_size(self.config.page_size)
+            .reconcile_with_page_size(self.config.page_size, self.config.worker_count)
             .await
             .map_err(|error| error.to_string())?;
         let cursor = ChangeCursor::new(identity.store_id, page.high_watermark, u32::MAX)
@@ -221,7 +221,7 @@ impl FrontendCatalogController {
             .any(|hint| hint.key.as_bytes().starts_with(prefix.as_bytes()));
         if *force_resync || page.resync_required || relevant {
             self.projection
-                .reconcile_with_page_size(self.config.page_size)
+                .reconcile_with_page_size(self.config.page_size, self.config.worker_count)
                 .await
                 .map_err(|error| error.to_string())?;
             *force_resync = false;
