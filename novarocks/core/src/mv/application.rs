@@ -21,7 +21,10 @@ mod refresh_artifact;
 
 use std::fmt;
 
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
+use novarocks_spi::connector::{
+    ConnectorControlPlanningLease, ConnectorExecutionBindingKey, ConnectorWriteLease,
+    ConnectorWriteOperationId, ConnectorWriteReceipt,
+};
 use uuid::Uuid;
 
 use crate::mv::repository::{
@@ -89,10 +92,36 @@ impl MvRefreshPreparationRequest {
 pub enum PreparedMvRefreshWork {
     NoOp,
     MetadataOnly,
-    DataProducing {
-        first_refresh_writes: Vec<PreparedMvFirstRefreshWrite>,
-        incremental_writes: Vec<PreparedMvIncrementalWrite>,
-    },
+    DataProducing { write: PreparedMvRefreshWrite },
+}
+
+/// Exactly one SQL-prepared staged write for a data-producing refresh.
+pub enum PreparedMvRefreshWrite {
+    FirstRefresh(PreparedMvFirstRefreshWrite),
+    Incremental(PreparedMvIncrementalWrite),
+}
+
+impl PreparedMvRefreshWrite {
+    pub fn operation_id(&self) -> ConnectorWriteOperationId {
+        match self {
+            Self::FirstRefresh(write) => write.operation_id(),
+            Self::Incremental(write) => write.operation_id(),
+        }
+    }
+
+    pub fn primary_cohort(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
+        match self {
+            Self::FirstRefresh(write) => write.primary_cohort(),
+            Self::Incremental(write) => write.primary_cohort(),
+        }
+    }
+
+    pub fn publication_intent(&self) -> &MvRefreshPublicationIntent {
+        match self {
+            Self::FirstRefresh(write) => write.publication_intent(),
+            Self::Incremental(write) => write.publication_intent(),
+        }
+    }
 }
 
 /// Frontend lifecycle artifact assembled from SQL facts and a reserved attempt.
@@ -172,7 +201,11 @@ mod refresh_preparation_tests {
         );
     }
 }
-pub use refresh_artifact::{PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite};
+pub use refresh_artifact::{
+    MvRefreshCommittedFacts, MvRefreshPublicationBase, MvRefreshPublicationIntent,
+    MvRefreshPublicationTechnique, MvRefreshPublishedFacts, PreparedMvFirstRefreshWrite,
+    PreparedMvIncrementalWrite,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvCreatePartitionField {
@@ -493,33 +526,29 @@ pub trait MvApplicationService: Send + Sync {
 /// write-session admission, execution, commit, publication, and cleanup; the
 /// port only turns an already frozen artifact into the generic result-free
 /// distributed write request after the exact lease is retained.
-pub trait MvFirstRefreshWriteActivator: Send + Sync {
-    fn bind_first_refresh_write(
+pub trait MvRefreshProviderActivation: Send + Sync {
+    fn activate_write(
         &self,
-        prepared: PreparedMvFirstRefreshWrite,
-        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+        prepared: PreparedMvRefreshWrite,
+        planning_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorWriteLease,
         execution: &crate::query_execution::request_context::QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, String>;
 
-    /// Bind one value-only incremental change-stream artifact after the same
-    /// retained exact lease has admitted its staging attempt.
-    fn bind_incremental_refresh_write(
+    fn interpret_write_commit(
         &self,
-        prepared: PreparedMvIncrementalWrite,
-        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
-        execution: &crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<PreparedDistributedWriteRequest, String>;
+        intent: MvRefreshPublicationIntent,
+        receipt: &ConnectorWriteReceipt,
+    ) -> Result<MvRefreshCommittedFacts, String>;
 }
 
 /// Frontend composition sink installed before Core opens. Core binds its
 /// provider activation adapter only after connector control and the engine
 /// state are available, avoiding a direct all-in-one call path.
-pub trait MvFirstRefreshWriteActivatorSink: Send + Sync {
-    fn bind_mv_first_refresh_write_activator(
+pub trait MvRefreshProviderActivationSink: Send + Sync {
+    fn bind_mv_refresh_provider_activation(
         &self,
-        activator: std::sync::Arc<dyn MvFirstRefreshWriteActivator>,
+        activation: std::sync::Arc<dyn MvRefreshProviderActivation>,
     ) -> Result<(), String>;
 }
 

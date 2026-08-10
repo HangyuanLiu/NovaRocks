@@ -92,7 +92,7 @@ impl FrontendMvService {
         repository: Arc<dyn MvRepository>,
         query_execution: QueryExecutionService,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        first_refresh_activator: Arc<refresh::FrontendMvFirstRefreshWriteActivatorPort>,
+        provider_activation: Arc<refresh::FrontendMvRefreshProviderActivationPort>,
         execution_role: novarocks::common::app_config::ClusterRole,
         topology: BackendTopologyService,
         scheduler_config: FrontendMvSchedulerConfig,
@@ -106,7 +106,7 @@ impl FrontendMvService {
             refresh: Some(refresh::FrontendMvRefreshDependencies {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
-                first_refresh_activator,
+                provider_activation,
             }),
             recovery: Some(recovery::FrontendMvRecoveryDependencies { connector_control }),
             activity_gate: MvActivityGate::new(),

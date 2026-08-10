@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorTableHandle, ConnectorWriteCohortId,
-    ConnectorWriteOperationId,
+    ConnectorCommittedVersion, ConnectorExecutionBindingKey, ConnectorTableHandle,
+    ConnectorWriteCohortId, ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
 use crate::sql::mv_refresh::first_refresh::{
@@ -27,6 +27,228 @@ use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 pub(crate) enum MvStagedRefreshWriteMode {
     Append,
     FullOverwrite,
+}
+
+/// Application-owned refresh technique. Provider-specific snapshot encodings
+/// are derived only inside the activation adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvRefreshPublicationTechnique {
+    Full,
+    Incremental,
+}
+
+/// One complete base-table watermark that is known before a refresh write is
+/// admitted. A provider encoder may render this fact, but may not alter it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshPublicationBase {
+    table_fqn: String,
+    table_uuid: String,
+    from_snapshot: Option<i64>,
+    to_snapshot: i64,
+}
+
+impl MvRefreshPublicationBase {
+    pub(crate) fn try_new(
+        table_fqn: String,
+        table_uuid: String,
+        from_snapshot: Option<i64>,
+        to_snapshot: i64,
+    ) -> Result<Self, String> {
+        if table_fqn.is_empty()
+            || table_uuid.is_empty()
+            || from_snapshot.is_some_and(|snapshot| snapshot < 0)
+            || to_snapshot < 0
+        {
+            return Err("invalid MV refresh publication base fact".to_string());
+        }
+        Ok(Self {
+            table_fqn,
+            table_uuid,
+            from_snapshot,
+            to_snapshot,
+        })
+    }
+
+    pub(crate) fn table_fqn(&self) -> &str {
+        &self.table_fqn
+    }
+
+    pub(crate) fn table_uuid(&self) -> &str {
+        &self.table_uuid
+    }
+
+    pub(crate) const fn from_snapshot(&self) -> Option<i64> {
+        self.from_snapshot
+    }
+
+    pub(crate) const fn to_snapshot(&self) -> i64 {
+        self.to_snapshot
+    }
+}
+
+/// Complete immutable intent known before the writer commits. It deliberately
+/// has no row-count or committed-version field: those facts cannot be
+/// fabricated by SQL preparation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshPublicationIntent {
+    refresh_id: i64,
+    mv_id: i64,
+    marker_token: String,
+    technique: MvRefreshPublicationTechnique,
+    bases: Vec<MvRefreshPublicationBase>,
+    definition_fingerprint: String,
+    target_catalog: String,
+    target_namespace: String,
+    target_name: String,
+    staging_branch: String,
+}
+
+impl MvRefreshPublicationIntent {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        refresh_id: i64,
+        mv_id: i64,
+        marker_token: String,
+        technique: MvRefreshPublicationTechnique,
+        bases: Vec<MvRefreshPublicationBase>,
+        definition_fingerprint: String,
+        target_catalog: String,
+        target_namespace: String,
+        target_name: String,
+        staging_branch: String,
+    ) -> Result<Self, String> {
+        if refresh_id <= 0
+            || mv_id <= 0
+            || marker_token.is_empty()
+            || bases.is_empty()
+            || definition_fingerprint.is_empty()
+            || target_catalog.is_empty()
+            || target_namespace.is_empty()
+            || target_name.is_empty()
+            || staging_branch.is_empty()
+        {
+            return Err("invalid MV refresh publication intent".to_string());
+        }
+        let mut table_fqns = std::collections::BTreeSet::new();
+        let mut table_uuids = std::collections::BTreeSet::new();
+        if bases.iter().any(|base| {
+            !table_fqns.insert(base.table_fqn.as_str())
+                || !table_uuids.insert(base.table_uuid.as_str())
+        }) {
+            return Err("MV refresh publication intent has duplicate base identity".to_string());
+        }
+        Ok(Self {
+            refresh_id,
+            mv_id,
+            marker_token,
+            technique,
+            bases,
+            definition_fingerprint,
+            target_catalog,
+            target_namespace,
+            target_name,
+            staging_branch,
+        })
+    }
+
+    pub(crate) const fn refresh_id(&self) -> i64 {
+        self.refresh_id
+    }
+    pub(crate) const fn mv_id(&self) -> i64 {
+        self.mv_id
+    }
+    pub(crate) fn marker_token(&self) -> &str {
+        &self.marker_token
+    }
+    pub(crate) const fn technique(&self) -> MvRefreshPublicationTechnique {
+        self.technique
+    }
+    pub(crate) fn bases(&self) -> &[MvRefreshPublicationBase] {
+        &self.bases
+    }
+    pub(crate) fn definition_fingerprint(&self) -> &str {
+        &self.definition_fingerprint
+    }
+    pub(crate) fn target_catalog(&self) -> &str {
+        &self.target_catalog
+    }
+    pub(crate) fn target_namespace(&self) -> &str {
+        &self.target_namespace
+    }
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target_name
+    }
+    pub(crate) fn staging_branch(&self) -> &str {
+        &self.staging_branch
+    }
+}
+
+/// Facts admitted only after the provider has committed the exact write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshCommittedFacts {
+    intent: MvRefreshPublicationIntent,
+    committed_version: ConnectorCommittedVersion,
+    resulting_row_count: i64,
+}
+
+impl MvRefreshCommittedFacts {
+    pub(crate) fn from_write_receipt(
+        intent: MvRefreshPublicationIntent,
+        receipt: &ConnectorWriteReceipt,
+    ) -> Result<Self, String> {
+        let committed_version = receipt
+            .committed_version()
+            .cloned()
+            .ok_or_else(|| "MV refresh write committed without a provider version".to_string())?;
+        let resulting_row_count =
+            i64::try_from(receipt.resulting_row_count().ok_or_else(|| {
+                "MV refresh write committed without resulting row-count fact".to_string()
+            })?)
+            .map_err(|_| "MV refresh committed row count exceeds i64 range".to_string())?;
+        Ok(Self {
+            intent,
+            committed_version,
+            resulting_row_count,
+        })
+    }
+
+    pub fn intent(&self) -> &MvRefreshPublicationIntent {
+        &self.intent
+    }
+    pub fn committed_version(&self) -> &ConnectorCommittedVersion {
+        &self.committed_version
+    }
+    pub const fn resulting_row_count(&self) -> i64 {
+        self.resulting_row_count
+    }
+}
+
+/// Facts available only after the publication action is known committed and
+/// provider finalization completed. The frontend constructs this value after
+/// recording the catalog action; it never changes the provider outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshPublishedFacts {
+    committed: MvRefreshCommittedFacts,
+    publication_version: ConnectorCommittedVersion,
+}
+
+impl MvRefreshPublishedFacts {
+    pub fn try_new(
+        committed: MvRefreshCommittedFacts,
+        publication_version: ConnectorCommittedVersion,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            committed,
+            publication_version,
+        })
+    }
+
+    pub fn committed(&self) -> &MvRefreshCommittedFacts {
+        &self.committed
+    }
+    pub fn publication_version(&self) -> &ConnectorCommittedVersion {
+        &self.publication_version
+    }
 }
 
 /// Application facts retained for the typed join activation path. The SQL
@@ -210,7 +432,7 @@ pub struct PreparedMvFirstRefreshWrite {
     artifact: MvFirstRefreshExecutionArtifact,
     primary_cohort: ConnectorWriteCohortId,
     write_mode: MvStagedRefreshWriteMode,
-    provenance_properties: BTreeMap<String, String>,
+    publication_intent: MvRefreshPublicationIntent,
 }
 
 impl PreparedMvFirstRefreshWrite {
@@ -224,6 +446,10 @@ impl PreparedMvFirstRefreshWrite {
 
     pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
         self.request.observed_binding()
+    }
+
+    pub(crate) fn target_table(&self) -> &ConnectorTableHandle {
+        self.request.target_table()
     }
 
     pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
@@ -275,16 +501,16 @@ impl PreparedMvFirstRefreshWrite {
         self
     }
 
-    pub(crate) fn with_provenance_properties(
+    pub(crate) fn with_publication_intent(
         mut self,
-        provenance_properties: BTreeMap<String, String>,
+        publication_intent: MvRefreshPublicationIntent,
     ) -> Self {
-        self.provenance_properties = provenance_properties;
+        self.publication_intent = publication_intent;
         self
     }
 
-    pub(crate) fn provenance_properties(&self) -> &BTreeMap<String, String> {
-        &self.provenance_properties
+    pub(crate) fn publication_intent(&self) -> &MvRefreshPublicationIntent {
+        &self.publication_intent
     }
 
     pub(crate) fn into_execution_artifact(self) -> MvFirstRefreshExecutionArtifact {
@@ -305,28 +531,33 @@ impl MvFirstRefreshWritePreparer {
     pub(crate) fn prepare(
         request: MvFirstRefreshWriteRequest,
         physical_sql: MvFirstRefreshPhysicalSql,
+        publication_intent: MvRefreshPublicationIntent,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
         Self::prepare_artifact(
             request,
             MvFirstRefreshExecutionArtifact::Sql(physical_sql),
             MvStagedRefreshWriteMode::Append,
+            publication_intent,
         )
     }
 
     pub(crate) fn prepare_full_overwrite(
         request: MvFirstRefreshWriteRequest,
         physical_sql: MvFirstRefreshPhysicalSql,
+        publication_intent: MvRefreshPublicationIntent,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
         Self::prepare_artifact(
             request,
             MvFirstRefreshExecutionArtifact::Sql(physical_sql),
             MvStagedRefreshWriteMode::FullOverwrite,
+            publication_intent,
         )
     }
 
     pub(crate) fn prepare_join_logical(
         request: MvFirstRefreshWriteRequest,
         context: MvFirstRefreshLogicalContext,
+        publication_intent: MvRefreshPublicationIntent,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
         Self::prepare_artifact(
             request,
@@ -334,6 +565,7 @@ impl MvFirstRefreshWritePreparer {
                 MvFirstRefreshLogicalArtifact::from_join_context(context),
             ),
             MvStagedRefreshWriteMode::Append,
+            publication_intent,
         )
     }
 
@@ -341,7 +573,17 @@ impl MvFirstRefreshWritePreparer {
         request: MvFirstRefreshWriteRequest,
         artifact: MvFirstRefreshExecutionArtifact,
         write_mode: MvStagedRefreshWriteMode,
+        publication_intent: MvRefreshPublicationIntent,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
+        if publication_intent.target_catalog() != request.target_catalog()
+            || publication_intent.target_namespace() != request.target_namespace()
+            || publication_intent.target_name() != request.target_name()
+            || publication_intent.staging_branch() != request.staging_branch()
+        {
+            return Err(
+                "MV first-refresh publication intent does not match write target".to_string(),
+            );
+        }
         if artifact.root_hash_column() != request.target_contract().hidden_hash_key() {
             return Err(
                 "MV first-refresh root distribution does not match the target hidden hash key"
@@ -363,7 +605,7 @@ impl MvFirstRefreshWritePreparer {
             artifact,
             primary_cohort: ConnectorWriteCohortId::primary(operation_id),
             write_mode,
-            provenance_properties: BTreeMap::new(),
+            publication_intent,
         })
     }
 }
@@ -455,6 +697,34 @@ mod incremental_tests {
     use super::*;
 
     #[test]
+    fn publication_intent_rejects_duplicate_base_identity() {
+        let base = MvRefreshPublicationBase::try_new(
+            "ice.db.base".to_string(),
+            "uuid-1".to_string(),
+            None,
+            7,
+        )
+        .expect("base");
+        let error = MvRefreshPublicationIntent::try_new(
+            1,
+            2,
+            "token".to_string(),
+            MvRefreshPublicationTechnique::Full,
+            vec![base.clone(), base],
+            "fingerprint".to_string(),
+            "ice".to_string(),
+            "db".to_string(),
+            "mv".to_string(),
+            "__nova_mv_1".to_string(),
+        )
+        .expect_err("duplicate base must fail");
+        assert_eq!(
+            error,
+            "MV refresh publication intent has duplicate base identity"
+        );
+    }
+
+    #[test]
     fn sqlx2_mv_incremental_request_rejects_missing_staging_identity() {
         let result = MvIncrementalWriteRequest::try_new(
             "ice".to_string(),
@@ -487,7 +757,7 @@ pub struct PreparedMvIncrementalWrite {
     mode: MvIncrementalWriteMode,
     evidence: MvIncrementalRewriteEvidence,
     execution_artifact: MvIncrementalExecutionArtifact,
-    provenance_properties: BTreeMap<String, String>,
+    publication_intent: MvRefreshPublicationIntent,
 }
 
 impl PreparedMvIncrementalWrite {
@@ -499,6 +769,10 @@ impl PreparedMvIncrementalWrite {
         ConnectorWriteCohortId::primary(self.request.operation_id)
     }
 
+    pub(crate) fn publication_intent(&self) -> &MvRefreshPublicationIntent {
+        &self.publication_intent
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -507,7 +781,7 @@ impl PreparedMvIncrementalWrite {
         MvIncrementalWriteMode,
         MvIncrementalRewriteEvidence,
         MvIncrementalExecutionArtifact,
-        BTreeMap<String, String>,
+        MvRefreshPublicationIntent,
     ) {
         (
             self.request,
@@ -515,7 +789,7 @@ impl PreparedMvIncrementalWrite {
             self.mode,
             self.evidence,
             self.execution_artifact,
-            self.provenance_properties,
+            self.publication_intent,
         )
     }
 }
@@ -529,7 +803,7 @@ impl MvIncrementalWritePreparer {
         mode: MvIncrementalWriteMode,
         evidence: MvIncrementalRewriteEvidence,
         execution_artifact: MvIncrementalExecutionArtifact,
-        provenance_properties: BTreeMap<String, String>,
+        publication_intent: MvRefreshPublicationIntent,
     ) -> Result<PreparedMvIncrementalWrite, String> {
         if logical_context.base_refs.is_empty() || logical_context.pin.is_empty() {
             return Err("MV incremental write requires pinned base facts".to_string());
@@ -537,13 +811,22 @@ impl MvIncrementalWritePreparer {
         if logical_context.pin.len() != logical_context.base_refs.len() {
             return Err("MV incremental write has incomplete base snapshot pins".to_string());
         }
+        if publication_intent.target_catalog() != request.target_catalog
+            || publication_intent.target_namespace() != request.target_namespace
+            || publication_intent.target_name() != request.target_name
+            || publication_intent.staging_branch() != request.staging_branch
+        {
+            return Err(
+                "MV incremental publication intent does not match write target".to_string(),
+            );
+        }
         Ok(PreparedMvIncrementalWrite {
             request,
             logical_context,
             mode,
             evidence,
             execution_artifact,
-            provenance_properties,
+            publication_intent,
         })
     }
 }

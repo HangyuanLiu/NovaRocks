@@ -85,8 +85,10 @@ use crate::mv::analysis::{
 };
 use crate::mv::application::{
     CreatedMvTarget, MvCreateStatement, MvEngine, MvEngineError, MvEngineErrorKind,
-    MvRefreshPreparationRequest, MvRefreshPreparationService, PrepareMvCreateRequest,
+    MvRefreshPreparationRequest, MvRefreshPreparationService, MvRefreshPublicationBase,
+    MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PrepareMvCreateRequest,
     PreparedMvCreate, PreparedMvDefinition, PreparedMvRefresh, PreparedMvRefreshWork,
+    PreparedMvRefreshWrite,
 };
 use crate::mv::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
@@ -268,7 +270,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
             ExecutableRefreshDecision::FirstRefresh => PreparedMvRefreshWork::DataProducing {
-                first_refresh_writes: vec![prepare_frontend_first_refresh_write(
+                write: PreparedMvRefreshWrite::FirstRefresh(prepare_frontend_first_refresh_write(
                     self.state,
                     self.current_catalog,
                     self.current_database,
@@ -277,8 +279,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     &base_table_uuids,
                     observed_binding.clone(),
                     self.connector_context.clone(),
-                )?],
-                incremental_writes: Vec::new(),
+                )?),
             },
             ExecutableRefreshDecision::Incremental => match prepare_frontend_incremental_write(
                 self.state,
@@ -291,14 +292,12 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             )? {
                 PreparedIncrementalRefreshWork::ChangeStream(incremental) => {
                     PreparedMvRefreshWork::DataProducing {
-                        first_refresh_writes: Vec::new(),
-                        incremental_writes: vec![incremental],
+                        write: PreparedMvRefreshWrite::Incremental(incremental),
                     }
                 }
                 PreparedIncrementalRefreshWork::FullRebuild(rebuild) => {
                     PreparedMvRefreshWork::DataProducing {
-                        first_refresh_writes: vec![rebuild],
-                        incremental_writes: Vec::new(),
+                        write: PreparedMvRefreshWrite::FirstRefresh(rebuild),
                     }
                 }
                 PreparedIncrementalRefreshWork::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
@@ -367,7 +366,7 @@ fn prepare_frontend_first_refresh_write(
         &target_loaded.table,
     )
     .map_err(IcebergMvRefreshExecutionError::into_message)?;
-    let provenance_properties = frontend_refresh_provenance(
+    let publication_intent = frontend_refresh_publication_intent(
         contract,
         attempt,
         definition.mv_id,
@@ -523,8 +522,8 @@ fn prepare_frontend_first_refresh_write(
             crate::engine::mv_first_refresh_staging::frozen_logical_context_with_base_overlays(
                 state, &context,
             )?,
-        )
-        .map(|prepared| prepared.with_provenance_properties(provenance_properties));
+            publication_intent,
+        );
     }
     let sql_pin = sql_first_refresh_snapshot_pin(&pin)?;
     let (shape, physical_sql) = if capabilities.has_agg_state {
@@ -647,17 +646,20 @@ fn prepare_frontend_first_refresh_write(
         observed_binding,
         attempt.write_operation_id,
     )?;
-    crate::mv::application::MvFirstRefreshWritePreparer::prepare(request, physical_sql)
-        .map(|prepared| prepared.with_provenance_properties(provenance_properties))
+    crate::mv::application::MvFirstRefreshWritePreparer::prepare(
+        request,
+        physical_sql,
+        publication_intent,
+    )
 }
 
-fn frontend_refresh_provenance(
+fn frontend_refresh_publication_intent(
     contract: &RefreshPlanContract,
     attempt: &crate::mv::application::MvRefreshAttemptIdentity,
     mv_id: i64,
     select_sql: &str,
     base_table_uuids: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, String> {
+) -> Result<MvRefreshPublicationIntent, String> {
     let snapshots = contract
         .snapshot_pins
         .iter()
@@ -674,18 +676,66 @@ fn frontend_refresh_provenance(
         } => previous_snapshot_ids.clone(),
         RefreshStateBaseline::Pinless => BTreeMap::new(),
     };
-    build_mv_refresh_provenance(
-        &MvRefreshSnapshotMarker {
-            refresh_id: attempt.refresh_id,
-            mv_id,
-            token: attempt.marker_token.clone(),
-        },
-        RefreshTechnique::Full,
-        build_mv_refresh_provenance_bases(&snapshots, base_table_uuids, &previous_snapshots),
+    mv_refresh_publication_intent(
+        attempt.refresh_id,
+        mv_id,
+        attempt.marker_token.clone(),
+        MvRefreshPublicationTechnique::Full,
+        &snapshots,
+        base_table_uuids,
+        &previous_snapshots,
         mv_definition_fingerprint(select_sql),
-        0,
+        contract
+            .target
+            .catalog
+            .clone()
+            .ok_or_else(|| "MV refresh publication target has no connector catalog".to_string())?,
+        contract.target.database.clone(),
+        contract.target.name.clone(),
+        attempt.staging_branch.clone(),
     )
-    .to_summary_properties()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mv_refresh_publication_intent(
+    refresh_id: i64,
+    mv_id: i64,
+    marker_token: String,
+    technique: MvRefreshPublicationTechnique,
+    snapshots: &BTreeMap<String, i64>,
+    base_table_uuids: &BTreeMap<String, String>,
+    previous_snapshots: &BTreeMap<String, i64>,
+    definition_fingerprint: String,
+    target_catalog: String,
+    target_namespace: String,
+    target_name: String,
+    staging_branch: String,
+) -> Result<MvRefreshPublicationIntent, String> {
+    let bases = snapshots
+        .iter()
+        .map(|(table_fqn, to_snapshot)| {
+            MvRefreshPublicationBase::try_new(
+                table_fqn.clone(),
+                base_table_uuids.get(table_fqn).cloned().ok_or_else(|| {
+                    format!("MV refresh publication has no UUID fact for {table_fqn}")
+                })?,
+                previous_snapshots.get(table_fqn).copied(),
+                *to_snapshot,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    MvRefreshPublicationIntent::try_new(
+        refresh_id,
+        mv_id,
+        marker_token,
+        technique,
+        bases,
+        definition_fingerprint,
+        target_catalog,
+        target_namespace,
+        target_name,
+        staging_branch,
+    )
 }
 
 /// Prepare the value-only non-join incremental handoff.  This is deliberately
@@ -892,9 +942,9 @@ fn prepare_frontend_incremental_write(
             select_join_incremental_refresh_mode(left_has_delete_changes, right_has_delete_changes)
         };
         let request = crate::mv::application::MvIncrementalWriteRequest::try_new(
-            target.catalog,
-            target.namespace,
-            target.table,
+            target.catalog.clone(),
+            target.namespace.clone(),
+            target.table.clone(),
             attempt.staging_branch.clone(),
             current_catalog.map(str::to_string),
             current_database.to_string(),
@@ -902,23 +952,20 @@ fn prepare_frontend_incremental_write(
             observed_binding,
             attempt.write_operation_id,
         )?;
-        let marker = MvRefreshSnapshotMarker {
-            refresh_id: attempt.refresh_id,
-            mv_id: context.rewrite.mv_definition.mv_id,
-            token: attempt.marker_token.clone(),
-        };
-        let provenance_properties = build_mv_refresh_provenance(
-            &marker,
-            RefreshTechnique::Incremental,
-            build_mv_refresh_provenance_bases(
-                &context.rewrite.pin.to_snapshot_map(),
-                &context.rewrite.pin.to_table_uuid_map(),
-                &context.rewrite.previous_snapshot_ids,
-            ),
+        let publication_intent = mv_refresh_publication_intent(
+            attempt.refresh_id,
+            context.rewrite.mv_definition.mv_id,
+            attempt.marker_token.clone(),
+            MvRefreshPublicationTechnique::Incremental,
+            &context.rewrite.pin.to_snapshot_map(),
+            &context.rewrite.pin.to_table_uuid_map(),
+            &context.rewrite.previous_snapshot_ids,
             definition_fingerprint.clone(),
-            0,
-        )
-        .to_summary_properties()?;
+            target.catalog.clone(),
+            target.namespace.clone(),
+            target.table.clone(),
+            attempt.staging_branch.clone(),
+        )?;
         return crate::mv::application::MvIncrementalWritePreparer::prepare(
             request,
             crate::engine::mv_first_refresh_staging::frozen_logical_context(&context)?,
@@ -945,7 +992,7 @@ fn prepare_frontend_incremental_write(
                     }
                 },
             },
-            provenance_properties,
+            publication_intent,
         )
         .map(PreparedIncrementalRefreshWork::ChangeStream);
     }
@@ -1047,9 +1094,9 @@ fn prepare_frontend_incremental_write(
         }
     };
     let request = crate::mv::application::MvIncrementalWriteRequest::try_new(
-        target.catalog,
-        target.namespace,
-        target.table,
+        target.catalog.clone(),
+        target.namespace.clone(),
+        target.table.clone(),
         attempt.staging_branch.clone(),
         current_catalog.map(str::to_string),
         current_database.to_string(),
@@ -1057,30 +1104,27 @@ fn prepare_frontend_incremental_write(
         observed_binding,
         attempt.write_operation_id,
     )?;
-    let marker = MvRefreshSnapshotMarker {
-        refresh_id: attempt.refresh_id,
-        mv_id: context.rewrite.mv_definition.mv_id,
-        token: attempt.marker_token.clone(),
-    };
-    let provenance_properties = build_mv_refresh_provenance(
-        &marker,
-        RefreshTechnique::Incremental,
-        build_mv_refresh_provenance_bases(
-            &context.rewrite.pin.to_snapshot_map(),
-            &context.rewrite.pin.to_table_uuid_map(),
-            &context.rewrite.previous_snapshot_ids,
-        ),
+    let publication_intent = mv_refresh_publication_intent(
+        attempt.refresh_id,
+        context.rewrite.mv_definition.mv_id,
+        attempt.marker_token.clone(),
+        MvRefreshPublicationTechnique::Incremental,
+        &context.rewrite.pin.to_snapshot_map(),
+        &context.rewrite.pin.to_table_uuid_map(),
+        &context.rewrite.previous_snapshot_ids,
         definition_fingerprint.clone(),
-        0,
-    )
-    .to_summary_properties()?;
+        target.catalog.clone(),
+        target.namespace.clone(),
+        target.table.clone(),
+        attempt.staging_branch.clone(),
+    )?;
     crate::mv::application::MvIncrementalWritePreparer::prepare(
         request,
         crate::engine::mv_first_refresh_staging::frozen_logical_context(&context)?,
         mode,
         evidence,
         crate::mv::application::MvIncrementalExecutionArtifact::CanonicalQuery,
-        provenance_properties,
+        publication_intent,
     )
     .map(PreparedIncrementalRefreshWork::ChangeStream)
 }
@@ -14145,7 +14189,7 @@ fn admit_mv_change_stream_write_targets(
     table: &str,
     target_ref: &str,
     context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<novarocks_spi::connector::ConnectorWriteLease, String> {
     let fields = materialization
         .columns
         .iter()
@@ -14203,8 +14247,9 @@ fn admit_mv_change_stream_write_targets(
         namespace: namespace.to_string(),
         table: table.to_string(),
     };
+    let mut preparation_lease = None;
     for input in inputs {
-        let (_, preparation) = materialization.prepare_write(
+        let (lease, preparation) = materialization.prepare_write(
             target_ref,
             ConnectorWriteIntent::RowDelta,
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
@@ -14217,8 +14262,13 @@ fn admit_mv_change_stream_write_targets(
             preparation,
             materialization.planning_lease.clone(),
         )?;
+        if preparation_lease.is_none() {
+            preparation_lease = Some(lease);
+        }
     }
-    Ok(())
+    preparation_lease.ok_or_else(|| {
+        "IMV change-stream write admission produced no Provider preparation".to_string()
+    })
 }
 
 #[cfg(test)]
@@ -16519,7 +16569,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
-    let (request, facts, mode, evidence, execution_artifact, provenance_properties) =
+    let (request, facts, mode, evidence, execution_artifact, publication_intent) =
         prepared.into_parts();
     if request.observed_binding != *exact_lease.binding_key() {
         return Err("MV incremental write lease drifted from prepared binding".to_string());
@@ -16554,7 +16604,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             &target.namespace,
             &target.table,
         )?;
-    admit_mv_change_stream_write_targets(
+    let preparation_lease = admit_mv_change_stream_write_targets(
         target_bindings.as_ref(),
         &target_materialization,
         &target.catalog,
@@ -16563,6 +16613,12 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         &request.staging_branch,
         crate::connector::connector_request_context_for_execution(None, execution)?,
     )?;
+    if !preparation_lease.retains_same_generation(exact_lease) {
+        return Err(
+            "MV incremental write preparation did not retain the frontend exact lease generation"
+                .to_string(),
+        );
+    }
     let rewrite_evidence = match evidence {
         crate::mv::application::MvIncrementalRewriteEvidence::None => {
             RewriteMergeRefreshEvidence::None
@@ -16678,7 +16734,10 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             change_stream: planned_query.change_stream,
             producer_branches,
             mv_refresh_ctx: Some(&refresh_context),
-            snapshot_properties: provenance_properties,
+            snapshot_properties:
+                crate::engine::mv::iceberg_activation::iceberg_publication_properties(
+                    &publication_intent,
+                )?,
             connector_operation_id: operation_id,
         },
         &staging_branch,

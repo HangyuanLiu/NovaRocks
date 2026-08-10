@@ -34,7 +34,7 @@ use crate::dml::{DmlService, StateStoreOperationJournal};
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{
-    FrontendMvFirstRefreshWriteActivatorPort, FrontendMvService, repository::StateStoreMvRepository,
+    FrontendMvRefreshProviderActivationPort, FrontendMvService, repository::StateStoreMvRepository,
 };
 use crate::query_control::FrontendQueryControl;
 use crate::statistics::FrontendStatisticsService;
@@ -114,7 +114,7 @@ pub struct FrontendApplicationHost {
     mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
     mv_service: Option<Arc<FrontendMvService>>,
-    mv_first_refresh_activator: Option<Arc<FrontendMvFirstRefreshWriteActivatorPort>>,
+    mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
     mv_background_engine_sink: Option<Arc<dyn novarocks::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
@@ -195,7 +195,7 @@ impl FrontendApplicationHost {
             mv_repository: None,
             mv_application_service: None,
             mv_service: None,
-            mv_first_refresh_activator: None,
+            mv_refresh_provider_activation: None,
             mv_background_engine_sink: None,
             state_store_host: None,
             query_execution: None,
@@ -289,13 +289,13 @@ impl FrontendApplicationHost {
                     Ok(repository) => {
                         let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
                             repository;
-                        let first_refresh_activator =
-                            Arc::new(FrontendMvFirstRefreshWriteActivatorPort::new());
+                        let provider_activation =
+                            Arc::new(FrontendMvRefreshProviderActivationPort::new());
                         let service = Arc::new(FrontendMvService::with_refresh_dependencies(
                             Arc::clone(&repository),
                             host.query_execution_service(),
                             host.connector_control_registry(),
-                            Arc::clone(&first_refresh_activator),
+                            Arc::clone(&provider_activation),
                             host.execution_role,
                             host.backend_topology_port(),
                             execution.mv_scheduler.clone(),
@@ -312,7 +312,7 @@ impl FrontendApplicationHost {
                         host.mv_application_service = Some(application_service);
                         host.mv_service = Some(service);
                         host.mv_repository = Some(repository);
-                        host.mv_first_refresh_activator = Some(first_refresh_activator);
+                        host.mv_refresh_provider_activation = Some(provider_activation);
                     }
                     Err(error) => {
                         return Err(host
@@ -428,12 +428,11 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn mv_first_refresh_write_activator_sink(
+    pub fn mv_refresh_provider_activation_sink(
         &self,
-    ) -> Option<Arc<dyn novarocks::mv::application::MvFirstRefreshWriteActivatorSink>> {
-        self.mv_first_refresh_activator.as_ref().map(|port| {
-            Arc::clone(port)
-                as Arc<dyn novarocks::mv::application::MvFirstRefreshWriteActivatorSink>
+    ) -> Option<Arc<dyn novarocks::mv::application::MvRefreshProviderActivationSink>> {
+        self.mv_refresh_provider_activation.as_ref().map(|port| {
+            Arc::clone(port) as Arc<dyn novarocks::mv::application::MvRefreshProviderActivationSink>
         })
     }
 
@@ -670,7 +669,7 @@ impl FrontendApplicationHost {
         self.view_service.take();
         self.mv_application_service.take();
         self.mv_service.take();
-        self.mv_first_refresh_activator.take();
+        self.mv_refresh_provider_activation.take();
         self.mv_background_engine_sink.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
