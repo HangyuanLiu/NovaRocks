@@ -25,6 +25,7 @@ use novarocks::connector::iceberg::provider::IcebergConnectorInstaller;
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
@@ -36,18 +37,11 @@ pub fn compose_backend_execution_installers(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>>> {
-    let object_store = config.connector.object_store_config().map_err(|error| {
-        anyhow::anyhow!("resolve connector startup object-store binding: {error}")
-    })?;
-    let resources = FsAccessResources::new(
-        object_store,
-        FsAccessResolver::new(),
-        std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
-    );
-    let binding = IcebergReadBinding::from_resources(resources);
+    let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
     let iceberg_installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
-        vec![std::sync::Arc::new(IcebergConnectorInstaller::new(binding))];
+        vec![std::sync::Arc::new(IcebergConnectorInstaller::new(
+            iceberg_resources.into_binding(),
+        ))];
     let expected = novarocks_spi::connector::ConnectorProviderId::parse(
         novarocks_connector_iceberg::PROVIDER_ID,
     )
@@ -67,6 +61,24 @@ pub fn compose_backend_execution_installers(
     }
     installers.extend(iceberg_installers);
     Ok(installers)
+}
+
+pub fn compose_iceberg_execution_resources(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<IcebergExecutionResources> {
+    let object_store = config.connector.object_store_config().map_err(|error| {
+        anyhow::anyhow!("resolve connector startup object-store binding: {error}")
+    })?;
+    let resources = FsAccessResources::new(
+        object_store,
+        FsAccessResolver::new(),
+        std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
+    );
+    Ok(IcebergExecutionResources::new(
+        IcebergReadBinding::from_resources(resources),
+    ))
 }
 
 pub fn state_store_host_config(
