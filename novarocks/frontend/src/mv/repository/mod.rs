@@ -434,9 +434,8 @@ impl StateStoreMvRepository {
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         validate_create_request(&request)?;
         prevalidate_create_operation(operation_id, explicit_id, &request)?;
-        let attachment_observations = self.capture_catalog_attachment_observations(
-            catalog_references_for_create(&request),
-        )?;
+        let attachment_observations =
+            self.capture_catalog_attachment_observations(catalog_references_for_create(&request))?;
         let recovery_request = request.clone();
         let store = Arc::clone(&self.store);
         let metrics = &self.runner_metrics;
@@ -3039,9 +3038,7 @@ fn catalog_references_for_create(request: &CreateMvRepositoryRequest) -> BTreeSe
     catalogs
 }
 
-fn catalog_references_for_dependencies(
-    requests: &[CreateMvDependencyRequest],
-) -> BTreeSet<String> {
+fn catalog_references_for_dependencies(requests: &[CreateMvDependencyRequest]) -> BTreeSet<String> {
     requests
         .iter()
         .filter_map(|request| request.upstream.catalog.as_deref())
@@ -3152,7 +3149,10 @@ pub(crate) async fn ensure_no_catalog_references_transaction(
         ));
     }
     for prefix in dependency_by_upstream_catalog_prefixes(catalog).map_err(invalid_state_store)? {
-        if !range_transaction(transaction, prefix, page_size).await?.is_empty() {
+        if !range_transaction(transaction, prefix, page_size)
+            .await?
+            .is_empty()
+        {
             return Err(conflict_state_store(
                 "catalog has materialized view dependencies",
             ));

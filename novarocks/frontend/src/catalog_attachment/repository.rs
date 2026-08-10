@@ -25,8 +25,8 @@ use novarocks_spi::state_store::{
     CommitResolution, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, VersionToken,
 };
-use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use novarocks_state_store::metrics::StateStoreMetrics;
+use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use uuid::Uuid;
 
 use super::codec::{StoredCatalogAttachment, StoredProperty, decode, encode};
@@ -71,7 +71,10 @@ impl CatalogAttachmentError {
     }
 
     fn new(kind: CatalogAttachmentErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 }
 
@@ -125,12 +128,23 @@ impl CatalogAttachmentRepository {
         let mut attachments = Vec::new();
         loop {
             let page = transaction.range(&request).await.map_err(store)?;
-            attachments.extend(page.records.into_iter().map(decode_record).collect::<Result<Vec<_>, _>>()?);
-            let Some(continuation) = page.continuation else { break; };
+            attachments.extend(
+                page.records
+                    .into_iter()
+                    .map(decode_record)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let Some(continuation) = page.continuation else {
+                break;
+            };
             request.continuation = Some(continuation);
         }
         transaction.abort().await.map_err(store)?;
-        attachments.sort_by(|left, right| left.attachment.instance_id.cmp(&right.attachment.instance_id));
+        attachments.sort_by(|left, right| {
+            left.attachment
+                .instance_id
+                .cmp(&right.attachment.instance_id)
+        });
         Ok(attachments)
     }
 
@@ -159,20 +173,31 @@ impl CatalogAttachmentRepository {
         let key = attachment_key(&attachment.instance_id).map_err(invalid)?;
         let value = Bytes::from(encode(&stored_from(&attachment)).map_err(corruption)?);
         let outcome = run_side_effect_free(
-            self.store.as_ref(), self.metrics.as_ref(), operation_id, "create catalog attachment",
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "create catalog attachment",
             |transaction| {
                 let key = key.clone();
                 let value = value.clone();
                 Box::pin(async move {
-                    transaction.put(key, value.try_into()?, Precondition::Absent).await?;
+                    transaction
+                        .put(key, value.try_into()?, Precondition::Absent)
+                        .await?;
                     Ok(())
                 })
             },
-        ).await;
+        )
+        .await;
         match outcome {
             Ok(_) => self.require_matching(&attachment).await,
-            Err(RunFailure::Operation(error)) if error.kind() == StateStoreErrorKind::PreconditionFailed => {
-                Err(CatalogAttachmentError::new(CatalogAttachmentErrorKind::AlreadyExists, "catalog attachment already exists"))
+            Err(RunFailure::Operation(error))
+                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
+            {
+                Err(CatalogAttachmentError::new(
+                    CatalogAttachmentErrorKind::AlreadyExists,
+                    "catalog attachment already exists",
+                ))
             }
             Err(RunFailure::RetryExhausted(error))
                 if error.kind() == StateStoreErrorKind::PreconditionFailed =>
@@ -182,8 +207,12 @@ impl CatalogAttachmentRepository {
                     "catalog attachment already exists",
                 ))
             }
-            Err(RunFailure::CommitUnknown { transaction_id, error }) => {
-                self.resolve_create_unknown(operation_id, transaction_id, attachment, error).await
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                self.resolve_create_unknown(operation_id, transaction_id, attachment, error)
+                    .await
             }
             Err(error) => Err(run_failure("create catalog attachment", error)),
         }
@@ -196,7 +225,12 @@ impl CatalogAttachmentRepository {
         attachment: CatalogAttachment,
         original: StateStoreError,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
-        match self.store.resolve_commit(&transaction_id).await.map_err(store)? {
+        match self
+            .store
+            .resolve_commit(&transaction_id)
+            .await
+            .map_err(store)?
+        {
             CommitResolution::Committed(_) => self.require_matching(&attachment).await,
             CommitResolution::NotCommitted => {
                 Box::pin(self.create_with_operation(operation_id, attachment)).await
@@ -219,20 +253,31 @@ impl CatalogAttachmentRepository {
         let key = attachment_key(&expected.attachment.instance_id).map_err(invalid)?;
         let version = expected.version.clone();
         let outcome = run_side_effect_free(
-            self.store.as_ref(), self.metrics.as_ref(), operation_id, "drop catalog attachment",
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "drop catalog attachment",
             |transaction| {
                 let key = key.clone();
                 let version = version.clone();
                 Box::pin(async move {
-                    transaction.delete(key, Precondition::Version(version)).await?;
+                    transaction
+                        .delete(key, Precondition::Version(version))
+                        .await?;
                     Ok(())
                 })
             },
-        ).await;
+        )
+        .await;
         match outcome {
             Ok(_) => Ok(()),
-            Err(RunFailure::Operation(error)) if error.kind() == StateStoreErrorKind::PreconditionFailed => {
-                Err(CatalogAttachmentError::new(CatalogAttachmentErrorKind::Conflict, "catalog attachment changed before drop"))
+            Err(RunFailure::Operation(error))
+                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
+            {
+                Err(CatalogAttachmentError::new(
+                    CatalogAttachmentErrorKind::Conflict,
+                    "catalog attachment changed before drop",
+                ))
             }
             Err(RunFailure::RetryExhausted(error))
                 if error.kind() == StateStoreErrorKind::PreconditionFailed =>
@@ -242,18 +287,36 @@ impl CatalogAttachmentRepository {
                     "catalog attachment changed before drop",
                 ))
             }
-            Err(RunFailure::CommitUnknown { transaction_id, error }) => {
-                match self.store.resolve_commit(&transaction_id).await.map_err(store)? {
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                match self
+                    .store
+                    .resolve_commit(&transaction_id)
+                    .await
+                    .map_err(store)?
+                {
                     CommitResolution::Committed(_) => Ok(()),
                     CommitResolution::NotCommitted => {
                         Box::pin(self.drop_with_operation(operation_id, expected)).await
                     }
-                    CommitResolution::Unresolved => match self.get(&expected.attachment.instance_id).await? {
-                        Some(current) if current.attachment.attachment_id == expected.attachment.attachment_id => {
-                            Err(CatalogAttachmentError::new(CatalogAttachmentErrorKind::CommitUnknown, format!("drop catalog attachment commit outcome is unknown: {error}")))
+                    CommitResolution::Unresolved => {
+                        match self.get(&expected.attachment.instance_id).await? {
+                            Some(current)
+                                if current.attachment.attachment_id
+                                    == expected.attachment.attachment_id =>
+                            {
+                                Err(CatalogAttachmentError::new(
+                                    CatalogAttachmentErrorKind::CommitUnknown,
+                                    format!(
+                                        "drop catalog attachment commit outcome is unknown: {error}"
+                                    ),
+                                ))
+                            }
+                            _ => Ok(()),
                         }
-                        _ => Ok(()),
-                    },
+                    }
                 }
             }
             Err(error) => Err(run_failure("drop catalog attachment", error)),
@@ -264,17 +327,22 @@ impl CatalogAttachmentRepository {
         &self,
         expected: &CatalogAttachment,
     ) -> Result<Option<CatalogAttachmentVersioned>, CatalogAttachmentError> {
-        Ok(self.get(&expected.instance_id).await?.filter(|current| current.attachment.attachment_id == expected.attachment_id))
+        Ok(self
+            .get(&expected.instance_id)
+            .await?
+            .filter(|current| current.attachment.attachment_id == expected.attachment_id))
     }
 
     async fn require_matching(
         &self,
         expected: &CatalogAttachment,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
-        self.matching(expected).await?.ok_or_else(|| CatalogAttachmentError::new(
-            CatalogAttachmentErrorKind::CommitUnknown,
-            "catalog attachment commit resolved but authoritative record does not match",
-        ))
+        self.matching(expected).await?.ok_or_else(|| {
+            CatalogAttachmentError::new(
+                CatalogAttachmentErrorKind::CommitUnknown,
+                "catalog attachment commit resolved but authoritative record does not match",
+            )
+        })
     }
 }
 
@@ -321,14 +389,21 @@ pub(crate) async fn assert_attachment_versions(
     Ok(())
 }
 
-fn decode_record(record: StateRecord) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
+fn decode_record(
+    record: StateRecord,
+) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
     let stored = decode(record.value.as_bytes()).map_err(corruption)?;
     let attachment = attachment_from(stored)?;
     let expected_key = attachment_key(&attachment.instance_id).map_err(corruption)?;
     if record.key != expected_key {
-        return Err(corruption("catalog attachment key does not match record identity"));
+        return Err(corruption(
+            "catalog attachment key does not match record identity",
+        ));
     }
-    Ok(CatalogAttachmentVersioned { attachment, version: record.version })
+    Ok(CatalogAttachmentVersioned {
+        attachment,
+        version: record.version,
+    })
 }
 
 fn stored_from(attachment: &CatalogAttachment) -> StoredCatalogAttachment {
@@ -337,22 +412,39 @@ fn stored_from(attachment: &CatalogAttachment) -> StoredCatalogAttachment {
         instance_id: attachment.instance_id.as_str().to_string(),
         provider_id: attachment.provider_id.as_str().to_string(),
         display_name: attachment.display_name.clone(),
-        durable_properties: attachment.durable_properties.iter().map(|(key, value)| StoredProperty { key: key.clone(), value: value.clone() }).collect(),
+        durable_properties: attachment
+            .durable_properties
+            .iter()
+            .map(|(key, value)| StoredProperty {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect(),
         created_at_ms: attachment.created_at_ms,
     }
 }
 
-fn attachment_from(stored: StoredCatalogAttachment) -> Result<CatalogAttachment, CatalogAttachmentError> {
+fn attachment_from(
+    stored: StoredCatalogAttachment,
+) -> Result<CatalogAttachment, CatalogAttachmentError> {
     let attachment = CatalogAttachment {
         attachment_id: Uuid::parse_str(&stored.attachment_id)
             .map_err(|error| corruption(format!("invalid catalog attachment UUID: {error}")))?,
-        instance_id: ConnectorInstanceId::parse(&stored.instance_id).map_err(|error| corruption(error.to_string()))?,
-        provider_id: ConnectorProviderId::parse(&stored.provider_id).map_err(|error| corruption(error.to_string()))?,
+        instance_id: ConnectorInstanceId::parse(&stored.instance_id)
+            .map_err(|error| corruption(error.to_string()))?,
+        provider_id: ConnectorProviderId::parse(&stored.provider_id)
+            .map_err(|error| corruption(error.to_string()))?,
         display_name: stored.display_name,
-        durable_properties: stored.durable_properties.into_iter().map(|property| (property.key, property.value)).collect(),
+        durable_properties: stored
+            .durable_properties
+            .into_iter()
+            .map(|property| (property.key, property.value))
+            .collect(),
         created_at_ms: stored.created_at_ms,
     };
-    validate_attachment(&attachment).map_err(|error| CatalogAttachmentError::new(CatalogAttachmentErrorKind::Corruption, error.message))?;
+    validate_attachment(&attachment).map_err(|error| {
+        CatalogAttachmentError::new(CatalogAttachmentErrorKind::Corruption, error.message)
+    })?;
     Ok(attachment)
 }
 
@@ -367,14 +459,32 @@ fn validate_attachment(attachment: &CatalogAttachment) -> Result<(), CatalogAtta
             return Err(invalid("catalog attachment property key must not be empty"));
         }
         if !keys.insert(key.as_str()) {
-            return Err(invalid(format!("duplicate catalog attachment property: {key}")));
+            return Err(invalid(format!(
+                "duplicate catalog attachment property: {key}"
+            )));
         }
         if previous.is_some_and(|last: &str| last >= key.as_str()) {
-            return Err(invalid("catalog attachment properties must be sorted by key"));
+            return Err(invalid(
+                "catalog attachment properties must be sorted by key",
+            ));
         }
         let normalized = key.to_ascii_lowercase();
-        if ["password", "secret", "token", "credential", "access-key", "access_key", "private-key", "private_key"].iter().any(|marker| normalized.contains(marker)) {
-            return Err(invalid(format!("credential-like catalog attachment property cannot be durable: {key}")));
+        if [
+            "password",
+            "secret",
+            "token",
+            "credential",
+            "access-key",
+            "access_key",
+            "private-key",
+            "private_key",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        {
+            return Err(invalid(format!(
+                "credential-like catalog attachment property cannot be durable: {key}"
+            )));
         }
         previous = Some(key);
     }
@@ -395,9 +505,16 @@ fn store(error: StateStoreError) -> CatalogAttachmentError {
 
 fn run_failure(context: &str, failure: RunFailure) -> CatalogAttachmentError {
     let (kind, message) = match failure {
-        RunFailure::Operation(error) if error.kind() == StateStoreErrorKind::PreconditionFailed => (CatalogAttachmentErrorKind::Conflict, error.to_string()),
-        RunFailure::CommitUnknown { error, .. } => (CatalogAttachmentErrorKind::CommitUnknown, error.to_string()),
-        error => (CatalogAttachmentErrorKind::Unavailable, format!("{error:?}")),
+        RunFailure::Operation(error) if error.kind() == StateStoreErrorKind::PreconditionFailed => {
+            (CatalogAttachmentErrorKind::Conflict, error.to_string())
+        }
+        RunFailure::CommitUnknown { error, .. } => {
+            (CatalogAttachmentErrorKind::CommitUnknown, error.to_string())
+        }
+        error => (
+            CatalogAttachmentErrorKind::Unavailable,
+            format!("{error:?}"),
+        ),
     };
     CatalogAttachmentError::new(kind, format!("{context}: {message}"))
 }
@@ -437,16 +554,20 @@ mod tests {
                 .kind(),
             CatalogAttachmentErrorKind::InvalidRequest
         );
-        assert!(validate_attachment(&attachment(vec![
-            ("z".into(), "1".into()),
-            ("a".into(), "2".into()),
-        ])).is_err());
+        assert!(
+            validate_attachment(&attachment(vec![
+                ("z".into(), "1".into()),
+                ("a".into(), "2".into()),
+            ]))
+            .is_err()
+        );
     }
 
     #[tokio::test]
     async fn sqlite_create_is_absent_cas_and_drop_requires_the_frozen_version() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
-        let registry = builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let registry =
+            builtin_state_store_provider_registry().expect("builtin StateStore registry");
         let mut host = StateStoreHost::open(
             &registry,
             StateStoreHostConfig {
@@ -477,7 +598,8 @@ mod tests {
             .await
             .expect("open catalog attachment repository");
 
-        let first = repository.create(attachment(vec![("type".into(), "iceberg".into())]))
+        let first = repository
+            .create(attachment(vec![("type".into(), "iceberg".into())]))
             .await
             .expect("first create");
         assert_eq!(
@@ -488,12 +610,18 @@ mod tests {
                 .kind(),
             CatalogAttachmentErrorKind::AlreadyExists
         );
-        repository.drop_exact(first.clone()).await.expect("exact drop");
+        repository
+            .drop_exact(first.clone())
+            .await
+            .expect("exact drop");
         let replacement = repository
             .create(attachment(vec![("type".into(), "iceberg".into())]))
             .await
             .expect("recreate after drop");
-        assert_ne!(first.attachment.attachment_id, replacement.attachment.attachment_id);
+        assert_ne!(
+            first.attachment.attachment_id,
+            replacement.attachment.attachment_id
+        );
         assert_eq!(
             repository
                 .drop_exact(first)

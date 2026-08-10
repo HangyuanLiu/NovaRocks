@@ -25,8 +25,8 @@ mod key;
 mod repository;
 
 pub use key::{attachment_key, attachment_prefix};
+pub(crate) use repository::assert_attachment_versions;
 pub use repository::{
     CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
     CatalogAttachmentRepository, CatalogAttachmentVersioned,
 };
-pub(crate) use repository::assert_attachment_versions;

@@ -28,7 +28,8 @@ pub fn attachment_prefix() -> Result<Key, String> {
 
 pub fn attachment_key(instance_id: &ConnectorInstanceId) -> Result<Key, String> {
     let key = format!("{ATTACHMENT_PREFIX}{}", hex::encode(instance_id.as_str()));
-    Key::try_from(Bytes::from(key)).map_err(|error| format!("build catalog attachment key: {error}"))
+    Key::try_from(Bytes::from(key))
+        .map_err(|error| format!("build catalog attachment key: {error}"))
 }
 
 #[cfg(test)]

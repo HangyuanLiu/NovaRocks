@@ -101,6 +101,9 @@ mod tests {
             }],
             created_at_ms: 42,
         };
-        assert_eq!(decode(&encode(&value).expect("encode")).expect("decode"), value);
+        assert_eq!(
+            decode(&encode(&value).expect("encode")).expect("decode"),
+            value
+        );
     }
 }
