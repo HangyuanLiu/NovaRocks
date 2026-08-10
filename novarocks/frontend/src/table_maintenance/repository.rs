@@ -5597,9 +5597,31 @@ impl CleanupOperationRepository {
             "create frontend connector cleanup operation",
             move |transaction, transaction_id| {
                 let request = request.clone();
-                Box::pin(
-                    async move { apply_cleanup_create(transaction, transaction_id, request).await },
-                )
+                Box::pin(async move {
+                    apply_cleanup_create(transaction, transaction_id, request, None).await
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn create_admitted(
+        &self,
+        request: CleanupOperationCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_create(&request)?;
+        self.cleanup_mutation(
+            request.operation_id,
+            StoredCleanupTransactionActionV4::Create,
+            "admitted create frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_cleanup_create(transaction, transaction_id, request, Some(&admission))
+                        .await
+                })
             },
         )
         .await
@@ -6104,9 +6126,17 @@ async fn apply_cleanup_create(
     transaction: &mut dyn WriteTransaction,
     transaction_id: OperationId,
     request: CleanupOperationCreate,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<CleanupOperation> {
     if let Err(error) = validate_cleanup_create(&request) {
         return Ok(Err(error));
+    }
+    if let Some(admission) = admission {
+        if let Err(error) = admission.validate_in(transaction).await {
+            return Ok(Err(RepositoryError::authority_lost(format!(
+                "maintenance write admission lost: {error}"
+            ))));
+        }
     }
     if let Some(existing) = load_cleanup_operation(transaction, request.operation_id).await?? {
         if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
