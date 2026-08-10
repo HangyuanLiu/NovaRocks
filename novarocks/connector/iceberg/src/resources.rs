@@ -143,4 +143,10 @@ mod tests {
         );
         assert_eq!(control.catalog_runtime().block_on(async { 7_u8 }), Ok(7));
     }
+
+    #[tokio::test]
+    async fn catalog_runtime_bridges_from_a_runtime_worker_without_context_probe() {
+        let runtime = IcebergCatalogRuntime::new(tokio::runtime::Handle::current());
+        assert_eq!(runtime.block_on(async { 11_u8 }), Ok(11));
+    }
 }
