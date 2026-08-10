@@ -62,8 +62,8 @@ pub(crate) use routing::{
     BackendRoutingShard,
 };
 pub(crate) use session::{
-    BackendRuntimeFilterSession, BackendRuntimeFilterSessionError,
-    BackendRuntimeFilterSessionSubmission,
+    BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendRuntimeFilterSession,
+    BackendRuntimeFilterSessionError, BackendRuntimeFilterSessionSubmission,
 };
 pub(crate) use snapshot::{
     BackendLogicalSnapshot, BackendLogicalSnapshotError, BackendReducedLogicalDomain,

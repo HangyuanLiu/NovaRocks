@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter::{
     LiveTerminal, PartitionId, ProducerSequence, RuntimeFilterBindOutcome, RuntimeFilterBindingId,
     RuntimeFilterConsumerContract, RuntimeFilterContractViolation,
@@ -45,6 +46,67 @@ use super::{
     BackendReductionState, BackendReductionStateError, BackendRouteEdgeId,
     BackendRuntimeFilterEventObserver, BackendSubscriptionError, BackendSubscriptionGroup,
 };
+
+/// A Backend-owned encoded delivery ready for the participant's route authority.
+/// Session materializes exactly one consumer profile; the participant chooses
+/// the physical loopback or remote leg for the sealed route set.
+#[derive(Clone, Debug)]
+pub(crate) struct BackendMaterializedDelivery {
+    channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+    route_edge_ids: Arc<[BackendRouteEdgeId]>,
+    kind: super::BackendEnvelopeKind,
+    schema_digest: [u8; 32],
+    payload: Arc<[u8]>,
+}
+
+impl BackendMaterializedDelivery {
+    pub(crate) fn new(
+        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+        route_edge_ids: impl Into<Arc<[BackendRouteEdgeId]>>,
+        kind: super::BackendEnvelopeKind,
+        schema_digest: [u8; 32],
+        payload: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            channel_id,
+            route_edge_ids: route_edge_ids.into(),
+            kind,
+            schema_digest,
+            payload: payload.into(),
+        }
+    }
+
+    pub(crate) const fn channel_id(
+        &self,
+    ) -> novarocks_execution::runtime_filter::RuntimeFilterChannelId {
+        self.channel_id
+    }
+
+    pub(crate) const fn route_edge_ids(&self) -> &Arc<[BackendRouteEdgeId]> {
+        &self.route_edge_ids
+    }
+
+    pub(crate) const fn kind(&self) -> super::BackendEnvelopeKind {
+        self.kind
+    }
+
+    pub(crate) const fn schema_digest(&self) -> [u8; 32] {
+        self.schema_digest
+    }
+
+    pub(crate) const fn payload(&self) -> &Arc<[u8]> {
+        &self.payload
+    }
+}
+
+/// Participant-private physical fanout. It deliberately receives only an
+/// encoded artifact frame and cannot observe reducer or evaluator state.
+pub(crate) trait BackendMaterializedDeliverySink: Send + Sync {
+    fn dispatch(
+        &self,
+        delivery: BackendMaterializedDelivery,
+    ) -> Result<(), RuntimeFilterContractViolation>;
+}
 
 #[derive(Debug)]
 pub(crate) enum BackendRuntimeFilterSessionError {
@@ -140,6 +202,7 @@ pub(crate) struct BackendRuntimeFilterSession {
     reduction: Option<Mutex<BackendReductionState>>,
     availability: Option<Mutex<BackendCoverageState>>,
     terminal: Option<Mutex<BackendCoverageState>>,
+    materialized_delivery_sink: Mutex<Option<Arc<dyn BackendMaterializedDeliverySink>>>,
 }
 
 impl BackendRuntimeFilterSession {
@@ -218,7 +281,18 @@ impl BackendRuntimeFilterSession {
             reduction,
             availability,
             terminal,
+            materialized_delivery_sink: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_materialized_delivery_sink(
+        &self,
+        sink: Arc<dyn BackendMaterializedDeliverySink>,
+    ) {
+        *self
+            .materialized_delivery_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sink);
     }
 
     pub(crate) const fn policy(&self) -> &BackendInstallPolicy {
@@ -602,6 +676,7 @@ impl BackendRuntimeFilterSession {
                     .map_err(subscription_violation)?;
             }
         }
+        self.dispatch_outbound_snapshot(snapshot, terminal)?;
         Ok(())
     }
 
@@ -616,6 +691,168 @@ impl BackendRuntimeFilterSession {
                     .publish_terminal(*route, terminal)
                     .map_err(subscription_violation)?;
             }
+        }
+        self.dispatch_outbound_terminal(terminal)?;
+        Ok(())
+    }
+
+    fn dispatch_outbound_snapshot(
+        &self,
+        snapshot: &BackendReducedLogicalSnapshot,
+        terminal: Option<LiveTerminal>,
+    ) -> Result<(), RuntimeFilterContractViolation> {
+        let Some(sink) = self
+            .materialized_delivery_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        else {
+            return Ok(());
+        };
+        for group in self.channel.outbound_materialization_groups().values() {
+            let frame = match (snapshot.domain(), self.channel.execution_contract()) {
+                (
+                    BackendReducedLogicalDomain::Membership(domain),
+                    RuntimeFilterExecutionContract::Membership(schema),
+                ) => match crate::runtime_filter::materializer::materialize_membership(
+                    snapshot.channel_id().get(),
+                    domain,
+                    schema,
+                    snapshot.logical_version(),
+                    group.profile(),
+                    crate::runtime_filter::materializer::MaterializationAdmission::new(
+                        self.channel.max_artifact_bytes(),
+                    ),
+                ) {
+                    crate::runtime_filter::materializer::MaterializationOutcome::Published(bundle) => {
+                        crate::runtime_filter::codec::artifact::encode_artifact_bundle(
+                            &bundle,
+                            crate::runtime_filter::codec::artifact::ArtifactDecodeExpectation {
+                                profile: group.profile(),
+                                schema,
+                                order_contract: None,
+                            },
+                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                                self.channel.max_artifact_bytes(),
+                            )
+                            .map_err(|error| materialization_violation(error.to_string()))?,
+                        )
+                        .map_err(|error| materialization_violation(error.to_string()))?
+                    }
+                    crate::runtime_filter::materializer::MaterializationOutcome::Unsupported(_) => {
+                        crate::runtime_filter::codec::artifact::encode_unavailable(
+                            UnavailableReason::MaterializationFailed,
+                            group.profile(),
+                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                                self.channel.max_artifact_bytes(),
+                            )
+                            .map_err(|error| materialization_violation(error.to_string()))?,
+                        )
+                        .map_err(|error| materialization_violation(error.to_string()))?
+                    }
+                    crate::runtime_filter::materializer::MaterializationOutcome::Unavailable(_) => {
+                        crate::runtime_filter::codec::artifact::encode_unavailable(
+                            UnavailableReason::MaterializationFailed,
+                            group.profile(),
+                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                                self.channel.max_artifact_bytes(),
+                            )
+                            .map_err(|error| materialization_violation(error.to_string()))?,
+                        )
+                        .map_err(|error| materialization_violation(error.to_string()))?
+                    }
+                },
+                (
+                    BackendReducedLogicalDomain::OrderedBound(bound),
+                    RuntimeFilterExecutionContract::Ordered(order),
+                ) => match crate::runtime_filter::materializer::range::materialize_range(
+                    snapshot.channel_id().get(),
+                    order,
+                    bound,
+                    snapshot.logical_version(),
+                    group.profile(),
+                    &crate::runtime_filter::materializer::MaterializationAdmission::new(
+                        self.channel.max_artifact_bytes(),
+                    ),
+                ) {
+                    Ok(bundle) => {
+                        let placeholder = placeholder_membership_schema()?;
+                        crate::runtime_filter::codec::artifact::encode_artifact_bundle(
+                            &bundle,
+                            crate::runtime_filter::codec::artifact::ArtifactDecodeExpectation {
+                                profile: group.profile(),
+                                schema: &placeholder,
+                                order_contract: Some(order),
+                            },
+                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                                self.channel.max_artifact_bytes(),
+                            )
+                            .map_err(|error| materialization_violation(error.to_string()))?,
+                        )
+                        .map_err(|error| materialization_violation(error.to_string()))?
+                    }
+                    Err(_) => crate::runtime_filter::codec::artifact::encode_unavailable(
+                        UnavailableReason::MaterializationFailed,
+                        group.profile(),
+                        crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                            self.channel.max_artifact_bytes(),
+                        )
+                        .map_err(|error| materialization_violation(error.to_string()))?,
+                    )
+                    .map_err(|error| materialization_violation(error.to_string()))?,
+                },
+                _ => crate::runtime_filter::codec::artifact::encode_unavailable(
+                    UnavailableReason::MaterializationFailed,
+                    group.profile(),
+                    crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                        self.channel.max_artifact_bytes(),
+                    )
+                    .map_err(|error| materialization_violation(error.to_string()))?,
+                )
+                .map_err(|error| materialization_violation(error.to_string()))?,
+            };
+            let is_artifact_bundle = frame.payload().get(6) == Some(&1);
+            let kind = if is_artifact_bundle && terminal == Some(LiveTerminal::Completed) {
+                super::BackendEnvelopeKind::FinalArtifact
+            } else if is_artifact_bundle {
+                super::BackendEnvelopeKind::Artifact
+            } else {
+                super::BackendEnvelopeKind::Unavailable
+            };
+            sink.dispatch(BackendMaterializedDelivery::new(
+                snapshot.channel_id(),
+                group.route_edge_ids().iter().copied().collect::<Vec<_>>(),
+                kind,
+                *frame.profile_digest(),
+                Arc::<[u8]>::from(frame.payload()),
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_outbound_terminal(
+        &self,
+        terminal: LiveTerminal,
+    ) -> Result<(), RuntimeFilterContractViolation> {
+        if terminal != LiveTerminal::CompletedWithoutArtifact {
+            return Ok(());
+        }
+        let Some(sink) = self
+            .materialized_delivery_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        else {
+            return Ok(());
+        };
+        for group in self.channel.outbound_materialization_groups().values() {
+            sink.dispatch(BackendMaterializedDelivery::new(
+                self.channel.channel_id(),
+                group.route_edge_ids().iter().copied().collect::<Vec<_>>(),
+                super::BackendEnvelopeKind::CompletedWithoutArtifact,
+                group.profile().id().bytes(),
+                Arc::<[u8]>::from([]),
+            ))?;
         }
         Ok(())
     }
@@ -882,6 +1119,27 @@ fn subscription_violation(error: BackendSubscriptionError) -> RuntimeFilterContr
         RuntimeFilterContractViolationKind::UnauthorizedBinding,
         format!("Backend subscription publication was not installed: {error:?}"),
     )
+}
+
+fn materialization_violation(detail: impl Into<Arc<str>>) -> RuntimeFilterContractViolation {
+    contract_violation(
+        RuntimeFilterContractViolationKind::ContractMismatch,
+        format!(
+            "Backend materialization could not encode an outbound artifact: {}",
+            detail.into()
+        ),
+    )
+}
+
+fn placeholder_membership_schema() -> Result<
+    novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema,
+    RuntimeFilterContractViolation,
+> {
+    novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
+        &DataType::Int8,
+        novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches,
+    )
+    .map_err(|error| materialization_violation(error.to_string()))
 }
 
 fn contract_violation(
