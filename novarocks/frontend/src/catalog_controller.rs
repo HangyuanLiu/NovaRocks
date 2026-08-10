@@ -60,6 +60,7 @@ pub struct FrontendCatalogController {
     projection: Arc<FrontendCatalogApplicationPort>,
     config: CatalogProjectionConfig,
     stopping: AtomicBool,
+    bootstrap_state: Mutex<Option<(StoreIdentity, ChangeCursor)>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -88,6 +89,7 @@ impl FrontendCatalogController {
             projection,
             config,
             stopping: AtomicBool::new(false),
+            bootstrap_state: Mutex::new(None),
             worker: Mutex::new(None),
         }))
     }
@@ -116,6 +118,11 @@ impl FrontendCatalogController {
         cursor
             .decode(identity.store_id)
             .map_err(|error| error.to_string())?;
+        *self
+            .bootstrap_state
+            .lock()
+            .map_err(|_| "catalog controller bootstrap state lock is poisoned".to_string())? =
+            Some((identity, cursor.clone()));
         Ok(cursor)
     }
 
@@ -156,11 +163,19 @@ impl FrontendCatalogController {
     }
 
     async fn run(&self) {
-        let mut identity = None;
-        let mut cursor = None;
+        let bootstrap = match self.bootstrap_state.lock() {
+            Ok(mut state) => state.take(),
+            Err(_) => {
+                tracing::warn!("catalog controller bootstrap state lock is poisoned");
+                None
+            }
+        };
+        let (mut identity, mut cursor) = bootstrap.map_or((None, None), |(identity, cursor)| {
+            (Some(identity), Some(cursor))
+        });
         let mut last_fresh = Instant::now();
         let mut retry = self.config.retry_initial;
-        let mut force_resync = true;
+        let mut force_resync = identity.is_none();
 
         while !self.stopping.load(Ordering::Acquire) {
             let outcome = self
@@ -494,6 +509,17 @@ mod tests {
                 .0,
             high_watermark
         );
+        let (bootstrap_identity, bootstrap_cursor) = first
+            .bootstrap_state
+            .lock()
+            .expect("bootstrap state")
+            .clone()
+            .expect("bootstrap HWM retained for the worker");
+        assert_eq!(
+            bootstrap_identity,
+            store.identity().await.expect("store identity")
+        );
+        assert_eq!(bootstrap_cursor, first_cursor);
         assert!(matches!(
             first_port.admit_catalog(&created.attachment.instance_id),
             CatalogAdmission::Ready(_)
