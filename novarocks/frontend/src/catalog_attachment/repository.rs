@@ -32,6 +32,8 @@ use uuid::Uuid;
 use super::codec::{StoredCatalogAttachment, StoredProperty, decode, encode};
 use super::key::{attachment_key, attachment_prefix};
 
+const DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE: usize = 256;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogAttachment {
     pub attachment_id: Uuid,
@@ -116,13 +118,27 @@ impl CatalogAttachmentRepository {
     }
 
     pub async fn list(&self) -> Result<Vec<CatalogAttachmentVersioned>, CatalogAttachmentError> {
+        self.list_with_page_size(DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE)
+            .await
+    }
+
+    pub async fn list_with_page_size(
+        &self,
+        page_size: usize,
+    ) -> Result<Vec<CatalogAttachmentVersioned>, CatalogAttachmentError> {
+        if page_size == 0 || page_size > self.store.limits().max_page_size {
+            return Err(CatalogAttachmentError::new(
+                CatalogAttachmentErrorKind::InvalidRequest,
+                "catalog attachment scan page size is outside StateStore limits",
+            ));
+        }
         let prefix = attachment_prefix().map_err(invalid)?;
         let range = KeyRange::for_prefix(prefix).map_err(store)?;
         let mut transaction = self.store.begin_read().await.map_err(store)?;
         let mut request = RangeRequest {
             range,
             direction: Direction::Forward,
-            page_size: self.store.limits().max_page_size,
+            page_size,
             continuation: None,
         };
         let mut attachments = Vec::new();

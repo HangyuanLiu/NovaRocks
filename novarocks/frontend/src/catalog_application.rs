@@ -169,6 +169,117 @@ impl FrontendCatalogApplicationPort {
             generation,
         })
     }
+
+    /// Rebuild this process's control projection from the authoritative
+    /// attachment scan. A change hint never carries attachment state; callers
+    /// always invoke this method after rereading StateStore.
+    pub(crate) async fn reconcile(&self) -> Result<(), CatalogApplicationError> {
+        self.reconcile_with_page_size(256).await
+    }
+
+    pub(crate) async fn reconcile_with_page_size(
+        &self,
+        page_size: usize,
+    ) -> Result<(), CatalogApplicationError> {
+        let repository = self.repository()?;
+        let attachments = repository
+            .list_with_page_size(page_size)
+            .await
+            .map_err(repository_error)?;
+        let desired = attachments
+            .iter()
+            .map(|versioned| {
+                (
+                    versioned.attachment.instance_id.clone(),
+                    versioned.attachment.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let stale = self
+            .projections
+            .lock()
+            .map_err(|_| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Internal,
+                    "catalog projection lock is poisoned",
+                )
+            })?
+            .keys()
+            .filter(|instance_id| !desired.contains_key(*instance_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for instance_id in stale {
+            self.retire_projection(&instance_id);
+        }
+
+        for attachment in desired.values() {
+            let installed = self
+                .projections
+                .lock()
+                .map_err(|_| {
+                    CatalogApplicationError::new(
+                        CatalogApplicationErrorKind::Internal,
+                        "catalog projection lock is poisoned",
+                    )
+                })?
+                .get(&attachment.instance_id)
+                .is_some_and(|projection| projection.attachment_id == attachment.attachment_id)
+                && self
+                    .control
+                    .observe_current_binding(&attachment.instance_id)
+                    .is_ok();
+            if installed {
+                continue;
+            }
+
+            self.retire_projection(&attachment.instance_id);
+            let installed = (|| {
+                let request = ConnectorControlFactoryRequest::try_new(
+                    attachment.provider_id.clone(),
+                    attachment.instance_id.clone(),
+                    attachment.durable_properties.clone(),
+                )
+                .map_err(connector_error)?;
+                let creation = self
+                    .control
+                    .create_control(request)
+                    .map_err(connector_error)?;
+                let (binding, _) = creation.into_parts();
+                self.install_created(attachment, binding).map(|_| ())
+            })();
+            if let Err(error) = installed {
+                // A single provider failure must not make durable truth
+                // disappear or prevent unrelated catalog projections. Its
+                // admission remains Unavailable until a later resync works.
+                tracing::warn!(%error, catalog = attachment.instance_id.as_str(), "catalog attachment remains unavailable after projection attempt");
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops all local admission before retiring existing leases. Durable
+    /// attachments remain unchanged, so a later authoritative reconcile can
+    /// construct fresh generations after a freshness outage.
+    pub(crate) fn unpublish_all(&self) {
+        let instances = self
+            .projections
+            .lock()
+            .map(|projections| projections.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for instance_id in instances {
+            self.retire_projection(&instance_id);
+        }
+    }
+
+    fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
+        if let Ok(mut projections) = self.projections.lock() {
+            projections.remove(instance_id);
+        }
+        if let Err(error) = self.control.retire_current(instance_id) {
+            tracing::debug!(%error, catalog = instance_id.as_str(), "catalog runtime was not locally active during retirement");
+        }
+    }
 }
 
 impl CatalogApplicationPort for FrontendCatalogApplicationPort {
@@ -230,14 +341,9 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
             };
         };
         self.block_on(repository.drop_exact(existing))?;
-        if let Ok(mut projections) = self.projections.lock() {
-            projections.remove(&command.instance_id);
-        }
+        self.retire_projection(&command.instance_id);
         // Durable deletion is authoritative. A local generation can be absent
         // or already retiring; either case converges through reconciliation.
-        if let Err(error) = self.control.retire_current(&command.instance_id) {
-            tracing::debug!(%error, catalog = command.instance_id.as_str(), "catalog runtime was not locally active during drop");
-        }
         Ok(())
     }
 
