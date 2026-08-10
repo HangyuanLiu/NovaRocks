@@ -22,9 +22,9 @@ use novarocks_connector_iceberg::iceberg::spec::{Struct, TableMetadata};
 use parquet::basic::Compression;
 
 use crate::connector::iceberg::commit::EqualityDeleteColumn;
-use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorBinding;
 use crate::fs::object_store_credentials::ObjectStoreCredentials;
 use novarocks_connector_iceberg::delete_file::IcebergFileFormat;
+use novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorBinding;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_fs::ObjectStoreConfig;
 

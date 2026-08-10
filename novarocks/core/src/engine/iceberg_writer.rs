@@ -2110,7 +2110,7 @@ mod tests {
     }
 
     fn assert_position_delete_output_field(
-        field: &crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField,
+        field: &novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteOutputField,
         output_expr_index: i32,
         name: &str,
         data_type: &DataType,
@@ -2123,9 +2123,9 @@ mod tests {
     }
 
     fn assert_position_delete_descriptor_contract(
-        desc: &crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
+        desc: &novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
     ) {
-        use crate::connector::iceberg::position_delete_descriptor::{
+        use novarocks_connector_iceberg::position_delete_descriptor::{
             ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
             ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         };

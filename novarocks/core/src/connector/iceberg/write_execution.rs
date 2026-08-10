@@ -41,7 +41,6 @@ use super::data_writer::{
     StagedDataFile, StagedWriteContext, StagedWriteOptions, cleanup_staged_files,
     staged_data_file_to_writer_report, write_record_batches,
 };
-use super::position_delete_descriptor::canonical_output_schema;
 use super::provider::IcebergReadBinding;
 use super::report::{
     IcebergPartitionReport, IcebergWriterReport, partition_path_from_struct,
@@ -58,6 +57,7 @@ use super::write_contract::{
 };
 use crate::runtime::global_async_runtime::data_block_on;
 use novarocks_connector_iceberg::delete_file::IcebergFileContent;
+use novarocks_connector_iceberg::position_delete_descriptor::canonical_output_schema;
 
 /// BE execution capability rooted only in process-startup storage bindings.
 #[derive(Clone)]
@@ -1103,7 +1103,7 @@ mod tests {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::position_delete_storage_batch;
-    use crate::connector::iceberg::position_delete_descriptor::{
+    use novarocks_connector_iceberg::position_delete_descriptor::{
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
     };
 

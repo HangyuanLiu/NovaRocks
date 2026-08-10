@@ -70,7 +70,7 @@ pub(crate) struct IcebergWriteSinkSpec {
     pub(crate) file_format: String,
     pub(crate) compression: IcebergWriteFileCompression,
     pub(crate) position_delete_output_descriptor: Option<
-        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
+        novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
     >,
 }
 

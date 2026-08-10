@@ -8258,11 +8258,11 @@ fn position_delete_columns_and_descriptor(
 ) -> Result<
     (
         Vec<novarocks_catalog::schema::ColumnDef>,
-        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
+        novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
     ),
     ConnectorError,
 > {
-    use crate::connector::iceberg::position_delete_descriptor::{
+    use novarocks_connector_iceberg::position_delete_descriptor::{
         ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         PositionDeleteOutputField, PositionDeletePartitionSourceField,
@@ -8335,7 +8335,7 @@ fn position_delete_columns_and_descriptor(
     }
     Ok((
         target_columns,
-        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
+        novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
             file_path: PositionDeleteOutputField {
                 output_expr_index: 0,
                 name: ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
