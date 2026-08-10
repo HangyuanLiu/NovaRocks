@@ -569,7 +569,7 @@ mod tests {
         let file_io =
             crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
         let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
-            crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
                 warehouse_uri.clone(),
             ),
@@ -941,7 +941,7 @@ mod tests {
         let file_io =
             crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
         let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
-            crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
                 warehouse_uri,
             ),

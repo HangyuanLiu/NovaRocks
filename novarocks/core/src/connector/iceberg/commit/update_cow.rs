@@ -47,8 +47,8 @@ use super::helpers::{
 };
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
 use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
-use crate::connector::iceberg::stats_assembler::CommitType;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 // `Eq` is intentionally omitted: `appended_files: Vec<WrittenFile>` and
 // `WrittenFile` is `PartialEq`-only (it carries stats fields not suited to `Eq`).

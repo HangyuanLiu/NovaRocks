@@ -1649,10 +1649,10 @@ fn build_hms_catalog_entry(
 /// convention (`v{N}.metadata.json` + `version-hint.text`).
 pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
-) -> Result<crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog, String> {
+) -> Result<novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog, String> {
     let file_io = fs_io::build_file_io_for_location(&entry.warehouse_uri, entry.s3_config.as_ref());
     Ok(
-        crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+        novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
             file_io,
             entry.warehouse_uri.clone(),
         ),

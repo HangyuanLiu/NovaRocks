@@ -426,7 +426,7 @@ pub(crate) fn staged_data_file_to_writer_report(
 ) -> Result<
     (
         crate::connector::iceberg::report::IcebergWriterReport,
-        Option<super::stats_assembler::FileSketchSet>,
+        Option<novarocks_connector_iceberg::stats_assembler::FileSketchSet>,
     ),
     String,
 > {
@@ -452,14 +452,12 @@ pub(crate) fn staged_data_file_to_writer_report(
         is_overwrite: None,
         is_rewrite: None,
     };
-    let sketch_set =
-        staged
-            .theta_sketches
-            .as_ref()
-            .map(|sketches| super::stats_assembler::FileSketchSet {
-                file_path: df.file_path().to_string(),
-                sketches: clone_theta_sketches(sketches),
-            });
+    let sketch_set = staged.theta_sketches.as_ref().map(|sketches| {
+        novarocks_connector_iceberg::stats_assembler::FileSketchSet {
+            file_path: df.file_path().to_string(),
+            sketches: clone_theta_sketches(sketches),
+        }
+    });
     Ok((report, sketch_set))
 }
 

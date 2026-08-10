@@ -45,7 +45,7 @@ use super::helpers::{
 };
 use super::overwrite::write_added_data_manifest;
 use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
-use crate::connector::iceberg::stats_assembler::{CommitType, FileSketchSet, StatsAssembler};
+use novarocks_connector_iceberg::stats_assembler::{CommitType, FileSketchSet, StatsAssembler};
 
 pub struct FastAppendCommit;
 

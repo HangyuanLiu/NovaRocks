@@ -60,8 +60,8 @@ use super::overwrite::{
 };
 use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::partition_spec::{PartitionMatch, partition_match_in_touched};
-use crate::connector::iceberg::stats_assembler::CommitType;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 pub struct OverwritePartitionsCommit;
 

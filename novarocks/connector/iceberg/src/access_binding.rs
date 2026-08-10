@@ -21,11 +21,11 @@
 //! and file-I/O runtime services. It is intentionally independent of Core's
 //! execution operators and SQL/application lifecycle.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use novarocks_fs::{
     FileError, FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
-    FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FsAccessResolver, FsAccessResources,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -34,10 +34,7 @@ const DEFAULT_ACCESS_BINDING: &str = "default";
 #[derive(Clone)]
 pub struct IcebergReadBinding {
     access_binding: String,
-    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
-    access_resolver: FsAccessResolver,
-    file_runtime: Arc<dyn FileIoRuntime>,
-    file_task_spawner: Arc<dyn FileTaskSpawner>,
+    resources: FsAccessResources,
 }
 
 impl std::fmt::Debug for IcebergReadBinding {
@@ -47,46 +44,45 @@ impl std::fmt::Debug for IcebergReadBinding {
             .field("access_binding", &self.access_binding)
             .field(
                 "object_store_config",
-                &self.object_store_config.as_ref().map(|_| "<redacted>"),
+                &self.resources.object_store_config().map(|_| "<redacted>"),
             )
             .finish_non_exhaustive()
     }
 }
 
 impl IcebergReadBinding {
-    pub fn default_binding(
-        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
-    ) -> Result<Self, ConnectorError> {
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            static FALLBACK_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-            FALLBACK_RUNTIME
-                .get_or_init(|| {
-                    tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Iceberg fallback Tokio runtime must initialize")
-                })
-                .handle()
-                .clone()
-        });
-        Ok(Self::new(
-            object_store_config,
-            Arc::new(TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(TokioFileTaskSpawner::new(handle)),
-        ))
+    /// Builds an Iceberg filesystem binding from resources supplied by the
+    /// process composition root.
+    pub fn from_resources(resources: FsAccessResources) -> Self {
+        Self {
+            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
+            resources,
+        }
     }
 
+    /// Explicit convenience constructor for composition roots that do not
+    /// retain a reusable [`FsAccessResources`] bundle.
     pub fn new(
         object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+        access_resolver: FsAccessResolver,
         file_runtime: Arc<dyn FileIoRuntime>,
         file_task_spawner: Arc<dyn FileTaskSpawner>,
     ) -> Self {
-        Self {
-            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
+        Self::from_resources(FsAccessResources::new(
             object_store_config,
-            access_resolver: FsAccessResolver::new(),
+            access_resolver,
             file_runtime,
             file_task_spawner,
+        ))
+    }
+
+    pub fn with_access_binding(
+        access_binding: impl Into<String>,
+        resources: FsAccessResources,
+    ) -> Self {
+        Self {
+            access_binding: access_binding.into(),
+            resources,
         }
     }
 
@@ -95,12 +91,13 @@ impl IcebergReadBinding {
     }
 
     pub fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
-        self.object_store_config.as_ref()
+        self.resources.object_store_config()
     }
 
     pub fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
-        self.access_resolver
-            .resolve_location(location, self.object_store_config.as_ref())
+        self.resources
+            .access_resolver()
+            .resolve_location(location, self.object_store_config())
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
             })
@@ -114,8 +111,9 @@ impl IcebergReadBinding {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.access_resolver
-            .resolve_locations(locations, self.object_store_config.as_ref())
+        self.resources
+            .access_resolver()
+            .resolve_locations(locations, self.object_store_config())
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
             })
@@ -129,8 +127,8 @@ impl IcebergReadBinding {
         Ok(FileReadContext {
             cancellation,
             deadline: Some(deadline),
-            runtime: Arc::clone(&self.file_runtime),
-            task_spawner: Arc::clone(&self.file_task_spawner),
+            runtime: Arc::clone(self.resources.file_runtime()),
+            task_spawner: Arc::clone(self.resources.file_task_spawner()),
         })
     }
 
@@ -153,5 +151,39 @@ impl IcebergReadBinding {
                 ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
                     .with_retryable_before_progress()
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use novarocks_fs::{FileCancellation, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+    #[test]
+    fn requires_a_composition_owned_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("build explicit Tokio runtime");
+        let file_runtime: Arc<dyn FileIoRuntime> =
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
+        let task_spawner: Arc<dyn FileTaskSpawner> =
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::clone(&file_runtime),
+            Arc::clone(&task_spawner),
+        );
+
+        let context = binding
+            .file_read_context(
+                FileCancellation::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("build file read context");
+
+        assert!(Arc::ptr_eq(&context.runtime, &file_runtime));
+        assert!(Arc::ptr_eq(&context.task_spawner, &task_spawner));
     }
 }

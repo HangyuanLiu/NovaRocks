@@ -60,8 +60,8 @@ use super::helpers::{
     required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
-use crate::connector::iceberg::stats_assembler::CommitType;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 pub struct OverwriteCommit;
 

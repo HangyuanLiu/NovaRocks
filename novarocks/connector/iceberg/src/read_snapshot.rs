@@ -293,3 +293,17 @@ pub async fn build_read_snapshot_at(
         files,
     })
 }
+
+/// Build the read view for the current snapshot, if the table has one.
+///
+/// Runtime ownership remains with the caller: the provider exposes an async
+/// manifest walk and never discovers a Tokio runtime itself.
+pub async fn build_current_read_snapshot(table: &Table) -> Result<IcebergReadSnapshot, String> {
+    match table.metadata().current_snapshot() {
+        Some(snapshot) => build_read_snapshot_at(table, snapshot.snapshot_id()).await,
+        None => Ok(IcebergReadSnapshot {
+            snapshot_id: None,
+            files: Vec::new(),
+        }),
+    }
+}

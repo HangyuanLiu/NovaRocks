@@ -29,8 +29,8 @@ use novarocks_spi::connector::{
     ConnectorReadSelector, ConnectorReadSessionLease, ConnectorScan, ConnectorScanHandle,
     ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, StatisticsDataVersion,
-    validate_static_predicates,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
+    ConnectorTableRequest, StatisticsDataVersion, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -282,6 +282,7 @@ impl Provider {
                 table: table.table,
             },
             schema: table.schema,
+            planning_facts: ConnectorTablePlanningFacts::empty(),
             version: Some(table.schema_version),
             statistics_data_version: Some(StatisticsDataVersion::try_new(table.data_version)?),
             table: table_handle,

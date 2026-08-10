@@ -439,8 +439,8 @@ fn load_iceberg_puffin_ndv_from_metadata(
     metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     snapshot_id: i64,
 ) -> (HashMap<String, f64>, HashMap<String, i32>) {
-    use crate::connector::iceberg::stats_loader::StatsLoader;
     use crate::runtime::global_async_runtime::data_block_on;
+    use novarocks_connector_iceberg::stats_loader::StatsLoader;
 
     let empty = (HashMap::new(), HashMap::new());
     if metadata.statistics_for_snapshot(snapshot_id).is_none() {
@@ -473,8 +473,8 @@ fn load_iceberg_puffin_ndv_from_metadata_with_file_io(
     snapshot_id: i64,
     file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
 ) -> (HashMap<String, f64>, HashMap<String, i32>) {
-    use crate::connector::iceberg::stats_loader::StatsLoader;
     use crate::runtime::global_async_runtime::data_block_on;
+    use novarocks_connector_iceberg::stats_loader::StatsLoader;
 
     let empty = (HashMap::new(), HashMap::new());
     if metadata.statistics_for_snapshot(snapshot_id).is_none() {

@@ -112,8 +112,14 @@ pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
     ConnectorReadNamedReference, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry, ConnectorTableIdentity,
-    ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry, ConnectorTableColumnPlanningFact,
+    ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+    ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorTableUniqueConstraint, MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS,
+    MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS,
+    MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS,
+    MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
 };
 pub use metadata_maintenance::{
     CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMetadataMaintenance,

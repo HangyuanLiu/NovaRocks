@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use crate::sql::binding::SqlTableBindingId;
 #[cfg(test)]
 use crate::sql::binding::SqlTableBindingScopeId;
+use arrow::datatypes::Schema;
 use novarocks_catalog::schema::ColumnDef;
 
 /// Immutable version selector attached to a query-local table binding.
@@ -143,6 +144,58 @@ impl SqlUkFkTableFacts {
                     .collect()
             })
             .unwrap_or_default();
+        Self {
+            unique_constraints,
+            foreign_key_constraints,
+        }
+    }
+
+    /// Project provider-neutral, schema-ordinal constraints into the SQL
+    /// optimizer's name-based facts.  The materializer never inspects a
+    /// connector table handle to recover these values.
+    pub(crate) fn from_connector_planning_facts(
+        schema: &Schema,
+        facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
+    ) -> Self {
+        let column_name = |ordinal: u32| {
+            schema
+                .fields()
+                .get(ordinal as usize)
+                .map(|field| field.name().to_ascii_lowercase())
+        };
+        let unique_constraints = facts
+            .unique_constraints()
+            .iter()
+            .filter_map(|constraint| {
+                constraint
+                    .column_ordinals()
+                    .iter()
+                    .map(|ordinal| column_name(*ordinal))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect();
+        let foreign_key_constraints = facts
+            .foreign_key_constraints()
+            .iter()
+            .filter_map(|constraint| {
+                let local_columns = constraint
+                    .local_column_ordinals()
+                    .iter()
+                    .map(|ordinal| column_name(*ordinal))
+                    .collect::<Option<Vec<_>>>()?;
+                let referenced = constraint.referenced_table();
+                let referenced_table = format!("{}.{}", referenced.namespace, referenced.table,);
+                Some(SqlUkFkForeignKey {
+                    local_columns,
+                    referenced_table,
+                    referenced_columns: constraint
+                        .referenced_column_names()
+                        .iter()
+                        .map(|column| column.to_ascii_lowercase())
+                        .collect(),
+                })
+            })
+            .collect();
         Self {
             unique_constraints,
             foreign_key_constraints,

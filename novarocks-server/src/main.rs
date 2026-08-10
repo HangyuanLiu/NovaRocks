@@ -247,12 +247,21 @@ fn run_standalone_be_role(
     if let Some(warn) = be_role_start_warning(port_override) {
         eprintln!("WARN: {warn}");
     }
-    let execution_installers = composition::compose_backend_execution_installers(&cfg)?;
-    novarocks_backend::run_backend_server(novarocks_backend::BackendServerConfig {
-        config: cfg,
-        execution_installers,
-    })
-    .map_err(|error| anyhow::anyhow!("role=be: {error}"))
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .build()
+        .map_err(|error| anyhow::anyhow!("role=be: build Tokio runtime: {error}"))?;
+    let execution_installers =
+        composition::compose_backend_execution_installers(&cfg, runtime.handle().clone())?;
+    runtime
+        .block_on(novarocks_backend::run_backend_server_until_signal(
+            novarocks_backend::BackendServerConfig {
+                config: cfg,
+                execution_installers,
+            },
+        ))
+        .map_err(|error| anyhow::anyhow!("role=be: {error}"))
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {

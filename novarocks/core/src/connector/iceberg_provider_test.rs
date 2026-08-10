@@ -142,23 +142,53 @@ fn registry_with_table() -> (Arc<RwLock<IcebergCatalogRegistry>>, tempfile::Temp
 
 fn install_execution(
     control: &novarocks_spi::connector::ConnectorControlBinding,
-) -> ConnectorExecutionBinding {
+) -> (tokio::runtime::Runtime, ConnectorExecutionBinding) {
+    let runtime = tokio::runtime::Runtime::new().expect("build explicit test runtime");
+    let handle = runtime.handle().clone();
+    let binding = IcebergReadBinding::new(
+        None,
+        novarocks_fs::FsAccessResolver::new(),
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+    );
     let declaration = control
         .execution_declaration(&context())
         .expect("create secret-free declaration");
-    IcebergConnectorInstaller::new(
-        IcebergReadBinding::default_binding(None).expect("build read binding"),
+    let execution = IcebergConnectorInstaller::new(binding)
+        .install(&declaration, &context())
+        .expect("install read-only Iceberg execution binding");
+    (runtime, execution)
+}
+
+fn control_with_explicit_resources(
+    instance_id: ConnectorInstanceId,
+    registry: Arc<RwLock<IcebergCatalogRegistry>>,
+) -> (
+    tokio::runtime::Runtime,
+    novarocks_spi::connector::ConnectorControlBinding,
+) {
+    let runtime = tokio::runtime::Runtime::new().expect("build explicit test runtime");
+    let handle = runtime.handle().clone();
+    let binding = IcebergReadBinding::new(
+        None,
+        novarocks_fs::FsAccessResolver::new(),
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+    );
+    let control = IcebergControlProvider::new_control_with_planning_binding(
+        instance_id,
+        registry,
+        Some(binding),
     )
-    .install(&declaration, &context())
-    .expect("install read-only Iceberg execution binding")
+    .expect("planning Iceberg control binding");
+    (runtime, control)
 }
 
 #[test]
 fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let control = IcebergControlProvider::new_control(instance_id, registry)
-        .expect("planning Iceberg control binding");
+    let (_runtime, control) = control_with_explicit_resources(instance_id, registry);
 
     let declaration = control
         .execution_declaration(&context())
@@ -167,7 +197,7 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
     assert!(!declaration_debug.contains("warehouse"));
     assert!(!declaration_debug.contains("access_key"));
 
-    let execution = install_execution(&control);
+    let (_runtime, execution) = install_execution(&control);
     assert_eq!(execution.key(), &declaration.binding_key());
     assert_eq!(
         execution.provider_id(),
@@ -179,8 +209,7 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
 fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let control = IcebergControlProvider::new_control(instance_id.clone(), registry)
-        .expect("planning Iceberg control binding");
+    let (_runtime, control) = control_with_explicit_resources(instance_id.clone(), registry);
     let metadata = control
         .metadata()
         .load_table(ConnectorTableRequest {
@@ -260,8 +289,8 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
 fn iceberg_statistics_publish_uses_a_pinned_operation_specific_puffin() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let control = IcebergControlProvider::new_control(instance_id.clone(), Arc::clone(&registry))
-        .expect("planning Iceberg control binding");
+    let (_runtime, control) =
+        control_with_explicit_resources(instance_id.clone(), Arc::clone(&registry));
     let metadata = control
         .metadata()
         .load_table(ConnectorTableRequest {
@@ -381,8 +410,7 @@ fn iceberg_statistics_publish_uses_a_pinned_operation_specific_puffin() {
 fn iceberg_control_mutation_honors_create_policy_without_implicit_namespace_creation() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let control = IcebergControlProvider::new_control(instance_id.clone(), registry)
-        .expect("Iceberg control binding");
+    let (_runtime, control) = control_with_explicit_resources(instance_id.clone(), registry);
     let mutation = control.mutation().expect("mutation capability");
     let target = ConnectorExecutionBindingKey {
         instance_id: instance_id.clone(),
@@ -469,8 +497,8 @@ fn iceberg_control_bootstraps_empty_table_once_with_an_operation_marker() {
     )
     .expect("create empty MV target");
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let control = IcebergControlProvider::new_control(instance_id.clone(), Arc::clone(&registry))
-        .expect("Iceberg control binding");
+    let (_runtime, control) =
+        control_with_explicit_resources(instance_id.clone(), Arc::clone(&registry));
     let mutation = control.mutation().expect("mutation capability");
     let target = ConnectorExecutionBindingKey {
         instance_id: instance_id.clone(),
@@ -542,8 +570,7 @@ fn iceberg_control_bootstraps_empty_table_once_with_an_operation_marker() {
 fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let planning = IcebergControlProvider::new_control(instance_id.clone(), registry)
-        .expect("planning Iceberg control binding");
+    let (_runtime, planning) = control_with_explicit_resources(instance_id.clone(), registry);
     let resolved = planning
         .metadata()
         .load_table(ConnectorTableRequest {
@@ -587,7 +614,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
         .expect("plan split")
         .splits
         .remove(0);
-    let installed = install_execution(&planning);
+    let (_runtime, installed) = install_execution(&planning);
 
     let mut reader = open_prepared_unit(
         &installed,
@@ -693,8 +720,7 @@ fn force_current_snapshot_id(
 fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     let (registry, warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let instance = IcebergControlProvider::new_control(instance_id.clone(), registry)
-        .expect("Iceberg control binding");
+    let (_runtime, instance) = control_with_explicit_resources(instance_id.clone(), registry);
     let metadata = instance.metadata();
     let namespace = ConnectorNamespaceIdentity {
         instance_id: instance_id.clone(),
@@ -770,7 +796,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
         remove_snapshot_manifest_files(warehouse.path()) > 0,
         "fixture must contain snapshot manifests before reader opens"
     );
-    let execution = install_execution(&instance);
+    let (_runtime, execution) = install_execution(&instance);
     for _ in 0..2 {
         let mut reader = open_prepared_unit(
             &execution,
@@ -804,8 +830,8 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         .get("ice")
         .expect("catalog entry");
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let instance = IcebergControlProvider::new_control(instance_id.clone(), Arc::clone(&registry))
-        .expect("Iceberg control binding");
+    let (_runtime, instance) =
+        control_with_explicit_resources(instance_id.clone(), Arc::clone(&registry));
     let table_identity = ConnectorTableIdentity {
         instance_id: instance_id.clone(),
         namespace: Arc::from("db"),
@@ -904,7 +930,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         "fixture must reproduce numeric snapshot-ID reuse"
     );
 
-    let execution = install_execution(&instance);
+    let (_runtime, execution) = install_execution(&instance);
     let error = match open_prepared_unit(
         &execution,
         &stale_split,

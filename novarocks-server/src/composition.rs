@@ -26,21 +26,21 @@ use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
-use novarocks_fs::{TokioFileIoRuntime, TokioFileTaskSpawner};
+use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn compose_backend_execution_installers(
     config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>>> {
     let object_store = config.connector.object_store_config().map_err(|error| {
         anyhow::anyhow!("resolve connector startup object-store binding: {error}")
     })?;
-    let runtime = novarocks::runtime::global_async_runtime::data_runtime_handle()
-        .map_err(|error| anyhow::anyhow!("resolve data runtime for Iceberg installer: {error}"))?;
     let binding = IcebergReadBinding::new(
         object_store,
+        FsAccessResolver::new(),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
         std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
     );
@@ -94,6 +94,7 @@ pub fn run_all_in_one(
         config,
         config_path,
         port_override,
+        runtime.handle().clone(),
         async {
             tokio::signal::ctrl_c()
                 .await
@@ -106,6 +107,7 @@ async fn run_all_in_one_until<F>(
     config: NovaRocksConfig,
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
+    runtime: tokio::runtime::Handle,
     shutdown: F,
 ) -> anyhow::Result<()>
 where
@@ -121,7 +123,7 @@ where
     let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
         .await
         .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
-    let execution_installers = compose_backend_execution_installers(&config)?;
+    let execution_installers = compose_backend_execution_installers(&config, runtime)?;
     let mut backend = match BackendApplicationHost::open_with_terminal_ingress(
         BackendServerConfig {
             config: config.clone(),

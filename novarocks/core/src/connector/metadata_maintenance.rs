@@ -30,9 +30,10 @@ use novarocks_spi::connector::{
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
     ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity,
+    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 
 use crate::common::engine_error::EngineError;
@@ -693,6 +694,7 @@ mod tests {
             Ok(ConnectorTableMetadata {
                 identity: request.table,
                 schema: Arc::new(Schema::empty()),
+                planning_facts: ConnectorTablePlanningFacts::empty(),
                 version: None,
                 statistics_data_version: None,
                 table: ConnectorTableHandle::try_new(

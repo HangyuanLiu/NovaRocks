@@ -27,6 +27,7 @@ mod error;
 mod physical_reader;
 mod predicate;
 mod read;
+mod resources;
 mod runtime;
 
 pub use access::{
@@ -58,6 +59,7 @@ pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
     FileReadContext, FileReadRange, FileReadRequest,
 };
+pub use resources::FsAccessResources;
 pub use runtime::{
     FileBytesFuture, FileCancellation, FileIoRuntime, FileTask, FileTaskFuture, FileTaskSpawner,
     FileU64Future, TokioFileIoRuntime, TokioFileTaskSpawner,

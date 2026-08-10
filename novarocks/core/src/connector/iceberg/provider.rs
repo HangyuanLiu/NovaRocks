@@ -71,16 +71,18 @@ use novarocks_spi::connector::{
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
     ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
     ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
-    ConnectorStatistics, ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
-    ConnectorTableResolution, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
-    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor,
-    ConnectorWriteCohortId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
-    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    ConnectorWriteRouteId, ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy,
-    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorStatistics, ConnectorTableColumnRole, ConnectorTableColumnSemanticKind,
+    ConnectorTableColumnVisibility, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata,
+    ConnectorViewMetadataValue, ConnectorViewRequest, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteRouteId,
+    ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     ExternalMutationOutcome, StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
     StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
     StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
@@ -852,6 +854,11 @@ pub(crate) struct IcebergControlProvider {
     incarnation: ConnectorInstanceIncarnation,
     binding_key: ConnectorExecutionBindingKey,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
+    /// FE-local filesystem capability used only to refine already-authorized
+    /// files into frozen row-group units. It is injected by composition;
+    /// absent legacy construction fails closed rather than discovering a
+    /// process-global Tokio runtime or credentials.
+    planning_binding: Option<IcebergReadBinding>,
     snapshot_memberships: Arc<SnapshotMembershipCache>,
     recovery_cleanup_outcomes:
         Arc<Mutex<HashMap<ConnectorMutationOperationId, IcebergRecoveryCleanupRecord>>>,
@@ -1010,6 +1017,14 @@ impl IcebergControlProvider {
         instance_id: ConnectorInstanceId,
         registry: Arc<RwLock<IcebergCatalogRegistry>>,
     ) -> Result<ConnectorControlBinding, ConnectorError> {
+        Self::new_control_with_planning_binding(instance_id, registry, None)
+    }
+
+    pub(crate) fn new_control_with_planning_binding(
+        instance_id: ConnectorInstanceId,
+        registry: Arc<RwLock<IcebergCatalogRegistry>>,
+        planning_binding: Option<IcebergReadBinding>,
+    ) -> Result<ConnectorControlBinding, ConnectorError> {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)?,
             instance_id: instance_id.clone(),
@@ -1038,6 +1053,7 @@ impl IcebergControlProvider {
             incarnation,
             binding_key: write_key.clone(),
             registry: Arc::clone(&registry),
+            planning_binding,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
@@ -4004,6 +4020,19 @@ impl ConnectorMetadata for IcebergControlProvider {
                 &[],
             )?
         };
+        let planning_facts = novarocks_connector_iceberg::planning_facts::table_planning_facts(
+            &schema,
+            &table.metadata_columns,
+            &table.hidden_columns,
+            &table.logical_type_columns,
+            table
+                .table_info
+                .as_ref()
+                .and_then(|info| info.serialized_metadata.as_deref()),
+            &request.table.namespace,
+            &self.instance_id,
+            &request.context,
+        )?;
         Ok(ConnectorTableMetadata {
             identity: novarocks_spi::connector::ConnectorTableIdentity {
                 instance_id: self.instance_id.clone(),
@@ -4011,6 +4040,7 @@ impl ConnectorMetadata for IcebergControlProvider {
                 table: Arc::from(table_name),
             },
             schema,
+            planning_facts,
             version,
             statistics_data_version: Some(statistics_data_version),
             table: ConnectorTableHandle::try_new(
@@ -4229,7 +4259,7 @@ impl StatisticsReader for IcebergControlProvider {
         )))?;
         if let Some(statistics_path) = statistics_path {
             let artifact = super::catalog::registry::block_on_iceberg(
-                super::stats_assembler::read_provider_statistics_blob(
+                novarocks_connector_iceberg::stats_assembler::read_provider_statistics_blob(
                     loaded.table.file_io(),
                     statistics_path,
                 ),
@@ -4462,11 +4492,12 @@ impl StatisticsCollection for IcebergControlProvider {
                 "cannot publish Iceberg statistics for a table without a snapshot",
             )
         })?;
-        let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
-            metadata,
-            snapshot_id,
-            request.operation_id.to_bytes(),
-        );
+        let statistics_path =
+            novarocks_connector_iceberg::stats_assembler::puffin_path_for_statistics_operation(
+                metadata,
+                snapshot_id,
+                request.operation_id.to_bytes(),
+            );
         self.statistics_evidence(
             request.operation_id,
             &table,
@@ -4579,11 +4610,12 @@ impl StatisticsCollection for IcebergControlProvider {
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
             sketches.insert(*field_id, sketch);
         }
-        let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
-            metadata,
-            snapshot_id,
-            request.operation_id.to_bytes(),
-        );
+        let statistics_path =
+            novarocks_connector_iceberg::stats_assembler::puffin_path_for_statistics_operation(
+                metadata,
+                snapshot_id,
+                request.operation_id.to_bytes(),
+            );
         let expected_evidence = self.statistics_evidence(
             request.operation_id,
             &table,
@@ -4597,7 +4629,7 @@ impl StatisticsCollection for IcebergControlProvider {
             )));
         }
         let written = super::catalog::registry::block_on_iceberg(
-            super::stats_assembler::write_puffin_with_provider_statistics(
+            novarocks_connector_iceberg::stats_assembler::write_puffin_with_provider_statistics(
                 loaded.table.file_io(),
                 &statistics_path,
                 snapshot_id,
@@ -5034,11 +5066,12 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         // Freeze row-group membership at the FE while the catalog snapshot and
         // object-store capability are still pinned. BE preparation preserves a
         // non-empty `row_groups` selection verbatim and never re-plans it.
-        let planning_binding = IcebergReadBinding::default_binding(
-            self.entry(self.instance_id.as_str())?
-                .object_store_config()
-                .cloned(),
-        )?;
+        let planning_binding = self.planning_binding.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "Iceberg control generation has no composed filesystem planning resources",
+            )
+        })?;
         let leaves = materialize_local_scan_units(
             &planning_binding,
             leaves,
@@ -5711,12 +5744,14 @@ fn build_table_payload(
         )
     ) {
         let rows = super::catalog::registry::block_on_iceberg(async {
-            crate::connector::iceberg::metadata_read::read_metadata_table_rows(
+            novarocks_connector_iceberg::metadata_read::read_metadata_table_rows(
                 &metadata_table,
                 &metadata_file_io,
-                metadata_table_type
-                    .clone()
-                    .expect("metadata table type is present"),
+                provider_metadata_table_type(
+                    metadata_table_type
+                        .as_ref()
+                        .expect("metadata table type is present"),
+                )?,
             )
             .await
         })
@@ -5740,6 +5775,23 @@ fn build_table_payload(
         hidden_columns,
         frozen_rewrite: None,
     })
+}
+
+fn provider_metadata_table_type(
+    ty: &super::IcebergMetadataTableType,
+) -> Result<novarocks_connector_iceberg::metadata_read::MetadataTableType, String> {
+    match ty {
+        super::IcebergMetadataTableType::Files => {
+            Ok(novarocks_connector_iceberg::metadata_read::MetadataTableType::Files)
+        }
+        super::IcebergMetadataTableType::Manifests => {
+            Ok(novarocks_connector_iceberg::metadata_read::MetadataTableType::Manifests)
+        }
+        super::IcebergMetadataTableType::LogicalIcebergMetadata => Ok(
+            novarocks_connector_iceberg::metadata_read::MetadataTableType::LogicalIcebergMetadata,
+        ),
+        other => Err(format!("provider metadata walk does not support {other:?}")),
+    }
 }
 
 /// Project only the SQL-visible Iceberg pseudo-column names into the provider
@@ -9852,44 +9904,27 @@ fn materialization_from_metadata(
             table: metadata.table.clone(),
             data_version,
         });
-    let read_selector = match binding {
-        IcebergDataFileBinding::CurrentSnapshot => ConnectorReadSelector::Current,
-        IcebergDataFileBinding::ExplicitFiles => ConnectorReadSelector::SnapshotId(
-            decode_payload::<TablePayload>(metadata.table.payload(), "table handle")
-                .map_err(|error| error.to_string())?
-                .table_info
-                .as_ref()
-                .and_then(|table| table.current_snapshot_id)
-                .ok_or_else(|| {
-                    "frozen Iceberg table materialization is missing its snapshot identity"
-                        .to_string()
-                })?,
-        ),
-    };
+    // Snapshot selection is an application fact supplied by the caller which
+    // froze it.  Base materialization is always current and never decodes the
+    // opaque table handle to rediscover a provider-private snapshot id.
+    let read_selector = ConnectorReadSelector::Current;
     let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
         .map_err(|error| error.to_string())?;
     let table = payload
         .table_info
         .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
-    let sql_ukfk_facts = sql_ukfk_facts_from_frozen_table(&table);
-    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
-        .into_iter()
-        .filter(|column| {
-            !payload
-                .hidden_columns
-                .iter()
-                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
-                && !payload
-                    .metadata_columns
-                    .iter()
-                    .any(|metadata| column.name.eq_ignore_ascii_case(metadata))
-        })
-        .collect();
+    let sql_ukfk_facts =
+        crate::sql::planner::table::SqlUkFkTableFacts::from_connector_planning_facts(
+            &metadata.schema,
+            &metadata.planning_facts,
+        );
+    let (columns, iceberg_row_lineage_metadata_columns) =
+        columns_from_planning_facts(&metadata.schema, &metadata.planning_facts);
     Ok(IcebergQueryTableMaterialization {
         table_name: payload.table,
         schema_id,
         columns,
-        iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
+        iceberg_row_lineage_metadata_columns,
         read_table: metadata.table,
         read_schema: metadata.schema,
         read_selector,
@@ -9901,25 +9936,6 @@ fn materialization_from_metadata(
         statistics_pin,
         planning_lease,
     })
-}
-
-fn sql_ukfk_facts_from_frozen_table(
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> crate::sql::planner::table::SqlUkFkTableFacts {
-    let Some(serialized) = table.serialized_metadata.as_deref() else {
-        return crate::sql::planner::table::SqlUkFkTableFacts::default();
-    };
-    let Ok(metadata) = serde_json::from_str::<
-        novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    >(serialized) else {
-        return crate::sql::planner::table::SqlUkFkTableFacts::default();
-    };
-    let properties = metadata
-        .properties()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    crate::sql::planner::table::SqlUkFkTableFacts::from_frozen_properties(&properties)
 }
 
 pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
@@ -9974,55 +9990,39 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
     })
 }
 
-fn columns_from_metadata(
+fn columns_from_planning_facts(
     schema: &Schema,
-    logical_type_columns: &BTreeMap<String, String>,
-) -> Vec<novarocks_catalog::schema::ColumnDef> {
-    schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let logical_type = match logical_type_columns
-                .get(&field.name().to_lowercase())
-                .map(String::as_str)
-            {
-                Some("bitmap") => Some(SqlType::Bitmap),
-                Some("hll") => Some(SqlType::Hll),
-                _ => None,
-            };
-            novarocks_catalog::schema::ColumnDef {
-                name: field.name().to_string(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                write_default: None,
-                logical_type,
-            }
-        })
-        .collect()
-}
-
-fn iceberg_metadata_columns(
-    names: &[String],
-) -> Result<Vec<novarocks_catalog::schema::ColumnDef>, String> {
-    names
-        .iter()
-        .map(|name| {
-            let (data_type, nullable) = match name.as_str() {
-                "_file" => (arrow::datatypes::DataType::Utf8, false),
-                "_pos" | "_row_id" | "_last_updated_sequence_number" => {
-                    (arrow::datatypes::DataType::Int64, false)
-                }
-                other => return Err(format!("unknown Iceberg metadata column `{other}`")),
-            };
-            Ok(novarocks_catalog::schema::ColumnDef {
-                name: name.clone(),
-                data_type,
-                nullable,
-                write_default: None,
-                logical_type: None,
-            })
-        })
-        .collect()
+    facts: &ConnectorTablePlanningFacts,
+) -> (
+    Vec<novarocks_catalog::schema::ColumnDef>,
+    Vec<novarocks_catalog::schema::ColumnDef>,
+) {
+    let mut columns = Vec::new();
+    let mut system_columns = Vec::new();
+    for (ordinal, field) in schema.fields().iter().enumerate() {
+        let fact = facts.column_facts().get(ordinal);
+        let logical_type = match fact.map(|fact| fact.semantic_kind()) {
+            Some(ConnectorTableColumnSemanticKind::Bitmap) => Some(SqlType::Bitmap),
+            Some(ConnectorTableColumnSemanticKind::Hll) => Some(SqlType::Hll),
+            _ => None,
+        };
+        let column = novarocks_catalog::schema::ColumnDef {
+            name: field.name().to_string(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type,
+        };
+        match fact.map(|fact| fact.role()) {
+            Some(ConnectorTableColumnRole::RowLineageSystem) => system_columns.push(column),
+            _ if matches!(
+                fact.map(|fact| fact.visibility()),
+                Some(ConnectorTableColumnVisibility::Hidden)
+            ) => {}
+            _ => columns.push(column),
+        }
+    }
+    (columns, system_columns)
 }
 
 fn metadata_table_name(metadata_type: &super::IcebergMetadataTableType) -> &'static str {
@@ -10475,6 +10475,16 @@ mod tests {
     use novarocks_connector_iceberg::scan_model::{
         IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     };
+
+    fn explicit_test_read_binding(runtime: &tokio::runtime::Runtime) -> IcebergReadBinding {
+        let handle = runtime.handle().clone();
+        IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+        )
+    }
 
     #[test]
     fn cow_recipe_keeps_provider_identity_private_and_round_trips() {
@@ -11039,7 +11049,10 @@ mod tests {
             .expect("Parquet size fits i64")
     }
 
-    fn local_planning_provider(warehouse: &Path) -> IcebergControlProvider {
+    fn local_planning_provider(
+        warehouse: &Path,
+    ) -> (tokio::runtime::Runtime, IcebergControlProvider) {
+        let runtime = tokio::runtime::Runtime::new().expect("build explicit test runtime");
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let mut catalog_registry = IcebergCatalogRegistry::default();
         catalog_registry
@@ -11052,7 +11065,7 @@ mod tests {
             )
             .expect("local catalog registration");
         let incarnation = ConnectorInstanceIncarnation::from_bytes([9; 16]);
-        IcebergControlProvider {
+        let provider = IcebergControlProvider {
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider ID"),
                 instance_id: instance_id.clone(),
@@ -11064,11 +11077,13 @@ mod tests {
             instance_id,
             incarnation,
             registry: Arc::new(RwLock::new(catalog_registry)),
+            planning_binding: Some(explicit_test_read_binding(&runtime)),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
             recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        (runtime, provider)
     }
 
     fn explicit_file_scan_handle(
@@ -11134,7 +11149,7 @@ mod tests {
             "the large third leaf must exceed the derived soft target"
         );
         let expected_total = files.iter().map(|file| file.size as u64).sum::<u64>();
-        let provider = local_planning_provider(directory.path());
+        let (_runtime, provider) = local_planning_provider(directory.path());
         let scan = explicit_file_scan_handle(provider.instance_id.clone(), files.clone());
 
         let first = ConnectorScanPlanning::plan_splits(&provider, &scan, local_planning_request())
@@ -11212,8 +11227,10 @@ mod tests {
         let request = ConnectorPrepareSplitRequest {
             context: context_with_payload_budgets(64 * 1024, 256 * 1024),
         };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = explicit_test_read_binding(&runtime);
         let materialized = materialize_local_scan_units(
-            &IcebergReadBinding::default_binding(None).expect("local binding"),
+            &binding,
             vec![IcebergFrozenScanUnitPayload {
                 data_file: IcebergDataFileInfo::for_test(
                     path.to_string_lossy().as_ref(),
@@ -11266,7 +11283,8 @@ mod tests {
             scalar_type: IcebergScanFactScalarTypeV1::Int32,
             nullable: false,
         }];
-        let binding = IcebergReadBinding::default_binding(None).expect("local binding");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = explicit_test_read_binding(&runtime);
         let mut inspections = HashMap::new();
         let exact = iceberg_unit_domain_facts(
             &binding,
@@ -11563,6 +11581,7 @@ mod tests {
             instance_id,
             incarnation,
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+            planning_binding: None,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
@@ -12027,6 +12046,7 @@ mod tests {
             instance_id,
             incarnation,
             registry: Arc::new(RwLock::new(catalog_registry)),
+            planning_binding: None,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
@@ -12459,6 +12479,7 @@ fn planned_table_files_fixture_binding(
             Ok(ConnectorTableMetadata {
                 identity: request.table.clone(),
                 schema: fixture_read_schema_for_table(request.table.table.as_ref()),
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
                 version: None,
                 statistics_data_version: None,
                 table: ConnectorTableHandle::try_new(

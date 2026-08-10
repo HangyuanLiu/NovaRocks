@@ -74,9 +74,9 @@ use super::row_delta_dv_metadata::{
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
 use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
-use crate::connector::iceberg::stats_assembler::CommitType;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
 use novarocks_connector_iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
+use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 pub struct RowDeltaDvCommit;
 

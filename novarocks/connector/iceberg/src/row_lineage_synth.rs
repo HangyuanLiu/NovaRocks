@@ -15,29 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! V3 row-lineage column synthesis helpers.
+//! Iceberg V3 row-lineage column synthesis helpers.
 //!
-//! Iceberg V3 spec rule for reading `_row_id` and `_last_updated_sequence_number`
-//! metadata columns:
-//!   1. If the data file carries a stored column with the reserved field id and
-//!      the value is non-NULL on a given row, use that stored value.
-//!   2. Otherwise, fall back to `first_row_id + row_position` (for `_row_id`) or
-//!      to the file's `data_sequence_number` (for `_last_updated_sequence_number`).
-//!
-//! The IVM `IcebergDeltaScan` reader and the regular base scan reader must both
-//! follow this rule. This module centralises the implementation so all readers
-//! produce identical row_id values for the same physical row.
-//!
-//! Cross-reference: iceberg-rust upstream
-//! `vendor/iceberg-0.9.0/src/arrow/record_batch_transformer.rs::create_row_id_column`.
+//! The reserved field IDs and fallback rules are Iceberg physical-format
+//! facts. They remain provider-private: consumers receive ordinary Arrow
+//! batches after the provider reader has applied this transformation.
 
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::Schema;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use novarocks_execution::exec::row_position::{
-    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-};
+/// Iceberg v3 reserved field IDs from the table-format specification.
+pub(crate) const ICEBERG_RESERVED_FIELD_ID_ROW_ID: i32 = i32::MAX - 107;
+pub(crate) const ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER: i32 = i32::MAX - 108;
 
 /// Indices of stored row-lineage columns (`_row_id`, `_last_updated_seq`) in a
 /// batch schema, if present.
@@ -47,9 +37,7 @@ pub(crate) struct StoredRowLineageIndices {
     pub(crate) last_updated_seq: Option<usize>,
 }
 
-/// Locate stored row-lineage columns by their reserved Iceberg field ids in
-/// the supplied Arrow schema. A column is considered "stored" iff its field
-/// metadata `PARQUET:field_id` matches the reserved id.
+/// Locate stored row-lineage columns by their reserved Iceberg field IDs.
 pub(crate) fn stored_row_lineage_indices(schema: &Schema) -> StoredRowLineageIndices {
     let mut out = StoredRowLineageIndices::default();
     for (idx, field) in schema.fields().iter().enumerate() {
@@ -70,10 +58,7 @@ pub(crate) fn stored_row_lineage_indices(schema: &Schema) -> StoredRowLineageInd
     out
 }
 
-/// Synthesize `_row_id` values for the rows currently in `columns`.
-///
-/// `positions` is the absolute row position of each row within its source data
-/// file. When `None`, the rows are assumed to start at `0` and increment by 1.
+/// Synthesize `_row_id` values for rows in `columns`.
 pub(crate) fn synthesize_row_id(
     schema: &Schema,
     columns: &[ArrayRef],
@@ -104,27 +89,24 @@ pub(crate) fn synthesize_row_id(
         })
         .transpose()?;
 
-    if let Some(p) = positions
-        && p.len() != num_rows
+    if let Some(positions) = positions
+        && positions.len() != num_rows
     {
         return Err(format!(
             "synthesize_row_id positions.len()={} does not match num_rows={num_rows}",
-            p.len()
+            positions.len()
         ));
     }
 
     let mut out = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
-        if let Some(arr) = stored
-            && !arr.is_null(i)
+        if let Some(stored) = stored
+            && !stored.is_null(i)
         {
-            out.push(arr.value(i));
+            out.push(stored.value(i));
             continue;
         }
-        let position = match positions {
-            Some(p) => p[i],
-            None => i as i64,
-        };
+        let position = positions.map_or(i as i64, |positions| positions[i]);
         let computed = first_row_id.checked_add(position).ok_or_else(|| {
             format!(
                 "Row ID overflow when computing fallback _row_id: first_row_id={first_row_id}, position={position}"
@@ -135,9 +117,7 @@ pub(crate) fn synthesize_row_id(
     Ok(out)
 }
 
-/// Synthesize `_last_updated_sequence_number` values for the rows currently in
-/// `columns`. Falls back to the file-level `data_sequence_number` when stored
-/// values are missing or NULL.
+/// Synthesize `_last_updated_sequence_number` values for rows in `columns`.
 pub(crate) fn synthesize_last_updated_sequence_number(
     schema: &Schema,
     columns: &[ArrayRef],
@@ -168,10 +148,10 @@ pub(crate) fn synthesize_last_updated_sequence_number(
 
     let mut out = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
-        if let Some(arr) = stored
-            && !arr.is_null(i)
+        if let Some(stored) = stored
+            && !stored.is_null(i)
         {
-            out.push(arr.value(i));
+            out.push(stored.value(i));
         } else {
             out.push(data_sequence_number);
         }
@@ -213,67 +193,51 @@ mod tests {
     #[test]
     fn locates_stored_row_lineage_columns_by_field_id() {
         let schema = schema_with_stored_row_id();
-        let idx = stored_row_lineage_indices(&schema);
-        assert_eq!(idx.row_id, Some(1));
-        assert_eq!(idx.last_updated_seq, Some(2));
+        let indices = stored_row_lineage_indices(&schema);
+        assert_eq!(indices.row_id, Some(1));
+        assert_eq!(indices.last_updated_seq, Some(2));
     }
 
     #[test]
-    fn returns_none_when_stored_lineage_absent() {
-        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-        let idx = stored_row_lineage_indices(&schema);
-        assert!(idx.row_id.is_none());
-        assert!(idx.last_updated_seq.is_none());
-    }
-
-    #[test]
-    fn synthesize_row_id_uses_stored_when_present_and_non_null() {
+    fn synthesize_row_id_uses_stored_and_fallback_values() {
         let schema = schema_with_stored_row_id();
-        let id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200, 300]));
-        let stored_row_id: ArrayRef = Arc::new(Int64Array::from(vec![Some(42i64), None, Some(7)]));
-        let stored_seq: ArrayRef =
-            Arc::new(Int64Array::from(vec![None as Option<i64>, None, None]));
-        let columns = vec![id_col, stored_row_id, stored_seq];
+        let columns = vec![
+            Arc::new(Int64Array::from(vec![100_i64, 200, 300])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(42_i64), None, Some(7)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None, None])) as ArrayRef,
+        ];
 
-        let row_ids = synthesize_row_id(&schema, &columns, 3, 1000, None).expect("synthesize ok");
-
-        assert_eq!(row_ids, vec![42, 1001, 7]);
+        assert_eq!(
+            synthesize_row_id(&schema, &columns, 3, 1000, None).expect("synthesis succeeds"),
+            vec![42, 1001, 7]
+        );
     }
 
     #[test]
-    fn synthesize_row_id_falls_back_when_stored_column_absent() {
+    fn synthesize_row_id_honors_positions() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-        let id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200, 300]));
-        let columns = vec![id_col];
+        let columns = vec![Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef];
 
-        let row_ids = synthesize_row_id(&schema, &columns, 3, 1000, None).expect("synthesize ok");
-
-        assert_eq!(row_ids, vec![1000, 1001, 1002]);
+        assert_eq!(
+            synthesize_row_id(&schema, &columns, 2, 500, Some(&[3, 9]))
+                .expect("synthesis succeeds"),
+            vec![503, 509]
+        );
     }
 
     #[test]
-    fn synthesize_row_id_honors_positions_when_provided() {
-        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-        let id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200]));
-        let columns = vec![id_col];
-
-        let row_ids =
-            synthesize_row_id(&schema, &columns, 2, 500, Some(&[3, 9])).expect("synthesize ok");
-
-        assert_eq!(row_ids, vec![503, 509]);
-    }
-
-    #[test]
-    fn synthesize_last_updated_seq_uses_stored_when_non_null() {
+    fn synthesize_last_updated_sequence_uses_stored_and_fallback_values() {
         let schema = schema_with_stored_row_id();
-        let id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200]));
-        let stored_row_id: ArrayRef = Arc::new(Int64Array::from(vec![None as Option<i64>, None]));
-        let stored_seq: ArrayRef = Arc::new(Int64Array::from(vec![Some(11i64), None]));
-        let columns = vec![id_col, stored_row_id, stored_seq];
+        let columns = vec![
+            Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(11_i64), None])) as ArrayRef,
+        ];
 
-        let seqs = synthesize_last_updated_sequence_number(&schema, &columns, 2, 99)
-            .expect("synthesize ok");
-
-        assert_eq!(seqs, vec![11, 99]);
+        assert_eq!(
+            synthesize_last_updated_sequence_number(&schema, &columns, 2, 99)
+                .expect("synthesis succeeds"),
+            vec![11, 99]
+        );
     }
 }

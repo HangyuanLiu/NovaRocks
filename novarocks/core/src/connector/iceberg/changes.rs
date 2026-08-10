@@ -561,8 +561,9 @@ pub(crate) fn equality_delete_targets_at(
     if equality_deletes.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let read_snapshot =
-        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    let read_snapshot = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::read_snapshot::build_read_snapshot_at(table, snapshot_id),
+    )??;
     let mut out = std::collections::HashMap::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
@@ -1160,7 +1161,9 @@ pub(crate) fn scan_equality_delete_rows_for_table(
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
     }
-    let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    let read_snapshot = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::read_snapshot::build_current_read_snapshot(table),
+    )??;
     let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot(
         &read_snapshot,
@@ -1181,8 +1184,9 @@ pub(crate) fn scan_equality_delete_rows_for_table_at(
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
     }
-    let read_snapshot =
-        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    let read_snapshot = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::read_snapshot::build_read_snapshot_at(table, snapshot_id),
+    )??;
     let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot(
         &read_snapshot,
@@ -1251,7 +1255,9 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
     }
-    let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    let read_snapshot = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::read_snapshot::build_current_read_snapshot(table),
+    )??;
     let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot_with_v3_lineage(
         &read_snapshot,
@@ -1275,8 +1281,9 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
     if equality_deletes.is_empty() {
         return Ok(Vec::new());
     }
-    let read_snapshot =
-        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    let read_snapshot = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::read_snapshot::build_read_snapshot_at(table, snapshot_id),
+    )??;
     let expected_bucket = expected_object_store_bucket_for_table(table)?;
     scan_equality_delete_rows_for_snapshot_with_v3_lineage(
         &read_snapshot,
@@ -1522,8 +1529,9 @@ pub(crate) fn base_data_file_lineage_index_at(
     std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
 > {
-    let read_snapshot =
-        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    let read_snapshot = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::read_snapshot::build_read_snapshot_at(table, snapshot_id),
+    )??;
     build_data_file_lineage_index_from_snapshot(&read_snapshot)
 }
 

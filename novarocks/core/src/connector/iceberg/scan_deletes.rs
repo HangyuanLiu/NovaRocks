@@ -677,11 +677,18 @@ where
     N: Fn(&str) -> Result<String, ChangeError>,
     P: Fn(&str) -> bool,
 {
-    use crate::connector::iceberg::read::build_read_snapshot_at;
     use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
     use novarocks_connector_iceberg::read_model::{IcebergReadDeleteFormat, IcebergReadDeleteKind};
 
-    let prior_snapshot = build_read_snapshot_at(table, snapshot_id).map_err(|e| {
+    let prior_snapshot = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::read_snapshot::build_read_snapshot_at(table, snapshot_id),
+    )
+    .map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "build prior snapshot {snapshot_id} for IVM delete subtraction: {e}"
+        ))
+    })?
+    .map_err(|e| {
         ChangeError::InternalInconsistency(format!(
             "build prior snapshot {snapshot_id} for IVM delete subtraction: {e}"
         ))

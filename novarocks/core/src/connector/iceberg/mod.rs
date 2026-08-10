@@ -35,7 +35,6 @@ pub(crate) mod file_pruning;
 pub(crate) mod fs_io;
 pub mod metadata;
 pub(crate) mod metadata_maintenance;
-pub(crate) mod metadata_read;
 pub(crate) mod operation_lifecycle;
 pub(crate) mod partition_spec;
 pub(crate) mod planning;
@@ -45,19 +44,15 @@ pub mod position_delete_descriptor;
 /// root. The provider crate owns the external Iceberg dependency boundary;
 /// these adapters only bind frozen SPI payloads to Core's runtime.
 pub mod provider;
-pub(crate) mod read;
 pub(crate) mod reader;
 
 pub(crate) mod report;
-pub(crate) mod row_lineage_synth;
 pub mod scan_deletes;
 pub mod schema;
 pub mod sink;
 pub mod sink_plan;
 pub(crate) mod staged_create;
 pub(crate) mod stats;
-pub(crate) mod stats_assembler;
-pub(crate) mod stats_loader;
 #[cfg(test)]
 pub(crate) mod test_metadata;
 pub(crate) mod variant_write;
