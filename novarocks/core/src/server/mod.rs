@@ -1933,6 +1933,12 @@ mod legacy {
         if normalized == DEFAULT_CATALOG {
             return Ok(None);
         }
+        if engine.catalog_application_is_configured() {
+            engine
+                .require_external_catalog_ready(&normalized)
+                .map_err(|error| error.to_string())?;
+            return Ok(Some(normalized));
+        }
         if engine.iceberg_catalog_exists(&normalized)? {
             Ok(Some(normalized))
         } else {

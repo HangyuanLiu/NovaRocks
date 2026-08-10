@@ -1780,6 +1780,34 @@ impl StandaloneNovaRocks {
         }
     }
 
+    /// Admits an external catalog through the frontend control plane when the
+    /// composition has installed it.  Pre-cutover standalone and test
+    /// composition retain the legacy registry lookup until CP-2 removes that
+    /// owner atomically.
+    pub(crate) fn require_external_catalog_ready(
+        &self,
+        catalog_name: &str,
+    ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+        let Some(application) = &self.inner.catalog_application else {
+            return Ok(());
+        };
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
+            .map_err(|error| {
+                crate::catalog_application::CatalogApplicationError::new(
+                    crate::catalog_application::CatalogApplicationErrorKind::InvalidRequest,
+                    format!("invalid catalog connector instance ID: {error}"),
+                )
+            })?;
+        application
+            .admit_catalog(&instance_id)
+            .require_ready()
+            .map(|_| ())
+    }
+
+    pub(crate) fn catalog_application_is_configured(&self) -> bool {
+        self.inner.catalog_application.is_some()
+    }
+
     pub fn iceberg_namespace_exists(
         &self,
         catalog_name: &str,
@@ -6834,6 +6862,28 @@ mod tests {
         assert_eq!(drops.len(), 1);
         assert_eq!(drops[0].instance_id.as_str(), "warehouse");
         assert!(drops[0].if_exists);
+    }
+
+    #[test]
+    fn configured_catalog_application_fails_closed_for_session_catalog_admission() {
+        let application = Arc::new(RecordingCatalogApplication::default());
+        let engine = StandaloneNovaRocks {
+            inner: Arc::new(StandaloneState {
+                catalog_application: Some(
+                    Arc::clone(&application) as Arc<dyn CatalogApplicationPort>
+                ),
+                ..Default::default()
+            }),
+        };
+
+        assert!(engine.catalog_application_is_configured());
+        assert_eq!(
+            engine
+                .require_external_catalog_ready("warehouse")
+                .expect_err("absent attachment must not enter session context")
+                .kind(),
+            crate::catalog_application::CatalogApplicationErrorKind::NotFound
+        );
     }
 
     #[test]
