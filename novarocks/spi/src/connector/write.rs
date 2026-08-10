@@ -576,6 +576,9 @@ impl ConnectorWritePreparation {
     pub fn input(&self) -> &ConnectorWriteInputShape {
         &self.input
     }
+    pub fn base_version(&self) -> &ConnectorWriteBaseVersion {
+        &self.base_version
+    }
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
     }
@@ -1820,13 +1823,62 @@ impl ConnectorWriteLease {
         request: super::ConnectorRowMutationActivationRequest,
     ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
         request.validate(&self.binding_key)?;
+        let preparation = request.preparation().clone();
         let plan = self.control.activate_row_mutation(request)?;
+        let contract = preparation.match_contract();
         for route in plan.routes() {
             route.validate()?;
             if route.preparation().owner() != &self.binding_key {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
                     "row-mutation route preparation does not retain the lease generation",
+                ));
+            }
+            if route.preparation().table() != preparation.table()
+                || route.preparation().base_version() != preparation.base_version()
+                || route
+                    .accepted_effects()
+                    .iter()
+                    .any(|effect| !preparation.intent().accepts(*effect))
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation route does not match its sealed table, base version, or intent",
+                ));
+            }
+            if route.input().fields().into_iter().any(|binding| {
+                !contract
+                    .identity_fields()
+                    .iter()
+                    .any(|field| field.token() == binding.token())
+                    && !contract
+                        .before_fields()
+                        .iter()
+                        .any(|field| field.token() == binding.token())
+                    && !contract
+                        .after_fields()
+                        .iter()
+                        .any(|field| field.token() == binding.token())
+            }) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation route has an input token foreign to its match contract",
+                ));
+            }
+        }
+        if let Some((sealed, recipes)) = plan.copy_on_write() {
+            if sealed.operation_id() != preparation.operation_id()
+                || recipes.len() != sealed.cohorts().len()
+                || plan.routes().iter().any(|route| {
+                    !sealed
+                        .cohorts()
+                        .iter()
+                        .any(|cohort| cohort.cohort_id() == route.cohort_id())
+                })
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "copy-on-write activation does not seal exactly its operation cohorts",
                 ));
             }
         }

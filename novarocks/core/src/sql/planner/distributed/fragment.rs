@@ -114,8 +114,7 @@ pub enum FragmentEdgeKind {
     },
     ChangeStreamRouter {
         router_group_id: i32,
-        branch_id: i32,
-        branch_kind: crate::sql::common::ChangeStreamBranchKind,
+        route_id: novarocks_spi::connector::ConnectorWriteRouteId,
     },
 }
 

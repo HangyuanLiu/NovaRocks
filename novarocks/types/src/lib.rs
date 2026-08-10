@@ -18,7 +18,6 @@
 pub mod aggregate;
 mod arithmetic;
 pub mod arrow_primitive;
-pub mod change_stream;
 pub mod coercion;
 pub mod decimal;
 pub mod identity;

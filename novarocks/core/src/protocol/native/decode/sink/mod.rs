@@ -38,13 +38,13 @@ use crate::runtime::query_options::query_expire_durations;
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_protocol::{common, expr, novarocks, plan};
+use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorWriteExecutionId,
     ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity, StatisticsMetric,
     StatisticsMetricRequest,
 };
-use novarocks_types::change_stream::ChangeStreamBranchKind;
 
 struct NativeWriterCancellation {
     query_id: QueryId,
@@ -601,14 +601,14 @@ pub(crate) fn decode_fragment_sink_assignment(
         }
         plan::data_sink::Kind::ChangeStreamRouter(router) => {
             let groups = router
-                .branches
+                .routes
                 .iter()
                 .enumerate()
                 .map(|(index, branch)| {
                     let group_path = path
                         .clone()
                         .field("change_stream_router")
-                        .field("branches")
+                        .field("routes")
                         .index(index)
                         .field("destinations");
                     let group = branch.destinations.as_ref().ok_or_else(|| {
@@ -750,40 +750,25 @@ fn decode_change_stream_router_program(
     context: Option<&NativePlanDecodeContext>,
 ) -> Result<SplitDataStreamSinkProgram, NativeFragmentLeafDecodeError> {
     let decoded = (|| -> Result<SplitDataStreamSinkProgram, NativeFragmentLeafDecodeError> {
-        let change_op_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
+        let effect_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
             output_columns,
-            router.change_op_output_ordinal,
-            "change_op_output_ordinal",
+            router.effect_output_ordinal,
+            "effect_output_ordinal",
         )?)
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InvalidValue,
-                "change_op_output_ordinal",
+                "effect_output_ordinal",
                 error,
             )
         })?;
-        let data_route_slot_id = router
-            .data_route_output_ordinal
-            .map(|ordinal| {
-                output_slot_id_for_ordinal(output_columns, ordinal, "data_route_output_ordinal")
-            })
-            .transpose()?
-            .map(SlotId::try_from)
-            .transpose()
-            .map_err(|error| {
-                NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InvalidValue,
-                    "data_route_output_ordinal",
-                    error,
-                )
-            })?;
         let mut partition_arena = ExprArena::default();
         let branches = router
-        .branches
+        .routes
         .iter()
         .enumerate()
         .map(|(index, branch)| {
-            let branch_path = |error: NativeFragmentLeafDecodeError| error.prepend_index(index).prepend_field("branches");
+            let branch_path = |error: NativeFragmentLeafDecodeError| error.prepend_index(index).prepend_field("routes");
             let partition = branch_partition_from_native(branch, output_exprs).map_err(branch_path)?;
             let partition_type = decode_stream_partition_type(partition.kind).map_err(|error| branch_path(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidEnum, "kind", error).prepend_field("output_partition")))?;
             let output_partition_exprs = if partition_type.requires_exprs() {
@@ -800,7 +785,7 @@ fn decode_change_stream_router_program(
                             FieldPath::root("plan_fragment")
                                 .field("sink")
                                 .field("change_stream_router")
-                                .field("branches")
+                                .field("routes")
                                 .index(index)
                                 .field("output_partition")
                                 .field("exprs")
@@ -808,7 +793,7 @@ fn decode_change_stream_router_program(
                         ).map_err(|error| {
                             NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "exprs", format!(
                                 "native CHANGE_STREAM_ROUTER_SINK branch[{index}] partition expr[{expr_index}]: {error}"
-                            )).append_index(expr_index).prepend_field("output_partition").prepend_index(index).prepend_field("branches")
+                            )).append_index(expr_index).prepend_field("output_partition").prepend_index(index).prepend_field("routes")
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -816,12 +801,26 @@ fn decode_change_stream_router_program(
                 Vec::new()
             };
             let branch_output_columns = decode_router_output_slots(
-                &branch.output_ordinals,
+                &branch.input_ordinals,
                 output_columns,
-                "output_ordinals",
+                "input_ordinals",
             ).map_err(branch_path)?;
+            let route_id = decode_route_id(&branch.route_id).map_err(|error| branch_path(
+                NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "route_id", error)
+            ))?;
+            let accepted_effects = branch.accepted_effects.iter().enumerate().map(|(effect_index, value)| {
+                decode_row_mutation_effect(*value).map_err(|error| branch_path(
+                    NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidEnum, "accepted_effects", error).append_index(effect_index)
+                ))
+            }).collect::<Result<Vec<_>, _>>()?;
+            if accepted_effects.is_empty() {
+                return Err(branch_path(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField, "accepted_effects", "native CHANGE_STREAM_ROUTER_SINK route accepts no effects"
+                )));
+            }
+            let _ = route_id;
             Ok((
-                decode_change_stream_branch_kind(branch.branch_kind).map_err(|error| branch_path(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidEnum, "branch_kind", error)))?,
+                accepted_effects,
                 DataStreamSinkBranchProgram::try_new(
                     branch.target_exchange_node_id,
                     Vec::new(),
@@ -834,15 +833,14 @@ fn decode_change_stream_router_program(
             ))
         })
         .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
-        let (branch_kinds, streams): (Vec<_>, Vec<_>) = branches.into_iter().unzip();
-        let split_exprs = branch_kinds
+        let (accepted_effect_sets, streams): (Vec<_>, Vec<_>) = branches.into_iter().unzip();
+        let split_exprs = accepted_effect_sets
             .into_iter()
-            .map(|branch_kind| {
+            .map(|accepted_effects| {
                 build_change_stream_split_predicate(
                     &mut partition_arena,
-                    change_op_slot_id,
-                    data_route_slot_id,
-                    branch_kind,
+                    effect_slot_id,
+                    &accepted_effects,
                 )
                 .map_err(|error| {
                     NativeFragmentLeafDecodeError::at_field(
@@ -986,17 +984,26 @@ fn decode_router_output_slots(
     decoded
 }
 
-fn decode_change_stream_branch_kind(value: i32) -> Result<ChangeStreamBranchKind, String> {
-    match plan::ChangeStreamBranchKind::try_from(value)
-        .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
+fn decode_row_mutation_effect(value: i32) -> Result<ConnectorRowMutationEffect, String> {
+    match plan::RowMutationEffect::try_from(value)
+        .map_err(|_| format!("unknown native RowMutationEffect value {value}"))?
     {
-        plan::ChangeStreamBranchKind::DeleteDv => Ok(ChangeStreamBranchKind::DeleteDv),
-        plan::ChangeStreamBranchKind::ReuseData => Ok(ChangeStreamBranchKind::ReuseData),
-        plan::ChangeStreamBranchKind::FreshData => Ok(ChangeStreamBranchKind::FreshData),
-        plan::ChangeStreamBranchKind::Unspecified => {
-            Err("native ChangeStreamBranchKind is unspecified".to_string())
+        plan::RowMutationEffect::Delete => Ok(ConnectorRowMutationEffect::Delete),
+        plan::RowMutationEffect::Replace => Ok(ConnectorRowMutationEffect::Replace),
+        plan::RowMutationEffect::Insert => Ok(ConnectorRowMutationEffect::Insert),
+        plan::RowMutationEffect::Unspecified => {
+            Err("native RowMutationEffect is unspecified".to_string())
         }
     }
+}
+
+fn decode_route_id(value: &[u8]) -> Result<[u8; 32], String> {
+    value.try_into().map_err(|_| {
+        format!(
+            "native route_id must contain exactly 32 bytes, got {}",
+            value.len()
+        )
+    })
 }
 
 fn decode_stream_destination_list(
@@ -1297,14 +1304,15 @@ mod tests {
     }
 
     #[test]
-    fn router_branch_kind_uses_exact_indexed_path() {
+    fn router_effect_uses_exact_indexed_path() {
         let fragment = plan::PlanFragment {
             sink: Some(plan::DataSink {
                 kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
                     plan::ChangeStreamRouterSink {
-                        branches: vec![plan::ChangeStreamBranchRoute {
-                            branch_kind: plan::ChangeStreamBranchKind::Unspecified as i32,
-                            output_ordinals: vec![0],
+                        routes: vec![plan::ChangeStreamBranchRoute {
+                            route_id: vec![1; 32],
+                            accepted_effects: vec![plan::RowMutationEffect::Unspecified as i32],
+                            input_ordinals: vec![0],
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -1313,7 +1321,7 @@ mod tests {
             }),
             output_columns: vec![common::OutputColumn {
                 column_id: 1,
-                name: "change_op".to_string(),
+                name: "effect".to_string(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1325,7 +1333,7 @@ mod tests {
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
             protocol.path().to_string(),
-            "plan_fragment.sink.change_stream_router.branches[0].branch_kind"
+            "plan_fragment.sink.change_stream_router.routes[0].accepted_effects[0]"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
     }
@@ -1336,9 +1344,10 @@ mod tests {
             sink: Some(plan::DataSink {
                 kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
                     plan::ChangeStreamRouterSink {
-                        branches: vec![plan::ChangeStreamBranchRoute {
-                            branch_kind: plan::ChangeStreamBranchKind::FreshData as i32,
-                            output_ordinals: vec![1],
+                        routes: vec![plan::ChangeStreamBranchRoute {
+                            route_id: vec![1; 32],
+                            accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+                            input_ordinals: vec![1],
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -1347,7 +1356,7 @@ mod tests {
             }),
             output_columns: vec![common::OutputColumn {
                 column_id: 1,
-                name: "change_op".to_string(),
+                name: "effect".to_string(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1359,7 +1368,7 @@ mod tests {
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
             protocol.path().to_string(),
-            "plan_fragment.sink.change_stream_router.branches[0].output_ordinals[0]"
+            "plan_fragment.sink.change_stream_router.routes[0].input_ordinals[0]"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
     }
@@ -1370,9 +1379,10 @@ mod tests {
             sink: Some(plan::DataSink {
                 kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
                     plan::ChangeStreamRouterSink {
-                        branches: vec![plan::ChangeStreamBranchRoute {
-                            branch_kind: plan::ChangeStreamBranchKind::FreshData as i32,
-                            output_ordinals: vec![0],
+                        routes: vec![plan::ChangeStreamBranchRoute {
+                            route_id: vec![1; 32],
+                            accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+                            input_ordinals: vec![0],
                             output_partition_ordinals: vec![1],
                             ..Default::default()
                         }],
@@ -1382,7 +1392,7 @@ mod tests {
             }),
             output_columns: vec![common::OutputColumn {
                 column_id: 1,
-                name: "change_op".to_string(),
+                name: "effect".to_string(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1394,7 +1404,7 @@ mod tests {
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
             protocol.path().to_string(),
-            "plan_fragment.sink.change_stream_router.branches[0].output_partition_ordinals[0]"
+            "plan_fragment.sink.change_stream_router.routes[0].output_partition_ordinals[0]"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
     }
@@ -1404,7 +1414,7 @@ mod tests {
         let sink = plan::DataSink {
             kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
                 plan::ChangeStreamRouterSink {
-                    branches: vec![plan::ChangeStreamBranchRoute {
+                    routes: vec![plan::ChangeStreamBranchRoute {
                         destinations: Some(plan::StreamDestinationList {
                             destinations: vec![plan_destination(12)],
                         }),

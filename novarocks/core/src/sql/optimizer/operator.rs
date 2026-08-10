@@ -443,14 +443,13 @@ pub(crate) struct RepeatOp {
 pub(crate) struct ChangeEventExpandOp {
     pub(crate) events: Vec<ChangeEventSpec>,
     pub(crate) output_columns: Vec<OutputColumn>,
-    pub(crate) change_op_column_id: ColumnId,
-    pub(crate) data_route_column_id: Option<ColumnId>,
+    pub(crate) effect_column_id: ColumnId,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeEventSpec {
     pub(crate) predicate: Option<ScalarId>,
-    pub(crate) branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind,
+    pub(crate) effect: crate::sql::common::change_stream::ConnectorRowMutationEffect,
     pub(crate) assignments: Vec<ChangeEventOutputExpr>,
 }
 

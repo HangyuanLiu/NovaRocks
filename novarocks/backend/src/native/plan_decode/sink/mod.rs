@@ -38,9 +38,9 @@ use novarocks_protocol::novarocks as native_proto;
 use novarocks_protocol::{common, expr, plan};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorWriteExecutionId,
-    ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity, StatisticsMetric,
-    StatisticsMetricRequest,
+    ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorRowMutationEffect,
+    ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
+    ConnectorWriterIdentity, StatisticsMetric, StatisticsMetricRequest,
 };
 
 use super::context::NativePlanDecodeContext;
@@ -584,14 +584,14 @@ pub(crate) fn decode_fragment_sink_assignment(
         }
         plan::data_sink::Kind::ChangeStreamRouter(router) => {
             let groups = router
-                .branches
+                .routes
                 .iter()
                 .enumerate()
                 .map(|(index, branch)| {
                     let group_path = path
                         .clone()
                         .field("change_stream_router")
-                        .field("branches")
+                        .field("routes")
                         .index(index)
                         .field("destinations");
                     let group = branch.destinations.as_ref().ok_or_else(|| {
@@ -732,41 +732,26 @@ fn decode_change_stream_router_program(
     layout: &Layout,
     context: Option<&NativePlanDecodeContext>,
 ) -> Result<SplitDataStreamSinkProgram, NativeFragmentLeafDecodeError> {
-    let change_op_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
+    let effect_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
         output_columns,
-        router.change_op_output_ordinal,
-        "change_op_output_ordinal",
+        router.effect_output_ordinal,
+        "effect_output_ordinal",
     )?)
     .map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
-            "change_op_output_ordinal",
+            "effect_output_ordinal",
             error,
         )
     })?;
-    let data_route_slot_id = router
-        .data_route_output_ordinal
-        .map(|ordinal| {
-            output_slot_id_for_ordinal(output_columns, ordinal, "data_route_output_ordinal")
-        })
-        .transpose()?
-        .map(SlotId::try_from)
-        .transpose()
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "data_route_output_ordinal",
-                error,
-            )
-        })?;
     let mut partition_arena = ExprArena::default();
     let branches = router
-        .branches
+        .routes
         .iter()
         .enumerate()
         .map(|(index, branch)| {
             let branch_path = |error: NativeFragmentLeafDecodeError| {
-                error.prepend_index(index).prepend_field("branches")
+                error.prepend_index(index).prepend_field("routes")
             };
             let partition = branch_partition_from_native(branch, output_exprs).map_err(branch_path)?;
             let partition_type = decode_stream_partition_type(partition.kind).map_err(|error| {
@@ -793,7 +778,7 @@ fn decode_change_stream_router_program(
                             FieldPath::root("plan_fragment")
                                 .field("sink")
                                 .field("change_stream_router")
-                                .field("branches")
+                                .field("routes")
                                 .index(index)
                                 .field("output_partition")
                                 .field("exprs")
@@ -810,7 +795,7 @@ fn decode_change_stream_router_program(
                             .append_index(expr_index)
                             .prepend_field("output_partition")
                             .prepend_index(index)
-                            .prepend_field("branches")
+                            .prepend_field("routes")
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -818,19 +803,26 @@ fn decode_change_stream_router_program(
                 Vec::new()
             };
             let branch_output_columns = decode_router_output_slots(
-                &branch.output_ordinals,
+                &branch.input_ordinals,
                 output_columns,
-                "output_ordinals",
+                "input_ordinals",
             )
             .map_err(branch_path)?;
+            let _route_id = decode_route_id(&branch.route_id).map_err(|error| branch_path(
+                NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "route_id", error)
+            ))?;
+            let accepted_effects = branch.accepted_effects.iter().enumerate().map(|(effect_index, value)| {
+                decode_row_mutation_effect(*value).map_err(|error| branch_path(
+                    NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidEnum, "accepted_effects", error).append_index(effect_index)
+                ))
+            }).collect::<Result<Vec<_>, _>>()?;
+            if accepted_effects.is_empty() {
+                return Err(branch_path(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField, "accepted_effects", "native CHANGE_STREAM_ROUTER_SINK route accepts no effects"
+                )));
+            }
             Ok((
-                decode_change_stream_branch_kind(branch.branch_kind).map_err(|error| {
-                    branch_path(NativeFragmentLeafDecodeError::at_field(
-                        ProtocolErrorKind::InvalidEnum,
-                        "branch_kind",
-                        error,
-                    ))
-                })?,
+                accepted_effects,
                 DataStreamSinkBranchProgram::try_new(
                     branch.target_exchange_node_id,
                     Vec::new(),
@@ -849,15 +841,14 @@ fn decode_change_stream_router_program(
             ))
         })
         .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
-    let (branch_kinds, streams): (Vec<_>, Vec<_>) = branches.into_iter().unzip();
-    let split_exprs = branch_kinds
+    let (accepted_effect_sets, streams): (Vec<_>, Vec<_>) = branches.into_iter().unzip();
+    let split_exprs = accepted_effect_sets
         .into_iter()
-        .map(|branch_kind| {
+        .map(|accepted_effects| {
             build_change_stream_split_predicate(
                 &mut partition_arena,
-                change_op_slot_id,
-                data_route_slot_id,
-                branch_kind,
+                effect_slot_id,
+                &accepted_effects,
             )
             .map_err(|error| {
                 NativeFragmentLeafDecodeError::at_field(
@@ -982,25 +973,26 @@ fn decode_router_output_slots(
     decoded
 }
 
-fn decode_change_stream_branch_kind(
-    value: i32,
-) -> Result<novarocks_types::change_stream::ChangeStreamBranchKind, String> {
-    match plan::ChangeStreamBranchKind::try_from(value)
-        .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
+fn decode_row_mutation_effect(value: i32) -> Result<ConnectorRowMutationEffect, String> {
+    match plan::RowMutationEffect::try_from(value)
+        .map_err(|_| format!("unknown native RowMutationEffect value {value}"))?
     {
-        plan::ChangeStreamBranchKind::DeleteDv => {
-            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::DeleteDv)
-        }
-        plan::ChangeStreamBranchKind::ReuseData => {
-            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::ReuseData)
-        }
-        plan::ChangeStreamBranchKind::FreshData => {
-            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::FreshData)
-        }
-        plan::ChangeStreamBranchKind::Unspecified => {
-            Err("native ChangeStreamBranchKind is unspecified".to_string())
+        plan::RowMutationEffect::Delete => Ok(ConnectorRowMutationEffect::Delete),
+        plan::RowMutationEffect::Replace => Ok(ConnectorRowMutationEffect::Replace),
+        plan::RowMutationEffect::Insert => Ok(ConnectorRowMutationEffect::Insert),
+        plan::RowMutationEffect::Unspecified => {
+            Err("native RowMutationEffect is unspecified".to_string())
         }
     }
+}
+
+fn decode_route_id(value: &[u8]) -> Result<[u8; 32], String> {
+    value.try_into().map_err(|_| {
+        format!(
+            "native route_id must contain exactly 32 bytes, got {}",
+            value.len()
+        )
+    })
 }
 
 fn decode_stream_destination_list(
@@ -1085,11 +1077,11 @@ mod tests {
     use novarocks::exec::chunk::{Chunk, ChunkSchema};
     use novarocks::runtime::fragment::FragmentSinkAssignment;
     use novarocks_protocol::{expr, novarocks as proto, plan};
-    use novarocks_types::change_stream::ChangeStreamBranchKind;
+    use novarocks_spi::connector::ConnectorRowMutationEffect;
 
     use super::{
-        decode_change_stream_branch_kind, decode_connector_write_output_expressions,
-        decode_fragment_sink_assignment,
+        decode_connector_write_output_expressions, decode_fragment_sink_assignment,
+        decode_row_mutation_effect,
     };
     use crate::native::plan_decode::context::NativePlanDecodeContext;
     use crate::native::plan_decode::layout::Layout;
@@ -1168,26 +1160,26 @@ mod tests {
     }
 
     #[test]
-    fn change_stream_branch_kind_decoding_uses_neutral_values_and_rejects_invalid_wire_values() {
+    fn row_mutation_effect_decoding_rejects_unspecified_and_unknown_values() {
         assert_eq!(
-            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::DeleteDv as i32),
-            Ok(ChangeStreamBranchKind::DeleteDv)
+            decode_row_mutation_effect(plan::RowMutationEffect::Delete as i32),
+            Ok(ConnectorRowMutationEffect::Delete)
         );
         assert_eq!(
-            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::ReuseData as i32),
-            Ok(ChangeStreamBranchKind::ReuseData)
+            decode_row_mutation_effect(plan::RowMutationEffect::Replace as i32),
+            Ok(ConnectorRowMutationEffect::Replace)
         );
         assert_eq!(
-            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::FreshData as i32),
-            Ok(ChangeStreamBranchKind::FreshData)
+            decode_row_mutation_effect(plan::RowMutationEffect::Insert as i32),
+            Ok(ConnectorRowMutationEffect::Insert)
         );
         assert_eq!(
-            decode_change_stream_branch_kind(plan::ChangeStreamBranchKind::Unspecified as i32),
-            Err("native ChangeStreamBranchKind is unspecified".to_string())
+            decode_row_mutation_effect(plan::RowMutationEffect::Unspecified as i32),
+            Err("native RowMutationEffect is unspecified".to_string())
         );
         assert_eq!(
-            decode_change_stream_branch_kind(99),
-            Err("unknown native ChangeStreamBranchKind value 99".to_string())
+            decode_row_mutation_effect(99),
+            Err("unknown native RowMutationEffect value 99".to_string())
         );
     }
 

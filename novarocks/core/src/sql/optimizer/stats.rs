@@ -2952,7 +2952,6 @@ mod tests {
 
     #[test]
     fn change_event_expand_output_columns_are_declared_schema() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
         use crate::sql::optimizer::operator::{
             ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator, ValuesOp,
@@ -2990,15 +2989,14 @@ mod tests {
             op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
                 events: vec![ChangeEventSpec {
                     predicate: None,
-                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                    effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
                     assignments: vec![ChangeEventOutputExpr {
                         output_column_id: ColumnId::new_for_test(101),
                         expr: None,
                     }],
                 }],
                 output_columns: output_columns.clone(),
-                change_op_column_id: ColumnId::new_for_test(103),
-                data_route_column_id: None,
+                effect_column_id: ColumnId::new_for_test(103),
             }),
             children: vec![child],
         });

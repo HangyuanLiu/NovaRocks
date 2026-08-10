@@ -386,7 +386,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
     use crate::sql::planner::distributed::write::change_stream::{
-        ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec,
+        ChangeStreamWriteDagSpec, ChangeStreamWriteRouteSpec,
     };
     use crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding;
     use crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan;
@@ -398,6 +398,10 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use novarocks_spi::connector::{
+        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
+        ConnectorWriteFieldToken, ConnectorWriteRouteId,
+    };
 
     use super::{
         TopologyError, build_topology_contract, select_execution_anchor, topological_order,
@@ -656,7 +660,13 @@ mod tests {
 
     fn change_stream_router_plan() -> DistributedPlan {
         let output_columns = vec![
-            output_col(1, "op"),
+            OutputColumn {
+                column_id: ColumnId::new_for_test(1),
+                name: "effect".to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                is_internal: true,
+            },
             output_col(2, "route"),
             output_col(3, "delete_id"),
         ];
@@ -676,9 +686,19 @@ mod tests {
             Vec::new(),
             Default::default(),
         );
-        let mut branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
-        branch.output_partition_ordinals = vec![2];
-        let dag = ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
+        let dag = ChangeStreamWriteDagSpec::for_test(0, vec![ChangeStreamWriteRouteSpec {
+            route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
+            cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
+            accepted_effects: vec![ConnectorRowMutationEffect::Delete],
+            input_ordinals: vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([9; 32]),
+                2,
+            )],
+            output_partition_ordinals: vec![2],
+            sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+                ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
+        }]);
         finalize_sql_change_stream_test_plan(builder, dag).expect("change-stream router plan seals")
     }
 

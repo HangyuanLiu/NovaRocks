@@ -76,6 +76,7 @@ pub(crate) mod mv_rewrite_prep;
 pub(crate) mod query_planning;
 pub(crate) mod query_prep;
 pub(crate) mod query_stats;
+pub mod row_mutation;
 pub(crate) mod statement;
 pub mod statistics;
 pub mod statistics_application;
@@ -4754,7 +4755,7 @@ enum ChangeStreamWriteEntrypoint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChangeStreamWriteBuildObservation {
     entrypoint: ChangeStreamWriteEntrypoint,
-    branch_kinds: Vec<crate::sql::common::ChangeStreamBranchKind>,
+    effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
     writer_fragment_ids: Vec<Option<crate::sql::planner::distributed::FragmentId>>,
 }
 
@@ -4830,15 +4831,15 @@ pub(crate) fn observe_change_stream_write_build_for_test(
         .observations
         .push(ChangeStreamWriteBuildObservation {
             entrypoint: ChangeStreamWriteEntrypoint::PhysicalPlan,
-            branch_kinds: topology
-                .writer_branches
+            effects: topology
+                .writer_routes
                 .iter()
-                .map(|branch| branch.branch_kind)
+                .flat_map(|route| route.accepted_effects.iter().copied())
                 .collect(),
             writer_fragment_ids: topology
-                .writer_branches
+                .writer_routes
                 .iter()
-                .map(|branch| Some(branch.writer_fragment_id))
+                .map(|route| Some(route.writer_fragment_id))
                 .collect(),
         });
     if observer.short_circuit_after_build {
@@ -9121,7 +9122,6 @@ path = "meta/operations.sqlite"
     #[test]
     fn planned_change_stream_write_uses_physical_plan_entrypoint() {
         use crate::sql::column_id::ColumnId;
-        use crate::sql::common::ChangeStreamBranchKind;
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
         use crate::sql::optimizer::optimized_tree::{
             OptimizedOperatorNode, PlanExecutionProps, attach_scalar_arena,
@@ -9129,7 +9129,11 @@ path = "meta/operations.sqlite"
         use crate::sql::optimizer::scalar::ScalarArena;
         use crate::sql::optimizer::statistics::Statistics;
         use crate::sql::planner::distributed::write::change_stream::{
-            ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec,
+            ChangeStreamWriteDagSpec, ChangeStreamWriteRouteSpec,
+        };
+        use novarocks_spi::connector::{
+            ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
+            ConnectorWriteFieldToken, ConnectorWriteRouteId,
         };
 
         let _test_guard = super::acquire_standalone_test_guard();
@@ -9137,14 +9141,14 @@ path = "meta/operations.sqlite"
         let output_columns = vec![
             crate::sql::analysis::OutputColumn {
                 column_id: ColumnId::new_for_test(1),
-                name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
-                data_type: DataType::Int32,
+                name: crate::sql::common::change_stream::ROW_MUTATION_EFFECT_COLUMN.to_string(),
+                data_type: DataType::Int8,
                 nullable: false,
                 is_internal: true,
             },
             crate::sql::analysis::OutputColumn {
                 column_id: ColumnId::new_for_test(2),
-                name: "__change_data_route".to_string(),
+                name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
                 is_internal: true,
@@ -9174,8 +9178,22 @@ path = "meta/operations.sqlite"
         };
         attach_scalar_arena(&mut optimized_tree, Arc::new(ScalarArena::new()));
         let state = Arc::new(StandaloneState::default());
-        let branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![2]);
-        let mut dag = ChangeStreamWriteDagSpec::for_test(Some(0), Some(1), vec![branch]);
+        let mut dag = ChangeStreamWriteDagSpec::for_test(
+            0,
+            vec![ChangeStreamWriteRouteSpec {
+                route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
+                cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
+                accepted_effects: vec![ConnectorRowMutationEffect::Replace],
+                input_ordinals: vec![ConnectorMutationRouteInput::new(
+                    ConnectorWriteFieldToken::from_bytes([9; 32]),
+                    1,
+                )],
+                output_partition_ordinals: Vec::new(),
+                sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+                    crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                ),
+            }],
+        );
 
         let result = super::execute_physical_plan_as_iceberg_change_stream_write(
             &state,
@@ -9197,8 +9215,8 @@ path = "meta/operations.sqlite"
             super::ChangeStreamWriteEntrypoint::PhysicalPlan
         );
         assert_eq!(
-            observation.branch_kinds,
-            vec![ChangeStreamBranchKind::ReuseData]
+            observation.effects,
+            vec![ConnectorRowMutationEffect::Replace]
         );
         assert_eq!(observation.writer_fragment_ids.len(), 1);
         assert!(

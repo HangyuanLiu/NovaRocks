@@ -1336,7 +1336,7 @@ mod tests {
             plan::plan_node::Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
                 events: vec![plan::DistributedChangeEventSpec {
                     predicate: None,
-                    branch_kind: plan::ChangeStreamBranchKind::DeleteDv as i32,
+                    effect: plan::RowMutationEffect::Delete as i32,
                     assignments: vec![plan::DistributedChangeEventOutputExpr {
                         output_column_id: 2,
                         expr: None,
@@ -1346,8 +1346,7 @@ mod tests {
                     output_column(1, "id", DataType::Int64),
                     output_column(2, "op", DataType::Int8),
                 ],
-                change_op_column_id: 2,
-                data_route_column_id: None,
+                effect_column_id: 2,
             }),
             Vec::new(),
             vec![one_col_values_node(10)],
@@ -1360,7 +1359,7 @@ mod tests {
             change_event.output_slot_ids,
             vec![SlotId::new(1), SlotId::new(2)]
         );
-        assert_eq!(change_event.change_op_slot_id, SlotId::new(2));
+        assert_eq!(change_event.effect_slot_id, SlotId::new(2));
         assert_eq!(change_event.events.len(), 1);
 
         let redistribute = physical_node(

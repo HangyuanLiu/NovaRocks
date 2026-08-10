@@ -200,15 +200,15 @@ fn change_stream_writer_handle_payloads(
     table_bindings: &QueryTableBindingStore,
 ) -> Result<BTreeMap<i32, Bytes>, String> {
     let mut payloads = BTreeMap::new();
-    for branch in &topology.writer_branches {
-        let fragment_id = i32::try_from(branch.writer_fragment_id).map_err(|_| {
+    for route in &topology.writer_routes {
+        let fragment_id = i32::try_from(route.writer_fragment_id).map_err(|_| {
             format!(
                 "change-stream writer fragment {} exceeds i32 handle-map range",
-                branch.writer_fragment_id
+                route.writer_fragment_id
             )
         })?;
         let mut sink_spec =
-            iceberg_sink_spec_from_sealed_preparation(table_bindings, &branch.sink, entry, table)?;
+            iceberg_sink_spec_from_sealed_preparation(table_bindings, &route.sink, entry, table)?;
         sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
         let payload = match sink_spec.mode {
             IcebergWriteSinkMode::DeletionVectors => {

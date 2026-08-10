@@ -29,7 +29,6 @@ use std::fmt;
 
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::runtime_filter::contract::{
     BindingId, PlanFragmentId, PlanNodeId, RuntimeFilterLogicalDomain,
 };
@@ -342,14 +341,10 @@ fn validate_global_node_ids(fragments: &[PlanFragment]) -> Result<(), String> {
 /// single sink, so it may drive at most one plain stream edge and must not also
 /// drive a router edge; CTE multicast is exempt because fanning one producer out
 /// to many receivers is its entire purpose. A router source addresses exactly
-/// one router group, and within that group every branch edge must be uniquely
-/// addressable per field: no two edges may repeat the same `branch_id`, the same
-/// `branch_kind`, or the same target exchange (`target_fragment_id`,
-/// `target_exchange_node_id`). This per-field uniqueness is strictly stronger
-/// than full-tuple route uniqueness (it also rejects, e.g., two edges that share
-/// a `branch_id` but differ in `branch_kind` or target), so the execution
-/// coordinator can trust the sealed shape instead of re-validating any of these
-/// facts at dispatch time.
+/// one router group, and within that group every opaque route id and target
+/// exchange (`target_fragment_id`, `target_exchange_node_id`) is unique. This
+/// lets the execution coordinator trust the sealed route shape instead of
+/// re-validating provider-owned routing facts at dispatch time.
 fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
     let mut plain_stream_sources: BTreeSet<FragmentId> = BTreeSet::new();
     let mut router_sources: BTreeSet<FragmentId> = BTreeSet::new();
@@ -357,9 +352,10 @@ fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
     // Per-(source, group) uniqueness ledgers. Keying on the router group id keeps
     // this aligned with the router sink template even though a source is limited
     // to a single group by the check above.
-    let mut branch_ids_by_group: BTreeMap<(FragmentId, i32), BTreeSet<i32>> = BTreeMap::new();
-    let mut branch_kinds_by_group: BTreeMap<(FragmentId, i32), BTreeSet<ChangeStreamBranchKind>> =
-        BTreeMap::new();
+    let mut route_ids_by_group: BTreeMap<
+        (FragmentId, i32),
+        BTreeSet<novarocks_spi::connector::ConnectorWriteRouteId>,
+    > = BTreeMap::new();
     let mut target_exchanges_by_group: BTreeMap<(FragmentId, i32), BTreeSet<(FragmentId, i32)>> =
         BTreeMap::new();
 
@@ -378,8 +374,7 @@ fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
             FragmentEdgeKind::CteMulticast { .. } => {}
             FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id,
-                branch_id,
-                branch_kind,
+                route_id,
             } => {
                 router_sources.insert(edge.source_fragment_id);
                 let groups = router_groups_by_source
@@ -392,29 +387,17 @@ fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
                         edge.source_fragment_id
                     ));
                 }
-                // Per-field uniqueness within the (source, group). Each check is
-                // strictly stronger than full-tuple route uniqueness, so the
-                // coordinator can trust the sealed shape rather than re-checking
-                // branch id / kind / target exchange at dispatch time.
+                // Route ids are provider-signed opaque keys. Their uniqueness
+                // is the only route identity invariant at this SQL boundary.
                 let group_key = (edge.source_fragment_id, *router_group_id);
-                if !branch_ids_by_group
+                if !route_ids_by_group
                     .entry(group_key)
                     .or_default()
-                    .insert(*branch_id)
+                    .insert(*route_id)
                 {
                     return Err(format!(
-                        "lower_distributed_plan router group source_fragment_id={} router_group_id={} repeats branch_id={}",
-                        edge.source_fragment_id, router_group_id, branch_id
-                    ));
-                }
-                if !branch_kinds_by_group
-                    .entry(group_key)
-                    .or_default()
-                    .insert(*branch_kind)
-                {
-                    return Err(format!(
-                        "lower_distributed_plan router group source_fragment_id={} router_group_id={} repeats branch_kind={:?}",
-                        edge.source_fragment_id, router_group_id, branch_kind
+                        "lower_distributed_plan router group source_fragment_id={} router_group_id={} repeats opaque route id {:?}",
+                        edge.source_fragment_id, router_group_id, route_id
                     ));
                 }
                 let target_exchange = (edge.target_fragment_id, edge.target_exchange_node_id);
@@ -527,8 +510,7 @@ fn validate_finalized_edge(
         }
         FragmentEdgeKind::ChangeStreamRouter {
             router_group_id,
-            branch_id,
-            branch_kind,
+            route_id,
         } => {
             let DataSink::ChangeStreamRouter(router) = &source.sink else {
                 return Err(edge_error(
@@ -537,19 +519,23 @@ fn validate_finalized_edge(
                 ));
             };
             let route = router
-                .branches
+                .routes
                 .iter()
                 .find(|route| {
                     router.group_id == *router_group_id
-                        && route.branch_id == *branch_id
-                        && route.branch_kind == *branch_kind
+                        && route.route_id == *route_id
                         && route.target_fragment_id == edge.target_fragment_id
                         && route.target_exchange_node_id == edge.target_exchange_node_id
                 })
-                .ok_or_else(|| edge_error(edge, "has no exact matching router branch route"))?;
+                .ok_or_else(|| edge_error(edge, "has no exact matching opaque router route"))?;
+            let route_output_ordinals = route
+                .input_ordinals
+                .iter()
+                .map(|binding| binding.input_ordinal() as usize)
+                .collect::<Vec<_>>();
             let expected_slots = checked_output_slot_ids_for_ordinals(
                 &source.output_columns,
-                &route.output_ordinals,
+                &route_output_ordinals,
                 edge,
                 "router output",
             )?;
@@ -930,7 +916,6 @@ mod tests {
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::test_support::{
         DistributedPlanDraftBuilder, distributed_plan_draft_builder_for_test,
         distributed_plan_for_test, draft_builder_from_plan,
@@ -942,6 +927,10 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use novarocks_spi::connector::{
+        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
+        ConnectorWriteFieldToken, ConnectorWriteRouteId,
+    };
 
     fn stats() -> PhysicalPlanStats {
         PhysicalPlanStats {
@@ -1045,7 +1034,13 @@ mod tests {
 
     fn finalized_router_plan() -> DistributedPlan {
         let output_columns = vec![
-            output_col(1, "op"),
+            AnalysisOutputColumn {
+                column_id: ColumnId::new_for_test(1),
+                name: "effect".to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                is_internal: true,
+            },
             output_col(2, "route"),
             output_col(3, "delete_id"),
         ];
@@ -1065,11 +1060,20 @@ mod tests {
             runtime_filter_graph: Default::default(),
             edges: Vec::new(),
         };
-        let mut branch =
-            crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
-        branch.output_partition_ordinals = vec![2];
-        let dag =
-            crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
+        let route = crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec {
+            route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
+            cohort_id: ConnectorWriteCohortId::from_bytes([6; 32]),
+            accepted_effects: vec![ConnectorRowMutationEffect::Delete],
+            input_ordinals: vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                2,
+            )],
+            output_partition_ordinals: vec![2],
+            sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
+        };
+        let dag = crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(0, vec![route]);
         crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan(dp, dag)
             .expect("plan change-stream write")
     }
@@ -1307,12 +1311,12 @@ mod tests {
 
         let mut route_mismatch = draft_builder_from_plan(&planned, Default::default());
         {
-            let FragmentEdgeKind::ChangeStreamRouter { branch_id, .. } =
+            let FragmentEdgeKind::ChangeStreamRouter { route_id, .. } =
                 &mut route_mismatch.edges_mut()[0].edge_kind
             else {
                 panic!("expected router edge");
             };
-            *branch_id += 1;
+            *route_id = ConnectorWriteRouteId::from_bytes([9; 32]);
         }
         let err = route_mismatch
             .seal()
@@ -1379,7 +1383,7 @@ mod tests {
     #[test]
     fn finalized_router_shape_rejects_two_edges_to_one_receiver() {
         // Two router edges in one group point at the same target exchange while
-        // differing in branch_id and branch_kind. Full-tuple route uniqueness
+        // differing in opaque route id. Full-tuple route uniqueness
         // would accept this and lean on the "conflicting partitions for the same
         // target Exchange" backstop in `validate_finalized_edge`; the seal's
         // per-source target-exchange uniqueness now rejects a second edge to one
@@ -1397,15 +1401,15 @@ mod tests {
             let DataSink::ChangeStreamRouter(router) = &mut source.sink else {
                 panic!("expected router sink");
             };
-            let mut second_route = router.branches[0].clone();
-            second_route.branch_id += 1;
-            // A distinct branch_kind clears the branch_id and branch_kind ledgers
-            // so the target-exchange ledger is what rejects the duplicate receiver.
-            second_route.branch_kind = ChangeStreamBranchKind::ReuseData;
-            second_route.output_ordinals = vec![1];
+            let mut second_route = router.routes[0].clone();
+            second_route.route_id = ConnectorWriteRouteId::from_bytes([8; 32]);
+            second_route.input_ordinals = vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([10; 32]),
+                1,
+            )];
             second_route.output_partition_ordinals = vec![1];
             let router_group_id = router.group_id;
-            router.branches.push(second_route.clone());
+            router.routes.push(second_route.clone());
 
             builder.edges_mut().push(FragmentEdge {
                 source_fragment_id: first_edge.source_fragment_id,
@@ -1426,8 +1430,7 @@ mod tests {
                 stream_kind: FragmentStreamKind::Partitioned,
                 edge_kind: FragmentEdgeKind::ChangeStreamRouter {
                     router_group_id,
-                    branch_id: second_route.branch_id,
-                    branch_kind: second_route.branch_kind,
+                    route_id: second_route.route_id,
                 },
                 output_slot_ids: vec![2],
             });
@@ -1599,8 +1602,7 @@ mod tests {
         target: u32,
         node: i32,
         group: i32,
-        branch: i32,
-        kind: ChangeStreamBranchKind,
+        route_byte: u8,
     ) -> FragmentEdge {
         FragmentEdge {
             source_fragment_id: source,
@@ -1610,8 +1612,7 @@ mod tests {
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id: group,
-                branch_id: branch,
-                branch_kind: kind,
+                route_id: ConnectorWriteRouteId::from_bytes([route_byte; 32]),
             },
             output_slot_ids: Vec::new(),
         }
@@ -1652,10 +1653,7 @@ mod tests {
             plain_fragment(1, 11, DataSink::Noop),
             plain_fragment(2, 12, DataSink::Noop),
         ];
-        let edges = vec![
-            stream_edge(1, 0, 100),
-            router_edge(1, 2, 101, 0, 0, ChangeStreamBranchKind::DeleteDv),
-        ];
+        let edges = vec![stream_edge(1, 0, 100), router_edge(1, 2, 101, 0, 1)];
 
         let err = seal_shape(fragments, edges).expect_err("plain/router mix must not seal");
         assert!(
@@ -1671,10 +1669,7 @@ mod tests {
             plain_fragment(1, 11, DataSink::Noop),
             plain_fragment(2, 12, DataSink::Noop),
         ];
-        let edges = vec![
-            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
-            router_edge(1, 2, 101, 1, 0, ChangeStreamBranchKind::DeleteDv),
-        ];
+        let edges = vec![router_edge(1, 0, 100, 0, 1), router_edge(1, 2, 101, 1, 2)];
 
         let err = seal_shape(fragments, edges)
             .expect_err("multiple router groups per source must not seal");
@@ -1685,63 +1680,31 @@ mod tests {
     }
 
     #[test]
-    fn structural_validation_rejects_repeated_router_branch_id() {
-        // Two router edges in one group repeat branch_id=0 while differing in
-        // branch_kind and target. Full-tuple route uniqueness would accept this;
-        // the seal's per-field branch_id uniqueness rejects it (strictly
-        // stronger), so the coordinator no longer needs to.
+    fn structural_validation_rejects_repeated_opaque_router_route() {
+        // Provider route ids are opaque but must be unique within one router
+        // group, independent of their accepted logical-effect sets.
         let fragments = vec![
             plain_fragment(0, 10, DataSink::Result),
             plain_fragment(1, 11, DataSink::Noop),
             plain_fragment(2, 12, DataSink::Noop),
         ];
-        let edges = vec![
-            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
-            router_edge(1, 2, 101, 0, 0, ChangeStreamBranchKind::ReuseData),
-        ];
+        let edges = vec![router_edge(1, 0, 100, 0, 1), router_edge(1, 2, 101, 0, 1)];
 
-        let err =
-            seal_shape(fragments, edges).expect_err("repeated router branch_id must not seal");
-        assert!(err.contains("repeats branch_id=0"), "{err}");
+        let err = seal_shape(fragments, edges).expect_err("repeated router route must not seal");
+        assert!(err.contains("repeats opaque route id"), "{err}");
         assert!(err.contains("source_fragment_id=1"), "{err}");
         assert!(err.contains("router_group_id=0"), "{err}");
     }
 
     #[test]
-    fn structural_validation_rejects_repeated_router_branch_kind() {
-        // Distinct branch_ids (0, 1) but a repeated branch_kind within the group:
-        // the branch_id ledger passes, the branch_kind ledger rejects. Full-tuple
-        // uniqueness would accept this.
-        let fragments = vec![
-            plain_fragment(0, 10, DataSink::Result),
-            plain_fragment(1, 11, DataSink::Noop),
-            plain_fragment(2, 12, DataSink::Noop),
-        ];
-        let edges = vec![
-            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
-            router_edge(1, 2, 101, 0, 1, ChangeStreamBranchKind::DeleteDv),
-        ];
-
-        let err =
-            seal_shape(fragments, edges).expect_err("repeated router branch_kind must not seal");
-        assert!(err.contains("repeats branch_kind=DeleteDv"), "{err}");
-        assert!(err.contains("source_fragment_id=1"), "{err}");
-        assert!(err.contains("router_group_id=0"), "{err}");
-    }
-
     #[test]
     fn structural_validation_rejects_repeated_router_target_exchange() {
-        // Distinct branch_ids and branch_kinds, but both edges target the same
-        // exchange (fragment 0, node 100): the target-exchange ledger rejects.
-        // Full-tuple uniqueness would accept this.
+        // Distinct opaque routes that target the same exchange are rejected.
         let fragments = vec![
             plain_fragment(0, 10, DataSink::Result),
             plain_fragment(1, 11, DataSink::Noop),
         ];
-        let edges = vec![
-            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
-            router_edge(1, 0, 100, 0, 1, ChangeStreamBranchKind::ReuseData),
-        ];
+        let edges = vec![router_edge(1, 0, 100, 0, 1), router_edge(1, 0, 100, 0, 2)];
 
         let err = seal_shape(fragments, edges)
             .expect_err("repeated router target exchange must not seal");

@@ -63,11 +63,12 @@ impl ConnectorRowMutationIntent {
 
 /// SQL-visible semantics only. A value is never a deletion-vector, rewrite,
 /// or table-format route discriminator.
+#[repr(i8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ConnectorRowMutationEffect {
-    Delete,
-    Replace,
-    Insert,
+    Delete = 1,
+    Replace = 2,
+    Insert = 3,
 }
 
 /// Fixed-width opaque provider route key. Native plans reject every other
@@ -149,10 +150,10 @@ impl ConnectorMutationEffectField {
         field: Field,
         target_ordinal: u32,
     ) -> Result<Self, ConnectorError> {
-        if field.data_type() != &DataType::UInt8 || field.is_nullable() {
+        if field.data_type() != &DataType::Int8 || field.is_nullable() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "row-mutation effect field must be non-null UInt8",
+                "row-mutation effect field must be non-null Int8",
             ));
         }
         Ok(Self {
@@ -564,6 +565,9 @@ impl ConnectorRowMutationPreparation {
     pub fn match_contract(&self) -> &ConnectorMutationMatchContract {
         &self.match_contract
     }
+    pub fn base_version(&self) -> &ConnectorWriteBaseVersion {
+        &self.base_version
+    }
     pub const fn strategy(&self) -> ConnectorRowMutationStrategy {
         self.strategy
     }
@@ -820,6 +824,25 @@ impl ConnectorRowMutationExecutionPlan {
     pub fn routes(&self) -> &[ConnectorRowMutationRoute] {
         match self {
             Self::Direct { routes } | Self::CopyOnWrite { routes, .. } => routes,
+        }
+    }
+
+    /// Returns the immutable cohort set and Provider-private rewrite recipes
+    /// only for a Copy-on-Write activation.  Callers may transport and seal
+    /// these values, but must not decode recipe payloads.
+    pub fn copy_on_write(
+        &self,
+    ) -> Option<(
+        &ConnectorSealedWriteCohortSet,
+        &[ConnectorRowMutationCohortRecipe],
+    )> {
+        match self {
+            Self::CopyOnWrite {
+                sealed_cohorts,
+                cohort_recipes,
+                ..
+            } => Some((sealed_cohorts, cohort_recipes)),
+            Self::Direct { .. } => None,
         }
     }
 }

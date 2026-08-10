@@ -81,7 +81,7 @@ use arrow::datatypes::DataType;
 use super::boundary::{
     BoundaryCatalog, BoundaryContract, ExecutionColumnId, ExecutionColumnIdAllocator,
 };
-use super::write::change_stream::ChangeStreamBranchRoute;
+use super::write::change_stream::ChangeStreamRoute;
 use super::write::contract::ConnectorWriteInputBinding;
 use super::write::sink::ConnectorWritePlanInput;
 use super::{
@@ -1776,10 +1776,11 @@ pub struct WriteContractCatalog {
     /// Finalized Iceberg write output/target-schema, keyed by fragment id. Only
     /// Connector-write fragments with a frozen output contract are present.
     connector_write_outputs: BTreeMap<FragmentId, ConnectorWriteOutputContract>,
-    /// Finalized change-stream router branch partition, keyed by the router
-    /// fragment id and the branch id. Only `DataSink::ChangeStreamRouter`
+    /// Finalized row-mutation router partition, keyed by the router fragment
+    /// id and opaque route id. Only `DataSink::ChangeStreamRouter`
     /// fragments contribute entries.
-    router_branch_partitions: BTreeMap<(FragmentId, i32), DataPartition>,
+    router_branch_partitions:
+        BTreeMap<(FragmentId, novarocks_spi::connector::ConnectorWriteRouteId), DataPartition>,
 }
 
 impl WriteContractCatalog {
@@ -1792,15 +1793,15 @@ impl WriteContractCatalog {
         self.connector_write_outputs.get(&fragment_id)
     }
 
-    /// The finalized partition of the change-stream router branch identified by
-    /// `(fragment_id, branch_id)`, or `None` if that fragment is not a router or
-    /// the branch id is unknown.
-    pub fn router_branch_partition(
+    /// The finalized partition of the row-mutation router route identified by
+    /// `(fragment_id, route_id)`, or `None` if that fragment is not a router or
+    /// the opaque route id is unknown.
+    pub fn router_route_partition(
         &self,
         fragment_id: FragmentId,
-        branch_id: i32,
+        route_id: novarocks_spi::connector::ConnectorWriteRouteId,
     ) -> Option<&DataPartition> {
-        self.router_branch_partitions.get(&(fragment_id, branch_id))
+        self.router_branch_partitions.get(&(fragment_id, route_id))
     }
 }
 
@@ -1843,7 +1844,7 @@ pub(in crate::sql::planner::distributed) enum WriteContractError {
     /// ordinal->expression reconstruction out-of-range check.
     RouterPartitionOrdinalOutOfRange {
         fragment_id: FragmentId,
-        branch_id: i32,
+        route_id: novarocks_spi::connector::ConnectorWriteRouteId,
         ordinal: usize,
         available: usize,
     },
@@ -1885,12 +1886,13 @@ impl fmt::Display for WriteContractError {
             ),
             Self::RouterPartitionOrdinalOutOfRange {
                 fragment_id,
-                branch_id,
+                route_id,
                 ordinal,
                 available,
             } => write!(
                 formatter,
-                "distributed plan change-stream router fragment id={fragment_id} branch {branch_id} partition references output ordinal {ordinal} but only {available} output columns exist"
+                "distributed plan row-mutation router fragment id={fragment_id} route {:?} partition references output ordinal {ordinal} but only {available} output columns exist",
+                route_id
             ),
         }
     }
@@ -1916,10 +1918,10 @@ pub(in crate::sql::planner::distributed) fn build_write_contract_catalog(
                 }
             }
             DataSink::ChangeStreamRouter(router) => {
-                for branch in &router.branches {
-                    let partition = finalize_router_branch_partition(fragment, branch)?;
+                for route in &router.routes {
+                    let partition = finalize_router_route_partition(fragment, route)?;
                     router_branch_partitions
-                        .insert((fragment.fragment_id, branch.branch_id), partition);
+                        .insert((fragment.fragment_id, route.route_id), partition);
                 }
             }
             DataSink::Result | DataSink::Noop | DataSink::Statistics(_) => {}
@@ -2059,19 +2061,19 @@ fn connector_write_input_columns<'a>(
 /// the encoder's removed ordinal->expression reconstruction: an empty ordinal
 /// list is unpartitioned, otherwise a hash partition over column references into
 /// the router fragment's output columns.
-fn finalize_router_branch_partition(
+fn finalize_router_route_partition(
     fragment: &PlanFragment,
-    branch: &ChangeStreamBranchRoute,
+    route: &ChangeStreamRoute,
 ) -> Result<DataPartition, WriteContractError> {
-    if branch.output_partition_ordinals.is_empty() {
+    if route.output_partition_ordinals.is_empty() {
         return Ok(DataPartition::unpartitioned());
     }
-    let mut exprs = Vec::with_capacity(branch.output_partition_ordinals.len());
-    for ordinal in &branch.output_partition_ordinals {
+    let mut exprs = Vec::with_capacity(route.output_partition_ordinals.len());
+    for ordinal in &route.output_partition_ordinals {
         let column = fragment.output_columns.get(*ordinal).ok_or(
             WriteContractError::RouterPartitionOrdinalOutOfRange {
                 fragment_id: fragment.fragment_id,
-                branch_id: branch.branch_id,
+                route_id: route.route_id,
                 ordinal: *ordinal,
                 available: fragment.output_columns.len(),
             },
@@ -2104,10 +2106,9 @@ mod tests {
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
     use crate::sql::planner::distributed::write::change_stream::{
-        ChangeStreamBranchRoute, ChangeStreamRouterSink,
+        ChangeStreamRoute, ChangeStreamRouterSink,
     };
     use crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding;
     use crate::sql::planner::distributed::write::sink::ConnectorWritePlanInput;
@@ -3411,7 +3412,7 @@ mod tests {
     /// encoder's single-fragment router fixture, which seals with vacuous edges).
     fn router_fragment(
         output_columns: Vec<OutputColumn>,
-        branches: Vec<ChangeStreamBranchRoute>,
+        routes: Vec<ChangeStreamRoute>,
     ) -> PlanFragment {
         PlanFragment {
             fragment_id: 0,
@@ -3420,9 +3421,8 @@ mod tests {
             output_partition: DataPartition::unpartitioned(),
             sink: DataSink::ChangeStreamRouter(ChangeStreamRouterSink {
                 group_id: 0,
-                change_op_output_ordinal: 0,
-                data_route_output_ordinal: Some(1),
-                branches,
+                effect_output_ordinal: 0,
+                routes,
             }),
             output_exprs: None,
             output_columns,
@@ -3431,17 +3431,31 @@ mod tests {
         }
     }
 
-    fn branch_route(
-        branch_id: i32,
-        output_ordinals: Vec<usize>,
+    fn route_for_test(
+        route_byte: u8,
+        input_ordinals: Vec<usize>,
         output_partition_ordinals: Vec<usize>,
-    ) -> ChangeStreamBranchRoute {
-        ChangeStreamBranchRoute {
-            branch_id,
-            branch_kind: ChangeStreamBranchKind::DeleteDv,
+    ) -> ChangeStreamRoute {
+        ChangeStreamRoute {
+            route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([route_byte; 32]),
+            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(
+                [route_byte.wrapping_add(1); 32],
+            ),
+            accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
+            input_ordinals: input_ordinals
+                .into_iter()
+                .enumerate()
+                .map(|(index, ordinal)| {
+                    novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                        novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(
+                            [route_byte.wrapping_add(index as u8 + 2); 32],
+                        ),
+                        ordinal as u32,
+                    )
+                })
+                .collect(),
             target_fragment_id: 1,
             target_exchange_node_id: 20,
-            output_ordinals,
             output_partition_ordinals,
         }
     }
@@ -3584,7 +3598,7 @@ mod tests {
                 output_col(2, "route"),
                 output_col(3, "bucket"),
             ],
-            vec![branch_route(0, vec![2], vec![5])],
+            vec![route_for_test(7, vec![2], vec![5])],
         );
         let error = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
             .expect_err("out-of-range router partition ordinal must not finalize");
@@ -3592,7 +3606,7 @@ mod tests {
             error,
             super::WriteContractError::RouterPartitionOrdinalOutOfRange {
                 fragment_id: 0,
-                branch_id: 0,
+                route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32]),
                 ordinal: 5,
                 available: 3,
             }
@@ -3702,8 +3716,8 @@ mod tests {
                     output_col(3, "bucket"),
                 ],
                 vec![
-                    branch_route(0, vec![2], vec![2]),
-                    branch_route(1, vec![2], Vec::new()),
+                    route_for_test(7, vec![2], vec![2]),
+                    route_for_test(8, vec![2], Vec::new()),
                 ],
             )],
             Some(0),
@@ -3715,8 +3729,11 @@ mod tests {
 
         let hashed = plan
             .write_contracts()
-            .router_branch_partition(0, 0)
-            .expect("branch 0 has a finalized partition");
+            .router_route_partition(
+                0,
+                novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32]),
+            )
+            .expect("route 0 has a finalized partition");
         assert!(matches!(hashed.kind, PartitionKind::Hash));
         assert_eq!(
             hashed.exprs.iter().map(column_ref_id).collect::<Vec<_>>(),
@@ -3725,8 +3742,11 @@ mod tests {
 
         let unpartitioned = plan
             .write_contracts()
-            .router_branch_partition(0, 1)
-            .expect("branch 1 has a finalized partition");
+            .router_route_partition(
+                0,
+                novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([8; 32]),
+            )
+            .expect("route 1 has a finalized partition");
         assert!(matches!(unpartitioned.kind, PartitionKind::Unpartitioned));
         assert!(unpartitioned.exprs.is_empty());
     }
@@ -3741,7 +3761,10 @@ mod tests {
         assert!(plan.write_contracts().connector_write_output(0).is_none());
         assert!(
             plan.write_contracts()
-                .router_branch_partition(0, 0)
+                .router_route_partition(
+                    0,
+                    novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32])
+                )
                 .is_none()
         );
     }

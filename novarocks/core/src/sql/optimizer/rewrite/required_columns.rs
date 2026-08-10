@@ -2425,7 +2425,6 @@ mod tests {
 
     #[test]
     fn change_event_expand_required_columns_include_predicates_and_assignments() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
         use crate::sql::optimizer::operator::{
             ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec,
         };
@@ -2450,7 +2449,7 @@ mod tests {
             Operator::LogicalChangeEventExpand(ChangeEventExpandOp {
                 events: vec![ChangeEventSpec {
                     predicate: Some(predicate),
-                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                    effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
                     assignments: vec![
                         ChangeEventOutputExpr {
                             output_column_id: ColumnId::new_for_test(101),
@@ -2463,8 +2462,7 @@ mod tests {
                     ],
                 }],
                 output_columns,
-                change_op_column_id: ColumnId::new_for_test(103),
-                data_route_column_id: None,
+                effect_column_id: ColumnId::new_for_test(103),
             }),
             vec![scan_with_3_cols(&arena_rc)],
         );

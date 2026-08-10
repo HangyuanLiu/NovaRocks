@@ -15,615 +15,341 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+//! SQL-owned row-mutation router topology.
+//!
+//! A sealed SQL plan carries only logical effects and opaque provider routes.
+//! It neither names nor infers a table-format strategy, row identity layout,
+//! or a physical data/delete branch.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use novarocks_spi::connector::{
+    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
+    ConnectorWriteFieldToken, ConnectorWriteRouteId,
+};
 
 use crate::sql::analysis::OutputColumn;
-use crate::sql::common::ChangeStreamBranchKind;
 
 use super::super::FragmentId;
 use super::contract::SqlWritePlanInput;
 
-/// Canonical internal output used by SQL change-stream plans to route rows to
-/// data writer branches. It is a planner contract and never reaches a user
-/// visible result schema.
-pub(crate) const CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
-
-/// A logical branch selected by the mutation kernel. SQL owns binding its
-/// sink columns to the producer output and assigning its stable branch id.
+/// One provider-signed route projected into a SQL router. The route id is
+/// opaque; its effect set and token-to-output-ordinal mapping are the only
+/// data needed by generic SQL topology construction.
 #[derive(Clone, Debug)]
-pub(crate) struct ChangeStreamWriteLayoutBranch {
-    pub(crate) branch_kind: ChangeStreamBranchKind,
+pub(crate) struct ChangeStreamWriteLayoutRoute {
+    pub(crate) route_id: ConnectorWriteRouteId,
+    pub(crate) cohort_id: ConnectorWriteCohortId,
+    pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
+    /// In provider input-field order, map each token to a producer output
+    /// ordinal. SQL never recovers that mapping from an internal column name.
+    pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
+    /// The provider-selected subset of `input_ordinals` used for partitioning.
+    pub(crate) partition_input_tokens: Vec<ConnectorWriteFieldToken>,
     pub(crate) sink: SqlWritePlanInput,
 }
 
-/// Planner-owned input for binding a logical change-stream branch set to one
-/// producer layout. The caller supplies no output ordinals or branch ids.
+/// Planner-owned input for binding a provider-selected route set to one
+/// immutable producer layout. The effect ordinal comes from the match
+/// contract's effect field, not a reserved name lookup.
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriteLayoutRequest<'a> {
     pub(crate) producer_output_columns: &'a [OutputColumn],
-    pub(crate) branches: Vec<ChangeStreamWriteLayoutBranch>,
-    pub(crate) target_partition_source_columns: &'a [String],
+    pub(crate) effect_output_ordinal: usize,
+    pub(crate) routes: Vec<ChangeStreamWriteLayoutRoute>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChangeStreamWriteBranchSpec {
-    pub(crate) branch_id: i32,
-    pub(crate) branch_kind: ChangeStreamBranchKind,
-    pub(crate) stream_output_ordinals: Vec<usize>,
+pub(crate) struct ChangeStreamWriteRouteSpec {
+    pub(crate) route_id: ConnectorWriteRouteId,
+    pub(crate) cohort_id: ConnectorWriteCohortId,
+    pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
+    pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
     pub(crate) output_partition_ordinals: Vec<usize>,
     pub(crate) sink: SqlWritePlanInput,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriteDagSpec {
-    pub(crate) change_op_output_ordinal: Option<usize>,
-    pub(crate) data_route_output_ordinal: Option<usize>,
-    pub(crate) branches: Vec<ChangeStreamWriteBranchSpec>,
+    pub(crate) effect_output_ordinal: usize,
+    pub(crate) routes: Vec<ChangeStreamWriteRouteSpec>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ChangeStreamRouterSink {
     pub(crate) group_id: i32,
-    pub(crate) change_op_output_ordinal: usize,
-    pub(crate) data_route_output_ordinal: Option<usize>,
-    pub(crate) branches: Vec<ChangeStreamBranchRoute>,
+    pub(crate) effect_output_ordinal: usize,
+    pub(crate) routes: Vec<ChangeStreamRoute>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChangeStreamBranchRoute {
-    pub(crate) branch_id: i32,
-    pub(crate) branch_kind: ChangeStreamBranchKind,
+pub(crate) struct ChangeStreamRoute {
+    pub(crate) route_id: ConnectorWriteRouteId,
+    pub(crate) cohort_id: ConnectorWriteCohortId,
+    pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
+    pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
     pub(crate) target_fragment_id: FragmentId,
     pub(crate) target_exchange_node_id: i32,
-    pub(crate) output_ordinals: Vec<usize>,
     pub(crate) output_partition_ordinals: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SqlChangeStreamWriteTopology {
-    pub(crate) writer_branches: Vec<SqlChangeStreamWriterBranch>,
+    pub(crate) writer_routes: Vec<SqlChangeStreamWriterRoute>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SqlChangeStreamWriterBranch {
-    pub(crate) branch_id: i32,
-    pub(crate) branch_kind: ChangeStreamBranchKind,
+pub(crate) struct SqlChangeStreamWriterRoute {
+    pub(crate) route_id: ConnectorWriteRouteId,
+    pub(crate) cohort_id: ConnectorWriteCohortId,
+    pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) writer_fragment_id: FragmentId,
     pub(crate) sink: SqlWritePlanInput,
 }
 
-impl ChangeStreamWriteBranchSpec {
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        branch_id: i32,
-        branch_kind: ChangeStreamBranchKind,
-        stream_output_ordinals: Vec<usize>,
-    ) -> Self {
-        Self {
-            branch_id,
-            branch_kind,
-            stream_output_ordinals,
-            output_partition_ordinals: Vec::new(),
-            sink: super::contract::test_support::simple_sql_write_plan_input(
-                super::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-            ),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn delete_dv_for_test(stream_output_ordinals: Vec<usize>) -> Self {
-        Self::for_test(0, ChangeStreamBranchKind::DeleteDv, stream_output_ordinals)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reuse_data_for_test(stream_output_ordinals: Vec<usize>) -> Self {
-        Self::for_test(1, ChangeStreamBranchKind::ReuseData, stream_output_ordinals)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fresh_data_for_test(stream_output_ordinals: Vec<usize>) -> Self {
-        Self::for_test(2, ChangeStreamBranchKind::FreshData, stream_output_ordinals)
-    }
-}
-
 impl ChangeStreamWriteDagSpec {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        validate_branch_set(&self.branches)?;
-        let has_data_branch = self.branches.iter().any(|b| {
-            matches!(
-                b.branch_kind,
-                ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData
-            )
-        });
-        if has_data_branch && self.data_route_output_ordinal.is_none() {
-            return Err(
-                "data_route_output_ordinal is required when data branches are declared".to_string(),
-            );
-        }
-        Ok(())
+        validate_route_set(&self.routes)
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(
-        change_op_output_ordinal: Option<usize>,
-        data_route_output_ordinal: Option<usize>,
-        branches: Vec<ChangeStreamWriteBranchSpec>,
+        effect_output_ordinal: usize,
+        routes: Vec<ChangeStreamWriteRouteSpec>,
     ) -> Self {
         Self {
-            change_op_output_ordinal,
-            data_route_output_ordinal,
-            branches,
+            effect_output_ordinal,
+            routes,
         }
     }
 }
 
-pub(crate) fn validate_branch_set(branches: &[ChangeStreamWriteBranchSpec]) -> Result<(), String> {
-    let mut seen = BTreeSet::new();
-    for branch in branches {
-        if !seen.insert(branch.branch_kind) {
-            return Err(format!(
-                "duplicate change-stream branch kind {:?}",
-                branch.branch_kind
-            ));
+pub(crate) fn validate_route_set(routes: &[ChangeStreamWriteRouteSpec]) -> Result<(), String> {
+    if routes.is_empty() {
+        return Err("row-mutation router requires at least one route".to_string());
+    }
+    let mut route_ids = BTreeSet::new();
+    for route in routes {
+        if !route_ids.insert(route.route_id) {
+            return Err("row-mutation router contains a duplicate opaque route id".to_string());
         }
+        validate_effects(&route.accepted_effects)?;
+        validate_input_ordinals(&route.input_ordinals)?;
     }
     Ok(())
 }
 
-/// Bind a logical change-stream branch set to the immutable SQL producer
-/// layout. All ordinal, visibility, partition and route validation happens
-/// before a connector write topology can be constructed.
+/// Bind provider-signed route inputs to the immutable SQL producer layout.
+/// No identifier string is interpreted as row identity, a physical branch, or
+/// a data route at this boundary.
 pub(crate) fn bind_change_stream_write_layout(
     mut request: ChangeStreamWriteLayoutRequest<'_>,
 ) -> Result<ChangeStreamWriteDagSpec, String> {
-    if request.branches.is_empty() {
-        return Err("DML change-stream write requires at least one branch".to_string());
+    if request.routes.is_empty() {
+        return Err("row-mutation router requires at least one route".to_string());
     }
-
-    let has_data_branch = request.branches.iter().any(|branch| {
-        matches!(
-            branch.branch_kind,
-            ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData
-        )
-    });
-    let change_op_output_ordinal = output_ordinal_by_name(
+    validate_output_ordinal(
         request.producer_output_columns,
-        crate::sql::common::CHANGE_OP_COLUMN,
-        "change-op column",
-        OutputBindingKind::Internal,
+        request.effect_output_ordinal,
+        "effect",
     )?;
-    let data_route_output_ordinal = has_data_branch
-        .then(|| {
-            output_ordinal_by_name(
-                request.producer_output_columns,
-                CHANGE_STREAM_DATA_ROUTE_COLUMN,
-                "data-route column",
-                OutputBindingKind::Internal,
-            )
-        })
-        .transpose()?;
-    let data_partition_ordinals = if has_data_branch {
-        target_partition_source_ordinals(
-            request.producer_output_columns,
-            request.target_partition_source_columns,
-        )?
-    } else {
-        Vec::new()
-    };
 
-    let mut branches = Vec::with_capacity(request.branches.len());
-    for (idx, branch) in request.branches.drain(..).enumerate() {
-        let output_partition_ordinals = match branch.branch_kind {
-            ChangeStreamBranchKind::DeleteDv => vec![output_ordinal_by_name(
-                request.producer_output_columns,
-                crate::sql::common::ICEBERG_FILE_PATH_COL,
-                "delete file column",
-                OutputBindingKind::Internal,
-            )?],
-            ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData => {
-                data_partition_ordinals.clone()
-            }
-        };
-        let stream_output_ordinals = output_ordinals_for_sink_columns(
+    let mut routes = Vec::with_capacity(request.routes.len());
+    for route in request.routes.drain(..) {
+        validate_effects(&route.accepted_effects)?;
+        validate_input_ordinals(&route.input_ordinals)?;
+        validate_output_ordinals(
             request.producer_output_columns,
-            &branch.sink.contract.input_columns,
+            &route
+                .input_ordinals
+                .iter()
+                .map(|binding| binding.input_ordinal() as usize)
+                .collect::<Vec<_>>(),
+            "route input",
         )?;
-        branches.push(ChangeStreamWriteBranchSpec {
-            branch_id: i32::try_from(idx).map_err(|_| {
-                "DML change-stream branch id overflow while binding layout".to_string()
-            })?,
-            branch_kind: branch.branch_kind,
-            stream_output_ordinals,
+
+        let by_token: HashMap<_, _> = route
+            .input_ordinals
+            .iter()
+            .map(|binding| (binding.token(), binding.input_ordinal() as usize))
+            .collect();
+        let mut partition_tokens = HashSet::new();
+        let output_partition_ordinals = route
+            .partition_input_tokens
+            .iter()
+            .map(|token| {
+                if !partition_tokens.insert(*token) {
+                    return Err(
+                        "row-mutation route has a duplicate partition input token".to_string()
+                    );
+                }
+                by_token.get(token).copied().ok_or_else(|| {
+                    "row-mutation route partition token is not bound to an input ordinal"
+                        .to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        routes.push(ChangeStreamWriteRouteSpec {
+            route_id: route.route_id,
+            cohort_id: route.cohort_id,
+            accepted_effects: route.accepted_effects,
+            input_ordinals: route.input_ordinals,
             output_partition_ordinals,
-            sink: branch.sink,
+            sink: route.sink,
         });
     }
 
     let dag = ChangeStreamWriteDagSpec {
-        change_op_output_ordinal: Some(change_op_output_ordinal),
-        data_route_output_ordinal,
-        branches,
+        effect_output_ordinal: request.effect_output_ordinal,
+        routes,
     };
     dag.validate()?;
     Ok(dag)
 }
 
-fn target_partition_source_ordinals(
-    output_columns: &[OutputColumn],
-    source_columns: &[String],
-) -> Result<Vec<usize>, String> {
-    source_columns
-        .iter()
-        .map(|name| {
-            output_ordinal_by_name(
-                output_columns,
-                name,
-                "target partition source column",
-                OutputBindingKind::UserVisible,
-            )
-        })
-        .collect()
-}
-
-fn output_ordinals_for_sink_columns(
-    output_columns: &[OutputColumn],
-    sink_columns: &[novarocks_catalog::schema::ColumnDef],
-) -> Result<Vec<usize>, String> {
-    sink_columns
-        .iter()
-        .map(|column| {
-            output_ordinal_by_name(
-                output_columns,
-                &column.name,
-                "sink input column",
-                binding_kind_for_sink_column(&column.name),
-            )
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OutputBindingKind {
-    Internal,
-    UserVisible,
-}
-
-fn binding_kind_for_sink_column(name: &str) -> OutputBindingKind {
-    if is_reserved_internal_output_name(name) {
-        OutputBindingKind::Internal
-    } else {
-        OutputBindingKind::UserVisible
+fn validate_effects(effects: &[ConnectorRowMutationEffect]) -> Result<(), String> {
+    if effects.is_empty() {
+        return Err("row-mutation route must accept at least one logical effect".to_string());
     }
+    let mut seen = BTreeSet::new();
+    if effects.iter().any(|effect| !seen.insert(*effect)) {
+        return Err("row-mutation route has a duplicate accepted effect".to_string());
+    }
+    Ok(())
 }
 
-fn is_reserved_internal_output_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
-        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
-        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
-        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
-        || name.eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
-        || name.eq_ignore_ascii_case(CHANGE_STREAM_DATA_ROUTE_COLUMN)
-}
-
-fn output_ordinal_by_name(
-    output_columns: &[OutputColumn],
-    name: &str,
-    label: &str,
-    binding_kind: OutputBindingKind,
-) -> Result<usize, String> {
-    let mut matches = output_columns
+fn validate_input_ordinals(bindings: &[ConnectorMutationRouteInput]) -> Result<(), String> {
+    if bindings.is_empty() {
+        return Err("row-mutation route must bind at least one input token".to_string());
+    }
+    let mut tokens = HashSet::new();
+    let mut ordinals = HashSet::new();
+    if bindings
         .iter()
-        .enumerate()
-        .filter(|(_, column)| column.name.eq_ignore_ascii_case(name));
-    let (ordinal, column) = matches
-        .next()
-        .ok_or_else(|| format!("DML change-stream {label} `{name}` not found in plan output"))?;
-    if matches.next().is_some() {
+        .any(|binding| !tokens.insert(binding.token()) || !ordinals.insert(binding.input_ordinal()))
+    {
+        return Err("row-mutation route has duplicate input token or ordinal".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn route_output_ordinals(route: &ChangeStreamWriteRouteSpec) -> Vec<usize> {
+    route
+        .input_ordinals
+        .iter()
+        .map(|binding| binding.input_ordinal() as usize)
+        .collect()
+}
+
+pub(crate) fn validate_output_ordinal(
+    output_columns: &[OutputColumn],
+    ordinal: usize,
+    label: &str,
+) -> Result<(), String> {
+    if ordinal >= output_columns.len() {
         return Err(format!(
-            "DML change-stream {label} `{name}` is ambiguous in plan output"
+            "row-mutation {label} output ordinal {ordinal} is out of range for {} columns",
+            output_columns.len()
         ));
     }
-    match binding_kind {
-        OutputBindingKind::Internal if !column.is_internal => {
-            return Err(format!(
-                "DML change-stream {label} `{name}` must be marked internal in plan output"
-            ));
-        }
-        OutputBindingKind::UserVisible if column.is_internal => {
-            return Err(format!(
-                "DML change-stream {label} `{name}` must be user-visible in plan output"
-            ));
-        }
-        OutputBindingKind::Internal | OutputBindingKind::UserVisible => {}
+    Ok(())
+}
+
+pub(crate) fn validate_output_ordinals(
+    output_columns: &[OutputColumn],
+    ordinals: &[usize],
+    label: &str,
+) -> Result<(), String> {
+    for ordinal in ordinals {
+        validate_output_ordinal(output_columns, *ordinal, label)?;
     }
-    Ok(ordinal)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
 
+    use super::super::contract::ConnectorWriteInputBinding;
+    use super::super::contract::test_support::simple_sql_write_plan_input;
     use super::*;
 
-    fn output_column(id: u32, name: &str, is_internal: bool) -> OutputColumn {
-        OutputColumn {
-            column_id: crate::sql::column_id::ColumnId::new_for_test(id),
-            name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: true,
-            is_internal,
-        }
-    }
-
-    fn dml_output_columns() -> Vec<OutputColumn> {
+    fn output_columns() -> Vec<OutputColumn> {
         vec![
-            output_column(1, "id", false),
-            output_column(2, crate::sql::common::ICEBERG_FILE_PATH_COL, true),
-            output_column(3, crate::sql::common::ICEBERG_ROW_POS_COL, true),
-            output_column(4, crate::sql::common::CHANGE_OP_COLUMN, true),
-            output_column(5, CHANGE_STREAM_DATA_ROUTE_COLUMN, true),
+            OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+                name: "before_value".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: true,
+            },
+            OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::new_for_test(2),
+                name: "effect".to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                is_internal: true,
+            },
         ]
     }
 
-    fn sql_sink(columns: &[&str]) -> SqlWritePlanInput {
-        let mut sink = super::super::contract::test_support::simple_sql_write_plan_input(
-            super::super::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        );
-        sink.contract.input_columns = columns
-            .iter()
-            .map(|name| ColumnDef {
-                name: (*name).to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                write_default: None,
-                logical_type: None,
-            })
-            .collect();
-        sink
-    }
-
-    fn branch(kind: ChangeStreamBranchKind, columns: &[&str]) -> ChangeStreamWriteLayoutBranch {
-        ChangeStreamWriteLayoutBranch {
-            branch_kind: kind,
-            sink: sql_sink(columns),
+    fn route(byte: u8, effects: Vec<ConnectorRowMutationEffect>) -> ChangeStreamWriteLayoutRoute {
+        ChangeStreamWriteLayoutRoute {
+            route_id: ConnectorWriteRouteId::from_bytes([byte; 32]),
+            cohort_id: ConnectorWriteCohortId::from_bytes([byte.wrapping_add(1); 32]),
+            accepted_effects: effects,
+            input_ordinals: vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([byte; 32]),
+                0,
+            )],
+            partition_input_tokens: Vec::new(),
+            sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
         }
     }
 
     #[test]
-    fn validate_rejects_duplicate_branch_kind() {
-        let branches = vec![
-            ChangeStreamWriteBranchSpec::for_test(0, ChangeStreamBranchKind::DeleteDv, Vec::new()),
-            ChangeStreamWriteBranchSpec::for_test(1, ChangeStreamBranchKind::DeleteDv, Vec::new()),
-        ];
-        let err = validate_branch_set(&branches).expect_err("duplicate branch kind");
-        assert!(err.contains("duplicate change-stream branch kind DeleteDv"));
-    }
-
-    #[test]
-    fn validate_requires_data_route_when_data_branch_exists() {
-        let spec = ChangeStreamWriteDagSpec::for_test(
-            Some(0),
-            None,
-            vec![ChangeStreamWriteBranchSpec::for_test(
-                0,
-                ChangeStreamBranchKind::ReuseData,
-                Vec::new(),
-            )],
-        );
-        let err = spec.validate().expect_err("missing data_route");
+    fn bind_layout_keeps_replace_fanout_as_two_opaque_routes() {
+        let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &output_columns(),
+            effect_output_ordinal: 1,
+            routes: vec![
+                route(1, vec![ConnectorRowMutationEffect::Replace]),
+                route(2, vec![ConnectorRowMutationEffect::Replace]),
+            ],
+        })
+        .expect("replace fanout is valid");
+        assert_eq!(dag.routes.len(), 2);
         assert!(
-            err.contains("data_route_output_ordinal is required when data branches are declared")
-        );
-    }
-
-    #[test]
-    fn validate_allows_delete_only_without_data_route() {
-        let spec = ChangeStreamWriteDagSpec::for_test(
-            Some(0),
-            None,
-            vec![ChangeStreamWriteBranchSpec::for_test(
-                0,
-                ChangeStreamBranchKind::DeleteDv,
-                Vec::new(),
-            )],
-        );
-        spec.validate()
-            .expect("delete-only does not require data route");
-    }
-
-    #[test]
-    fn validate_allows_delete_and_one_data_branch_with_data_route() {
-        let spec = ChangeStreamWriteDagSpec::for_test(
-            Some(0),
-            Some(1),
-            vec![
-                ChangeStreamWriteBranchSpec::for_test(
-                    0,
-                    ChangeStreamBranchKind::DeleteDv,
-                    Vec::new(),
-                ),
-                ChangeStreamWriteBranchSpec::for_test(
-                    1,
-                    ChangeStreamBranchKind::FreshData,
-                    Vec::new(),
-                ),
-            ],
-        );
-        spec.validate()
-            .expect("change_op alone distinguishes delete from one data branch");
-    }
-
-    #[test]
-    fn bind_layout_assigns_update_mor_branches_and_ordinals() {
-        let output_columns = dml_output_columns();
-        let partition_columns = vec!["id".to_string()];
-        let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![
-                branch(
-                    ChangeStreamBranchKind::DeleteDv,
-                    &[
-                        crate::sql::common::ICEBERG_FILE_PATH_COL,
-                        crate::sql::common::ICEBERG_ROW_POS_COL,
-                    ],
-                ),
-                branch(ChangeStreamBranchKind::ReuseData, &["id"]),
-            ],
-            target_partition_source_columns: &partition_columns,
-        })
-        .expect("update MOR layout");
-
-        assert_eq!(dag.change_op_output_ordinal, Some(3));
-        assert_eq!(dag.data_route_output_ordinal, Some(4));
-        assert_eq!(dag.branches.len(), 2);
-        assert_eq!(dag.branches[0].branch_id, 0);
-        assert_eq!(
-            dag.branches[0].branch_kind,
-            ChangeStreamBranchKind::DeleteDv
-        );
-        assert_eq!(dag.branches[0].stream_output_ordinals, vec![1, 2]);
-        assert_eq!(dag.branches[0].output_partition_ordinals, vec![1]);
-        assert_eq!(dag.branches[1].branch_id, 1);
-        assert_eq!(
-            dag.branches[1].branch_kind,
-            ChangeStreamBranchKind::ReuseData
-        );
-        assert_eq!(dag.branches[1].stream_output_ordinals, vec![0]);
-        assert_eq!(dag.branches[1].output_partition_ordinals, vec![0]);
-    }
-
-    #[test]
-    fn bind_layout_preserves_merge_branch_order() {
-        let output_columns = dml_output_columns();
-        let partition_columns = vec!["id".to_string()];
-        let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![
-                branch(
-                    ChangeStreamBranchKind::DeleteDv,
-                    &[crate::sql::common::ICEBERG_FILE_PATH_COL],
-                ),
-                branch(ChangeStreamBranchKind::ReuseData, &["id"]),
-                branch(ChangeStreamBranchKind::FreshData, &["id"]),
-            ],
-            target_partition_source_columns: &partition_columns,
-        })
-        .expect("merge layout");
-
-        assert_eq!(
-            dag.branches
+            dag.routes
                 .iter()
-                .map(|branch| (branch.branch_id, branch.branch_kind))
-                .collect::<Vec<_>>(),
-            vec![
-                (0, ChangeStreamBranchKind::DeleteDv),
-                (1, ChangeStreamBranchKind::ReuseData),
-                (2, ChangeStreamBranchKind::FreshData),
-            ]
+                .all(|route| { route.accepted_effects == [ConnectorRowMutationEffect::Replace] })
         );
     }
 
     #[test]
-    fn bind_layout_rejects_missing_change_op_output() {
-        let output_columns = vec![output_column(1, "id", false)];
-        let partition_columns = Vec::new();
-        let err = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![branch(ChangeStreamBranchKind::FreshData, &["id"])],
-            target_partition_source_columns: &partition_columns,
+    fn bind_layout_rejects_duplicate_opaque_route_id() {
+        let error = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &output_columns(),
+            effect_output_ordinal: 1,
+            routes: vec![
+                route(1, vec![ConnectorRowMutationEffect::Delete]),
+                route(1, vec![ConnectorRowMutationEffect::Insert]),
+            ],
         })
-        .expect_err("missing change-op output");
-        assert!(err.contains("change-op column"));
-        assert!(err.contains("not found"));
+        .expect_err("duplicate route id");
+        assert!(error.contains("duplicate opaque route id"));
     }
 
     #[test]
-    fn bind_layout_rejects_ambiguous_data_route_output() {
-        let mut output_columns = dml_output_columns();
-        output_columns.push(output_column(6, CHANGE_STREAM_DATA_ROUTE_COLUMN, true));
-        let partition_columns = Vec::new();
-        let err = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![branch(ChangeStreamBranchKind::FreshData, &["id"])],
-            target_partition_source_columns: &partition_columns,
+    fn bind_layout_rejects_foreign_partition_token() {
+        let mut route = route(1, vec![ConnectorRowMutationEffect::Delete]);
+        route.partition_input_tokens = vec![ConnectorWriteFieldToken::from_bytes([9; 32])];
+        let error = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &output_columns(),
+            effect_output_ordinal: 1,
+            routes: vec![route],
         })
-        .expect_err("ambiguous data route");
-        assert!(err.contains("data-route column"));
-        assert!(err.contains("ambiguous"));
-    }
-
-    #[test]
-    fn bind_layout_rejects_user_visible_internal_column() {
-        let mut output_columns = dml_output_columns();
-        output_columns[3].is_internal = false;
-        let partition_columns = Vec::new();
-        let err = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![branch(ChangeStreamBranchKind::FreshData, &["id"])],
-            target_partition_source_columns: &partition_columns,
-        })
-        .expect_err("change-op must be internal");
-        assert!(err.contains("change-op column"));
-        assert!(err.contains("must be marked internal"));
-    }
-
-    #[test]
-    fn bind_layout_rejects_internal_user_visible_sink_column() {
-        let mut output_columns = dml_output_columns();
-        output_columns[0].is_internal = true;
-        let partition_columns = Vec::new();
-        let err = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![branch(ChangeStreamBranchKind::FreshData, &["id"])],
-            target_partition_source_columns: &partition_columns,
-        })
-        .expect_err("sink column must be user-visible");
-        assert!(err.contains("sink input column"));
-        assert!(err.contains("must be user-visible"));
-    }
-
-    #[test]
-    fn bind_layout_rejects_internal_partition_source_column() {
-        let mut output_columns = dml_output_columns();
-        output_columns[0].is_internal = true;
-        let partition_columns = vec!["id".to_string()];
-        let err = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![branch(ChangeStreamBranchKind::FreshData, &["id"])],
-            target_partition_source_columns: &partition_columns,
-        })
-        .expect_err("partition source must be user-visible");
-        assert!(err.contains("target partition source column"));
-        assert!(err.contains("must be user-visible"));
-    }
-
-    #[test]
-    fn bind_layout_rejects_missing_partition_source_column() {
-        let output_columns = dml_output_columns();
-        let partition_columns = vec!["missing_partition".to_string()];
-        let err = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![branch(ChangeStreamBranchKind::FreshData, &["id"])],
-            target_partition_source_columns: &partition_columns,
-        })
-        .expect_err("partition source missing from producer output");
-        assert!(err.contains("target partition source column"));
-        assert!(err.contains("not found"));
-    }
-
-    #[test]
-    fn bind_layout_rejects_missing_data_route_for_data_branch() {
-        let mut output_columns = dml_output_columns();
-        output_columns.pop();
-        let partition_columns = Vec::new();
-        let err = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
-            producer_output_columns: &output_columns,
-            branches: vec![branch(ChangeStreamBranchKind::ReuseData, &["id"])],
-            target_partition_source_columns: &partition_columns,
-        })
-        .expect_err("data route missing from producer output");
-        assert!(err.contains("data-route column"));
-        assert!(err.contains("not found"));
+        .expect_err("foreign partition token");
+        assert!(error.contains("partition token is not bound"));
     }
 }

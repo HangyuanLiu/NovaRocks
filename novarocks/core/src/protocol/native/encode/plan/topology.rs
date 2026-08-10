@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::type_mapping::{
-    encode_change_stream_branch_kind, encode_data_partition, encode_edge_partition_type,
-};
+use super::type_mapping::{encode_data_partition, encode_edge_partition_type};
 use super::write::{encode_change_stream_router_sink, encode_connector_write_fragment_sink};
 use super::*;
 use crate::sql::plan_read::FragmentId;
@@ -233,12 +231,10 @@ fn encode_fragment_edge_kind(src: &FragmentEdgeKind) -> plan::FragmentEdgeKind {
             }),
             FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id,
-                branch_id,
-                branch_kind,
+                route_id,
             } => Kind::ChangeStreamRouter(plan::ChangeStreamRouterEdge {
                 router_group_id: *router_group_id,
-                branch_id: *branch_id,
-                branch_kind: encode_change_stream_branch_kind(*branch_kind),
+                route_id: route_id.to_bytes().to_vec(),
             }),
         }),
     }

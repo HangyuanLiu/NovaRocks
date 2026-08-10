@@ -21,7 +21,6 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{JoinKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::payload::{
     AggregateCall, PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode, PlanCTEProduceNode,
     PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode,
@@ -108,15 +107,14 @@ pub(crate) struct PhysicalSetOpNode {
 pub(crate) struct DistributedChangeEventExpandNode {
     pub(crate) events: Vec<DistributedChangeEventSpec>,
     pub(crate) output_columns: Vec<OutputColumn>,
-    pub(crate) change_op_column_id: ColumnId,
-    pub(crate) data_route_column_id: Option<ColumnId>,
+    pub(crate) effect_column_id: ColumnId,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedChangeEventSpec {
     pub(crate) predicate: Option<TypedExpr>,
-    pub(crate) branch_kind: ChangeStreamBranchKind,
+    pub(crate) effect: novarocks_spi::connector::ConnectorRowMutationEffect,
     pub(crate) assignments: Vec<DistributedChangeEventOutputExpr>,
 }
 

@@ -31,7 +31,6 @@ use crate::runtime::endpoint::FragmentDestination;
 use novarocks_spi::connector::{
     ConnectorExecutionBinding, ConnectorOpenWriterRequest, StatisticsMetricRequest,
 };
-use novarocks_types::change_stream::ChangeStreamBranchKind;
 
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
@@ -680,51 +679,30 @@ impl SplitDataStreamSinkProgram {
 
 pub fn build_change_stream_split_predicate(
     arena: &mut ExprArena,
-    change_op_slot_id: SlotId,
-    data_route_slot_id: Option<SlotId>,
-    branch_kind: ChangeStreamBranchKind,
+    effect_slot_id: SlotId,
+    accepted_effects: &[novarocks_spi::connector::ConnectorRowMutationEffect],
 ) -> Result<ExprId, ExecPlanBuildError> {
     use crate::exec::expr::{ExprNode, LiteralValue};
 
-    let route_key = branch_kind.route_key();
-    let operation = arena.push_typed(ExprNode::SlotId(change_op_slot_id), DataType::Int8);
-    let operation_literal = arena.push_typed(
-        ExprNode::Literal(LiteralValue::Int8(route_key.change_op() as i8)),
-        DataType::Int8,
-    );
-    let operation_matches = arena.push_typed(
-        ExprNode::Eq(operation, operation_literal),
-        DataType::Boolean,
-    );
-
-    let route_matches = match route_key.data_route() {
-        None => data_route_slot_id.map(|route_slot| {
-            let route = arena.push_typed(ExprNode::SlotId(route_slot), DataType::Int32);
-            arena.push_typed(ExprNode::IsNull(route), DataType::Boolean)
-        }),
-        Some(expected_route) => {
-            let route_slot = data_route_slot_id.ok_or_else(|| {
-                ExecPlanBuildError::new(
-                    ExecPlanInvariant::Sink,
-                    "change-stream data branch requires a data route slot",
-                )
-            })?;
-            let route = arena.push_typed(ExprNode::SlotId(route_slot), DataType::Int32);
-            let route_literal = arena.push_typed(
-                ExprNode::Literal(LiteralValue::Int32(expected_route)),
-                DataType::Int32,
-            );
-            Some(arena.push_typed(ExprNode::Eq(route, route_literal), DataType::Boolean))
-        }
-    };
-
-    Ok(match route_matches {
-        Some(route_matches) => arena.push_typed(
-            ExprNode::And(operation_matches, route_matches),
-            DataType::Boolean,
-        ),
-        None => operation_matches,
-    })
+    if accepted_effects.is_empty() {
+        return Err(ExecPlanBuildError::new(
+            ExecPlanInvariant::Sink,
+            "change-stream route must accept at least one logical effect",
+        ));
+    }
+    let effect = arena.push_typed(ExprNode::SlotId(effect_slot_id), DataType::Int8);
+    let mut predicates = Vec::with_capacity(accepted_effects.len());
+    for accepted in accepted_effects {
+        let literal = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Int8(*accepted as i8)),
+            DataType::Int8,
+        );
+        predicates.push(arena.push_typed(ExprNode::Eq(effect, literal), DataType::Boolean));
+    }
+    let first = predicates.remove(0);
+    Ok(predicates.into_iter().fold(first, |predicate, next| {
+        arena.push_typed(ExprNode::Or(predicate, next), DataType::Boolean)
+    }))
 }
 
 fn validate_stream_shape(

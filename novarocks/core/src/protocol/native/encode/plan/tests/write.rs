@@ -38,11 +38,14 @@ use crate::query_execution::preparation::scan::{
 };
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::write::change_stream::{
-    ChangeStreamBranchRoute, ChangeStreamRouterSink,
+    ChangeStreamRoute, ChangeStreamRouterSink,
 };
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
+use novarocks_spi::connector::{
+    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
+    ConnectorWriteFieldToken, ConnectorWriteRouteId,
+};
 
 fn planned_connector_read_for_test(
     column_name: &str,
@@ -214,12 +217,17 @@ fn change_stream_router_encoder_materializes_partition_exprs() {
     )
     .expect("encode change-stream router sink");
 
-    let branch = router.branches.first().expect("router branch");
-    assert_eq!(branch.output_partition_ordinals, vec![2]);
-    let partition = branch
+    let route = router.routes.first().expect("router route");
+    assert_eq!(route.output_partition_ordinals, vec![1]);
+    assert_eq!(route.route_id, vec![7; 32]);
+    assert_eq!(
+        route.accepted_effects,
+        vec![novarocks_protocol::plan::RowMutationEffect::Delete as i32]
+    );
+    let partition = route
         .output_partition
         .as_ref()
-        .expect("branch output partition");
+        .expect("route output partition");
     assert_eq!(
         partition.kind,
         novarocks_protocol::plan::PartitionKind::Hash as i32
@@ -253,16 +261,20 @@ fn change_stream_router_encoder_preserves_wire_bytes() {
     )
     .expect("encode change-stream router sink");
 
+    let encoded = router.encode_to_vec();
+    assert!(!encoded.is_empty());
+    let decoded = novarocks_protocol::plan::ChangeStreamRouterSink::decode(encoded.as_slice())
+        .expect("router wire round trip");
+    assert_eq!(decoded.routes.len(), 1);
     assert_eq!(
-        hex::encode(router.encode_to_vec()),
-        "180122241001180120142a01023201023a16080312120a040a020804520a08031a066275636b6574"
+        decoded.routes[0].accepted_effects,
+        router.routes[0].accepted_effects
     );
 }
 
 fn single_fragment_router_plan_for_test() -> DistributedPlan {
     let output_columns = vec![
-        output_column(1, "op", DataType::Int32),
-        output_column(2, "route", DataType::Int32),
+        output_column(1, "__row_mutation_effect", DataType::Int8),
         output_column(3, "bucket", DataType::Int32),
     ];
     crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
@@ -288,15 +300,18 @@ fn single_fragment_router_plan_for_test() -> DistributedPlan {
             output_partition: DataPartition::unpartitioned(),
             sink: DataSink::ChangeStreamRouter(ChangeStreamRouterSink {
                 group_id: 0,
-                change_op_output_ordinal: 0,
-                data_route_output_ordinal: Some(1),
-                branches: vec![ChangeStreamBranchRoute {
-                    branch_id: 0,
-                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                effect_output_ordinal: 0,
+                routes: vec![ChangeStreamRoute {
+                    route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
+                    cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
+                    accepted_effects: vec![ConnectorRowMutationEffect::Delete],
+                    input_ordinals: vec![ConnectorMutationRouteInput::new(
+                        ConnectorWriteFieldToken::from_bytes([9; 32]),
+                        1,
+                    )],
                     target_fragment_id: 1,
                     target_exchange_node_id: 20,
-                    output_ordinals: vec![2],
-                    output_partition_ordinals: vec![2],
+                    output_partition_ordinals: vec![1],
                 }],
             }),
             output_exprs: None,

@@ -1578,15 +1578,14 @@ fn build_distributed_plan_change_event_expand_allocates_new_tuple() {
             events: vec![],
             output_columns: vec![
                 output_col(2, "payload", DataType::Int64, false),
-                output_col(3, "change_op", DataType::Int64, false),
+                output_col(3, "effect", DataType::Int8, false),
             ],
-            change_op_column_id: ColumnId::new_for_test(3),
-            data_route_column_id: None,
+            effect_column_id: ColumnId::new_for_test(3),
         }),
         children: vec![scan],
         output_columns: vec![
             output_col(2, "payload", DataType::Int64, false),
-            output_col(3, "change_op", DataType::Int64, false),
+            output_col(3, "effect", DataType::Int8, false),
         ],
         stats: stats(),
         probe_runtime_filters: vec![],

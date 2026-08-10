@@ -61,14 +61,14 @@ pub(crate) fn decode_fragment_sink_assignment(
         }
         plan::data_sink::Kind::ChangeStreamRouter(router) => {
             let groups = router
-                .branches
+                .routes
                 .iter()
                 .enumerate()
                 .map(|(index, branch)| {
                     let group_path = path
                         .clone()
                         .field("change_stream_router")
-                        .field("branches")
+                        .field("routes")
                         .index(index)
                         .field("destinations");
                     let group = branch.destinations.as_ref().ok_or_else(|| {

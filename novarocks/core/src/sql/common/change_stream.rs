@@ -15,76 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SQL-owned change-stream action and route vocabulary.
+//! SQL-owned row-mutation vocabulary.
 //!
-//! These facts describe the logical writer branches selected by SQL planning.
-//! Execution translates them at its native boundary; SQL must not inherit the
-//! execution-layer representation or constants.
+//! SQL emits only the logical effect selected by a statement. Provider
+//! strategy, identity encoding and the opaque sink route are sealed by the
+//! connector admission contract and are never reconstructed from SQL values.
 
+pub(crate) const ROW_MUTATION_EFFECT_COLUMN: &str = "__row_mutation_effect";
+
+/// Aggregate MV deltas retain their signed multiplicity column. This is not a
+/// row-mutation route discriminator.
 pub(crate) const CHANGE_OP_COLUMN: &str = "__change_op";
 pub(crate) const CHANGE_OP_INSERT: i8 = 1;
 pub(crate) const CHANGE_OP_DELETE: i8 = -1;
-pub(crate) const DATA_ROUTE_REUSE: i32 = 1;
-pub(crate) const DATA_ROUTE_FRESH: i32 = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ChangeStreamBranchKind {
-    DeleteDv,
-    ReuseData,
-    FreshData,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ChangeStreamRouteKey {
-    pub(crate) change_op: i32,
-    pub(crate) data_route: Option<i32>,
-}
-
-impl ChangeStreamBranchKind {
-    pub(crate) fn route_key(self) -> ChangeStreamRouteKey {
-        match self {
-            Self::DeleteDv => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_DELETE.into(),
-                data_route: None,
-            },
-            Self::ReuseData => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_INSERT.into(),
-                data_route: Some(DATA_ROUTE_REUSE),
-            },
-            Self::FreshData => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_INSERT.into(),
-                data_route: Some(DATA_ROUTE_FRESH),
-            },
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sqlx2_planner_vocabulary_change_stream_branch_maps_to_sql_route_key() {
-        assert_eq!(
-            ChangeStreamBranchKind::DeleteDv.route_key(),
-            ChangeStreamRouteKey {
-                change_op: -1,
-                data_route: None,
-            }
-        );
-        assert_eq!(
-            ChangeStreamBranchKind::ReuseData.route_key(),
-            ChangeStreamRouteKey {
-                change_op: 1,
-                data_route: Some(1),
-            }
-        );
-        assert_eq!(
-            ChangeStreamBranchKind::FreshData.route_key(),
-            ChangeStreamRouteKey {
-                change_op: 1,
-                data_route: Some(2),
-            }
-        );
-    }
-}
+pub(crate) use novarocks_spi::connector::ConnectorRowMutationEffect;
