@@ -32,6 +32,7 @@ use novarocks_connector_iceberg::iceberg::spec::DataFile;
 use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use novarocks_connector_iceberg::iceberg::transaction::ApplyTransactionAction;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::changes::plan_changes;
@@ -13496,7 +13497,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     table_bindings: planned_query.table_bindings,
                     output_columns: planned_query.output_columns,
                     change_stream: logical.change_stream,
-                    producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
+                    producer_branches: vec![ImvChangeStreamProducerRoute::AppendedData],
                     mv_refresh_ctx: Some(ctx),
                     snapshot_properties: marker.clone(),
                     connector_operation_id: load_iceberg_mv_refresh_connector_operation_id(
@@ -13763,7 +13764,7 @@ fn first_refresh_iceberg_join_mv(
                     table_bindings: planned_query.table_bindings,
                     output_columns: planned_query.output_columns,
                     change_stream: logical.change_stream,
-                    producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
+                    producer_branches: vec![ImvChangeStreamProducerRoute::AppendedData],
                     mv_refresh_ctx: Some(ctx),
                     snapshot_properties: marker.clone(),
                     connector_operation_id: load_iceberg_mv_refresh_connector_operation_id(
@@ -15700,12 +15701,12 @@ fn execute_join_delta_branches_logical(
             planned_query.table_bindings = Some(Arc::clone(&target_bindings));
             let producer_branches = match mode {
                 JoinIncrementalRefreshMode::AppendOnly => {
-                    vec![ImvChangeStreamProducerBranch::FreshData]
+                    vec![ImvChangeStreamProducerRoute::AppendedData]
                 }
                 JoinIncrementalRefreshMode::Coalesce => vec![
-                    ImvChangeStreamProducerBranch::DeleteDv,
-                    ImvChangeStreamProducerBranch::ReuseData,
-                    ImvChangeStreamProducerBranch::FreshData,
+                    ImvChangeStreamProducerRoute::Deletion,
+                    ImvChangeStreamProducerRoute::ExistingData,
+                    ImvChangeStreamProducerRoute::AppendedData,
                 ],
             };
             execute_imv_change_stream_writer(
@@ -16139,13 +16140,15 @@ fn rewrite_merge_refresh_evidence(apply_key: ApplyKeyContract) -> RewriteMergeRe
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImvChangeStreamProducerBranch {
-    DeleteDv,
-    ReuseData,
-    FreshData,
+enum ImvChangeStreamProducerRoute {
+    Deletion,
+    ExistingData,
+    AppendedData,
 }
 
-const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
+const IMV_CHANGE_STREAM_EFFECT_COLUMN: &str = "__imv_change_stream_effect";
+const IMV_CHANGE_STREAM_EFFECT_EXISTING: i32 = 1;
+const IMV_CHANGE_STREAM_EFFECT_APPENDED: i32 = 2;
 
 struct ImvRefreshPlannedChangeStream<'a> {
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
@@ -16153,7 +16156,7 @@ struct ImvRefreshPlannedChangeStream<'a> {
         Option<std::sync::Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>>,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
-    producer_branches: Vec<ImvChangeStreamProducerBranch>,
+    producer_branches: Vec<ImvChangeStreamProducerRoute>,
     mv_refresh_ctx: Option<&'a IcebergMvRefreshContext>,
     snapshot_properties: BTreeMap<String, String>,
     connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
@@ -16259,8 +16262,7 @@ fn execute_imv_change_stream_writer(
     target_ref: &str,
     commit_op_kind: Option<CommitOpKind>,
 ) -> Result<crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite, String> {
-    let (refresh_plan, data_route_output_ordinal) =
-        ensure_imv_change_stream_data_route(refresh_plan)?;
+    let (refresh_plan, effect_output_ordinal) = ensure_imv_change_stream_effect(refresh_plan)?;
     let entry = state
         .iceberg_catalogs
         .read()
@@ -16280,7 +16282,7 @@ fn execute_imv_change_stream_writer(
     let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
         target,
         &refresh_plan,
-        data_route_output_ordinal,
+        effect_output_ordinal,
     )?;
     let planned =
         crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
@@ -16318,7 +16320,7 @@ fn execute_imv_change_stream_writer(
         if refresh_plan
             .producer_branches
             .iter()
-            .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv))
+            .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
         {
             CommitOpKind::RowDeltaDvFromFiles
         } else {
@@ -16380,11 +16382,30 @@ fn execute_imv_change_stream_writer(
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive Iceberg MV change-stream write lease: {error}"))?;
+    let primary_write_binding = planned
+        .topology
+        .writer_routes
+        .first()
+        .ok_or_else(|| "IMV change-stream topology has no writer routes".to_string())?
+        .sink
+        .contract
+        .target
+        .binding;
+    let primary_preparation = table_bindings
+        .binding(primary_write_binding)?
+        .write_target_admission
+        .as_ref()
+        .ok_or_else(|| {
+            "IMV change-stream primary writer binding has no Provider preparation".to_string()
+        })?
+        .preparation
+        .clone();
     let connector_write =
         crate::engine::iceberg_writer::register_iceberg_change_stream_provider_binding(
             state,
             target,
             &binding,
+            primary_preparation,
             refresh_plan.connector_operation_id,
             connector_context.clone(),
             &write_lease,
@@ -16438,8 +16459,7 @@ fn prepare_imv_change_stream_writer(
     exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
-    let (refresh_plan, data_route_output_ordinal) =
-        ensure_imv_change_stream_data_route(refresh_plan)?;
+    let (refresh_plan, effect_output_ordinal) = ensure_imv_change_stream_effect(refresh_plan)?;
     let entry = state
         .iceberg_catalogs
         .read()
@@ -16459,7 +16479,7 @@ fn prepare_imv_change_stream_writer(
     let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
         target,
         &refresh_plan,
-        data_route_output_ordinal,
+        effect_output_ordinal,
     )?;
     let planned =
         crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
@@ -16476,7 +16496,7 @@ fn prepare_imv_change_stream_writer(
     let op_kind = if refresh_plan
         .producer_branches
         .iter()
-        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv))
+        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
     {
         CommitOpKind::RowDeltaDvFromFiles
     } else {
@@ -16517,9 +16537,9 @@ fn prepare_imv_change_stream_writer(
         });
     let primary_write_binding = planned
         .topology
-        .writer_branches
+        .writer_routes
         .first()
-        .ok_or_else(|| "IMV change-stream topology has no writer branches".to_string())?
+        .ok_or_else(|| "IMV change-stream topology has no writer routes".to_string())?
         .sink
         .contract
         .target
@@ -16702,12 +16722,12 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     };
     let producer_branches = match mode {
         crate::mv::application::MvIncrementalWriteMode::FastAppend => {
-            vec![ImvChangeStreamProducerBranch::FreshData]
+            vec![ImvChangeStreamProducerRoute::AppendedData]
         }
         crate::mv::application::MvIncrementalWriteMode::RowDelta => vec![
-            ImvChangeStreamProducerBranch::DeleteDv,
-            ImvChangeStreamProducerBranch::ReuseData,
-            ImvChangeStreamProducerBranch::FreshData,
+            ImvChangeStreamProducerRoute::Deletion,
+            ImvChangeStreamProducerRoute::ExistingData,
+            ImvChangeStreamProducerRoute::AppendedData,
         ],
     };
     let target_table = refresh_context
@@ -16769,17 +16789,16 @@ fn executed_change_stream_write_from_result(
     )
 }
 
-fn ensure_imv_change_stream_data_route(
+fn ensure_imv_change_stream_effect(
     mut refresh_plan: ImvRefreshPlannedChangeStream<'_>,
 ) -> Result<(ImvRefreshPlannedChangeStream<'_>, Option<usize>), String> {
-    let Some(route_mode) = imv_data_route_mode(&refresh_plan.producer_branches)? else {
-        return Ok((refresh_plan, None));
-    };
+    let route_mode = imv_change_stream_effect_mode(&refresh_plan.producer_branches)?
+        .unwrap_or(ImvChangeStreamEffectMode::Constant(0));
 
     let has_delete_branch = refresh_plan
         .producer_branches
         .iter()
-        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv));
+        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion));
     let action_output = if has_delete_branch {
         let action_ordinal = imv_change_op_output_ordinal(&refresh_plan)?;
         Some(refresh_plan.output_columns[action_ordinal].clone())
@@ -16787,8 +16806,8 @@ fn ensure_imv_change_stream_data_route(
         None
     };
     let row_lineage_output = match route_mode {
-        ImvDataRouteMode::Constant(_) => None,
-        ImvDataRouteMode::ByRowLineage => Some(
+        ImvChangeStreamEffectMode::Constant(_) => None,
+        ImvChangeStreamEffectMode::ByRowLineage => Some(
             output_column_by_name(
                 &refresh_plan.output_columns,
                 crate::exec::row_position::ICEBERG_ROW_ID_COL,
@@ -16798,9 +16817,9 @@ fn ensure_imv_change_stream_data_route(
         ),
     };
 
-    let route_output = imv_data_route_output_column(&refresh_plan.output_columns);
+    let route_output = imv_change_stream_effect_output_column(&refresh_plan.output_columns);
     let route_output_ordinal = refresh_plan.output_columns.len();
-    let optimized_tree = add_imv_data_route_project(
+    let optimized_tree = add_imv_change_stream_effect_project(
         refresh_plan.optimized_tree,
         &refresh_plan.output_columns,
         action_output.as_ref(),
@@ -16815,31 +16834,33 @@ fn ensure_imv_change_stream_data_route(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImvDataRouteMode {
+enum ImvChangeStreamEffectMode {
     Constant(i32),
     ByRowLineage,
 }
 
-fn imv_data_route_mode(
-    producer_branches: &[ImvChangeStreamProducerBranch],
-) -> Result<Option<ImvDataRouteMode>, String> {
-    use crate::sql::common::{DATA_ROUTE_FRESH, DATA_ROUTE_REUSE};
-
+fn imv_change_stream_effect_mode(
+    producer_branches: &[ImvChangeStreamProducerRoute],
+) -> Result<Option<ImvChangeStreamEffectMode>, String> {
     let has_reuse = producer_branches
         .iter()
-        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::ReuseData));
+        .any(|route| matches!(route, ImvChangeStreamProducerRoute::ExistingData));
     let has_fresh = producer_branches
         .iter()
-        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::FreshData));
+        .any(|route| matches!(route, ImvChangeStreamProducerRoute::AppendedData));
     Ok(match (has_reuse, has_fresh) {
         (false, false) => None,
-        (true, false) => Some(ImvDataRouteMode::Constant(DATA_ROUTE_REUSE)),
-        (false, true) => Some(ImvDataRouteMode::Constant(DATA_ROUTE_FRESH)),
-        (true, true) => Some(ImvDataRouteMode::ByRowLineage),
+        (true, false) => Some(ImvChangeStreamEffectMode::Constant(
+            IMV_CHANGE_STREAM_EFFECT_EXISTING,
+        )),
+        (false, true) => Some(ImvChangeStreamEffectMode::Constant(
+            IMV_CHANGE_STREAM_EFFECT_APPENDED,
+        )),
+        (true, true) => Some(ImvChangeStreamEffectMode::ByRowLineage),
     })
 }
 
-fn imv_data_route_output_column(existing: &[OutputColumn]) -> OutputColumn {
+fn imv_change_stream_effect_output_column(existing: &[OutputColumn]) -> OutputColumn {
     OutputColumn {
         column_id: ColumnId(
             existing
@@ -16849,19 +16870,19 @@ fn imv_data_route_output_column(existing: &[OutputColumn]) -> OutputColumn {
                 .unwrap_or(0)
                 + 1,
         ),
-        name: IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN.to_string(),
-        data_type: DataType::Int32,
-        nullable: true,
+        name: IMV_CHANGE_STREAM_EFFECT_COLUMN.to_string(),
+        data_type: DataType::Int8,
+        nullable: false,
         is_internal: true,
     }
 }
 
-fn add_imv_data_route_project(
+fn add_imv_change_stream_effect_project(
     child: crate::sql::optimizer::OptimizedOperatorNode,
     child_output_columns: &[OutputColumn],
     action_output: Option<&OutputColumn>,
     row_lineage_output: Option<&OutputColumn>,
-    route_mode: ImvDataRouteMode,
+    route_mode: ImvChangeStreamEffectMode,
     route_output: OutputColumn,
 ) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
     use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
@@ -16890,7 +16911,7 @@ fn add_imv_data_route_project(
     }
 
     let route_expr =
-        imv_data_route_scalar(&mut arena, action_output, row_lineage_output, route_mode)?;
+        imv_change_stream_effect_scalar(&mut arena, action_output, row_lineage_output, route_mode)?;
     arena.remember_project_output_display(route_output.column_id, None, route_output.name.clone());
     items.push(ScalarProjectItem {
         expr: route_expr,
@@ -16924,24 +16945,26 @@ fn add_imv_data_route_project(
     Ok(plan)
 }
 
-fn imv_data_route_scalar(
+fn imv_change_stream_effect_scalar(
     arena: &mut crate::sql::optimizer::scalar::ScalarArena,
     action_output: Option<&OutputColumn>,
     row_lineage_output: Option<&OutputColumn>,
-    route_mode: ImvDataRouteMode,
+    route_mode: ImvChangeStreamEffectMode,
 ) -> Result<crate::sql::optimizer::scalar::ScalarId, String> {
-    use crate::sql::common::{
-        BinOp, CHANGE_OP_INSERT, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE, LiteralValue,
-    };
+    use crate::sql::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
     let route_value_expr = match route_mode {
-        ImvDataRouteMode::Constant(route_value) => arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(route_value as i64))),
-            DataType::Int32,
+        ImvChangeStreamEffectMode::Constant(route_value) => arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(match route_value {
+                IMV_CHANGE_STREAM_EFFECT_EXISTING => 2,
+                IMV_CHANGE_STREAM_EFFECT_APPENDED => 3,
+                _ => 1,
+            }))),
+            DataType::Int8,
             false,
         ),
-        ImvDataRouteMode::ByRowLineage => {
+        ImvChangeStreamEffectMode::ByRowLineage => {
             let row_lineage_output = row_lineage_output.ok_or_else(|| {
                 "IMV reuse/fresh route requires preserved row-lineage output".to_string()
             })?;
@@ -16959,13 +16982,13 @@ fn imv_data_route_scalar(
                 false,
             );
             let fresh_route = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(DATA_ROUTE_FRESH as i64))),
-                DataType::Int32,
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(3))),
+                DataType::Int8,
                 false,
             );
             let reuse_route = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(DATA_ROUTE_REUSE as i64))),
-                DataType::Int32,
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(2))),
+                DataType::Int8,
                 false,
             );
             arena.intern(
@@ -16974,7 +16997,7 @@ fn imv_data_route_scalar(
                     when_then: vec![(is_fresh, fresh_route)],
                     else_expr: Some(reuse_route),
                 },
-                DataType::Int32,
+                DataType::Int8,
                 false,
             )
         }
@@ -16988,33 +17011,33 @@ fn imv_data_route_scalar(
         action_output.data_type.clone(),
         action_output.nullable,
     );
-    let insert_literal = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_INSERT as i64))),
+    let delete_literal = arena.intern(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
         action_output.data_type.clone(),
         false,
     );
-    let is_insert = arena.intern(
+    let is_delete = arena.intern(
         ScalarNode::BinaryOp {
             op: BinOp::Eq,
             left: action_ref,
-            right: insert_literal,
+            right: delete_literal,
         },
         DataType::Boolean,
         action_output.nullable,
     );
-    let null_route = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
-        DataType::Int32,
-        true,
+    let delete_effect = arena.intern(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+        DataType::Int8,
+        false,
     );
     Ok(arena.intern(
         ScalarNode::Case {
             operand: None,
-            when_then: vec![(is_insert, route_value_expr)],
-            else_expr: Some(null_route),
+            when_then: vec![(is_delete, delete_effect)],
+            else_expr: Some(route_value_expr),
         },
-        DataType::Int32,
-        true,
+        DataType::Int8,
+        false,
     ))
 }
 
@@ -17032,13 +17055,13 @@ fn iceberg_mv_target_backend(
 fn iceberg_change_stream_write_dag_for_imv_refresh(
     target: &crate::engine::backend_resolver::TargetBackend,
     refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
-    data_route_output_ordinal: Option<usize>,
+    effect_output_ordinal: Option<usize>,
 ) -> Result<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String>
 {
     let bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
         "IMV change-stream write is missing admission-frozen query table bindings".to_string()
     })?;
-    let branches = build_imv_change_stream_branches(
+    let routes = build_imv_change_stream_routes(
         target,
         bindings,
         &refresh_plan.output_columns,
@@ -17046,9 +17069,10 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
     )?;
     Ok(
         crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
-            change_op_output_ordinal: Some(imv_change_op_output_ordinal(refresh_plan)?),
-            data_route_output_ordinal,
-            branches,
+            effect_output_ordinal: effect_output_ordinal.ok_or_else(|| {
+                "IMV change-stream plan did not install its dedicated effect column".to_string()
+            })?,
+            routes,
         },
     )
 }
@@ -17101,20 +17125,23 @@ fn is_imv_change_op_output_column(column: &OutputColumn) -> bool {
         && !column.nullable
 }
 
-fn build_imv_change_stream_branches(
+fn build_imv_change_stream_routes(
     target: &crate::engine::backend_resolver::TargetBackend,
     bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     output_columns: &[OutputColumn],
-    producer_branches: &[ImvChangeStreamProducerBranch],
+    producer_branches: &[ImvChangeStreamProducerRoute],
 ) -> Result<
-    Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec>,
+    Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
     String,
 > {
     use crate::engine::query_planning::write_sink::sql_write_plan_input_for_admitted_target;
-    use crate::sql::common::ChangeStreamBranchKind;
-    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec;
+    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
     use crate::sql::planner::distributed::write::contract::{
         ConnectorWriteInputBinding, SqlWriteSinkMode,
+    };
+    use novarocks_spi::connector::{
+        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
+        ConnectorWriteRouteId,
     };
 
     producer_branches
@@ -17122,22 +17149,13 @@ fn build_imv_change_stream_branches(
         .copied()
         .enumerate()
         .map(|(idx, producer_branch)| {
-            let branch_kind = match producer_branch {
-                ImvChangeStreamProducerBranch::DeleteDv => ChangeStreamBranchKind::DeleteDv,
-                ImvChangeStreamProducerBranch::ReuseData => ChangeStreamBranchKind::ReuseData,
-                ImvChangeStreamProducerBranch::FreshData => ChangeStreamBranchKind::FreshData,
-            };
-            let target_binding = mv_change_stream_write_binding_for_mode(
-                bindings,
-                target,
-                match producer_branch {
-                    ImvChangeStreamProducerBranch::DeleteDv => SqlWriteSinkMode::DeletionVectors,
-                    ImvChangeStreamProducerBranch::ReuseData => SqlWriteSinkMode::RowLineageData,
-                    ImvChangeStreamProducerBranch::FreshData => SqlWriteSinkMode::Data,
-                },
-            )?;
             let (sink, partition_ordinals) = match producer_branch {
-                ImvChangeStreamProducerBranch::DeleteDv => {
+                ImvChangeStreamProducerRoute::Deletion => {
+                    let target_binding = mv_change_stream_write_binding_for_mode(
+                        bindings,
+                        target,
+                        SqlWriteSinkMode::DeletionVectors,
+                    )?;
                     let sink = sql_write_plan_input_for_admitted_target(
                         bindings,
                         target_binding,
@@ -17152,7 +17170,12 @@ fn build_imv_change_stream_branches(
                     )?;
                     (sink, vec![file_ordinal])
                 }
-                ImvChangeStreamProducerBranch::ReuseData => {
+                ImvChangeStreamProducerRoute::ExistingData => {
+                    let target_binding = mv_change_stream_write_binding_for_mode(
+                        bindings,
+                        target,
+                        SqlWriteSinkMode::RowLineageData,
+                    )?;
                     let sink = sql_write_plan_input_for_admitted_target(
                         bindings,
                         target_binding,
@@ -17164,7 +17187,12 @@ fn build_imv_change_stream_branches(
                         target_partition_source_ordinals_for_sql_sink(&sink, output_columns)?;
                     (sink, partition_ordinals)
                 }
-                ImvChangeStreamProducerBranch::FreshData => {
+                ImvChangeStreamProducerRoute::AppendedData => {
+                    let target_binding = mv_change_stream_write_binding_for_mode(
+                        bindings,
+                        target,
+                        SqlWriteSinkMode::Data,
+                    )?;
                     let sink = sql_write_plan_input_for_admitted_target(
                         bindings,
                         target_binding,
@@ -17179,12 +17207,47 @@ fn build_imv_change_stream_branches(
             };
             let stream_output_ordinals =
                 output_ordinals_for_sink_columns(output_columns, &sink.contract.input_columns)?;
-            Ok(ChangeStreamWriteBranchSpec {
-                branch_id: i32::try_from(idx).map_err(|_| {
-                    "IMV change-stream branch id overflow while building DAG".to_string()
-                })?,
-                branch_kind,
-                stream_output_ordinals,
+            let role = match producer_branch {
+                ImvChangeStreamProducerRoute::Deletion => b"delete".as_slice(),
+                ImvChangeStreamProducerRoute::ExistingData => b"replace".as_slice(),
+                ImvChangeStreamProducerRoute::AppendedData => b"insert".as_slice(),
+            };
+            let mut route_hash = Sha256::new();
+            route_hash.update(b"novarocks.imv.change-stream.route.v1\0");
+            route_hash.update(role);
+            route_hash.update((idx as u64).to_be_bytes());
+            let route_id = ConnectorWriteRouteId::from_bytes(route_hash.finalize().into());
+            let mut cohort_hash = Sha256::new();
+            cohort_hash.update(b"novarocks.imv.change-stream.cohort.v1\0");
+            cohort_hash.update(route_id.to_bytes());
+            let cohort_id = ConnectorWriteCohortId::from_bytes(cohort_hash.finalize().into());
+            let input_ordinals = sink
+                .contract
+                .target
+                .fields
+                .iter()
+                .zip(stream_output_ordinals.iter().copied())
+                .map(|(field, ordinal)| {
+                    ConnectorMutationRouteInput::new(field.token, ordinal as u32)
+                })
+                .collect::<Vec<_>>();
+            if input_ordinals.is_empty() {
+                return Err("IMV change-stream route has no token-bound inputs".to_string());
+            }
+            let accepted_effects = match producer_branch {
+                ImvChangeStreamProducerRoute::Deletion => vec![ConnectorRowMutationEffect::Delete],
+                ImvChangeStreamProducerRoute::ExistingData => {
+                    vec![ConnectorRowMutationEffect::Replace]
+                }
+                ImvChangeStreamProducerRoute::AppendedData => {
+                    vec![ConnectorRowMutationEffect::Insert]
+                }
+            };
+            Ok(ChangeStreamWriteRouteSpec {
+                route_id,
+                cohort_id,
+                accepted_effects,
+                input_ordinals,
                 output_partition_ordinals: partition_ordinals,
                 sink,
             })
@@ -17322,13 +17385,11 @@ enum ImvBranchShape {
 #[cfg(test)]
 fn build_imv_change_stream_branches_for_test(
     shape: ImvBranchShape,
-) -> Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec> {
-    use crate::sql::common::ChangeStreamBranchKind;
-    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec;
+) -> Vec<novarocks_spi::connector::ConnectorRowMutationEffect> {
     match shape {
         ImvBranchShape::DeleteAndReuse => vec![
-            ChangeStreamWriteBranchSpec::for_test(0, ChangeStreamBranchKind::DeleteDv, Vec::new()),
-            ChangeStreamWriteBranchSpec::for_test(1, ChangeStreamBranchKind::ReuseData, Vec::new()),
+            novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+            novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
         ],
     }
 }
@@ -17785,11 +17846,11 @@ fn incremental_refresh_iceberg_mv_with_changes(
     })?;
     let mut producer_branches = Vec::new();
     if can_emit_delete_rows {
-        producer_branches.push(ImvChangeStreamProducerBranch::DeleteDv);
-        producer_branches.push(ImvChangeStreamProducerBranch::ReuseData);
-        producer_branches.push(ImvChangeStreamProducerBranch::FreshData);
+        producer_branches.push(ImvChangeStreamProducerRoute::Deletion);
+        producer_branches.push(ImvChangeStreamProducerRoute::ExistingData);
+        producer_branches.push(ImvChangeStreamProducerRoute::AppendedData);
     } else {
-        producer_branches.push(ImvChangeStreamProducerBranch::FreshData);
+        producer_branches.push(ImvChangeStreamProducerRoute::AppendedData);
     }
     let target_backend = iceberg_mv_target_backend(target);
     let populated = execute_imv_change_stream_write(
@@ -18342,17 +18403,19 @@ mod tests {
     }
 
     #[test]
-    fn imv_change_stream_branch_set_can_include_zero_row_branch() {
-        let branches = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
+    fn imv_change_stream_effect_set_can_include_zero_row_route() {
+        let effects = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
         assert!(
-            branches
+            effects
                 .iter()
-                .any(|b| { b.branch_kind == crate::sql::common::ChangeStreamBranchKind::DeleteDv })
+                .any(|effect| *effect
+                    == novarocks_spi::connector::ConnectorRowMutationEffect::Delete)
         );
         assert!(
-            branches.iter().any(|b| {
-                b.branch_kind == crate::sql::common::ChangeStreamBranchKind::ReuseData
-            })
+            effects
+                .iter()
+                .any(|effect| *effect
+                    == novarocks_spi::connector::ConnectorRowMutationEffect::Replace)
         );
     }
 
@@ -27674,9 +27737,7 @@ mod tests {
 
         let err = executed_change_stream_write_from_result(
             result,
-            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::new(
-                BTreeMap::new(),
-            ),
+            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::new(),
         )
         .err()
         .expect("writer abort must fail conversion");
@@ -27696,9 +27757,7 @@ mod tests {
 
         let executed = executed_change_stream_write_from_result(
             result,
-            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::new(
-                BTreeMap::new(),
-            ),
+            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::new(),
         )
         .expect("metadata-only write must retain an uncommitted artifact");
 

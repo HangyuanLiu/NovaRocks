@@ -2,9 +2,9 @@
 id: ADR-0042
 title: "Sealed distributed plan read contract"
 domain: [sql-compiler]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0050
 date: 2026-08-08
 provenance:
   - "implementation: sealed distributed plan read contract"

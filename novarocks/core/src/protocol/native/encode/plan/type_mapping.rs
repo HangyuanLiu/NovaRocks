@@ -17,12 +17,12 @@
 
 use super::super::expr::encode_expr;
 use crate::sql::plan_read::{
-    AggMode, ChangeStreamBranchKind, DataPartition, HashSource, JoinDistribution,
-    JoinExecutionMode, JoinKind, PartitionKind, PlanSetOpKind, RedistributeMode, SqlTopNType,
-    TopNPhase,
+    AggMode, DataPartition, HashSource, JoinDistribution, JoinExecutionMode, JoinKind,
+    PartitionKind, PlanSetOpKind, RedistributeMode, SqlTopNType, TopNPhase,
 };
 use novarocks_catalog::schema::SqlType;
 use novarocks_protocol::{common, plan};
+use novarocks_spi::connector::ConnectorRowMutationEffect;
 
 pub(super) fn encode_sql_type(src: &SqlType) -> Result<common::TypeDesc, String> {
     use common::type_desc::Kind;
@@ -174,11 +174,11 @@ pub(super) fn encode_set_op_kind(src: PlanSetOpKind) -> i32 {
     }
 }
 
-pub(super) fn encode_change_stream_branch_kind(src: ChangeStreamBranchKind) -> i32 {
+pub(super) fn encode_row_mutation_effect(src: ConnectorRowMutationEffect) -> i32 {
     match src {
-        ChangeStreamBranchKind::DeleteDv => plan::ChangeStreamBranchKind::DeleteDv as i32,
-        ChangeStreamBranchKind::ReuseData => plan::ChangeStreamBranchKind::ReuseData as i32,
-        ChangeStreamBranchKind::FreshData => plan::ChangeStreamBranchKind::FreshData as i32,
+        ConnectorRowMutationEffect::Delete => plan::RowMutationEffect::Delete as i32,
+        ConnectorRowMutationEffect::Replace => plan::RowMutationEffect::Replace as i32,
+        ConnectorRowMutationEffect::Insert => plan::RowMutationEffect::Insert as i32,
     }
 }
 

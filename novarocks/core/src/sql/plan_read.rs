@@ -16,14 +16,13 @@
 // under the License.
 
 //! Read-only public projections of a sealed distributed SQL plan.
-// Design: ADR-0042 (docs/adr/ADR-0042-sealed-distributed-plan-read-contract.md)
+// Design: ADR-0050 (docs/adr/ADR-0050-sealed-plan-logical-mutation-effects-and-opaque-routes.md)
 //!
 //! This is the single public SQL plan reading surface. Construction, draft
 //! mutation, sealing, and validation remain private to the SQL compiler.
 
 pub use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 pub use crate::sql::column_id::ColumnId;
-pub use crate::sql::common::change_stream::ChangeStreamBranchKind;
 pub use crate::sql::common::expr::{
     BinOp, JoinKind, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
@@ -42,6 +41,9 @@ pub use crate::sql::planner::payload::{PlanRowCountAssertion, PlanScanNode};
 pub use crate::sql::planner::physical::node::{PhysicalPlanKind, PlanSetOpKind, RedistributeMode};
 pub use crate::sql::planner::physical::runtime_filter::JoinExecutionMode;
 pub use crate::sql::planner::physical::vocab::{AggMode, HashSource, JoinDistribution, TopNPhase};
+pub use novarocks_spi::connector::{
+    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteRouteId,
+};
 
 /// Read-only SQL table facts used by plan encoders.
 pub mod table {

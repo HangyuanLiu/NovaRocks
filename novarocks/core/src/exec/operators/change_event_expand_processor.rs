@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, new_null_array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, new_null_array};
 use arrow::compute::{concat, filter};
 use arrow::datatypes::DataType;
 
@@ -37,8 +37,7 @@ pub struct ChangeEventExpandProcessorFactory {
     events: Vec<ChangeEventRuntimeSpec>,
     output_chunk_schema: ChunkSchemaRef,
     output_slot_ids: Vec<SlotId>,
-    change_op_slot_id: SlotId,
-    data_route_slot_id: Option<SlotId>,
+    effect_slot_id: SlotId,
 }
 
 impl ChangeEventExpandProcessorFactory {
@@ -48,15 +47,9 @@ impl ChangeEventExpandProcessorFactory {
         events: Vec<ChangeEventRuntimeSpec>,
         output_chunk_schema: ChunkSchemaRef,
         output_slot_ids: Vec<SlotId>,
-        change_op_slot_id: SlotId,
-        data_route_slot_id: Option<SlotId>,
+        effect_slot_id: SlotId,
     ) -> Result<Self, String> {
-        validate_output_schema(
-            &output_chunk_schema,
-            &output_slot_ids,
-            change_op_slot_id,
-            data_route_slot_id,
-        )?;
+        validate_output_schema(&output_chunk_schema, &output_slot_ids, effect_slot_id)?;
         let name = if node_id >= 0 {
             format!("CHANGE_EVENT_EXPAND (id={node_id})")
         } else {
@@ -68,8 +61,7 @@ impl ChangeEventExpandProcessorFactory {
             events,
             output_chunk_schema,
             output_slot_ids,
-            change_op_slot_id,
-            data_route_slot_id,
+            effect_slot_id,
         })
     }
 }
@@ -86,8 +78,7 @@ impl OperatorFactory for ChangeEventExpandProcessorFactory {
             events: self.events.clone(),
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             output_slot_ids: self.output_slot_ids.clone(),
-            change_op_slot_id: self.change_op_slot_id,
-            data_route_slot_id: self.data_route_slot_id,
+            effect_slot_id: self.effect_slot_id,
             pending_output: None,
             finishing: false,
             finished: false,
@@ -101,8 +92,7 @@ struct ChangeEventExpandProcessorOperator {
     events: Vec<ChangeEventRuntimeSpec>,
     output_chunk_schema: ChunkSchemaRef,
     output_slot_ids: Vec<SlotId>,
-    change_op_slot_id: SlotId,
-    data_route_slot_id: Option<SlotId>,
+    effect_slot_id: SlotId,
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
@@ -201,8 +191,7 @@ impl ChangeEventExpandProcessorOperator {
         validate_output_schema(
             &self.output_chunk_schema,
             &self.output_slot_ids,
-            self.change_op_slot_id,
-            self.data_route_slot_id,
+            self.effect_slot_id,
         )
     }
 
@@ -247,24 +236,12 @@ impl ChangeEventExpandProcessorOperator {
         chunk: &Chunk,
     ) -> Result<Chunk, String> {
         let assignments = self.assignment_arrays(event_idx, event, mask, selected_count, chunk)?;
-        let route_key = event.branch_kind.route_key();
         let mut columns = Vec::with_capacity(self.output_chunk_schema.slots().len());
 
         for slot_schema in self.output_chunk_schema.slots() {
             let slot_id = slot_schema.slot_id();
-            let array = if slot_id == self.change_op_slot_id {
-                route_value_array(
-                    route_key.change_op(),
-                    slot_schema.data_type(),
-                    selected_count,
-                )?
-            } else if Some(slot_id) == self.data_route_slot_id {
-                match route_key.data_route() {
-                    Some(route) => {
-                        route_value_array(route, slot_schema.data_type(), selected_count)?
-                    }
-                    None => new_null_array(slot_schema.data_type(), selected_count),
-                }
+            let array = if slot_id == self.effect_slot_id {
+                effect_value_array(event.effect as i8, slot_schema.data_type(), selected_count)?
             } else if let Some(array) = assignments.get(&slot_id) {
                 array.clone()
             } else {
@@ -289,7 +266,7 @@ impl ChangeEventExpandProcessorOperator {
         let mut arrays = HashMap::with_capacity(event.assignments.len());
         for assignment in &event.assignments {
             let slot_id = assignment.output_slot_id;
-            if slot_id == self.change_op_slot_id || Some(slot_id) == self.data_route_slot_id {
+            if slot_id == self.effect_slot_id {
                 return Err(format!(
                     "change event expand event {event_idx} assignment targets generated route slot {}",
                     slot_id
@@ -390,22 +367,19 @@ fn filter_selected_rows(
     filter(array.as_ref(), mask).map_err(|err| format!("filter selected rows failed: {err}"))
 }
 
-fn route_value_array(
-    value: i32,
+fn effect_value_array(
+    value: i8,
     target_type: &arrow::datatypes::DataType,
     len: usize,
 ) -> Result<ArrayRef, String> {
-    let array = Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(
-        value, len,
-    ))) as ArrayRef;
+    let array = Arc::new(Int8Array::from_iter_values(std::iter::repeat_n(value, len))) as ArrayRef;
     cast_array_to_target(&array, target_type)
 }
 
 fn validate_output_schema(
     output_chunk_schema: &ChunkSchemaRef,
     output_slot_ids: &[SlotId],
-    change_op_slot_id: SlotId,
-    data_route_slot_id: Option<SlotId>,
+    effect_slot_id: SlotId,
 ) -> Result<(), String> {
     if output_chunk_schema.slot_ids() != output_slot_ids {
         return Err(format!(
@@ -414,59 +388,30 @@ fn validate_output_schema(
             output_chunk_schema.slot_ids()
         ));
     }
-    if data_route_slot_id == Some(change_op_slot_id) {
+    let Some(effect_slot) = output_chunk_schema.slot(effect_slot_id) else {
         return Err(format!(
-            "change event expand change-op slot {} and data-route slot must be distinct",
-            change_op_slot_id
-        ));
-    }
-    let Some(change_op_slot) = output_chunk_schema.slot(change_op_slot_id) else {
-        return Err(format!(
-            "change event expand output schema is missing change-op slot {}",
-            change_op_slot_id
+            "change event expand output schema is missing logical effect slot {}",
+            effect_slot_id
         ));
     };
-    if change_op_slot.data_type() != &DataType::Int8 {
+    if effect_slot.data_type() != &DataType::Int8 {
         return Err(format!(
-            "change event expand change-op slot {} must be Int8, got {:?}",
-            change_op_slot_id,
-            change_op_slot.data_type()
+            "change event expand logical effect slot {} must be Int8, got {:?}",
+            effect_slot_id,
+            effect_slot.data_type()
         ));
     }
-    if let Some(data_route_slot_id) = data_route_slot_id {
-        let data_route_slot = output_chunk_schema
-            .slot(data_route_slot_id)
-            .ok_or_else(|| {
-                format!(
-                    "change event expand output schema is missing data-route slot {}",
-                    data_route_slot_id
-                )
-            })?;
-        if !is_signed_integer_route_type(data_route_slot.data_type()) {
-            return Err(format!(
-                "change event expand data-route slot {} must be a signed integer route type, got {:?}",
-                data_route_slot_id,
-                data_route_slot.data_type()
-            ));
-        }
-    }
     Ok(())
-}
-
-fn is_signed_integer_route_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Int8Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{Array, ArrayRef, Int8Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_spi::connector::ConnectorRowMutationEffect;
 
     use super::*;
     use crate::common::ids::SlotId;
@@ -477,29 +422,12 @@ mod tests {
     };
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
-    use novarocks_types::change_stream::ChangeStreamBranchKind;
 
-    const INPUT_FILE_SLOT: SlotId = SlotId::new(10);
-    const INPUT_POS_SLOT: SlotId = SlotId::new(11);
-    const INPUT_ROW_ID_SLOT: SlotId = SlotId::new(12);
-    const INPUT_VALUE_SLOT: SlotId = SlotId::new(13);
-    const CHANGE_OP_SLOT: SlotId = SlotId::new(20);
-    const DATA_ROUTE_SLOT: SlotId = SlotId::new(21);
-    const OUTPUT_FILE_SLOT: SlotId = SlotId::new(22);
-    const OUTPUT_POS_SLOT: SlotId = SlotId::new(23);
-    const OUTPUT_VALUE_SLOT: SlotId = SlotId::new(24);
+    const INPUT_SLOT: SlotId = SlotId::new(10);
+    const EFFECT_SLOT: SlotId = SlotId::new(20);
+    const VALUE_SLOT: SlotId = SlotId::new(21);
 
-    fn output_slot_ids() -> Vec<SlotId> {
-        vec![
-            CHANGE_OP_SLOT,
-            DATA_ROUTE_SLOT,
-            OUTPUT_FILE_SLOT,
-            OUTPUT_POS_SLOT,
-            OUTPUT_VALUE_SLOT,
-        ]
-    }
-
-    fn chunk_schema(fields: Vec<(SlotId, Field)>) -> ChunkSchemaRef {
+    fn schema(fields: Vec<(SlotId, Field)>) -> ChunkSchemaRef {
         Arc::new(
             ChunkSchema::try_new(
                 fields
@@ -509,480 +437,145 @@ mod tests {
                     })
                     .collect(),
             )
-            .expect("chunk schema"),
+            .expect("schema"),
         )
     }
 
-    fn input_chunk() -> Chunk {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("_row_id", DataType::Int64, false),
-            Field::new("value", DataType::Int32, false),
-        ]));
+    fn input() -> Chunk {
         let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![Some("f1.parquet")])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![Some(3)])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![Some(9)])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![Some(42)])) as ArrayRef,
-            ],
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![42])) as ArrayRef],
         )
-        .expect("input batch");
+        .expect("input");
         Chunk::new_with_chunk_schema(
             batch,
-            chunk_schema(vec![
-                (INPUT_FILE_SLOT, Field::new("_file", DataType::Utf8, false)),
-                (INPUT_POS_SLOT, Field::new("_pos", DataType::Int64, false)),
-                (
-                    INPUT_ROW_ID_SLOT,
-                    Field::new("_row_id", DataType::Int64, false),
-                ),
-                (
-                    INPUT_VALUE_SLOT,
-                    Field::new("value", DataType::Int32, false),
-                ),
-            ]),
+            schema(vec![(
+                INPUT_SLOT,
+                Field::new("value", DataType::Int32, false),
+            )]),
         )
     }
 
-    fn output_chunk_schema() -> ChunkSchemaRef {
-        chunk_schema(vec![
+    fn output_schema() -> ChunkSchemaRef {
+        schema(vec![
             (
-                CHANGE_OP_SLOT,
-                Field::new("__change_op", DataType::Int8, false),
+                EFFECT_SLOT,
+                Field::new("__row_mutation_effect", DataType::Int8, false),
             ),
-            (
-                DATA_ROUTE_SLOT,
-                Field::new("__data_route", DataType::Int32, true),
-            ),
-            (OUTPUT_FILE_SLOT, Field::new("_file", DataType::Utf8, true)),
-            (OUTPUT_POS_SLOT, Field::new("_pos", DataType::Int64, true)),
-            (
-                OUTPUT_VALUE_SLOT,
-                Field::new("value", DataType::Int32, true),
-            ),
+            (VALUE_SLOT, Field::new("value", DataType::Int32, true)),
         ])
     }
 
-    fn assert_empty_output_has_output_schema(out: &Chunk) {
-        let expected_slot_ids = output_slot_ids();
-        let expected_schema = output_chunk_schema();
-
-        assert_eq!(out.len(), 0);
-        assert_eq!(out.batch.num_columns(), expected_slot_ids.len());
-        assert_eq!(out.chunk_schema().slot_ids(), expected_slot_ids.as_slice());
-
-        for slot in expected_schema.slots() {
-            let array = out
-                .column_by_slot_id(slot.slot_id())
-                .expect("output slot must exist");
-            assert_eq!(array.len(), 0, "slot {} row count", slot.slot_id());
-            assert_eq!(
-                array.data_type(),
-                slot.data_type(),
-                "slot {} data type",
-                slot.slot_id()
-            );
-        }
-    }
-
-    fn slot_expr(
-        arena: &mut ExprArena,
-        slot_id: SlotId,
-        data_type: DataType,
-    ) -> crate::exec::expr::ExprId {
-        arena.push_typed(ExprNode::SlotId(slot_id), data_type)
+    fn slot_expr(arena: &mut ExprArena) -> crate::exec::expr::ExprId {
+        arena.push_typed(ExprNode::SlotId(INPUT_SLOT), DataType::Int32)
     }
 
     #[test]
-    fn change_event_expand_emits_delete_and_reuse_rows() {
-        // Input has one row: file=f1.parquet, pos=3, row_id=9, value=42.
-        // Expand has DeleteDv and ReuseData events.
-        // Output has two rows:
-        //   row 0: __change_op=-1, route=NULL, _file=f1.parquet, _pos=3, data value NULL
-        //   row 1: __change_op=+1, route=1, _file NULL, _pos NULL, data value=42
+    fn change_event_expand_materializes_logical_effects() {
         let mut arena = ExprArena::default();
-        let file_expr = slot_expr(&mut arena, INPUT_FILE_SLOT, DataType::Utf8);
-        let pos_expr = slot_expr(&mut arena, INPUT_POS_SLOT, DataType::Int64);
-        let value_expr = slot_expr(&mut arena, INPUT_VALUE_SLOT, DataType::Int32);
+        let value = slot_expr(&mut arena);
         let factory = ChangeEventExpandProcessorFactory::new(
             7,
             Arc::new(arena),
             vec![
                 ChangeEventRuntimeSpec {
                     predicate: None,
-                    branch_kind: ChangeStreamBranchKind::DeleteDv,
-                    assignments: vec![
-                        ChangeEventRuntimeOutputExpr {
-                            output_slot_id: OUTPUT_FILE_SLOT,
-                            expr: Some(file_expr),
-                        },
-                        ChangeEventRuntimeOutputExpr {
-                            output_slot_id: OUTPUT_POS_SLOT,
-                            expr: Some(pos_expr),
-                        },
-                    ],
+                    effect: ConnectorRowMutationEffect::Delete,
+                    assignments: Vec::new(),
                 },
                 ChangeEventRuntimeSpec {
                     predicate: None,
-                    branch_kind: ChangeStreamBranchKind::ReuseData,
+                    effect: ConnectorRowMutationEffect::Replace,
                     assignments: vec![ChangeEventRuntimeOutputExpr {
-                        output_slot_id: OUTPUT_VALUE_SLOT,
-                        expr: Some(value_expr),
+                        output_slot_id: VALUE_SLOT,
+                        expr: Some(value),
                     }],
                 },
             ],
-            output_chunk_schema(),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
+            output_schema(),
+            vec![EFFECT_SLOT, VALUE_SLOT],
+            EFFECT_SLOT,
         )
         .expect("factory");
-        let mut op = factory.create(1, 0);
         let state = RuntimeState::default();
-        let processor = op.as_processor_mut().expect("processor");
+        let mut operator = factory.create(1, 0);
+        let processor = operator.as_processor_mut().expect("processor");
+        processor.push_chunk(&state, input()).expect("push");
+        let output = processor.pull_chunk(&state).expect("pull").expect("output");
 
-        processor.push_chunk(&state, input_chunk()).expect("push");
-        let out = processor
-            .pull_chunk(&state)
-            .expect("pull")
-            .expect("output chunk");
-
-        assert_eq!(out.len(), 2);
-        let change_op_array = out.column_by_slot_id(CHANGE_OP_SLOT).expect("change op");
-        let change_op = change_op_array
+        let effect_array = output.column_by_slot_id(EFFECT_SLOT).expect("effect");
+        let effects = effect_array
             .as_any()
             .downcast_ref::<Int8Array>()
-            .expect("change op int8");
-        let data_route_array = out.column_by_slot_id(DATA_ROUTE_SLOT).expect("data route");
-        let data_route = data_route_array
+            .expect("int8 effect");
+        assert_eq!(effects.values(), &[1, 2]);
+        let value_array = output.column_by_slot_id(VALUE_SLOT).expect("value");
+        let values = value_array
             .as_any()
             .downcast_ref::<Int32Array>()
-            .expect("data route int32");
-        let file_array = out.column_by_slot_id(OUTPUT_FILE_SLOT).expect("file");
-        let file = file_array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("file string");
-        let pos_array = out.column_by_slot_id(OUTPUT_POS_SLOT).expect("pos");
-        let pos = pos_array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("pos int64");
-        let value_array = out.column_by_slot_id(OUTPUT_VALUE_SLOT).expect("value");
-        let value = value_array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("value int32");
-
-        assert_eq!(change_op.value(0), -1);
-        assert_eq!(change_op.value(1), 1);
-        assert!(data_route.is_null(0));
-        assert_eq!(data_route.value(1), 1);
-        assert_eq!(file.value(0), "f1.parquet");
-        assert!(file.is_null(1));
-        assert_eq!(pos.value(0), 3);
-        assert!(pos.is_null(1));
-        assert!(value.is_null(0));
-        assert_eq!(value.value(1), 42);
+            .expect("int32 value");
+        assert!(values.is_null(0));
+        assert_eq!(values.value(1), 42);
     }
 
     #[test]
-    fn change_event_expand_skips_false_predicate() {
-        // One event predicate is false for all rows; processor emits no rows for it
-        // and still reaches finish cleanly.
+    fn change_event_expand_skips_false_predicate_without_changing_schema() {
         let mut arena = ExprArena::default();
         let false_predicate = arena.push_typed(
             ExprNode::Literal(LiteralValue::Bool(false)),
             DataType::Boolean,
         );
-        let value_expr = slot_expr(&mut arena, INPUT_VALUE_SLOT, DataType::Int32);
         let factory = ChangeEventExpandProcessorFactory::new(
             8,
             Arc::new(arena),
             vec![ChangeEventRuntimeSpec {
                 predicate: Some(false_predicate),
-                branch_kind: ChangeStreamBranchKind::ReuseData,
-                assignments: vec![ChangeEventRuntimeOutputExpr {
-                    output_slot_id: OUTPUT_VALUE_SLOT,
-                    expr: Some(value_expr),
-                }],
+                effect: ConnectorRowMutationEffect::Insert,
+                assignments: Vec::new(),
             }],
-            output_chunk_schema(),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
+            output_schema(),
+            vec![EFFECT_SLOT, VALUE_SLOT],
+            EFFECT_SLOT,
         )
         .expect("factory");
-        let mut op = factory.create(1, 0);
         let state = RuntimeState::default();
-        let processor = op.as_processor_mut().expect("processor");
-
-        processor.push_chunk(&state, input_chunk()).expect("push");
-        let out = processor
+        let mut operator = factory.create(1, 0);
+        let processor = operator.as_processor_mut().expect("processor");
+        processor.push_chunk(&state, input()).expect("push");
+        let output = processor
             .pull_chunk(&state)
             .expect("pull")
-            .expect("empty output chunk");
-
-        assert_empty_output_has_output_schema(&out);
-        processor.set_finishing(&state).expect("finish");
-        assert!(op.is_finished());
+            .expect("empty output");
+        assert_eq!(output.len(), 0);
+        assert_eq!(output.chunk_schema().slot_ids(), &[EFFECT_SLOT, VALUE_SLOT]);
     }
 
     #[test]
-    fn change_event_expand_skips_null_predicate() {
-        let mut arena = ExprArena::default();
-        let null_predicate =
-            arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Boolean);
-        let value_expr = slot_expr(&mut arena, INPUT_VALUE_SLOT, DataType::Int32);
-        let factory = ChangeEventExpandProcessorFactory::new(
-            12,
-            Arc::new(arena),
-            vec![ChangeEventRuntimeSpec {
-                predicate: Some(null_predicate),
-                branch_kind: ChangeStreamBranchKind::ReuseData,
-                assignments: vec![ChangeEventRuntimeOutputExpr {
-                    output_slot_id: OUTPUT_VALUE_SLOT,
-                    expr: Some(value_expr),
-                }],
-            }],
-            output_chunk_schema(),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
-        )
-        .expect("factory");
-        let mut op = factory.create(1, 0);
-        let state = RuntimeState::default();
-        let processor = op.as_processor_mut().expect("processor");
-
-        processor.push_chunk(&state, input_chunk()).expect("push");
-        let out = processor
-            .pull_chunk(&state)
-            .expect("pull")
-            .expect("empty output chunk");
-
-        assert_empty_output_has_output_schema(&out);
-    }
-
-    #[test]
-    fn change_event_expand_empty_input_preserves_output_schema() {
-        let factory = ChangeEventExpandProcessorFactory::new(
-            14,
-            Arc::new(ExprArena::default()),
-            vec![ChangeEventRuntimeSpec {
-                predicate: None,
-                branch_kind: ChangeStreamBranchKind::DeleteDv,
-                assignments: vec![],
-            }],
-            output_chunk_schema(),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
-        )
-        .expect("factory");
-        let mut op = factory.create(1, 0);
-        let state = RuntimeState::default();
-        let processor = op.as_processor_mut().expect("processor");
-
-        processor
-            .push_chunk(&state, input_chunk().slice(0, 0))
-            .expect("push");
-        let out = processor
-            .pull_chunk(&state)
-            .expect("pull")
-            .expect("empty output chunk");
-
-        assert_empty_output_has_output_schema(&out);
-    }
-
-    #[test]
-    fn change_event_expand_emits_fresh_data_route() {
-        let mut arena = ExprArena::default();
-        let value_expr = slot_expr(&mut arena, INPUT_VALUE_SLOT, DataType::Int32);
-        let factory = ChangeEventExpandProcessorFactory::new(
-            13,
-            Arc::new(arena),
-            vec![ChangeEventRuntimeSpec {
-                predicate: None,
-                branch_kind: ChangeStreamBranchKind::FreshData,
-                assignments: vec![ChangeEventRuntimeOutputExpr {
-                    output_slot_id: OUTPUT_VALUE_SLOT,
-                    expr: Some(value_expr),
-                }],
-            }],
-            output_chunk_schema(),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
-        )
-        .expect("factory");
-        let mut op = factory.create(1, 0);
-        let state = RuntimeState::default();
-        let processor = op.as_processor_mut().expect("processor");
-
-        processor.push_chunk(&state, input_chunk()).expect("push");
-        let out = processor
-            .pull_chunk(&state)
-            .expect("pull")
-            .expect("output chunk");
-
-        assert_eq!(out.len(), 1);
-        let change_op_array = out.column_by_slot_id(CHANGE_OP_SLOT).expect("change op");
-        let change_op = change_op_array
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .expect("change op int8");
-        let data_route_array = out.column_by_slot_id(DATA_ROUTE_SLOT).expect("data route");
-        let data_route = data_route_array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("data route int32");
-
-        assert_eq!(change_op.value(0), 1);
-        assert_eq!(data_route.value(0), 2);
-    }
-
-    #[test]
-    fn change_event_expand_rejects_equal_route_slots() {
-        let mut arena = ExprArena::default();
-        let value_expr = slot_expr(&mut arena, INPUT_VALUE_SLOT, DataType::Int32);
+    fn change_event_expand_rejects_non_int8_effect_slot() {
         let err = match ChangeEventExpandProcessorFactory::new(
             9,
-            Arc::new(arena),
-            vec![ChangeEventRuntimeSpec {
-                predicate: None,
-                branch_kind: ChangeStreamBranchKind::ReuseData,
-                assignments: vec![ChangeEventRuntimeOutputExpr {
-                    output_slot_id: OUTPUT_VALUE_SLOT,
-                    expr: Some(value_expr),
-                }],
-            }],
-            output_chunk_schema(),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(CHANGE_OP_SLOT),
-        ) {
-            Ok(_) => panic!("equal route slots must fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.contains("change-op") && err.contains("data-route") && err.contains("distinct"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn change_event_expand_rejects_non_int8_change_op_schema() {
-        let err = match ChangeEventExpandProcessorFactory::new(
-            10,
             Arc::new(ExprArena::default()),
-            vec![ChangeEventRuntimeSpec {
-                predicate: None,
-                branch_kind: ChangeStreamBranchKind::DeleteDv,
-                assignments: vec![],
-            }],
-            chunk_schema(vec![
+            Vec::new(),
+            schema(vec![
                 (
-                    CHANGE_OP_SLOT,
-                    Field::new("__change_op", DataType::Int32, false),
+                    EFFECT_SLOT,
+                    Field::new("__row_mutation_effect", DataType::Int32, false),
                 ),
-                (
-                    DATA_ROUTE_SLOT,
-                    Field::new("__data_route", DataType::Int32, true),
-                ),
-                (OUTPUT_FILE_SLOT, Field::new("_file", DataType::Utf8, true)),
-                (OUTPUT_POS_SLOT, Field::new("_pos", DataType::Int64, true)),
-                (
-                    OUTPUT_VALUE_SLOT,
-                    Field::new("value", DataType::Int32, true),
-                ),
+                (VALUE_SLOT, Field::new("value", DataType::Int32, true)),
             ]),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
+            vec![EFFECT_SLOT, VALUE_SLOT],
+            EFFECT_SLOT,
         ) {
-            Ok(_) => panic!("non-Int8 change-op must fail"),
+            Ok(_) => panic!("effect slot type must fail"),
             Err(err) => err,
         };
-
         assert!(
-            err.contains("change-op") && err.contains("Int8"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn change_event_expand_rejects_non_integral_data_route_schema() {
-        let err = match ChangeEventExpandProcessorFactory::new(
-            15,
-            Arc::new(ExprArena::default()),
-            vec![ChangeEventRuntimeSpec {
-                predicate: None,
-                branch_kind: ChangeStreamBranchKind::ReuseData,
-                assignments: vec![],
-            }],
-            chunk_schema(vec![
-                (
-                    CHANGE_OP_SLOT,
-                    Field::new("__change_op", DataType::Int8, false),
-                ),
-                (
-                    DATA_ROUTE_SLOT,
-                    Field::new("__data_route", DataType::Utf8, true),
-                ),
-                (OUTPUT_FILE_SLOT, Field::new("_file", DataType::Utf8, true)),
-                (OUTPUT_POS_SLOT, Field::new("_pos", DataType::Int64, true)),
-                (
-                    OUTPUT_VALUE_SLOT,
-                    Field::new("value", DataType::Int32, true),
-                ),
-            ]),
-            output_slot_ids(),
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
-        ) {
-            Ok(_) => panic!("non-integral data-route must fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.contains("data-route") && err.contains("integer"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn change_event_expand_rejects_output_slot_order_mismatch() {
-        let err = match ChangeEventExpandProcessorFactory::new(
-            11,
-            Arc::new(ExprArena::default()),
-            vec![ChangeEventRuntimeSpec {
-                predicate: None,
-                branch_kind: ChangeStreamBranchKind::DeleteDv,
-                assignments: vec![],
-            }],
-            output_chunk_schema(),
-            vec![
-                DATA_ROUTE_SLOT,
-                CHANGE_OP_SLOT,
-                OUTPUT_FILE_SLOT,
-                OUTPUT_POS_SLOT,
-                OUTPUT_VALUE_SLOT,
-            ],
-            CHANGE_OP_SLOT,
-            Some(DATA_ROUTE_SLOT),
-        ) {
-            Ok(_) => panic!("output slot order mismatch must fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.contains("output_slot_ids") && err.contains("output schema"),
-            "unexpected error: {err}"
+            err.contains("logical effect") && err.contains("Int8"),
+            "{err}"
         );
     }
 }

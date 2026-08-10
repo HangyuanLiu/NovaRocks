@@ -192,7 +192,7 @@ impl BridgeCtx<'_> {
                         predicate: event
                             .predicate
                             .map(|predicate| materialize(self.scalars, predicate)),
-                        branch_kind: event.branch_kind,
+                        effect: event.effect,
                         assignments: event
                             .assignments
                             .iter()
@@ -207,8 +207,7 @@ impl BridgeCtx<'_> {
                     DistributedChangeEventExpandNode {
                         events,
                         output_columns: op.output_columns.clone(),
-                        change_op_column_id: op.change_op_column_id,
-                        data_route_column_id: op.data_route_column_id,
+                        effect_column_id: op.effect_column_id,
                     },
                 ))
             }
@@ -760,7 +759,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
+    use crate::sql::common::{JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, ChangeEventExpandOp, ChangeEventOutputExpr,
         ChangeEventSpec, JoinDistribution, Operator, PhysicalDistributionOp,
@@ -1241,15 +1240,14 @@ mod tests {
         let mut node = base_node(Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
             events: vec![ChangeEventSpec {
                 predicate: Some(predicate),
-                branch_kind: ChangeStreamBranchKind::FreshData,
+                effect: novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
                 assignments: vec![ChangeEventOutputExpr {
                     output_column_id: ColumnId::new_for_test(2),
                     expr: Some(assignment),
                 }],
             }],
             output_columns: vec![output_column(2, "payload")],
-            change_op_column_id: ColumnId::new_for_test(3),
-            data_route_column_id: Some(ColumnId::new_for_test(4)),
+            effect_column_id: ColumnId::new_for_test(3),
         }));
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(arena));
@@ -1265,8 +1263,8 @@ mod tests {
         ));
         assert_eq!(expand.events.len(), 1);
         assert_eq!(
-            expand.events[0].branch_kind,
-            ChangeStreamBranchKind::FreshData
+            expand.events[0].effect,
+            novarocks_spi::connector::ConnectorRowMutationEffect::Insert
         );
         assert_eq!(expand.events[0].assignments.len(), 1);
         assert_eq!(
@@ -1295,8 +1293,7 @@ mod tests {
             ColumnId::new_for_test(2)
         );
         assert_eq!(expand.output_columns[0].name, "payload");
-        assert_eq!(expand.change_op_column_id, ColumnId::new_for_test(3));
-        assert_eq!(expand.data_route_column_id, Some(ColumnId::new_for_test(4)));
+        assert_eq!(expand.effect_column_id, ColumnId::new_for_test(3));
     }
 
     #[test]

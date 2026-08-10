@@ -79,6 +79,7 @@ pub(crate) fn decode_primary_write_completion(
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::catalog::IcebergCatalogEntry;
 use super::change_stream_routing::ChangeStreamWriterCommitPlan;
 use super::commit::{
     CleanupAttempt, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
@@ -750,6 +751,7 @@ impl IcebergWriteReportCommitter for IcebergChangeStreamWriteReportCommitter {
 /// Iceberg catalog commit exactly once.
 pub(crate) struct IcebergCowWriteReportCommitter {
     executor: Arc<IcebergWriteCommitExecutor>,
+    entry: IcebergCatalogEntry,
 }
 
 /// Aggregate committer for a frozen distributed rewrite.  It retains the
@@ -1164,8 +1166,11 @@ impl IcebergWriteReportCommitter for IcebergDistributedRewriteReportCommitter {
 }
 
 impl IcebergCowWriteReportCommitter {
-    pub(crate) fn new(executor: Arc<IcebergWriteCommitExecutor>) -> Self {
-        Self { executor }
+    pub(crate) fn new(
+        executor: Arc<IcebergWriteCommitExecutor>,
+        entry: IcebergCatalogEntry,
+    ) -> Self {
+        Self { executor, entry }
     }
 
     fn decode_and_convert(
@@ -1226,7 +1231,7 @@ impl IcebergCowWriteReportCommitter {
             target_ref: self.executor.target_ref.clone(),
             snapshot_properties: self.executor.snapshot_properties.clone(),
         };
-        match crate::runtime::global_async_runtime::data_block_on(async {
+        let outcome = match crate::runtime::global_async_runtime::data_block_on(async {
             run_iceberg_commit(input).await
         }) {
             Ok(result) => result,
@@ -1234,7 +1239,15 @@ impl IcebergCowWriteReportCommitter {
                 message,
                 CleanupAttempt::not_attempted(),
             )),
-        }
+        };
+        // A COW commit can advance a non-main ref while leaving main's
+        // snapshot unchanged. Clear the provider cache for every terminal
+        // outcome so the next exact lease cannot sign pre-rewrite branch
+        // metadata or frozen partition facts.
+        let identifier = self.executor.table.identifier();
+        self.entry
+            .invalidate_table_cache(&identifier.namespace().to_url_string(), &identifier.name);
+        outcome
     }
 }
 

@@ -421,26 +421,41 @@ fn register_insert_connector_write(
 
 pub(crate) fn register_iceberg_change_stream_provider_binding(
     state: &Arc<StandaloneState>,
-    target: &TargetBackend,
+    _target: &TargetBackend,
     binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
+    preparation: ConnectorWritePreparation,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    register_iceberg_connector_write_service(
-        state,
-        target,
-        binding.target_ref(),
-        ConnectorWriteIntent::RowDelta,
-        Arc::new(Schema::empty()),
-        IcebergWritePlanPayloadV1::decode(&binding.provider_payload())
-            .map_err(|error| format!("decode Iceberg change-stream provider payload: {error}"))?,
-        binding
-            .control_service()
-            .map_err(|error| format!("build Iceberg change-stream write service: {error}"))?,
-        operation_id,
-        context,
-        exact_lease,
+    preparation
+        .validate()
+        .map_err(|error| format!("validate Iceberg change-stream preparation: {error}"))?;
+    if preparation.owner() != exact_lease.binding_key()
+        || preparation.target_ref().as_str() != binding.target_ref()
+    {
+        return Err("Iceberg change-stream preparation drifted from its exact binding".to_string());
+    }
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    services
+        .register(
+            operation_id,
+            binding
+                .control_service()
+                .map_err(|error| format!("build Iceberg change-stream write service: {error}"))?,
+        )
+        .map_err(|error| format!("register Iceberg change-stream write service: {error}"))?;
+    Ok(
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
+            operation_id,
+            preparation,
+            context,
+            exact_lease.clone(),
+        ),
     )
 }
 

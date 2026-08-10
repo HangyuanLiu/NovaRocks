@@ -24,8 +24,8 @@ pub(crate) mod schema;
 
 #[allow(unused_imports)]
 pub(crate) use change_stream::{
-    CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind,
-    ChangeStreamRouteKey, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+    CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT, ConnectorRowMutationEffect,
+    ROW_MUTATION_EFFECT_COLUMN,
 };
 pub use expr::LiteralValue;
 pub(crate) use expr::{

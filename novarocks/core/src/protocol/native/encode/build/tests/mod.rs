@@ -357,11 +357,12 @@ fn stream_exchange_plan(flavor: ExchangeFlavor) -> DistributedPlan {
 }
 
 fn finalized_router_plan() -> DistributedPlan {
-    let output_columns = vec![
-        output_col(1, "op"),
-        output_col(2, "route"),
+    let mut output_columns = vec![
+        output_col(1, "__row_mutation_effect"),
         output_col(3, "delete_id"),
     ];
+    output_columns[0].data_type = DataType::Int8;
+    output_columns[0].is_internal = true;
     let dp = crate::sql::planner::distributed::test_support::distributed_plan_draft_builder_for_test! {
         fragments: vec![PlanFragment {
             fragment_id: 0,
@@ -378,15 +379,22 @@ fn finalized_router_plan() -> DistributedPlan {
         runtime_filter_graph: Default::default(),
         edges: Vec::new(),
     };
-    let mut branch =
-        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
-    branch.output_partition_ordinals = vec![2];
-    let dag =
-        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
-            Some(0),
-            None,
-            vec![branch],
-        );
+    let dag = crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
+        0,
+        vec![crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec {
+            route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32]),
+            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes([8; 32]),
+            accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
+            input_ordinals: vec![novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([9; 32]),
+                1,
+            )],
+            output_partition_ordinals: vec![1],
+            sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
+        }],
+    );
     crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan(dp, dag)
         .expect("plan change-stream write")
 }

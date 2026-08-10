@@ -585,12 +585,11 @@ fn patch_native_change_stream_router_sink_in_place(
         ));
     }
 
-    let mut edge_route_keys = BTreeSet::new();
+    let mut edge_route_ids = BTreeSet::new();
     for edge in branch_edges {
         let FragmentEdgeKind::ChangeStreamRouter {
             router_group_id: edge_group_id,
-            branch_id,
-            branch_kind,
+            route_id,
         } = &edge.edge_kind
         else {
             return Err(format!(
@@ -604,45 +603,38 @@ fn patch_native_change_stream_router_sink_in_place(
                 fragment_id, router_group_id, edge_group_id
             ));
         }
-        let branch_kind = sql_change_stream_branch_kind(*branch_kind);
-        if !edge_route_keys.insert((*branch_id, branch_kind)) {
+        if !edge_route_ids.insert(route_id.to_bytes()) {
             return Err(format!(
                 "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
-                 has duplicate branch edge route key branch_id={branch_id} branch_kind={branch_kind:?}"
+                 has duplicate opaque route id"
             ));
         }
     }
 
-    let mut encoded_route_keys = BTreeSet::new();
-    for route in &router.branches {
-        let branch_kind = native_change_stream_branch_kind(route.branch_kind).map_err(|err| {
-            format!(
-                "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
-                 branch_id={} has invalid encoded branch kind: {err}",
-                route.branch_id
-            )
+    let mut encoded_route_ids = BTreeSet::new();
+    for route in &router.routes {
+        let route_id: [u8; 32] = route.route_id.as_slice().try_into().map_err(|_| {
+            format!("native row-mutation router source={fragment_id} group={router_group_id} has non-32-byte route id")
         })?;
-        if !encoded_route_keys.insert((route.branch_id, branch_kind)) {
+        if !encoded_route_ids.insert(route_id) {
             return Err(format!(
                 "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
-                 has duplicate encoded route key branch_id={} branch_kind={branch_kind:?}",
-                route.branch_id
+                 has duplicate encoded opaque route id"
             ));
         }
     }
 
-    if encoded_route_keys != edge_route_keys {
+    if encoded_route_ids != edge_route_ids {
         return Err(format!(
             "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
-             route key set mismatch: encoded={encoded_route_keys:?}, branch_edges={edge_route_keys:?}"
+             route id set mismatch: encoded={encoded_route_ids:?}, branch_edges={edge_route_ids:?}"
         ));
     }
 
     for edge in branch_edges {
         let FragmentEdgeKind::ChangeStreamRouter {
             router_group_id: edge_group_id,
-            branch_id,
-            branch_kind,
+            route_id,
         } = edge.edge_kind
         else {
             return Err(format!(
@@ -658,19 +650,13 @@ fn patch_native_change_stream_router_sink_in_place(
         }
 
         let route = router
-            .branches
+            .routes
             .iter_mut()
-            .find(|route| {
-                route.branch_id == branch_id
-                    && native_change_stream_branch_kind(route.branch_kind).is_ok_and(|route_kind| {
-                        route_kind == sql_change_stream_branch_kind(branch_kind)
-                    })
-            })
+            .find(|route| route.route_id.as_slice() == route_id.to_bytes())
             .ok_or_else(|| {
                 format!(
-                    "native Iceberg change-stream router source={} group={} branch_id={} \
-                     branch_kind={:?} has no matching branch route",
-                    fragment_id, router_group_id, branch_id, branch_kind
+                    "native row-mutation router source={} group={} has no matching route",
+                    fragment_id, router_group_id
                 )
             })?;
         route.target_fragment_id = edge.target_fragment_id;
@@ -678,17 +664,16 @@ fn patch_native_change_stream_router_sink_in_place(
 
         if route.output_partition.is_none() {
             return Err(format!(
-                "native Iceberg change-stream router source={} group={} branch_id={} \
-                 branch_kind={:?} missing output_partition from native encoder",
-                fragment_id, router_group_id, branch_id, branch_kind
+                "native row-mutation router source={} group={} missing output_partition from native encoder",
+                fragment_id, router_group_id
             ));
         }
 
         let dests = placements.get(&edge.target_fragment_id).ok_or_else(|| {
             format!(
-                "native Iceberg change-stream router source={} group={} branch_id={} target \
+                "native row-mutation router source={} group={} target \
                  fragment {} has no placements",
-                fragment_id, router_group_id, branch_id, edge.target_fragment_id
+                fragment_id, router_group_id, edge.target_fragment_id
             )
         })?;
         route.destinations = Some(novarocks_protocol::plan::StreamDestinationList {
@@ -711,43 +696,6 @@ fn patch_native_change_stream_router_sink_in_place(
         branch_edges.len()
     );
     Ok(())
-}
-
-fn native_change_stream_branch_kind(
-    value: i32,
-) -> Result<novarocks_types::change_stream::ChangeStreamBranchKind, String> {
-    match novarocks_protocol::plan::ChangeStreamBranchKind::try_from(value)
-        .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
-    {
-        novarocks_protocol::plan::ChangeStreamBranchKind::DeleteDv => {
-            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::DeleteDv)
-        }
-        novarocks_protocol::plan::ChangeStreamBranchKind::ReuseData => {
-            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::ReuseData)
-        }
-        novarocks_protocol::plan::ChangeStreamBranchKind::FreshData => {
-            Ok(novarocks_types::change_stream::ChangeStreamBranchKind::FreshData)
-        }
-        novarocks_protocol::plan::ChangeStreamBranchKind::Unspecified => {
-            Err("native ChangeStreamBranchKind is unspecified".to_string())
-        }
-    }
-}
-
-fn sql_change_stream_branch_kind(
-    value: crate::sql::common::ChangeStreamBranchKind,
-) -> novarocks_types::change_stream::ChangeStreamBranchKind {
-    match value {
-        crate::sql::common::ChangeStreamBranchKind::DeleteDv => {
-            novarocks_types::change_stream::ChangeStreamBranchKind::DeleteDv
-        }
-        crate::sql::common::ChangeStreamBranchKind::ReuseData => {
-            novarocks_types::change_stream::ChangeStreamBranchKind::ReuseData
-        }
-        crate::sql::common::ChangeStreamBranchKind::FreshData => {
-            novarocks_types::change_stream::ChangeStreamBranchKind::FreshData
-        }
-    }
 }
 
 pub(crate) fn patch_native_cte_multicast_sink(
@@ -974,8 +922,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
-        ConnectorWriterIdentity,
+        ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
+        ConnectorWriteRouteId, ConnectorWriterHandle, ConnectorWriterIdentity,
     };
 
     use super::*;
@@ -983,7 +931,6 @@ mod tests {
     use crate::common::types::UniqueId;
     use crate::exec::chunk::ChunkSchema;
     use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-    use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::{DataPartition, FragmentStreamKind};
     use novarocks_protocol::plan as native_plan;
 
@@ -1010,8 +957,7 @@ mod tests {
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id: 7,
-                branch_id: 0,
-                branch_kind: ChangeStreamBranchKind::DeleteDv,
+                route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
             },
             output_slot_ids: vec![10],
         }
@@ -1024,20 +970,22 @@ mod tests {
                 kind: Some(native_plan::data_sink::Kind::ChangeStreamRouter(
                     native_plan::ChangeStreamRouterSink {
                         group_id: 7,
-                        change_op_output_ordinal: 0,
-                        data_route_output_ordinal: None,
-                        branches: vec![native_plan::ChangeStreamBranchRoute {
-                            branch_id: 0,
-                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
+                        effect_output_ordinal: 0,
+                        routes: vec![native_plan::ChangeStreamBranchRoute {
                             target_fragment_id: 0,
                             target_exchange_node_id: -1,
-                            output_ordinals: vec![0],
                             output_partition_ordinals: Vec::new(),
                             output_partition: Some(native_plan::DataPartition {
                                 kind: native_plan::PartitionKind::Unpartitioned as i32,
                                 exprs: Vec::new(),
                             }),
                             destinations: None,
+                            route_id: vec![7; 32],
+                            cohort_id: ConnectorWriteCohortId::from_bytes([8; 32])
+                                .to_bytes()
+                                .to_vec(),
+                            accepted_effects: vec![native_plan::RowMutationEffect::Delete as i32],
+                            input_ordinals: vec![0],
                         }],
                     },
                 )),

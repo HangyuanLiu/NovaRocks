@@ -96,8 +96,9 @@ code-anchors:
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
 - ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
 - ADR-0039 — scan unit为何以immutable、bounded的physical domain facts服务后续执行侧（active）
-- ADR-0044 — distributed write为何以 Provider-signed preparation、exact lease 与中立 durable terminal fact 收敛 caller authority（active）
-- ADR-0041 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
+- ADR-0048 — distributed write为何以 Provider-signed preparation、exact lease 与中立 durable terminal fact 收敛 caller authority（active）
+- ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
+- ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 
 ### distributed-query-lifecycle
 
@@ -111,7 +112,7 @@ code-anchors:
 - ADR-0010 — 显式 query cancellation surface 为何以 MySQL KILL QUERY 和 frontend session owner 实现（active）
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
-- ADR-0041 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
+- ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
 
 ### sql-compiler
 
@@ -119,7 +120,11 @@ code-anchors:
 
 - ADR-0025 — SQL compiler 为何以显式 request、immutable snapshots 与 post-compile binding context 形成唯一入口（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
-- ADR-0042 — sealed DistributedPlan 为何以单一只读契约服务跨 owner encoder（active）
+- ADR-0050 — sealed DistributedPlan 为何以 logical mutation effect 与 opaque provider route 服务跨 owner encoder（active）
+
+#### 历史
+
+- ADR-0042 — sealed DistributedPlan 为何以单一只读契约服务跨 owner encoder（superseded → ADR-0050）
 
 ### runtime-role
 
@@ -149,10 +154,13 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
-- ADR-0030 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（active）
-- ADR-0031 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
-- ADR-0032 — change-stream 为何由 SQL 绑定 layout、Iceberg Connector 拥有 provider binding，DML/MV 只共享该 binding（active）
-- ADR-0033 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（active）
+- ADR-0032 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（active）
+- ADR-0033 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
+- ADR-0046 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（active）
+
+#### 历史
+
+- ADR-0045 — change-stream 为何由 SQL 绑定 layout、Iceberg Connector 拥有 provider binding，DML/MV 只共享该 binding（superseded → ADR-0049）
 
 ### frontend-mv
 

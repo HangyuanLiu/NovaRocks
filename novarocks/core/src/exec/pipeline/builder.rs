@@ -997,8 +997,7 @@ fn build_pipeline_for_node(
                 node.events.clone(),
                 node.output_chunk_schema.clone(),
                 node.output_slot_ids.clone(),
-                node.change_op_slot_id,
-                node.data_route_slot_id,
+                node.effect_slot_id,
             )?;
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::any(build.pipeline.dop);

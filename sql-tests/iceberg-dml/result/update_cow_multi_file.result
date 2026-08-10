@@ -1,0 +1,16 @@
+-- query 2
+snaps_before
+2
+
+-- query 4
+snaps_after
+3
+
+-- query 5
+id	v
+1	a_updated
+2	b_updated
+
+-- query 6
+distinct_row_ids	total_rows
+2	2

@@ -284,7 +284,7 @@ fn fragment_build_preserves_finalized_router_edge() {
         .and_then(|sink| sink.kind.as_ref())
         .expect("router sink")
     {
-        novarocks_protocol::plan::data_sink::Kind::ChangeStreamRouter(router) => router.branches[0]
+        novarocks_protocol::plan::data_sink::Kind::ChangeStreamRouter(router) => router.routes[0]
             .output_partition
             .as_ref()
             .expect("router route partition"),

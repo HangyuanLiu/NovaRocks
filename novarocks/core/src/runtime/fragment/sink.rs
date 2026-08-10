@@ -272,6 +272,7 @@ fn materialize_split(
         plan_node_id,
         std::sync::Arc::new(program.arena().clone()),
         program.split_exprs().to_vec(),
+        program.fanout(),
         transmitter,
     )))
 }

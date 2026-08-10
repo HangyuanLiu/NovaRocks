@@ -35,6 +35,8 @@ use sha2::{Digest, Sha256};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorRowMutationActivationRequest, ConnectorRowMutationExecutionPlan,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorStagedReport, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
     ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteOperationId,
@@ -235,12 +237,35 @@ pub(crate) type IcebergWritePreparationFactory = dyn Fn(
     + Send
     + Sync;
 
+/// Row-mutation admission is deliberately a separate provider factory. It is
+/// invoked by the same exact write control, but cannot silently route through
+/// ordinary append/overwrite preparation.
+pub(crate) type IcebergRowMutationPreparationFactory = dyn Fn(
+        ConnectorRowMutationPreparationRequest,
+        &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorRowMutationPreparationOutcome, ConnectorError>
+    + Send
+    + Sync;
+
+/// Activation stays paired with row-mutation admission.  In particular, it
+/// cannot fall through to `plan_write`: the only value it may consume is the
+/// provider-signed preparation returned by the factory above, retained by
+/// this exact control generation.
+pub(crate) type IcebergRowMutationActivationFactory = dyn Fn(
+        ConnectorRowMutationActivationRequest,
+        &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub(crate) struct IcebergWriteControlAdapter {
     key: ConnectorExecutionBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     backend: Arc<dyn IcebergWriteControlBackend>,
     prepare: Arc<IcebergWritePreparationFactory>,
+    prepare_row_mutation: Arc<IcebergRowMutationPreparationFactory>,
+    activate_row_mutation: Arc<IcebergRowMutationActivationFactory>,
     operations: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteOperationRecord>>>,
     aborts: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteAbortRecord>>>,
     plans: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteOperationPlans>>>,
@@ -335,10 +360,28 @@ impl IcebergWriteControlAdapter {
             descriptor,
             backend,
             prepare,
+            prepare_row_mutation: Arc::new(default_prepare_row_mutation),
+            activate_row_mutation: Arc::new(default_activate_row_mutation),
             operations: Arc::new(Mutex::new(HashMap::new())),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub(crate) fn with_row_mutation_preparation(
+        mut self,
+        prepare_row_mutation: Arc<IcebergRowMutationPreparationFactory>,
+    ) -> Self {
+        self.prepare_row_mutation = prepare_row_mutation;
+        self
+    }
+
+    pub(crate) fn with_row_mutation_activation(
+        mut self,
+        activate_row_mutation: Arc<IcebergRowMutationActivationFactory>,
+    ) -> Self {
+        self.activate_row_mutation = activate_row_mutation;
+        self
     }
 
     fn ensure_owner(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
@@ -497,6 +540,22 @@ impl ConnectorWriteControl for IcebergWriteControlAdapter {
     ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
         request.validate(&self.key)?;
         (self.prepare)(request, &self.key)
+    }
+
+    fn prepare_row_mutation(
+        &self,
+        request: ConnectorRowMutationPreparationRequest,
+    ) -> Result<ConnectorRowMutationPreparationOutcome, ConnectorError> {
+        request.validate(&self.key)?;
+        (self.prepare_row_mutation)(request, &self.key)
+    }
+
+    fn activate_row_mutation(
+        &self,
+        request: ConnectorRowMutationActivationRequest,
+    ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
+        request.validate(&self.key)?;
+        (self.activate_row_mutation)(request, &self.key)
     }
 
     fn plan_write(
@@ -1111,6 +1170,26 @@ fn default_prepare(
     Err(ConnectorError::new(
         ConnectorErrorKind::Unsupported,
         "Iceberg write control was constructed without a provider admission factory",
+    ))
+}
+
+fn default_prepare_row_mutation(
+    _: ConnectorRowMutationPreparationRequest,
+    _: &ConnectorExecutionBindingKey,
+) -> Result<ConnectorRowMutationPreparationOutcome, ConnectorError> {
+    Err(ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "Iceberg write control was constructed without a row-mutation admission factory",
+    ))
+}
+
+fn default_activate_row_mutation(
+    _: ConnectorRowMutationActivationRequest,
+    _: &ConnectorExecutionBindingKey,
+) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
+    Err(ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "Iceberg write control was constructed without a row-mutation activation factory",
     ))
 }
 

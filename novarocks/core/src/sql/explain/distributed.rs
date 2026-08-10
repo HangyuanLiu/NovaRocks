@@ -434,15 +434,15 @@ fn format_distributed_shared_plan_node_header(
             node.grouping_ids.len()
         )),
         PhysicalPlanKind::ChangeEventExpand(node) => {
-            let branches = node
+            let effects = node
                 .events
                 .iter()
-                .map(|event| format!("{:?}", event.branch_kind))
+                .map(|event| format!("{:?}", event.effect))
                 .collect::<Vec<_>>();
             Some(format!(
-                "CHANGE_EVENT_EXPAND(events={}, branches=[{}])",
+                "CHANGE_EVENT_EXPAND(events={}, effects=[{}])",
                 node.events.len(),
-                branches.join(",")
+                effects.join(",")
             ))
         }
         PhysicalPlanKind::GenerateSeries(node) => Some(format!(

@@ -372,19 +372,11 @@ fn verify_change_event_expand(
     let input = only_child(child_outputs, "PhysicalChangeEventExpand")?;
     let outputs = output_ids(op.output_columns.iter().map(|c| c.column_id));
     verify_declared_output_id(
-        op.change_op_column_id,
+        op.effect_column_id,
         &outputs,
-        "PhysicalChangeEventExpand change-op column",
+        "PhysicalChangeEventExpand effect column",
     )?;
-    if let Some(column_id) = op.data_route_column_id {
-        verify_declared_output_id(
-            column_id,
-            &outputs,
-            "PhysicalChangeEventExpand data-route column",
-        )?;
-    }
     for event in &op.events {
-        let _route_key = event.branch_kind.route_key();
         if let Some(predicate) = event.predicate {
             let predicate = materialize(scalars, predicate);
             verify_expr(&predicate, input, "PhysicalChangeEventExpand predicate")?;

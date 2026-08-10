@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::type_mapping::{encode_change_stream_branch_kind, encode_data_partition, usize_to_u64};
+use super::type_mapping::{encode_data_partition, encode_row_mutation_effect, usize_to_u64};
 use super::{NativePlanEncodeContext, required_context_ref};
 use crate::sql::plan_read::{
     ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding, FragmentId,
@@ -86,27 +86,15 @@ pub(super) fn encode_change_stream_router_sink(
 ) -> Result<plan::ChangeStreamRouterSink, String> {
     Ok(plan::ChangeStreamRouterSink {
         group_id: src.group_id,
-        change_op_output_ordinal: usize_to_u64(src.change_op_output_ordinal),
-        data_route_output_ordinal: src.data_route_output_ordinal.map(usize_to_u64),
-        branches: src
-            .branches
+        effect_output_ordinal: usize_to_u64(src.effect_output_ordinal),
+        routes: src
+            .routes
             .iter()
-            .map(|branch| {
+            .map(|route| {
                 Ok(plan::ChangeStreamBranchRoute {
-                    branch_id: branch.branch_id,
-                    branch_kind: encode_change_stream_branch_kind(branch.branch_kind),
-                    target_fragment_id: branch.target_fragment_id,
-                    target_exchange_node_id: branch.target_exchange_node_id,
-                    output_ordinals: branch
-                        .output_ordinals
-                        .iter()
-                        .map(|value| usize_to_u64(*value))
-                        .collect(),
-                    // The ordinals still travel on the wire 1:1, but
-                    // the runtime consumes `output_partition` below;
-                    // the encoder no longer reconstructs the partition
-                    // expression from them (CGO-9C Task 3).
-                    output_partition_ordinals: branch
+                    target_fragment_id: route.target_fragment_id,
+                    target_exchange_node_id: route.target_exchange_node_id,
+                    output_partition_ordinals: route
                         .output_partition_ordinals
                         .iter()
                         .map(|value| usize_to_u64(*value))
@@ -114,9 +102,21 @@ pub(super) fn encode_change_stream_router_sink(
                     output_partition: Some(encode_finalized_router_branch_partition(
                         ctx,
                         fragment_id,
-                        branch.branch_id,
+                        route.route_id,
                     )?),
                     destinations: None,
+                    route_id: route.route_id.to_bytes().to_vec(),
+                    cohort_id: route.cohort_id.to_bytes().to_vec(),
+                    accepted_effects: route
+                        .accepted_effects
+                        .iter()
+                        .map(|effect| encode_row_mutation_effect(*effect))
+                        .collect(),
+                    input_ordinals: route
+                        .input_ordinals
+                        .iter()
+                        .map(|binding| usize_to_u64(binding.input_ordinal() as usize))
+                        .collect(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -130,15 +130,15 @@ pub(super) fn encode_change_stream_router_sink(
 fn encode_finalized_router_branch_partition(
     ctx: &NativePlanEncodeContext<'_>,
     fragment_id: FragmentId,
-    branch_id: i32,
+    route_id: novarocks_spi::connector::ConnectorWriteRouteId,
 ) -> Result<plan::DataPartition, String> {
     let partition = required_context_ref(ctx.write_contracts, || {
         format!("native change-stream router fragment {fragment_id} has no sealed write contract")
     })?
-    .router_branch_partition(fragment_id, branch_id)
+    .router_route_partition(fragment_id, route_id)
     .ok_or_else(|| {
         format!(
-            "native change-stream router fragment {fragment_id} branch {branch_id} is missing from the sealed write contract"
+            "native row-mutation router fragment {fragment_id} route is missing from the sealed write contract"
         )
     })?;
     encode_data_partition(partition)

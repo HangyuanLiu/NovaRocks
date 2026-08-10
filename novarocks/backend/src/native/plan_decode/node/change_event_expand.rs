@@ -30,7 +30,7 @@ use novarocks::exec::node::change_event_expand::{
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
 use novarocks_protocol::plan;
-use novarocks_types::change_stream::ChangeStreamBranchKind;
+use novarocks_spi::connector::ConnectorRowMutationEffect;
 
 pub(super) fn lower_change_event_expand_node(
     node: &plan::DistributedNode,
@@ -53,94 +53,40 @@ pub(super) fn lower_change_event_expand_node(
     let output_schema = output_layout.chunk_schema();
     let output_slot_ids = layout.order().to_vec();
     let output_set = output_slot_ids.iter().copied().collect::<HashSet<_>>();
-    let change_op_slot_id = SlotId::new(expand.change_op_column_id);
-    if !output_set.contains(&change_op_slot_id) {
+    let effect_slot_id = SlotId::new(expand.effect_column_id);
+    if !output_set.contains(&effect_slot_id) {
         return Err(NativeFragmentDecodeError::inconsistent(
-            path.clone().field("change_op_column_id"),
+            path.clone().field("effect_column_id"),
             format!(
-                "ChangeEventExpandNode change_op_column_id {} is not in outputs",
-                expand.change_op_column_id
+                "ChangeEventExpandNode effect_column_id {} is not in outputs",
+                expand.effect_column_id
             ),
         ));
     }
-    let change_op_field = output_schema.slot(change_op_slot_id).ok_or_else(|| {
+    let effect_field = output_schema.slot(effect_slot_id).ok_or_else(|| {
         NativeFragmentDecodeError::inconsistent(
-            path.clone().field("change_op_column_id"),
+            path.clone().field("effect_column_id"),
             format!(
-                "ChangeEventExpandNode change_op_column_id {} missing from output schema",
-                expand.change_op_column_id
+                "ChangeEventExpandNode effect_column_id {} missing from output schema",
+                expand.effect_column_id
             ),
         )
     })?;
-    if change_op_field.data_type() != &DataType::Int8 {
+    if effect_field.data_type() != &DataType::Int8 {
         return Err(NativeFragmentDecodeError::invalid_value(
-            path.clone().field("change_op_column_id"),
+            path.clone().field("effect_column_id"),
             format!(
-                "ChangeEventExpandNode change_op_column_id {} must be Int8, got {:?}",
-                expand.change_op_column_id,
-                change_op_field.data_type()
+                "ChangeEventExpandNode effect_column_id {} must be Int8, got {:?}",
+                expand.effect_column_id,
+                effect_field.data_type()
             ),
         ));
-    }
-    let data_route_slot_id = expand.data_route_column_id.map(SlotId::new);
-    if let Some(slot_id) = data_route_slot_id {
-        if slot_id == change_op_slot_id {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                path.clone().field("data_route_column_id"),
-                format!(
-                    "ChangeEventExpandNode data_route_column_id {} must differ from change_op_column_id {}",
-                    slot_id, change_op_slot_id
-                ),
-            ));
-        }
-        if !output_set.contains(&slot_id) {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                path.clone().field("data_route_column_id"),
-                format!(
-                    "ChangeEventExpandNode data_route_column_id {} is not in outputs",
-                    slot_id
-                ),
-            ));
-        }
-        let route_field = output_schema.slot(slot_id).ok_or_else(|| {
-            NativeFragmentDecodeError::inconsistent(
-                path.clone().field("data_route_column_id"),
-                format!(
-                    "ChangeEventExpandNode data_route_column_id {} missing from output schema",
-                    slot_id
-                ),
-            )
-        })?;
-        if !is_signed_integer_route_type(route_field.data_type()) {
-            return Err(NativeFragmentDecodeError::invalid_value(
-                path.clone().field("data_route_column_id"),
-                format!(
-                    "ChangeEventExpandNode data_route_column_id {} must be a signed integer route type, got {:?}",
-                    slot_id,
-                    route_field.data_type()
-                ),
-            ));
-        }
     }
 
     let mut events = Vec::with_capacity(expand.events.len());
     for (event_idx, event) in expand.events.iter().enumerate() {
         let event_path = path.clone().field("events").index(event_idx);
-        let branch_kind =
-            change_event_branch_kind(event.branch_kind, event_path.clone().field("branch_kind"))?;
-        if matches!(
-            branch_kind,
-            ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData
-        ) && data_route_slot_id.is_none()
-        {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                event_path.clone().field("branch_kind"),
-                format!(
-                    "ChangeEventExpandNode data branch {:?} requires data_route_column_id",
-                    branch_kind
-                ),
-            ));
-        }
+        let effect = change_event_effect(event.effect, event_path.clone().field("effect"))?;
         let predicate = event
             .predicate
             .as_ref()
@@ -178,7 +124,7 @@ pub(super) fn lower_change_event_expand_node(
             .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         events.push(ChangeEventRuntimeSpec {
             predicate,
-            branch_kind,
+            effect,
             assignments,
         });
     }
@@ -191,8 +137,7 @@ pub(super) fn lower_change_event_expand_node(
                 events,
                 output_slot_ids,
                 output_chunk_schema: output_schema.clone(),
-                change_op_slot_id,
-                data_route_slot_id,
+                effect_slot_id,
             }),
         },
         layout,
@@ -200,29 +145,22 @@ pub(super) fn lower_change_event_expand_node(
     })
 }
 
-fn is_signed_integer_route_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}
-
-fn change_event_branch_kind(
+fn change_event_effect(
     value: i32,
     path: FieldPath,
-) -> Result<ChangeStreamBranchKind, NativeFragmentDecodeError> {
-    match plan::ChangeStreamBranchKind::try_from(value).map_err(|_| {
+) -> Result<ConnectorRowMutationEffect, NativeFragmentDecodeError> {
+    match plan::RowMutationEffect::try_from(value).map_err(|_| {
         NativeFragmentDecodeError::invalid_enum(
             path.clone(),
-            format!("unknown change event branch kind {value}"),
+            format!("unknown row mutation effect {value}"),
         )
     })? {
-        plan::ChangeStreamBranchKind::DeleteDv => Ok(ChangeStreamBranchKind::DeleteDv),
-        plan::ChangeStreamBranchKind::ReuseData => Ok(ChangeStreamBranchKind::ReuseData),
-        plan::ChangeStreamBranchKind::FreshData => Ok(ChangeStreamBranchKind::FreshData),
-        plan::ChangeStreamBranchKind::Unspecified => Err(NativeFragmentDecodeError::invalid_enum(
+        plan::RowMutationEffect::Delete => Ok(ConnectorRowMutationEffect::Delete),
+        plan::RowMutationEffect::Replace => Ok(ConnectorRowMutationEffect::Replace),
+        plan::RowMutationEffect::Insert => Ok(ConnectorRowMutationEffect::Insert),
+        plan::RowMutationEffect::Unspecified => Err(NativeFragmentDecodeError::invalid_enum(
             path,
-            "change event branch kind is unspecified",
+            "row mutation effect is unspecified",
         )),
     }
 }

@@ -1,5 +1,5 @@
 ---
-id: ADR-0044
+id: ADR-0048
 title: "Connector write admission and durable terminal facts"
 domain: [provider-spi, frontend-dml]
 status: active

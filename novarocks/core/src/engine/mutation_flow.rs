@@ -19,13 +19,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int64Array, StringArray};
 use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema;
-use sha2::{Digest, Sha256};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergUpdateMode};
@@ -130,7 +129,7 @@ fn data_input_request(
 /// their physical layout binding and the Iceberg connector owns terminal
 /// handles and aggregate report routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DmlChangeStreamBranchSet {
+enum DmlRowMutationEffectSet {
     UpdateMor,
     Merge {
         matched_update: bool,
@@ -139,102 +138,106 @@ enum DmlChangeStreamBranchSet {
     },
 }
 
-/// Every terminal change-stream branch is admitted independently.  A
-/// RowLineage signature cannot authorize a deletion-vector or data-file sink,
-/// even when they target the same table and are committed atomically.
+/// Provider-signed row-mutation admission retained before stage. It is pure:
+/// routes are activated only after the frontend has persisted the operation
+/// intent that owns this exact operation id.
 #[derive(Clone)]
 struct DmlChangeStreamPreparations {
-    deletion_vectors: Option<novarocks_spi::connector::ConnectorWritePreparation>,
-    row_lineage: Option<novarocks_spi::connector::ConnectorWritePreparation>,
-    data: Option<novarocks_spi::connector::ConnectorWritePreparation>,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    lease: novarocks_spi::connector::ConnectorWriteLease,
+    preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+/// Provider-signed opaque route set available only during post-intent staging.
+#[derive(Clone)]
+struct ActivatedDmlChangeStreamPreparations {
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    routes: Vec<novarocks_spi::connector::ConnectorRowMutationRoute>,
 }
 
 impl DmlChangeStreamPreparations {
     fn prepare(
         materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
         target_ref: &str,
-        branch_set: DmlChangeStreamBranchSet,
+        effect_set: DmlRowMutationEffectSet,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Self, String> {
-        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
+        use novarocks_spi::connector::{ConnectorRowMutationIntent, ConnectorWriteOperationId};
 
-        let prepare = |input| {
-            materialization.prepare_write(
-                target_ref,
-                ConnectorWriteIntent::RowDelta,
-                ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                input,
-                context.clone(),
-            )
+        let intent = match effect_set {
+            DmlRowMutationEffectSet::UpdateMor => ConnectorRowMutationIntent::Update,
+            DmlRowMutationEffectSet::Merge { .. } => ConnectorRowMutationIntent::Merge {
+                effects: effect_set.effects(),
+            },
         };
-        let branch_kinds = branch_set.branch_kinds();
+        let operation_id = ConnectorWriteOperationId::new();
+        let (lease, preparation) = materialization.prepare_row_mutation(
+            target_ref,
+            operation_id,
+            intent,
+            context.clone(),
+        )?;
         Ok(Self {
-            deletion_vectors: branch_kinds
-                .contains(&crate::sql::common::ChangeStreamBranchKind::DeleteDv)
-                .then(|| prepare(deletion_vector_input_request()))
-                .transpose()?
-                .map(|(_, preparation)| preparation),
-            row_lineage: branch_kinds
-                .contains(&crate::sql::common::ChangeStreamBranchKind::ReuseData)
-                .then(|| prepare(row_lineage_input_request(&materialization.columns)))
-                .transpose()?
-                .map(|(_, preparation)| preparation),
-            data: branch_kinds
-                .contains(&crate::sql::common::ChangeStreamBranchKind::FreshData)
-                .then(|| prepare(data_input_request(&materialization.columns)))
-                .transpose()?
-                .map(|(_, preparation)| preparation),
+            operation_id,
+            lease,
+            preparation,
+            context,
         })
-    }
-
-    fn for_branch(
-        &self,
-        branch: crate::sql::common::ChangeStreamBranchKind,
-    ) -> Result<&novarocks_spi::connector::ConnectorWritePreparation, String> {
-        let preparation = match branch {
-            crate::sql::common::ChangeStreamBranchKind::DeleteDv => &self.deletion_vectors,
-            crate::sql::common::ChangeStreamBranchKind::ReuseData => &self.row_lineage,
-            crate::sql::common::ChangeStreamBranchKind::FreshData => &self.data,
-        };
-        preparation.as_ref().ok_or_else(|| {
-            format!("change-stream branch {branch:?} has no Provider-signed write preparation")
-        })
-    }
-
-    fn primary(&self) -> &novarocks_spi::connector::ConnectorWritePreparation {
-        self.row_lineage
-            .as_ref()
-            .or(self.deletion_vectors.as_ref())
-            .or(self.data.as_ref())
-            .expect("change-stream branch set always has a signed preparation")
     }
 }
 
-impl DmlChangeStreamBranchSet {
-    fn branch_kinds(self) -> Vec<crate::sql::common::ChangeStreamBranchKind> {
-        use crate::sql::common::ChangeStreamBranchKind;
+impl DmlChangeStreamPreparations {
+    fn activate(&self) -> Result<ActivatedDmlChangeStreamPreparations, String> {
+        let plan = self
+            .lease
+            .activate_row_mutation(
+                novarocks_spi::connector::ConnectorRowMutationActivationRequest::Direct {
+                    preparation: self.preparation.clone(),
+                    context: self.context.clone(),
+                },
+            )
+            .map_err(|error| {
+                format!("activate Iceberg row mutation after durable intent: {error}")
+            })?;
+        Ok(ActivatedDmlChangeStreamPreparations {
+            operation_id: self.operation_id,
+            routes: plan.routes().to_vec(),
+        })
+    }
+}
+
+impl ActivatedDmlChangeStreamPreparations {
+    fn primary(&self) -> &novarocks_spi::connector::ConnectorWritePreparation {
+        self.routes
+            .first()
+            .expect("row-mutation route plan is non-empty")
+            .preparation()
+    }
+}
+
+impl DmlRowMutationEffectSet {
+    fn effects(self) -> Vec<novarocks_spi::connector::ConnectorRowMutationEffect> {
+        use novarocks_spi::connector::ConnectorRowMutationEffect;
 
         match self {
-            Self::UpdateMor => vec![
-                ChangeStreamBranchKind::DeleteDv,
-                ChangeStreamBranchKind::ReuseData,
-            ],
+            Self::UpdateMor => vec![ConnectorRowMutationEffect::Replace],
             Self::Merge {
                 matched_update,
                 matched_delete,
                 not_matched_insert,
             } => {
-                let mut branches = Vec::with_capacity(3);
+                let mut effects = Vec::with_capacity(3);
                 if matched_update || matched_delete {
-                    branches.push(ChangeStreamBranchKind::DeleteDv);
+                    effects.push(ConnectorRowMutationEffect::Delete);
                 }
                 if matched_update {
-                    branches.push(ChangeStreamBranchKind::ReuseData);
+                    effects.push(ConnectorRowMutationEffect::Replace);
                 }
                 if not_matched_insert {
-                    branches.push(ChangeStreamBranchKind::FreshData);
+                    effects.push(ConnectorRowMutationEffect::Insert);
                 }
-                branches
+                effects
             }
         }
     }
@@ -261,30 +264,38 @@ fn build_dml_change_stream_write_plan(
     producer: crate::sql::optimizer::OptimizedOperatorNode,
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
-    branch_set: DmlChangeStreamBranchSet,
-    preparations: &DmlChangeStreamPreparations,
+    _effect_set: DmlRowMutationEffectSet,
+    preparations: &ActivatedDmlChangeStreamPreparations,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     use crate::sql::planner::distributed::write::change_stream::{
-        ChangeStreamWriteLayoutBranch, ChangeStreamWriteLayoutRequest,
+        ChangeStreamWriteLayoutRequest, ChangeStreamWriteLayoutRoute,
         bind_change_stream_write_layout,
     };
-    let mut branches = Vec::new();
-    for branch_kind in branch_set.branch_kinds() {
+    use novarocks_spi::connector::{ConnectorMutationRouteInput, ConnectorWriteInputShape};
+
+    let mut routes = Vec::new();
+    for route in &preparations.routes {
         let target_binding = table_bindings.admitted_iceberg_write_binding_id_for_preparation(
             &target.catalog,
             &target.namespace,
             &target.table,
-            preparations.for_branch(branch_kind)?,
+            route.preparation(),
         )?;
-        let mode = match branch_kind {
-            crate::sql::common::ChangeStreamBranchKind::DeleteDv => {
-                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::DeletionVectors
+        let mode = match route.input() {
+            ConnectorWriteInputShape::Data { .. } => {
+                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data
             }
-            crate::sql::common::ChangeStreamBranchKind::ReuseData => {
+            ConnectorWriteInputShape::RowLineage { .. } => {
                 crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::RowLineageData
             }
-            crate::sql::common::ChangeStreamBranchKind::FreshData => {
-                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data
+            ConnectorWriteInputShape::PositionDelete { .. } => {
+                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::PositionDeletes
+            }
+            ConnectorWriteInputShape::DeletionVector { .. } => {
+                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::DeletionVectors
+            }
+            ConnectorWriteInputShape::EqualityDelete { .. } => {
+                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::EqualityDeletes
             }
         };
         let sink = sql_write_plan_input_for_admitted_target(
@@ -294,25 +305,53 @@ fn build_dml_change_stream_write_plan(
             crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
             None,
         )
-        .map_err(|error| format!("build {branch_kind:?} change-stream sink: {error}"))?;
-        branches.push(ChangeStreamWriteLayoutBranch { branch_kind, sink });
-    }
-    let target_partition_source_columns = target_partition_source_column_names(
-        branches
-            .iter()
-            .find(|branch| {
-                matches!(
-                    branch.branch_kind,
-                    crate::sql::common::ChangeStreamBranchKind::ReuseData
-                        | crate::sql::common::ChangeStreamBranchKind::FreshData
-                )
+        .map_err(|error| format!("build row-mutation route sink: {error}"))?;
+        // The Provider signs route field tokens, while SQL owns the physical
+        // producer layout.  Bind each token to this exact producer output here
+        // rather than treating the provider's match-contract ordinal as a
+        // planner output ordinal.  A logical Replace can therefore fan out to
+        // an identity-only delete route and an after-image data route.
+        let input_ordinals = route
+            .input()
+            .fields()
+            .into_iter()
+            .map(|field| {
+                producer
+                    .output_columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(field.field().name()))
+                    .ok_or_else(|| {
+                        format!(
+                            "row-mutation producer has no output for Provider route field `{}`",
+                            field.field().name()
+                        )
+                    })
+                    .and_then(|ordinal| {
+                        u32::try_from(ordinal).map_err(|_| {
+                            "row-mutation producer output ordinal exceeds u32".to_string()
+                        })
+                    })
+                    .map(|ordinal| ConnectorMutationRouteInput::new(field.token(), ordinal))
             })
-            .map(|branch| &branch.sink),
-    )?;
+            .collect::<Result<Vec<_>, _>>()?;
+        routes.push(ChangeStreamWriteLayoutRoute {
+            route_id: route.route_id(),
+            cohort_id: route.cohort_id(),
+            accepted_effects: route.accepted_effects().to_vec(),
+            input_ordinals,
+            partition_input_tokens: route.partition_fields().to_vec(),
+            sink,
+        });
+    }
+    let effect_output_ordinal = producer
+        .output_columns
+        .iter()
+        .position(|column| column.name == crate::sql::common::ROW_MUTATION_EFFECT_COLUMN)
+        .ok_or_else(|| "row-mutation producer has no logical effect output".to_string())?;
     let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
         producer_output_columns: &producer.output_columns,
-        branches,
-        target_partition_source_columns: &target_partition_source_columns,
+        effect_output_ordinal,
+        routes,
     })?;
     Ok(DmlChangeStreamWritePlan {
         producer,
@@ -580,7 +619,7 @@ pub(crate) fn prepare_update_mutation(
         let preparations = DmlChangeStreamPreparations::prepare(
             &materialization,
             &target_ref,
-            DmlChangeStreamBranchSet::UpdateMor,
+            DmlRowMutationEffectSet::UpdateMor,
             connector_context.clone(),
         )?;
         Some(PreparedMorUpdateWriteTarget {
@@ -682,7 +721,7 @@ pub(crate) fn prepare_merge_mutation(
                 &target.table,
             )?;
         let planning_lease = materialization.planning_lease.clone();
-        let branch_set = DmlChangeStreamBranchSet::Merge {
+        let effect_set = DmlRowMutationEffectSet::Merge {
             matched_update: matches!(
                 stmt.matched.as_ref().map(|clause| &clause.action),
                 Some(MergeMatchedAction::Update { .. })
@@ -696,7 +735,7 @@ pub(crate) fn prepare_merge_mutation(
         let preparations = DmlChangeStreamPreparations::prepare(
             &materialization,
             "main",
-            branch_set,
+            effect_set,
             connector_context.clone(),
         )?;
         Some(PreparedMorMergeWriteTarget {
@@ -761,7 +800,40 @@ pub(crate) fn stage_prepared_update_mutation(
             if matched.row_ids.is_empty() {
                 return Ok(MutationStagedWrite::NoOp);
             }
-            validate_unique_target_row_ids(&matched.row_ids)?;
+            let materialization =
+                crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+                    planning_lease.clone(),
+                    connector_context.clone(),
+                    &target.namespace,
+                    &target.table,
+                )?;
+            let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+            let (row_mutation_lease, row_mutation_preparation) = materialization
+                .prepare_row_mutation(
+                    &target_ref,
+                    operation_id,
+                    novarocks_spi::connector::ConnectorRowMutationIntent::Update,
+                    connector_context.clone(),
+                )?;
+            let selection = cow_selection_from_matched_update(
+                &matched,
+                &row_mutation_preparation,
+                connector_context.clone(),
+            )?;
+            let provider_plan = row_mutation_lease
+                .activate_row_mutation(
+                    novarocks_spi::connector::ConnectorRowMutationActivationRequest::CopyOnWrite {
+                        preparation: row_mutation_preparation,
+                        selection,
+                        context: connector_context.clone(),
+                    },
+                )
+                .map_err(|error| format!("activate Provider COW UPDATE plan: {error}"))?;
+            let provider_binding =
+                crate::connector::iceberg::provider::bind_iceberg_cow_execution_plan(
+                    &provider_plan,
+                )
+                .map_err(|error| format!("bind Provider COW UPDATE plan: {error}"))?;
             let metadata = table.metadata();
             let base_snapshot_id = if target_ref != "main" {
                 novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
@@ -795,11 +867,13 @@ pub(crate) fn stage_prepared_update_mutation(
                 &table,
                 &matched,
                 &target_columns,
-                &entry,
                 base_snapshot_id,
                 &target_ref,
                 planning_lease,
                 &connector_context,
+                provider_plan,
+                provider_binding,
+                row_mutation_lease,
             )?;
             let execution_handle = build_cow_update_distributed_execution(
                 state,
@@ -808,7 +882,6 @@ pub(crate) fn stage_prepared_update_mutation(
                 table,
                 collector,
                 entry,
-                base_snapshot_id,
                 &target_ref,
                 write,
                 execution,
@@ -842,6 +915,7 @@ pub(crate) fn stage_prepared_update_mutation(
             } = mor_write_target.ok_or_else(|| {
                 "MOR UPDATE reached stage without an admitted frozen write target".to_string()
             })?;
+            let preparations = preparations.activate()?;
             let write_lease = write_planning_lease
                 .derive_write_lease()
                 .map_err(|error| format!("derive MOR UPDATE write lease: {error}"))?;
@@ -888,7 +962,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 target_ref: target_ref.clone(),
                 snapshot_properties: BTreeMap::new(),
             });
-            let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+            let operation_id = preparations.operation_id;
             let mut write = write;
             let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
             let provider_binding = Arc::new(
@@ -1103,7 +1177,7 @@ fn build_update_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparations: &DmlChangeStreamPreparations,
+    preparations: &ActivatedDmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
@@ -1146,7 +1220,7 @@ fn build_update_mor_change_stream_write_plan(
     // intentionally precedes compilation, so `build_dml_change_stream_write_plan`
     // can recover the write token from the same store that resolves producer
     // scans. No preparation phase is allowed to reacquire current/latest.
-    for branch in DmlChangeStreamBranchSet::UpdateMor.branch_kinds() {
+    for route in &preparations.routes {
         crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
             table_bindings.as_ref(),
             crate::sql::planner::table::SqlTableIdentity {
@@ -1154,7 +1228,7 @@ fn build_update_mor_change_stream_write_plan(
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
             },
-            preparations.for_branch(branch)?.clone(),
+            route.preparation().clone(),
             write_planning_lease.clone(),
         )?;
     }
@@ -1179,7 +1253,7 @@ fn build_update_mor_change_stream_write_plan(
             "MOR UPDATE change-stream compilation did not retain query table bindings".to_string()
         })?,
         execution.clone(),
-        DmlChangeStreamBranchSet::UpdateMor,
+        DmlRowMutationEffectSet::UpdateMor,
         preparations,
     )?;
     plan.pre_expand_keyed_assert = Some(DmlPreExpandKeyedAssert {
@@ -1322,16 +1396,10 @@ fn build_update_mor_change_event_expand_plan(
         true,
         true,
     );
-    let change_op_output = alloc_output(
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+    let effect_output = alloc_output(
+        crate::sql::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
         arrow::datatypes::DataType::Int8,
         false,
-        true,
-    );
-    let data_route_output = alloc_output(
-        crate::sql::planner::distributed::write::change_stream::CHANGE_STREAM_DATA_ROUTE_COLUMN,
-        arrow::datatypes::DataType::Int32,
-        true,
         true,
     );
 
@@ -1361,7 +1429,7 @@ fn build_update_mor_change_event_expand_plan(
         false,
     );
 
-    let mut delete_assignments = vec![
+    let mut reuse_assignments = vec![
         ChangeEventOutputExpr {
             output_column_id: file_output.column_id,
             expr: Some(file_expr),
@@ -1371,7 +1439,6 @@ fn build_update_mor_change_event_expand_plan(
             expr: Some(pos_expr),
         },
     ];
-    let mut reuse_assignments = Vec::with_capacity(target_columns.len() + 2);
     for (name, output) in &target_outputs {
         let old_expr = child_column_expr(
             &mut scalar_arena,
@@ -1379,10 +1446,7 @@ fn build_update_mor_change_event_expand_plan(
             name,
             "UPDATE old target column",
         )?;
-        delete_assignments.push(ChangeEventOutputExpr {
-            output_column_id: output.column_id,
-            expr: Some(old_expr),
-        });
+        let _ = old_expr;
 
         let new_name = format!("__nr_new_{name}");
         let new_expr = match maybe_output_column_by_name(&child_outputs, &new_name)? {
@@ -1418,30 +1482,18 @@ fn build_update_mor_change_event_expand_plan(
     output_columns.extend(target_outputs.into_iter().map(|(_, column)| column));
     output_columns.push(row_id_output.clone());
     output_columns.push(last_sequence_output);
-    output_columns.push(change_op_output.clone());
-    output_columns.push(data_route_output.clone());
+    output_columns.push(effect_output.clone());
 
-    let mut stats = child_stats;
-    stats.output_row_count *= 2.0;
+    let stats = child_stats;
     let mut root = OptimizedOperatorNode {
         op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
-            events: vec![
-                ChangeEventSpec {
-                    predicate: None,
-                    branch_kind:
-                        crate::sql::common::change_stream::ChangeStreamBranchKind::DeleteDv,
-                    assignments: delete_assignments,
-                },
-                ChangeEventSpec {
-                    predicate: None,
-                    branch_kind:
-                        crate::sql::common::change_stream::ChangeStreamBranchKind::ReuseData,
-                    assignments: reuse_assignments,
-                },
-            ],
+            events: vec![ChangeEventSpec {
+                predicate: None,
+                effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+                assignments: reuse_assignments,
+            }],
             output_columns: output_columns.clone(),
-            change_op_column_id: change_op_output.column_id,
-            data_route_column_id: Some(data_route_output.column_id),
+            effect_column_id: effect_output.column_id,
         }),
         children: vec![distributed],
         stats,
@@ -1545,16 +1597,10 @@ fn build_merge_mor_change_event_expand_plan(
         true,
         true,
     );
-    let change_op_output = alloc_output(
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+    let effect_output = alloc_output(
+        crate::sql::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
         arrow::datatypes::DataType::Int8,
         false,
-        true,
-    );
-    let data_route_output = alloc_output(
-        crate::sql::planner::distributed::write::change_stream::CHANGE_STREAM_DATA_ROUTE_COLUMN,
-        arrow::datatypes::DataType::Int32,
-        true,
         true,
     );
 
@@ -1594,7 +1640,16 @@ fn build_merge_mor_change_event_expand_plan(
             expr: Some(pos_expr),
         },
     ];
-    let mut reuse_assignments = Vec::with_capacity(target_columns.len() + 2);
+    let mut reuse_assignments = vec![
+        ChangeEventOutputExpr {
+            output_column_id: file_output.column_id,
+            expr: Some(file_expr),
+        },
+        ChangeEventOutputExpr {
+            output_column_id: pos_output.column_id,
+            expr: Some(pos_expr),
+        },
+    ];
     let mut fresh_assignments = Vec::with_capacity(target_columns.len());
     for (name, output) in &target_outputs {
         let old_expr = child_column_expr(
@@ -1677,12 +1732,7 @@ fn build_merge_mor_change_event_expand_plan(
         let predicate = action_predicate(&mut scalar_arena, MERGE_ACTION_MATCHED_UPDATE)?;
         events.push(ChangeEventSpec {
             predicate: Some(predicate),
-            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::DeleteDv,
-            assignments: delete_assignments.clone(),
-        });
-        events.push(ChangeEventSpec {
-            predicate: Some(predicate),
-            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::ReuseData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: reuse_assignments,
         });
     }
@@ -1692,7 +1742,7 @@ fn build_merge_mor_change_event_expand_plan(
                 &mut scalar_arena,
                 MERGE_ACTION_MATCHED_DELETE,
             )?),
-            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::DeleteDv,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
             assignments: delete_assignments,
         });
     }
@@ -1702,7 +1752,7 @@ fn build_merge_mor_change_event_expand_plan(
                 &mut scalar_arena,
                 MERGE_ACTION_NOT_MATCHED_INSERT,
             )?),
-            branch_kind: crate::sql::common::change_stream::ChangeStreamBranchKind::FreshData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
             assignments: fresh_assignments,
         });
     }
@@ -1716,19 +1766,14 @@ fn build_merge_mor_change_event_expand_plan(
     output_columns.extend(target_outputs.into_iter().map(|(_, column)| column));
     output_columns.push(row_id_output);
     output_columns.push(last_sequence_output);
-    output_columns.push(change_op_output.clone());
-    output_columns.push(data_route_output.clone());
+    output_columns.push(effect_output.clone());
 
     let mut stats = child_stats;
-    if matched_update {
-        stats.output_row_count *= 2.0;
-    }
     let mut root = OptimizedOperatorNode {
         op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
             events,
             output_columns: output_columns.clone(),
-            change_op_column_id: change_op_output.column_id,
-            data_route_column_id: Some(data_route_output.column_id),
+            effect_column_id: effect_output.column_id,
         }),
         children: vec![distributed],
         stats,
@@ -2106,7 +2151,6 @@ struct CowFileRewritePlan {
     query_local_overlay:
         crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay,
     rewrite_query: sqlparser::ast::Query,
-    matched_row_ids: Vec<i64>,
 }
 
 /// Fully-planned distributed COW UPDATE write. The old/new-file mapping is
@@ -2115,8 +2159,10 @@ struct CowFileRewritePlan {
 struct CowUpdateDistributedWrite {
     file_plans: Vec<CowFileRewritePlan>,
     rewrite_preparation: novarocks_spi::connector::ConnectorWritePreparation,
+    provider_plan: novarocks_spi::connector::ConnectorRowMutationExecutionPlan,
+    provider_binding: crate::connector::iceberg::provider::IcebergCowExecutionBinding,
+    write_lease: novarocks_spi::connector::ConnectorWriteLease,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    base_snapshot_id: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2125,28 +2171,26 @@ fn build_cow_update_distributed_write(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     matched: &MatchedUpdateBatch,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
     target_ref: &str,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    provider_plan: novarocks_spi::connector::ConnectorRowMutationExecutionPlan,
+    provider_binding: crate::connector::iceberg::provider::IcebergCowExecutionBinding,
+    write_lease: novarocks_spi::connector::ConnectorWriteLease,
 ) -> Result<CowUpdateDistributedWrite, String> {
     let base_snapshot_id =
         base_snapshot_id.ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
-    let materialization =
-        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
-            planning_lease.clone(),
-            connector_context.clone(),
-            &target.namespace,
-            &target.table,
-        )?;
-    let (_, rewrite_preparation) = materialization.prepare_write(
-        target_ref,
-        novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        row_lineage_input_request(target_columns),
-        connector_context.clone(),
-    )?;
+    let rewrite_preparation = provider_plan
+        .routes()
+        .iter()
+        .find(|route| {
+            route
+                .accepted_effects()
+                .contains(&novarocks_spi::connector::ConnectorRowMutationEffect::Replace)
+        })
+        .map(|route| route.preparation().clone())
+        .ok_or_else(|| "Provider COW activation returned no replacement route".to_string())?;
 
     // Index the snapshot's data files by path so each touched file inherits its
     // `first_row_id` / `data_sequence_number` / pre-existing delete files. The
@@ -2192,10 +2236,6 @@ fn build_cow_update_distributed_write(
             planning_lease.clone(),
             connector_context,
         )?;
-        let matched_row_ids = matched_indices
-            .iter()
-            .map(|idx| matched.row_ids[*idx])
-            .collect::<Vec<_>>();
         let rewrite_query = build_cow_rewrite_query(
             target,
             &synthetic_table_name,
@@ -2208,15 +2248,16 @@ fn build_cow_update_distributed_write(
             old_file,
             query_local_overlay,
             rewrite_query,
-            matched_row_ids,
         });
     }
 
     Ok(CowUpdateDistributedWrite {
         file_plans,
         rewrite_preparation,
+        provider_plan,
+        provider_binding,
+        write_lease,
         planning_lease,
-        base_snapshot_id,
     })
 }
 
@@ -2343,9 +2384,12 @@ fn build_cow_rewrite_query(
     for &idx in matched_indices {
         let mut values = Vec::with_capacity(target_columns.len() + 1);
         values.push(matched.row_ids[idx].to_string());
+        let (batch_index, row_index) = matched.row_locations[idx];
+        let new_rows = matched.new_rows.get(batch_index).ok_or_else(|| {
+            "COW UPDATE matched row references a missing non-concatenated new-row batch".to_string()
+        })?;
         for target_column in target_columns {
-            let col_idx = matched
-                .new_rows
+            let col_idx = new_rows
                 .schema()
                 .index_of(&target_column.name)
                 .map_err(|_| {
@@ -2355,7 +2399,7 @@ fn build_cow_rewrite_query(
                     )
                 })?;
             let literal =
-                crate::sql::literal::literal_from_batch(matched.new_rows.column(col_idx), idx)?;
+                crate::sql::literal::literal_from_batch(new_rows.column(col_idx), row_index)?;
             values.push(literal_to_sql_for_values_target_column(
                 &literal,
                 target_column,
@@ -2667,7 +2711,6 @@ fn build_cow_update_distributed_execution(
     table: novarocks_connector_iceberg::iceberg::table::Table,
     collector: Arc<IcebergCommitCollector>,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    base_snapshot_id: Option<i64>,
     target_ref: &str,
     write: CowUpdateDistributedWrite,
     execution: QueryExecutionContext,
@@ -2685,46 +2728,24 @@ fn build_cow_update_distributed_execution(
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
     });
-    let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
-    let write_lease = write
-        .planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive COW UPDATE write lease: {error}"))?;
     let mut write = write;
+    let operation_id = write
+        .provider_plan
+        .copy_on_write()
+        .ok_or_else(|| "COW UPDATE is missing the Provider sealed cohort set".to_string())?
+        .0
+        .operation_id();
+    let write_lease = write.write_lease.clone();
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
-    let mut provider_cohorts = Vec::with_capacity(write.file_plans.len());
     let mut cohort_templates = Vec::with_capacity(write.file_plans.len());
     let mut cohort_by_old_file = BTreeMap::new();
     for file_plan in &mut write.file_plans {
-        file_plan.matched_row_ids.sort_unstable();
-        if file_plan
-            .matched_row_ids
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-        {
-            return Err(format!(
-                "COW UPDATE old file `{}` contains duplicate matched row IDs",
-                file_plan.old_file
-            ));
-        }
-        let semantic_digest: [u8; 32] = Sha256::digest(file_plan.old_file.as_bytes()).into();
-        let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::derive(
-            operation_id,
-            b"cow-rewrite",
-            semantic_digest,
-        )
-        .map_err(|error| format!("derive COW rewrite cohort: {error}"))?;
-        provider_cohorts.push(
-            crate::connector::iceberg::provider::IcebergCowWriteCohort::Rewrite {
-                cohort_id,
-                preparation: write.rewrite_preparation.clone(),
-                base_snapshot_id: write.base_snapshot_id,
-                old_file: file_plan.old_file.clone(),
-                matched_row_ids: file_plan.matched_row_ids.clone(),
-            },
-        );
+        let cohort_id = write
+            .provider_binding
+            .rewrite_cohort_for_file(&file_plan.old_file)
+            .map_err(|error| format!("resolve Provider COW rewrite cohort: {error}"))?;
         cohort_templates.push(
             crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
                 operation_id,
@@ -2745,6 +2766,7 @@ fn build_cow_update_distributed_execution(
         Arc::new(
             crate::connector::iceberg::write_service::IcebergCowWriteReportCommitter::new(
                 Arc::clone(&commit_executor),
+                entry.clone(),
             ),
         );
     let services = state
@@ -2752,10 +2774,9 @@ fn build_cow_update_distributed_execution(
         .read()
         .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
         .write_services();
-    crate::connector::iceberg::provider::register_iceberg_cow_write_service_from_preparations(
+    crate::connector::iceberg::provider::register_iceberg_cow_write_service_from_execution_plan(
         services,
-        operation_id,
-        provider_cohorts,
+        &write.provider_plan,
         target_ref,
         &entry,
         committer,
@@ -2787,8 +2808,211 @@ struct MatchedUpdateBatch {
     row_ids: Vec<i64>,
     file_paths: Vec<String>,
     row_positions: Vec<i64>,
-    old_rows: RecordBatch,
-    new_rows: RecordBatch,
+    last_updated_sequences: Vec<Option<i64>>,
+    /// Global match-row index to its non-concatenated Arrow batch/row.
+    row_locations: Vec<(usize, usize)>,
+    old_rows: Vec<RecordBatch>,
+    new_rows: Vec<RecordBatch>,
+}
+
+/// Convert the already-matched UPDATE rows into the provider-signed COW
+/// layout. This is deliberately token/ordinal driven after construction: the
+/// generic validator checks the signed match contract before activation and
+/// the Provider alone groups identities into cohort recipes.
+fn cow_selection_from_matched_update(
+    matched: &MatchedUpdateBatch,
+    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::ConnectorRowMutationSelection, String> {
+    cow_selection_from_matched_and_insert(matched, None, preparation, context)
+}
+
+/// Builds one bounded selection for a COW MERGE.  Insert rows intentionally
+/// carry null target identity/before-image fields: the signed contract and
+/// Provider both treat logical `Insert` as outside target-row uniqueness.
+fn cow_selection_from_matched_and_insert(
+    matched: &MatchedUpdateBatch,
+    insert_batch: Option<&RecordBatch>,
+    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::ConnectorRowMutationSelection, String> {
+    use novarocks_spi::connector::ConnectorRowMutationEffect;
+
+    let contract = preparation.match_contract();
+    let mut collector =
+        crate::engine::row_mutation::BoundedRowMutationMatchCollector::try_new(context, None)
+            .map_err(|error| format!("create bounded COW match collector: {error}"))?;
+    for (batch_index, (old_rows, new_rows)) in
+        matched.old_rows.iter().zip(&matched.new_rows).enumerate()
+    {
+        let global_rows = matched
+            .row_locations
+            .iter()
+            .enumerate()
+            .filter_map(|(global, (part, _))| (*part == batch_index).then_some(global))
+            .collect::<Vec<_>>();
+        let mut fields = Vec::new();
+        let mut columns = Vec::<ArrayRef>::new();
+        for identity in contract.identity_fields() {
+            fields.push(Arc::new(identity.field().clone()));
+            let column: ArrayRef = match identity.field().name().as_str() {
+                "_file" => Arc::new(StringArray::from(
+                    global_rows
+                        .iter()
+                        .map(|row| matched.file_paths[*row].clone())
+                        .collect::<Vec<_>>(),
+                )),
+                "_pos" => Arc::new(Int64Array::from(
+                    global_rows
+                        .iter()
+                        .map(|row| matched.row_positions[*row])
+                        .collect::<Vec<_>>(),
+                )),
+                "_row_id" => Arc::new(Int64Array::from(
+                    global_rows
+                        .iter()
+                        .map(|row| matched.row_ids[*row])
+                        .collect::<Vec<_>>(),
+                )),
+                "_last_updated_sequence_number" => Arc::new(Int64Array::from(
+                    global_rows
+                        .iter()
+                        .map(|row| matched.last_updated_sequences[*row])
+                        .collect::<Vec<_>>(),
+                )),
+                other => {
+                    return Err(format!(
+                        "provider match contract requested an unsupported COW identity field `{other}`"
+                    ));
+                }
+            };
+            columns.push(column);
+        }
+        for field in contract.before_fields() {
+            fields.push(Arc::new(field.field().clone()));
+            let ordinal = old_rows
+                .schema()
+                .index_of(field.field().name())
+                .map_err(|_| {
+                    format!(
+                        "provider COW before-image field `{}` is absent from the matched result",
+                        field.field().name()
+                    )
+                })?;
+            columns.push(
+                crate::exec::expr::cast_array_to_target(
+                    old_rows.column(ordinal),
+                    field.field().data_type(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "cast provider COW before-image field `{}` to its sealed contract: {error}",
+                        field.field().name()
+                    )
+                })?,
+            );
+        }
+        for field in contract.after_fields() {
+            fields.push(Arc::new(field.field().clone()));
+            let ordinal = new_rows
+                .schema()
+                .index_of(field.field().name())
+                .map_err(|_| {
+                    format!(
+                        "provider COW after-image field `{}` is absent from the matched result",
+                        field.field().name()
+                    )
+                })?;
+            columns.push(
+                crate::exec::expr::cast_array_to_target(
+                    new_rows.column(ordinal),
+                    field.field().data_type(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "cast provider COW after-image field `{}` to its sealed contract: {error}",
+                        field.field().name()
+                    )
+                })?,
+            );
+        }
+        fields.push(Arc::new(contract.effect_field().field().clone()));
+        columns.push(Arc::new(Int8Array::from(vec![
+            ConnectorRowMutationEffect::Replace
+                as i8;
+            global_rows.len()
+        ])));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| format!("assemble provider COW match selection: {error}"))?;
+        collector
+            .push(batch)
+            .map_err(|error| format!("collect bounded COW match batch: {error}"))?;
+    }
+    if let Some(insert_batch) = insert_batch.filter(|batch| batch.num_rows() > 0) {
+        let mut fields = Vec::new();
+        let mut columns = Vec::<ArrayRef>::new();
+        for identity in contract.identity_fields() {
+            fields.push(Arc::new(identity.field().clone()));
+            columns.push(arrow::array::new_null_array(
+                identity.field().data_type(),
+                insert_batch.num_rows(),
+            ));
+        }
+        for field in contract.before_fields() {
+            fields.push(Arc::new(field.field().clone()));
+            columns.push(arrow::array::new_null_array(
+                field.field().data_type(),
+                insert_batch.num_rows(),
+            ));
+        }
+        for field in contract.after_fields() {
+            fields.push(Arc::new(field.field().clone()));
+            let ordinal = insert_batch
+                .schema()
+                .index_of(field.field().name())
+                .map_err(|_| {
+                    format!(
+                        "provider COW after-image field `{}` is absent from the MERGE INSERT result",
+                        field.field().name()
+                    )
+                })?;
+            columns.push(
+                crate::exec::expr::cast_array_to_target(
+                    insert_batch.column(ordinal),
+                    field.field().data_type(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "cast provider COW MERGE INSERT field `{}` to its sealed contract: {error}",
+                        field.field().name()
+                    )
+                })?,
+            );
+        }
+        fields.push(Arc::new(contract.effect_field().field().clone()));
+        columns.push(Arc::new(Int8Array::from(vec![
+            ConnectorRowMutationEffect::Insert
+                as i8;
+            insert_batch.num_rows()
+        ])));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| format!("assemble provider COW INSERT selection: {error}"))?;
+        collector
+            .push(batch)
+            .map_err(|error| format!("collect bounded COW INSERT batch: {error}"))?;
+    }
+    let selection = collector
+        .finish()
+        .map_err(|error| format!("finish bounded COW match collection: {error}"))?;
+    let mut validator = crate::engine::row_mutation::RowMutationMatchValidator::try_new(
+        contract.clone(),
+        preparation.intent().clone(),
+    )
+    .map_err(|error| format!("initialize COW match contract validator: {error}"))?;
+    validator
+        .validate_selection(&selection)
+        .map_err(|error| format!("validate COW match contract: {error}"))?;
+    Ok(selection)
 }
 
 fn execute_update_match_query(
@@ -2818,18 +3042,11 @@ fn execute_update_match_query(
 fn matched_update_batch_from_query_result(
     result: QueryResult,
 ) -> Result<MatchedUpdateBatch, String> {
-    let Some(first_chunk) = result.chunks.first() else {
-        return empty_matched_update_batch();
-    };
-    let schema = first_chunk.batch.schema();
-    let batches = result
-        .chunks
-        .iter()
-        .map(|chunk| chunk.batch.clone())
-        .collect::<Vec<_>>();
-    let batch = concat_batches(&schema, batches.iter())
-        .map_err(|e| format!("concatenate UPDATE match batches failed: {e}"))?;
-    matched_update_batch_from_record_batch(&batch)
+    let mut merged = empty_matched_update_batch()?;
+    for chunk in result.chunks {
+        merged.append(matched_update_batch_from_record_batch(&chunk.batch)?);
+    }
+    Ok(merged)
 }
 
 fn matched_update_batch_from_record_batch(
@@ -2857,10 +3074,20 @@ fn matched_update_batch_from_record_batch(
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| "__nr_row_id was not Int64 after cast".to_string())?;
+    let last_updated_col = cast(
+        required_column(batch, "__nr_last_updated_sequence_number")?,
+        &DataType::Int64,
+    )
+    .map_err(|e| format!("cast __nr_last_updated_sequence_number to Int64 failed: {e}"))?;
+    let last_updated_arr = last_updated_col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| "__nr_last_updated_sequence_number was not Int64 after cast".to_string())?;
 
     let mut file_paths = Vec::with_capacity(batch.num_rows());
     let mut row_positions = Vec::with_capacity(batch.num_rows());
     let mut row_ids = Vec::with_capacity(batch.num_rows());
+    let mut last_updated_sequences = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         if file_arr.is_null(row) || pos_arr.is_null(row) || row_id_arr.is_null(row) {
             return Err("UPDATE match query produced null row identity columns".to_string());
@@ -2868,6 +3095,8 @@ fn matched_update_batch_from_record_batch(
         file_paths.push(file_arr.value(row).to_string());
         row_positions.push(pos_arr.value(row));
         row_ids.push(row_id_arr.value(row));
+        last_updated_sequences
+            .push((!last_updated_arr.is_null(row)).then(|| last_updated_arr.value(row)));
     }
 
     let old_indices = batch
@@ -2911,20 +3140,40 @@ fn matched_update_batch_from_record_batch(
         row_ids,
         file_paths,
         row_positions,
-        old_rows,
-        new_rows,
+        last_updated_sequences,
+        row_locations: (0..batch.num_rows()).map(|row| (0, row)).collect(),
+        old_rows: vec![old_rows],
+        new_rows: vec![new_rows],
     })
 }
 
+impl MatchedUpdateBatch {
+    fn append(&mut self, mut next: Self) {
+        let batch_offset = self.new_rows.len();
+        self.row_ids.append(&mut next.row_ids);
+        self.file_paths.append(&mut next.file_paths);
+        self.row_positions.append(&mut next.row_positions);
+        self.last_updated_sequences
+            .append(&mut next.last_updated_sequences);
+        self.row_locations.extend(
+            next.row_locations
+                .drain(..)
+                .map(|(batch, row)| (batch + batch_offset, row)),
+        );
+        self.old_rows.append(&mut next.old_rows);
+        self.new_rows.append(&mut next.new_rows);
+    }
+}
+
 fn empty_matched_update_batch() -> Result<MatchedUpdateBatch, String> {
-    let schema = Arc::new(Schema::empty());
-    let empty = RecordBatch::new_empty(schema);
     Ok(MatchedUpdateBatch {
         row_ids: Vec::new(),
         file_paths: Vec::new(),
         row_positions: Vec::new(),
-        old_rows: empty.clone(),
-        new_rows: empty,
+        last_updated_sequences: Vec::new(),
+        row_locations: Vec::new(),
+        old_rows: Vec::new(),
+        new_rows: Vec::new(),
     })
 }
 
@@ -3033,19 +3282,6 @@ fn validate_update_assignments(
     Ok(())
 }
 
-fn validate_unique_target_row_ids(row_ids: &[i64]) -> Result<(), String> {
-    let mut seen = std::collections::HashSet::new();
-    for row_id in row_ids {
-        if !seen.insert(*row_id) {
-            return Err(format!(
-                "UPDATE source matched target row _row_id={} more than once; deduplicate the source before retrying",
-                row_id
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn build_update_match_query_sql(
     target_sql: &str,
     target_alias: &str,
@@ -3147,6 +3383,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         } = mor_write_target.ok_or_else(|| {
             "MOR MERGE reached stage without an admitted frozen write target".to_string()
         })?;
+        let preparations = preparations.activate()?;
         let write_lease = write_planning_lease
             .derive_write_lease()
             .map_err(|error| format!("derive MOR MERGE write lease: {error}"))?;
@@ -3193,7 +3430,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             target_ref: "main".to_string(),
             snapshot_properties: BTreeMap::new(),
         });
-        let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+        let operation_id = preparations.operation_id;
         let mut write = write;
         let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
         let provider_binding = Arc::new(
@@ -3300,7 +3537,10 @@ pub(crate) fn stage_prepared_merge_mutation(
         &execution,
         &connector_context,
     )?;
-    let insert_branch = if has_not_matched_insert {
+    // Keep the logical INSERT result for the COW selection, but do not admit
+    // an ordinary append preparation yet.  A COW MERGE must use only the
+    // Provider-sealed append route returned with the rewrite cohorts.
+    let insert_candidate = if has_not_matched_insert {
         let insert_columns = insert_columns_resolved
             .as_ref()
             .expect("not_matched populated => insert columns resolved");
@@ -3318,54 +3558,70 @@ pub(crate) fn stage_prepared_merge_mutation(
                 state.connector_control.as_ref(),
                 &target.catalog,
             )?;
-            let materialization =
-                crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
-                    planning_lease.clone(),
-                    connector_context.clone(),
-                    &target.namespace,
-                    &target.table,
-                )?;
-            let (_, preparation) = materialization.prepare_write(
-                "main",
-                novarocks_spi::connector::ConnectorWriteIntent::Append,
-                novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                    fields: target_columns
-                        .iter()
-                        .map(|column| {
-                            novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                                arrow::datatypes::Field::new(
-                                    &column.name,
-                                    column.data_type.clone(),
-                                    column.nullable,
-                                ),
-                            )
-                        })
-                        .collect(),
-                },
-                connector_context.clone(),
-            )?;
-            Some((insert_query, preparation, planning_lease))
+            Some((insert_query, insert_batch, planning_lease))
         } else {
             None
         }
     } else {
         None
     };
+    let insert_selection_batch = insert_candidate.as_ref().map(|(_, batch, _)| batch);
     let mut matched_branch = if let Some(clause) = stmt.matched.as_ref() {
         let matched = matched_update_batch_from_record_batch(&match_rows.matched_batch()?)?;
         if matched.row_ids.is_empty() {
             MergeMatchedBranch::None
         } else {
-            validate_unique_target_row_ids(&matched.row_ids)?;
             match &clause.action {
                 MergeMatchedAction::Update { .. } => {
+                    let materialization = crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+                        planning_lease.clone(),
+                        connector_context.clone(),
+                        &target.namespace,
+                        &target.table,
+                    )?;
+                    let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+                    let intent = if insert_selection_batch.is_some() {
+                        novarocks_spi::connector::ConnectorRowMutationIntent::Merge {
+                            effects: vec![
+                                novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+                                novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
+                            ],
+                        }
+                    } else {
+                        novarocks_spi::connector::ConnectorRowMutationIntent::Update
+                    };
+                    let (row_mutation_lease, row_mutation_preparation) = materialization
+                        .prepare_row_mutation(
+                            "main",
+                            operation_id,
+                            intent,
+                            connector_context.clone(),
+                        )?;
+                    let selection = cow_selection_from_matched_and_insert(
+                        &matched,
+                        insert_selection_batch,
+                        &row_mutation_preparation,
+                        connector_context.clone(),
+                    )?;
+                    let provider_plan = row_mutation_lease
+                        .activate_row_mutation(
+                            novarocks_spi::connector::ConnectorRowMutationActivationRequest::CopyOnWrite {
+                                preparation: row_mutation_preparation,
+                                selection,
+                                context: connector_context.clone(),
+                            },
+                        )
+                        .map_err(|error| format!("activate Provider COW MERGE plan: {error}"))?;
+                    let provider_binding =
+                        crate::connector::iceberg::provider::bind_iceberg_cow_execution_plan(
+                            &provider_plan,
+                        )
+                        .map_err(|error| format!("bind Provider COW MERGE plan: {error}"))?;
                     MergeMatchedBranch::CowUpdate(build_cow_update_distributed_write(
                         &target,
                         &table,
                         &matched,
                         &target_columns,
-                        &entry,
                         table
                             .metadata()
                             .current_snapshot()
@@ -3373,6 +3629,9 @@ pub(crate) fn stage_prepared_merge_mutation(
                         "main",
                         planning_lease.clone(),
                         &connector_context,
+                        provider_plan,
+                        provider_binding,
+                        row_mutation_lease,
                     )?)
                 }
                 MergeMatchedAction::Delete => unreachable!("MOR DELETE was selected above"),
@@ -3381,11 +3640,11 @@ pub(crate) fn stage_prepared_merge_mutation(
     } else {
         MergeMatchedBranch::None
     };
-    if insert_branch.is_none() && matches!(matched_branch, MergeMatchedBranch::None) {
+    if insert_candidate.is_none() && matches!(matched_branch, MergeMatchedBranch::None) {
         return Ok(MutationStagedWrite::NoOp);
     }
     if matches!(matched_branch, MergeMatchedBranch::None) {
-        let (query, _, planning_lease) = insert_branch
+        let (query, _, planning_lease) = insert_candidate
             .as_ref()
             .expect("non-noop MERGE without a matched branch has an insert branch");
         let resolved = crate::connector::metadata_load_table_with_planning_lease(
@@ -3466,17 +3725,14 @@ pub(crate) fn stage_prepared_merge_mutation(
         target_ref: "main".to_string(),
         snapshot_properties: BTreeMap::new(),
     });
-    let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
     let cow_operation = match &mut matched_branch {
         MergeMatchedBranch::CowUpdate(write) => Some(prepare_cow_merge_operation(
             state,
-            &target,
             "main",
             write,
-            insert_branch.as_ref(),
+            insert_candidate.is_some(),
             &entry,
             Arc::clone(&commit_executor),
-            operation_id,
             &connector_context,
         )?),
         MergeMatchedBranch::None => unreachable!("checked above"),
@@ -3484,6 +3740,25 @@ pub(crate) fn stage_prepared_merge_mutation(
     let planning_lease = match &matched_branch {
         MergeMatchedBranch::CowUpdate(write) => write.planning_lease.clone(),
         MergeMatchedBranch::None => unreachable!("checked above"),
+    };
+    let insert_branch = match (
+        insert_candidate,
+        cow_operation
+            .as_ref()
+            .and_then(|operation| operation.append_preparation.as_ref()),
+    ) {
+        (Some((query, _, _)), Some(preparation)) => {
+            Some((query, preparation.clone(), planning_lease.clone()))
+        }
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err("MERGE COW INSERT has no Provider-sealed append route".to_string());
+        }
+        (None, Some(_)) => {
+            return Err(
+                "Provider COW plan sealed an append route without INSERT input".to_string(),
+            );
+        }
     };
     let execution_handle = Arc::new(DistributedMergeExecutor {
         state: Arc::clone(state),
@@ -3523,58 +3798,30 @@ pub(crate) fn stage_prepared_merge_mutation(
 #[allow(clippy::too_many_arguments)]
 fn prepare_cow_merge_operation(
     state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
     target_ref: &str,
     write: &mut CowUpdateDistributedWrite,
-    insert: Option<&(
-        sqlparser::ast::Query,
-        novarocks_spi::connector::ConnectorWritePreparation,
-        novarocks_spi::connector::ConnectorControlPlanningLease,
-    )>,
+    has_insert: bool,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
-    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowMergeOperation, String> {
-    let write_lease = write
-        .planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive COW MERGE write lease: {error}"))?;
+    let operation_id = write
+        .provider_plan
+        .copy_on_write()
+        .ok_or_else(|| "COW MERGE is missing the Provider sealed cohort set".to_string())?
+        .0
+        .operation_id();
+    let write_lease = write.write_lease.clone();
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
-    let mut provider_cohorts =
-        Vec::with_capacity(write.file_plans.len() + usize::from(insert.is_some()));
-    let mut templates = Vec::with_capacity(write.file_plans.len() + usize::from(insert.is_some()));
+    let mut templates = Vec::with_capacity(write.file_plans.len() + usize::from(has_insert));
     let mut cohort_by_old_file = BTreeMap::new();
     for file_plan in &mut write.file_plans {
-        file_plan.matched_row_ids.sort_unstable();
-        if file_plan
-            .matched_row_ids
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-        {
-            return Err(format!(
-                "MERGE COW old file `{}` contains duplicate matched row IDs",
-                file_plan.old_file
-            ));
-        }
-        let semantic_digest: [u8; 32] = Sha256::digest(file_plan.old_file.as_bytes()).into();
-        let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::derive(
-            operation_id,
-            b"cow-rewrite",
-            semantic_digest,
-        )
-        .map_err(|error| format!("derive MERGE COW rewrite cohort: {error}"))?;
-        provider_cohorts.push(
-            crate::connector::iceberg::provider::IcebergCowWriteCohort::Rewrite {
-                cohort_id,
-                preparation: write.rewrite_preparation.clone(),
-                base_snapshot_id: write.base_snapshot_id,
-                old_file: file_plan.old_file.clone(),
-                matched_row_ids: file_plan.matched_row_ids.clone(),
-            },
-        );
+        let cohort_id = write
+            .provider_binding
+            .rewrite_cohort_for_file(&file_plan.old_file)
+            .map_err(|error| format!("resolve Provider COW MERGE rewrite cohort: {error}"))?;
         templates.push(
             crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
                 operation_id,
@@ -3586,21 +3833,17 @@ fn prepare_cow_merge_operation(
         );
         cohort_by_old_file.insert(file_plan.old_file.clone(), cohort_id);
     }
-    let append_cohort = if let Some((_, preparation, _)) = insert {
-        let semantic_digest: [u8; 32] = Sha256::digest(b"cow-append").into();
-        let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::derive(
-            operation_id,
-            b"cow-append",
-            semantic_digest,
-        )
-        .map_err(|error| format!("derive MERGE COW append cohort: {error}"))?;
-        provider_cohorts.push(
-            crate::connector::iceberg::provider::IcebergCowWriteCohort::Append {
-                cohort_id,
-                preparation: preparation.clone(),
-                base_snapshot_id: write.base_snapshot_id,
-            },
-        );
+    let (append_cohort, append_preparation) = if has_insert {
+        let cohort_id = write.provider_binding.append_cohort().ok_or_else(|| {
+            "MERGE COW INSERT branch has no Provider-sealed append cohort".to_string()
+        })?;
+        let preparation = write
+            .provider_plan
+            .routes()
+            .iter()
+            .find(|route| route.cohort_id() == cohort_id)
+            .map(|route| route.preparation().clone())
+            .ok_or_else(|| "Provider COW append cohort has no route preparation".to_string())?;
         templates.push(
             crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
                 operation_id,
@@ -3610,14 +3853,15 @@ fn prepare_cow_merge_operation(
                 write_lease.clone(),
             ),
         );
-        Some(cohort_id)
+        (Some(cohort_id), Some(preparation))
     } else {
-        None
+        (None, None)
     };
     let committer: Arc<dyn crate::connector::iceberg::write_service::IcebergWriteReportCommitter> =
         Arc::new(
             crate::connector::iceberg::write_service::IcebergCowWriteReportCommitter::new(
                 commit_executor,
+                entry.clone(),
             ),
         );
     let services = state
@@ -3625,10 +3869,9 @@ fn prepare_cow_merge_operation(
         .read()
         .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
         .write_services();
-    crate::connector::iceberg::provider::register_iceberg_cow_write_service_from_preparations(
+    crate::connector::iceberg::provider::register_iceberg_cow_write_service_from_execution_plan(
         services,
-        operation_id,
-        provider_cohorts,
+        &write.provider_plan,
         target_ref,
         entry,
         committer,
@@ -3645,6 +3888,7 @@ fn prepare_cow_merge_operation(
         session,
         cohort_by_old_file,
         append_cohort,
+        append_preparation,
     })
 }
 
@@ -3984,7 +4228,7 @@ fn build_merge_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparations: &DmlChangeStreamPreparations,
+    preparations: &ActivatedDmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt
@@ -4114,12 +4358,12 @@ fn build_merge_mor_change_stream_write_plan(
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let table_bindings = analyzer_provider.query_table_bindings();
-    let branch_set = DmlChangeStreamBranchSet::Merge {
+    let effect_set = DmlRowMutationEffectSet::Merge {
         matched_update: has_matched_update,
         matched_delete: has_matched_delete,
         not_matched_insert: has_not_matched_insert,
     };
-    for branch in branch_set.branch_kinds() {
+    for route in &preparations.routes {
         crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
             table_bindings.as_ref(),
             crate::sql::planner::table::SqlTableIdentity {
@@ -4127,7 +4371,7 @@ fn build_merge_mor_change_stream_write_plan(
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
             },
-            preparations.for_branch(branch)?.clone(),
+            route.preparation().clone(),
             write_planning_lease.clone(),
         )?;
     }
@@ -4155,7 +4399,7 @@ fn build_merge_mor_change_stream_write_plan(
             "MOR MERGE change-stream compilation did not retain query table bindings".to_string()
         })?,
         execution.clone(),
-        branch_set,
+        effect_set,
         preparations,
     )?;
     if has_matched_update || has_matched_delete {
@@ -4416,6 +4660,7 @@ struct CowMergeOperation {
     session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
     cohort_by_old_file: BTreeMap<String, novarocks_spi::connector::ConnectorWriteCohortId>,
     append_cohort: Option<novarocks_spi::connector::ConnectorWriteCohortId>,
+    append_preparation: Option<novarocks_spi::connector::ConnectorWritePreparation>,
 }
 
 fn admitted_merge_write_input(
@@ -4864,65 +5109,16 @@ mod tests {
         assert!(saw_action_literal, "predicate must compare expected action");
     }
 
-    fn branch_kinds_for_test(
+    fn effects_for_test(
         expand: &crate::sql::optimizer::operator::ChangeEventExpandOp,
-    ) -> Vec<crate::sql::common::change_stream::ChangeStreamBranchKind> {
-        expand
-            .events
-            .iter()
-            .map(|event| event.branch_kind)
-            .collect()
+    ) -> Vec<novarocks_spi::connector::ConnectorRowMutationEffect> {
+        expand.events.iter().map(|event| event.effect).collect()
     }
 
     #[test]
-    fn iceberg_table_columns_maps_variant_to_largebinary() {
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
-
-        let iceberg_schema = Arc::new(
-            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                    NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
-                    NestedField::optional(3, "b", Type::Primitive(PrimitiveType::Binary)).into(),
-                ])
-                .build()
-                .expect("schema"),
-        );
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
-            iceberg_schema.as_ref().clone(),
-            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
-            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
-            "file:///tmp/iv3_variant_columns".to_string(),
-            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
-            std::collections::HashMap::new(),
-        )
-        .expect("builder")
-        .build()
-        .expect("metadata")
-        .metadata;
-        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(
-                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"])
-                    .expect("ident"),
-            )
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("table");
-
-        let columns = iceberg_table_columns(&table).expect("columns");
-        assert_eq!(columns[0].data_type, DataType::Int64);
-        assert_eq!(columns[1].data_type, DataType::LargeBinary);
-        assert_eq!(columns[2].data_type, DataType::Binary);
-    }
-
-    #[test]
-    fn update_mor_change_event_expand_plan_has_expected_shape() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+    fn update_mor_change_event_expand_emits_one_replace_effect() {
         use crate::sql::optimizer::operator::Operator;
         use crate::sql::optimizer::property::{DistributionSpec, HashSource};
-        use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
         let target_columns = vec![non_null_col("id"), col("qty")];
         let plan = build_update_mor_change_event_expand_plan(
@@ -4934,7 +5130,6 @@ mod tests {
         let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
             panic!("expected PhysicalChangeEventExpand");
         };
-        assert_eq!(plan.children.len(), 1);
         let Operator::PhysicalDistribution(distribution) = &plan.children[0].op else {
             panic!("expected pre-expand PhysicalDistribution");
         };
@@ -4945,94 +5140,26 @@ mod tests {
                 source: HashSource::ShuffleAgg,
             }
         );
-
-        assert_eq!(expand.events.len(), 2);
         assert_eq!(
-            expand.events[0].branch_kind,
-            ChangeStreamBranchKind::DeleteDv
+            effects_for_test(expand),
+            vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace]
         );
-        assert_eq!(
-            expand.events[1].branch_kind,
-            ChangeStreamBranchKind::ReuseData
+        let effect = output_column_by_name_for_test(
+            &expand.output_columns,
+            crate::sql::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
         );
-
-        let file = output_column_by_name_for_test(&expand.output_columns, "_file");
-        let pos = output_column_by_name_for_test(&expand.output_columns, "_pos");
-        let id = output_column_by_name_for_test(&expand.output_columns, "id");
-        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
-        let row_id = output_column_by_name_for_test(&expand.output_columns, "_row_id");
-        let seq =
-            output_column_by_name_for_test(&expand.output_columns, "_last_updated_sequence_number");
-        let change_op = output_column_by_name_for_test(&expand.output_columns, "__change_op");
-        let route = output_column_by_name_for_test(&expand.output_columns, "__change_data_route");
-        assert!(file.is_internal);
-        assert!(pos.is_internal);
-        assert!(!id.is_internal);
-        assert!(!qty.is_internal);
-        assert!(row_id.is_internal);
-        assert!(seq.is_internal);
-        assert!(change_op.is_internal);
-        assert!(route.is_internal);
-        assert_eq!(expand.change_op_column_id, change_op.column_id);
-        assert_eq!(expand.data_route_column_id, Some(route.column_id));
-        assert_eq!(plan.output_columns.len(), expand.output_columns.len());
-        assert!(
-            plan.output_columns
-                .iter()
-                .zip(&expand.output_columns)
-                .all(|(left, right)| left.column_id == right.column_id
-                    && left.name == right.name
-                    && left.is_internal == right.is_internal)
-        );
-
-        let arena = plan
-            .execution_props
-            .scalar_arena
-            .as_deref()
-            .expect("scalar arena");
-        let delete = &expand.events[0];
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(delete, file.column_id),
-            1,
-        );
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(delete, pos.column_id),
-            2,
-        );
-        assert_assignment_is_column_ref(arena, assignment_expr_for_output(delete, id.column_id), 4);
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(delete, qty.column_id),
-            5,
-        );
-
-        let reuse = &expand.events[1];
-        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, id.column_id), 4);
-        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, qty.column_id), 6);
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(reuse, row_id.column_id),
-            3,
-        );
-        let seq_expr = assignment_expr_for_output(reuse, seq.column_id);
-        assert_eq!(
-            arena.node(seq_expr),
-            &ScalarNode::Literal(HashableLiteral(crate::sql::analysis::LiteralValue::Int(77)))
-        );
+        assert!(effect.is_internal);
+        assert_eq!(effect.data_type, DataType::Int8);
+        assert_eq!(expand.effect_column_id, effect.column_id);
     }
 
     #[test]
-    fn merge_mor_change_event_expand_matched_update_shape() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+    fn merge_mor_matched_update_is_one_replace_effect() {
         use crate::sql::optimizer::operator::Operator;
-        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
 
-        let target_columns = vec![non_null_col("id"), col("qty")];
         let plan = build_merge_mor_change_event_expand_plan(
             merge_mor_expand_child_plan_for_test(true),
-            &target_columns,
+            &[non_null_col("id"), col("qty")],
             101,
             true,
             false,
@@ -5042,215 +5169,10 @@ mod tests {
         let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
             panic!("expected PhysicalChangeEventExpand");
         };
-        let Operator::PhysicalDistribution(distribution) = &plan.children[0].op else {
-            panic!("expected pre-expand PhysicalDistribution");
-        };
         assert_eq!(
-            distribution.spec,
-            DistributionSpec::HashPartitioned {
-                cols: vec![crate::sql::column_id::ColumnId::new_for_test(4)],
-                source: HashSource::ShuffleAgg,
-            }
+            effects_for_test(expand),
+            vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace]
         );
-
-        assert_eq!(expand.events.len(), 2);
-        assert_eq!(
-            branch_kinds_for_test(expand),
-            vec![
-                ChangeStreamBranchKind::DeleteDv,
-                ChangeStreamBranchKind::ReuseData,
-            ]
-        );
-
-        let file = output_column_by_name_for_test(&expand.output_columns, "_file");
-        let pos = output_column_by_name_for_test(&expand.output_columns, "_pos");
-        let id = output_column_by_name_for_test(&expand.output_columns, "id");
-        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
-        let row_id = output_column_by_name_for_test(&expand.output_columns, "_row_id");
-        let seq =
-            output_column_by_name_for_test(&expand.output_columns, "_last_updated_sequence_number");
-        let change_op = output_column_by_name_for_test(&expand.output_columns, "__change_op");
-        let route = output_column_by_name_for_test(&expand.output_columns, "__change_data_route");
-        assert!(file.is_internal);
-        assert!(pos.is_internal);
-        assert!(!id.is_internal);
-        assert!(!qty.is_internal);
-        assert!(row_id.is_internal);
-        assert!(seq.is_internal);
-        assert!(change_op.is_internal);
-        assert!(route.is_internal);
-        assert_eq!(expand.change_op_column_id, change_op.column_id);
-        assert_eq!(expand.data_route_column_id, Some(route.column_id));
-
-        let arena = plan
-            .execution_props
-            .scalar_arena
-            .as_deref()
-            .expect("scalar arena");
-        let delete = &expand.events[0];
-        assert_event_predicate_matches_action(arena, delete, MERGE_ACTION_MATCHED_UPDATE);
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(delete, file.column_id),
-            1,
-        );
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(delete, pos.column_id),
-            2,
-        );
-        assert_assignment_is_column_ref(arena, assignment_expr_for_output(delete, id.column_id), 6);
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(delete, qty.column_id),
-            7,
-        );
-
-        let reuse = &expand.events[1];
-        assert_event_predicate_matches_action(arena, reuse, MERGE_ACTION_MATCHED_UPDATE);
-        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, id.column_id), 6);
-        assert_assignment_is_column_ref(arena, assignment_expr_for_output(reuse, qty.column_id), 8);
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(reuse, row_id.column_id),
-            3,
-        );
-        assert_assignment_is_int_literal(
-            arena,
-            assignment_expr_for_output(reuse, seq.column_id),
-            101,
-        );
-    }
-
-    #[test]
-    fn merge_mor_change_event_expand_matched_delete_shape() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
-        use crate::sql::optimizer::operator::Operator;
-
-        let target_columns = vec![non_null_col("id"), col("qty")];
-        let plan = build_merge_mor_change_event_expand_plan(
-            merge_mor_expand_child_plan_for_test(true),
-            &target_columns,
-            101,
-            false,
-            true,
-            false,
-        )
-        .expect("MOR MERGE matched DELETE expand plan");
-        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
-            panic!("expected PhysicalChangeEventExpand");
-        };
-        assert_eq!(
-            branch_kinds_for_test(expand),
-            vec![ChangeStreamBranchKind::DeleteDv]
-        );
-
-        let arena = plan
-            .execution_props
-            .scalar_arena
-            .as_deref()
-            .expect("scalar arena");
-        let delete = &expand.events[0];
-        assert_event_predicate_matches_action(arena, delete, MERGE_ACTION_MATCHED_DELETE);
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(
-                delete,
-                output_column_by_name_for_test(&expand.output_columns, "_file").column_id,
-            ),
-            1,
-        );
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(
-                delete,
-                output_column_by_name_for_test(&expand.output_columns, "_pos").column_id,
-            ),
-            2,
-        );
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(
-                delete,
-                output_column_by_name_for_test(&expand.output_columns, "id").column_id,
-            ),
-            6,
-        );
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(
-                delete,
-                output_column_by_name_for_test(&expand.output_columns, "qty").column_id,
-            ),
-            7,
-        );
-    }
-
-    #[test]
-    fn merge_mor_change_event_expand_fresh_only_omitted_insert_column_outputs_null() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
-        use crate::sql::optimizer::operator::Operator;
-
-        let target_columns = vec![non_null_col("id"), col("qty")];
-        let plan = build_merge_mor_change_event_expand_plan(
-            merge_mor_expand_child_plan_for_test(false),
-            &target_columns,
-            101,
-            false,
-            false,
-            true,
-        )
-        .expect("MOR MERGE fresh-only expand plan");
-        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
-            panic!("expected PhysicalChangeEventExpand");
-        };
-        assert_eq!(
-            branch_kinds_for_test(expand),
-            vec![ChangeStreamBranchKind::FreshData]
-        );
-
-        let arena = plan
-            .execution_props
-            .scalar_arena
-            .as_deref()
-            .expect("scalar arena");
-        let fresh = &expand.events[0];
-        assert_event_predicate_matches_action(arena, fresh, MERGE_ACTION_NOT_MATCHED_INSERT);
-        let id = output_column_by_name_for_test(&expand.output_columns, "id");
-        let qty = output_column_by_name_for_test(&expand.output_columns, "qty");
-        assert_assignment_is_column_ref(arena, assignment_expr_for_output(fresh, id.column_id), 9);
-        // Omitted INSERT target columns intentionally have no event assignment;
-        // ChangeEventExpand fills unassigned output slots with NULL.
-        assert_no_assignment_for_output(fresh, qty.column_id);
-    }
-
-    #[test]
-    fn merge_mor_change_event_expand_mixed_update_and_insert_shape() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
-        use crate::sql::optimizer::operator::Operator;
-
-        let target_columns = vec![non_null_col("id"), col("qty")];
-        let plan = build_merge_mor_change_event_expand_plan(
-            merge_mor_expand_child_plan_for_test(true),
-            &target_columns,
-            101,
-            true,
-            false,
-            true,
-        )
-        .expect("MOR MERGE update+insert expand plan");
-        let Operator::PhysicalChangeEventExpand(expand) = &plan.op else {
-            panic!("expected PhysicalChangeEventExpand");
-        };
-        assert_eq!(
-            branch_kinds_for_test(expand),
-            vec![
-                ChangeStreamBranchKind::DeleteDv,
-                ChangeStreamBranchKind::ReuseData,
-                ChangeStreamBranchKind::FreshData,
-            ]
-        );
-
         let arena = plan
             .execution_props
             .scalar_arena
@@ -5261,45 +5183,15 @@ mod tests {
             &expand.events[0],
             MERGE_ACTION_MATCHED_UPDATE,
         );
-        assert_event_predicate_matches_action(
-            arena,
-            &expand.events[1],
-            MERGE_ACTION_MATCHED_UPDATE,
-        );
-        assert_event_predicate_matches_action(
-            arena,
-            &expand.events[2],
-            MERGE_ACTION_NOT_MATCHED_INSERT,
-        );
-
-        let fresh = &expand.events[2];
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(
-                fresh,
-                output_column_by_name_for_test(&expand.output_columns, "id").column_id,
-            ),
-            9,
-        );
-        assert_assignment_is_column_ref(
-            arena,
-            assignment_expr_for_output(
-                fresh,
-                output_column_by_name_for_test(&expand.output_columns, "qty").column_id,
-            ),
-            10,
-        );
     }
 
     #[test]
-    fn merge_mor_change_event_expand_mixed_delete_and_insert_shape() {
-        use crate::sql::common::change_stream::ChangeStreamBranchKind;
+    fn merge_mor_mixed_delete_and_insert_keep_logical_effects() {
         use crate::sql::optimizer::operator::Operator;
 
-        let target_columns = vec![non_null_col("id"), col("qty")];
         let plan = build_merge_mor_change_event_expand_plan(
             merge_mor_expand_child_plan_for_test(true),
-            &target_columns,
+            &[non_null_col("id"), col("qty")],
             101,
             false,
             true,
@@ -5310,13 +5202,12 @@ mod tests {
             panic!("expected PhysicalChangeEventExpand");
         };
         assert_eq!(
-            branch_kinds_for_test(expand),
+            effects_for_test(expand),
             vec![
-                ChangeStreamBranchKind::DeleteDv,
-                ChangeStreamBranchKind::FreshData,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
             ]
         );
-
         let arena = plan
             .execution_props
             .scalar_arena
@@ -5359,8 +5250,10 @@ mod tests {
             row_ids: vec![7, 9],
             file_paths: vec!["f.parquet".to_string(), "f.parquet".to_string()],
             row_positions: vec![1, 3],
-            old_rows,
-            new_rows,
+            last_updated_sequences: vec![Some(1), Some(1)],
+            row_locations: vec![(0, 0), (0, 1)],
+            old_rows: vec![old_rows],
+            new_rows: vec![new_rows],
         };
 
         let query = build_cow_rewrite_query(
@@ -5421,8 +5314,10 @@ mod tests {
             row_ids: vec![7],
             file_paths: vec!["f.parquet".to_string()],
             row_positions: vec![1],
-            old_rows,
-            new_rows,
+            last_updated_sequences: vec![Some(1)],
+            row_locations: vec![(0, 0)],
+            old_rows: vec![old_rows],
+            new_rows: vec![new_rows],
         };
 
         let query = build_cow_rewrite_query(
@@ -5473,12 +5368,6 @@ mod tests {
         )
         .expect_err("must reject");
         assert!(err.contains("partition column"), "{err}");
-    }
-
-    #[test]
-    fn cow_host_duplicate_row_ids_are_rejected_before_rewrite() {
-        let err = validate_unique_target_row_ids(&[7, 8, 7]).expect_err("duplicate");
-        assert!(err.contains("_row_id=7"), "{err}");
     }
 
     #[test]

@@ -140,7 +140,6 @@ mod tests {
     use super::*;
 
     use std::cell::Cell;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use novarocks_connector_iceberg::iceberg::spec::{
@@ -154,7 +153,6 @@ mod tests {
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
     use crate::query_execution::write::{WriterCommitInput, WriterKey};
-    use crate::sql::common::ChangeStreamBranchKind;
     use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
     fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {
@@ -205,11 +203,10 @@ mod tests {
     fn executed_write(
         _table: &novarocks_connector_iceberg::iceberg::table::Table,
         _writers: Vec<(i32, &str, IcebergFileContent, i64)>,
-        branches: BTreeMap<i32, ChangeStreamBranchKind>,
     ) -> ExecutedChangeStreamWrite {
         ExecutedChangeStreamWrite {
             write_commit: None,
-            commit_plan: ChangeStreamWriterCommitPlan::new(branches),
+            commit_plan: ChangeStreamWriterCommitPlan::new(),
             committed: None,
         }
     }
@@ -226,7 +223,7 @@ mod tests {
             CommitOpKind::FastAppend,
             || {
                 calls.set(calls.get() + 1);
-                Ok(executed_write(&table, Vec::new(), BTreeMap::new()))
+                Ok(executed_write(&table, Vec::new()))
             },
         );
 
@@ -258,7 +255,7 @@ mod tests {
             || {
                 Ok(ExecutedChangeStreamWrite {
                     write_commit: None,
-                    commit_plan: ChangeStreamWriterCommitPlan::new(BTreeMap::new()),
+                    commit_plan: ChangeStreamWriterCommitPlan::new(),
                     committed: Some(CommittedChangeStreamWrite {
                         collector: Arc::clone(&collector),
                         outcome: outcome.clone(),
@@ -286,7 +283,6 @@ mod tests {
                 Ok(executed_write(
                     &table,
                     vec![(11, "fresh.parquet", IcebergFileContent::Data, 2)],
-                    BTreeMap::from([(11, ChangeStreamBranchKind::FreshData)]),
                 ))
             },
         );
@@ -311,10 +307,6 @@ mod tests {
                         (10, "delete.puffin", IcebergFileContent::PositionDeletes, 3),
                         (11, "fresh.parquet", IcebergFileContent::Data, 2),
                     ],
-                    BTreeMap::from([
-                        (10, ChangeStreamBranchKind::DeleteDv),
-                        (11, ChangeStreamBranchKind::FreshData),
-                    ]),
                 ))
             },
         );
@@ -362,7 +354,6 @@ mod tests {
                         (11, "known.parquet", IcebergFileContent::Data, 2),
                         (12, "unknown.parquet", IcebergFileContent::Data, 3),
                     ],
-                    BTreeMap::from([(11, ChangeStreamBranchKind::FreshData)]),
                 ))
             },
         );

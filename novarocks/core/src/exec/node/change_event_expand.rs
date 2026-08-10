@@ -18,7 +18,7 @@
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
-use novarocks_types::change_stream::ChangeStreamBranchKind;
+use novarocks_spi::connector::ConnectorRowMutationEffect;
 
 use super::ExecNode;
 
@@ -30,15 +30,14 @@ pub struct ChangeEventExpandNode {
     pub events: Vec<ChangeEventRuntimeSpec>,
     pub output_slot_ids: Vec<SlotId>,
     pub output_chunk_schema: ChunkSchemaRef,
-    pub change_op_slot_id: SlotId,
-    pub data_route_slot_id: Option<SlotId>,
+    pub effect_slot_id: SlotId,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ChangeEventRuntimeSpec {
     pub predicate: Option<ExprId>,
-    pub branch_kind: ChangeStreamBranchKind,
+    pub effect: ConnectorRowMutationEffect,
     pub assignments: Vec<ChangeEventRuntimeOutputExpr>,
 }
 

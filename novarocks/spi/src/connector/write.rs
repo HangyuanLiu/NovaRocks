@@ -16,7 +16,7 @@
 // under the License.
 
 //! Provider-neutral distributed writer contract.
-//! Design: ADR-0044 (docs/adr/ADR-0044-connector-write-admission-and-terminal-facts.md)
+//! Design: ADR-0048 (docs/adr/ADR-0048-connector-write-admission-and-terminal-facts.md)
 //!
 //! The frontend owns planning and external commit state. Backend execution
 //! bindings can only stage Arrow batches and return bounded opaque reports.
@@ -424,6 +424,10 @@ impl ConnectorWriteBaseVersion {
         }
         Ok(())
     }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
 }
 
 #[derive(Clone)]
@@ -571,6 +575,9 @@ impl ConnectorWritePreparation {
     }
     pub fn input(&self) -> &ConnectorWriteInputShape {
         &self.input
+    }
+    pub fn base_version(&self) -> &ConnectorWriteBaseVersion {
+        &self.base_version
     }
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
@@ -1688,6 +1695,31 @@ pub trait ConnectorWriteControl: Send + Sync {
         ))
     }
 
+    /// Plans a logical row mutation under this exact write control generation.
+    /// This contract is intentionally separate from ordinary write preparation:
+    /// providers own strategy, identity, opaque routes, and cohorts.
+    fn prepare_row_mutation(
+        &self,
+        _request: super::ConnectorRowMutationPreparationRequest,
+    ) -> Result<super::ConnectorRowMutationPreparationOutcome, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement row-mutation preparation",
+        ))
+    }
+
+    /// Activates a sealed direct route set or COW preparation plus bounded
+    /// selection. Implementations must not obtain a new control generation.
+    fn activate_row_mutation(
+        &self,
+        _request: super::ConnectorRowMutationActivationRequest,
+    ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement row-mutation activation",
+        ))
+    }
+
     fn plan_write(
         &self,
         request: ConnectorWritePlanningRequest,
@@ -1766,6 +1798,91 @@ impl ConnectorWriteLease {
 
     pub fn control(&self) -> &Arc<dyn ConnectorWriteControl> {
         &self.control
+    }
+
+    pub fn prepare_row_mutation(
+        &self,
+        request: super::ConnectorRowMutationPreparationRequest,
+    ) -> Result<super::ConnectorRowMutationPreparationOutcome, ConnectorError> {
+        request.validate(&self.binding_key)?;
+        let outcome = self.control.prepare_row_mutation(request)?;
+        if let super::ConnectorRowMutationPreparationOutcome::Prepared(preparation) = &outcome {
+            preparation.validate()?;
+            if preparation.owner() != &self.binding_key {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation preparation does not retain the lease generation",
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub fn activate_row_mutation(
+        &self,
+        request: super::ConnectorRowMutationActivationRequest,
+    ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
+        request.validate(&self.binding_key)?;
+        let preparation = request.preparation().clone();
+        let plan = self.control.activate_row_mutation(request)?;
+        let contract = preparation.match_contract();
+        for route in plan.routes() {
+            route.validate()?;
+            if route.preparation().owner() != &self.binding_key {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation route preparation does not retain the lease generation",
+                ));
+            }
+            if route.preparation().table() != preparation.table()
+                || route.preparation().base_version() != preparation.base_version()
+                || route
+                    .accepted_effects()
+                    .iter()
+                    .any(|effect| !preparation.intent().accepts(*effect))
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation route does not match its sealed table, base version, or intent",
+                ));
+            }
+            if route.input().fields().into_iter().any(|binding| {
+                !contract
+                    .identity_fields()
+                    .iter()
+                    .any(|field| field.token() == binding.token())
+                    && !contract
+                        .before_fields()
+                        .iter()
+                        .any(|field| field.token() == binding.token())
+                    && !contract
+                        .after_fields()
+                        .iter()
+                        .any(|field| field.token() == binding.token())
+            }) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation route has an input token foreign to its match contract",
+                ));
+            }
+        }
+        if let Some((sealed, recipes)) = plan.copy_on_write() {
+            if sealed.operation_id() != preparation.operation_id()
+                || recipes.len() != sealed.cohorts().len()
+                || plan.routes().iter().any(|route| {
+                    !sealed
+                        .cohorts()
+                        .iter()
+                        .any(|cohort| cohort.cohort_id() == route.cohort_id())
+                })
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "copy-on-write activation does not seal exactly its operation cohorts",
+                ));
+            }
+        }
+        Ok(plan)
     }
 
     /// Return whether two leases retain the same provider control generation.

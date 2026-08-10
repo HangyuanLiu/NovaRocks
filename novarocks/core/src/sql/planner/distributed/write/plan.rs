@@ -16,8 +16,8 @@
 // under the License.
 
 use super::change_stream::{
-    ChangeStreamBranchRoute, ChangeStreamRouterSink, ChangeStreamWriteDagSpec,
-    SqlChangeStreamWriteTopology, SqlChangeStreamWriterBranch,
+    ChangeStreamRoute, ChangeStreamRouterSink, ChangeStreamWriteDagSpec,
+    SqlChangeStreamWriteTopology, SqlChangeStreamWriterRoute, route_output_ordinals,
 };
 use super::contract::{ConnectorWriteInputBinding, SqlWritePlanInput};
 use super::sink::{ConnectorWriteFragmentSink, ConnectorWritePlanInput};
@@ -132,26 +132,23 @@ pub(in crate::sql::planner::distributed) fn with_sql_change_stream_write(
     dag: ChangeStreamWriteDagSpec,
 ) -> Result<PlannedSqlChangeStreamDistributedPlanDraft, String> {
     dag.validate()?;
-    if dag.branches.is_empty() {
-        return Err("Iceberg change-stream write DAG requires at least one branch".to_string());
+    if dag.routes.is_empty() {
+        return Err("row-mutation router requires at least one route".to_string());
     }
-    let change_op_output_ordinal = dag.change_op_output_ordinal.ok_or_else(|| {
-        "Iceberg change-stream write DAG requires change_op_output_ordinal".to_string()
-    })?;
 
-    let root_fragment_id = plan.root_fragment_id.ok_or_else(|| {
-        "Iceberg change-stream write requires a draft root fragment id".to_string()
-    })?;
+    let root_fragment_id = plan
+        .root_fragment_id
+        .ok_or_else(|| "row-mutation write requires a draft root fragment id".to_string())?;
     let root_index = plan
         .fragments
         .iter()
         .position(|fragment| fragment.fragment_id == root_fragment_id)
         .ok_or_else(|| {
-            format!("Iceberg change-stream write cannot find root fragment id={root_fragment_id}")
+            format!("row-mutation write cannot find root fragment id={root_fragment_id}")
         })?;
     if !matches!(plan.fragments[root_index].sink, DataSink::Result) {
         return Err(format!(
-            "Iceberg change-stream write expected root fragment id={} to use result sink",
+            "row-mutation write expected root fragment id={} to use result sink",
             root_fragment_id
         ));
     }
@@ -159,55 +156,46 @@ pub(in crate::sql::planner::distributed) fn with_sql_change_stream_write(
     let source_fragment = plan.fragments[root_index].clone();
     validate_output_ordinal(
         &source_fragment.output_columns,
-        change_op_output_ordinal,
-        "change_op",
+        dag.effect_output_ordinal,
+        "effect",
     )?;
-    if let Some(data_route_ordinal) = dag.data_route_output_ordinal {
-        validate_output_ordinal(
-            &source_fragment.output_columns,
-            data_route_ordinal,
-            "data_route",
-        )?;
-    }
 
     let mut next_fragment_id = next_fragment_id(&plan);
     let mut next_node_id = next_node_id(&plan);
     let mut next_tuple_id = next_tuple_id(&plan);
-    let mut routes = Vec::with_capacity(dag.branches.len());
-    let mut writer_branches = Vec::with_capacity(dag.branches.len());
-    let mut writer_fragments = Vec::with_capacity(dag.branches.len());
-    let mut writer_edges = Vec::with_capacity(dag.branches.len());
+    let mut routes = Vec::with_capacity(dag.routes.len());
+    let mut writer_routes = Vec::with_capacity(dag.routes.len());
+    let mut writer_fragments = Vec::with_capacity(dag.routes.len());
+    let mut writer_edges = Vec::with_capacity(dag.routes.len());
 
-    for branch in dag.branches {
+    for route in dag.routes {
+        let stream_output_ordinals = route_output_ordinals(&route);
         validate_output_ordinals(
             &source_fragment.output_columns,
-            &branch.stream_output_ordinals,
-            &format!("branch {:?} output", branch.branch_kind),
+            &stream_output_ordinals,
+            "route input",
         )?;
         validate_output_ordinals(
             &source_fragment.output_columns,
-            &branch.output_partition_ordinals,
-            &format!("branch {:?} partition", branch.branch_kind),
+            &route.output_partition_ordinals,
+            "route partition",
         )?;
 
-        let sink = branch.sink;
+        let sink = route.sink;
 
-        let writer_columns = output_columns_by_ordinals(
-            &source_fragment.output_columns,
-            &branch.stream_output_ordinals,
-        )?;
+        let writer_columns =
+            output_columns_by_ordinals(&source_fragment.output_columns, &stream_output_ordinals)?;
         let output_slot_ids = output_slot_ids_for_ordinals(
             &source_fragment.output_columns,
-            &branch.stream_output_ordinals,
-            &format!("branch {:?} output", branch.branch_kind),
+            &stream_output_ordinals,
+            "route input",
         )?;
         if !matches!(sink.input, ConnectorWriteInputBinding::RootOutputByOrdinal) {
             return Err("SQL change-stream writer requires root output input binding".to_string());
         }
         if writer_columns.len() != sink.contract.input_columns.len() {
             return Err(format!(
-                "SQL change-stream branch {:?} output column count {} does not match write input column count {}",
-                branch.branch_kind,
+                "SQL row-mutation route output column count {} does not match write input column count {}",
                 writer_columns.len(),
                 sink.contract.input_columns.len()
             ));
@@ -221,8 +209,8 @@ pub(in crate::sql::planner::distributed) fn with_sql_change_stream_write(
         next_tuple_id += 1;
         let output_partition = data_partition_for_ordinals(
             &source_fragment.output_columns,
-            &branch.output_partition_ordinals,
-            &format!("branch {:?} partition", branch.branch_kind),
+            &route.output_partition_ordinals,
+            "route partition",
         )?;
         let stream_kind = stream_kind_for_data_partition(&output_partition);
 
@@ -275,23 +263,24 @@ pub(in crate::sql::planner::distributed) fn with_sql_change_stream_write(
             stream_kind,
             edge_kind: FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id: 0,
-                branch_id: branch.branch_id,
-                branch_kind: branch.branch_kind,
+                route_id: route.route_id,
             },
             output_slot_ids,
         });
 
-        routes.push(ChangeStreamBranchRoute {
-            branch_id: branch.branch_id,
-            branch_kind: branch.branch_kind,
+        routes.push(ChangeStreamRoute {
+            route_id: route.route_id,
+            cohort_id: route.cohort_id,
+            accepted_effects: route.accepted_effects.clone(),
+            input_ordinals: route.input_ordinals,
             target_fragment_id: writer_fragment_id,
             target_exchange_node_id: exchange_node_id,
-            output_ordinals: branch.stream_output_ordinals,
-            output_partition_ordinals: branch.output_partition_ordinals,
+            output_partition_ordinals: route.output_partition_ordinals,
         });
-        writer_branches.push(SqlChangeStreamWriterBranch {
-            branch_id: branch.branch_id,
-            branch_kind: branch.branch_kind,
+        writer_routes.push(SqlChangeStreamWriterRoute {
+            route_id: route.route_id,
+            cohort_id: route.cohort_id,
+            accepted_effects: route.accepted_effects,
             writer_fragment_id,
             sink,
         });
@@ -299,16 +288,15 @@ pub(in crate::sql::planner::distributed) fn with_sql_change_stream_write(
 
     plan.fragments[root_index].sink = DataSink::ChangeStreamRouter(ChangeStreamRouterSink {
         group_id: 0,
-        change_op_output_ordinal,
-        data_route_output_ordinal: dag.data_route_output_ordinal,
-        branches: routes,
+        effect_output_ordinal: dag.effect_output_ordinal,
+        routes,
     });
     plan.fragments.extend(writer_fragments);
     plan.edges.extend(writer_edges);
 
     Ok(PlannedSqlChangeStreamDistributedPlanDraft {
         distributed_plan: plan,
-        topology: SqlChangeStreamWriteTopology { writer_branches },
+        topology: SqlChangeStreamWriteTopology { writer_routes },
     })
 }
 
@@ -373,7 +361,7 @@ fn validate_output_ordinal(
 ) -> Result<(), String> {
     if output_columns.get(ordinal).is_none() {
         return Err(format!(
-            "Iceberg change-stream {label} output ordinal {ordinal} is out of range"
+            "row-mutation {label} output ordinal {ordinal} is out of range"
         ));
     }
     Ok(())
@@ -399,7 +387,7 @@ fn output_columns_by_ordinals(
         .copied()
         .map(|ordinal| {
             output_columns.get(ordinal).cloned().ok_or_else(|| {
-                format!("Iceberg change-stream branch output ordinal {ordinal} is out of range")
+                format!("row-mutation route input ordinal {ordinal} is out of range")
             })
         })
         .collect()
@@ -415,11 +403,11 @@ fn output_slot_ids_for_ordinals(
         .copied()
         .map(|ordinal| {
             let column = output_columns.get(ordinal).ok_or_else(|| {
-                format!("Iceberg change-stream {label} output ordinal {ordinal} is out of range")
+                format!("row-mutation {label} output ordinal {ordinal} is out of range")
             })?;
             i32::try_from(column.column_id.0).map_err(|_| {
                 format!(
-                    "Iceberg change-stream {label} column id {} cannot be encoded as stream output slot id",
+                    "row-mutation {label} column id {} cannot be encoded as stream output slot id",
                     column.column_id
                 )
             })
@@ -441,7 +429,7 @@ fn data_partition_for_ordinals(
         .copied()
         .map(|ordinal| {
             let column = output_columns.get(ordinal).ok_or_else(|| {
-                format!("Iceberg change-stream {label} output ordinal {ordinal} is out of range")
+                format!("row-mutation {label} output ordinal {ordinal} is out of range")
             })?;
             Ok(TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -470,12 +458,11 @@ fn stream_kind_for_data_partition(partition: &DataPartition) -> FragmentStreamKi
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::super::change_stream::{ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec};
+    use super::super::change_stream::ChangeStreamWriteDagSpec;
     use super::super::contract::{ConnectorWriteInputBinding, test_support};
     use super::super::sink::ConnectorWritePlanInput;
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
@@ -539,162 +526,114 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generic_connector_sink_replaces_result_without_provider_input() {
-        let plan = single_fragment_plan_for_test();
-        let sink = ConnectorWritePlanInput::from_target_columns(
-            &test_support::simple_sql_write_plan_input(
+    fn test_route(
+        route_byte: u8,
+        effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
+        input_ordinal: u32,
+        partition_ordinals: Vec<usize>,
+    ) -> super::super::change_stream::ChangeStreamWriteRouteSpec {
+        super::super::change_stream::ChangeStreamWriteRouteSpec {
+            route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([route_byte; 32]),
+            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(
+                [route_byte.wrapping_add(1); 32],
+            ),
+            accepted_effects: effects,
+            input_ordinals: vec![novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(
+                    [route_byte.wrapping_add(2); 32],
+                ),
+                input_ordinal,
+            )],
+            output_partition_ordinals: partition_ordinals,
+            sink: test_support::simple_sql_write_plan_input(
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
-            )
-            .contract
-            .input_columns,
-            ConnectorWriteInputBinding::RootOutputByOrdinal,
-            None,
-        );
-
-        let planned =
-            with_connector_write_sink(plan.into_draft(), sink).expect("generic write sink");
-        let planned = crate::sql::planner::distributed::seal::seal_draft(planned)
-            .expect("generic write draft seals");
-        let root = planned
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.fragment_id == planned.root_fragment_id())
-            .expect("root fragment");
-        assert!(matches!(root.sink, DataSink::ConnectorWrite(_)));
+            ),
+        }
     }
 
     #[test]
-    fn change_stream_expander_adds_router_and_writer_fragments() {
+    fn row_mutation_expander_adds_opaque_routes_and_preserves_replace_fanout() {
         let plan = single_fragment_plan_for_test_with_columns(vec![
-            ("op", DataType::Int32),
-            ("route", DataType::Int32),
+            ("__row_mutation_effect", DataType::Int8),
             ("delete_id", DataType::Int32),
-            ("reuse_id", DataType::Int32),
+            ("replacement", DataType::Int32),
         ]);
-        let mut delete_branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![3, 2]);
-        let repeated_column = delete_branch.sink.contract.input_columns[0].clone();
-        delete_branch
-            .sink
-            .contract
-            .input_columns
-            .push(repeated_column);
-        delete_branch.output_partition_ordinals = vec![1];
-        let reuse_branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![3]);
-        let dag =
-            ChangeStreamWriteDagSpec::for_test(Some(0), Some(1), vec![delete_branch, reuse_branch]);
+        let dag = ChangeStreamWriteDagSpec::for_test(
+            0,
+            vec![
+                test_route(
+                    7,
+                    vec![
+                        novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+                        novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+                    ],
+                    1,
+                    vec![1],
+                ),
+                test_route(
+                    8,
+                    vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
+                    2,
+                    Vec::new(),
+                ),
+            ],
+        );
 
         let planned =
-            with_sql_change_stream_write(plan.into_draft(), dag).expect("plan change stream");
+            with_sql_change_stream_write(plan.into_draft(), dag).expect("plan row mutation");
         let topology = planned.topology;
         let distributed_plan =
             crate::sql::planner::distributed::seal::seal_draft(planned.distributed_plan)
-                .expect("decorated change-stream draft seals");
+                .expect("decorated row-mutation draft seals");
 
-        assert_eq!(distributed_plan.fragments().len(), 3);
         let root = distributed_plan
             .fragments()
             .iter()
             .find(|fragment| fragment.fragment_id == distributed_plan.root_fragment_id())
             .expect("root fragment");
         let DataSink::ChangeStreamRouter(router) = &root.sink else {
-            panic!("expected router sink");
+            panic!("expected row-mutation router sink");
         };
-        assert_eq!(router.group_id, 0);
-        assert_eq!(router.change_op_output_ordinal, 0);
-        assert_eq!(router.data_route_output_ordinal, Some(1));
-        assert_eq!(router.branches.len(), 2);
-        assert_eq!(router.branches[0].output_ordinals, vec![3, 2]);
-        assert_eq!(router.branches[0].output_partition_ordinals, vec![1]);
-
-        assert_eq!(distributed_plan.edges().len(), 2);
-        let first_edge = &distributed_plan.edges()[0];
-        assert_eq!(first_edge.source_fragment_id, 0);
-        assert_eq!(first_edge.target_fragment_id, 1);
-        assert_eq!(first_edge.output_slot_ids, vec![4, 3]);
-        assert_eq!(distributed_plan.edges()[1].output_slot_ids, vec![4]);
+        assert_eq!(router.effect_output_ordinal, 0);
+        assert_eq!(router.routes.len(), 2);
         assert_eq!(
-            first_edge.stream_kind,
-            crate::sql::planner::distributed::FragmentStreamKind::Partitioned
-        );
-        assert!(matches!(
-            first_edge.output_partition.kind,
-            crate::sql::planner::distributed::PartitionKind::Hash
-        ));
-        let [partition_expr] = first_edge.output_partition.exprs.as_slice() else {
-            panic!("expected native hash partition expr");
-        };
-        let ExprKind::ColumnRef {
-            column_id, column, ..
-        } = &partition_expr.kind
-        else {
-            panic!("expected native partition expr to be a column ref");
-        };
-        assert_eq!(*column_id, ColumnId::new_for_test(2));
-        assert_eq!(column, "route");
-        assert!(matches!(
-            first_edge.edge_kind,
-            crate::sql::planner::distributed::FragmentEdgeKind::ChangeStreamRouter {
-                branch_kind: ChangeStreamBranchKind::DeleteDv,
-                ..
-            }
-        ));
-
-        let writer = distributed_plan
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.fragment_id == first_edge.target_fragment_id)
-            .expect("writer fragment");
-        assert!(matches!(writer.sink, DataSink::ConnectorWrite(_)));
-        assert_eq!(writer.output_columns.len(), 2);
-        assert_eq!(writer.output_columns[0].name, "reuse_id");
-        assert_eq!(writer.output_columns[1].name, "delete_id");
-        assert_eq!(topology.writer_branches.len(), 2);
-        assert_eq!(
-            topology.writer_branches[0].sink.contract.target.binding,
-            topology.writer_branches[1].sink.contract.target.binding
+            router.routes[0].accepted_effects,
+            vec![
+                novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+            ]
         );
         assert_eq!(
-            topology.writer_branches[0].sink.contract.target.table.table,
-            "orders"
+            router.routes[1].accepted_effects,
+            vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace]
+        );
+        assert_eq!(topology.writer_routes.len(), 2);
+        assert_eq!(
+            topology.writer_routes[0].route_id,
+            router.routes[0].route_id
         );
     }
 
     #[test]
-    fn change_stream_expander_rejects_missing_change_op_ordinal() {
+    fn row_mutation_expander_rejects_effect_ordinal_out_of_range() {
         let plan = single_fragment_plan_for_test();
         let dag = ChangeStreamWriteDagSpec::for_test(
-            None,
-            None,
-            vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
-        );
-
-        let err =
-            with_sql_change_stream_write(plan.into_draft(), dag).expect_err("missing change_op");
-
-        assert!(err.contains("requires change_op_output_ordinal"));
-    }
-
-    #[test]
-    fn change_stream_expander_rejects_out_of_range_branch_output_ordinal() {
-        let plan = single_fragment_plan_for_test();
-        let dag = ChangeStreamWriteDagSpec::for_test(
-            Some(0),
-            None,
-            vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![7])],
+            7,
+            vec![test_route(
+                7,
+                vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
+                0,
+                Vec::new(),
+            )],
         );
 
         let err = with_sql_change_stream_write(plan.into_draft(), dag)
-            .expect_err("out-of-range branch output ordinal");
-
-        assert!(
-            err.contains("output ordinal 7 is out of range"),
-            "unexpected error: {err}"
-        );
+            .expect_err("invalid effect ordinal");
+        assert!(err.contains("effect output ordinal 7"), "{err}");
     }
 
     #[test]
-    fn change_stream_expander_rejects_branch_output_slot_id_overflow() {
+    fn row_mutation_expander_rejects_route_output_slot_id_overflow() {
         let mut plan = single_fragment_plan_for_test();
         let overflow_column_id = ColumnId::new_for_test(i32::MAX as u32 + 1);
         plan.fragments_mut()[0].output_columns[0].column_id = overflow_column_id;
@@ -703,14 +642,17 @@ mod tests {
         };
         values.columns[0].column_id = overflow_column_id;
         let dag = ChangeStreamWriteDagSpec::for_test(
-            Some(0),
-            None,
-            vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
+            0,
+            vec![test_route(
+                7,
+                vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
+                0,
+                Vec::new(),
+            )],
         );
 
         let err = with_sql_change_stream_write(plan.into_draft(), dag)
-            .expect_err("branch output slot id overflow");
-
+            .expect_err("route output slot id overflow");
         assert!(
             err.contains("column id c2147483648 cannot be encoded as stream output slot id"),
             "unexpected error: {err}"

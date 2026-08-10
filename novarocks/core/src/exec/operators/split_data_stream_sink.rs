@@ -50,6 +50,7 @@ pub(crate) struct SplitDataStreamSinkFactory {
     init_error: Option<String>,
     split_arena: Arc<ExprArena>,
     split_exprs: Vec<ExprId>,
+    fanout: bool,
     sinks: Vec<InnerSinkSpec>,
 }
 
@@ -63,6 +64,7 @@ impl SplitDataStreamSinkFactory {
         plan_node_id: i32,
         split_arena: Arc<ExprArena>,
         split_exprs: Vec<ExprId>,
+        fanout: bool,
         transmitter: Arc<dyn ExchangeFrameTransmitter>,
     ) -> Self {
         let name = if plan_node_id >= 0 {
@@ -102,6 +104,7 @@ impl SplitDataStreamSinkFactory {
             init_error,
             split_arena,
             split_exprs,
+            fanout,
             sinks: sinks_out,
         }
     }
@@ -125,6 +128,7 @@ impl OperatorFactory for SplitDataStreamSinkFactory {
             init_error: self.init_error.clone(),
             split_arena: Arc::clone(&self.split_arena),
             split_exprs: self.split_exprs.clone(),
+            fanout: self.fanout,
             sinks,
             finishing: false,
         })
@@ -144,6 +148,7 @@ struct SplitDataStreamSinkOperator {
     init_error: Option<String>,
     split_arena: Arc<ExprArena>,
     split_exprs: Vec<ExprId>,
+    fanout: bool,
     sinks: Vec<InnerSinkRuntime>,
     finishing: bool,
 }
@@ -229,7 +234,8 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
             return Ok(());
         }
 
-        let split_chunks = split_chunk_by_exprs(&self.split_arena, &self.split_exprs, chunk)?;
+        let split_chunks =
+            split_chunk_by_exprs(&self.split_arena, &self.split_exprs, chunk, self.fanout)?;
         if split_chunks.len() != self.sinks.len() {
             return Err(format!(
                 "split chunk output size {} != sink size {}",
@@ -296,9 +302,23 @@ fn split_chunk_by_exprs(
     arena: &ExprArena,
     split_exprs: &[ExprId],
     chunk: Chunk,
+    fanout: bool,
 ) -> Result<Vec<Option<Chunk>>, String> {
     if split_exprs.is_empty() {
         return Ok(vec![]);
+    }
+
+    if fanout {
+        // A row-mutation route is a filter, not an exclusive partition.  In
+        // particular, a logical Replace must reach both the delete and
+        // replacement-data routes.
+        return split_exprs
+            .iter()
+            .map(|expr| {
+                eval_split_mask(arena, *expr, &chunk)
+                    .and_then(|mask| filter_chunk_by_mask(&chunk, &mask))
+            })
+            .collect();
     }
 
     let mut out = vec![None; split_exprs.len()];
@@ -466,6 +486,7 @@ mod tests {
             init_error: None,
             split_arena: Arc::new(ExprArena::default()),
             split_exprs: Vec::new(),
+            fanout: false,
             sinks: vec![
                 InnerSinkRuntime {
                     op: Box::new(PendingFinishSink::new("first", Arc::clone(&first_done))),
@@ -515,7 +536,7 @@ mod tests {
 
         let mut arena = ExprArena::default();
         let predicate = arena.push_typed(ExprNode::SlotId(predicate_slot), DataType::Boolean);
-        let split = split_chunk_by_exprs(&arena, &[predicate], chunk).expect("split chunk");
+        let split = split_chunk_by_exprs(&arena, &[predicate], chunk, false).expect("split chunk");
         let selected = split[0].as_ref().expect("matching first branch rows");
 
         assert_eq!(selected.len(), 1);

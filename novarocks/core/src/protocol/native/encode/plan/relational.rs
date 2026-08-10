@@ -19,8 +19,8 @@ use super::super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use super::output::encode_output_columns;
 use super::scan::encode_scan_node;
 use super::type_mapping::{
-    encode_agg_mode, encode_change_stream_branch_kind, encode_join_distribution,
-    encode_join_execution_mode, encode_join_kind, encode_redistribute_mode, encode_set_op_kind,
+    encode_agg_mode, encode_join_distribution, encode_join_execution_mode, encode_join_kind,
+    encode_redistribute_mode, encode_row_mutation_effect, encode_set_op_kind,
     encode_sort_topn_type, encode_topn_phase, usize_to_u64,
 };
 use super::{NativePlanEncodeContext, encode_exprs};
@@ -348,7 +348,7 @@ pub(super) fn encode_physical_node(
                     .map(|event| {
                         Ok(plan::DistributedChangeEventSpec {
                             predicate: event.predicate.as_ref().map(encode_expr).transpose()?,
-                            branch_kind: encode_change_stream_branch_kind(event.branch_kind),
+                            effect: encode_row_mutation_effect(event.effect),
                             assignments: event
                                 .assignments
                                 .iter()
@@ -367,8 +367,7 @@ pub(super) fn encode_physical_node(
                     })
                     .collect::<Result<Vec<_>, String>>()?,
                 output_columns: encode_output_columns(&node.output_columns)?,
-                change_op_column_id: node.change_op_column_id.0,
-                data_route_column_id: node.data_route_column_id.map(|id| id.0),
+                effect_column_id: node.effect_column_id.0,
             }),
         ),
         PhysicalPlanKind::CTEAnchor(node) => (

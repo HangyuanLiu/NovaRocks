@@ -36,6 +36,7 @@ use super::sink_plan::IcebergSinkObjectStoreConfig;
 use super::write_commit::IcebergWriteCommitExecutor;
 use super::write_contract::{
     encode_data_sink_spec_handle_payload, encode_deletion_vector_sink_handle_payload,
+    encode_position_delete_sink_handle_payload,
 };
 use super::write_control::IcebergWritePlanPayloadV1;
 use super::write_service::{
@@ -120,7 +121,7 @@ impl IcebergChangeStreamProviderBinding {
     }
 }
 
-/// ADR-0034: terminal handle routing, aggregate commit routing and lazy
+/// ADR-0049: terminal handle routing, aggregate commit routing and lazy
 /// activation must be derived from the same planner-frozen topology.
 pub(crate) fn bind_iceberg_change_stream_provider(
     request: IcebergChangeStreamProviderRequest<'_>,
@@ -200,17 +201,32 @@ fn change_stream_writer_handle_payloads(
     table_bindings: &QueryTableBindingStore,
 ) -> Result<BTreeMap<i32, Bytes>, String> {
     let mut payloads = BTreeMap::new();
-    for branch in &topology.writer_branches {
-        let fragment_id = i32::try_from(branch.writer_fragment_id).map_err(|_| {
+    for route in &topology.writer_routes {
+        let fragment_id = i32::try_from(route.writer_fragment_id).map_err(|_| {
             format!(
                 "change-stream writer fragment {} exceeds i32 handle-map range",
-                branch.writer_fragment_id
+                route.writer_fragment_id
             )
         })?;
         let mut sink_spec =
-            iceberg_sink_spec_from_sealed_preparation(table_bindings, &branch.sink, entry, table)?;
+            iceberg_sink_spec_from_sealed_preparation(table_bindings, &route.sink, entry, table)?;
         sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
         let payload = match sink_spec.mode {
+            IcebergWriteSinkMode::PositionDeletes => {
+                let position_index_storage =
+                    position_delete_index_storage_config(entry, table.metadata().location())?;
+                let partitions = build_position_delete_data_file_partition_index(
+                    table.metadata(),
+                    base_snapshot_id,
+                    table.metadata().location(),
+                    position_index_storage.as_ref(),
+                )?;
+                encode_position_delete_sink_handle_payload(
+                    &sink_spec,
+                    table.metadata(),
+                    &partitions,
+                )?
+            }
             IcebergWriteSinkMode::DeletionVectors => {
                 frozen_deletion_vector_handle_payload(&sink_spec, table, entry, base_snapshot_id)?
             }

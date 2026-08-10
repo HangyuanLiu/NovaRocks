@@ -18,7 +18,7 @@
 use super::*;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
     JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
 };
@@ -114,14 +114,35 @@ fn change_event_expand_node(
         kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
             events,
             output_columns: output_columns.clone(),
-            change_op_column_id: ColumnId::new_for_test(200),
-            data_route_column_id: None,
+            effect_column_id: ColumnId::new_for_test(200),
         }),
         children: vec![child],
         output_columns,
         stats: physical_stats(),
         probe_runtime_filters: vec![],
     }
+}
+
+fn row_mutation_dag(
+    effect_output_ordinal: usize,
+    input_ordinal: u32,
+) -> crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
+    crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
+        effect_output_ordinal,
+        vec![crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec {
+            route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32]),
+            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes([8; 32]),
+            accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
+            input_ordinals: vec![novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([9; 32]),
+                input_ordinal,
+            )],
+            output_partition_ordinals: Vec::new(),
+            sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
+        }],
+    )
 }
 
 fn physical_sort_node(
@@ -266,11 +287,7 @@ fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
 
     let change = build_sql_change_stream_distributed_plan(
         physical_values_node(vec![id]),
-        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
-            Some(0),
-            None,
-            vec![crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
-        ),
+        row_mutation_dag(0, 0),
         None,
     )
     .expect("change-stream entrypoint seals after router decoration");
@@ -331,12 +348,11 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
         kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
             events: vec![DistributedChangeEventSpec {
                 predicate: None,
-                branch_kind: ChangeStreamBranchKind::ReuseData,
+                effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
                 assignments: vec![],
             }],
             output_columns: expanded_columns.clone(),
-            change_op_column_id: ColumnId::new_for_test(3),
-            data_route_column_id: None,
+            effect_column_id: ColumnId::new_for_test(3),
         }),
         children: vec![child],
         output_columns: expanded_columns.clone(),
@@ -346,11 +362,7 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
 
     let planned = build_sql_change_stream_distributed_plan(
         physical,
-        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
-            Some(2),
-            None,
-            vec![crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
-        ),
+        row_mutation_dag(2, 0),
         Some(PreExpandKeyedAssertSpec {
             key_column_name: "__nr_row_id".to_string(),
             key_label: "_row_id".to_string(),
@@ -395,7 +407,7 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
             .map(|column| column.column_id)
             .collect::<Vec<_>>()
     );
-    assert_eq!(planned.topology.writer_branches.len(), 1);
+    assert_eq!(planned.topology.writer_routes.len(), 1);
     assert_eq!(distributed.fragments().len(), 2);
 }
 
@@ -480,7 +492,7 @@ fn pre_expand_keyed_assert_derives_row_id_from_change_event_assignment() {
         vec![output_row_id],
         vec![DistributedChangeEventSpec {
             predicate: None,
-            branch_kind: ChangeStreamBranchKind::ReuseData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: vec![assignment],
         }],
     );
@@ -510,7 +522,7 @@ fn pre_expand_keyed_assert_rejects_assignment_outside_direct_child_scope_atomica
         vec![output_row_id.clone()],
         vec![DistributedChangeEventSpec {
             predicate: None,
-            branch_kind: ChangeStreamBranchKind::ReuseData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: vec![DistributedChangeEventOutputExpr {
                 output_column_id: output_row_id.column_id,
                 expr: Some(column_ref(ColumnId::new_for_test(99), "source_row_id")),
@@ -536,7 +548,7 @@ fn pre_expand_keyed_assert_rejects_ambiguous_assignment_in_direct_child_scope() 
         vec![output_row_id.clone()],
         vec![DistributedChangeEventSpec {
             predicate: None,
-            branch_kind: ChangeStreamBranchKind::ReuseData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: vec![DistributedChangeEventOutputExpr {
                 output_column_id: output_row_id.column_id,
                 expr: Some(column_ref(ColumnId::new_for_test(99), "source_row_id")),
@@ -569,7 +581,7 @@ fn pre_expand_keyed_assert_rejects_assignment_pruned_by_sort_output_scope_atomic
         vec![output_row_id.clone()],
         vec![DistributedChangeEventSpec {
             predicate: None,
-            branch_kind: ChangeStreamBranchKind::ReuseData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: vec![DistributedChangeEventOutputExpr {
                 output_column_id: output_row_id.column_id,
                 expr: Some(column_ref(source_row_id.column_id, "source_row_id")),
@@ -624,7 +636,7 @@ fn pre_expand_keyed_assert_accepts_assignment_in_reordered_sort_output_scope() {
         vec![output_row_id.clone()],
         vec![DistributedChangeEventSpec {
             predicate: None,
-            branch_kind: ChangeStreamBranchKind::ReuseData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: vec![DistributedChangeEventOutputExpr {
                 output_column_id: output_row_id.column_id,
                 expr: Some(column_ref(source_row_id.column_id, "source_row_id")),
@@ -650,7 +662,7 @@ fn pre_expand_keyed_assert_accepts_empty_sort_output_as_passthrough_scope() {
         vec![output_row_id.clone()],
         vec![DistributedChangeEventSpec {
             predicate: None,
-            branch_kind: ChangeStreamBranchKind::ReuseData,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: vec![DistributedChangeEventOutputExpr {
                 output_column_id: output_row_id.column_id,
                 expr: Some(column_ref(source_row_id.column_id, "source_row_id")),

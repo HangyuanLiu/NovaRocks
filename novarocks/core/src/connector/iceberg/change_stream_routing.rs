@@ -17,37 +17,41 @@ use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use crate::connector::iceberg::commit::IcebergCommitCollector;
 use crate::connector::iceberg::commit::WrittenFile;
 use crate::connector::iceberg::report::IcebergWriterReport;
-use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ChangeStreamWriterCommitPlan {
-    branch_by_writer_fragment: BTreeMap<i32, ChangeStreamBranchKind>,
+    role_by_writer_fragment: BTreeMap<i32, IcebergRouteReportRole>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IcebergRouteReportRole {
+    Existing,
+    Appended,
 }
 
 impl ChangeStreamWriterCommitPlan {
-    pub(crate) fn new(branch_by_writer_fragment: BTreeMap<i32, ChangeStreamBranchKind>) -> Self {
-        Self {
-            branch_by_writer_fragment,
-        }
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.branch_by_writer_fragment.is_empty()
+        self.role_by_writer_fragment.is_empty()
     }
 
     pub(crate) fn from_topology(topology: &SqlChangeStreamWriteTopology) -> Result<Self, String> {
-        let mut branch_by_writer_fragment = BTreeMap::new();
-        for branch in &topology.writer_branches {
-            insert_writer_fragment_branch(
-                &mut branch_by_writer_fragment,
-                branch.writer_fragment_id,
-                branch.branch_id,
-                branch.branch_kind,
+        let mut role_by_writer_fragment = BTreeMap::new();
+        for route in &topology.writer_routes {
+            insert_writer_fragment_role(
+                &mut role_by_writer_fragment,
+                route.writer_fragment_id,
+                route_role(&route.sink),
             )?;
         }
-        Ok(Self::new(branch_by_writer_fragment))
+        Ok(Self {
+            role_by_writer_fragment,
+        })
     }
 
     #[cfg(test)]
@@ -55,29 +59,24 @@ impl ChangeStreamWriterCommitPlan {
         &self,
         topology: &SqlChangeStreamWriteTopology,
     ) -> Vec<Option<FragmentId>> {
-        let by_kind = self
-            .branch_by_writer_fragment
-            .iter()
-            .filter_map(|(fragment_id, branch_kind)| {
-                u32::try_from(*fragment_id)
-                    .ok()
-                    .map(|fragment_id| (*branch_kind, fragment_id))
-            })
-            .collect::<BTreeMap<_, _>>();
         topology
-            .writer_branches
+            .writer_routes
             .iter()
-            .map(|branch| by_kind.get(&branch.branch_kind).copied())
+            .map(|route| {
+                self.role_by_writer_fragment
+                    .contains_key(&(route.writer_fragment_id as i32))
+                    .then_some(route.writer_fragment_id)
+            })
             .collect()
     }
 
-    fn branch_for_fragment_id(
+    fn role_for_fragment_id(
         &self,
         fragment_id: FragmentId,
-    ) -> Result<ChangeStreamBranchKind, String> {
+    ) -> Result<IcebergRouteReportRole, String> {
         let fragment_id = i32::try_from(fragment_id)
             .map_err(|_| format!("writer fragment {fragment_id} does not fit in commit plan"))?;
-        self.branch_by_writer_fragment
+        self.role_by_writer_fragment
             .get(&fragment_id)
             .copied()
             .ok_or_else(|| {
@@ -88,20 +87,19 @@ impl ChangeStreamWriterCommitPlan {
     }
 }
 
-fn insert_writer_fragment_branch(
-    branch_by_writer_fragment: &mut BTreeMap<i32, ChangeStreamBranchKind>,
+fn insert_writer_fragment_role(
+    role_by_writer_fragment: &mut BTreeMap<i32, IcebergRouteReportRole>,
     writer_fragment_id: FragmentId,
-    branch_id: i32,
-    branch_kind: ChangeStreamBranchKind,
+    role: IcebergRouteReportRole,
 ) -> Result<(), String> {
     let writer_fragment_id = i32::try_from(writer_fragment_id).map_err(|_| {
         format!(
-            "writer fragment id {writer_fragment_id} for change-stream branch {branch_id} \
+            "writer fragment id {writer_fragment_id} for change-stream route \
              does not fit in commit-plan fragment id field"
         )
     })?;
-    if branch_by_writer_fragment
-        .insert(writer_fragment_id, branch_kind)
+    if role_by_writer_fragment
+        .insert(writer_fragment_id, role)
         .is_some()
     {
         return Err(format!(
@@ -109,6 +107,20 @@ fn insert_writer_fragment_branch(
         ));
     }
     Ok(())
+}
+
+fn route_role(
+    sink: &crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+) -> IcebergRouteReportRole {
+    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
+    match sink.contract.mode {
+        SqlWriteSinkMode::Data | SqlWriteSinkMode::RowLineageData => {
+            IcebergRouteReportRole::Appended
+        }
+        SqlWriteSinkMode::PositionDeletes
+        | SqlWriteSinkMode::DeletionVectors
+        | SqlWriteSinkMode::EqualityDeletes => IcebergRouteReportRole::Existing,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -201,8 +213,8 @@ pub(crate) fn route_change_stream_staged_reports(
             })?;
             writer_files.push(file);
         }
-        let branch = plan
-            .branch_for_fragment_id(u32::try_from(writer.fragment_id).map_err(|_| {
+        let role = plan
+            .role_for_fragment_id(u32::try_from(writer.fragment_id).map_err(|_| {
                 ChangeStreamWriterRoutingError::new(
                     format!(
                         "generic change-stream writer fragment {} is negative",
@@ -217,11 +229,9 @@ pub(crate) fn route_change_stream_staged_reports(
                     routed.converted_files_with(&writer_files),
                 )
             })?;
-        match branch {
-            ChangeStreamBranchKind::FreshData => routed.fresh.extend(writer_files),
-            ChangeStreamBranchKind::DeleteDv | ChangeStreamBranchKind::ReuseData => {
-                routed.reuse_or_dv.extend(writer_files);
-            }
+        match role {
+            IcebergRouteReportRole::Appended => routed.fresh.extend(writer_files),
+            IcebergRouteReportRole::Existing => routed.reuse_or_dv.extend(writer_files),
         }
     }
 
@@ -247,6 +257,10 @@ mod tests {
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
     use novarocks_connector_iceberg::delete_file::IcebergFileContent;
+    use novarocks_spi::connector::{
+        ConnectorRowMutationEffect, ConnectorWriteCohortId, ConnectorWriteOperationId,
+        ConnectorWriteRouteId,
+    };
 
     fn test_unpartitioned_metadata() -> TableMetadata {
         let schema = Schema::builder()
@@ -319,10 +333,12 @@ mod tests {
     fn change_stream_commit_routes_provider_reports_without_legacy_carrier() {
         let metadata = test_unpartitioned_metadata();
         let collector = test_collector(&metadata, CommitOpKind::RowDeltaDvFromFiles);
-        let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([
-            (10, ChangeStreamBranchKind::ReuseData),
-            (11, ChangeStreamBranchKind::FreshData),
-        ]));
+        let plan = ChangeStreamWriterCommitPlan {
+            role_by_writer_fragment: BTreeMap::from([
+                (10, IcebergRouteReportRole::Existing),
+                (11, IcebergRouteReportRole::Appended),
+            ]),
+        };
         route_change_stream_staged_reports(
             &collector,
             vec![
@@ -361,7 +377,7 @@ mod tests {
 
     #[test]
     fn change_stream_commit_plan_uses_topology_writer_fragments() {
-        let topology = topology_for_test(vec![(0, ChangeStreamBranchKind::ReuseData, 7)]);
+        let topology = topology_for_test(vec![(ConnectorRowMutationEffect::Replace, 7)]);
 
         let plan = ChangeStreamWriterCommitPlan::from_topology(&topology)
             .expect("topology writer mapping");
@@ -375,8 +391,8 @@ mod tests {
     #[test]
     fn change_stream_commit_plan_rejects_duplicate_writer_fragment() {
         let topology = topology_for_test(vec![
-            (0, ChangeStreamBranchKind::DeleteDv, 7),
-            (1, ChangeStreamBranchKind::ReuseData, 7),
+            (ConnectorRowMutationEffect::Delete, 7),
+            (ConnectorRowMutationEffect::Replace, 7),
         ]);
 
         let err = ChangeStreamWriterCommitPlan::from_topology(&topology)
@@ -386,15 +402,17 @@ mod tests {
     }
 
     fn topology_for_test(
-        branches: Vec<(i32, ChangeStreamBranchKind, FragmentId)>,
+        routes: Vec<(ConnectorRowMutationEffect, FragmentId)>,
     ) -> SqlChangeStreamWriteTopology {
         SqlChangeStreamWriteTopology {
-            writer_branches: branches
+            writer_routes: routes
                 .into_iter()
-                .map(|(branch_id, branch_kind, writer_fragment_id)| {
-                    crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriterBranch {
-                        branch_id,
-                        branch_kind,
+                .enumerate()
+                .map(|(index, (effect, writer_fragment_id))| {
+                    crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriterRoute {
+                        route_id: ConnectorWriteRouteId::from_bytes([index as u8 + 1; 32]),
+                        cohort_id: ConnectorWriteCohortId::primary(ConnectorWriteOperationId::new()),
+                        accepted_effects: vec![effect],
                         writer_fragment_id,
                         sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
                             crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
