@@ -18,7 +18,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::ops::Deref;
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -67,23 +68,10 @@ pub(crate) struct IcebergCatalogRegistry {
 
 #[derive(Clone)]
 pub(crate) struct IcebergCatalogEntry {
-    // Tracked but unused outside the REST catalog path / tests until the
-    // engine flows migrate from `build_hadoop_catalog` to the unified
-    // `build_iceberg_catalog` dispatcher.
-    #[allow(dead_code)]
-    pub(crate) kind: IcebergCatalogKind,
-    pub(crate) warehouse_uri: String,
-    /// REST endpoint URL (`uri` property) — populated only when
-    /// `kind == IcebergCatalogKind::Rest`. None for Hadoop.
-    #[allow(dead_code)]
-    pub(crate) rest_uri: Option<String>,
-    /// HMS endpoint in `host:port` form (no `thrift://`) — populated only when
-    /// `kind == IcebergCatalogKind::Hive`. None otherwise.
-    #[allow(dead_code)]
-    pub(crate) hms_uris: Option<String>,
-    pub(crate) properties: Vec<(String, String)>,
-    s3_config: Option<novarocks_fs::ObjectStoreConfig>,
-    pub(crate) warehouse_path: PathBuf,
+    /// Provider-owned catalog configuration. Core owns only SQL projections
+    /// and application caches below; it must not re-model catalog credentials,
+    /// endpoints, or warehouse identity.
+    configuration: IcebergCatalogConfiguration,
     table_cache: Arc<std::sync::RwLock<HashMap<(String, String), IcebergLoadedTable>>>,
     data_files_cache:
         Arc<std::sync::RwLock<HashMap<(String, String, Option<i64>), Vec<DataFileWithStats>>>>,
@@ -156,12 +144,16 @@ impl IcebergCatalogRegistry {
 }
 
 impl IcebergCatalogEntry {
+    pub(crate) fn configuration(&self) -> &IcebergCatalogConfiguration {
+        &self.configuration
+    }
+
     pub(crate) fn properties(&self) -> &[(String, String)] {
         &self.properties
     }
 
     pub(crate) fn is_s3(&self) -> bool {
-        self.s3_config.is_some()
+        self.object_store_config.is_some()
     }
 
     /// True when namespace/table state is owned by a remote Iceberg catalog
@@ -177,15 +169,13 @@ impl IcebergCatalogEntry {
     }
 
     pub(crate) fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
-        self.s3_config.as_ref()
+        self.object_store_config.as_ref()
     }
 
     pub(crate) fn cloud_properties_map(&self) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         for (key, value) in &self.properties {
-            if crate::fs::object_store_credentials::AWS_S3_CREDENTIAL_PROPERTY_KEYS
-                .contains(&key.as_str())
-            {
+            if novarocks_fs::AWS_S3_CATALOG_PROPERTY_KEYS.contains(&key.as_str()) {
                 map.insert(key.clone(), value.clone());
             }
         }
@@ -254,12 +244,23 @@ impl IcebergCatalogEntry {
     }
 }
 
+// Keep the existing Core SQL adapters source-compatible while their remaining
+// application cache is removed. The provider configuration itself has a single
+// owner in novarocks-connector-iceberg.
+impl Deref for IcebergCatalogEntry {
+    type Target = IcebergCatalogConfiguration;
+
+    fn deref(&self) -> &Self::Target {
+        self.configuration()
+    }
+}
+
 fn resolve_warehouse_access_for_entry(
     entry: &IcebergCatalogEntry,
     context: &str,
 ) -> Result<novarocks_connector_iceberg::fs_io::IcebergFsAccess, String> {
     let object_store_config = entry
-        .s3_config
+        .object_store_config
         .as_ref()
         .ok_or_else(|| format!("missing object-store config for {context}"))?;
     fs_io::resolve_access_for_location(&entry.warehouse_uri, Some(object_store_config))
@@ -281,7 +282,7 @@ pub(crate) fn create_namespace(
         .map(|_| ())
         .map_err(|e| format!("create iceberg namespace {namespace}: {e}"));
     }
-    if entry.s3_config.is_some() {
+    if entry.object_store_config.is_some() {
         let access = resolve_warehouse_access_for_entry(entry, "namespace create")?;
         let op = access.operator();
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
@@ -318,7 +319,7 @@ pub(crate) fn namespace_exists(
             .map_err(|e| format!("check iceberg namespace runtime: {e}"))?
             .map_err(|e| format!("check iceberg namespace failed: {e}"));
     }
-    if entry.s3_config.is_some() {
+    if entry.object_store_config.is_some() {
         let access = resolve_warehouse_access_for_entry(entry, "namespace check")?;
         let op = access.operator();
         let ns_prefix = s3_namespace_prefix(entry, &ns_name)?;
@@ -366,7 +367,7 @@ pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>
         names.dedup();
         return Ok(names);
     }
-    if entry.s3_config.is_some() {
+    if entry.object_store_config.is_some() {
         let access = resolve_warehouse_access_for_entry(entry, "list namespaces")?;
         let op = access.operator();
         let root_prefix = access.single_relative_path()?;
@@ -435,7 +436,7 @@ pub(crate) fn drop_namespace(
             .map_err(|e| format!("drop iceberg namespace runtime: {e}"))?
             .map_err(|e| format!("drop iceberg namespace {namespace}: {e}"));
     }
-    if entry.s3_config.is_some() {
+    if entry.object_store_config.is_some() {
         let access = resolve_warehouse_access_for_entry(entry, "namespace drop")?;
         let op = access.operator();
         let root_marker_key = s3_namespace_root_marker_key(entry, &ns_name)?;
@@ -558,7 +559,7 @@ pub(crate) fn list_tables(
         tables.sort();
         return Ok(tables);
     }
-    if entry.s3_config.is_some() {
+    if entry.object_store_config.is_some() {
         let access = resolve_warehouse_access_for_entry(entry, "list tables")?;
         let op = access.operator();
         let ns_prefix = s3_namespace_prefix(entry, &ns_name)?;
@@ -685,7 +686,7 @@ fn purge_s3_table_prefix_before_create(
     namespace: &NamespaceIdent,
     table_name: &str,
 ) -> Result<(), String> {
-    if entry.s3_config.is_none() || entry.warehouse_uri.trim().is_empty() {
+    if entry.object_store_config.is_none() || entry.warehouse_uri.trim().is_empty() {
         return Ok(());
     }
     if matches!(entry.kind, IcebergCatalogKind::Rest) {
@@ -889,7 +890,7 @@ pub(crate) fn drop_table(
             .map_err(|e| format!("drop iceberg table runtime failed: {e}"))?
             .map_err(|e| format!("drop iceberg table {ident}: {e}"))?;
         if matches!(entry.kind, IcebergCatalogKind::Rest)
-            && entry.s3_config.is_some()
+            && entry.object_store_config.is_some()
             && !entry.warehouse_uri.trim().is_empty()
         {
             drop_s3_table_prefix(entry, &ns_name, &tbl_name)
@@ -898,7 +899,7 @@ pub(crate) fn drop_table(
         return Ok(());
     }
 
-    if entry.s3_config.is_some() {
+    if entry.object_store_config.is_some() {
         drop_s3_table_prefix(entry, &ns_name, &tbl_name)
     } else {
         let table_dir = entry.warehouse_path.join(&ns_name).join(&tbl_name);
@@ -918,7 +919,7 @@ pub(crate) fn purge_orphan_s3_table_prefix(
     let ns_name = normalize_identifier(namespace_name)?;
     let tbl_name = normalize_identifier(table_name)?;
     entry.invalidate_table_cache(&ns_name, &tbl_name);
-    if entry.s3_config.is_none() || entry.warehouse_uri.trim().is_empty() {
+    if entry.object_store_config.is_none() || entry.warehouse_uri.trim().is_empty() {
         return Ok(false);
     }
     drop_s3_table_prefix(entry, &ns_name, &tbl_name)?;
@@ -979,7 +980,7 @@ pub(crate) fn load_table(
         block_on_iceberg(async { catalog.load_table(&ident).await })
             .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
             .map_err(|e| format_remote_load_table_error(&ident, &ns_name, &tbl_name, e))?
-    } else if entry.s3_config.is_some() {
+    } else if entry.object_store_config.is_some() {
         // S3 path: discover metadata from S3 directly
         let (metadata_file_name, metadata_bytes) =
             latest_table_metadata_file_s3(entry, &ns_name, &tbl_name)?;
@@ -992,8 +993,10 @@ pub(crate) fn load_table(
         let metadata_location =
             format!("{warehouse_trimmed}/{ns_name}/{tbl_name}/metadata/{metadata_file_name}");
 
-        let file_io =
-            fs_io::build_file_io_for_location(&entry.warehouse_uri, entry.s3_config.as_ref());
+        let file_io = fs_io::build_file_io_for_location(
+            &entry.warehouse_uri,
+            entry.object_store_config.as_ref(),
+        );
 
         novarocks_connector_iceberg::iceberg::table::Table::builder()
             .file_io(file_io)
@@ -1100,7 +1103,7 @@ pub(crate) fn load_table(
         logical_types,
         key_desc,
         column_aggregations,
-        object_store_config: entry.s3_config.clone(),
+        object_store_config: entry.object_store_config.clone(),
     };
 
     // Cache the loaded table
@@ -1151,7 +1154,7 @@ pub(crate) fn current_schema_id(
         return Ok(table.metadata().current_schema_id());
     }
 
-    let metadata_bytes = if entry.s3_config.is_some() {
+    let metadata_bytes = if entry.object_store_config.is_some() {
         latest_table_metadata_file_s3(entry, &ns_name, &tbl_name)?.1
     } else {
         let metadata_location = latest_table_metadata_location_local(entry, &ns_name, &tbl_name)?;
@@ -1360,13 +1363,7 @@ pub(crate) fn build_catalog_entry(
 ) -> Result<IcebergCatalogEntry, String> {
     let configuration = parse_catalog_configuration(catalog_name, properties)?;
     Ok(IcebergCatalogEntry {
-        kind: configuration.kind,
-        warehouse_uri: configuration.warehouse_uri,
-        rest_uri: configuration.rest_uri,
-        hms_uris: configuration.hms_uris,
-        properties: configuration.properties,
-        s3_config: configuration.object_store_config,
-        warehouse_path: configuration.warehouse_path,
+        configuration,
         table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         data_files_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
     })
@@ -1413,15 +1410,7 @@ pub(crate) async fn build_hms_catalog(
 }
 
 fn provider_catalog_configuration(entry: &IcebergCatalogEntry) -> IcebergCatalogConfiguration {
-    IcebergCatalogConfiguration {
-        kind: entry.kind,
-        warehouse_uri: entry.warehouse_uri.clone(),
-        rest_uri: entry.rest_uri.clone(),
-        hms_uris: entry.hms_uris.clone(),
-        properties: entry.properties.clone(),
-        object_store_config: entry.s3_config.clone(),
-        warehouse_path: entry.warehouse_path.clone(),
-    }
+    entry.configuration.clone()
 }
 
 /// Synchronous dispatcher that returns an `Arc<dyn Catalog>` regardless of
@@ -2734,7 +2723,9 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
 
 #[cfg(test)]
 mod data_file_with_stats_tests {
-    use super::{DataFileWithStats, IcebergCatalogEntry, IcebergCatalogKind};
+    use super::{
+        DataFileWithStats, IcebergCatalogConfiguration, IcebergCatalogEntry, IcebergCatalogKind,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
@@ -2790,13 +2781,15 @@ mod data_file_with_stats_tests {
     #[test]
     fn data_file_cache_is_snapshot_scoped_and_table_invalidation_clears_it() {
         let entry = IcebergCatalogEntry {
-            kind: IcebergCatalogKind::Hadoop,
-            warehouse_uri: "file:///tmp/warehouse".to_string(),
-            rest_uri: None,
-            hms_uris: None,
-            properties: vec![],
-            s3_config: None,
-            warehouse_path: PathBuf::from("/tmp/warehouse"),
+            configuration: IcebergCatalogConfiguration {
+                kind: IcebergCatalogKind::Hadoop,
+                warehouse_uri: "file:///tmp/warehouse".to_string(),
+                rest_uri: None,
+                hms_uris: None,
+                properties: vec![],
+                object_store_config: None,
+                warehouse_path: PathBuf::from("/tmp/warehouse"),
+            },
             table_cache: Arc::new(RwLock::new(HashMap::new())),
             data_files_cache: Arc::new(RwLock::new(HashMap::new())),
         };
