@@ -34,17 +34,22 @@ use novarocks_spi::connector::{
 /// The serialized metadata is parsed only inside the Iceberg provider.  The
 /// returned facts intentionally contain no table UUID, snapshot, file, or
 /// provider payload detail.
+pub struct IcebergTablePlanningFactsInput<'a> {
+    pub schema: &'a SchemaRef,
+    pub metadata_columns: &'a [String],
+    pub hidden_columns: &'a [String],
+    pub logical_type_columns: &'a BTreeMap<String, String>,
+    pub serialized_metadata: Option<&'a str>,
+    pub namespace: &'a Arc<str>,
+    pub instance_id: &'a ConnectorInstanceId,
+    pub context: &'a ConnectorRequestContext,
+}
+
 pub fn table_planning_facts(
-    schema: &SchemaRef,
-    metadata_columns: &[String],
-    hidden_columns: &[String],
-    logical_type_columns: &BTreeMap<String, String>,
-    serialized_metadata: Option<&str>,
-    namespace: &Arc<str>,
-    instance_id: &ConnectorInstanceId,
-    context: &ConnectorRequestContext,
+    input: IcebergTablePlanningFactsInput<'_>,
 ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
-    let column_facts = schema
+    let column_facts = input
+        .schema
         .fields()
         .iter()
         .enumerate()
@@ -54,7 +59,8 @@ pub fn table_planning_facts(
                 .metadata()
                 .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
                 .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-                || hidden_columns
+                || input
+                    .hidden_columns
                     .iter()
                     .any(|hidden| hidden.eq_ignore_ascii_case(field.name()))
             {
@@ -62,12 +68,13 @@ pub fn table_planning_facts(
             } else {
                 ConnectorTableColumnVisibility::Sql
             };
-            let semantic_kind = match logical_type_columns.get(&name).map(String::as_str) {
+            let semantic_kind = match input.logical_type_columns.get(&name).map(String::as_str) {
                 Some("bitmap") => ConnectorTableColumnSemanticKind::Bitmap,
                 Some("hll") => ConnectorTableColumnSemanticKind::Hll,
                 _ => ConnectorTableColumnSemanticKind::None,
             };
-            let role = if metadata_columns
+            let role = if input
+                .metadata_columns
                 .iter()
                 .any(|column| column.eq_ignore_ascii_case(field.name()))
             {
@@ -88,20 +95,26 @@ pub fn table_planning_facts(
             ))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    let (unique_constraints, foreign_key_constraints) = serialized_metadata
+    let (unique_constraints, foreign_key_constraints) = input
+        .serialized_metadata
         .and_then(|serialized| {
             serde_json::from_str::<crate::iceberg::spec::TableMetadata>(serialized).ok()
         })
         .map(|metadata| {
-            iceberg_constraint_facts(schema, metadata.properties(), namespace, instance_id)
+            iceberg_constraint_facts(
+                input.schema,
+                metadata.properties(),
+                input.namespace,
+                input.instance_id,
+            )
         })
         .unwrap_or_default();
     ConnectorTablePlanningFacts::try_new(
-        schema,
+        input.schema,
         column_facts,
         unique_constraints,
         foreign_key_constraints,
-        context,
+        input.context,
     )
 }
 
@@ -270,16 +283,22 @@ mod tests {
             Field::new("row_id", DataType::Int64, false),
             Field::new("internal", DataType::Utf8, true).with_metadata(hidden_metadata),
         ]));
-        let facts = table_planning_facts(
-            &schema,
-            &["row_id".to_string()],
-            &[],
-            &BTreeMap::from([(String::from("payload"), String::from("bitmap"))]),
-            None,
-            &Arc::from("db"),
-            &ConnectorInstanceId::parse("ice").expect("instance ID"),
-            &context(),
-        )
+        let metadata_columns = vec!["row_id".to_string()];
+        let logical_type_columns =
+            BTreeMap::from([(String::from("payload"), String::from("bitmap"))]);
+        let namespace = Arc::from("db");
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let context = context();
+        let facts = table_planning_facts(IcebergTablePlanningFactsInput {
+            schema: &schema,
+            metadata_columns: &metadata_columns,
+            hidden_columns: &[],
+            logical_type_columns: &logical_type_columns,
+            serialized_metadata: None,
+            namespace: &namespace,
+            instance_id: &instance_id,
+            context: &context,
+        })
         .expect("planning facts");
 
         assert_eq!(

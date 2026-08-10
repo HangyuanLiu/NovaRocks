@@ -273,7 +273,7 @@ fn validate_column_facts(
 
 fn validate_unique_constraints(
     schema: &SchemaRef,
-    constraints: &mut Vec<ConnectorTableUniqueConstraint>,
+    constraints: &mut [ConnectorTableUniqueConstraint],
 ) -> Result<(), ConnectorError> {
     if constraints.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS {
         return Err(ConnectorError::new(
@@ -296,7 +296,7 @@ fn validate_unique_constraints(
 
 fn validate_foreign_key_constraints(
     schema: &SchemaRef,
-    constraints: &mut Vec<ConnectorTableForeignKeyConstraint>,
+    constraints: &mut [ConnectorTableForeignKeyConstraint],
 ) -> Result<(), ConnectorError> {
     if constraints.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS {
         return Err(ConnectorError::new(
@@ -376,7 +376,7 @@ fn validate_foreign_key_constraints(
 
 fn validate_local_constraint_columns(
     schema: &SchemaRef,
-    columns: &mut Vec<u32>,
+    columns: &mut [u32],
 ) -> Result<(), ConnectorError> {
     if columns.is_empty() || columns.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS {
         return Err(ConnectorError::new(

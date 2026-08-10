@@ -4021,17 +4021,19 @@ impl ConnectorMetadata for IcebergControlProvider {
             )?
         };
         let planning_facts = novarocks_connector_iceberg::planning_facts::table_planning_facts(
-            &schema,
-            &table.metadata_columns,
-            &table.hidden_columns,
-            &table.logical_type_columns,
-            table
-                .table_info
-                .as_ref()
-                .and_then(|info| info.serialized_metadata.as_deref()),
-            &request.table.namespace,
-            &self.instance_id,
-            &request.context,
+            novarocks_connector_iceberg::planning_facts::IcebergTablePlanningFactsInput {
+                schema: &schema,
+                metadata_columns: &table.metadata_columns,
+                hidden_columns: &table.hidden_columns,
+                logical_type_columns: &table.logical_type_columns,
+                serialized_metadata: table
+                    .table_info
+                    .as_ref()
+                    .and_then(|info| info.serialized_metadata.as_deref()),
+                namespace: &request.table.namespace,
+                instance_id: &self.instance_id,
+                context: &request.context,
+            },
         )?;
         Ok(ConnectorTableMetadata {
             identity: novarocks_spi::connector::ConnectorTableIdentity {

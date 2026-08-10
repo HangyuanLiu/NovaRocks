@@ -59,16 +59,18 @@ where
     Fut: std::future::Future<Output = Result<(), crate::iceberg::Error>>,
 {
     let mut last_err: Option<crate::iceberg::Error> = None;
-    for attempt in 0..COMMIT_RETRY_MAX_ATTEMPTS {
+    for (attempt, backoff_ms) in COMMIT_RETRY_BACKOFF_MS
+        .iter()
+        .copied()
+        .enumerate()
+        .take(COMMIT_RETRY_MAX_ATTEMPTS)
+    {
         match do_attempt(attempt).await {
             Ok(()) => return Ok(()),
             Err(e) if is_retryable_commit_conflict(&e) => {
                 last_err = Some(e);
                 if attempt + 1 < COMMIT_RETRY_MAX_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        COMMIT_RETRY_BACKOFF_MS[attempt],
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
             }
             Err(e) => {
