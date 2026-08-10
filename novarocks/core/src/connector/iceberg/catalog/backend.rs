@@ -30,7 +30,9 @@ use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
 };
 #[cfg(test)]
-use novarocks_connector_iceberg::schema_facts::{row_lineage_enabled, stored_row_lineage_enabled};
+use novarocks_connector_iceberg::schema_facts::{
+    iceberg_schema_def, row_lineage_enabled, stored_row_lineage_enabled,
+};
 
 #[cfg(test)]
 use super::registry::load_table as reg_load_table;

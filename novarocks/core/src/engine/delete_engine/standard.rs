@@ -39,6 +39,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use chrono::NaiveDateTime;
+#[cfg(test)]
+use novarocks_connector_iceberg::delete_file::{
+    ReferencedDataFilePartition, ReferencedDataFilePartitions,
+    insert_referenced_data_file_partition,
+};
 use novarocks_connector_iceberg::iceberg::expr::{Predicate, Reference};
 use novarocks_connector_iceberg::iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
@@ -50,8 +55,7 @@ use crate::connector::iceberg::commit::{
 };
 #[cfg(test)]
 use crate::connector::iceberg::delete_visibility::{
-    ExistingDeleteVisibility, ReferencedDataFilePartition, ReferencedDataFilePartitions,
-    insert_referenced_data_file_partition, load_existing_delete_visibility_by_data_file,
+    ExistingDeleteVisibility, load_existing_delete_visibility_by_data_file,
     load_existing_delete_visibility_by_data_file_at,
     load_existing_delete_visibility_from_descriptors, load_referenced_data_file_partitions,
     load_referenced_data_file_partitions_at,

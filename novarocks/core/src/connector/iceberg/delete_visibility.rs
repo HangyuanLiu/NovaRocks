@@ -18,15 +18,12 @@
 use std::collections::HashMap;
 
 use arrow::array::RecordBatch;
+use novarocks_connector_iceberg::delete_file::{
+    ReferencedDataFilePartition, ReferencedDataFilePartitions,
+    insert_referenced_data_file_partition,
+};
 
 use super::catalog::registry;
-
-pub(crate) struct ReferencedDataFilePartition {
-    pub(crate) partition_spec_id: i32,
-    pub(crate) partition_values: novarocks_connector_iceberg::iceberg::spec::Struct,
-}
-
-pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
 
 /// Snapshot-aware version of [`load_referenced_data_file_partitions`].
 ///
@@ -66,33 +63,6 @@ pub(crate) fn load_referenced_data_file_partitions(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<ReferencedDataFilePartitions, String> {
     load_referenced_data_file_partitions_at(table, None)
-}
-
-pub(crate) fn insert_referenced_data_file_partition(
-    partitions: &mut ReferencedDataFilePartitions,
-    path: String,
-    partition: ReferencedDataFilePartition,
-) -> Result<(), String> {
-    match partitions.entry(path) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(partition);
-        }
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            let existing = entry.get();
-            if existing.partition_spec_id == partition.partition_spec_id
-                && existing.partition_values == partition.partition_values
-            {
-                return Ok(());
-            }
-            return Err(format!(
-                "iceberg data file `{}` has conflicting partition metadata: old partition spec id {}, new partition spec id {}",
-                entry.key(),
-                existing.partition_spec_id,
-                partition.partition_spec_id
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
