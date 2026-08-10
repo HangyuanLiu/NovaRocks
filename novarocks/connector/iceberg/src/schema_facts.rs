@@ -87,6 +87,18 @@ pub fn row_lineage_enabled(metadata: &TableMetadata) -> bool {
     }
 }
 
+/// Returns whether a table's stored data files may be assumed to carry V3
+/// row-lineage values. Unlike [`row_lineage_enabled`], this requires an
+/// explicit `write.row-lineage=true` declaration because older writers can
+/// produce V3 metadata without materializing `first_row_id` in every file.
+pub fn stored_row_lineage_enabled(metadata: &TableMetadata) -> bool {
+    matches!(metadata.format_version(), FormatVersion::V3)
+        && metadata
+            .properties()
+            .get("write.row-lineage")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -134,6 +146,18 @@ mod tests {
         assert!(!row_lineage_enabled(&metadata(
             FormatVersion::V2,
             HashMap::new()
+        )));
+    }
+
+    #[test]
+    fn stored_row_lineage_requires_an_explicit_v3_declaration() {
+        assert!(!stored_row_lineage_enabled(&metadata(
+            FormatVersion::V3,
+            HashMap::new(),
+        )));
+        assert!(stored_row_lineage_enabled(&metadata(
+            FormatVersion::V3,
+            HashMap::from([("write.row-lineage".to_string(), "true".to_string())]),
         )));
     }
 }

@@ -687,7 +687,7 @@ pub(crate) fn collect_base_catalog_entries(
 
 #[cfg(test)]
 fn data_file_with_stats_to_info(
-    file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    file: novarocks_connector_iceberg::manifest::DataFileWithStats,
 ) -> IcebergDataFileInfo {
     IcebergDataFileInfo {
         path: file.path,

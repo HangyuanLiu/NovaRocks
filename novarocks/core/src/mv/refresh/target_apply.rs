@@ -513,7 +513,7 @@ fn validate_physical_field_identity(
 }
 
 fn data_file_with_stats_to_info(
-    file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    file: novarocks_connector_iceberg::manifest::DataFileWithStats,
 ) -> IcebergDataFileInfo {
     IcebergDataFileInfo {
         path: file.path,

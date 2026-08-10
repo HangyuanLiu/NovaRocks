@@ -1325,7 +1325,7 @@ fn reject_unsupported_iceberg_table_semantics(loaded: &IcebergLoadedTable) -> Re
     Ok(())
 }
 
-pub(crate) use novarocks_connector_iceberg::manifest::DataFileWithStats;
+use novarocks_connector_iceberg::manifest::DataFileWithStats;
 
 pub(crate) fn current_equality_delete_column_names(
     table: &novarocks_connector_iceberg::iceberg::table::Table,

@@ -2267,7 +2267,7 @@ fn build_cow_update_distributed_write(
 fn build_cow_rewrite_query_local_overlay(
     target: &crate::engine::backend_resolver::TargetBackend,
     synthetic_table_name: &str,
-    data_file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    data_file: novarocks_connector_iceberg::manifest::DataFileWithStats,
     base_snapshot_id: i64,
     target_ref: &str,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,

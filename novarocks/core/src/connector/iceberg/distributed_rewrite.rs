@@ -36,8 +36,8 @@ use sha2::{Digest, Sha256};
 
 use super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info;
 use super::catalog::registry::{
-    DataFileWithStats, IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg,
-    build_iceberg_catalog, extract_data_files_with_stats, load_table,
+    IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg, build_iceberg_catalog,
+    extract_data_files_with_stats, load_table,
 };
 use super::commit::{IcebergCommitCollector, SelectedRewriteKind};
 use super::sink::build_position_delete_data_file_partition_index;
@@ -54,6 +54,7 @@ use super::write_service::{
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
+use novarocks_connector_iceberg::manifest::DataFileWithStats;
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
 };

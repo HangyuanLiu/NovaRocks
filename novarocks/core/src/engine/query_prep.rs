@@ -485,11 +485,11 @@ pub(crate) fn build_iceberg_delta_table_def_with_files(
 #[cfg(test)]
 fn iceberg_files_for_query_to_stats(
     data_files: Vec<IcebergFileForQuery>,
-) -> Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats> {
+) -> Vec<novarocks_connector_iceberg::manifest::DataFileWithStats> {
     data_files
         .into_iter()
         .map(
-            |file| crate::connector::iceberg::catalog::registry::DataFileWithStats {
+            |file| novarocks_connector_iceberg::manifest::DataFileWithStats {
                 path: file.path,
                 size: file.size,
                 record_count: file.record_count,

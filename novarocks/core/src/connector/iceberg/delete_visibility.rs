@@ -169,7 +169,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
 }
 
 fn load_delete_visibility_from_data_files(
-    data_files: Vec<registry::DataFileWithStats>,
+    data_files: Vec<novarocks_connector_iceberg::manifest::DataFileWithStats>,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     let mut out = ExistingDeleteVisibilityByDataFile::new();

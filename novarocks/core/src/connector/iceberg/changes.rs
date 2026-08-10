@@ -598,7 +598,7 @@ pub(crate) fn delete_visibility_data_files_at(
 }
 
 fn delete_visibility_data_file_from_stats(
-    file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    file: novarocks_connector_iceberg::manifest::DataFileWithStats,
 ) -> Result<DeleteVisibilityDataFileDescriptor, String> {
     let delete_files = file
         .delete_files

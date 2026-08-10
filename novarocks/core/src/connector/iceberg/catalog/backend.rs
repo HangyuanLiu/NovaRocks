@@ -25,11 +25,12 @@ use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_P
 use crate::sql::planner::table::{ScanSource, TableDef};
 #[cfg(test)]
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::manifest::DataFileWithStats;
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
 };
 #[cfg(test)]
-use novarocks_connector_iceberg::schema_facts::row_lineage_enabled;
+use novarocks_connector_iceberg::schema_facts::{row_lineage_enabled, stored_row_lineage_enabled};
 
 #[cfg(test)]
 use super::registry::load_table as reg_load_table;
@@ -45,7 +46,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
-    data_files: Vec<super::registry::DataFileWithStats>,
+    data_files: Vec<DataFileWithStats>,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files(
         entry,
@@ -149,7 +150,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     table_name: &str,
     loaded: IcebergLoadedTable,
 ) -> Result<TableDef, String> {
-    if !is_v3_row_lineage(loaded.table.metadata()) {
+    if !stored_row_lineage_enabled(loaded.table.metadata()) {
         return Err(format!(
             "iceberg table {namespace}.{table_name} cannot back an IVM-A1 delta scan because its \
              metadata does not declare Iceberg v3 row-lineage; rebuild the base table with \
@@ -225,7 +226,7 @@ fn build_iceberg_table_def_with_data_files(
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
-    data_files: Vec<super::registry::DataFileWithStats>,
+    data_files: Vec<DataFileWithStats>,
     binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files_impl(
@@ -249,7 +250,7 @@ fn build_iceberg_table_def_with_data_files_impl(
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
-    data_files: Vec<super::registry::DataFileWithStats>,
+    data_files: Vec<DataFileWithStats>,
     options: IcebergTableDefOptions,
 ) -> Result<TableDef, String> {
     let has_data_files = !data_files.is_empty();
@@ -295,13 +296,13 @@ fn build_iceberg_table_def_with_data_files_impl(
         IcebergTableDefMode::ScanBinding => {
             let mut metadata_columns = iceberg_row_identity_metadata_columns();
             if has_data_files
-                && is_v3_row_lineage(loaded.table.metadata())
+                && stored_row_lineage_enabled(loaded.table.metadata())
                 && all_files_have_first_row_id
             {
                 metadata_columns.extend(iceberg_v3_row_lineage_metadata_columns());
             } else {
                 if has_data_files
-                    && is_v3_row_lineage(loaded.table.metadata())
+                    && stored_row_lineage_enabled(loaded.table.metadata())
                     && !all_files_have_first_row_id
                 {
                     tracing::warn!(
@@ -431,7 +432,7 @@ fn hidden_internal_column_names(
 }
 
 pub(crate) fn data_file_with_stats_to_iceberg_data_file_info(
-    file: super::registry::DataFileWithStats,
+    file: DataFileWithStats,
 ) -> IcebergDataFileInfo {
     IcebergDataFileInfo {
         path: file.path,
@@ -517,7 +518,6 @@ mod tests {
     use novarocks_connector_iceberg::iceberg::table::Table;
     use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
-    use crate::connector::iceberg::catalog::registry::DataFileWithStats;
     use crate::sql::parser::ast::TableColumnDef;
     use novarocks_catalog::schema::SqlType;
 
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn data_file_with_stats_to_iceberg_data_file_info_preserves_read_metadata() {
-        let file = crate::connector::iceberg::catalog::registry::DataFileWithStats {
+        let file = DataFileWithStats {
             path: "s3://bucket/table/data.parquet".to_string(),
             size: 12,
             record_count: Some(3),

@@ -1268,7 +1268,7 @@ fn build_locator_visible_target_table_def(
 fn register_framework_locator_control_fixture(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     catalog: &str,
-    files: &[crate::connector::iceberg::catalog::registry::DataFileWithStats],
+    files: &[novarocks_connector_iceberg::manifest::DataFileWithStats],
 ) -> Result<(), String> {
     let planned_files = files
         .iter()
@@ -1288,9 +1288,9 @@ fn register_framework_locator_control_fixture(
 #[cfg(test)]
 fn filter_locator_data_files_by_partition(
     target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
+    files: Vec<novarocks_connector_iceberg::manifest::DataFileWithStats>,
     partition_filter: &TargetPartitionFilter,
-) -> Result<Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>, String> {
+) -> Result<Vec<novarocks_connector_iceberg::manifest::DataFileWithStats>, String> {
     if !partition_filter.is_allow_list() {
         return Ok(files);
     }
@@ -1315,7 +1315,7 @@ fn filter_locator_data_files_by_partition(
 #[cfg(test)]
 fn locator_data_file_matches_partition_filter(
     target_metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    file: &crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    file: &novarocks_connector_iceberg::manifest::DataFileWithStats,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<bool, String> {
     let partition_struct = file.partition_values.as_ref().ok_or_else(|| {

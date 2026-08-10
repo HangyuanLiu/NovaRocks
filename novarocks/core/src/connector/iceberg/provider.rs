@@ -4724,7 +4724,7 @@ fn metric_state_f64(value: &StatValue<f64>) -> StatisticsMetricState {
 /// the manifest fast path exact without reconstructing a count from a lossy
 /// floating-point null fraction.
 fn manifest_null_count(
-    files: &[super::catalog::registry::DataFileWithStats],
+    files: &[novarocks_connector_iceberg::manifest::DataFileWithStats],
     column: &str,
 ) -> StatisticsMetricState {
     let total = files.iter().try_fold(0_u64, |total, file| {
@@ -4751,7 +4751,7 @@ fn manifest_null_count(
 
 fn manifest_evidence_is_complete(
     row_count: &StatValue<u64>,
-    files: &[super::catalog::registry::DataFileWithStats],
+    files: &[novarocks_connector_iceberg::manifest::DataFileWithStats],
 ) -> bool {
     matches!(row_count, StatValue::Known { .. })
         && files.iter().all(|file| file.delete_files.is_empty())
@@ -11348,8 +11348,8 @@ mod tests {
     fn data_file_with_column_null_count(
         column: &str,
         null_count: Option<i64>,
-    ) -> crate::connector::iceberg::catalog::registry::DataFileWithStats {
-        crate::connector::iceberg::catalog::registry::DataFileWithStats {
+    ) -> novarocks_connector_iceberg::manifest::DataFileWithStats {
+        novarocks_connector_iceberg::manifest::DataFileWithStats {
             path: "file:///tmp/table/data.parquet".to_string(),
             size: 12,
             record_count: Some(4),
