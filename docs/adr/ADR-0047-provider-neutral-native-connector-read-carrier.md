@@ -1,5 +1,5 @@
 ---
-id: ADR-0041
+id: ADR-0047
 title: "Provider-neutral native Connector read carrier"
 domain: [provider-spi, distributed-query-lifecycle]
 status: active

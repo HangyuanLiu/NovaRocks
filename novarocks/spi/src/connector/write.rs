@@ -16,7 +16,7 @@
 // under the License.
 
 //! Provider-neutral distributed writer contract.
-//! Design: ADR-0044 (docs/adr/ADR-0044-connector-write-admission-and-terminal-facts.md)
+//! Design: ADR-0048 (docs/adr/ADR-0048-connector-write-admission-and-terminal-facts.md)
 //!
 //! The frontend owns planning and external commit state. Backend execution
 //! bindings can only stage Arrow batches and return bounded opaque reports.

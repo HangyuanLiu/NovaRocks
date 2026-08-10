@@ -1,10 +1,10 @@
 ---
-id: ADR-0034
+id: ADR-0045
 title: "Change-stream layout and provider ownership"
 domain: [frontend-dml]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0049
 date: 2026-08-03
 provenance:
   - "PR: pending"

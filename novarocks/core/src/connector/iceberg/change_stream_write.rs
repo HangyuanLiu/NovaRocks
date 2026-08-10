@@ -120,7 +120,7 @@ impl IcebergChangeStreamProviderBinding {
     }
 }
 
-/// ADR-0034: terminal handle routing, aggregate commit routing and lazy
+/// ADR-0049: terminal handle routing, aggregate commit routing and lazy
 /// activation must be derived from the same planner-frozen topology.
 pub(crate) fn bind_iceberg_change_stream_provider(
     request: IcebergChangeStreamProviderRequest<'_>,
