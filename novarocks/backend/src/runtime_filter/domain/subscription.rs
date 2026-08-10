@@ -388,7 +388,7 @@ impl BackendSubscriptionGroup {
                         slot.publish(Arc::clone(snapshot), terminal)?
                     }
                     SnapshotAcquireOutcome::Unavailable(reason) => {
-                        slot.terminal(LiveTerminal::Unavailable(*reason))
+                        slot.terminal(terminal.unwrap_or(LiveTerminal::Unavailable(*reason)))
                     }
                     SnapshotAcquireOutcome::Cancelled => slot.terminal(LiveTerminal::Cancelled),
                     SnapshotAcquireOutcome::Unsupported(_) | SnapshotAcquireOutcome::TimedOut => {
@@ -397,6 +397,36 @@ impl BackendSubscriptionGroup {
                         ))
                     }
                 },
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_terminal(
+        &self,
+        route_edge_id: BackendRouteEdgeId,
+        terminal: LiveTerminal,
+    ) -> Result<(), BackendSubscriptionError> {
+        if !self.route_edge_ids.contains(&route_edge_id) {
+            return Err(BackendSubscriptionError::UnknownRoute(route_edge_id));
+        }
+        for slot in self.slots.values() {
+            match slot {
+                BackendInstalledSubscriptionSlot::Blocking(slot) => {
+                    let outcome = match terminal {
+                        LiveTerminal::Cancelled => SnapshotAcquireOutcome::Cancelled,
+                        LiveTerminal::Unavailable(reason) => {
+                            SnapshotAcquireOutcome::Unavailable(reason)
+                        }
+                        LiveTerminal::Completed | LiveTerminal::CompletedWithoutArtifact => {
+                            SnapshotAcquireOutcome::Unavailable(
+                                UnavailableReason::IncompleteCoverage,
+                            )
+                        }
+                    };
+                    slot.publish(outcome);
+                }
+                BackendInstalledSubscriptionSlot::Live(slot) => slot.terminal(terminal),
             }
         }
         Ok(())
