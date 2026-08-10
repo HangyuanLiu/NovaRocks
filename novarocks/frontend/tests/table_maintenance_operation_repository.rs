@@ -474,10 +474,53 @@ async fn v1_child_rewrite_copies_the_claimed_authority_without_a_second_lease() 
     assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
 
     let child = repository
-        .create_for_claimed_optimize_job_fenced(request, parent.job_id, authority, validator)
+        .create_for_claimed_optimize_job_fenced(
+            request,
+            parent.job_id,
+            authority.clone(),
+            Arc::clone(&validator),
+        )
         .await
         .unwrap();
     assert_eq!(child.state, DistributedRewriteOperationState::Pending);
+
+    let plan_payload = b"v1-child-plan".to_vec();
+    let error = repository
+        .plan_fenced(
+            child.operation_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload.clone(),
+                cohort_count: 1,
+            },
+            12,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    let planned = repository
+        .plan_fenced(
+            child.operation_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload,
+                cohort_count: 1,
+            },
+            12,
+            authority,
+            validator,
+        )
+        .await
+        .unwrap();
+    assert_eq!(planned.state, DistributedRewriteOperationState::Planned);
 }
 
 #[tokio::test]

@@ -3983,6 +3983,42 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Plan(plan)),
             None,
             now_ms,
+            None,
+        )
+        .await
+    }
+
+    pub async fn plan_fenced(
+        &self,
+        operation_id: Uuid,
+        plan: DistributedRewritePlanPayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &plan.payload,
+            plan.payload_digest,
+            "distributed rewrite plan payload",
+        )?;
+        validate_authority(&authority)?;
+        if plan.cohort_count as usize
+            > novarocks_spi::connector::MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS
+        {
+            return Err(RepositoryError::new(
+                RepositoryErrorKind::Store,
+                "distributed rewrite plan exceeds cohort limit",
+            ));
+        }
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Plan,
+            &[DistributedRewriteOperationState::Pending],
+            DistributedRewriteOperationState::Planned,
+            Some(RewriteTransitionPayload::Plan(plan)),
+            None,
+            now_ms,
+            Some((authority, validator)),
         )
         .await
     }
@@ -4000,6 +4036,7 @@ impl DistributedRewriteOperationRepository {
             None,
             None,
             now_ms,
+            None,
         )
         .await
     }
@@ -4018,6 +4055,7 @@ impl DistributedRewriteOperationRepository {
             None,
             Some(checkpoint),
             0,
+            None,
         )
         .await
     }
@@ -4040,6 +4078,7 @@ impl DistributedRewriteOperationRepository {
             None,
             None,
             now_ms,
+            None,
         )
         .await
     }
@@ -4057,6 +4096,7 @@ impl DistributedRewriteOperationRepository {
             None,
             None,
             now_ms,
+            None,
         )
         .await
     }
@@ -4080,6 +4120,7 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Evidence(evidence)),
             None,
             now_ms,
+            None,
         )
         .await
     }
@@ -4108,6 +4149,7 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Receipt(receipt)),
             None,
             now_ms,
+            None,
         )
         .await
     }
@@ -4132,6 +4174,7 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Error(message)),
             None,
             now_ms,
+            None,
         )
         .await
     }
@@ -4156,6 +4199,7 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Error(message)),
             None,
             now_ms,
+            None,
         )
         .await
     }
@@ -4384,6 +4428,7 @@ impl DistributedRewriteOperationRepository {
         payload: Option<RewriteTransitionPayload>,
         checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
         now_ms: i64,
+        fenced: Option<(MaintenanceAuthorityV1, MaintenanceFenceValidator)>,
     ) -> RepositoryResult<DistributedRewriteOperation> {
         let transaction_operation_id = OperationId::new_v7();
         let result = run_side_effect_free(
@@ -4395,6 +4440,7 @@ impl DistributedRewriteOperationRepository {
                 let payload = payload.clone();
                 let checkpoint = checkpoint.clone();
                 let allowed = allowed.to_vec();
+                let fenced = fenced.clone();
                 Box::pin(async move {
                     apply_rewrite_transition(
                         transaction,
@@ -4406,6 +4452,9 @@ impl DistributedRewriteOperationRepository {
                         payload,
                         checkpoint,
                         now_ms,
+                        fenced
+                            .as_ref()
+                            .map(|(authority, validator)| (authority, validator)),
                     )
                     .await
                 })
@@ -4659,6 +4708,7 @@ async fn apply_rewrite_transition(
     payload: Option<RewriteTransitionPayload>,
     checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<DistributedRewriteOperation> {
     let loaded = match load_rewrite_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -4670,6 +4720,20 @@ async fn apply_rewrite_transition(
             format!("distributed rewrite operation {operation_id} not found"),
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Some(durable) = operation.stored.authority.as_ref() {
+            if let Err(error) =
+                validate_bound_fenced_authority(transaction, Some(durable), authority, validator)
+                    .await
+            {
+                return Ok(Err(error));
+            }
+        } else if let Err(error) =
+            validate_fenced_authority(transaction, authority, validator).await
+        {
+            return Ok(Err(error));
+        }
+    }
     if operation.stored.state == next {
         if let Some(RewriteTransitionPayload::Plan(plan)) = &payload {
             if operation.stored.plan_digest == Some(plan.plan_digest)
@@ -4707,6 +4771,9 @@ async fn apply_rewrite_transition(
     .await?
     {
         return Ok(Err(error));
+    }
+    if let Some((authority, _)) = fenced {
+        operation.stored.authority = Some(authority.clone());
     }
     let mut extra = None;
     match payload {
