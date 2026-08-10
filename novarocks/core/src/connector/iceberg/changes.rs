@@ -1354,7 +1354,7 @@ fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
 fn read_data_file_matching_equality_deletes_with_v3_lineage<N>(
     data_file_path: &str,
     data_file_size: Option<u64>,
-    sets: &[crate::connector::iceberg::equality_delete::EqualityDeleteSet],
+    sets: &[novarocks_connector_iceberg::file_reader::equality_delete::EqualityDeleteSet],
     first_row_id: i64,
     data_sequence_number: i64,
     factory: &novarocks_fs::FsAccessHandle,
@@ -1383,7 +1383,9 @@ where
     for batch in batches {
         let row_count = batch.num_rows();
         let Some(keep_mask) =
-            crate::connector::iceberg::equality_delete::equality_delete_keep_mask(&batch, sets)?
+            novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_keep_mask(
+                &batch, sets,
+            )?
         else {
             next_position = next_position.checked_add(row_count as u64).ok_or_else(|| {
                 format!(
@@ -1434,7 +1436,7 @@ where
 fn read_data_file_matching_equality_deletes_with_base_row_id<N>(
     data_file_path: &str,
     data_file_size: Option<u64>,
-    sets: &[crate::connector::iceberg::equality_delete::EqualityDeleteSet],
+    sets: &[novarocks_connector_iceberg::file_reader::equality_delete::EqualityDeleteSet],
     first_row_id: Option<i64>,
     factory: &novarocks_fs::FsAccessHandle,
     normalize_path: N,
@@ -1462,7 +1464,9 @@ where
     for batch in batches {
         let row_count = batch.num_rows();
         let Some(keep_mask) =
-            crate::connector::iceberg::equality_delete::equality_delete_keep_mask(&batch, sets)?
+            novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_keep_mask(
+                &batch, sets,
+            )?
         else {
             next_position = next_position.checked_add(row_count as u64).ok_or_else(|| {
                 format!(
@@ -3485,7 +3489,7 @@ mod tests {
         )
         .expect("replacement batch");
         let data_files = block_on_iceberg(async {
-            crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+            novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files(
                 &loaded.table,
                 [batch],
             )

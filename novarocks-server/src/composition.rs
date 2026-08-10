@@ -25,7 +25,7 @@ use novarocks::connector::iceberg::provider::IcebergConnectorInstaller;
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::resources::IcebergExecutionResources;
+use novarocks_connector_iceberg::resources::{IcebergControlResources, IcebergExecutionResources};
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
@@ -40,7 +40,7 @@ pub fn compose_backend_execution_installers(
     let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
     let iceberg_installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
         vec![std::sync::Arc::new(IcebergConnectorInstaller::new(
-            iceberg_resources.into_binding(),
+            iceberg_resources,
         ))];
     let expected = novarocks_spi::connector::ConnectorProviderId::parse(
         novarocks_connector_iceberg::PROVIDER_ID,
@@ -67,6 +67,31 @@ pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<IcebergExecutionResources> {
+    Ok(IcebergExecutionResources::new(
+        compose_iceberg_read_binding(config, runtime.clone())?,
+        runtime,
+    ))
+}
+
+/// Compose the frontend-only resources for one Iceberg control factory.
+///
+/// This deliberately creates a distinct resource bundle from BE execution
+/// composition. All-in-one may share the top-level Tokio handle, but its FE
+/// catalog client and BE installer must never share a provider instance.
+pub fn compose_iceberg_control_resources(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<IcebergControlResources> {
+    Ok(IcebergControlResources::new(
+        compose_iceberg_read_binding(config, runtime.clone())?,
+        runtime,
+    ))
+}
+
+fn compose_iceberg_read_binding(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<IcebergReadBinding> {
     let object_store = config.connector.object_store_config().map_err(|error| {
         anyhow::anyhow!("resolve connector startup object-store binding: {error}")
     })?;
@@ -76,9 +101,7 @@ pub fn compose_iceberg_execution_resources(
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
         std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
     );
-    Ok(IcebergExecutionResources::new(
-        IcebergReadBinding::from_resources(resources),
-    ))
+    Ok(IcebergReadBinding::from_resources(resources))
 }
 
 pub fn state_store_host_config(

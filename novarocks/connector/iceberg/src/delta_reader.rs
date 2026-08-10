@@ -1,19 +1,8 @@
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// distributed with this work for additional information regarding copyright
+// ownership.  The ASF licenses this file to You under the Apache License,
+// Version 2.0.
 
 //! Provider-owned reader for Iceberg snapshot-delta split roles.
 
@@ -28,14 +17,15 @@ use novarocks_spi::connector::{
     ConnectorReaderMetricsSnapshot,
 };
 
-use super::reader::IcebergBatchReader;
-use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec;
-use novarocks_connector_iceberg::delta::{
+use crate as novarocks_connector_iceberg;
+use crate::access_binding::IcebergReadBinding;
+use crate::delete_file::IcebergDeleteFileSpec;
+use crate::delta::{
     BaseDataFileLineage, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,
     PositionDeleteFileFormat,
 };
-use novarocks_connector_iceberg::scan_model::{
+use crate::file_reader::batch_reader::IcebergBatchReader;
+use crate::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
 
@@ -45,7 +35,8 @@ struct DeltaReadJob {
     row_id_allow_list: Option<BTreeSet<i64>>,
 }
 
-pub(crate) struct IcebergDeltaBatchReader {
+/// A provider-owned sequence of physical data readers for one frozen delta split.
+pub struct IcebergDeltaBatchReader {
     binding: IcebergReadBinding,
     request: ConnectorOpenReaderRequest,
     cancellation: FileCancellation,
@@ -57,7 +48,7 @@ pub(crate) struct IcebergDeltaBatchReader {
 }
 
 impl IcebergDeltaBatchReader {
-    pub(crate) fn try_new(
+    pub fn try_new(
         source: DeltaSourceFile,
         delete_side: Option<DeltaScanDeleteSide>,
         binding: IcebergReadBinding,
@@ -385,13 +376,7 @@ fn position_delete_applies_to_data_file(
     data_file_path: &str,
 ) -> bool {
     match delete.file_format {
-        // Parquet position-delete files carry one target path per row, so the
-        // reader must retain them and perform the row-level path filter.
         PositionDeleteFileFormat::Parquet => true,
-        // A Puffin deletion vector has no per-row file-path column. Its
-        // manifest-level referenced_data_file is therefore the only target
-        // identity; applying it to every live file aliases positions across
-        // files and corrupts v3 row lineage.
         PositionDeleteFileFormat::Puffin => delete
             .referenced_data_file
             .as_deref()
@@ -408,20 +393,12 @@ fn delete_visibility_specs(
             Ok(IcebergDeleteFileInfo {
                 path: delete.path.clone(),
                 file_format: match delete.file_format {
-                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Parquet => {
-                        IcebergDeleteFileFormat::Parquet
-                    }
-                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Puffin => {
-                        IcebergDeleteFileFormat::Puffin
-                    }
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Parquet => IcebergDeleteFileFormat::Parquet,
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Puffin => IcebergDeleteFileFormat::Puffin,
                 },
                 file_content: match delete.file_content {
-                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Position => {
-                        IcebergDeleteFileContent::Position
-                    }
-                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Equality => {
-                        IcebergDeleteFileContent::Equality
-                    }
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Position => IcebergDeleteFileContent::Position,
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Equality => IcebergDeleteFileContent::Equality,
                 },
                 length: delete.length,
                 content_offset: delete.content_offset,
@@ -476,9 +453,8 @@ fn filter_allowed_row_ids(
             .map(|index| !row_ids.is_null(index) && allowed.contains(&row_ids.value(index)))
             .collect::<Vec<_>>(),
     );
-    let filtered = filter_record_batch(&batch, &mask)
-        .map_err(|error| corrupt(format!("filter Iceberg delta row_id_allow_list: {error}")))?;
-    Ok(filtered)
+    filter_record_batch(&batch, &mask)
+        .map_err(|error| corrupt(format!("filter Iceberg delta row_id_allow_list: {error}")))
 }
 
 #[cfg(test)]
@@ -501,7 +477,6 @@ mod tests {
     #[test]
     fn puffin_deletion_vector_only_applies_to_its_referenced_data_file() {
         let delete = puffin_delete(Some("s3://bucket/table/data-new.parquet"));
-
         assert!(position_delete_applies_to_data_file(
             &delete,
             "s3://bucket/table/data-new.parquet"
@@ -518,7 +493,6 @@ mod tests {
         delete.file_format = PositionDeleteFileFormat::Parquet;
         delete.content_offset = None;
         delete.content_size_in_bytes = None;
-
         assert!(position_delete_applies_to_data_file(
             &delete,
             "s3://bucket/table/any-data-file.parquet"

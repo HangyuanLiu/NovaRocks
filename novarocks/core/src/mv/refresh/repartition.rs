@@ -148,7 +148,7 @@ pub(crate) async fn write_repartition_chunk_payload(
     let data_files = if total_rows == 0 {
         Vec::new()
     } else {
-        crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+        novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files(
             table,
             chunks.into_iter().map(|chunk| chunk.batch),
         )

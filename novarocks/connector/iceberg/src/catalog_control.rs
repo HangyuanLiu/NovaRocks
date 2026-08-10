@@ -17,7 +17,7 @@
 
 //! Provider-owned control-generation catalog state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 
 use novarocks_catalog::identifier::normalize_identifier;
@@ -36,6 +36,60 @@ pub struct IcebergCatalogControlState {
     configuration: IcebergCatalogConfiguration,
     physical_table_cache: IcebergPhysicalTableCache,
     data_files_cache: IcebergDataFilesCache,
+}
+
+/// Provider-owned registry for one control generation's catalog bindings.
+///
+/// The registry is deliberately limited to Iceberg configuration and physical
+/// cache state.  SQL table projections, write services, and application
+/// routing stay outside this value, so no Core-owned execution state is
+/// captured by a provider catalog binding.
+#[derive(Default)]
+pub struct IcebergCatalogControlRegistry {
+    entries: HashMap<String, IcebergCatalogControlState>,
+}
+
+impl IcebergCatalogControlRegistry {
+    /// Register a catalog exactly once. The initializer is evaluated only for
+    /// a new normalized name, preserving idempotent CREATE semantics without
+    /// re-parsing credentials or allocating another provider cache.
+    pub fn ensure_with<F>(&mut self, name: &str, initializer: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<IcebergCatalogControlState, String>,
+    {
+        let key = normalize_identifier(name)?;
+        if self.entries.contains_key(&key) {
+            return Ok(());
+        }
+        self.entries.insert(key, initializer()?);
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Result<IcebergCatalogControlState, String> {
+        let key = normalize_identifier(name)?;
+        self.entries
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| format!("unknown catalog: {name}"))
+    }
+
+    pub fn contains(&self, name: &str) -> Result<bool, String> {
+        Ok(self.entries.contains_key(&normalize_identifier(name)?))
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        let mut names = self.entries.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub fn remove(&mut self, name: &str) -> Result<(), String> {
+        let key = normalize_identifier(name)?;
+        self.entries
+            .remove(&key)
+            .map(|_| ())
+            .ok_or_else(|| format!("unknown catalog: {name}"))
+    }
 }
 
 impl IcebergCatalogControlState {
@@ -172,5 +226,31 @@ mod tests {
             Some(&"http://minio:9000".to_string())
         );
         assert!(!state.cloud_properties_map().contains_key("unrelated"));
+    }
+
+    #[test]
+    fn control_registry_normalizes_and_initializes_only_once() {
+        let mut registry = IcebergCatalogControlRegistry::default();
+        let configuration = || {
+            IcebergCatalogControlState::new(IcebergCatalogConfiguration {
+                kind: crate::catalog_config::IcebergCatalogKind::Hadoop,
+                warehouse_uri: "file:///tmp/warehouse".to_string(),
+                rest_uri: None,
+                hms_uris: None,
+                properties: Vec::new(),
+                object_store_config: None,
+                warehouse_path: PathBuf::from("/tmp/warehouse"),
+            })
+        };
+        registry
+            .ensure_with("SALES", || Ok(configuration()))
+            .expect("initial catalog");
+        registry
+            .ensure_with("sales", || Err("must not initialize twice".to_string()))
+            .expect("idempotent catalog");
+        assert!(registry.contains("sales").expect("contains"));
+        assert_eq!(registry.names(), vec!["sales"]);
+        registry.remove("sales").expect("remove");
+        assert!(!registry.contains("sales").expect("absent"));
     }
 }

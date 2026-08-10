@@ -22,46 +22,46 @@
 //! `VariantValue::serialize` form). Iceberg parquet writers expect the
 //! parent column to be a `StructArray { metadata: BinaryArray (req),
 //! value: BinaryArray (req) }`; this module bridges the two right
-//! before `novarocks_connector_iceberg::iceberg::ParquetWriter::write`.
+//! before `crate::iceberg::ParquetWriter::write`.
 
 use std::collections::HashMap;
 
+use crate::iceberg::spec::SchemaRef;
 use arrow::datatypes::DataType;
-use novarocks_connector_iceberg::iceberg::spec::SchemaRef;
 
-pub(crate) const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shredding.";
+pub const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shredding.";
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct VariantShreddingConfig {
+pub struct VariantShreddingConfig {
     specs_by_index: HashMap<usize, VariantShreddingSpec>,
 }
 
 impl VariantShreddingConfig {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.specs_by_index.is_empty()
     }
 
-    pub(crate) fn spec_for_index(&self, index: usize) -> Option<&VariantShreddingSpec> {
+    pub fn spec_for_index(&self, index: usize) -> Option<&VariantShreddingSpec> {
         self.specs_by_index.get(&index)
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct VariantShreddingSpec {
+pub struct VariantShreddingSpec {
     as_type: DataType,
 }
 
 impl VariantShreddingSpec {
-    pub(crate) fn as_type(&self) -> &DataType {
+    pub fn as_type(&self) -> &DataType {
         &self.as_type
     }
 }
 
-pub(crate) fn parse_variant_shredding_properties(
+pub fn parse_variant_shredding_properties(
     properties: &HashMap<String, String>,
     iceberg_schema: &SchemaRef,
 ) -> Result<VariantShreddingConfig, String> {
-    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
+    use crate::iceberg::spec::{PrimitiveType, Type};
 
     let mut columns_by_name = HashMap::new();
     for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
@@ -102,7 +102,7 @@ pub(crate) fn parse_variant_shredding_properties(
     Ok(VariantShreddingConfig { specs_by_index })
 }
 
-pub(crate) fn apply_variant_shredding_to_arrow_schema(
+pub fn apply_variant_shredding_to_arrow_schema(
     annotated_schema: &arrow::datatypes::SchemaRef,
     shredding_config: &VariantShreddingConfig,
 ) -> Result<arrow::datatypes::SchemaRef, String> {
@@ -249,18 +249,21 @@ fn parse_path_type_entry<'a>(
 }
 
 fn parse_shredding_sql_type(property_key: &str, raw: &str) -> Result<DataType, String> {
-    use novarocks_catalog::schema::SqlType;
+    let normalized = raw.trim();
+    if normalized.is_empty() || !normalized.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(format!(
+            "{property_key}: invalid shredding type `{raw}`; expected one of boolean, bigint, double, string, date"
+        ));
+    }
 
-    let sql_type = crate::sql::parser::dialect::create_table::parse_sql_type_string(raw)
-        .map_err(|e| format!("{property_key}: invalid shredding type `{raw}`: {e}"))?;
-    match sql_type {
-        SqlType::Boolean => Ok(DataType::Boolean),
-        SqlType::BigInt => Ok(DataType::Int64),
-        SqlType::Double => Ok(DataType::Float64),
-        SqlType::String => Ok(DataType::Utf8),
-        SqlType::Date => Ok(DataType::Date32),
-        other => Err(format!(
-            "{property_key}: unsupported variant shredding type `{raw}` ({other:?}); supported types are boolean, bigint, double, string, date"
+    match normalized.to_ascii_lowercase().as_str() {
+        "boolean" => Ok(DataType::Boolean),
+        "bigint" => Ok(DataType::Int64),
+        "double" => Ok(DataType::Float64),
+        "string" => Ok(DataType::Utf8),
+        "date" => Ok(DataType::Date32),
+        _ => Err(format!(
+            "{property_key}: unsupported variant shredding type `{raw}`; supported types are boolean, bigint, double, string, date"
         )),
     }
 }
@@ -271,7 +274,7 @@ fn parse_shredding_sql_type(property_key: &str, raw: &str) -> Result<DataType, S
 /// it deliberately does not validate the value segment.
 ///
 /// `payload` must be the bytes AFTER the leading `u32` size header.
-pub(crate) fn metadata_byte_len(payload: &[u8]) -> Result<usize, String> {
+fn metadata_byte_len(payload: &[u8]) -> Result<usize, String> {
     // Mirror src/exec/variant.rs::load_metadata, but stop at the metadata
     // segment instead of returning the full slice.
     const HEADER: usize = 1;
@@ -334,8 +337,8 @@ fn read_le_u32(data: &[u8], size: u8) -> Result<u32, String> {
 /// Returns the *top-level* arrow indices in the iceberg current
 /// schema that correspond to `PrimitiveType::Variant` fields. Order
 /// matches `iceberg_schema.as_struct().fields()`.
-pub(crate) fn variant_field_indices(iceberg_schema: &SchemaRef) -> Vec<usize> {
-    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
+pub fn variant_field_indices(iceberg_schema: &SchemaRef) -> Vec<usize> {
+    use crate::iceberg::spec::{PrimitiveType, Type};
     iceberg_schema
         .as_struct()
         .fields()
@@ -350,7 +353,7 @@ pub(crate) fn variant_field_indices(iceberg_schema: &SchemaRef) -> Vec<usize> {
 
 use arrow::record_batch::RecordBatch;
 
-pub(crate) fn transform_variant_columns_for_write(
+pub fn transform_variant_columns_for_write(
     batch: &RecordBatch,
     annotated_schema: &arrow::datatypes::SchemaRef,
     variant_indices: &[usize],
@@ -520,9 +523,7 @@ mod tests {
 
     #[test]
     fn variant_field_indices_finds_variant_columns() {
-        use novarocks_connector_iceberg::iceberg::spec::{
-            NestedField, PrimitiveType, Schema, Type,
-        };
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
         use std::sync::Arc;
         let schema = Arc::new(
             Schema::builder()
@@ -541,9 +542,7 @@ mod tests {
 
     #[test]
     fn variant_field_indices_returns_empty_when_no_variants() {
-        use novarocks_connector_iceberg::iceberg::spec::{
-            NestedField, PrimitiveType, Schema, Type,
-        };
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
         use std::sync::Arc;
         let schema = Arc::new(
             Schema::builder()
@@ -578,11 +577,11 @@ mod tests {
     }
 
     fn make_iceberg_schema(
-        fields: Vec<novarocks_connector_iceberg::iceberg::spec::NestedFieldRef>,
-    ) -> novarocks_connector_iceberg::iceberg::spec::SchemaRef {
+        fields: Vec<crate::iceberg::spec::NestedFieldRef>,
+    ) -> crate::iceberg::spec::SchemaRef {
         use std::sync::Arc;
         Arc::new(
-            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+            crate::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(fields)
                 .build()
@@ -591,20 +590,17 @@ mod tests {
     }
 
     fn make_annotated_arrow_schema(
-        iceberg_schema: &novarocks_connector_iceberg::iceberg::spec::SchemaRef,
+        iceberg_schema: &crate::iceberg::spec::SchemaRef,
     ) -> arrow::datatypes::SchemaRef {
         use std::sync::Arc;
-        Arc::new(
-            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-                .expect("convert"),
-        )
+        Arc::new(crate::iceberg::arrow::schema_to_arrow_schema(iceberg_schema).expect("convert"))
     }
 
     #[test]
     fn transform_single_variant_column_one_row() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use arrow::array::{LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -650,9 +646,9 @@ mod tests {
 
     #[test]
     fn transform_handles_null_row_with_zero_length_children() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use arrow::array::{Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -700,9 +696,9 @@ mod tests {
 
     #[test]
     fn transform_passes_through_non_variant_columns_unchanged() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use arrow::array::{Int32Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -744,9 +740,9 @@ mod tests {
     /// the INPUT batch, not from annotated_schema.
     #[test]
     fn transform_preserves_widened_non_variant_column_type() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use arrow::array::{Int64Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         // Annotated schema says id is Int32 (the table column type).
@@ -807,9 +803,9 @@ mod tests {
 
     #[test]
     fn transform_handles_two_adjacent_variant_columns() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use arrow::array::{Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -846,8 +842,8 @@ mod tests {
 
     #[test]
     fn parse_variant_shredding_properties_accepts_whitelisted_paths() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use arrow::datatypes::{DataType, Field, Fields};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::collections::HashMap;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -856,7 +852,7 @@ mod tests {
         ]);
         let props = HashMap::from([(
             "write.parquet.variant-shredding.v".to_string(),
-            "a bigint, b.c string".to_string(),
+            "a  \tBiGiNt  , b.c  STRING ".to_string(),
         )]);
 
         let config = parse_variant_shredding_properties(&props, &iceberg_schema).expect("config");
@@ -876,8 +872,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_variant_shredding_properties_rejects_noncanonical_type_syntax() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::collections::HashMap;
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+
+        for value in ["a DECIMAL(9, 2)", "a bigint trailing"] {
+            let props = HashMap::from([(
+                "write.parquet.variant-shredding.v".to_string(),
+                value.to_string(),
+            )]);
+            let err = parse_variant_shredding_properties(&props, &iceberg_schema)
+                .expect_err("noncanonical type syntax must be rejected");
+            assert!(err.contains("invalid shredding type"), "{err}");
+        }
+    }
+
+    #[test]
     fn parse_variant_shredding_properties_rejects_non_variant_column() {
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::collections::HashMap;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -897,11 +913,11 @@ mod tests {
 
     #[test]
     fn transform_variant_columns_for_write_shreds_configured_column() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         use arrow::array::{
             Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, RecordBatch,
         };
         use arrow::datatypes::{DataType, Field, Schema};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use parquet::variant::json_to_variant;
         use std::collections::HashMap;
         use std::sync::Arc;

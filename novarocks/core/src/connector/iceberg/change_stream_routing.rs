@@ -16,9 +16,9 @@ use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
 use crate::connector::iceberg::commit::IcebergCommitCollector;
 use crate::connector::iceberg::commit::WrittenFile;
-use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
+use novarocks_connector_iceberg::commit::report::IcebergWriterReport;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ChangeStreamWriterCommitPlan {
@@ -253,7 +253,7 @@ mod tests {
 
     use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::CommitOpKind;
-    use crate::connector::iceberg::report::{
+    use novarocks_connector_iceberg::commit::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
     use novarocks_connector_iceberg::delete_file::IcebergFileContent;

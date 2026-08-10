@@ -33,6 +33,8 @@ pub mod catalog_config;
 pub mod catalog_control;
 pub mod catalog_runtime;
 pub mod commit;
+pub mod control_factory;
+pub mod control_runtime;
 pub mod default_value;
 pub mod delete_file;
 pub mod delta;
@@ -42,23 +44,30 @@ pub mod fs_io;
 pub mod hadoop_catalog;
 pub mod loaded_table;
 pub mod manifest;
+pub mod metadata_batch_reader;
 pub mod metadata_read;
 pub mod planning_facts;
 pub mod position_delete;
 pub mod position_delete_descriptor;
 pub mod read_snapshot;
+pub mod reconcile_payload;
 pub mod ref_snapshot;
 pub mod resources;
 /// Iceberg virtual-column and row-lineage facts. These names and reserved
 /// field IDs are defined by the table format, not by the execution engine.
 pub mod row_lineage_synth;
+pub mod row_mutation_payload;
 pub mod scan_model;
 pub mod schema_facts;
 pub mod schema_mapping;
+pub mod statistics_codec;
 pub mod stats_assembler;
 pub mod stats_loader;
 pub mod theta_sketch;
+pub mod write_activation;
+pub mod write_codec;
 pub mod write_descriptor;
+pub mod write_payload;
 
 pub mod iceberg {
     pub use ::iceberg::*;

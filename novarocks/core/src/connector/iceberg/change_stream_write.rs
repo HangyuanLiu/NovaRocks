@@ -38,7 +38,6 @@ use super::write_contract::{
     encode_data_sink_spec_handle_payload, encode_deletion_vector_sink_handle_payload,
     encode_position_delete_sink_handle_payload,
 };
-use super::write_control::IcebergWritePlanPayloadV1;
 use super::write_service::{
     IcebergChangeStreamWriteReportCommitter, IcebergWriteControlService,
     IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
@@ -46,6 +45,7 @@ use super::write_service::{
 use crate::connector::iceberg::write_contract::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
+use novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1;
 use novarocks_spi::connector::{ConnectorError, ConnectorWriteOperationId};
 
 /// Frozen application input accepted by the Iceberg provider binding. It has

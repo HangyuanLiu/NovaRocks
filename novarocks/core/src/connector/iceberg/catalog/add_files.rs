@@ -114,7 +114,7 @@ pub(crate) fn plan_manifest_for_table(
         .metadata()
         .properties()
         .get(novarocks_connector_iceberg::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
-        .map(|mapping| canonical_name_mapping(mapping))
+        .map(|mapping| novarocks_connector_iceberg::schema_mapping::canonical_name_mapping(mapping))
         .transpose()?;
     let default_ids = initial_default_ids(table.metadata().current_schema().as_struct());
     plan_manifest(
@@ -762,70 +762,6 @@ fn initial_default_ids(
     ids
 }
 
-pub(crate) fn canonical_name_mapping(raw: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
-    validate_mapping_json(&value)?;
-    let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping =
-        serde_json::from_value(value)
-            .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
-    serde_json::to_string(&mapping)
-        .map_err(|error| format!("encode canonical schema.name-mapping.default: {error}"))
-}
-
-fn validate_mapping_json(value: &serde_json::Value) -> Result<(), String> {
-    fn visit(fields: &serde_json::Value, ids: &mut HashSet<i64>) -> Result<(), String> {
-        let fields = fields
-            .as_array()
-            .ok_or_else(|| "Iceberg name mapping root/fields must be an array".to_string())?;
-        let mut sibling_aliases = HashSet::new();
-        for field in fields {
-            let object = field
-                .as_object()
-                .ok_or_else(|| "Iceberg name mapping field must be an object".to_string())?;
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "field-id" | "names" | "fields"))
-            {
-                return Err("Iceberg name mapping contains an unknown field".to_string());
-            }
-            let id = object
-                .get("field-id")
-                .and_then(serde_json::Value::as_i64)
-                .ok_or_else(|| "Iceberg name mapping field-id is required".to_string())?;
-            if id <= 0 || !ids.insert(id) {
-                return Err(format!(
-                    "Iceberg name mapping has duplicate or invalid ID {id}"
-                ));
-            }
-            let names = object
-                .get("names")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| "Iceberg name mapping names must be an array".to_string())?;
-            if names.is_empty() {
-                return Err("Iceberg name mapping names must not be empty".to_string());
-            }
-            for name in names {
-                let name = name
-                    .as_str()
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| "Iceberg name mapping alias must be nonempty".to_string())?;
-                if !sibling_aliases.insert(name.to_string()) {
-                    return Err(format!("Iceberg name mapping has duplicate alias {name}"));
-                }
-            }
-            if let Some(children) = object.get("fields")
-                && !children.is_null()
-            {
-                visit(children, ids)?;
-            }
-        }
-        Ok(())
-    }
-    let mut ids = HashSet::new();
-    visit(value, &mut ids)
-}
-
 fn schema_identity_digest(schema: &SchemaRef) -> Result<[u8; 32], String> {
     let mut fields = HashMap::new();
     collect_fields_by_id(schema.fields(), &mut fields, "source")?;
@@ -877,10 +813,10 @@ mod tests {
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
     use super::{
-        canonical_directory_source_scope, canonical_name_mapping, list_direct_files,
-        read_parquet_footer, read_type_compatible, validate_name_mapping_for_target,
-        validate_schema,
+        canonical_directory_source_scope, list_direct_files, read_parquet_footer,
+        read_type_compatible, validate_name_mapping_for_target, validate_schema,
     };
+    use novarocks_connector_iceberg::schema_mapping::canonical_name_mapping;
 
     fn object_store_config(
         endpoint: &str,

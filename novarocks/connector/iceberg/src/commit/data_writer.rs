@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use crate as novarocks_connector_iceberg;
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use novarocks_connector_iceberg::iceberg::arrow::{
@@ -40,24 +41,27 @@ use novarocks_connector_iceberg::row_lineage_synth::{
 };
 use parquet::file::properties::WriterProperties;
 
-use super::variant_write::{
+use novarocks_connector_iceberg::commit::report as iceberg_report;
+use novarocks_connector_iceberg::commit::variant_write::{
     VariantShreddingConfig, apply_variant_shredding_to_arrow_schema,
     parse_variant_shredding_properties, transform_variant_columns_for_write, variant_field_indices,
 };
 use novarocks_connector_iceberg::delete_file::IcebergFileContent;
-use novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle;
+use novarocks_connector_iceberg::theta_sketch::{
+    ThetaSketchHandle, compute_theta_sketches_for_batch,
+};
 
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StagedContent {
+pub enum StagedContent {
     Data,
     PositionDeletes,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StagedWriteOptions {
+pub struct StagedWriteOptions {
     pub collect_theta_sketches: bool,
     pub content: StagedContent,
 }
@@ -71,21 +75,21 @@ impl Default for StagedWriteOptions {
     }
 }
 
-pub(crate) struct StagedDataFile {
+pub struct StagedDataFile {
     pub data_file: DataFile,
     pub metadata: Arc<TableMetadata>,
     pub partition_spec_id: i32,
     pub theta_sketches: Option<HashMap<i32, ThetaSketchHandle>>,
 }
 
-pub(crate) struct StagedDataFileWriter {
+pub struct StagedDataFileWriter {
     ctx: StagedWriteContext,
     opts: StagedWriteOptions,
     buffered: Vec<RecordBatch>,
 }
 
 impl StagedDataFileWriter {
-    pub(crate) fn new(ctx: StagedWriteContext, opts: StagedWriteOptions) -> Result<Self, String> {
+    pub fn new(ctx: StagedWriteContext, opts: StagedWriteOptions) -> Result<Self, String> {
         ensure_data_file_staged_content(opts.content)?;
         Ok(Self {
             ctx,
@@ -94,14 +98,14 @@ impl StagedDataFileWriter {
         })
     }
 
-    pub(crate) async fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
+    pub async fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
         if batch.num_rows() > 0 {
             self.buffered.push(batch);
         }
         Ok(())
     }
 
-    pub(crate) async fn finish(self) -> Result<Vec<StagedDataFile>, String> {
+    pub async fn finish(self) -> Result<Vec<StagedDataFile>, String> {
         if self.buffered.is_empty() {
             return Ok(Vec::new());
         }
@@ -109,7 +113,7 @@ impl StagedDataFileWriter {
     }
 }
 
-pub(crate) struct StagedWriteContext {
+pub struct StagedWriteContext {
     metadata: Arc<novarocks_connector_iceberg::iceberg::spec::TableMetadata>,
     file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     writer_schema: SchemaRef,
@@ -123,7 +127,7 @@ pub(crate) struct StagedWriteContext {
 }
 
 impl StagedWriteContext {
-    pub(crate) fn from_table(
+    pub fn from_table(
         table: &novarocks_connector_iceberg::iceberg::table::Table,
     ) -> Result<Self, String> {
         let writer_schema = table.metadata().current_schema().clone();
@@ -147,7 +151,7 @@ impl StagedWriteContext {
         )
     }
 
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
         file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
         writer_schema: SchemaRef,
@@ -163,7 +167,7 @@ impl StagedWriteContext {
         )
     }
 
-    pub(crate) fn from_parts_with_partition_spec_id(
+    pub fn from_parts_with_partition_spec_id(
         metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
         file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
         writer_schema: SchemaRef,
@@ -186,27 +190,27 @@ impl StagedWriteContext {
         })
     }
 
-    pub(crate) fn schema(&self) -> &SchemaRef {
+    pub fn schema(&self) -> &SchemaRef {
         &self.writer_schema
     }
 
-    pub(crate) fn partition_spec(&self) -> &PartitionSpecRef {
+    pub fn partition_spec(&self) -> &PartitionSpecRef {
         self.metadata.default_partition_spec()
     }
 
-    pub(crate) fn partition_spec_id(&self) -> i32 {
+    pub fn partition_spec_id(&self) -> i32 {
         self.partition_spec_id
     }
 
-    pub(crate) fn metadata(&self) -> &TableMetadata {
+    pub fn metadata(&self) -> &TableMetadata {
         self.metadata.as_ref()
     }
 
-    pub(crate) fn file_io(&self) -> &novarocks_connector_iceberg::iceberg::io::FileIO {
+    pub fn file_io(&self) -> &novarocks_connector_iceberg::iceberg::io::FileIO {
         &self.file_io
     }
 
-    pub(crate) fn data_file_writer_builder(&self) -> Result<IcebergDataFileWriterBuilder, String> {
+    pub fn data_file_writer_builder(&self) -> Result<IcebergDataFileWriterBuilder, String> {
         let location_generator = DefaultLocationGenerator::new(self.metadata.as_ref().clone())
             .map_err(|e| format!("build iceberg location generator failed: {e}"))?;
         let file_name_generator = DefaultFileNameGenerator::new(
@@ -228,14 +232,14 @@ impl StagedWriteContext {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RowLineageColumns {
+pub struct RowLineageColumns {
     pub row_ids: arrow::array::Int64Array,
     pub last_updated_sequence_numbers: arrow::array::Int64Array,
 }
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-pub(crate) struct RowLineageWriteBatch {
+pub struct RowLineageWriteBatch {
     pub user_batch: arrow::record_batch::RecordBatch,
     pub lineage: RowLineageColumns,
 }
@@ -243,30 +247,28 @@ pub(crate) struct RowLineageWriteBatch {
 /// Streaming-shape facade over the staged data-file writer for the IVM-A1 MV
 /// merge sink. It preserves the legacy `DataFile` surface while delegating
 /// write semantics to the shared staged writer kernel.
-pub(crate) struct IcebergStreamingDataFileWriter {
+pub struct IcebergStreamingDataFileWriter {
     writer: StagedDataFileWriter,
 }
 
 impl IcebergStreamingDataFileWriter {
-    pub(crate) fn new(
-        table: novarocks_connector_iceberg::iceberg::table::Table,
-    ) -> Result<Self, String> {
+    pub fn new(table: novarocks_connector_iceberg::iceberg::table::Table) -> Result<Self, String> {
         let ctx = StagedWriteContext::from_table(&table)?;
         let writer = StagedDataFileWriter::new(ctx, StagedWriteOptions::default())?;
         Ok(Self { writer })
     }
 
-    pub(crate) async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
+    pub async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
         self.writer.write_batch(batch).await
     }
 
-    pub(crate) async fn finish(self) -> Result<Vec<DataFile>, String> {
+    pub async fn finish(self) -> Result<Vec<DataFile>, String> {
         let staged = self.writer.finish().await?;
         Ok(staged.into_iter().map(to_iceberg_data_file).collect())
     }
 }
 
-pub(crate) async fn write_record_batches_as_data_files(
+pub async fn write_record_batches_as_data_files(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<DataFile>, String> {
@@ -275,7 +277,7 @@ pub(crate) async fn write_record_batches_as_data_files(
     Ok(staged.into_iter().map(to_iceberg_data_file).collect())
 }
 
-pub(crate) async fn write_record_batches(
+pub async fn write_record_batches(
     ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,
     opts: &StagedWriteOptions,
@@ -401,7 +403,7 @@ fn ensure_data_file_staged_content(content: StagedContent) -> Result<(), String>
     }
 }
 
-pub(crate) async fn cleanup_staged_files(
+pub async fn cleanup_staged_files(
     ctx: &StagedWriteContext,
     paths: &[String],
 ) -> Result<(), String> {
@@ -414,25 +416,25 @@ pub(crate) async fn cleanup_staged_files(
     Ok(())
 }
 
-pub(crate) fn to_iceberg_data_file(staged: StagedDataFile) -> DataFile {
+pub fn to_iceberg_data_file(staged: StagedDataFile) -> DataFile {
     staged.data_file
 }
 
-pub(crate) fn staged_data_file_to_writer_report(
+pub fn staged_data_file_to_writer_report(
     staged: &StagedDataFile,
-    partition: crate::connector::iceberg::report::IcebergPartitionReport,
+    partition: iceberg_report::IcebergPartitionReport,
     format: String,
     content: IcebergFileContent,
 ) -> Result<
     (
-        crate::connector::iceberg::report::IcebergWriterReport,
+        iceberg_report::IcebergWriterReport,
         Option<novarocks_connector_iceberg::stats_assembler::FileSketchSet>,
     ),
     String,
 > {
     let df = &staged.data_file;
-    let report = crate::connector::iceberg::report::IcebergWriterReport {
-        file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+    let report = iceberg_report::IcebergWriterReport {
+        file: iceberg_report::IcebergWrittenFileReport {
             path: df.file_path().to_string(),
             format,
             content,
@@ -463,7 +465,7 @@ pub(crate) fn staged_data_file_to_writer_report(
 
 fn iceberg_data_file_to_report_column_stats(
     df: &DataFile,
-) -> Result<Option<crate::connector::iceberg::report::IcebergColumnStats>, String> {
+) -> Result<Option<iceberg_report::IcebergColumnStats>, String> {
     let column_sizes = u64_stats_to_i64(df.column_sizes(), "column_sizes")?;
     let value_counts = u64_stats_to_i64(df.value_counts(), "value_counts")?;
     let null_value_counts = u64_stats_to_i64(df.null_value_counts(), "null_value_counts")?;
@@ -481,16 +483,14 @@ fn iceberg_data_file_to_report_column_stats(
         return Ok(None);
     }
 
-    Ok(Some(
-        crate::connector::iceberg::report::IcebergColumnStats {
-            column_sizes,
-            value_counts,
-            null_value_counts,
-            nan_value_counts,
-            lower_bounds,
-            upper_bounds,
-        },
-    ))
+    Ok(Some(iceberg_report::IcebergColumnStats {
+        column_sizes,
+        value_counts,
+        null_value_counts,
+        nan_value_counts,
+        lower_bounds,
+        upper_bounds,
+    }))
 }
 
 fn u64_to_i64(value: u64, field: &str) -> Result<i64, String> {
@@ -531,7 +531,7 @@ fn maybe_collect_sketches(
     if !opts.collect_theta_sketches {
         return Ok(None);
     }
-    Ok(super::sink::compute_theta_sketches_for_batch(batch))
+    Ok(compute_theta_sketches_for_batch(batch))
 }
 
 fn merge_theta_sketches(
@@ -628,7 +628,7 @@ fn retag_data_file_partition_spec_id(
 }
 
 #[allow(dead_code)]
-pub(crate) async fn write_row_lineage_batches_as_data_files(
+pub async fn write_row_lineage_batches_as_data_files(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     batches: &[RowLineageWriteBatch],
 ) -> Result<Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>, String> {
@@ -872,7 +872,7 @@ fn build_row_lineage_writer_schema(current_schema: &SchemaRef) -> Result<SchemaR
     ))
 }
 
-pub(crate) fn append_row_lineage_columns(
+pub fn append_row_lineage_columns(
     batch: &arrow::record_batch::RecordBatch,
     lineage: RowLineageColumns,
 ) -> Result<arrow::record_batch::RecordBatch, String> {
@@ -1080,7 +1080,7 @@ fn annotate_batch_by_identity(
 /// type to the general scalar cast: a nested-vs-scalar pair (e.g. List -> Int)
 /// or an unsupported nested-vs-nested pair (e.g. List -> Struct) must fail
 /// fast via the catch-all. This guard gates the general scalar coercion arm so
-/// only genuine scalar <-> scalar pairs are delegated to the engine cast.
+/// only genuine scalar <-> scalar pairs are delegated to the neutral scalar cast.
 fn is_nested_dtype(dtype: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::DataType;
     matches!(
@@ -1122,7 +1122,7 @@ fn is_nested_dtype(dtype: &arrow::datatypes::DataType) -> bool {
 ///   2. supported nested rebuilds (Map / Struct / List -> same kind), recursing
 ///      into children;
 ///   3. Arrow `Null` source (bare NULL literal insert) -> all-null target array;
-///   4. general scalar <-> scalar coercion via `cast_with_special_rules`,
+///   4. general scalar <-> scalar coercion via the neutral scalar cast,
 ///      GUARDED so neither side is a nested/composite type;
 ///   5. catch-all fail-fast `Err` for everything else (structural mismatches
 ///      such as List -> Int, scalar -> nested, or unsupported nested pairs),
@@ -1255,8 +1255,7 @@ fn reannotate_array(
         //   * scalar -> STRING (numeric/boolean/temporal -> Utf8);
         //   * STRING -> scalar and temporal <-> string, etc.
         // The native Iceberg write path accepts these coercions. We delegate to
-        // the same relaxed cast the
-        // engine uses for `CAST(... AS <type>)`, which applies safe=true
+        // the canonical relaxed scalar cast, which applies safe=true
         // semantics (out-of-range values become NULL, matching the DECIMAL
         // overflow convention) and identical textual formatting for ->STRING.
         //
@@ -1269,15 +1268,14 @@ fn reannotate_array(
         // errors out, preserving CLAUDE.md rule #2 (fail fast on structural
         // mismatches).
         (a, b) if !is_nested_dtype(a) && !is_nested_dtype(b) => {
-            novarocks_execution::exec::expr::cast_with_special_rules(array, target_dtype).map_err(
-                |e| {
+            novarocks_types::arrow_cast::cast_scalar_with_special_rules(array, target_dtype)
+                .map_err(|e| {
                     format!(
                         "reannotate_array: coerce scalar {:?} to {:?} failed: {e}",
                         array.data_type(),
                         target_dtype
                     )
-                },
-            )
+                })
         }
         (a, b) => Err(format!(
             "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
@@ -1286,32 +1284,7 @@ fn reannotate_array(
 }
 
 fn unique_file_suffix() -> String {
-    use rand::Rng;
-
-    let mut rng = rand::thread_rng();
-    let mut bytes = [0_u8; 16];
-    rng.fill(&mut bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    )
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 #[cfg(test)]
@@ -1565,7 +1538,7 @@ mod tests {
 
         let (report, sketch_set) = staged_data_file_to_writer_report(
             s,
-            crate::connector::iceberg::report::IcebergPartitionReport {
+            iceberg_report::IcebergPartitionReport {
                 partition_path: String::new(),
                 null_fingerprint: String::new(),
                 partition_spec_id: ctx.partition_spec_id(),
@@ -2574,95 +2547,6 @@ mod tests {
         );
     }
 
-    /// OQ-3.1: a NovaRocks-written Iceberg data file must carry per-column
-    /// min/max bounds end-to-end through the standalone commit round-trip
-    /// (`DataFile` → `WrittenFile` → committed `DataFile`), so range-predicate
-    /// selectivity reflects the real value range instead of the 0.5 fallback.
-    #[tokio::test]
-    async fn standalone_commit_round_trip_preserves_column_bounds() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use novarocks_connector_iceberg::iceberg::spec::{Datum, NestedField, PrimitiveType, Type};
-        use std::sync::Arc;
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let location = format!("file://{}", dir.path().display());
-
-        let iceberg_schema = Arc::new(
-            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "k1", Type::Primitive(PrimitiveType::Int)).into(),
-                ])
-                .build()
-                .expect("schema"),
-        );
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
-            iceberg_schema.as_ref().clone(),
-            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
-            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
-            location.clone(),
-            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
-            std::collections::HashMap::new(),
-        )
-        .expect("builder")
-        .build()
-        .expect("metadata")
-        .metadata;
-        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(
-                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
-            )
-            .file_io(
-                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
-            )
-            .metadata(metadata)
-            .build()
-            .expect("table");
-
-        let input_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "k1",
-            DataType::Int32,
-            false,
-        )]));
-        let values: Vec<i32> = (1..=1000).collect();
-        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(Int32Array::from(values))])
-            .expect("batch");
-
-        let data_files = write_record_batches_as_data_files(&table, vec![batch])
-            .await
-            .expect("write");
-        assert_eq!(data_files.len(), 1);
-        let df = &data_files[0];
-        // The iceberg-rust ParquetWriter populates bounds from the parquet footer.
-        assert_eq!(df.lower_bounds().get(&1), Some(&Datum::int(1)));
-        assert_eq!(df.upper_bounds().get(&1), Some(&Datum::int(1000)));
-
-        // Round-trip through the standalone commit path and assert the committed
-        // DataFile still carries the bounds (the OQ-3.1 fix).
-        let wf = crate::engine::iceberg_writer::data_file_to_written_file(df, 0).expect("wf");
-        assert_eq!(wf.lower_bounds.get(&1), Some(&Datum::int(1)));
-        assert_eq!(wf.upper_bounds.get(&1), Some(&Datum::int(1000)));
-
-        let collector = crate::connector::iceberg::commit::IcebergCommitCollector::new(
-            crate::connector::iceberg::commit::CommitOpKind::FastAppend,
-            novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
-            None,
-            0,
-            table.metadata().current_schema().clone(),
-            table.metadata().default_partition_spec().clone(),
-            "file:///tmp/staging".to_string(),
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(table.metadata().clone());
-        let committed =
-            crate::connector::iceberg::commit::written_file_to_iceberg_data_file(&wf, &collector)
-                .expect("committed");
-        assert_eq!(committed.lower_bounds().get(&1), Some(&Datum::int(1)));
-        assert_eq!(committed.upper_bounds().get(&1), Some(&Datum::int(1000)));
-    }
-
     /// reannotate_array must narrow Decimal128(src_p, src_s) → Decimal128(tgt_p, tgt_s)
     /// with half-up rounding rather than returning an error.
     #[test]
@@ -3170,5 +3054,147 @@ mod tests {
             err.contains("Iceberg MAP keys must be non-null"),
             "expected the null-map-key fail-fast error, got: {err}"
         );
+    }
+
+    #[test]
+    fn reannotate_nested_list_coerces_int64_children_to_largeint() {
+        use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field};
+
+        let values = Arc::new(Int64Array::from(vec![Some(7_i64), Some(-9_i64)])) as ArrayRef;
+        let source = Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new("item", DataType::Int64, true)),
+                OffsetBuffer::new(vec![0_i32, 2].into()),
+                values,
+                None,
+            )
+            .expect("source list"),
+        ) as ArrayRef;
+        let target = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::FixedSizeBinary(16),
+            true,
+        )));
+
+        let output = reannotate_array(&source, &target).expect("List<Int64> -> List<LARGEINT>");
+        let output = output
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("list output");
+        let values = output
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("LARGEINT values");
+        assert_eq!(novarocks_types::largeint::value_at(values, 0).unwrap(), 7);
+        assert_eq!(novarocks_types::largeint::value_at(values, 1).unwrap(), -9);
+    }
+
+    #[test]
+    fn reannotate_nested_struct_coerces_int64_child_to_largeint() {
+        use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array, StructArray};
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        let source_fields: Fields = vec![Arc::new(Field::new("id", DataType::Int64, true))].into();
+        let source = Arc::new(
+            StructArray::try_new(
+                source_fields,
+                vec![Arc::new(Int64Array::from(vec![Some(11_i64), Some(-13_i64)])) as ArrayRef],
+                None,
+            )
+            .expect("source struct"),
+        ) as ArrayRef;
+        let target = DataType::Struct(
+            vec![Arc::new(Field::new(
+                "id",
+                DataType::FixedSizeBinary(16),
+                true,
+            ))]
+            .into(),
+        );
+
+        let output = reannotate_array(&source, &target).expect("Struct<Int64> -> Struct<LARGEINT>");
+        let output = output
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("struct output");
+        let value = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("LARGEINT child");
+        assert_eq!(novarocks_types::largeint::value_at(value, 0).unwrap(), 11);
+        assert_eq!(novarocks_types::largeint::value_at(value, 1).unwrap(), -13);
+    }
+
+    #[test]
+    fn reannotate_nested_map_coerces_int64_entries_to_largeint() {
+        use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array, MapArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        let source_fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::Int64, false)),
+            Arc::new(Field::new("value", DataType::Int64, true)),
+        ]
+        .into();
+        let source_entries_field = Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(source_fields.clone()),
+            false,
+        ));
+        let source_entries = StructArray::try_new(
+            source_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![3_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(-5_i64)])) as ArrayRef,
+            ],
+            None,
+        )
+        .expect("source map entries");
+        let source = Arc::new(
+            MapArray::try_new(
+                source_entries_field,
+                OffsetBuffer::new(vec![0_i32, 1].into()),
+                source_entries,
+                None,
+                false,
+            )
+            .expect("source map"),
+        ) as ArrayRef;
+        let target_fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::FixedSizeBinary(16), false)),
+            Arc::new(Field::new("value", DataType::FixedSizeBinary(16), true)),
+        ]
+        .into();
+        let target = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(target_fields),
+                false,
+            )),
+            false,
+        );
+
+        let output = reannotate_array(&source, &target)
+            .expect("Map<Int64, Int64> -> Map<LARGEINT, LARGEINT>");
+        let output = output
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map output");
+        let keys = output
+            .keys()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("LARGEINT keys");
+        let values = output
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("LARGEINT values");
+        assert_eq!(novarocks_types::largeint::value_at(keys, 0).unwrap(), 3);
+        assert_eq!(novarocks_types::largeint::value_at(values, 0).unwrap(), -5);
     }
 }

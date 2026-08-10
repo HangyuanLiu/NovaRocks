@@ -34,42 +34,53 @@ use novarocks_spi::connector::{
     ConnectorWriteExecution, ConnectorWriterTerminalState,
 };
 
-use super::commit::{
-    DeletionVector, write_equality_delete_file, write_single_deletion_vector_puffin,
-};
-use super::data_writer::{
+use crate as novarocks_connector_iceberg;
+use crate::access_binding::IcebergReadBinding;
+use crate::commit::data_writer::{
     StagedDataFile, StagedWriteContext, StagedWriteOptions, cleanup_staged_files,
     staged_data_file_to_writer_report, write_record_batches,
 };
-use super::report::{
-    IcebergPartitionReport, IcebergWriterReport, partition_path_from_struct,
+use crate::commit::frozen_write::{FrozenDataWriteFacts, staged_write_context_from_frozen_facts};
+use crate::commit::report::{
+    IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, partition_path_from_struct,
     writer_report_from_unpartitioned_equality_delete_file,
 };
-use super::sink::{build_staged_file_io, unique_file_path, write_parquet_file};
-use super::sink_plan::IcebergSinkObjectStoreConfig;
-use super::write_contract::{
+use crate::commit::write_io::{build_staged_file_io, unique_file_path, write_parquet_file};
+use crate::commit::{
+    DeletionVector, EqualityDeleteColumn, write_equality_delete_file,
+    write_single_deletion_vector_puffin,
+};
+use crate::delete_file::IcebergFileContent;
+use crate::position_delete_descriptor::canonical_output_schema;
+use crate::resources::IcebergExecutionRuntime;
+use crate::row_lineage_synth::ICEBERG_ROW_ID_COL;
+use crate::write_codec::{
     IcebergPositionDeleteHandle, IcebergPositionDeletePartition, IcebergPositionDeleteStagedFile,
-    IcebergWriteHandleMode, data_sink_plan_from_handle_payload,
-    equality_delete_handle_from_payload, position_delete_handle_from_payload,
-    staged_report_from_iceberg_reports, staged_report_from_position_delete_files,
+    IcebergWriteHandleMode, decode_write_handle, equality_delete_handle_from_payload,
+    position_delete_handle_from_payload, staged_report_from_iceberg_reports,
+    staged_report_from_position_delete_files,
     staged_report_from_unpartitioned_equality_delete_reports, write_handle_mode,
 };
-use crate::runtime::global_async_runtime::data_block_on;
-use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::delete_file::IcebergFileContent;
-use novarocks_connector_iceberg::position_delete_descriptor::canonical_output_schema;
-use novarocks_connector_iceberg::row_lineage_synth::ICEBERG_ROW_ID_COL;
 
 /// BE execution capability rooted only in process-startup storage bindings.
 #[derive(Clone)]
-pub(crate) struct IcebergDataWriteExecution {
+pub struct IcebergDataWriteExecution {
     key: ConnectorExecutionBindingKey,
     binding: IcebergReadBinding,
+    runtime: IcebergExecutionRuntime,
 }
 
 impl IcebergDataWriteExecution {
-    pub(crate) fn new(key: ConnectorExecutionBindingKey, binding: IcebergReadBinding) -> Self {
-        Self { key, binding }
+    pub fn new(
+        key: ConnectorExecutionBindingKey,
+        binding: IcebergReadBinding,
+        runtime: IcebergExecutionRuntime,
+    ) -> Self {
+        Self {
+            key,
+            binding,
+            runtime,
+        }
     }
 }
 
@@ -108,12 +119,6 @@ impl ConnectorWriteExecution for IcebergDataWriteExecution {
             IcebergWriteHandleMode::EqualityDeletes => self.open_equality_delete_writer(request),
             IcebergWriteHandleMode::PositionDeletes => self.open_position_delete_writer(request),
             IcebergWriteHandleMode::DeletionVectors => self.open_deletion_vector_writer(request),
-            unsupported => Err(error(
-                ConnectorErrorKind::Unsupported,
-                format!(
-                    "Iceberg connector writer mode {unsupported:?} has no BE execution adapter"
-                ),
-            )),
         }
     }
 }
@@ -123,24 +128,39 @@ impl IcebergDataWriteExecution {
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
-        let mut plan = data_sink_plan_from_handle_payload(
-            request.handle.payload(),
-            request.expected_schema.clone(),
-            None,
-        )
-        .map_err(|message| error(ConnectorErrorKind::Unsupported, message))?;
-        plan.object_store_s3 =
-            super::provider::write_object_store_config(&self.binding, &plan.data_location)
-                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let report_file_format = plan.report_file_format.clone();
-        let context = plan
-            .build_staged_write_context()
+        let handle = decode_write_handle(request.handle.payload())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        if handle.mode != IcebergWriteHandleMode::Data {
+            return Err(error(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg DATA writer received a non-DATA handle",
+            ));
+        }
+        let facts = FrozenDataWriteFacts {
+            table_location: handle.table_location,
+            data_location: handle.data_location,
+            target_partition_spec_id: handle.target_partition_spec_id,
+            partition_source_column_names: handle.partition_source_column_names,
+            partition_column_names: handle.partition_column_names,
+            transform_exprs: handle.transform_exprs,
+            data_input_schema: handle.data_input_schema.ok_or_else(|| {
+                error(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg DATA handle is missing its frozen field-ID schema",
+                )
+            })?,
+        };
+        let report_file_format = handle.report_file_format;
+        let row_lineage_data = handle.row_lineage_data;
+        let context =
+            staged_write_context_from_frozen_facts(&self.binding, &request.expected_schema, facts)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergDataBatchWriter {
             writer: request.handle.writer().clone(),
+            runtime: self.runtime.clone(),
             context,
             report_file_format,
-            row_lineage_data: plan.row_lineage_data,
+            row_lineage_data,
             request,
             reports: Vec::new(),
             staged_paths: Vec::new(),
@@ -158,13 +178,11 @@ impl IcebergDataWriteExecution {
             request.expected_schema.clone(),
         )
         .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let object_store_s3 =
-            super::provider::write_object_store_config(&self.binding, &data_location)
-                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let file_io = build_staged_file_io(&data_location, object_store_s3.as_ref())
+        let file_io = build_staged_file_io(&self.binding, &data_location)
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergEqualityDeleteBatchWriter {
             writer: request.handle.writer().clone(),
+            runtime: self.runtime.clone(),
             file_io,
             staging_dir: data_location.trim_end_matches('/').to_string(),
             partition_spec_id,
@@ -184,15 +202,13 @@ impl IcebergDataWriteExecution {
         let handle =
             position_delete_handle_from_payload(request.handle.payload(), &request.expected_schema)
                 .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let object_store_s3 =
-            super::provider::write_object_store_config(&self.binding, &handle.data_location)
-                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let file_io = build_staged_file_io(&handle.data_location, object_store_s3.as_ref())
+        let file_io = build_staged_file_io(&self.binding, &handle.data_location)
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergPositionDeleteBatchWriter {
             writer: request.handle.writer().clone(),
+            runtime: self.runtime.clone(),
             file_io,
-            object_store_s3,
+            binding: self.binding.clone(),
             handle,
             request,
             files: Vec::new(),
@@ -216,13 +232,11 @@ impl IcebergDataWriteExecution {
                 "deletion-vector adapter received a non-DV handle",
             ));
         }
-        let object_store_s3 =
-            super::provider::write_object_store_config(&self.binding, &handle.data_location)
-                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let file_io = build_staged_file_io(&handle.data_location, object_store_s3.as_ref())
+        let file_io = build_staged_file_io(&self.binding, &handle.data_location)
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergDeletionVectorBatchWriter {
             writer: request.handle.writer().clone(),
+            runtime: self.runtime.clone(),
             file_io,
             handle,
             request,
@@ -238,6 +252,7 @@ impl IcebergDataWriteExecution {
 
 struct IcebergDataBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
+    runtime: IcebergExecutionRuntime,
     context: StagedWriteContext,
     report_file_format: String,
     row_lineage_data: bool,
@@ -388,13 +403,15 @@ impl IcebergDataBatchWriter {
                 arrow::compute::take_record_batch(&batch, &run_indices).map_err(|arrow_error| {
                     error(ConnectorErrorKind::Internal, arrow_error.to_string())
                 })?;
-            let staged = data_block_on(write_record_batches(
-                &self.context,
-                [run],
-                &StagedWriteOptions::default(),
-            ))
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+            let staged = self
+                .runtime
+                .block_on(write_record_batches(
+                    &self.context,
+                    [run],
+                    &StagedWriteOptions::default(),
+                ))
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
             self.record_staged_files(staged, Some(first))?;
             start = end;
         }
@@ -412,13 +429,15 @@ impl ConnectorBatchWriter for IcebergDataBatchWriter {
         if self.row_lineage_data {
             self.append_row_lineage_batch(batch)?;
         } else {
-            let staged = data_block_on(write_record_batches(
-                &self.context,
-                [batch],
-                &StagedWriteOptions::default(),
-            ))
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+            let staged = self
+                .runtime
+                .block_on(write_record_batches(
+                    &self.context,
+                    [batch],
+                    &StagedWriteOptions::default(),
+                ))
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
             self.record_staged_files(staged, None)?;
         }
         self.summary.input_rows = self.summary.input_rows.saturating_add(input_rows);
@@ -440,7 +459,8 @@ impl ConnectorBatchWriter for IcebergDataBatchWriter {
 
     fn abort(&mut self) -> Result<(), ConnectorError> {
         if !self.staged_paths.is_empty() {
-            data_block_on(cleanup_staged_files(&self.context, &self.staged_paths))
+            self.runtime
+                .block_on(cleanup_staged_files(&self.context, &self.staged_paths))
                 .map_err(|message| error(ConnectorErrorKind::Internal, message))?
                 .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
             self.staged_paths.clear();
@@ -456,10 +476,11 @@ impl ConnectorBatchWriter for IcebergDataBatchWriter {
 
 struct IcebergEqualityDeleteBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
+    runtime: IcebergExecutionRuntime,
     file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     staging_dir: String,
     partition_spec_id: i32,
-    columns: Vec<super::commit::EqualityDeleteColumn>,
+    columns: Vec<EqualityDeleteColumn>,
     request: ConnectorOpenWriterRequest,
     reports: Vec<IcebergWriterReport>,
     staged_paths: Vec<String>,
@@ -472,7 +493,7 @@ struct IcebergPositionDeleteStagedFileOwned {
     record_count: i64,
     file_size_in_bytes: i64,
     split_offsets: Option<Vec<i64>>,
-    column_stats: Option<super::report::IcebergColumnStats>,
+    column_stats: Option<IcebergColumnStats>,
     referenced_data_file: String,
     partition: IcebergPositionDeletePartition,
     format: String,
@@ -483,8 +504,9 @@ struct IcebergPositionDeleteStagedFileOwned {
 
 struct IcebergPositionDeleteBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
+    runtime: IcebergExecutionRuntime,
     file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
-    object_store_s3: Option<IcebergSinkObjectStoreConfig>,
+    binding: IcebergReadBinding,
     handle: IcebergPositionDeleteHandle,
     request: ConnectorOpenWriterRequest,
     files: Vec<IcebergPositionDeleteStagedFileOwned>,
@@ -541,16 +563,17 @@ impl IcebergPositionDeleteBatchWriter {
             return Ok(());
         }
         let paths = self.staged_paths.clone();
-        data_block_on(async {
-            for path in &paths {
-                self.file_io.delete(path).await.map_err(|error| {
-                    format!("cleanup staged position-delete file {path} failed: {error}")
-                })?;
-            }
-            Ok::<(), String>(())
-        })
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        self.runtime
+            .block_on(async {
+                for path in &paths {
+                    self.file_io.delete(path).await.map_err(|error| {
+                        format!("cleanup staged position-delete file {path} failed: {error}")
+                    })?;
+                }
+                Ok::<(), String>(())
+            })
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         self.staged_paths.clear();
         Ok(())
     }
@@ -625,8 +648,9 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
                 })?;
             let path = self.next_path(&partition);
             let written = write_parquet_file(
+                &self.binding,
+                &self.runtime,
                 &path,
-                self.object_store_s3.as_ref(),
                 delete_batch.schema(),
                 &delete_batch,
                 self.handle.compression,
@@ -682,17 +706,32 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
     fn finish(&mut self) -> Result<ConnectorStagedReport, ConnectorError> {
         self.ensure_open()?;
         self.terminal = true;
+        let partitions = self
+            .files
+            .iter()
+            .map(|file| IcebergPositionDeletePartition {
+                partition_path: file.partition.partition_path.clone(),
+                null_fingerprint: file.partition.null_fingerprint.clone(),
+                partition_spec_id: file.partition.partition_spec_id,
+                descriptor: file.partition.descriptor.clone(),
+                existing_deletion_vector_payload: file
+                    .partition
+                    .existing_deletion_vector_payload
+                    .clone(),
+            })
+            .collect::<Vec<_>>();
         let files = self
             .files
             .iter()
-            .map(|file| IcebergPositionDeleteStagedFile {
+            .zip(&partitions)
+            .map(|(file, partition)| IcebergPositionDeleteStagedFile {
                 path: &file.path,
                 record_count: file.record_count,
                 file_size_in_bytes: file.file_size_in_bytes,
                 split_offsets: file.split_offsets.clone(),
                 column_stats: file.column_stats.clone(),
                 referenced_data_file: file.referenced_data_file.clone(),
-                partition: &file.partition,
+                partition,
                 format: &file.format,
                 content_offset: file.content_offset,
                 content_size_in_bytes: file.content_size_in_bytes,
@@ -725,6 +764,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
 /// delete file is opened on the BE.
 struct IcebergDeletionVectorBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
+    runtime: IcebergExecutionRuntime,
     file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     handle: IcebergPositionDeleteHandle,
     request: ConnectorOpenWriterRequest,
@@ -780,16 +820,17 @@ impl IcebergDeletionVectorBatchWriter {
 
     fn cleanup_staged_paths(&mut self) -> Result<(), ConnectorError> {
         let paths = self.staged_paths.clone();
-        data_block_on(async {
-            for path in &paths {
-                self.file_io.delete(path).await.map_err(|error| {
-                    format!("cleanup staged deletion-vector file {path} failed: {error}")
-                })?;
-            }
-            Ok::<(), String>(())
-        })
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        self.runtime
+            .block_on(async {
+                for path in &paths {
+                    self.file_io.delete(path).await.map_err(|error| {
+                        format!("cleanup staged deletion-vector file {path} failed: {error}")
+                    })?;
+                }
+                Ok::<(), String>(())
+            })
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         self.staged_paths.clear();
         Ok(())
     }
@@ -889,19 +930,21 @@ impl ConnectorBatchWriter for IcebergDeletionVectorBatchWriter {
                 vector.merge(&existing);
             }
             let path = self.next_path(&partition);
-            let written = data_block_on(write_single_deletion_vector_puffin(
-                &self.file_io,
-                &path,
-                &referenced_data_file,
-                &vector,
-            ))
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-            .map_err(|write_error| {
-                error(
-                    ConnectorErrorKind::Internal,
-                    format!("stage Iceberg deletion vector failed: {write_error}"),
-                )
-            })?;
+            let written = self
+                .runtime
+                .block_on(write_single_deletion_vector_puffin(
+                    &self.file_io,
+                    &path,
+                    &referenced_data_file,
+                    &vector,
+                ))
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+                .map_err(|write_error| {
+                    error(
+                        ConnectorErrorKind::Internal,
+                        format!("stage Iceberg deletion vector failed: {write_error}"),
+                    )
+                })?;
             let record_count = i64::try_from(written.cardinality).map_err(|_| {
                 error(
                     ConnectorErrorKind::Internal,
@@ -934,17 +977,32 @@ impl ConnectorBatchWriter for IcebergDeletionVectorBatchWriter {
                 cardinality: Some(record_count),
             });
         }
+        let partitions = self
+            .files
+            .iter()
+            .map(|file| IcebergPositionDeletePartition {
+                partition_path: file.partition.partition_path.clone(),
+                null_fingerprint: file.partition.null_fingerprint.clone(),
+                partition_spec_id: file.partition.partition_spec_id,
+                descriptor: file.partition.descriptor.clone(),
+                existing_deletion_vector_payload: file
+                    .partition
+                    .existing_deletion_vector_payload
+                    .clone(),
+            })
+            .collect::<Vec<_>>();
         let files = self
             .files
             .iter()
-            .map(|file| IcebergPositionDeleteStagedFile {
+            .zip(&partitions)
+            .map(|(file, partition)| IcebergPositionDeleteStagedFile {
                 path: &file.path,
                 record_count: file.record_count,
                 file_size_in_bytes: file.file_size_in_bytes,
                 split_offsets: file.split_offsets.clone(),
                 column_stats: file.column_stats.clone(),
                 referenced_data_file: file.referenced_data_file.clone(),
-                partition: &file.partition,
+                partition,
                 format: &file.format,
                 content_offset: file.content_offset,
                 content_size_in_bytes: file.content_size_in_bytes,
@@ -998,16 +1056,17 @@ impl IcebergEqualityDeleteBatchWriter {
             return Ok(());
         }
         let paths = self.staged_paths.clone();
-        data_block_on(async {
-            for path in &paths {
-                self.file_io.delete(path).await.map_err(|error| {
-                    format!("cleanup staged equality-delete file {path} failed: {error}")
-                })?;
-            }
-            Ok::<(), String>(())
-        })
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        self.runtime
+            .block_on(async {
+                for path in &paths {
+                    self.file_io.delete(path).await.map_err(|error| {
+                        format!("cleanup staged equality-delete file {path} failed: {error}")
+                    })?;
+                }
+                Ok::<(), String>(())
+            })
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         self.staged_paths.clear();
         Ok(())
     }
@@ -1020,15 +1079,17 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteBatchWriter {
             return Ok(());
         }
         let input_rows = batch.num_rows() as u64;
-        let written = data_block_on(write_equality_delete_file(
-            &self.file_io,
-            &self.staging_dir,
-            self.partition_spec_id,
-            self.columns.clone(),
-            batch,
-        ))
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        let written = self
+            .runtime
+            .block_on(write_equality_delete_file(
+                &self.file_io,
+                &self.staging_dir,
+                self.partition_spec_id,
+                self.columns.clone(),
+                batch,
+            ))
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         if let Some(written) = written {
             let report = writer_report_from_unpartitioned_equality_delete_file(&written)
                 .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
@@ -1101,7 +1162,7 @@ mod tests {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::position_delete_storage_batch;
-    use novarocks_connector_iceberg::position_delete_descriptor::{
+    use crate::position_delete_descriptor::{
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
     };
 

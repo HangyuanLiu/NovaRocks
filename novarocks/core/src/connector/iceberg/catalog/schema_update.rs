@@ -2249,9 +2249,6 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key,
     logical_type_property_key, logical_type_property_value,
 };
-use crate::connector::iceberg::variant_write::{
-    VARIANT_SHREDDING_PROPERTY_PREFIX, parse_variant_shredding_properties,
-};
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::statement::{
@@ -2261,6 +2258,9 @@ use crate::engine::statement::{
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::SqlType;
 use novarocks_connector_iceberg::commit::commit_with_retry;
+use novarocks_connector_iceberg::commit::variant_write::{
+    VARIANT_SHREDDING_PROPERTY_PREFIX, parse_variant_shredding_properties,
+};
 use novarocks_connector_iceberg::row_lineage_synth::{
     is_iceberg_last_updated_sequence_number, is_iceberg_row_id,
 };

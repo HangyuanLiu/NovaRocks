@@ -153,9 +153,14 @@ fn install_execution(
     let declaration = control
         .execution_declaration(&context())
         .expect("create secret-free declaration");
-    let execution = IcebergConnectorInstaller::new(binding)
-        .install(&declaration, &context())
-        .expect("install read-only Iceberg execution binding");
+    let execution = IcebergConnectorInstaller::new(
+        novarocks_connector_iceberg::resources::IcebergExecutionResources::new(
+            binding,
+            runtime.handle().clone(),
+        ),
+    )
+    .install(&declaration, &context())
+    .expect("install read-only Iceberg execution binding");
     (runtime, execution)
 }
 

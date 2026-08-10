@@ -1,36 +1,42 @@
 // Licensed to the Apache Software Foundation (ASF) under one or more
 // contributor license agreements.  See the NOTICE file distributed with this
-// work for additional information regarding copyright ownership.  The ASF
-// licenses this file to you under the Apache License, Version 2.0.
+// work for additional information regarding copyright ownership.
 
-//! BE-only source for a frozen Iceberg Puffin deletion-vector rewrite group.
-//!
-//! The Iceberg control provider creates the opaque split after validating the
-//! immutable group artifact.  This reader has only the startup-bound object
-//! store capability; it converts the selected Puffin ranges into the ordinary
-//! `(_file, _pos)` batches consumed by C1's existing deletion-vector writer.
+//! Provider reader for a frozen Iceberg Puffin deletion-vector rewrite group.
 
 use std::collections::VecDeque;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
+use novarocks_fs::FileCancellation;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot,
 };
+use serde::{Deserialize, Serialize};
 
-use super::changes::PositionDeleteRef;
-use super::provider::IcebergRewritePositionSplitPayloadV1;
-use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+use crate::access_binding::IcebergReadBinding;
+use crate::delete_file::{IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat};
+use crate::position_delete::load_position_deletes_with_context;
+use crate::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
+
+pub const ICEBERG_REWRITE_POSITION_SPLIT_V1: u16 = 1;
+
+/// Provider-private maintenance split.  Generic carriers transport this
+/// opaque payload without learning Puffin metadata or deletion-vector rows.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IcebergRewritePositionSplitPayloadV1 {
+    pub version: u16,
+    pub selected_delete_files: Vec<IcebergDeleteFileInfo>,
+}
 
 const POSITION_BATCH_ROWS: usize = 64 * 1024;
 
-pub(crate) struct IcebergRewritePositionBatchReader {
+pub struct IcebergRewritePositionBatchReader {
     request: ConnectorOpenReaderRequest,
     batches: VecDeque<RecordBatch>,
     metrics: ConnectorReaderMetricsSnapshot,
@@ -38,7 +44,7 @@ pub(crate) struct IcebergRewritePositionBatchReader {
 }
 
 impl IcebergRewritePositionBatchReader {
-    pub(crate) fn try_new(
+    pub fn try_new(
         data_file: IcebergDataFileInfo,
         payload: IcebergRewritePositionSplitPayloadV1,
         binding: IcebergReadBinding,
@@ -57,26 +63,25 @@ impl IcebergRewritePositionBatchReader {
         if std::time::Instant::now() >= request.context.deadline() {
             return Err(deadline());
         }
-        let refs = selected_refs(&data_file, &payload)?;
-        let access = binding.resolve_access_for_locations(
-            refs.iter()
-                .map(|reference| reference.delete_file_path.as_str()),
-        )?;
-        let read_bytes = refs
-            .iter()
-            .map(|reference| reference.content_size_in_bytes.unwrap_or(0).max(0) as u64)
-            .sum();
-        let positions = crate::runtime::global_async_runtime::data_block_on(async {
-            super::scan_deletes::read_dv_positions_per_data_file(&refs, &access).await
-        })
-        .map_err(|error| unavailable(error))?
-        .map_err(|error| corrupt(error.to_string()))?;
-        let positions = positions.get(&data_file.path).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg rewrite-position Puffin files do not reference the frozen data file",
-            )
+        let specs = selected_delete_specs(&data_file, &payload)?;
+        let access =
+            binding.resolve_access_for_locations(specs.iter().map(|spec| spec.path.as_str()))?;
+        let context =
+            binding.file_read_context(FileCancellation::new(), request.context.deadline())?;
+        let read_bytes = specs.iter().try_fold(0_u64, |total, spec| {
+            let size = spec.content_size_in_bytes.unwrap_or_default();
+            let size = u64::try_from(size)
+                .map_err(|_| corrupt("Iceberg rewrite-position Puffin content size is negative"))?;
+            total.checked_add(size).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg rewrite-position byte count overflows u64",
+                )
+            })
         })?;
+        let positions =
+            load_position_deletes_with_context(&specs, &data_file.path, &access, &context)
+                .map_err(corrupt)?;
         let mut values = positions.iter().collect::<Vec<_>>();
         if values.iter().any(|position| *position > i64::MAX as u64) {
             return Err(corrupt(
@@ -110,7 +115,7 @@ impl IcebergRewritePositionBatchReader {
             batches,
             metrics: ConnectorReaderMetricsSnapshot {
                 bytes_read: read_bytes,
-                read_requests: refs.len() as u64,
+                read_requests: specs.len() as u64,
                 rows_decoded,
                 ..Default::default()
             },
@@ -156,44 +161,55 @@ impl Drop for IcebergRewritePositionBatchReader {
     }
 }
 
-fn selected_refs(
+fn selected_delete_specs(
     data_file: &IcebergDataFileInfo,
     payload: &IcebergRewritePositionSplitPayloadV1,
-) -> Result<Vec<PositionDeleteRef>, ConnectorError> {
+) -> Result<Vec<IcebergDeleteFileSpec>, ConnectorError> {
     if payload.selected_delete_files.is_empty() {
         return Err(corrupt(
             "Iceberg rewrite-position split has no selected Puffin files",
         ));
     }
-    let mut refs = Vec::with_capacity(payload.selected_delete_files.len());
-    for delete in &payload.selected_delete_files {
-        if !data_file
-            .delete_files
-            .iter()
-            .any(|candidate| candidate == delete)
-            || !matches!(delete.file_content, IcebergDeleteFileContent::Position)
-            || !matches!(delete.file_format, IcebergDeleteFileFormat::Puffin)
-        {
-            return Err(corrupt(
-                "Iceberg rewrite-position split selects a foreign or non-Puffin delete file",
-            ));
-        }
-        let reference = PositionDeleteRef {
-            delete_file_path: delete.path.clone(),
-            delete_file_size: delete.length.unwrap_or(0),
-            record_count: None,
-            referenced_data_file: Some(data_file.path.clone()),
-            file_format: DataFileFormat::Puffin,
-            content_offset: delete.content_offset,
-            content_size_in_bytes: delete.content_size_in_bytes,
-            partition_values: Vec::new(),
-        };
-        reference
-            .validate_invariants()
-            .map_err(|error| corrupt(error.to_string()))?;
-        refs.push(reference);
-    }
-    Ok(refs)
+    payload
+        .selected_delete_files
+        .iter()
+        .map(|delete| {
+            if !data_file
+                .delete_files
+                .iter()
+                .any(|candidate| candidate == delete)
+                || !matches!(delete.file_content, IcebergDeleteFileContent::Position)
+                || !matches!(delete.file_format, IcebergDeleteFileFormat::Puffin)
+            {
+                return Err(corrupt(
+                    "Iceberg rewrite-position split selects a foreign or non-Puffin delete file",
+                ));
+            }
+            let length =
+                delete.length.map(u64::try_from).transpose().map_err(|_| {
+                    corrupt("Iceberg rewrite-position Puffin file has a negative size")
+                })?;
+            let offset = delete.content_offset.ok_or_else(|| {
+                corrupt("Iceberg rewrite-position Puffin file is missing content_offset")
+            })?;
+            let content_size_in_bytes = delete.content_size_in_bytes.ok_or_else(|| {
+                corrupt("Iceberg rewrite-position Puffin file is missing content_size_in_bytes")
+            })?;
+            if content_size_in_bytes < 0 {
+                return Err(corrupt(
+                    "Iceberg rewrite-position Puffin file has a negative content size",
+                ));
+            }
+            Ok(IcebergDeleteFileSpec {
+                path: delete.path.clone(),
+                file_format: IcebergFileFormat::Puffin,
+                file_content: IcebergFileContent::PositionDeletes,
+                length,
+                content_offset: Some(offset),
+                content_size_in_bytes: Some(content_size_in_bytes),
+            })
+        })
+        .collect()
 }
 
 fn rewrite_position_schema() -> std::sync::Arc<Schema> {
@@ -205,11 +221,6 @@ fn rewrite_position_schema() -> std::sync::Arc<Schema> {
 
 fn corrupt(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message.into())
-}
-
-fn unavailable(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
-        .with_retryable_before_progress()
 }
 
 fn cancelled() -> ConnectorError {
@@ -229,7 +240,6 @@ fn deadline() -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo;
 
     fn puffin(path: &str) -> IcebergDeleteFileInfo {
         IcebergDeleteFileInfo {
@@ -248,26 +258,23 @@ mod tests {
     }
 
     #[test]
-    fn selected_refs_rejects_a_delete_file_outside_the_frozen_data_file() {
+    fn selected_specs_reject_a_delete_file_outside_the_frozen_data_file() {
         let selected = puffin("s3://warehouse/delete-1.puffin");
         let mut file = IcebergDataFileInfo::for_test("s3://warehouse/data-1.parquet", 16, 2);
         file.delete_files.push(selected.clone());
         let payload = IcebergRewritePositionSplitPayloadV1 {
-            version: 1,
+            version: ICEBERG_REWRITE_POSITION_SPLIT_V1,
             selected_delete_files: vec![selected],
         };
-        let refs = selected_refs(&file, &payload).expect("frozen Puffin reference");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(
-            refs[0].referenced_data_file.as_deref(),
-            Some("s3://warehouse/data-1.parquet")
-        );
+        let specs = selected_delete_specs(&file, &payload).expect("frozen Puffin reference");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].path, "s3://warehouse/delete-1.puffin");
 
         let foreign = IcebergRewritePositionSplitPayloadV1 {
-            version: 1,
+            version: ICEBERG_REWRITE_POSITION_SPLIT_V1,
             selected_delete_files: vec![puffin("s3://warehouse/delete-foreign.puffin")],
         };
-        let error = selected_refs(&file, &foreign)
+        let error = selected_delete_specs(&file, &foreign)
             .expect_err("a split cannot name a delete file outside its frozen group");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }

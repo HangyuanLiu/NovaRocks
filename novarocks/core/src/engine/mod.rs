@@ -349,6 +349,10 @@ pub(crate) struct StandaloneState {
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+    /// Frontend-owned provider factory resolver. Core submits durable
+    /// attachment facts here and never constructs a concrete generation.
+    pub(crate) connector_control_factory_resolver:
+        Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
     /// Process-local cache of immutable evidence returned by connector
     /// statistics readers. Query compilation still consumes only the pin
     /// captured during table resolution.
@@ -407,6 +411,7 @@ impl Default for StandaloneState {
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
             connector_control: Arc::new(TestConnectorControlRegistry::default()),
+            connector_control_factory_resolver: Arc::new(TestConnectorControlRegistry::default()),
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -1024,6 +1029,22 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorControlFactoryResolver for TestConnectorControlRegistry {
+    fn create_control(
+        &self,
+        _request: novarocks_spi::connector::ConnectorControlFactoryRequest,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlCreation,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control registry has no provider factories",
+        ))
+    }
+}
+
+#[cfg(test)]
 struct TestDistributedQueryCoordinator {
     connector_control:
         Option<std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>>,
@@ -1216,6 +1237,10 @@ pub struct StandaloneOpenServices {
     pub query_control: crate::query_execution::control::QueryControlService,
     /// Frontend-owned lifecycle port for logical connector control bindings.
     pub connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+    /// Frontend-owned provider factory resolver used by catalog create and
+    /// durable attachment restore.
+    pub connector_control_factory_resolver:
+        std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
     /// Bound by the server composition root before engine open. Zero means no
     /// local fragment endpoint is available to this engine instance.
     pub exchange_port: u16,
@@ -1242,6 +1267,9 @@ impl StandaloneOpenServices {
         >,
         query_control: crate::query_execution::control::QueryControlService,
         connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+        connector_control_factory_resolver: std::sync::Arc<
+            dyn novarocks_spi::connector::ConnectorControlFactoryResolver,
+        >,
         exchange_port: u16,
     ) -> Self {
         Self {
@@ -1258,6 +1286,7 @@ impl StandaloneOpenServices {
             mv_refresh_provider_activation_sink: None,
             mv_background_engine_sink: None,
             connector_control,
+            connector_control_factory_resolver,
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -1401,6 +1430,7 @@ impl StandaloneNovaRocks {
             mv_refresh_provider_activation_sink,
             mv_background_engine_sink,
             connector_control,
+            connector_control_factory_resolver,
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -1428,6 +1458,7 @@ impl StandaloneNovaRocks {
             statistics_service,
             statistics_application,
             connector_control,
+            connector_control_factory_resolver,
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -6603,6 +6634,7 @@ mod tests {
             backend_topology,
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             crate::query_execution::control::QueryControlService::for_test(),
+            Arc::new(super::TestConnectorControlRegistry::default()),
             Arc::new(super::TestConnectorControlRegistry::default()),
             1,
         )

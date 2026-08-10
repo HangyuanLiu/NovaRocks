@@ -17,12 +17,88 @@
 
 //! Provider-owned Parquet field-identity and Iceberg name-mapping helpers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY;
 use crate::iceberg::spec::{MappedField, NameMapping};
+use crate::row_lineage_synth::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
+};
+use crate::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+
+/// Validates and canonically encodes an Iceberg name mapping.
+///
+/// Name mappings are physical Iceberg schema facts.  Keeping validation and
+/// canonical serialization with the provider prevents catalog mutation and
+/// write planning callers from each accepting a slightly different mapping.
+pub fn canonical_name_mapping(raw: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
+    validate_name_mapping_json(&value)?;
+    let mapping: NameMapping = serde_json::from_value(value)
+        .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
+    serde_json::to_string(&mapping)
+        .map_err(|error| format!("encode canonical schema.name-mapping.default: {error}"))
+}
+
+fn validate_name_mapping_json(value: &serde_json::Value) -> Result<(), String> {
+    fn visit(fields: &serde_json::Value, ids: &mut HashSet<i64>) -> Result<(), String> {
+        let fields = fields
+            .as_array()
+            .ok_or_else(|| "Iceberg name mapping root/fields must be an array".to_string())?;
+        let mut sibling_aliases = HashSet::new();
+        for field in fields {
+            let object = field
+                .as_object()
+                .ok_or_else(|| "Iceberg name mapping field must be an object".to_string())?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "field-id" | "names" | "fields"))
+            {
+                return Err("Iceberg name mapping contains an unknown field".to_string());
+            }
+            let id = object
+                .get("field-id")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| "Iceberg name mapping field-id is required".to_string())?;
+            if id <= 0 || !ids.insert(id) {
+                return Err(format!(
+                    "Iceberg name mapping has duplicate or invalid ID {id}"
+                ));
+            }
+            let names = object
+                .get("names")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "Iceberg name mapping names must be an array".to_string())?;
+            if names.is_empty() {
+                return Err("Iceberg name mapping names must not be empty".to_string());
+            }
+            for name in names {
+                let name = name
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| "Iceberg name mapping alias must be nonempty".to_string())?;
+                if !sibling_aliases.insert(name.to_string()) {
+                    return Err(format!("Iceberg name mapping has duplicate alias {name}"));
+                }
+            }
+            if let Some(children) = object.get("fields")
+                && !children.is_null()
+            {
+                visit(children, ids)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut ids = HashSet::new();
+    visit(value, &mut ids)
+}
 
 pub fn schema_field_id_coverage(schema: &SchemaRef) -> Result<(usize, usize), String> {
     schema
@@ -53,6 +129,161 @@ pub fn apply_name_mapping_to_schema(
         fields,
         schema.metadata().clone(),
     )))
+}
+
+/// Re-annotate a generic native writer schema with the frozen Iceberg field-ID
+/// tree carried by a provider write handle.  The generic carrier owns Arrow
+/// types; Iceberg owns physical field identity and defaults.
+pub fn annotate_schema_from_scan_model(
+    input_schema: &SchemaRef,
+    iceberg_schema: &IcebergSchemaDef,
+) -> Result<SchemaRef, String> {
+    let fields = input_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if is_write_virtual_column(field.name()) {
+                return Ok(field.as_ref().clone());
+            }
+            if let Some(field_id) = reserved_row_lineage_field_id(field)? {
+                let mut metadata = field.metadata().clone();
+                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+                return Ok(Field::new(
+                    field.name(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(metadata));
+            }
+            let frozen = iceberg_schema
+                .fields
+                .iter()
+                .find(|candidate| candidate.name == field.name().as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg writer column {} is missing its frozen schema field",
+                        field.name()
+                    )
+                })?;
+            apply_scan_field_id_recursive(field.as_ref(), frozen)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        input_schema.metadata().clone(),
+    )))
+}
+
+fn is_write_virtual_column(name: &str) -> bool {
+    matches!(name, "_file" | "_pos" | "__change_op") || name.starts_with("__nr_var_")
+}
+
+fn reserved_row_lineage_field_id(field: &Field) -> Result<Option<i32>, String> {
+    let field_id = if field.name().eq_ignore_ascii_case(ICEBERG_ROW_ID_COL) {
+        ICEBERG_RESERVED_FIELD_ID_ROW_ID
+    } else if field
+        .name()
+        .eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
+    {
+        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+    } else {
+        return Ok(None);
+    };
+    if field.data_type() != &DataType::Int64 {
+        return Err(format!(
+            "Iceberg reserved row-lineage column {} expects Int64, got {:?}",
+            field.name(),
+            field.data_type()
+        ));
+    }
+    Ok(Some(field_id))
+}
+
+fn apply_scan_field_id_recursive(
+    field: &Field,
+    frozen: &IcebergSchemaFieldDef,
+) -> Result<Field, String> {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        frozen.field_id.to_string(),
+    );
+    if let Some(default) = frozen.initial_default_json.as_ref() {
+        metadata.insert(
+            ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
+            default.clone(),
+        );
+    }
+    let data_type = match field.data_type() {
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|child| scan_child_field(child.as_ref(), &frozen.children))
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
+        ),
+        DataType::List(child) => DataType::List(Arc::new(scan_list_child(child.as_ref(), frozen)?)),
+        DataType::LargeList(child) => {
+            DataType::LargeList(Arc::new(scan_list_child(child.as_ref(), frozen)?))
+        }
+        DataType::FixedSizeList(child, size) => {
+            DataType::FixedSizeList(Arc::new(scan_list_child(child.as_ref(), frozen)?), *size)
+        }
+        DataType::Map(entries, sorted) => {
+            let DataType::Struct(children) = entries.data_type() else {
+                return Err(format!(
+                    "Iceberg MAP column {} has non-struct entries",
+                    field.name()
+                ));
+            };
+            if children.len() != 2 || frozen.children.len() != 2 {
+                return Err(format!(
+                    "Iceberg MAP column {} has incompatible frozen fields",
+                    field.name()
+                ));
+            }
+            let children = children
+                .iter()
+                .zip(frozen.children.iter())
+                .map(|(child, frozen)| apply_scan_field_id_recursive(child.as_ref(), frozen))
+                .collect::<Result<Vec<_>, _>>()?;
+            let entries = Field::new(
+                entries.name(),
+                DataType::Struct(children.into()),
+                entries.is_nullable(),
+            )
+            .with_metadata(entries.metadata().clone());
+            DataType::Map(Arc::new(entries), *sorted)
+        }
+        data_type => data_type.clone(),
+    };
+    Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
+}
+
+fn scan_child_field(
+    field: &Field,
+    frozen_children: &[IcebergSchemaFieldDef],
+) -> Result<Field, String> {
+    let frozen = frozen_children
+        .iter()
+        .find(|candidate| candidate.name == field.name().as_str())
+        .ok_or_else(|| {
+            format!(
+                "Iceberg nested writer field {} is missing frozen metadata",
+                field.name()
+            )
+        })?;
+    apply_scan_field_id_recursive(field, frozen)
+}
+
+fn scan_list_child(field: &Field, frozen: &IcebergSchemaFieldDef) -> Result<Field, String> {
+    let child = frozen.children.first().ok_or_else(|| {
+        format!(
+            "Iceberg list writer field {} is missing frozen element metadata",
+            field.name()
+        )
+    })?;
+    apply_scan_field_id_recursive(field, child)
 }
 
 fn map_field_id_recursive(field: &Field, mappings: &[Arc<MappedField>]) -> Result<Field, String> {
@@ -223,4 +454,31 @@ fn is_binary_like(data_type: &DataType) -> bool {
         data_type,
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_name_mapping;
+
+    #[test]
+    fn canonical_name_mapping_is_strict_and_provider_owned() {
+        assert_eq!(
+            canonical_name_mapping(r#"[{"names":["legacy_id"],"field-id":1}]"#)
+                .expect("canonical mapping"),
+            r#"[{"field-id":1,"names":["legacy_id"]}]"#,
+        );
+        assert!(
+            canonical_name_mapping(r#"[{"field-id":1,"names":["id"],"credential":"secret"}]"#)
+                .is_err()
+        );
+        assert!(
+            canonical_name_mapping(
+                r#"[
+                {"field-id":1,"names":["left"],"fields":[{"field-id":2,"names":["id"]}]},
+                {"field-id":3,"names":["right"],"fields":[{"field-id":4,"names":["id"]}]}
+            ]"#
+            )
+            .is_ok()
+        );
+    }
 }

@@ -38,120 +38,24 @@ use novarocks_spi::connector::{
     ConnectorRowMutationActivationRequest, ConnectorRowMutationExecutionPlan,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorStagedReport, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteActivation, ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
-    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
-    ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteOperationId,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
+    ConnectorWriteActivation, ConnectorWriteActivationRequest, ConnectorWriteAttemptCompletion,
+    ConnectorWriteCohortId, ConnectorWriteCommitRequest, ConnectorWriteControl,
+    ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWritePlan,
+    ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
     ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
     ConnectorWriterTerminalState, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_WRITE_ACTIVATIONS,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use super::commit::{CommitServiceError, RecoveryEvidence};
-use super::write_contract::connector_write_receipt;
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
+use novarocks_connector_iceberg::write_codec::connector_write_receipt;
 
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;
 const ICEBERG_WRITE_OPERATION_KIND: &str = "iceberg.connector_write.v2";
-const ICEBERG_WRITE_PLAN_PAYLOAD_VERSION: u16 = 1;
-const ICEBERG_FIRST_REFRESH_WRITE_PLAN_PAYLOAD_VERSION: u16 = 2;
-const MAX_FIRST_REFRESH_STAGING_PATH_BYTES: usize = 4 * 1024;
-
-/// Canonical, secret-free FE control payload.  The planner may use `target`
-/// to describe a catalog table/ref, but must never put a catalog client or
-/// storage credentials here.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IcebergWritePlanPayloadV1 {
-    pub version: u16,
-    pub target: String,
-    pub target_ref: String,
-}
-
-impl IcebergWritePlanPayloadV1 {
-    pub(crate) fn encode(&self) -> Result<Bytes, ConnectorError> {
-        if self.version != ICEBERG_WRITE_PLAN_PAYLOAD_VERSION
-            || self.target.is_empty()
-            || self.target_ref.is_empty()
-        {
-            return Err(invalid("invalid Iceberg write plan payload"));
-        }
-        canonical_json(self, "Iceberg write plan payload")
-    }
-
-    pub(crate) fn decode(payload: &[u8]) -> Result<Self, ConnectorError> {
-        let decoded: Self = decode_canonical_json(payload, "Iceberg write plan payload")?;
-        if decoded.version != ICEBERG_WRITE_PLAN_PAYLOAD_VERSION
-            || decoded.target.is_empty()
-            || decoded.target_ref.is_empty()
-        {
-            return Err(invalid(
-                "unsupported or incomplete Iceberg write plan payload",
-            ));
-        }
-        if canonical_json(&decoded, "Iceberg write plan payload")?.as_ref() != payload {
-            return Err(invalid(
-                "Iceberg write plan payload is not canonical JSON v1",
-            ));
-        }
-        Ok(decoded)
-    }
-}
-
-/// Provider-private facts for a first-refresh append. The application layer
-/// retains this only as an opaque payload; validation and provenance handling
-/// remain inside the Iceberg control binding.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IcebergFirstRefreshWritePlanPayloadV2 {
-    pub version: u16,
-    pub target: String,
-    pub target_ref: String,
-    pub expected_snapshot_id: Option<i64>,
-    pub staging_path: String,
-    pub provenance_properties: BTreeMap<String, String>,
-}
-
-impl IcebergFirstRefreshWritePlanPayloadV2 {
-    pub(crate) fn encode(&self) -> Result<Bytes, ConnectorError> {
-        self.validate()?;
-        canonical_json(self, "Iceberg first-refresh write plan payload")
-    }
-
-    pub(crate) fn decode(payload: &[u8]) -> Result<Self, ConnectorError> {
-        let decoded: Self =
-            decode_canonical_json(payload, "Iceberg first-refresh write plan payload")?;
-        decoded.validate()?;
-        if canonical_json(&decoded, "Iceberg first-refresh write plan payload")?.as_ref() != payload
-        {
-            return Err(invalid(
-                "Iceberg first-refresh write plan payload is not canonical JSON v2",
-            ));
-        }
-        Ok(decoded)
-    }
-
-    fn validate(&self) -> Result<(), ConnectorError> {
-        if self.version != ICEBERG_FIRST_REFRESH_WRITE_PLAN_PAYLOAD_VERSION
-            || self.target.is_empty()
-            || self.target_ref.is_empty()
-            || self.staging_path.is_empty()
-            || self.staging_path.len() > MAX_FIRST_REFRESH_STAGING_PATH_BYTES
-            || self
-                .expected_snapshot_id
-                .is_some_and(|snapshot_id| snapshot_id < 0)
-            || self
-                .provenance_properties
-                .iter()
-                .any(|(key, value)| key.is_empty() || value.is_empty())
-        {
-            return Err(invalid(
-                "unsupported or incomplete Iceberg first-refresh write plan payload",
-            ));
-        }
-        Ok(())
-    }
-}
+use novarocks_connector_iceberg::write_payload::{
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
+};
 
 /// Provider-owned planning result.  The backend uses
 /// `write_contract::writer_handle_from_sink_plan` to create each handle from
@@ -267,7 +171,8 @@ pub(crate) struct IcebergWriteControlAdapter {
     prepare: Arc<IcebergWritePreparationFactory>,
     prepare_row_mutation: Arc<IcebergRowMutationPreparationFactory>,
     activate_row_mutation: Arc<IcebergRowMutationActivationFactory>,
-    activations: Arc<Mutex<HashMap<ConnectorWriteOperationId, [u8; 32]>>>,
+    activations:
+        Arc<novarocks_connector_iceberg::write_activation::IcebergWriteActivationReservations>,
     operations: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteOperationRecord>>>,
     aborts: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteAbortRecord>>>,
     plans: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteOperationPlans>>>,
@@ -364,7 +269,9 @@ impl IcebergWriteControlAdapter {
             prepare,
             prepare_row_mutation: Arc::new(default_prepare_row_mutation),
             activate_row_mutation: Arc::new(default_activate_row_mutation),
-            activations: Arc::new(Mutex::new(HashMap::new())),
+            activations: Arc::new(
+                novarocks_connector_iceberg::write_activation::IcebergWriteActivationReservations::default(),
+            ),
             operations: Arc::new(Mutex::new(HashMap::new())),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
@@ -565,41 +472,7 @@ impl ConnectorWriteControl for IcebergWriteControlAdapter {
         &self,
         request: ConnectorWriteActivationRequest,
     ) -> Result<ConnectorWriteActivation, ConnectorError> {
-        let operation_id = request.operation_id;
-        request.validate(&self.key)?;
-        let cohorts = match &request.source {
-            ConnectorWriteActivationSource::Prepared(preparation) => vec![(
-                ConnectorWriteCohortId::primary(operation_id),
-                preparation.clone(),
-            )],
-            ConnectorWriteActivationSource::RowMutation(plan) => plan
-                .routes()
-                .iter()
-                .map(|route| (route.cohort_id(), route.preparation().clone()))
-                .collect(),
-        };
-        let activation = ConnectorWriteActivation::try_new(self.key.clone(), &request, cohorts)?;
-        let mut activations = self
-            .activations
-            .lock()
-            .map_err(|error| internal(format!("Iceberg write activation lock: {error}")))?;
-        match activations.get(&operation_id) {
-            Some(existing) if existing == &activation.digest() => return Ok(activation),
-            Some(_) => {
-                return Err(invalid(
-                    "Iceberg write activation conflicts with an existing operation reservation",
-                ));
-            }
-            None if activations.len() >= MAX_CONNECTOR_WRITE_ACTIVATIONS => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "Iceberg write activation reservation limit is exhausted",
-                ));
-            }
-            None => {}
-        }
-        activations.insert(operation_id, activation.digest());
-        Ok(activation)
+        self.activations.activate(&self.key, &request)
     }
 
     fn plan_write(
@@ -896,11 +769,7 @@ impl IcebergWriteControlAdapter {
         &self,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<(), ConnectorError> {
-        self.activations
-            .lock()
-            .map_err(|error| internal(format!("Iceberg write activation lock: {error}")))?
-            .remove(&operation_id);
-        Ok(())
+        self.activations.release(operation_id)
     }
 
     fn release_activation_if_known(

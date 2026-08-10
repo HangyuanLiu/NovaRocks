@@ -478,7 +478,9 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 .metadata()
                 .properties()
                 .get(novarocks_connector_iceberg::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
-                .map(|mapping| super::catalog::add_files::canonical_name_mapping(mapping))
+                .map(|mapping| {
+                    novarocks_connector_iceberg::schema_mapping::canonical_name_mapping(mapping)
+                })
                 .transpose()
                 .map_err(|error| {
                     CommitServiceError::finalize_failed_known_committed(

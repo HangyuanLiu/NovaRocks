@@ -24,12 +24,11 @@ pub mod commit;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod compact;
 pub(crate) mod data_mutation;
-pub(crate) mod data_writer;
+#[cfg(test)]
+mod data_writer_tests;
 pub(crate) mod delete_visibility;
-pub(crate) mod delta_reader;
 pub(crate) mod distributed_rewrite;
 pub(crate) mod distributed_rewrite_execution;
-pub(crate) mod distributed_rewrite_reader;
 pub mod equality_delete;
 pub(crate) mod file_pruning;
 pub mod metadata;
@@ -42,9 +41,7 @@ pub mod position_delete;
 /// root. The provider crate owns the external Iceberg dependency boundary;
 /// these adapters only bind frozen SPI payloads to Core's runtime.
 pub mod provider;
-pub(crate) mod reader;
 
-pub(crate) mod report;
 pub mod scan_deletes;
 pub mod schema;
 pub mod sink;
@@ -53,11 +50,9 @@ pub(crate) mod staged_create;
 pub(crate) mod stats;
 #[cfg(test)]
 pub(crate) mod test_metadata;
-pub(crate) mod variant_write;
 pub(crate) mod write_commit;
 pub(crate) mod write_contract;
 pub(crate) mod write_control;
-pub(crate) mod write_execution;
 pub(crate) mod write_service;
 
 pub use metadata::{

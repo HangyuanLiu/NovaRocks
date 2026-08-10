@@ -647,16 +647,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 target_ref: "main".to_string(),
                 snapshot_properties: Default::default(),
             });
-            let plan_payload = super::write_control::IcebergWritePlanPayloadV1 {
-                version: 1,
-                target: format!(
-                    "{}.{}.{}",
-                    self.descriptor.instance_id.as_str(),
-                    ident.namespace,
-                    ident.name
-                ),
-                target_ref: "main".to_string(),
-            };
+            let plan_payload =
+                novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1 {
+                    version: 1,
+                    target: format!(
+                        "{}.{}.{}",
+                        self.descriptor.instance_id.as_str(),
+                        ident.namespace,
+                        ident.name
+                    ),
+                    target_ref: "main".to_string(),
+                };
             let provider_payload = plan_payload.encode()?;
             let committer: Arc<dyn super::write_service::IcebergWriteReportCommitter> =
                 commit_executor;

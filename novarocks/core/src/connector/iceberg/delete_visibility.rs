@@ -68,7 +68,8 @@ pub(crate) fn load_referenced_data_file_partitions(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExistingDeleteVisibility {
     pub(crate) deleted_positions: roaring::RoaringTreemap,
-    pub(crate) equality_deletes: Vec<super::equality_delete::EqualityDeleteSet>,
+    pub(crate) equality_deletes:
+        Vec<novarocks_connector_iceberg::file_reader::equality_delete::EqualityDeleteSet>,
 }
 
 pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDeleteVisibility>;
@@ -293,7 +294,11 @@ pub(crate) fn data_file_row_is_visible(
     let equality_deletes = visibility
         .map(|state| state.equality_deletes.as_slice())
         .unwrap_or(&[]);
-    if super::equality_delete::equality_delete_row_is_deleted(batch, row, equality_deletes)? {
+    if novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_row_is_deleted(
+        batch,
+        row,
+        equality_deletes,
+    )? {
         return Ok(false);
     }
     Ok(true)

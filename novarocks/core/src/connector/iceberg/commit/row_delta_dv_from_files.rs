@@ -740,12 +740,12 @@ mod tests {
 
     use super::super::action::CommitCtx;
     use super::super::collector::IcebergCommitCollector;
-    use super::super::position_delete_writer::PositionDeleteGroup;
     use super::super::row_delta_dv_metadata::{LiveFile, dv_data_file};
     use super::super::test_helpers::empty_v3_iceberg_table;
     use super::*;
     use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::types::CommitOpKind;
+    use novarocks_connector_iceberg::commit::PositionDeleteGroup;
 
     /// M3a Part B: a RowDeltaDvFromFiles commit may carry, in one snapshot,
     /// REUSE data (MOR-UPDATE replacement rows that preserve their `_row_id`s,

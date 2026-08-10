@@ -378,10 +378,125 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampMicrosecondArray,
-    TimestampNanosecondArray,
+    TimestampNanosecondArray, new_null_array,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
+
+/// Arrow field metadata key carrying Iceberg format-v3 initial defaults.
+///
+/// This is physical table-format metadata consumed by the provider reader;
+/// SQL schema projection must not define a competing key.
+pub const ICEBERG_INITIAL_DEFAULT_META_KEY: &str = "novarocks.iceberg.initial_default";
+
+/// Materialize an Iceberg format-v3 initial default for a missing physical
+/// column. Missing metadata deliberately yields a typed null array so schema
+/// evolution has one provider-owned interpretation on every execution node.
+pub fn build_iceberg_default_array(
+    target_field: &Field,
+    row_count: usize,
+) -> Result<ArrayRef, String> {
+    let Some(json) = target_field
+        .metadata()
+        .get(ICEBERG_INITIAL_DEFAULT_META_KEY)
+    else {
+        return Ok(new_null_array(target_field.data_type(), row_count));
+    };
+    let json_value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
+        format!(
+            "corrupted initial-default JSON for column {}: {error}",
+            target_field.name()
+        )
+    })?;
+    let iceberg_type = arrow_type_to_iceberg_type(target_field.data_type()).map_err(|error| {
+        format!(
+            "unsupported initial-default for column {}: {error}",
+            target_field.name()
+        )
+    })?;
+    let literal = IcebergLiteral::try_from_json(json_value, &iceberg_type)
+        .map_err(|error| {
+            format!(
+                "decode initial-default for column {}: {error}",
+                target_field.name()
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "initial-default JSON for column {} produced no literal",
+                target_field.name()
+            )
+        })?;
+    literal_to_constant_array(&literal, target_field.data_type(), row_count)
+}
+
+fn arrow_type_to_iceberg_type(data_type: &DataType) -> Result<Type, String> {
+    use crate::iceberg::spec::{ListType, MapType, NestedField};
+    Ok(match data_type {
+        DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
+        DataType::Int32 => Type::Primitive(PrimitiveType::Int),
+        DataType::Int64 => Type::Primitive(PrimitiveType::Long),
+        DataType::Float32 => Type::Primitive(PrimitiveType::Float),
+        DataType::Float64 => Type::Primitive(PrimitiveType::Double),
+        DataType::Decimal128(precision, scale) => Type::Primitive(PrimitiveType::Decimal {
+            precision: *precision as u32,
+            scale: *scale as u32,
+        }),
+        DataType::Utf8 => Type::Primitive(PrimitiveType::String),
+        DataType::Date32 => Type::Primitive(PrimitiveType::Date),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Type::Primitive(PrimitiveType::Timestamp)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
+            Type::Primitive(PrimitiveType::Timestamptz)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            Type::Primitive(PrimitiveType::TimestampNs)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
+            Type::Primitive(PrimitiveType::TimestamptzNs)
+        }
+        DataType::Binary | DataType::LargeBinary => Type::Primitive(PrimitiveType::Binary),
+        DataType::List(element_field) => {
+            Type::List(ListType::new(Arc::new(NestedField::optional(
+                1,
+                "element",
+                arrow_type_to_iceberg_type(element_field.data_type())?,
+            ))))
+        }
+        DataType::Map(entries_field, _) => {
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "arrow Map field entries must be a Struct, got {:?}",
+                    entries_field.data_type()
+                ));
+            };
+            if entry_fields.len() < 2 {
+                return Err(format!(
+                    "arrow Map entries struct must have at least 2 fields, got {}",
+                    entry_fields.len()
+                ));
+            }
+            Type::Map(MapType::new(
+                Arc::new(NestedField::required(
+                    1,
+                    "key",
+                    arrow_type_to_iceberg_type(entry_fields[0].data_type())?,
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "value",
+                    arrow_type_to_iceberg_type(entry_fields[1].data_type())?,
+                )),
+            ))
+        }
+        other => {
+            return Err(format!(
+                "arrow type {other:?} cannot carry an iceberg default"
+            ));
+        }
+    })
+}
 
 /// Build an Arrow constant array of length `row_count` whose every element is
 /// the value encoded by `literal`. The literal's runtime type must agree with

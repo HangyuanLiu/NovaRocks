@@ -67,6 +67,19 @@ pub fn parse_catalog_configuration(
     catalog_name: &str,
     properties: &[(String, String)],
 ) -> Result<IcebergCatalogConfiguration, String> {
+    parse_catalog_configuration_with_object_store_binding(catalog_name, properties, None)
+}
+
+/// Parse catalog properties with credentials injected by the process
+/// composition root.  Catalog properties may provide the same credentials for
+/// a CREATE request, but they must match the role-local binding: a provider
+/// generation can never depend on a credential that its BE installers do not
+/// also possess.
+pub fn parse_catalog_configuration_with_object_store_binding(
+    catalog_name: &str,
+    properties: &[(String, String)],
+    injected_object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<IcebergCatalogConfiguration, String> {
     let properties = normalized_properties(properties);
     if let Some(kind) = properties.get("type")
         && !kind.eq_ignore_ascii_case("iceberg")
@@ -88,15 +101,22 @@ pub fn parse_catalog_configuration(
     };
 
     match kind {
-        IcebergCatalogKind::Hadoop => parse_hadoop_configuration(catalog_name, properties),
-        IcebergCatalogKind::Rest => parse_rest_configuration(properties),
-        IcebergCatalogKind::Hive => parse_hive_configuration(properties),
+        IcebergCatalogKind::Hadoop => {
+            parse_hadoop_configuration(catalog_name, properties, injected_object_store_config)
+        }
+        IcebergCatalogKind::Rest => {
+            parse_rest_configuration(properties, injected_object_store_config)
+        }
+        IcebergCatalogKind::Hive => {
+            parse_hive_configuration(properties, injected_object_store_config)
+        }
     }
 }
 
 fn parse_hadoop_configuration(
     catalog_name: &str,
     mut properties: HashMap<String, String>,
+    injected_object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let raw_warehouse = properties
         .get("iceberg.catalog.warehouse")
@@ -115,7 +135,11 @@ fn parse_hadoop_configuration(
         }
     };
     let (warehouse_uri, warehouse_path, object_store_config) = if is_object_store {
-        let object_store_config = object_store_config(&properties)?.ok_or_else(|| {
+        let object_store_config = resolve_object_store_config(
+            &properties,
+            injected_object_store_config,
+        )?
+        .ok_or_else(|| {
             "object-store iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()
         })?;
@@ -156,6 +180,7 @@ fn parse_hadoop_configuration(
 
 fn parse_rest_configuration(
     mut properties: HashMap<String, String>,
+    injected_object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let uri = properties
         .get("uri")
@@ -169,7 +194,8 @@ fn parse_rest_configuration(
         .or_else(|| properties.get("iceberg.catalog.warehouse"))
         .cloned()
         .unwrap_or_default();
-    let object_store_config = object_store_config(&properties)?;
+    let object_store_config =
+        resolve_object_store_config(&properties, injected_object_store_config)?;
     properties.insert("type".to_string(), "iceberg".to_string());
     properties.insert("iceberg.catalog.type".to_string(), "rest".to_string());
     properties.insert("uri".to_string(), uri.clone());
@@ -192,6 +218,7 @@ fn parse_rest_configuration(
 
 fn parse_hive_configuration(
     mut properties: HashMap<String, String>,
+    injected_object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     for key in properties.keys() {
         let normalized = key.to_ascii_lowercase();
@@ -229,7 +256,8 @@ fn parse_hive_configuration(
         .or_else(|| properties.get("hive.metastore.warehouse.dir"))
         .cloned()
         .unwrap_or_default();
-    let object_store_config = object_store_config(&properties)?;
+    let object_store_config =
+        resolve_object_store_config(&properties, injected_object_store_config)?;
     properties.insert("type".to_string(), "iceberg".to_string());
     properties.insert("iceberg.catalog.type".to_string(), "hive".to_string());
     properties.insert("hive.metastore.uris".to_string(), first_uri);
@@ -265,6 +293,28 @@ fn object_store_config(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     object_store_config_from_aws_s3_catalog_properties(&properties)
+}
+
+fn resolve_object_store_config(
+    properties: &HashMap<String, String>,
+    injected: Option<&ObjectStoreConfig>,
+) -> Result<Option<ObjectStoreConfig>, String> {
+    let supplied = object_store_config(properties)?;
+    match (supplied, injected) {
+        (Some(supplied), Some(injected)) if supplied != *injected => Err(
+            "Iceberg catalog object-store credentials do not match the server-composed binding"
+                .to_string(),
+        ),
+        (Some(_), Some(injected)) => Ok(Some(injected.clone())),
+        // The legacy parser remains useful to provider unit tests and tools
+        // that only construct a catalog configuration. Production factory
+        // construction performs the stronger role-resource check after
+        // parsing, where it can distinguish an omitted binding from this
+        // standalone configuration path.
+        (Some(supplied), None) => Ok(Some(supplied)),
+        (None, Some(injected)) => Ok(Some(injected.clone())),
+        (None, None) => Ok(None),
+    }
 }
 
 fn sorted_properties(properties: &HashMap<String, String>) -> Vec<(String, String)> {

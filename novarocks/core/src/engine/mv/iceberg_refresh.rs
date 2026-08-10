@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
+use novarocks_connector_iceberg::commit::PositionDeleteGroup;
 use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::TableIdent;
 use novarocks_connector_iceberg::iceberg::spec::DataFile;
@@ -38,11 +39,9 @@ use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::changes::plan_changes;
 use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitServiceError, IcebergCommitCollector, MvRefreshSnapshotMarker,
-    PositionDeleteGroup, RecoveryEvidence, RunInput, run_iceberg_commit,
-    snapshot_matches_refresh_marker,
+    RecoveryEvidence, RunInput, run_iceberg_commit, snapshot_matches_refresh_marker,
 };
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
-use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
     operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
@@ -183,6 +182,7 @@ use crate::sql::planner::vocabulary::{
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files;
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
@@ -11038,24 +11038,23 @@ fn publish_iceberg_mv_refresh(
     // locally. Publication itself nevertheless receives the same opaque
     // committed-version carrier that the frontend lifecycle will retain; the
     // Iceberg provider is the only consumer that decodes it.
-    let committed_version =
-        match crate::connector::iceberg::write_contract::connector_write_receipt(
-            staging_snapshot_id,
-            None,
-        )
-        .and_then(|receipt| {
-            receipt.committed_version().cloned().ok_or_else(|| {
-                "Iceberg write receipt unexpectedly omitted a committed version".to_string()
-            })
-        }) {
-            Ok(version) => version,
-            Err(message) => {
-                return IcebergMvPublicationResolution::ContractFailure {
-                    message,
-                    possibly_dispatched: false,
-                };
-            }
-        };
+    let committed_version = match novarocks_connector_iceberg::write_codec::connector_write_receipt(
+        staging_snapshot_id,
+        None,
+    )
+    .and_then(|receipt| {
+        receipt.committed_version().cloned().ok_or_else(|| {
+            "Iceberg write receipt unexpectedly omitted a committed version".to_string()
+        })
+    }) {
+        Ok(version) => version,
+        Err(message) => {
+            return IcebergMvPublicationResolution::ContractFailure {
+                message,
+                possibly_dispatched: false,
+            };
+        }
+    };
     match crate::connector::mutation::resolve_catalog_mutation(
         state.connector_control.as_ref(),
         &instance_id,

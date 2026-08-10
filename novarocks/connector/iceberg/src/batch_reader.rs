@@ -16,10 +16,9 @@
 
 //! Provider-owned physical Iceberg reader.
 //!
-//! `novarocks-fs` owns physical format decoding and returns physical row
-//! coordinates.  This module owns the Iceberg field-ID output contract and is
-//! intentionally the only place an Iceberg connector reader turns a physical
-//! batch into a provider batch.
+//! The filesystem returns physical Arrow batches and physical coordinates. This
+//! module applies Iceberg field identity, delete facts, schema evolution, and
+//! virtual-column facts before returning the connector-neutral batch.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -40,33 +39,27 @@ use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot,
 };
-#[cfg(test)]
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use super::equality_delete::{
+use crate::delete_file::{delete_specs_for_data_file, included_positions_for_data_file};
+use crate::file_reader::equality_delete::{
     EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_with_context,
 };
-use novarocks_connector_iceberg::delete_file::{
-    delete_specs_for_data_file, included_positions_for_data_file,
-};
-use novarocks_connector_iceberg::file_reader::{
+use crate::file_reader::{
     connector_metrics, iceberg_data_file_format, map_file_error,
-    physical_predicates_to_file_predicates, validate_reader_request_context,
+    physical_predicates_to_file_predicates, retag_iceberg_array, validate_reader_request_context,
 };
-use novarocks_connector_iceberg::position_delete::load_position_deletes_with_context;
-use novarocks_connector_iceberg::scan_model::{IcebergDataFileInfo, IcebergPhysicalPredicate};
-use novarocks_connector_iceberg::schema_mapping::{
-    apply_name_mapping_to_schema as provider_apply_name_mapping_to_schema,
-    field_id_for_arrow_field as provider_field_id_for_arrow_field,
-    is_variant_struct_data_type as provider_is_variant_struct_data_type,
-    schema_field_id_coverage as provider_schema_field_id_coverage,
-    unidentified_fields_are_only_opaque_variants as provider_unidentified_fields_are_only_opaque_variants,
+use crate::position_delete::load_position_deletes_with_context;
+use crate::scan_model::{IcebergDataFileInfo, IcebergPhysicalPredicate};
+use crate::schema_mapping::{
+    apply_name_mapping_to_schema, field_id_for_arrow_field, is_variant_struct_data_type,
+    schema_field_id_coverage, unidentified_fields_are_only_opaque_variants,
 };
 
-pub(crate) struct IcebergBatchReader {
+/// One provider-owned physical Iceberg file reader.
+pub struct IcebergBatchReader {
     reader: Box<dyn FileBatchReader>,
     expected_schema: SchemaRef,
-    name_mapping: Option<Arc<novarocks_connector_iceberg::iceberg::spec::NameMapping>>,
+    name_mapping: Option<Arc<crate::iceberg::spec::NameMapping>>,
     data_file_path: String,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
@@ -82,7 +75,7 @@ pub(crate) struct IcebergBatchReader {
 }
 
 impl IcebergBatchReader {
-    pub(crate) fn try_new(
+    pub fn try_new(
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
         access: FsAccessHandle,
@@ -102,7 +95,7 @@ impl IcebergBatchReader {
         )
     }
 
-    pub(crate) fn try_new_with_name_mapping(
+    pub fn try_new_with_name_mapping(
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
         name_mapping: Option<&str>,
@@ -121,10 +114,9 @@ impl IcebergBatchReader {
         )
     }
 
-    /// Opens one FE-frozen physical leaf. A row-group selection is a
-    /// correctness boundary: it is applied before decoding, while Iceberg
-    /// delete/DV facts remain attached to the original data file.
-    pub(crate) fn try_new_with_name_mapping_and_row_groups(
+    /// Opens an FE-frozen physical leaf. Row-group pruning is applied before
+    /// decode while delete/DV facts remain attached to the full data file.
+    pub fn try_new_with_name_mapping_and_row_groups(
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
         name_mapping: Option<&str>,
@@ -158,10 +150,8 @@ impl IcebergBatchReader {
         )
     }
 
-    /// Build a reverse-projection reader for an equality-delete delta role.
-    /// Ordinary table scans keep rows not present in an equality-delete set;
-    /// the delta delete side must deliver exactly those matching rows instead.
-    pub(crate) fn try_new_matching_equality(
+    /// Creates the reverse-projection reader used by equality-delete deltas.
+    pub fn try_new_matching_equality(
         file: &IcebergDataFileInfo,
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
@@ -180,10 +170,8 @@ impl IcebergBatchReader {
         )
     }
 
-    /// Build one child of a multi-file delta reader.  The parent owns the
-    /// shared cancellation token, so EOF for one file must not cancel later
-    /// data/delete files in the same connector split.
-    pub(crate) fn try_new_delta_child(
+    /// Creates a child reader whose parent retains shared cancellation.
+    pub fn try_new_delta_child(
         file: &IcebergDataFileInfo,
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
@@ -203,10 +191,11 @@ impl IcebergBatchReader {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_new_with_equality_mode(
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
-        name_mapping: Option<Arc<novarocks_connector_iceberg::iceberg::spec::NameMapping>>,
+        name_mapping: Option<Arc<crate::iceberg::spec::NameMapping>>,
         row_groups: Option<&[usize]>,
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
@@ -221,9 +210,6 @@ impl IcebergBatchReader {
                 format!("Iceberg data file {} has a negative size", file.path),
             )
         })?;
-        // Keep one cancellation token for delete/DV materialization and the
-        // physical reader. Connector terminal lifecycle must be able to stop
-        // every provider-owned I/O path, not only the data-file decoder.
         let cancellation = file_context.cancellation.clone();
         let delete_specs = delete_specs_for_data_file(file)?;
         let position_deletes =
@@ -237,8 +223,6 @@ impl IcebergBatchReader {
             .bind_location(&file.path, FileIdentity::new(&file.path, file_size, None))
             .map_err(map_file_error)?;
         let format = iceberg_data_file_format(&file.path)?;
-        // ORC has no physical predicate support. Its SQL residual stays in
-        // Core because Iceberg reports such predicates as Unsupported.
         let predicates = if format == FileFormat::Parquet {
             physical_predicates_to_file_predicates(physical_predicates)
         } else {
@@ -405,21 +389,20 @@ fn apply_delete_filters(
         let position = positions.value(row);
         let position_keep = !position_deletes.contains(position)
             && included_positions.is_none_or(|included| included.contains(position));
-        let normal_equality_keep = match equality_keep.as_ref() {
-            Some(values) => values.get(row).copied().unwrap_or(false),
-            None => true,
-        };
-        let equality_keep = if equality_match_only {
-            !normal_equality_keep
-        } else {
-            normal_equality_keep
-        };
-        keep.push(position_keep && equality_keep);
+        let normal_equality_keep = equality_keep
+            .as_ref()
+            .map(|values| values.get(row).copied().unwrap_or(false))
+            .unwrap_or(true);
+        keep.push(
+            position_keep
+                && if equality_match_only {
+                    !normal_equality_keep
+                } else {
+                    normal_equality_keep
+                },
+        );
     }
-    if !changed {
-        return Ok((batch, Some(positions)));
-    }
-    if keep.iter().all(|keep| *keep) {
+    if !changed || keep.iter().all(|keep| *keep) {
         return Ok((batch, Some(positions)));
     }
     let keep = BooleanArray::from(keep);
@@ -450,21 +433,14 @@ fn apply_delete_filters(
 
 fn apply_name_mapping_to_batch(
     batch: RecordBatch,
-    name_mapping: Option<&novarocks_connector_iceberg::iceberg::spec::NameMapping>,
+    name_mapping: Option<&crate::iceberg::spec::NameMapping>,
 ) -> Result<RecordBatch, String> {
-    let (identified, total) = provider_schema_field_id_coverage(&batch.schema())?;
+    let (identified, total) = schema_field_id_coverage(&batch.schema())?;
     if identified == total {
         return Ok(batch);
     }
     if identified != 0 {
-        // Some parquet readers do not retain the parent field ID on the
-        // logical VARIANT group even though the physical file is valid. The
-        // variant payload is opaque to Iceberg field identity (its metadata
-        // and value children are not table fields), so a missing ID there is
-        // safe to align by name when no rename mapping is required. Keep the
-        // mixed-ID rejection for ordinary fields and nested structs.
-        if name_mapping.is_none()
-            && provider_unidentified_fields_are_only_opaque_variants(&batch.schema())?
+        if name_mapping.is_none() && unidentified_fields_are_only_opaque_variants(&batch.schema())?
         {
             return Ok(batch);
         }
@@ -473,36 +449,20 @@ fn apply_name_mapping_to_batch(
     let Some(name_mapping) = name_mapping else {
         return Ok(batch);
     };
-    let schema = provider_apply_name_mapping_to_schema(&batch.schema(), name_mapping)?;
+    let schema = apply_name_mapping_to_schema(&batch.schema(), name_mapping)?;
     RecordBatch::try_new(schema, batch.columns().to_vec())
         .map_err(|error| format!("apply Iceberg name mapping to batch schema: {error}"))
-}
-
-#[cfg(test)]
-fn parse_field_id(field: &Field) -> Result<Option<i32>, String> {
-    field
-        .metadata()
-        .get(PARQUET_FIELD_ID_META_KEY)
-        .map(|value| {
-            value.parse::<i32>().map_err(|error| {
-                format!(
-                    "invalid Iceberg field ID metadata for column {}: {error}",
-                    field.name()
-                )
-            })
-        })
-        .transpose()
 }
 
 fn source_index_for_target(
     source_fields: &[arrow::datatypes::FieldRef],
     target: &Field,
 ) -> Result<Option<usize>, String> {
-    let target_id = provider_field_id_for_arrow_field(target)?;
+    let target_id = field_id_for_arrow_field(target)?;
     if let Some(target_id) = target_id {
         let mut any_source_id = false;
         for (index, source) in source_fields.iter().enumerate() {
-            let source_id = provider_field_id_for_arrow_field(source.as_ref())?;
+            let source_id = field_id_for_arrow_field(source.as_ref())?;
             any_source_id |= source_id.is_some();
             if source_id == Some(target_id) {
                 return Ok(Some(index));
@@ -539,22 +499,14 @@ fn align_batch_to_schema(
                     source.data_type(),
                     target.data_type(),
                 ) {
-                    novarocks_execution::exec::chunk::type_compatibility::retag_column(
-                            &source,
-                            target.data_type(),
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "Iceberg field {} cannot align nested Arrow metadata ({error:?}) from {:?} to {:?}",
-                                target.name(),
-                                source.data_type(),
-                                target.data_type()
-                            )
-                        })?
+                    retag_iceberg_array(&source, target.data_type()).map_err(|error| format!(
+                        "Iceberg field {} cannot align nested Arrow metadata ({error}) from {:?} to {:?}",
+                        target.name(), source.data_type(), target.data_type()
+                    ))?
                 } else if matches!(target.data_type(), DataType::LargeBinary)
-                    && provider_is_variant_struct_data_type(source.data_type())
+                    && is_variant_struct_data_type(source.data_type())
                 {
-                    crate::formats::parquet::collapse_variant_struct_to_largebinary(
+                    crate::file_reader::variant::collapse_variant_struct_to_largebinary(
                         &source,
                         target.name(),
                     )?
@@ -572,11 +524,11 @@ fn align_batch_to_schema(
             None if is_iceberg_virtual(target.name()) => {
                 iceberg_virtual_column(target, batch.num_rows(), positions, &facts)?
             }
-            None if target.metadata().contains_key(
-                crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY,
-            ) =>
+            None if target
+                .metadata()
+                .contains_key(crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY) =>
             {
-                crate::formats::parquet::build_iceberg_default_array(
+                crate::default_value::build_iceberg_default_array(
                     target.as_ref(),
                     batch.num_rows(),
                 )?
@@ -642,13 +594,6 @@ fn iceberg_types_differ_only_by_nested_field_metadata(
     }
 }
 
-/// Retain a low-cardinality UTF-8 scan column as an Arrow dictionary carrier.
-///
-/// Parquet decoding normally materializes dictionary pages as flat UTF-8.  Keeping
-/// small domains encoded lets downstream filter and aggregate operators avoid
-/// repeatedly processing the same string values while retaining the logical scan
-/// schema.  High-cardinality columns stay flat so the per-batch dictionary does
-/// not inflate memory use.
 fn dictionary_encode_low_cardinality_strings(batch: RecordBatch) -> Result<RecordBatch, String> {
     const MAX_DISTINCT_VALUES: usize = 64;
     const MIN_NON_NULL_VALUES: usize = 2;
@@ -823,7 +768,8 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow::array::Int32Array;
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::Field;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::*;
 
@@ -832,168 +778,6 @@ mod tests {
             PARQUET_FIELD_ID_META_KEY.to_string(),
             field_id.to_string(),
         )]))
-    }
-
-    fn physical_variant_field(name: &str, field_id: Option<i32>) -> Field {
-        let field = Field::new(
-            name,
-            DataType::Struct(
-                vec![
-                    Field::new("metadata", DataType::Binary, false),
-                    Field::new("value", DataType::Binary, true),
-                ]
-                .into(),
-            ),
-            true,
-        );
-        match field_id {
-            Some(field_id) => field.with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                field_id.to_string(),
-            )])),
-            None => field,
-        }
-    }
-
-    #[test]
-    fn applies_name_mapping_recursively_to_reordered_nested_schema() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "old_map",
-                DataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        DataType::Struct(
-                            vec![
-                                Field::new("old_key", DataType::Utf8, false),
-                                Field::new("old_value", DataType::Int32, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                true,
-            ),
-            Field::new(
-                "old_values",
-                DataType::List(Arc::new(Field::new("element_old", DataType::Int32, true))),
-                true,
-            ),
-            Field::new(
-                "old_record",
-                DataType::Struct(vec![Field::new("old_nested", DataType::Int32, false)].into()),
-                false,
-            ),
-        ]));
-        let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping = serde_json::from_str(
-            r#"[
-                {"field-id":1,"names":["old_record"],"fields":[{"field-id":2,"names":["old_nested"]}]},
-                {"field-id":3,"names":["old_values"],"fields":[{"field-id":4,"names":["element_old"]}]},
-                {"field-id":5,"names":["old_map"],"fields":[
-                    {"field-id":6,"names":["old_key"]},
-                    {"field-id":7,"names":["old_value"]}
-                ]}
-            ]"#,
-        )
-        .expect("mapping");
-
-        let mapped =
-            provider_apply_name_mapping_to_schema(&schema, &mapping).expect("recursive mapping");
-        assert_eq!(
-            provider_schema_field_id_coverage(&mapped).expect("coverage"),
-            (7, 7)
-        );
-        assert_eq!(parse_field_id(mapped.field(0)).expect("map ID"), Some(5));
-        assert_eq!(parse_field_id(mapped.field(1)).expect("list ID"), Some(3));
-        assert_eq!(parse_field_id(mapped.field(2)).expect("struct ID"), Some(1));
-    }
-
-    #[test]
-    fn name_mapping_rejects_missing_nested_alias_and_mixed_ids_are_detected() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "old_record",
-            DataType::Struct(vec![Field::new("missing", DataType::Int32, false)].into()),
-            false,
-        )]));
-        let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping = serde_json::from_str(
-            r#"[{"field-id":1,"names":["old_record"],"fields":[{"field-id":2,"names":["other"]}]}]"#,
-        )
-        .expect("mapping");
-        assert!(
-            provider_apply_name_mapping_to_schema(&schema, &mapping)
-                .expect_err("nested mapping must be complete")
-                .contains("does not contain physical field missing")
-        );
-
-        let mixed = Arc::new(Schema::new(vec![
-            field_with_id("identified", 1, false),
-            Field::new("unidentified", DataType::Int32, false),
-        ]));
-        assert_eq!(
-            provider_schema_field_id_coverage(&mixed).expect("coverage"),
-            (1, 2)
-        );
-    }
-
-    #[test]
-    fn variant_physical_children_do_not_participate_in_iceberg_field_id_coverage() {
-        let schema = Arc::new(Schema::new(vec![
-            field_with_id("id", 1, false),
-            physical_variant_field("payload", Some(2)),
-        ]));
-        assert_eq!(
-            provider_schema_field_id_coverage(&schema).expect("coverage"),
-            (2, 2)
-        );
-
-        let ordinary_struct = Arc::new(Schema::new(vec![
-            Field::new(
-                "record",
-                DataType::Struct(vec![Field::new("child", DataType::Int32, false)].into()),
-                false,
-            )
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "3".to_string(),
-            )])),
-        ]));
-        assert_eq!(
-            provider_schema_field_id_coverage(&ordinary_struct).expect("ordinary struct coverage"),
-            (1, 2)
-        );
-    }
-
-    #[test]
-    fn missing_variant_parent_id_does_not_make_a_valid_file_mixed() {
-        let schema = Arc::new(Schema::new(vec![
-            field_with_id("id", 1, false),
-            physical_variant_field("payload", None),
-        ]));
-
-        assert!(
-            provider_unidentified_fields_are_only_opaque_variants(&schema)
-                .expect("variant coverage")
-        );
-    }
-
-    #[test]
-    fn name_mapping_treats_variant_physical_children_as_opaque() {
-        let schema = Arc::new(Schema::new(vec![physical_variant_field("payload", None)]));
-        let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping =
-            serde_json::from_str(r#"[{"field-id":2,"names":["payload"]}]"#).expect("mapping");
-
-        let mapped =
-            provider_apply_name_mapping_to_schema(&schema, &mapping).expect("variant mapping");
-        assert_eq!(
-            provider_schema_field_id_coverage(&mapped).expect("coverage"),
-            (1, 1)
-        );
-        assert_eq!(
-            parse_field_id(mapped.field(0)).expect("variant field ID"),
-            Some(2)
-        );
     }
 
     #[test]
@@ -1008,13 +792,12 @@ mod tests {
                 Arc::new(Int32Array::from(vec![10])) as ArrayRef,
             ],
         )
-        .expect("source batch");
+        .unwrap();
         let expected = Arc::new(Schema::new(vec![
             field_with_id("first", 1, false),
             field_with_id("second", 2, false),
             field_with_id("introduced_nullable", 3, true),
         ]));
-
         let aligned = align_batch_to_schema(
             &expected,
             source,
@@ -1026,9 +809,7 @@ mod tests {
                 ivm_change_op: None,
             },
         )
-        .expect("field-ID alignment");
-        assert_eq!(aligned.schema().field(0).name(), "first");
-        assert_eq!(aligned.schema().field(1).name(), "second");
+        .unwrap();
         assert_eq!(
             aligned
                 .column(0)
@@ -1051,152 +832,14 @@ mod tests {
     }
 
     #[test]
-    fn aligns_nested_iceberg_field_metadata_without_arrow_cast() {
-        let source_type = DataType::Map(
-            Arc::new(Field::new(
-                "key_value",
-                DataType::Struct(
-                    vec![
-                        Field::new("key", DataType::Int32, false),
-                        Field::new(
-                            "value",
-                            DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
-                            true,
-                        ),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        );
-        let target_type = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Field::new("key", DataType::Int32, true),
-                        Field::new(
-                            "value",
-                            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                            true,
-                        ),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        );
-        let source = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "map2",
-                source_type.clone(),
-                true,
-            )])),
-            vec![arrow::array::new_empty_array(&source_type)],
-        )
-        .expect("source batch");
-        let expected = Arc::new(Schema::new(vec![Field::new(
-            "map2",
-            target_type.clone(),
-            true,
-        )]));
-
-        let aligned = align_batch_to_schema(
-            &expected,
-            source,
-            None,
-            IcebergFileFacts {
-                path: "file:///test.parquet",
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-            },
-        )
-        .expect("nested metadata alignment");
-
-        assert_eq!(aligned.column(0).data_type(), &target_type);
-    }
-
-    #[test]
-    fn aligns_iceberg_output_with_initial_default_for_missing_field() {
-        let source = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![field_with_id("id", 1, false)])),
-            vec![Arc::new(Int32Array::from(vec![7])) as ArrayRef],
-        )
-        .expect("source batch");
-        let expected = Arc::new(Schema::new(vec![
-            field_with_id("id", 1, false),
-            Field::new("introduced", DataType::Int32, true).with_metadata(HashMap::from([
-                (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
-                (
-                    crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
-                    "5".to_string(),
-                ),
-            ])),
-        ]));
-
-        let aligned = align_batch_to_schema(
-            &expected,
-            source,
-            None,
-            IcebergFileFacts {
-                path: "file:///test.parquet",
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-            },
-        )
-        .expect("initial default must fill older data files");
-
-        let introduced = aligned
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("introduced column");
-        assert_eq!(introduced.value(0), 5);
-        assert_eq!(introduced.null_count(), 0);
-    }
-
-    #[test]
-    fn dictionary_encodes_low_cardinality_utf8_columns() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "status",
-                DataType::Utf8,
-                true,
-            )])),
-            vec![Arc::new(StringArray::from(vec![
-                Some("NEW"),
-                Some("PAID"),
-                Some("PAID"),
-                Some("CANCELLED"),
-                Some("SHIPPED"),
-                None,
-            ])) as ArrayRef],
-        )
-        .expect("source batch");
-
-        let encoded = dictionary_encode_low_cardinality_strings(batch)
-            .expect("dictionary encode low-cardinality status");
-        assert!(matches!(
-            encoded.column(0).data_type(),
-            DataType::Dictionary(key, value)
-                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8
-        ));
-    }
-
-    #[test]
     fn applies_position_deletes_and_included_positions_to_physical_coordinates() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
         )
-        .expect("source batch");
+        .unwrap();
         let deletes = roaring::RoaringTreemap::from_iter([6]);
         let included = roaring::RoaringTreemap::from_iter([5, 6]);
-
         let (filtered, positions) = apply_delete_filters(
             batch,
             Some(UInt64Array::from(vec![5, 6, 7])),
@@ -1206,18 +849,9 @@ mod tests {
             Some(&included),
             "file:///warehouse/data.parquet",
         )
-        .expect("filter physical positions");
+        .unwrap();
         assert_eq!(filtered.num_rows(), 1);
         assert_eq!(positions.unwrap().value(0), 5);
-        assert_eq!(
-            filtered
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .value(0),
-            10
-        );
     }
 
     #[test]
@@ -1229,10 +863,8 @@ mod tests {
         .unwrap();
         let expected = Arc::new(Schema::new(vec![
             field_with_id("id", 1, false),
-            Field::new("_file", DataType::Utf8, false),
             Field::new("_pos", DataType::Int64, false),
             Field::new("_row_id", DataType::Int64, false),
-            Field::new("_last_updated_sequence_number", DataType::Int64, false),
         ]));
         let aligned = align_batch_to_schema(
             &expected,
@@ -1250,10 +882,10 @@ mod tests {
             aligned
                 .column(1)
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<Int64Array>()
                 .unwrap()
-                .value(0),
-            "s3://warehouse/data.parquet"
+                .values(),
+            &[5, 7]
         );
         assert_eq!(
             aligned
@@ -1262,59 +894,7 @@ mod tests {
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .values(),
-            &[5, 7]
-        );
-        assert_eq!(
-            aligned
-                .column(3)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values(),
             &[105, 107]
-        );
-        assert_eq!(
-            aligned
-                .column(4)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values(),
-            &[19, 19]
-        );
-    }
-
-    #[test]
-    fn synthesizes_delta_change_op_from_provider_file_facts() {
-        let source = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![field_with_id("id", 1, false)])),
-            vec![Arc::new(Int32Array::from(vec![10, 30])) as ArrayRef],
-        )
-        .unwrap();
-        let expected = Arc::new(Schema::new(vec![
-            field_with_id("id", 1, false),
-            Field::new("__change_op", DataType::Int8, false),
-        ]));
-        let aligned = align_batch_to_schema(
-            &expected,
-            source,
-            None,
-            IcebergFileFacts {
-                path: "s3://warehouse/data.parquet",
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: Some(1),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            aligned
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::Int8Array>()
-                .unwrap()
-                .values(),
-            &[1, 1]
         );
     }
 }

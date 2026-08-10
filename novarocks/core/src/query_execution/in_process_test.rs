@@ -128,7 +128,12 @@ fn install_connector_bindings(
         Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
     );
     let installers: Vec<Arc<dyn ConnectorExecutionInstaller>> = vec![Arc::new(
-        crate::connector::iceberg::provider::IcebergConnectorInstaller::new(binding),
+        crate::connector::iceberg::provider::IcebergConnectorInstaller::new(
+            novarocks_connector_iceberg::resources::IcebergExecutionResources::new(
+                binding,
+                runtime.handle().clone(),
+            ),
+        ),
     )];
     let context = crate::connector::test_request_context();
     let mut resolver = TestExecutionResolver {

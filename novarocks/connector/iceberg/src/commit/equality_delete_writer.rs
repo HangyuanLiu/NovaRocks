@@ -20,23 +20,23 @@
 //! The writer receives an Arrow batch that already contains only equality-key
 //! columns. It attaches Iceberg field-id metadata to the Parquet schema, writes
 //! one delete file under the caller-provided staging directory, and returns a
-//! [`crate::connector::iceberg::commit::types::WrittenFile`] with `content = EqualityDeletes` and
+//! [`super::types::WrittenFile`] with `content = EqualityDeletes` and
 //! `equality_ids` populated for `RowDeltaCommit`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::iceberg::io::FileIO;
+use crate::iceberg::spec::{DataContentType, DataFileFormat, Struct};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use arrow::record_batch::RecordBatch;
-use novarocks_connector_iceberg::iceberg::io::FileIO;
-use novarocks_connector_iceberg::iceberg::spec::{DataContentType, DataFileFormat, Struct};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-use crate::connector::iceberg::commit::types::WrittenFile;
+use super::types::WrittenFile;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EqualityDeleteColumn {

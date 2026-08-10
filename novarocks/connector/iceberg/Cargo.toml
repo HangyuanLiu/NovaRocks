@@ -25,6 +25,7 @@ doctest = false
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-catalog-hms = "0.9.0"
@@ -43,10 +44,12 @@ sha2 = "0.10"
 tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 typetag = "0.2"
+url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 novarocks-catalog = { path = "../../catalog" }
 novarocks-fs = { path = "../../fs" }
 novarocks-spi = { path = "../../spi" }
+novarocks-types = { path = "../../types" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -15,52 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
-
-use arrow::array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
-};
+use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::connector::file_execution::read_foundation_parquet_batches;
 use novarocks_connector_iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
-use novarocks_fs::FileReadContext;
 use novarocks_fs::{FileProjection, FsAccessHandle};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum EqualityValue {
-    Null,
-    Bool(bool),
-    I64(i64),
-    U64(u64),
-    F64(u64),
-    Utf8(String),
-    Binary(Vec<u8>),
-    Decimal128(i128, i8),
-    Date32(i32),
-    Date64(i64),
-    Timestamp(i64, TimeUnit),
-}
-
-#[derive(Clone, Debug)]
-pub struct EqualityDeleteSet {
-    columns: Vec<EqualityColumnRef>,
-    keys: HashSet<Vec<EqualityValue>>,
-}
-
-#[derive(Clone, Debug)]
-struct EqualityColumnRef {
-    name: String,
-    field_id: Option<i32>,
-}
+use novarocks_connector_iceberg::file_reader::equality_delete::{
+    EqualityDeleteSet, equality_delete_keep_mask, equality_delete_set_from_record_batches,
+};
 
 pub(crate) fn load_equality_delete_sets(
     specs: &[IcebergDeleteFileSpec],
@@ -85,123 +51,18 @@ pub(crate) fn load_equality_delete_sets(
         }
         let batches =
             read_foundation_parquet_batches(access, &spec.path, spec.length, FileProjection::All)?;
-        let Some(schema) = batches.first().map(RecordBatch::schema) else {
+        if batches.is_empty() {
             continue;
-        };
-        if schema.fields().is_empty() {
-            return Err(format!(
-                "iceberg equality-delete file {} has no equality columns",
-                spec.path
-            ));
         }
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| equality_column_ref(field.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut keys = HashSet::new();
-        for batch in batches {
-            if batch.num_columns() != columns.len() {
-                return Err(format!(
-                    "equality-delete batch from {} has {} columns, expected {}",
-                    spec.path,
-                    batch.num_columns(),
-                    columns.len()
-                ));
-            }
-            for row in 0..batch.num_rows() {
-                keys.insert(equality_key_for_row(&batch, row, &columns)?);
-            }
-        }
-        sets.push(EqualityDeleteSet { columns, keys });
+        sets.push(equality_delete_set_from_record_batches(
+            &spec.path, batches,
+        )?);
     }
     Ok(sets)
 }
 
-/// Provider-reader variant whose delete-file decoding shares the data reader's
-/// process-local runtime, deadline, and cancellation binding.
-pub(crate) fn load_equality_delete_sets_with_context(
-    specs: &[IcebergDeleteFileSpec],
-    access: &FsAccessHandle,
-    context: &FileReadContext,
-) -> Result<Vec<EqualityDeleteSet>, String> {
-    let mut sets = Vec::new();
-    for spec in specs {
-        if spec.file_content != IcebergFileContent::EqualityDeletes {
-            continue;
-        }
-        if spec.file_format != IcebergFileFormat::Parquet
-            || spec.content_offset.is_some()
-            || spec.content_size_in_bytes.is_some()
-        {
-            return Err(format!(
-                "iceberg equality-delete file {} has unsupported physical layout",
-                spec.path
-            ));
-        }
-        let batches = novarocks_connector_iceberg::file_reader::read_parquet_batches(
-            access,
-            &spec.path,
-            spec.length,
-            FileProjection::All,
-            context.clone(),
-        )?;
-        let Some(schema) = batches.first().map(|batch| batch.batch.schema()) else {
-            continue;
-        };
-        if schema.fields().is_empty() {
-            return Err(format!(
-                "iceberg equality-delete file {} has no equality columns",
-                spec.path
-            ));
-        }
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| equality_column_ref(field.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut keys = HashSet::new();
-        for file_batch in batches {
-            let batch = file_batch.batch;
-            if batch.num_columns() != columns.len() {
-                return Err(format!(
-                    "equality-delete batch from {} has {} columns, expected {}",
-                    spec.path,
-                    batch.num_columns(),
-                    columns.len()
-                ));
-            }
-            for row in 0..batch.num_rows() {
-                keys.insert(equality_key_for_row(&batch, row, &columns)?);
-            }
-        }
-        sets.push(EqualityDeleteSet { columns, keys });
-    }
-    Ok(sets)
-}
-
-pub(crate) fn equality_delete_keep_mask(
-    batch: &RecordBatch,
-    sets: &[EqualityDeleteSet],
-) -> Result<Option<Vec<bool>>, String> {
-    if sets.is_empty() || batch.num_rows() == 0 {
-        return Ok(None);
-    }
-    let mut keep = Vec::with_capacity(batch.num_rows());
-    let mut deleted_count = 0usize;
-    for row in 0..batch.num_rows() {
-        let deleted = row_matches_any_equality_delete(batch, row, sets)?;
-        if deleted {
-            deleted_count += 1;
-        }
-        keep.push(!deleted);
-    }
-    if deleted_count == 0 {
-        return Ok(None);
-    }
-    Ok(Some(keep))
-}
-
+/// Legacy Core-only IVM reverse projection.  It owns older `FileScanContext`
+/// construction and calls the provider for all equality semantics.
 #[allow(dead_code)]
 pub(crate) fn read_data_file_matching_equality_deletes_with_path_normalizer<N>(
     data_file_path: &str,
@@ -242,219 +103,6 @@ where
         }
     }
     Ok(out)
-}
-
-fn row_matches_any_equality_delete(
-    batch: &RecordBatch,
-    row: usize,
-    sets: &[EqualityDeleteSet],
-) -> Result<bool, String> {
-    for set in sets {
-        let key = equality_key_for_row(batch, row, &set.columns)?;
-        if set.keys.contains(&key) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-pub(crate) fn equality_delete_row_is_deleted(
-    batch: &RecordBatch,
-    row: usize,
-    sets: &[EqualityDeleteSet],
-) -> Result<bool, String> {
-    if sets.is_empty() {
-        return Ok(false);
-    }
-    row_matches_any_equality_delete(batch, row, sets)
-}
-
-fn equality_key_for_row(
-    batch: &RecordBatch,
-    row: usize,
-    columns: &[EqualityColumnRef],
-) -> Result<Vec<EqualityValue>, String> {
-    let schema = batch.schema();
-    let mut key = Vec::with_capacity(columns.len());
-    for column in columns {
-        let idx = find_equality_column_index(schema.as_ref(), column)?;
-        key.push(equality_value(batch.column(idx).as_ref(), row)?);
-    }
-    Ok(key)
-}
-
-fn equality_column_ref(field: &Field) -> Result<EqualityColumnRef, String> {
-    Ok(EqualityColumnRef {
-        name: field.name().to_ascii_lowercase(),
-        field_id: parse_parquet_field_id(field)?,
-    })
-}
-
-fn find_equality_column_index(
-    schema: &Schema,
-    column: &EqualityColumnRef,
-) -> Result<usize, String> {
-    if let Some(target_field_id) = column.field_id {
-        let mut schema_has_field_ids = false;
-        for (idx, field) in schema.fields().iter().enumerate() {
-            let field_id = parse_parquet_field_id(field.as_ref())?;
-            schema_has_field_ids |= field_id.is_some();
-            if field_id == Some(target_field_id) {
-                return Ok(idx);
-            }
-        }
-        if schema_has_field_ids {
-            return Err(equality_column_missing_error(schema, column));
-        }
-    }
-
-    schema
-        .fields()
-        .iter()
-        .position(|field| field.name().eq_ignore_ascii_case(&column.name))
-        .ok_or_else(|| equality_column_missing_error(schema, column))
-}
-
-fn equality_column_missing_error(schema: &Schema, column: &EqualityColumnRef) -> String {
-    let field_id = column
-        .field_id
-        .map(|id| format!(" field_id={id}"))
-        .unwrap_or_default();
-    format!(
-        "equality-delete column `{}`{} is not available in data batch schema {:?}",
-        column.name,
-        field_id,
-        schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
-    )
-}
-
-fn parse_parquet_field_id(field: &Field) -> Result<Option<i32>, String> {
-    let Some(raw) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
-        return Ok(None);
-    };
-    raw.parse::<i32>().map(Some).map_err(|e| {
-        format!(
-            "invalid parquet field_id metadata: field={} key={} value={} error={}",
-            field.name(),
-            PARQUET_FIELD_ID_META_KEY,
-            raw,
-            e
-        )
-    })
-}
-
-fn equality_value(array: &dyn Array, row: usize) -> Result<EqualityValue, String> {
-    if array.is_null(row) {
-        return Ok(EqualityValue::Null);
-    }
-    match array.data_type() {
-        DataType::Boolean => {
-            let a = array_as::<BooleanArray>(array)?;
-            Ok(EqualityValue::Bool(a.value(row)))
-        }
-        DataType::Int8 => {
-            let a = array_as::<Int8Array>(array)?;
-            Ok(EqualityValue::I64(i64::from(a.value(row))))
-        }
-        DataType::Int16 => {
-            let a = array_as::<Int16Array>(array)?;
-            Ok(EqualityValue::I64(i64::from(a.value(row))))
-        }
-        DataType::Int32 => {
-            let a = array_as::<Int32Array>(array)?;
-            Ok(EqualityValue::I64(i64::from(a.value(row))))
-        }
-        DataType::Int64 => {
-            let a = array_as::<Int64Array>(array)?;
-            Ok(EqualityValue::I64(a.value(row)))
-        }
-        DataType::UInt8 => {
-            let a = array_as::<UInt8Array>(array)?;
-            Ok(EqualityValue::U64(u64::from(a.value(row))))
-        }
-        DataType::UInt16 => {
-            let a = array_as::<UInt16Array>(array)?;
-            Ok(EqualityValue::U64(u64::from(a.value(row))))
-        }
-        DataType::UInt32 => {
-            let a = array_as::<UInt32Array>(array)?;
-            Ok(EqualityValue::U64(u64::from(a.value(row))))
-        }
-        DataType::UInt64 => {
-            let a = array_as::<UInt64Array>(array)?;
-            Ok(EqualityValue::U64(a.value(row)))
-        }
-        DataType::Float32 => {
-            let a = array_as::<Float32Array>(array)?;
-            Ok(EqualityValue::F64(f64::from(a.value(row)).to_bits()))
-        }
-        DataType::Float64 => {
-            let a = array_as::<Float64Array>(array)?;
-            Ok(EqualityValue::F64(a.value(row).to_bits()))
-        }
-        DataType::Utf8 => {
-            let a = array_as::<StringArray>(array)?;
-            Ok(EqualityValue::Utf8(a.value(row).to_string()))
-        }
-        DataType::LargeUtf8 => {
-            let a = array_as::<LargeStringArray>(array)?;
-            Ok(EqualityValue::Utf8(a.value(row).to_string()))
-        }
-        DataType::Binary => {
-            let a = array_as::<BinaryArray>(array)?;
-            Ok(EqualityValue::Binary(a.value(row).to_vec()))
-        }
-        DataType::LargeBinary => {
-            let a = array_as::<LargeBinaryArray>(array)?;
-            Ok(EqualityValue::Binary(a.value(row).to_vec()))
-        }
-        DataType::Decimal128(_, scale) => {
-            let a = array_as::<Decimal128Array>(array)?;
-            Ok(EqualityValue::Decimal128(a.value(row), *scale))
-        }
-        DataType::Date32 => {
-            let a = array_as::<Date32Array>(array)?;
-            Ok(EqualityValue::Date32(a.value(row)))
-        }
-        DataType::Date64 => {
-            let a = array_as::<Date64Array>(array)?;
-            Ok(EqualityValue::Date64(a.value(row)))
-        }
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            let a = array_as::<TimestampSecondArray>(array)?;
-            Ok(EqualityValue::Timestamp(a.value(row), TimeUnit::Second))
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let a = array_as::<TimestampMillisecondArray>(array)?;
-            Ok(EqualityValue::Timestamp(
-                a.value(row),
-                TimeUnit::Millisecond,
-            ))
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let a = array_as::<TimestampMicrosecondArray>(array)?;
-            Ok(EqualityValue::Timestamp(
-                a.value(row),
-                TimeUnit::Microsecond,
-            ))
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let a = array_as::<TimestampNanosecondArray>(array)?;
-            Ok(EqualityValue::Timestamp(a.value(row), TimeUnit::Nanosecond))
-        }
-        other => Err(format!(
-            "unsupported equality-delete column type for row filtering: {other:?}"
-        )),
-    }
-}
-
-fn array_as<T: 'static>(array: &dyn Array) -> Result<&T, String> {
-    array.as_any().downcast_ref::<T>().ok_or_else(|| {
-        format!(
-            "array downcast failed for equality-delete filtering: {:?}",
-            array.data_type()
-        )
-    })
 }
 
 #[cfg(test)]
@@ -622,7 +270,11 @@ mod tests {
         )
         .expect("data batch");
 
-        let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
+        let mask =
+            novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_keep_mask(
+                &data, &sets,
+            )
+            .expect("mask");
 
         assert_eq!(mask, Some(vec![true, false, true, false]));
     }
@@ -659,7 +311,11 @@ mod tests {
         )
         .expect("data batch");
 
-        let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
+        let mask =
+            novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_keep_mask(
+                &data, &sets,
+            )
+            .expect("mask");
 
         assert_eq!(mask, Some(vec![true, false, true]));
     }
@@ -692,7 +348,11 @@ mod tests {
         let data = RecordBatch::try_new(data_schema, vec![Arc::new(Int32Array::from(vec![20]))])
             .expect("data batch");
 
-        let err = super::equality_delete_keep_mask(&data, &sets).expect_err("field-id mismatch");
+        let err =
+            novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_keep_mask(
+                &data, &sets,
+            )
+            .expect_err("field-id mismatch");
 
         assert!(err.contains("field_id=2"), "{err}");
     }
@@ -728,7 +388,11 @@ mod tests {
         )
         .expect("data batch");
 
-        let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
+        let mask =
+            novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_keep_mask(
+                &data, &sets,
+            )
+            .expect("mask");
 
         assert_eq!(mask, Some(vec![false, true]));
     }
@@ -763,7 +427,11 @@ mod tests {
             .expect("decimal data array");
         let data = RecordBatch::try_new(data_schema, vec![Arc::new(amounts)]).expect("data batch");
 
-        let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
+        let mask =
+            novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_keep_mask(
+                &data, &sets,
+            )
+            .expect("mask");
 
         assert_eq!(mask, Some(vec![false, true]));
     }

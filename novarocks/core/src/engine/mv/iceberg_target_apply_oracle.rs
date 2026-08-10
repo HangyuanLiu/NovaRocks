@@ -26,6 +26,7 @@
 
 #[cfg(test)]
 use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_connector_iceberg::commit::{PositionDeleteGroup, write_position_delete_files};
 #[cfg(test)]
 use novarocks_connector_iceberg::delete_file::{
     ReferencedDataFilePartition, ReferencedDataFilePartitions,
@@ -92,7 +93,7 @@ pub(crate) async fn locate_target_rows_by_apply_key(
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+) -> Result<Vec<PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_apply_key_with_matches(
         target_table,
         base_row_ids,
@@ -131,7 +132,7 @@ pub(crate) async fn locate_target_rows_by_string_apply_key(
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+) -> Result<Vec<PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_string_apply_key_with_matches(
         target_table,
         apply_key_column,
@@ -185,7 +186,7 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key(
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+) -> Result<Vec<PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_branch_apply_key_with_matches(
         target_table,
         requested_keys,
@@ -224,7 +225,7 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+) -> Result<Vec<PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_branch_string_apply_key_with_matches(
         target_table,
         apply_key_column,
@@ -296,7 +297,7 @@ pub(crate) struct TargetRowPositionSet {
 
 #[cfg(test)]
 pub(crate) struct TargetApplyLocatorResult {
-    pub(crate) delete_groups: Vec<crate::connector::iceberg::commit::PositionDeleteGroup>,
+    pub(crate) delete_groups: Vec<PositionDeleteGroup>,
     pub(crate) matched_positions: Vec<TargetRowPositionSet>,
 }
 
@@ -653,7 +654,7 @@ fn process_branch_utf8_apply_key_locator_batch(
 fn build_position_delete_groups_from_apply_key_matches(
     matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
     referenced_data_file_partitions: &ReferencedDataFilePartitions,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+) -> Result<Vec<PositionDeleteGroup>, String> {
     Ok(build_target_apply_locator_result_from_apply_key_matches(
         matches,
         referenced_data_file_partitions,
@@ -686,7 +687,7 @@ fn build_target_apply_locator_result_from_apply_key_matches(
             referenced_data_file: referenced_data_file.clone(),
             positions: positions.clone(),
         });
-        delete_groups.push(crate::connector::iceberg::commit::PositionDeleteGroup {
+        delete_groups.push(PositionDeleteGroup {
             referenced_data_file,
             partition_spec_id: partition.partition_spec_id,
             partition_values: partition.partition_values.clone(),
@@ -1738,7 +1739,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
-) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+) -> Result<Vec<PositionDeleteGroup>, String> {
     locate_target_rows_by_string_apply_key(
         target_table,
         JOIN_APPLY_KEY_COLUMN_NAME,
@@ -1753,7 +1754,6 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::commit::PositionDeleteGroup;
     use crate::mv::model::TargetPartitionFilter;
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -2455,7 +2455,7 @@ mod tests {
             // file per partition, so data_files[0] = region=a and
             // data_files[1] = region=b.
             let data_files =
-                crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files(
                     &table,
                     vec![batch_a, batch_b],
                 )
@@ -2616,7 +2616,7 @@ mod tests {
             .expect("branch batch");
 
             let data_files =
-                crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files(
                     &table,
                     vec![batch],
                 )
@@ -2707,7 +2707,7 @@ mod tests {
             metadata.location(),
             uuid::Uuid::new_v4()
         );
-        let written = crate::connector::iceberg::commit::write_position_delete_files(
+        let written = write_position_delete_files(
             &fixture.table.file_io().clone(),
             &staging_dir,
             delete_groups,

@@ -34,13 +34,11 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
 use crate::connector::iceberg::commit::{
-    CleanupPathMapper, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
-    ensure_iceberg_write_supported, ensure_no_equality_deletes,
-    ensure_overwrite_single_partition_spec,
+    CleanupPathMapper, CommitServiceError, IcebergCommitCollector, ensure_iceberg_write_supported,
+    ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
 };
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, WrittenFile};
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
-use crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1;
 use crate::connector::iceberg::write_service::{
     IcebergWriteControlService, IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
 };
@@ -60,6 +58,8 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::SqlType;
+use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
+use novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,

@@ -50,19 +50,19 @@ use crate::connector::iceberg::commit::{
     classify_iceberg_write_mode,
 };
 use crate::connector::iceberg::commit::{CommitOpKind, IcebergWriteMode, WrittenFile};
-use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
-use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
 use crate::connector::iceberg::write_service::IcebergWriteServiceRegistry;
 use crate::sql::literal::{literal_to_i128_for_integer, parse_datetime_string_to_nanos};
 use crate::sql::{ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::{ColumnDefault, SqlType};
+use novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files;
+use novarocks_connector_iceberg::commit::variant_write::parse_variant_shredding_properties;
 use novarocks_connector_iceberg::fs_io;
 
 #[derive(Default)]
 pub(crate) struct IcebergCatalogRegistry {
-    catalogs: HashMap<String, IcebergCatalogEntry>,
+    catalogs: novarocks_connector_iceberg::catalog_control::IcebergCatalogControlRegistry,
     write_services: IcebergWriteServiceRegistry,
 }
 
@@ -130,43 +130,28 @@ impl IcebergCatalogRegistry {
         catalog_name: &str,
         properties: &[(String, String)],
     ) -> Result<(), String> {
-        let key = normalize_identifier(catalog_name)?;
-        if self.catalogs.contains_key(&key) {
-            return Ok(());
-        }
-        let entry = build_catalog_entry(catalog_name, properties)?;
-        self.catalogs.insert(key, entry);
-        Ok(())
+        self.catalogs.ensure_with(catalog_name, || {
+            build_catalog_entry(catalog_name, properties)
+        })
     }
 
     pub(crate) fn get(&self, catalog_name: &str) -> Result<IcebergCatalogEntry, String> {
-        let key = normalize_identifier(catalog_name)?;
-        self.catalogs
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| format!("unknown catalog: {catalog_name}"))
+        self.catalogs.get(catalog_name)
     }
 
     pub(crate) fn contains_catalog(&self, catalog_name: &str) -> Result<bool, String> {
-        let key = normalize_identifier(catalog_name)?;
-        Ok(self.catalogs.contains_key(&key))
+        self.catalogs.contains(catalog_name)
     }
 
     /// Return the normalized names of every registered catalog, sorted for
     /// deterministic iteration. Used by lake-native IMV cache rebuild to walk
     /// all live Iceberg catalogs (see `engine::mv::lake_rebuild`).
     pub(crate) fn catalog_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.catalogs.keys().cloned().collect();
-        names.sort();
-        names
+        self.catalogs.names()
     }
 
     pub(crate) fn drop_catalog(&mut self, catalog_name: &str) -> Result<(), String> {
-        let key = normalize_identifier(catalog_name)?;
-        self.catalogs
-            .remove(&key)
-            .map(|_| ())
-            .ok_or_else(|| format!("unknown catalog: {catalog_name}"))
+        self.catalogs.remove(catalog_name)
     }
 }
 

@@ -103,19 +103,15 @@ use super::catalog::views;
 use super::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
 use super::data_mutation::IcebergDataMutationAdapter;
 use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
-use super::reader::IcebergBatchReader;
 use super::write_contract::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
-    encode_data_sink_spec_handle_payload, encode_deletion_vector_sink_handle_payload,
-    encode_equality_delete_sink_spec_handle_payload, encode_position_delete_sink_handle_payload,
-    iceberg_write_sink_mode,
+    encode_data_sink_spec_handle_payload, encode_equality_delete_sink_spec_handle_payload,
+    encode_position_delete_sink_handle_payload,
 };
 use super::write_control::{
-    IcebergFirstRefreshWritePlanPayloadV2, IcebergRowMutationActivationFactory,
-    IcebergRowMutationPreparationFactory, IcebergWriteControlAdapter, IcebergWritePlanPayloadV1,
-    IcebergWritePreparationFactory,
+    IcebergRowMutationActivationFactory, IcebergRowMutationPreparationFactory,
+    IcebergWriteControlAdapter, IcebergWritePreparationFactory,
 };
-use super::write_execution::IcebergDataWriteExecution;
 use super::write_service::{
     IcebergFirstRefreshWriteReportCommitter, IcebergMvPrimaryEmptyInputPolicy,
     IcebergWriteCohortContext, IcebergWriteControlService, IcebergWriteControlServiceContext,
@@ -123,10 +119,28 @@ use super::write_service::{
 };
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
+use novarocks_connector_iceberg::commit::write_execution::IcebergDataWriteExecution;
+use novarocks_connector_iceberg::delta::IcebergDeltaSplitPayload;
 use novarocks_connector_iceberg::execution_declaration::{
     IcebergInstanceDistribution, decode_access_binding,
 };
+use novarocks_connector_iceberg::file_reader::batch_reader::IcebergBatchReader;
+use novarocks_connector_iceberg::file_reader::delta_reader::IcebergDeltaBatchReader;
+use novarocks_connector_iceberg::file_reader::distributed_rewrite_reader::{
+    ICEBERG_REWRITE_POSITION_SPLIT_V1, IcebergRewritePositionBatchReader,
+    IcebergRewritePositionSplitPayloadV1,
+};
+use novarocks_connector_iceberg::reconcile_payload::{
+    ICEBERG_MUTATION_EVIDENCE_VERSION, ICEBERG_STAGED_PUBLICATION_PROOF_VERSION,
+    ICEBERG_STATISTICS_EVIDENCE_VERSION, IcebergMutationEvidenceTarget, IcebergMutationEvidenceV1,
+    IcebergStagedPublicationProofV1, IcebergStatisticsEvidenceV1, decode_mutation_evidence,
+    decode_staged_publication_proof, decode_statistics_evidence, encode_mutation_evidence,
+    encode_staged_publication_proof, encode_statistics_evidence,
+};
 use novarocks_connector_iceberg::row_lineage_synth as iceberg_row_lineage;
+use novarocks_connector_iceberg::row_mutation_payload::{
+    IcebergCowRecipePayloadV1, decode_cow_recipe, encode_cow_recipe,
+};
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -136,204 +150,17 @@ use novarocks_connector_iceberg::scan_model::{
 use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use novarocks_connector_iceberg::schema_facts::{iceberg_schema_def, row_lineage_enabled};
 use novarocks_connector_iceberg::schema_mapping::is_variant_struct_data_type;
-
-#[derive(Clone, Deserialize, Serialize)]
-struct IcebergDeltaSplitPayload {
-    source: novarocks_connector_iceberg::delta::DeltaSourceFile,
-    #[serde(default)]
-    delete_side: Option<novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
-}
+use novarocks_connector_iceberg::statistics_codec::{
+    decode_provider_statistics, encode_provider_statistics, statistics_data_version,
+    statistics_metric_column,
+};
+use novarocks_connector_iceberg::write_payload::{
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
+};
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
-const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
-const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
-const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_OPERATION_KIND: &str = "statistics-publish";
-const ICEBERG_STAGED_PUBLICATION_PROOF_VERSION: u16 = 1;
-fn statistics_data_version(
-    table_uuid: &str,
-    snapshot_id: Option<i64>,
-) -> Result<StatisticsDataVersion, ConnectorError> {
-    StatisticsDataVersion::try_new(Bytes::from(format!(
-        "iceberg/v1/{table_uuid}/{}",
-        snapshot_id
-            .map(|snapshot| snapshot.to_string())
-            .unwrap_or_else(|| "empty".to_string())
-    )))
-}
-
-fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
-    match metric {
-        StatisticsMetric::RowCount => None,
-        StatisticsMetric::NullCount { column }
-        | StatisticsMetric::Minimum { column }
-        | StatisticsMetric::Maximum { column }
-        | StatisticsMetric::AverageSize { column }
-        | StatisticsMetric::ThetaNdv { column } => Some(column),
-    }
-}
-
-fn encode_provider_statistics(evidence: &StatisticsEvidence) -> Result<Vec<u8>, ConnectorError> {
-    if evidence.coverage != StatisticsCoverage::Full
-        || evidence.accuracy != StatisticsAccuracy::Exact
-        || evidence.provenance != StatisticsProvenance::VisibleRows
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "Iceberg provider statistics require Full Exact visible-row evidence",
-        ));
-    }
-    let metrics = evidence
-        .metrics
-        .iter()
-        .map(|(metric, state)| {
-            let StatisticsMetricState::Available(value) = state else {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg provider statistics cannot persist unavailable metrics",
-                ));
-            };
-            let value = match value {
-                StatisticsMetricValue::U64(value) => IcebergStatisticValueV1::U64(*value),
-                StatisticsMetricValue::I64(value) => IcebergStatisticValueV1::I64(*value),
-                StatisticsMetricValue::F64(value) => IcebergStatisticValueV1::F64(*value),
-                StatisticsMetricValue::Bytes(value) => {
-                    IcebergStatisticValueV1::Bytes(value.to_vec())
-                }
-            };
-            Ok(match metric {
-                StatisticsMetric::RowCount => IcebergProviderStatisticV1::RowCount { value },
-                StatisticsMetric::NullCount { column } => IcebergProviderStatisticV1::NullCount {
-                    column: column.to_string(),
-                    value,
-                },
-                StatisticsMetric::Minimum { column } => IcebergProviderStatisticV1::Minimum {
-                    column: column.to_string(),
-                    value,
-                },
-                StatisticsMetric::Maximum { column } => IcebergProviderStatisticV1::Maximum {
-                    column: column.to_string(),
-                    value,
-                },
-                StatisticsMetric::AverageSize { column } => {
-                    IcebergProviderStatisticV1::AverageSize {
-                        column: column.to_string(),
-                        value,
-                    }
-                }
-                StatisticsMetric::ThetaNdv { column } => IcebergProviderStatisticV1::ThetaNdv {
-                    column: column.to_string(),
-                    value,
-                },
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    serde_json::to_vec(&IcebergProviderStatisticsV1 {
-        version: ICEBERG_PROVIDER_STATISTICS_VERSION,
-        data_version: evidence.data_version.as_bytes().to_vec(),
-        metrics,
-    })
-    .map_err(|error| internal(format!("encode Iceberg provider statistics: {error}")))
-}
-
-fn decode_provider_statistics(
-    payload: &[u8],
-    expected_data_version: &StatisticsDataVersion,
-    requested: &novarocks_spi::connector::StatisticsMetricRequest,
-) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricState>, ConnectorError> {
-    let artifact: IcebergProviderStatisticsV1 =
-        serde_json::from_slice(payload).map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("decode Iceberg provider statistics: {error}"),
-            )
-        })?;
-    if artifact.version != ICEBERG_PROVIDER_STATISTICS_VERSION
-        || artifact.data_version.as_slice() != expected_data_version.as_bytes().as_ref()
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg provider statistics do not match the pinned table version",
-        ));
-    }
-    let mut available = BTreeMap::new();
-    for metric in artifact.metrics {
-        let (metric, value) = match metric {
-            IcebergProviderStatisticV1::RowCount { value } => (StatisticsMetric::RowCount, value),
-            IcebergProviderStatisticV1::NullCount { column, value } => (
-                StatisticsMetric::NullCount {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::Minimum { column, value } => (
-                StatisticsMetric::Minimum {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::Maximum { column, value } => (
-                StatisticsMetric::Maximum {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::AverageSize { column, value } => (
-                StatisticsMetric::AverageSize {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::ThetaNdv { column, value } => (
-                StatisticsMetric::ThetaNdv {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-        };
-        let value = match value {
-            IcebergStatisticValueV1::U64(value) => StatisticsMetricValue::U64(value),
-            IcebergStatisticValueV1::I64(value) => StatisticsMetricValue::I64(value),
-            IcebergStatisticValueV1::F64(value) if value.is_finite() => {
-                StatisticsMetricValue::F64(value)
-            }
-            IcebergStatisticValueV1::F64(_) => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg provider statistics contain a non-finite value",
-                ));
-            }
-            IcebergStatisticValueV1::Bytes(value) => {
-                StatisticsMetricValue::try_bytes(Bytes::from(value))?
-            }
-        };
-        if available
-            .insert(metric, StatisticsMetricState::Available(value))
-            .is_some()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg provider statistics contain a duplicate metric",
-            ));
-        }
-    }
-    Ok(requested
-        .metrics()
-        .iter()
-        .map(|metric| {
-            let state = available.get(metric).cloned().unwrap_or_else(|| {
-                StatisticsMetricState::Missing(StatisticsMissing {
-                    kind: StatisticsMissingKind::NotCollected,
-                    message: Arc::from(
-                        "metric was not present in the published statistics artifact",
-                    ),
-                })
-            });
-            (metric.clone(), state)
-        })
-        .collect())
-}
 
 /// Build the physical layout from the metadata serialized into the resolved
 /// table handle.  In particular, this must not call `load_table`: durable
@@ -410,49 +237,21 @@ fn statistics_scan_layout(
 }
 
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-
-/// Recreate the Core writer's provider-private storage configuration from a
-/// BE startup binding. Credentials remain local to the exact incarnation.
-pub(crate) fn write_object_store_config(
-    binding: &IcebergReadBinding,
-    data_location: &str,
-) -> Result<Option<super::sink_plan::IcebergSinkObjectStoreConfig>, String> {
-    let Some(bucket) = super::changes::expected_object_store_bucket_from_location(data_location)?
-    else {
-        return Ok(None);
-    };
-    let config = binding.object_store_config().ok_or_else(|| {
-        format!("Iceberg connector writer needs a startup object-store binding for bucket {bucket}")
-    })?;
-    Ok(Some(super::sink_plan::IcebergSinkObjectStoreConfig {
-        endpoint: config.endpoint.clone(),
-        bucket,
-        access_key_id: config.access_key_id.clone(),
-        access_key_secret: config.access_key_secret.clone(),
-        session_token: config.session_token.clone(),
-        region: config.region.clone(),
-        enable_path_style_access: config.enable_path_style_access,
-        retry_max_times: config.retry_max_times,
-        retry_min_delay_ms: config.retry_min_delay_ms,
-        retry_max_delay_ms: config.retry_max_delay_ms,
-        timeout_ms: config.timeout_ms,
-        io_timeout_ms: config.io_timeout_ms,
-    }))
-}
+use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 
 /// Startup-composed installer for Iceberg read-only instances.  The payload
 /// identifies the binding but cannot override it with cloud properties.
 pub struct IcebergConnectorInstaller {
     provider_id: ConnectorProviderId,
-    binding: IcebergReadBinding,
+    resources: IcebergExecutionResources,
 }
 
 impl IcebergConnectorInstaller {
-    pub fn new(binding: IcebergReadBinding) -> Self {
+    pub fn new(resources: IcebergExecutionResources) -> Self {
         Self {
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
                 .expect("static Iceberg provider ID is valid"),
-            binding,
+            resources,
         }
     }
 }
@@ -474,7 +273,7 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
             ));
         }
         let access_binding = decode_access_binding(declaration)?;
-        if access_binding != self.binding.access_binding() {
+        if access_binding != self.resources.binding().access_binding() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg declaration access binding does not match BE startup binding",
@@ -486,11 +285,12 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
             key.clone(),
             Some(Arc::new(IcebergReadOnlyConnectorInstance {
                 key: key.clone(),
-                binding: self.binding.clone(),
+                binding: self.resources.binding().clone(),
             })),
             Some(Arc::new(IcebergDataWriteExecution::new(
                 key,
-                self.binding.clone(),
+                self.resources.binding().clone(),
+                self.resources.runtime().clone(),
             ))),
         )
     }
@@ -699,8 +499,8 @@ impl IcebergReadOnlyConnectorInstance {
                     "Iceberg metadata prepared unit does not belong to this installed instance incarnation",
                 ));
             }
-            return super::metadata::open_metadata_connector_reader(
-                metadata.metadata_table_type,
+            return novarocks_connector_iceberg::metadata_batch_reader::open_metadata_connector_reader(
+                super::metadata::provider_metadata_table_type(metadata.metadata_table_type),
                 metadata.serialized_table,
                 metadata.serialized_payload,
                 request.expected_schema.clone(),
@@ -720,7 +520,7 @@ impl IcebergReadOnlyConnectorInstance {
             ));
         }
         if let Some(delta) = shared.delta {
-            return super::delta_reader::IcebergDeltaBatchReader::try_new(
+            return IcebergDeltaBatchReader::try_new(
                 delta.source,
                 delta.delete_side,
                 self.binding.clone(),
@@ -729,7 +529,7 @@ impl IcebergReadOnlyConnectorInstance {
             .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
         }
         if let Some(rewrite_position) = shared.distributed_rewrite_position {
-            return super::distributed_rewrite_reader::IcebergRewritePositionBatchReader::try_new(
+            return IcebergRewritePositionBatchReader::try_new(
                 prepared.data_file,
                 rewrite_position,
                 self.binding.clone(),
@@ -812,143 +612,6 @@ struct IcebergRecoveryCleanupRecord {
     proof: IcebergStagedPublicationProofV1,
     descriptor_digest: [u8; 32],
     observation_digest: [u8; 32],
-}
-
-/// Provider-private, bounded description of exactly the ref that an
-/// inspection proved safe to clean up. It is only carried back as opaque SPI
-/// proof; the frontend never interprets these fields.
-#[derive(Clone, Deserialize, Serialize)]
-struct IcebergStagedPublicationProofV1 {
-    version: u16,
-    descriptor_digest: Vec<u8>,
-    namespace: String,
-    table: String,
-    table_uuid: String,
-    staging_ref: String,
-    staging_snapshot_id: Option<i64>,
-    target_ref: String,
-    target_snapshot_id: Option<i64>,
-    refresh_id: i64,
-    mv_id: i64,
-    marker_token: String,
-}
-
-/// Provider-private, bounded evidence used only to decide an ambiguous
-/// external catalog commit. It intentionally contains no catalog handle,
-/// credentials, parser AST, or runtime object.
-#[derive(Deserialize, Serialize)]
-struct IcebergMutationEvidenceV1 {
-    version: u16,
-    target: IcebergMutationEvidenceTarget,
-}
-
-/// Minimal, secret-free proof needed to determine whether an uncertain Puffin
-/// publication reached the catalog.  The operation-specific path is both the
-/// idempotency key and the orphan-cleanup target; it is never a replacement
-/// statistics authority.
-#[derive(Deserialize, Serialize)]
-struct IcebergStatisticsEvidenceV1 {
-    version: u16,
-    namespace: String,
-    table: String,
-    data_version: Vec<u8>,
-    statistics_path: String,
-}
-
-/// Exact scalar evidence collected from visible rows and stored alongside the
-/// standard Theta blobs.  This is provider-private persisted data: Core sees
-/// only the typed `StatisticsEvidence` reconstructed from it.
-#[derive(Deserialize, Serialize)]
-struct IcebergProviderStatisticsV1 {
-    version: u16,
-    data_version: Vec<u8>,
-    metrics: Vec<IcebergProviderStatisticV1>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "metric", rename_all = "snake_case")]
-enum IcebergProviderStatisticV1 {
-    RowCount {
-        value: IcebergStatisticValueV1,
-    },
-    NullCount {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    Minimum {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    Maximum {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    AverageSize {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    ThetaNdv {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
-enum IcebergStatisticValueV1 {
-    U64(u64),
-    I64(i64),
-    F64(f64),
-    Bytes(Vec<u8>),
-}
-
-#[derive(Deserialize, Serialize)]
-enum IcebergMutationEvidenceTarget {
-    Namespace {
-        namespace: String,
-        should_exist: bool,
-    },
-    Table {
-        namespace: String,
-        table: String,
-        should_exist: bool,
-        before_uuid: Option<String>,
-    },
-    View {
-        namespace: String,
-        view: String,
-        should_exist: bool,
-    },
-    TableVersion {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        before_metadata_location: Option<String>,
-    },
-    BootstrapEmptyTableSnapshot {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        operation_marker: String,
-    },
-    Ref {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        ref_name: String,
-        expected_snapshot_id: Option<i64>,
-    },
-    GuardedFastForward {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        before_metadata_location: Option<String>,
-        source_branch: String,
-        target_branch: String,
-        source_snapshot_id: i64,
-        expected_target_snapshot_id: Option<i64>,
-        guard_digest: [u8; 32],
-    },
 }
 
 impl IcebergControlProvider {
@@ -1219,11 +882,11 @@ impl IcebergControlProvider {
                 }
             }
         };
-        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+        let payload = encode_mutation_evidence(&IcebergMutationEvidenceV1 {
             version: ICEBERG_MUTATION_EVIDENCE_VERSION,
             target,
         })
-        .map_err(|error| internal(format!("encode Iceberg mutation evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_MUTATION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1256,11 +919,11 @@ impl IcebergControlProvider {
             expected_target_snapshot_id,
             guard_digest: guard.digest(),
         };
-        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+        let payload = encode_mutation_evidence(&IcebergMutationEvidenceV1 {
             version: ICEBERG_MUTATION_EVIDENCE_VERSION,
             target,
         })
-        .map_err(|error| internal(format!("encode Iceberg mutation evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_MUTATION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1284,11 +947,11 @@ impl IcebergControlProvider {
             table_uuid: loaded.table.metadata().uuid().to_string(),
             operation_marker: operation_marker.to_string(),
         };
-        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+        let payload = encode_mutation_evidence(&IcebergMutationEvidenceV1 {
             version: ICEBERG_MUTATION_EVIDENCE_VERSION,
             target,
         })
-        .map_err(|error| internal(format!("encode Iceberg bootstrap evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_MUTATION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1656,14 +1319,14 @@ impl IcebergControlProvider {
         data_version: &StatisticsDataVersion,
         statistics_path: &str,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
-        let payload = serde_json::to_vec(&IcebergStatisticsEvidenceV1 {
+        let payload = encode_statistics_evidence(&IcebergStatisticsEvidenceV1 {
             version: ICEBERG_STATISTICS_EVIDENCE_VERSION,
             namespace: table.namespace.clone(),
             table: table.table.clone(),
             data_version: data_version.as_bytes().to_vec(),
             statistics_path: statistics_path.to_string(),
         })
-        .map_err(|error| internal(format!("encode Iceberg statistics evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_STATISTICS_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -2419,8 +2082,8 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 evidence: request.evidence,
             });
         }
-        let decoded: IcebergMutationEvidenceV1 =
-            serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
+        let decoded =
+            decode_mutation_evidence(request.evidence.provider_payload()).map_err(|error| {
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     format!("decode Iceberg mutation evidence: {error}"),
@@ -2628,7 +2291,7 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
             mv_id: descriptor.mv_id,
             marker_token: descriptor.marker_token.to_string(),
         };
-        let proof = serde_json::to_vec(&proof)
+        let proof = encode_staged_publication_proof(&proof)
             .map(Bytes::from)
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
@@ -2667,13 +2330,14 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
         {
             return Ok(outcome);
         }
-        let proof: IcebergStagedPublicationProofV1 =
-            serde_json::from_slice(request.observation.proof.payload()).map_err(|error| {
+        let proof = decode_staged_publication_proof(request.observation.proof.payload()).map_err(
+            |error| {
                 ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
                     format!("invalid Iceberg staged publication cleanup proof: {error}"),
                 )
-            })?;
+            },
+        )?;
         if proof.version != ICEBERG_STAGED_PUBLICATION_PROOF_VERSION
             || proof.descriptor_digest.as_slice() != request.descriptor_digest
             || proof.staging_snapshot_id != request.observation.staging_snapshot_id
@@ -3007,13 +2671,14 @@ fn source_snapshot_id_from_committed_version(
             "Iceberg guarded publication requires a snapshot-bearing committed version",
         )
     })?;
-    let decoded = super::write_contract::decode_write_receipt(committed_version.payload())
-        .map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("decode Iceberg committed version for guarded publication: {error}"),
-            )
-        })?;
+    let decoded =
+        novarocks_connector_iceberg::write_codec::decode_write_receipt(committed_version.payload())
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!("decode Iceberg committed version for guarded publication: {error}"),
+                )
+            })?;
     if decoded != snapshot_id {
         return Err(ConnectorError::new(
             ConnectorErrorKind::CorruptData,
@@ -4640,8 +4305,8 @@ impl StatisticsCollection for IcebergControlProvider {
         request: StatisticsReconcileRequest,
     ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
         self.validate_context(&request.context)?;
-        let evidence: IcebergStatisticsEvidenceV1 =
-            serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
+        let evidence =
+            decode_statistics_evidence(request.evidence.provider_payload()).map_err(|error| {
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     format!("decode Iceberg statistics evidence: {error}"),
@@ -6720,65 +6385,18 @@ fn iceberg_row_mutation_route_payload(
     ))
 }
 
-/// Provider-private COW recipe. SQL/Core can retain, compare and pass its
-/// bytes, but only this module decodes the old-file identity or matched-row
-/// membership used to configure an Iceberg writer service.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IcebergCowRecipePayloadV1 {
-    version: u8,
-    role: String,
-    old_file: String,
-    matched_row_ids: Vec<i64>,
-}
-
 fn iceberg_cow_recipe_payload(
     role: &[u8],
     old_file: &str,
     row_ids: &[i64],
 ) -> Result<Bytes, ConnectorError> {
-    let role = std::str::from_utf8(role).map_err(|_| {
-        invalid_iceberg_row_mutation_activation("Iceberg COW recipe role is not UTF-8")
-    })?;
-    serde_json::to_vec(&IcebergCowRecipePayloadV1 {
-        version: 2,
-        role: role.to_string(),
-        old_file: old_file.to_string(),
-        matched_row_ids: row_ids.to_vec(),
-    })
-    .map(Bytes::from)
-    .map_err(|error| {
-        invalid_iceberg_row_mutation_activation(format!("encode Iceberg COW recipe: {error}"))
-    })
+    encode_cow_recipe(role, old_file, row_ids).map_err(invalid_iceberg_row_mutation_activation)
 }
 
 fn decode_iceberg_cow_recipe_payload(
     payload: &Bytes,
 ) -> Result<IcebergCowRecipePayloadV1, ConnectorError> {
-    let recipe = serde_json::from_slice::<IcebergCowRecipePayloadV1>(payload).map_err(|error| {
-        invalid_iceberg_row_mutation_activation(format!("decode Iceberg COW recipe: {error}"))
-    })?;
-    if recipe.version != 2
-        || !matches!(recipe.role.as_str(), "rewrite" | "append")
-        || (recipe.role == "rewrite"
-            && (recipe.old_file.is_empty() || recipe.matched_row_ids.is_empty()))
-        || (recipe.role == "append"
-            && (!recipe.old_file.is_empty() || !recipe.matched_row_ids.is_empty()))
-    {
-        return Err(invalid_iceberg_row_mutation_activation(
-            "Iceberg COW recipe has an invalid role or payload shape",
-        ));
-    }
-    if recipe
-        .matched_row_ids
-        .windows(2)
-        .any(|pair| pair[0] >= pair[1])
-    {
-        return Err(invalid_iceberg_row_mutation_activation(
-            "Iceberg COW recipe row identities are not strictly ordered",
-        ));
-    }
-    Ok(recipe)
+    decode_cow_recipe(payload).map_err(invalid_iceberg_row_mutation_activation)
 }
 
 /// Resolve the physical COW base solely inside the Iceberg adapter.  The
@@ -8041,7 +7659,7 @@ pub(crate) fn iceberg_row_write_sink_spec_from_preparation(
 ) -> Result<
     (
         IcebergWriteSinkSpec,
-        Option<Vec<super::commit::EqualityDeleteColumn>>,
+        Option<Vec<novarocks_connector_iceberg::commit::EqualityDeleteColumn>>,
     ),
     ConnectorError,
 > {
@@ -8305,7 +7923,7 @@ fn equality_delete_columns_from_preparation(
 ) -> Result<
     (
         Vec<novarocks_catalog::schema::ColumnDef>,
-        Vec<super::commit::EqualityDeleteColumn>,
+        Vec<novarocks_connector_iceberg::commit::EqualityDeleteColumn>,
     ),
     ConnectorError,
 > {
@@ -8336,7 +7954,7 @@ fn equality_delete_columns_from_preparation(
                 ))
             })?;
         columns.push(column_def_from_binding(binding));
-        equality_columns.push(super::commit::EqualityDeleteColumn {
+        equality_columns.push(novarocks_connector_iceberg::commit::EqualityDeleteColumn {
             name: field.name().to_string(),
             field_id: iceberg_field.id,
             data_type: field.data_type().clone(),
@@ -8963,17 +8581,6 @@ enum IcebergScanFactScalarTypeV1 {
     Unsupported,
 }
 
-/// Provider-private maintenance split.  The C1 carrier only transports this
-/// opaque payload; it never learns Puffin metadata or deletion-vector rows.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IcebergRewritePositionSplitPayloadV1 {
-    pub(crate) version: u16,
-    pub(crate) selected_delete_files: Vec<IcebergDeleteFileInfo>,
-}
-
-const ICEBERG_REWRITE_POSITION_SPLIT_V1: u16 = 1;
-
 const ICEBERG_SPLIT_V5: u16 = 5;
 const ICEBERG_PREPARED_SPLIT_SHARED_V2: u16 = 2;
 const ICEBERG_PREPARED_SCAN_UNIT_V1: u16 = 1;
@@ -9098,7 +8705,7 @@ fn canonical_split_name_mapping(mapping: &str) -> Result<String, ConnectorError>
             "Iceberg name mapping exceeds the provider-private split bound",
         ));
     }
-    super::catalog::add_files::canonical_name_mapping(mapping)
+    novarocks_connector_iceberg::schema_mapping::canonical_name_mapping(mapping)
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
 }
 
@@ -10432,21 +10039,6 @@ mod tests {
     }
 
     #[test]
-    fn cow_recipe_keeps_provider_identity_private_and_round_trips() {
-        let payload = iceberg_cow_recipe_payload(
-            b"rewrite",
-            "s3://warehouse/orders/data-00042.parquet",
-            &[9, 3, 17],
-        )
-        .expect("encode COW recipe");
-        let decoded = decode_iceberg_cow_recipe_payload(&payload).expect("decode COW recipe");
-
-        assert_eq!(decoded.role, "rewrite");
-        assert_eq!(decoded.old_file, "s3://warehouse/orders/data-00042.parquet");
-        assert_eq!(decoded.matched_row_ids, vec![9, 3, 17]);
-    }
-
-    #[test]
     fn unknown_table_catalog_error_is_not_found() {
         let error = map_iceberg_error("unknown table: analytics.orders".to_string());
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -11450,67 +11042,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn provider_statistics_artifact_round_trips_requested_metrics() {
-        let data_version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
-        let theta_metric = StatisticsMetric::ThetaNdv {
-            column: Arc::from("k"),
-        };
-        let evidence = StatisticsEvidence {
-            data_version: data_version.clone(),
-            evidence_revision: StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1"))
-                .expect("revision"),
-            coverage: StatisticsCoverage::Full,
-            accuracy: StatisticsAccuracy::Exact,
-            interval: None,
-            provenance: StatisticsProvenance::VisibleRows,
-            metrics: BTreeMap::from([
-                (
-                    StatisticsMetric::RowCount,
-                    StatisticsMetricState::Available(StatisticsMetricValue::U64(3)),
-                ),
-                (
-                    theta_metric.clone(),
-                    StatisticsMetricState::Available(StatisticsMetricValue::F64(3.0)),
-                ),
-            ]),
-        };
-        let payload = encode_provider_statistics(&evidence).expect("encode artifact");
-        let requested = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::RowCount,
-            theta_metric.clone(),
-            StatisticsMetric::NullCount {
-                column: Arc::from("k"),
-            },
-        ])
-        .expect("metric request");
-
-        let decoded = decode_provider_statistics(&payload, &data_version, &requested)
-            .expect("decode artifact");
-        assert_eq!(
-            decoded.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(3)
-            ))
-        );
-        assert_eq!(
-            decoded.get(&theta_metric),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(3.0)
-            ))
-        );
-        assert!(matches!(
-            decoded.get(&StatisticsMetric::NullCount {
-                column: Arc::from("k")
-            }),
-            Some(StatisticsMetricState::Missing(StatisticsMissing {
-                kind: StatisticsMissingKind::NotCollected,
-                ..
-            }))
-        ));
-    }
-
     fn mutation_provider_without_catalog() -> IcebergControlProvider {
         let instance_id = ConnectorInstanceId::parse("ice.test").expect("instance ID");
         let incarnation = ConnectorInstanceIncarnation::from_bytes([7; 16]);
@@ -11968,6 +11499,7 @@ mod tests {
         )
         .expect("scan handle");
         let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let mut catalog_registry = IcebergCatalogRegistry::default();
         catalog_registry
@@ -11991,7 +11523,7 @@ mod tests {
             instance_id,
             incarnation,
             registry: Arc::new(RwLock::new(catalog_registry)),
-            planning_binding: None,
+            planning_binding: Some(explicit_test_read_binding(&runtime)),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),

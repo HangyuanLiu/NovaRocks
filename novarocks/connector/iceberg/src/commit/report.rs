@@ -17,25 +17,25 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::iceberg::spec::{Literal, PartitionSpecRef, PrimitiveLiteral, Struct};
 use base64::Engine;
-use novarocks_connector_iceberg::iceberg::spec::{
-    Literal, PartitionSpecRef, PrimitiveLiteral, Struct,
-};
 
-use novarocks_connector_iceberg::delete_file::IcebergFileContent;
+use crate::delete_file::IcebergFileContent;
+
+use super::types::WrittenFile;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct IcebergColumnStats {
-    pub(crate) column_sizes: BTreeMap<i32, i64>,
-    pub(crate) value_counts: BTreeMap<i32, i64>,
-    pub(crate) null_value_counts: BTreeMap<i32, i64>,
-    pub(crate) nan_value_counts: BTreeMap<i32, i64>,
-    pub(crate) lower_bounds: BTreeMap<i32, Vec<u8>>,
-    pub(crate) upper_bounds: BTreeMap<i32, Vec<u8>>,
+pub struct IcebergColumnStats {
+    pub column_sizes: BTreeMap<i32, i64>,
+    pub value_counts: BTreeMap<i32, i64>,
+    pub null_value_counts: BTreeMap<i32, i64>,
+    pub nan_value_counts: BTreeMap<i32, i64>,
+    pub lower_bounds: BTreeMap<i32, Vec<u8>>,
+    pub upper_bounds: BTreeMap<i32, Vec<u8>>,
 }
 
 impl IcebergColumnStats {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.column_sizes.is_empty()
             && self.value_counts.is_empty()
             && self.null_value_counts.is_empty()
@@ -46,42 +46,42 @@ impl IcebergColumnStats {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergPartitionReport {
-    pub(crate) partition_path: String,
-    pub(crate) null_fingerprint: String,
-    pub(crate) partition_spec_id: i32,
-    pub(crate) partition_values: Struct,
+pub struct IcebergPartitionReport {
+    pub partition_path: String,
+    pub null_fingerprint: String,
+    pub partition_spec_id: i32,
+    pub partition_values: Struct,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergWrittenFileReport {
-    pub(crate) path: String,
-    pub(crate) format: String,
-    pub(crate) content: IcebergFileContent,
-    pub(crate) record_count: i64,
-    pub(crate) file_size_in_bytes: i64,
-    pub(crate) partition: IcebergPartitionReport,
-    pub(crate) split_offsets: Option<Vec<i64>>,
-    pub(crate) column_stats: Option<IcebergColumnStats>,
-    pub(crate) referenced_data_file: Option<String>,
-    pub(crate) first_row_id: Option<i64>,
-    pub(crate) equality_ids: Option<Vec<i32>>,
-    pub(crate) key_metadata: Option<Vec<u8>>,
-    pub(crate) content_offset: Option<i64>,
-    pub(crate) content_size_in_bytes: Option<i64>,
-    pub(crate) cardinality: Option<i64>,
+pub struct IcebergWrittenFileReport {
+    pub path: String,
+    pub format: String,
+    pub content: IcebergFileContent,
+    pub record_count: i64,
+    pub file_size_in_bytes: i64,
+    pub partition: IcebergPartitionReport,
+    pub split_offsets: Option<Vec<i64>>,
+    pub column_stats: Option<IcebergColumnStats>,
+    pub referenced_data_file: Option<String>,
+    pub first_row_id: Option<i64>,
+    pub equality_ids: Option<Vec<i32>>,
+    pub key_metadata: Option<Vec<u8>>,
+    pub content_offset: Option<i64>,
+    pub content_size_in_bytes: Option<i64>,
+    pub cardinality: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergWriterReport {
-    pub(crate) file: IcebergWrittenFileReport,
-    pub(crate) is_overwrite: Option<bool>,
-    pub(crate) is_rewrite: Option<bool>,
+pub struct IcebergWriterReport {
+    pub file: IcebergWrittenFileReport,
+    pub is_overwrite: Option<bool>,
+    pub is_rewrite: Option<bool>,
 }
 
-pub(crate) fn writer_report_from_written_file(
-    file: &crate::connector::iceberg::commit::WrittenFile,
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+pub fn writer_report_from_written_file(
+    file: &WrittenFile,
+    metadata: &crate::iceberg::spec::TableMetadata,
 ) -> Result<IcebergWriterReport, String> {
     let partition_spec = metadata
         .partition_spec_by_id(file.partition_spec_id)
@@ -94,13 +94,11 @@ pub(crate) fn writer_report_from_written_file(
     let (partition_path, null_fingerprint) =
         partition_path_from_struct(&file.partition_values, &partition_spec)?;
     let content = match file.content {
-        novarocks_connector_iceberg::iceberg::spec::DataContentType::Data => {
-            IcebergFileContent::Data
-        }
-        novarocks_connector_iceberg::iceberg::spec::DataContentType::PositionDeletes => {
+        crate::iceberg::spec::DataContentType::Data => IcebergFileContent::Data,
+        crate::iceberg::spec::DataContentType::PositionDeletes => {
             IcebergFileContent::PositionDeletes
         }
-        novarocks_connector_iceberg::iceberg::spec::DataContentType::EqualityDeletes => {
+        crate::iceberg::spec::DataContentType::EqualityDeletes => {
             IcebergFileContent::EqualityDeletes
         }
     };
@@ -139,11 +137,10 @@ pub(crate) fn writer_report_from_written_file(
 /// writer without requiring table metadata on the BE.  Control-side decoding
 /// still validates the empty partition descriptor against the frozen table
 /// metadata before catalog commit.
-pub(crate) fn writer_report_from_unpartitioned_equality_delete_file(
-    file: &crate::connector::iceberg::commit::WrittenFile,
+pub fn writer_report_from_unpartitioned_equality_delete_file(
+    file: &WrittenFile,
 ) -> Result<IcebergWriterReport, String> {
-    if file.content != novarocks_connector_iceberg::iceberg::spec::DataContentType::EqualityDeletes
-    {
+    if file.content != crate::iceberg::spec::DataContentType::EqualityDeletes {
         return Err(
             "unpartitioned equality-delete report requires an equality-delete file".to_string(),
         );
@@ -182,7 +179,7 @@ pub(crate) fn writer_report_from_unpartitioned_equality_delete_file(
 }
 
 fn column_stats_from_written_file(
-    file: &crate::connector::iceberg::commit::WrittenFile,
+    file: &WrittenFile,
 ) -> Result<Option<IcebergColumnStats>, String> {
     let stats = IcebergColumnStats {
         column_sizes: u64_stats_to_i64(&file.column_sizes, "column_sizes")?,
@@ -209,7 +206,7 @@ fn u64_stats_to_i64(stats: &HashMap<i32, u64>, label: &str) -> Result<BTreeMap<i
 }
 
 fn datum_bounds_to_bytes(
-    bounds: &HashMap<i32, novarocks_connector_iceberg::iceberg::spec::Datum>,
+    bounds: &HashMap<i32, crate::iceberg::spec::Datum>,
     label: &str,
 ) -> Result<BTreeMap<i32, Vec<u8>>, String> {
     bounds
@@ -225,7 +222,7 @@ fn datum_bounds_to_bytes(
         .collect()
 }
 
-pub(crate) fn partition_path_from_struct(
+pub fn partition_path_from_struct(
     values: &Struct,
     partition_spec: &PartitionSpecRef,
 ) -> Result<(String, String), String> {
@@ -311,37 +308,37 @@ mod tests {
 
     #[test]
     fn writer_report_from_written_file_preserves_nan_value_counts() {
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::from_table_creation(
-            novarocks_connector_iceberg::iceberg::TableCreation::builder()
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::from_table_creation(
+            crate::iceberg::TableCreation::builder()
                 .name("t".to_string())
                 .location("file:///warehouse/db/t".to_string())
                 .schema(
-                    novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+                    crate::iceberg::spec::Schema::builder()
                         .with_schema_id(1)
                         .with_fields(vec![std::sync::Arc::new(
-                            novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                            crate::iceberg::spec::NestedField::required(
                                 1,
                                 "id",
-                                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Double,
+                                crate::iceberg::spec::Type::Primitive(
+                                    crate::iceberg::spec::PrimitiveType::Double,
                                 ),
                             ),
                         )])
                         .build()
                         .expect("schema"),
                 )
-                .partition_spec(novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec())
-                .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2)
+                .partition_spec(crate::iceberg::spec::PartitionSpec::unpartition_spec())
+                .format_version(crate::iceberg::spec::FormatVersion::V2)
                 .build(),
         )
         .expect("table metadata builder")
         .build()
         .expect("table metadata")
         .metadata;
-        let file = crate::connector::iceberg::commit::WrittenFile {
+        let file = WrittenFile {
             path: "file:///warehouse/t/data/a.parquet".to_string(),
-            format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
-            content: novarocks_connector_iceberg::iceberg::spec::DataContentType::Data,
+            format: crate::iceberg::spec::DataFileFormat::Parquet,
+            content: crate::iceberg::spec::DataContentType::Data,
             partition_values: Struct::empty(),
             partition_spec_id: metadata.default_partition_spec_id(),
             record_count: 1,
@@ -377,35 +374,37 @@ mod tests {
 
     #[test]
     fn writer_report_from_written_file_rejects_cardinality_overflow() {
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::from_table_creation(
-            novarocks_connector_iceberg::iceberg::TableCreation::builder()
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::from_table_creation(
+            crate::iceberg::TableCreation::builder()
                 .name("t".to_string())
                 .location("file:///warehouse/db/t".to_string())
                 .schema(
-                    novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+                    crate::iceberg::spec::Schema::builder()
                         .with_schema_id(1)
                         .with_fields(vec![std::sync::Arc::new(
-                            novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                            crate::iceberg::spec::NestedField::required(
                                 1,
                                 "id",
-                                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int),
+                                crate::iceberg::spec::Type::Primitive(
+                                    crate::iceberg::spec::PrimitiveType::Int,
+                                ),
                             ),
                         )])
                         .build()
                         .expect("schema"),
                 )
-                .partition_spec(novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec())
-                .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2)
+                .partition_spec(crate::iceberg::spec::PartitionSpec::unpartition_spec())
+                .format_version(crate::iceberg::spec::FormatVersion::V2)
                 .build(),
         )
         .expect("table metadata builder")
         .build()
         .expect("table metadata")
         .metadata;
-        let file = crate::connector::iceberg::commit::WrittenFile {
+        let file = WrittenFile {
             path: "file:///warehouse/t/dv-00000000.puffin".to_string(),
-            format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Puffin,
-            content: novarocks_connector_iceberg::iceberg::spec::DataContentType::PositionDeletes,
+            format: crate::iceberg::spec::DataFileFormat::Puffin,
+            content: crate::iceberg::spec::DataContentType::PositionDeletes,
             partition_values: Struct::empty(),
             partition_spec_id: metadata.default_partition_spec_id(),
             record_count: 3,

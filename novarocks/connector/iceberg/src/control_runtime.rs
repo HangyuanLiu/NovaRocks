@@ -1,0 +1,127 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Runtime-private state for one Iceberg control generation.
+//!
+//! A control generation owns precisely one catalog client and the physical
+//! caches derived from its parsed configuration.  The frontend owns the map
+//! of generations; this value deliberately has no catalog-name registry and
+//! never falls back to a process-global Tokio runtime.
+
+use std::sync::Arc;
+
+use crate::catalog_control::IcebergCatalogControlState;
+use crate::resources::IcebergControlResources;
+
+#[allow(dead_code)] // Assembled into the concrete provider factory during R3C.
+#[derive(Clone)]
+pub struct IcebergControlRuntime {
+    control_state: IcebergCatalogControlState,
+    resources: IcebergControlResources,
+    catalog: Arc<dyn crate::iceberg::Catalog>,
+    write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
+}
+
+#[allow(dead_code)]
+impl IcebergControlRuntime {
+    /// Construct one fully local provider generation.  REST and HMS client
+    /// initialization is polled only through the runtime injected by server
+    /// composition, so factory construction remains deterministic in every
+    /// frontend role.
+    pub fn try_new(
+        control_state: IcebergCatalogControlState,
+        resources: IcebergControlResources,
+    ) -> Result<Self, String> {
+        let configuration = control_state.configuration().clone();
+        let catalog = resources
+            .catalog_runtime()
+            .block_on(async move { crate::catalog_runtime::build_catalog(&configuration).await })?
+            .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
+        Ok(Self {
+            control_state,
+            resources,
+            catalog,
+            write_activations: Arc::new(
+                crate::write_activation::IcebergWriteActivationReservations::default(),
+            ),
+        })
+    }
+
+    pub(crate) fn control_state(&self) -> &IcebergCatalogControlState {
+        &self.control_state
+    }
+
+    pub(crate) fn catalog(&self) -> &Arc<dyn crate::iceberg::Catalog> {
+        &self.catalog
+    }
+
+    /// Shared reservation scope for every write capability assembled from
+    /// this exact control generation.
+    pub(crate) fn write_activation_reservations(
+        &self,
+    ) -> &Arc<crate::write_activation::IcebergWriteActivationReservations> {
+        &self.write_activations
+    }
+}
+
+impl std::fmt::Debug for IcebergControlRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergControlRuntime")
+            .field("control_state", &"<provider catalog state>")
+            .field("resources", &self.resources)
+            .field("catalog", &"<provider catalog client>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+    use super::*;
+
+    #[test]
+    fn generation_runtime_keeps_one_explicit_catalog_client() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let control = IcebergControlResources::new(binding, runtime.handle().clone());
+        let generation =
+            IcebergControlRuntime::try_new(IcebergCatalogControlState::new(configuration), control)
+                .expect("generation runtime");
+
+        assert_eq!(generation.control_state().properties().len(), 2);
+        assert!(Arc::strong_count(generation.catalog()) >= 1);
+        assert!(Arc::strong_count(generation.write_activation_reservations()) >= 1);
+    }
+}

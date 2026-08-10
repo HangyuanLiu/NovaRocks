@@ -66,6 +66,7 @@ fn standalone_open_services(
         host.coordinator_report_endpoint_sink(),
         host.query_control_service(),
         host.connector_control_registry(),
+        host.connector_control_factory_resolver(),
         0,
     )
     .with_statistics_application(host.statistics_application_port())

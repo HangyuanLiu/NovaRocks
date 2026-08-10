@@ -17,7 +17,7 @@
 
 //! Provider-owned projection of frozen Iceberg metadata into bounded SPI facts.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -28,6 +28,127 @@ use novarocks_spi::connector::{
     ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTablePlanningFacts,
     ConnectorTableUniqueConstraint,
 };
+
+use crate::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergTableInfo};
+
+/// Validate the Iceberg-owned delete facts sealed into planned data files.
+///
+/// This is deliberately a provider-side validation step: generic planning
+/// carries the opaque file facts but must neither infer Iceberg equality-delete
+/// identity nor reinterpret table field IDs.  Callers invoke it before a
+/// split is frozen for the execution host.
+pub fn validate_planned_files(
+    table: Option<&IcebergTableInfo>,
+    files: &[IcebergDataFileInfo],
+) -> Result<(), ConnectorError> {
+    for file in files {
+        crate::delete_file::validate_delete_apply_cost(file)?;
+    }
+    let Some(table) = table else {
+        return Ok(());
+    };
+
+    let mut schema_by_id = BTreeMap::new();
+    let mut schema_by_name = BTreeMap::new();
+    for field in &table.schema.fields {
+        if schema_by_id
+            .insert(field.field_id, field.name.clone())
+            .is_some()
+        {
+            return corrupt(format!(
+                "Iceberg table schema has duplicate field id {} for table {}",
+                field.field_id, table.table
+            ));
+        }
+        if schema_by_name
+            .insert(field.name.to_ascii_lowercase(), field.name.clone())
+            .is_some()
+        {
+            return corrupt(format!(
+                "Iceberg table schema has duplicate field name {} for table {}",
+                field.name, table.table
+            ));
+        }
+    }
+
+    for file in files {
+        for delete in &file.delete_files {
+            if delete.file_content != IcebergDeleteFileContent::Equality {
+                continue;
+            }
+
+            let mut ids_seen = BTreeSet::new();
+            let mut resolved_ids = Vec::new();
+            for field_id in &delete.equality_field_ids {
+                if !ids_seen.insert(*field_id) {
+                    return corrupt(format!(
+                        "Iceberg equality-delete file {} has duplicate equality field id {}",
+                        delete.path, field_id
+                    ));
+                }
+                let name = schema_by_id.get(field_id).ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        format!(
+                            "Iceberg equality-delete file {} references unknown field id {} in table {}",
+                            delete.path, field_id, table.table
+                        ),
+                    )
+                })?;
+                resolved_ids.push(name.to_ascii_lowercase());
+            }
+
+            let mut names_seen = BTreeSet::new();
+            let mut resolved_names = Vec::new();
+            for name in &delete.equality_column_names {
+                let normalized = name.to_ascii_lowercase();
+                if !names_seen.insert(normalized.clone()) {
+                    return corrupt(format!(
+                        "Iceberg equality-delete file {} has duplicate equality column name {}",
+                        delete.path, name
+                    ));
+                }
+                let canonical = schema_by_name.get(&normalized).ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        format!(
+                            "Iceberg equality-delete file {} references unknown equality column {} in table {}",
+                            delete.path, name, table.table
+                        ),
+                    )
+                })?;
+                resolved_names.push(canonical.to_ascii_lowercase());
+            }
+
+            match (resolved_ids.is_empty(), resolved_names.is_empty()) {
+                (true, true) => {
+                    return corrupt(format!(
+                        "Iceberg equality-delete file {} has no equality field identity",
+                        delete.path
+                    ));
+                }
+                (false, false)
+                    if resolved_ids.iter().collect::<BTreeSet<_>>()
+                        != resolved_names.iter().collect::<BTreeSet<_>>() =>
+                {
+                    return corrupt(format!(
+                        "Iceberg equality-delete file {} field id/name mismatch: ids={resolved_ids:?} names={resolved_names:?}",
+                        delete.path
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn corrupt<T>(message: String) -> Result<T, ConnectorError> {
+    Err(ConnectorError::new(
+        ConnectorErrorKind::CorruptData,
+        message,
+    ))
+}
 
 /// Derives the planning facts exposed by `ConnectorMetadata::load_table`.
 ///
@@ -252,6 +373,10 @@ mod tests {
     };
 
     use super::*;
+    use crate::scan_model::{
+        IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+        IcebergDeleteFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    };
 
     struct NeverCancelled;
 
@@ -315,5 +440,50 @@ mod tests {
         );
         assert!(facts.unique_constraints().is_empty());
         assert!(facts.foreign_key_constraints().is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_equality_delete_field_ids_before_split_freeze() {
+        let table = IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            table_uuid: None,
+            current_snapshot_id: None,
+            schema_id: 1,
+            location: "s3://warehouse/db/t".to_string(),
+            schema: IcebergSchemaDef {
+                fields: vec![IcebergSchemaFieldDef {
+                    field_id: 7,
+                    name: "id".to_string(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    write_default_json: None,
+                    children: Vec::new(),
+                }],
+            },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        };
+        let mut file = IcebergDataFileInfo::for_test("data.parquet", 10, 1);
+        file.delete_files.push(IcebergDeleteFileInfo {
+            path: "eq-delete.parquet".to_string(),
+            file_format: IcebergDeleteFileFormat::Parquet,
+            file_content: IcebergDeleteFileContent::Equality,
+            length: Some(1),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: None,
+            partition_spec_id: None,
+            partition_key: None,
+            equality_column_names: Vec::new(),
+            equality_field_ids: vec![7, 7],
+        });
+
+        let error = validate_planned_files(Some(&table), &[file])
+            .expect_err("duplicate equality field identity must be rejected");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.to_string().contains("duplicate equality field id 7"));
     }
 }

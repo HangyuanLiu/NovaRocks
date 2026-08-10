@@ -32,9 +32,6 @@ use crate::connector::iceberg::commit::{
     IcebergCommitCollector, LiveFileMetrics, RunInput, current_live_file_metrics,
     run_iceberg_commit,
 };
-use crate::connector::iceberg::data_writer::{
-    RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
-};
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::{
@@ -43,6 +40,9 @@ use crate::engine::iceberg_writer::{
 };
 use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use novarocks_connector_iceberg::commit::AbortLog;
+use novarocks_connector_iceberg::commit::data_writer::{
+    RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
+};
 use novarocks_connector_iceberg::row_lineage_synth::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
 };

@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
-use arrow::array::{Array, ArrayRef, RecordBatch, StructArray, new_null_array};
+use arrow::array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -635,10 +635,12 @@ fn align_iceberg_array_to_field(
                         case_sensitive,
                     )?);
                 } else {
-                    columns.push(build_iceberg_default_array(
-                        target_child.as_ref(),
-                        row_count,
-                    )?);
+                    columns.push(
+                        novarocks_connector_iceberg::default_value::build_iceberg_default_array(
+                            target_child.as_ref(),
+                            row_count,
+                        )?,
+                    );
                 }
             }
             Ok(Arc::new(
@@ -678,121 +680,6 @@ fn align_iceberg_array_to_field(
             Ok(casted)
         }
     }
-}
-
-pub(crate) fn build_iceberg_default_array(
-    target_field: &Field,
-    row_count: usize,
-) -> Result<ArrayRef, String> {
-    use crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY;
-    use novarocks_connector_iceberg::default_value::literal_to_constant_array;
-    use novarocks_connector_iceberg::iceberg::spec::Literal;
-
-    let Some(json) = target_field
-        .metadata()
-        .get(ICEBERG_INITIAL_DEFAULT_META_KEY)
-    else {
-        return Ok(new_null_array(target_field.data_type(), row_count));
-    };
-    let json_value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
-        format!(
-            "corrupted initial-default JSON for column {}: {error}",
-            target_field.name()
-        )
-    })?;
-    let iceberg_type = arrow_type_to_iceberg_type(target_field.data_type()).map_err(|error| {
-        format!(
-            "unsupported initial-default for column {}: {error}",
-            target_field.name()
-        )
-    })?;
-    let literal = Literal::try_from_json(json_value, &iceberg_type)
-        .map_err(|error| {
-            format!(
-                "decode initial-default for column {}: {error}",
-                target_field.name()
-            )
-        })?
-        .ok_or_else(|| {
-            format!(
-                "initial-default JSON for column {} produced no literal",
-                target_field.name()
-            )
-        })?;
-    literal_to_constant_array(&literal, target_field.data_type(), row_count)
-}
-
-fn arrow_type_to_iceberg_type(
-    data_type: &DataType,
-) -> Result<novarocks_connector_iceberg::iceberg::spec::Type, String> {
-    use arrow::datatypes::TimeUnit;
-    use novarocks_connector_iceberg::iceberg::spec::{
-        ListType, MapType, NestedField, PrimitiveType, Type,
-    };
-    Ok(match data_type {
-        DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
-        DataType::Int32 => Type::Primitive(PrimitiveType::Int),
-        DataType::Int64 => Type::Primitive(PrimitiveType::Long),
-        DataType::Float32 => Type::Primitive(PrimitiveType::Float),
-        DataType::Float64 => Type::Primitive(PrimitiveType::Double),
-        DataType::Decimal128(precision, scale) => Type::Primitive(PrimitiveType::Decimal {
-            precision: *precision as u32,
-            scale: *scale as u32,
-        }),
-        DataType::Utf8 => Type::Primitive(PrimitiveType::String),
-        DataType::Date32 => Type::Primitive(PrimitiveType::Date),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Type::Primitive(PrimitiveType::Timestamp)
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
-            Type::Primitive(PrimitiveType::Timestamptz)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
-            Type::Primitive(PrimitiveType::TimestampNs)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
-            Type::Primitive(PrimitiveType::TimestamptzNs)
-        }
-        DataType::Binary | DataType::LargeBinary => Type::Primitive(PrimitiveType::Binary),
-        DataType::List(element_field) => {
-            Type::List(ListType::new(Arc::new(NestedField::optional(
-                1,
-                "element",
-                arrow_type_to_iceberg_type(element_field.data_type())?,
-            ))))
-        }
-        DataType::Map(entries_field, _) => {
-            let DataType::Struct(entry_fields) = entries_field.data_type() else {
-                return Err(format!(
-                    "arrow Map field entries must be a Struct, got {:?}",
-                    entries_field.data_type()
-                ));
-            };
-            if entry_fields.len() < 2 {
-                return Err(format!(
-                    "arrow Map entries struct must have at least 2 fields, got {}",
-                    entry_fields.len()
-                ));
-            }
-            Type::Map(MapType::new(
-                Arc::new(NestedField::required(
-                    1,
-                    "key",
-                    arrow_type_to_iceberg_type(entry_fields[0].data_type())?,
-                )),
-                Arc::new(NestedField::optional(
-                    2,
-                    "value",
-                    arrow_type_to_iceberg_type(entry_fields[1].data_type())?,
-                )),
-            ))
-        }
-        other => {
-            return Err(format!(
-                "arrow type {other:?} cannot carry an iceberg default"
-            ));
-        }
-    })
 }
 
 fn iceberg_output_field_for_array(target_field: &Field, array: &ArrayRef) -> Field {
@@ -847,7 +734,12 @@ fn align_batch_to_iceberg_schema(
             columns.push(array);
         } else {
             fields.push(target.as_ref().clone());
-            columns.push(build_iceberg_default_array(target.as_ref(), row_count)?);
+            columns.push(
+                novarocks_connector_iceberg::default_value::build_iceberg_default_array(
+                    target.as_ref(),
+                    row_count,
+                )?,
+            );
         }
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| error.to_string())
@@ -992,7 +884,8 @@ mod file_read_contract_tests {
             Field::new("b", DataType::Int32, true).with_metadata(HashMap::from([
                 (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
                 (
-                    crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
+                    novarocks_connector_iceberg::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY
+                        .to_string(),
                     "99".to_string(),
                 ),
             ])),

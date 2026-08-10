@@ -7,6 +7,8 @@
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
+use arrow::array::{ArrayData, ArrayRef, make_array};
+use arrow::datatypes::DataType;
 use bytes::Bytes;
 use novarocks_fs::{
     FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget, FileReadContext,
@@ -20,6 +22,84 @@ use crate::scan_model::{
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
     IcebergPhysicalPredicateValue,
 };
+
+#[path = "batch_reader.rs"]
+pub mod batch_reader;
+#[path = "delta_reader.rs"]
+pub mod delta_reader;
+#[path = "equality_delete.rs"]
+pub mod equality_delete;
+
+#[path = "distributed_rewrite_reader.rs"]
+pub mod distributed_rewrite_reader;
+#[path = "variant.rs"]
+pub mod variant;
+
+/// Re-label an Arrow array with an equivalent Iceberg schema type while
+/// preserving every physical buffer. Iceberg schema evolution can change
+/// nested field metadata without changing the underlying Parquet layout; this
+/// belongs to the provider reader, not to the execution engine.
+pub fn retag_iceberg_array(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, String> {
+    retag_iceberg_array_data(array.to_data(), target).map(make_array)
+}
+
+fn retag_iceberg_array_data(data: ArrayData, target: &DataType) -> Result<ArrayData, String> {
+    use DataType::*;
+
+    if data.data_type() == target {
+        return Ok(data);
+    }
+    let source = data.data_type().clone();
+    let children = match (&source, target) {
+        (Decimal128(_, source_scale), Decimal128(_, target_scale))
+        | (Decimal256(_, source_scale), Decimal256(_, target_scale))
+            if source_scale == target_scale =>
+        {
+            Vec::new()
+        }
+        (Timestamp(source_unit, _), Timestamp(target_unit, _)) if source_unit == target_unit => {
+            Vec::new()
+        }
+        (Utf8, Binary) | (Binary, Utf8) => Vec::new(),
+        (List(_), List(target_field)) => vec![retag_iceberg_array_data(
+            data.child_data()[0].clone(),
+            target_field.data_type(),
+        )?],
+        (LargeList(_), LargeList(target_field)) => vec![retag_iceberg_array_data(
+            data.child_data()[0].clone(),
+            target_field.data_type(),
+        )?],
+        (Map(_, source_ordered), Map(target_field, target_ordered))
+            if source_ordered == target_ordered =>
+        {
+            vec![retag_iceberg_array_data(
+                data.child_data()[0].clone(),
+                target_field.data_type(),
+            )?]
+        }
+        (Struct(_), Struct(target_fields)) if data.child_data().len() == target_fields.len() => {
+            target_fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    retag_iceberg_array_data(data.child_data()[index].clone(), field.data_type())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        _ => {
+            return Err(format!(
+                "Iceberg physical Arrow type cannot be metadata-retagged from {source:?} to {target:?}"
+            ));
+        }
+    };
+    let mut builder = data.into_builder().data_type(target.clone());
+    if !children.is_empty() {
+        builder = builder.child_data(children);
+    }
+    builder.build().map_err(|error| {
+        format!("rebuild Iceberg Arrow metadata from {source:?} to {target:?}: {error}")
+    })
+}
 
 /// Lower provider-owned Iceberg predicates into connector-neutral physical
 /// file predicates.  Field IDs remain authoritative across Iceberg renames.
@@ -227,6 +307,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use arrow::array::StringArray;
+    use arrow::datatypes::DataType;
+
     use super::*;
 
     struct NeverCancelled;
@@ -302,5 +385,14 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::DeadlineExceeded
         );
+    }
+
+    #[test]
+    fn retags_equivalent_physical_string_buffers_without_reencoding() {
+        let source: ArrayRef = Arc::new(StringArray::from(vec!["iceberg", "provider"]));
+        let retagged = retag_iceberg_array(&source, &DataType::Binary).expect("retag utf8");
+
+        assert_eq!(retagged.data_type(), &DataType::Binary);
+        assert_eq!(retagged.to_data().buffers(), source.to_data().buffers());
     }
 }

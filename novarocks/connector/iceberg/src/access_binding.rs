@@ -37,6 +37,25 @@ pub struct IcebergReadBinding {
     resources: FsAccessResources,
 }
 
+/// Provider-local credentials selected for one Iceberg object-store location.
+/// This is process-local construction state, never a connector handle or
+/// durable catalog property.
+#[derive(Clone, Debug)]
+pub struct IcebergObjectStoreBinding {
+    bucket: String,
+    config: novarocks_fs::ObjectStoreConfig,
+}
+
+impl IcebergObjectStoreBinding {
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn config(&self) -> &novarocks_fs::ObjectStoreConfig {
+        &self.config
+    }
+}
+
 impl std::fmt::Debug for IcebergReadBinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -92,6 +111,39 @@ impl IcebergReadBinding {
 
     pub fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
         self.resources.object_store_config()
+    }
+
+    /// Resolve the startup-composed object-store credentials for an Iceberg
+    /// output location. Local/HDFS paths intentionally return no object-store
+    /// binding; object-store paths must name a bucket and have explicit BE
+    /// credentials.
+    pub fn object_store_binding_for_location(
+        &self,
+        location: &str,
+    ) -> Result<Option<IcebergObjectStoreBinding>, String> {
+        let location = self
+            .resources
+            .access_resolver()
+            .parse_location(location)
+            .map_err(|error| format!("parse Iceberg output location: {error}"))?;
+        if location.scheme() != novarocks_fs::FsScheme::ObjectStore {
+            return Ok(None);
+        }
+        let bucket = location.authority().ok_or_else(|| {
+            format!(
+                "Iceberg object-store output location is missing a bucket: {}",
+                location.original()
+            )
+        })?;
+        let config = self.object_store_config().cloned().ok_or_else(|| {
+            format!(
+                "Iceberg connector writer needs a startup object-store binding for bucket {bucket}"
+            )
+        })?;
+        Ok(Some(IcebergObjectStoreBinding {
+            bucket: bucket.to_string(),
+            config,
+        }))
     }
 
     pub fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
@@ -185,5 +237,42 @@ mod tests {
 
         assert!(Arc::ptr_eq(&context.runtime, &file_runtime));
         assert!(Arc::ptr_eq(&context.task_spawner, &task_spawner));
+    }
+
+    #[test]
+    fn object_store_writer_binding_never_discovers_credentials() {
+        let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
+        let config = novarocks_fs::ObjectStoreConfig {
+            endpoint: "http://minio:9000".to_string(),
+            access_key_id: "test".to_string(),
+            access_key_secret: "test".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: None,
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        };
+        let binding = IcebergReadBinding::new(
+            Some(config),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+
+        let selected = binding
+            .object_store_binding_for_location("s3://warehouse/staging/data.parquet")
+            .expect("select object store")
+            .expect("object store binding");
+        assert_eq!(selected.bucket(), "warehouse");
+        assert_eq!(selected.config().endpoint, "http://minio:9000");
+        assert!(
+            binding
+                .object_store_binding_for_location("file:///tmp/data.parquet")
+                .expect("local location")
+                .is_none()
+        );
     }
 }

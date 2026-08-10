@@ -233,7 +233,7 @@ pub(crate) fn has_iceberg_staged_output(
         .reports()
         .iter()
         .try_fold(false, |has_staged_output, staged| {
-            let reports = crate::connector::iceberg::write_contract::decode_writer_reports(
+            let reports = novarocks_connector_iceberg::write_codec::decode_writer_reports(
                 staged.payload(),
                 commit_executor.table.metadata(),
             )?;

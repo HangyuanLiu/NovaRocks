@@ -1814,6 +1814,23 @@ fn cast_with_special_rules_with_field_schema(
     if array.data_type() == &DataType::Null {
         return Ok(new_null_array(target_type, array.len()));
     }
+    if !matches!(
+        array.data_type(),
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+    ) && !matches!(
+        target_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+    ) {
+        return novarocks_types::arrow_cast::cast_scalar_with_special_rules(array, target_type);
+    }
     match (array.data_type(), target_type) {
         (DataType::Utf8, DataType::Date32) => {
             let arr = array
