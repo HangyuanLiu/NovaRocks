@@ -670,6 +670,9 @@ impl BackendRuntimeFilterSession {
                 _ => SnapshotAcquireOutcome::Unavailable(UnavailableReason::MaterializationFailed),
             };
             for route in &consumer.routes {
+                if !self.owns_outbound_materialization_route(*route) {
+                    continue;
+                }
                 consumer
                     .subscriptions
                     .publish(*route, outcome.clone(), terminal)
@@ -686,6 +689,9 @@ impl BackendRuntimeFilterSession {
     ) -> Result<(), RuntimeFilterContractViolation> {
         for consumer in self.consumers.values() {
             for route in &consumer.routes {
+                if !self.owns_outbound_materialization_route(*route) {
+                    continue;
+                }
                 consumer
                     .subscriptions
                     .publish_terminal(*route, terminal)
@@ -694,6 +700,13 @@ impl BackendRuntimeFilterSession {
         }
         self.dispatch_outbound_terminal(terminal)?;
         Ok(())
+    }
+
+    fn owns_outbound_materialization_route(&self, route: BackendRouteEdgeId) -> bool {
+        self.channel
+            .outbound_materialization_groups()
+            .values()
+            .any(|group| group.route_edge_ids().contains(&route))
     }
 
     fn dispatch_outbound_snapshot(
@@ -1394,6 +1407,74 @@ mod tests {
             session.availability_progress(),
             BackendCoverageProgress::Satisfied
         );
+    }
+
+    #[test]
+    fn producer_without_materialization_ownership_does_not_publish_local_snapshot() {
+        let (session, fixture) = session();
+        let consumer_contract = RuntimeFilterConsumerContract::membership_blocking(
+            RuntimeFilterBindingId::new(70),
+            RuntimeFilterChannelId::new(11),
+            session.channel().execution_contract().clone(),
+        )
+        .unwrap();
+        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(
+            subscription,
+        )) = session
+            .subscribe(
+                instance(51),
+                RuntimeFilterSubscriptionRequest::new(consumer_contract),
+            )
+            .unwrap()
+        else {
+            panic!("installed blocking consumer must bind")
+        };
+
+        for producer_instance in [instance(37), instance(41)] {
+            let RuntimeFilterBindOutcome::Bound(producer) = session
+                .open_producer(
+                    producer_instance,
+                    RuntimeFilterProducerOpenRequest::new(fixture.producer_contract(), 1),
+                )
+                .unwrap()
+            else {
+                panic!("installed producer must bind")
+            };
+            producer
+                .submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    fixture.membership_contribution(),
+                )
+                .unwrap();
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+                .unwrap();
+        }
+        let second_contract =
+            novarocks_execution::runtime_filter::RuntimeFilterProducerContract::membership(
+                RuntimeFilterBindingId::new(8),
+                RuntimeFilterChannelId::new(11),
+                session.channel().execution_contract().clone(),
+            )
+            .unwrap();
+        let RuntimeFilterBindOutcome::Bound(second) = session
+            .open_producer(
+                instance(43),
+                RuntimeFilterProducerOpenRequest::new(second_contract, 1),
+            )
+            .unwrap()
+        else {
+            panic!("second installed producer binding must bind")
+        };
+        second
+            .close_partition(PartitionId::new(0), ProducerSequence::new(0))
+            .unwrap();
+
+        assert!(matches!(
+            subscription.acquire(Duration::ZERO),
+            SnapshotAcquireOutcome::TimedOut
+        ));
     }
 
     #[test]

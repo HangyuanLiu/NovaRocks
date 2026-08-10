@@ -1739,10 +1739,10 @@ pub(crate) fn validate_participant_install(
         if producer_witnesses.len() != channel.producers().len() {
             return Err("producer coverage witness is duplicated within a channel".to_string());
         }
-        if channel.availability_coverage().witnesses() != producer_witnesses
-            || channel.terminal_coverage().witnesses() != producer_witnesses
-        {
-            return Err("coverage must reference every producer witness exactly once".to_string());
+        if !producer_witnesses.is_subset(&channel.availability_coverage().witnesses()) {
+            return Err(
+                "availability coverage must reference every local producer witness".to_string(),
+            );
         }
         for binding in channel.producers().keys().chain(channel.consumers().keys()) {
             if !bindings.insert(*binding) {
@@ -1767,7 +1767,17 @@ pub(crate) fn validate_participant_install(
 }
 #[cfg(test)]
 mod tests {
-    use super::{CONTRIBUTION_DIGEST_DOMAIN, decode_runtime_filter_contribution};
+    use super::{
+        CONTRIBUTION_DIGEST_DOMAIN, decode_runtime_filter_contribution,
+        validate_participant_install,
+    };
+    use crate::runtime_filter::{
+        domain::{
+            BackendChannelInstall, BackendChannelLifecycle, BackendMaterializationPolicy,
+            BackendParticipantInstall, BackendRoutingShard,
+        },
+        test_support::BackendRuntimeFilterFixture,
+    };
     use novarocks::query_execution::lifecycle::{
         AttemptId, QueryExecutionId, RuntimeFilterContribution,
     };
@@ -1845,5 +1855,33 @@ mod tests {
             error.to_string(),
             "InvalidManifest: runtime filter contribution digest does not match install DTO"
         );
+    }
+
+    #[test]
+    fn accepts_global_coverage_on_participant_without_local_producer() {
+        let fixture = BackendRuntimeFilterFixture::membership();
+        let producer = fixture.producer_contract();
+        let channel = BackendChannelInstall::new(
+            producer.channel_id(),
+            producer.contract().clone(),
+            BackendChannelLifecycle::CompleteOnce,
+            fixture.coverage(),
+            fixture.coverage(),
+            BackendMaterializationPolicy::new(8, 3, 17, 1, 4096, 1024, 1)
+                .expect("valid materialization policy"),
+            4096,
+            4096,
+            [],
+            [],
+            [],
+        )
+        .expect("valid participant-local channel projection");
+        let routing = BackendRoutingShard::new(fixture.identity(), 1, [])
+            .expect("valid empty local routing projection");
+        let install = BackendParticipantInstall::new(fixture.identity(), 1, [channel], routing)
+            .expect("valid participant install");
+
+        validate_participant_install(&install)
+            .expect("global coverage may include witnesses owned by remote participants");
     }
 }
