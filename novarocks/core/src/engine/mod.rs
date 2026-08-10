@@ -2324,7 +2324,12 @@ impl StandaloneSession {
 
         // SHOW CREATE TABLE ...
         if looks_like_show_create_table(&normalized) {
-            return self.handle_show_create_table(&normalized, current_catalog, current_database);
+            return self.handle_show_create_table(
+                &normalized,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
@@ -2386,6 +2391,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let table_name = parse_show_create_table(sql)?;
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
@@ -2400,20 +2406,33 @@ impl StandaloneSession {
                 target.backend_name
             ));
         }
-        let entry = {
-            let registry = self
-                .inner
-                .iceberg_catalogs
-                .read()
-                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-            registry.get(&target.catalog)?
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        let lease = self
+            .inner
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|error| error.to_string())?;
+        let identity = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(target.namespace.as_str()),
+            table: Arc::from(target.table.as_str()),
         };
-        entry.invalidate_table_cache(&target.namespace, &target.table);
-        let loaded = crate::connector::iceberg::catalog::registry::load_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )?;
+        let loaded = lease
+            .binding()
+            .metadata()
+            .load_table(novarocks_spi::connector::ConnectorTableRequest {
+                table: identity.clone(),
+                resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                context: connector_context.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+        if loaded.identity != identity || loaded.table.owner() != &identity.instance_id {
+            return Err(
+                "SHOW CREATE TABLE received corrupt metadata for a different connector table"
+                    .to_string(),
+            );
+        }
         let ddl = build_iceberg_create_table_ddl(
             &target.catalog,
             &target.namespace,
@@ -3151,62 +3170,70 @@ fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::Obje
     Ok(crate::sql::parser::ast::ObjectName { parts })
 }
 
-/// Generate a `CREATE TABLE` DDL string from a loaded Iceberg table's current
-/// schema.  Column doc strings are emitted as `COMMENT '...'` clauses.
+/// Generate a `CREATE TABLE` DDL string from exact-generation connector facts.
 fn build_iceberg_create_table_ddl(
     catalog: &str,
     namespace: &str,
     table: &str,
-    loaded: &crate::connector::iceberg::catalog::registry::IcebergLoadedTable,
+    loaded: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<String, String> {
-    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
+    use novarocks_spi::connector::ConnectorTableDefinitionType;
 
-    fn iceberg_type_to_sql(ty: &Type) -> String {
+    fn definition_type_to_sql(ty: &ConnectorTableDefinitionType) -> String {
         match ty {
-            Type::Primitive(PrimitiveType::Boolean) => "BOOLEAN".to_string(),
-            Type::Primitive(PrimitiveType::Int) => "INT".to_string(),
-            Type::Primitive(PrimitiveType::Long) => "BIGINT".to_string(),
-            Type::Primitive(PrimitiveType::Float) => "FLOAT".to_string(),
-            Type::Primitive(PrimitiveType::Double) => "DOUBLE".to_string(),
-            Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
+            ConnectorTableDefinitionType::Boolean => "BOOLEAN".to_string(),
+            ConnectorTableDefinitionType::Int => "INT".to_string(),
+            ConnectorTableDefinitionType::BigInt => "BIGINT".to_string(),
+            ConnectorTableDefinitionType::Float => "FLOAT".to_string(),
+            ConnectorTableDefinitionType::Double => "DOUBLE".to_string(),
+            ConnectorTableDefinitionType::Decimal { precision, scale } => {
                 format!("DECIMAL({precision},{scale})")
             }
-            Type::Primitive(PrimitiveType::Date) => "DATE".to_string(),
-            Type::Primitive(PrimitiveType::Time) => "TIME".to_string(),
-            Type::Primitive(PrimitiveType::Timestamp)
-            | Type::Primitive(PrimitiveType::Timestamptz) => "DATETIME".to_string(),
-            Type::Primitive(PrimitiveType::TimestampNs)
-            | Type::Primitive(PrimitiveType::TimestamptzNs) => "TIMESTAMP_NS".to_string(),
-            Type::Primitive(PrimitiveType::String) => "STRING".to_string(),
-            Type::Primitive(PrimitiveType::Uuid) => "STRING".to_string(),
-            Type::Primitive(PrimitiveType::Fixed(n)) => format!("BINARY({n})"),
-            Type::Primitive(PrimitiveType::Binary) => "BINARY".to_string(),
-            Type::Primitive(PrimitiveType::Variant) => "VARIANT".to_string(),
-            Type::List(l) => format!(
-                "ARRAY<{}>",
-                iceberg_type_to_sql(&l.element_field.field_type)
-            ),
-            Type::Map(m) => format!(
+            ConnectorTableDefinitionType::Date => "DATE".to_string(),
+            ConnectorTableDefinitionType::Time => "TIME".to_string(),
+            ConnectorTableDefinitionType::DateTime => "DATETIME".to_string(),
+            ConnectorTableDefinitionType::DateTimeNs => "TIMESTAMP_NS".to_string(),
+            ConnectorTableDefinitionType::String => "STRING".to_string(),
+            ConnectorTableDefinitionType::Binary {
+                fixed_length: Some(length),
+            } => format!("BINARY({length})"),
+            ConnectorTableDefinitionType::Binary { fixed_length: None } => "BINARY".to_string(),
+            ConnectorTableDefinitionType::Variant => "VARIANT".to_string(),
+            ConnectorTableDefinitionType::Array(element) => {
+                format!("ARRAY<{}>", definition_type_to_sql(element))
+            }
+            ConnectorTableDefinitionType::Map(key, value) => format!(
                 "MAP<{},{}>",
-                iceberg_type_to_sql(&m.key_field.field_type),
-                iceberg_type_to_sql(&m.value_field.field_type)
+                definition_type_to_sql(key),
+                definition_type_to_sql(value)
             ),
-            Type::Struct(s) => {
-                let fields: Vec<String> = s
-                    .fields()
+            ConnectorTableDefinitionType::Struct(fields) => {
+                let fields = fields
                     .iter()
-                    .map(|f| format!("{} {}", f.name, iceberg_type_to_sql(&f.field_type)))
-                    .collect();
+                    .map(|field| {
+                        format!(
+                            "{} {}",
+                            field.name(),
+                            definition_type_to_sql(field.data_type())
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 format!("STRUCT<{}>", fields.join(", "))
             }
         }
     }
 
-    let schema = loaded.table.metadata().current_schema();
-    let mut col_defs: Vec<String> = Vec::new();
-    for field in schema.as_struct().fields() {
-        let nullable = if field.required { " NOT NULL" } else { "" };
-        let comment = if let Some(doc) = &field.doc {
+    if loaded.definition_facts.is_empty() {
+        return Err(
+            "SHOW CREATE TABLE is unsupported because the connector returned no table definition facts"
+                .to_string(),
+        );
+    }
+    let mut col_defs = Vec::with_capacity(loaded.definition_facts.columns().len());
+    for column in loaded.definition_facts.columns() {
+        let field = loaded.schema.field(column.field_ordinal() as usize);
+        let nullable = if column.nullable() { "" } else { " NOT NULL" };
+        let comment = if let Some(doc) = column.comment() {
             let escaped = doc.replace('\'', "\\'");
             format!(" COMMENT '{escaped}'")
         } else {
@@ -3214,19 +3241,16 @@ fn build_iceberg_create_table_ddl(
         };
         col_defs.push(format!(
             "  `{}` {}{}{}",
-            field.name,
-            iceberg_type_to_sql(&field.field_type),
+            field.name(),
+            definition_type_to_sql(column.data_type()),
             nullable,
             comment
         ));
     }
 
-    // Emit table-level COMMENT if the "comment" property is set and non-empty.
     let table_comment = loaded
-        .table
-        .metadata()
-        .properties()
-        .get("comment")
+        .definition_facts
+        .table_comment()
         .filter(|v| !v.is_empty())
         .map(|v| {
             let escaped = v.replace('\'', "\\'");
@@ -5982,89 +6006,126 @@ fn parse_explain_refresh_materialized_view(
 #[cfg(test)]
 mod build_iceberg_create_table_ddl_tests {
     use super::build_iceberg_create_table_ddl;
-    use crate::connector::iceberg::catalog::registry::IcebergLoadedTable;
-    use novarocks_connector_iceberg::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type,
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
+        ConnectorTableDefinitionStructField, ConnectorTableDefinitionType, ConnectorTableHandle,
+        ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
     };
-    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    fn loaded_table_with_props(props: HashMap<String, String>) -> IcebergLoadedTable {
-        let schema = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::optional(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-            ))])
-            .build()
-            .expect("build schema");
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec(),
-            SortOrder::unsorted_order(),
-            "/tmp/test".to_string(),
-            FormatVersion::V2,
-            props,
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(60),
+            Arc::new(NeverCancelled),
+            1_024,
+            64 * 1_024,
         )
-        .expect("builder")
-        .build()
-        .expect("metadata")
-        .metadata;
-        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(
-                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
-            )
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("table");
-        IcebergLoadedTable::new(table, None, vec![], HashMap::new(), None, HashMap::new())
+        .expect("request context")
+    }
+
+    fn loaded_table(
+        table_comment: Option<&str>,
+        column_comment: Option<&str>,
+        data_type: ConnectorTableDefinitionType,
+        nullable: bool,
+    ) -> ConnectorTableMetadata {
+        let instance_id = ConnectorInstanceId::parse("cat").expect("instance ID");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            nullable,
+        )]));
+        let planning_facts = ConnectorTablePlanningFacts::empty();
+        let definition_facts = ConnectorTableDefinitionFacts::try_new(
+            &schema,
+            &planning_facts,
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                data_type,
+                nullable,
+                column_comment.map(Arc::from),
+            )],
+            table_comment.map(Arc::from),
+            &request_context(),
+        )
+        .expect("definition facts");
+        ConnectorTableMetadata {
+            identity: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from("ns"),
+                table: Arc::from("tbl"),
+            },
+            schema,
+            planning_facts,
+            definition_facts,
+            version: None,
+            statistics_data_version: None,
+            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
+                .expect("table handle"),
+        }
     }
 
     #[test]
-    fn emits_comment_when_property_is_set() {
-        let mut props = HashMap::new();
-        props.insert("comment".to_string(), "my table comment".to_string());
-        let loaded = loaded_table_with_props(props);
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            ddl.contains("COMMENT 'my table comment'"),
-            "expected COMMENT clause in DDL, got: {ddl}"
+    fn emits_table_and_column_comments_with_escaping() {
+        let loaded = loaded_table(
+            Some("it's great"),
+            Some("owner's id"),
+            ConnectorTableDefinitionType::Int,
+            false,
         );
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(ddl.contains("`id` INT NOT NULL COMMENT 'owner\\'s id'"));
+        assert!(ddl.contains("COMMENT 'it\\'s great'"));
     }
 
     #[test]
-    fn no_comment_clause_when_property_absent() {
-        let loaded = loaded_table_with_props(HashMap::new());
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            !ddl.contains("COMMENT"),
-            "expected no COMMENT clause when property absent, got: {ddl}"
+    fn renders_fixed_and_nested_definition_types() {
+        let loaded = loaded_table(
+            None,
+            None,
+            ConnectorTableDefinitionType::Array(Box::new(ConnectorTableDefinitionType::Struct(
+                vec![ConnectorTableDefinitionStructField::new(
+                    "payload",
+                    ConnectorTableDefinitionType::Map(
+                        Box::new(ConnectorTableDefinitionType::String),
+                        Box::new(ConnectorTableDefinitionType::Binary {
+                            fixed_length: Some(16),
+                        }),
+                    ),
+                )],
+            ))),
+            true,
         );
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(ddl.contains("ARRAY<STRUCT<payload MAP<STRING,BINARY(16)>>>"));
     }
 
     #[test]
-    fn no_comment_clause_when_property_empty() {
-        let mut props = HashMap::new();
-        props.insert("comment".to_string(), String::new());
-        let loaded = loaded_table_with_props(props);
+    fn no_comment_clause_when_comment_is_empty() {
+        let loaded = loaded_table(Some(""), None, ConnectorTableDefinitionType::Int, true);
         let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            !ddl.contains("COMMENT"),
-            "expected no COMMENT clause when property is empty string, got: {ddl}"
-        );
+        assert!(!ddl.contains("COMMENT"));
     }
 
     #[test]
-    fn comment_with_single_quote_is_escaped() {
-        let mut props = HashMap::new();
-        props.insert("comment".to_string(), "it's great".to_string());
-        let loaded = loaded_table_with_props(props);
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            ddl.contains("COMMENT 'it\\'s great'"),
-            "expected escaped single quote in COMMENT, got: {ddl}"
-        );
+    fn empty_definition_facts_fail_closed() {
+        let mut loaded = loaded_table(None, None, ConnectorTableDefinitionType::Int, true);
+        loaded.definition_facts = ConnectorTableDefinitionFacts::empty();
+        let error = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded)
+            .expect_err("empty definition facts must fail");
+        assert!(error.contains("unsupported"));
     }
 }
 

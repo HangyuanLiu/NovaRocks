@@ -607,6 +607,7 @@ mod tests {
                 identity: request.table,
                 schema: Arc::new(Schema::empty()),
                 planning_facts: ConnectorTablePlanningFacts::empty(),
+                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
                 version: None,
                 statistics_data_version: None,
                 table: novarocks_spi::connector::ConnectorTableHandle::try_new(

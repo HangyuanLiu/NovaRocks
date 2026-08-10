@@ -63,6 +63,7 @@ pub mod schema_mapping;
 pub mod statistics_codec;
 pub mod stats_assembler;
 pub mod stats_loader;
+pub mod table_definition;
 pub mod theta_sketch;
 pub mod write_activation;
 pub mod write_codec;

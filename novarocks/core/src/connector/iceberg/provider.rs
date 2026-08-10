@@ -3606,6 +3606,8 @@ impl ConnectorMetadata for IcebergControlProvider {
             &loaded.table.metadata().uuid().to_string(),
             loaded.table.metadata().current_snapshot_id(),
         )?;
+        let definition_schema = loaded.table.metadata().current_schema().clone();
+        let table_comment = loaded.table.metadata().properties().get("comment").cloned();
         let table = build_table_payload(
             self.instance_id.as_str(),
             &request.table.namespace,
@@ -3639,6 +3641,17 @@ impl ConnectorMetadata for IcebergControlProvider {
                 context: &request.context,
             },
         )?;
+        let definition_facts = if table.metadata_table_type.is_some() {
+            novarocks_spi::connector::ConnectorTableDefinitionFacts::empty()
+        } else {
+            novarocks_connector_iceberg::table_definition::table_definition_facts(
+                &definition_schema,
+                &schema,
+                &planning_facts,
+                table_comment.as_deref(),
+                &request.context,
+            )?
+        };
         Ok(ConnectorTableMetadata {
             identity: novarocks_spi::connector::ConnectorTableIdentity {
                 instance_id: self.instance_id.clone(),
@@ -3647,6 +3660,7 @@ impl ConnectorMetadata for IcebergControlProvider {
             },
             schema,
             planning_facts,
+            definition_facts,
             version,
             statistics_data_version: Some(statistics_data_version),
             table: ConnectorTableHandle::try_new(
@@ -11957,6 +11971,7 @@ fn planned_table_files_fixture_binding(
                 identity: request.table.clone(),
                 schema: fixture_read_schema_for_table(request.table.table.as_ref()),
                 planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
                 version: None,
                 statistics_data_version: None,
                 table: ConnectorTableHandle::try_new(
