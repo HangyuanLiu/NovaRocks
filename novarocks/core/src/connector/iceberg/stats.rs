@@ -525,16 +525,17 @@ fn build_stats_file_io(
         return Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(location, None));
     }
 
-    let props = cloud_properties
+    let properties = cloud_properties
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
-    let object_store_config =
-        crate::connector::iceberg::fs_io::object_store_config_from_catalog_properties(&props)?
-            .ok_or_else(|| {
-                "object-store stats FileIO requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                    .to_string()
-            })?;
+    let object_store_config = novarocks_fs::object_store_config_from_aws_s3_catalog_property_pairs(
+        &properties,
+    )?
+    .ok_or_else(|| {
+        "object-store stats FileIO requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+            .to_string()
+    })?;
     Ok(
         crate::connector::iceberg::fs_io::build_file_io_for_location(
             location,

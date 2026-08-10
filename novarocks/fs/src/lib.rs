@@ -47,6 +47,7 @@ pub use cache::{
 pub use catalog_properties::{
     AWS_S3_CATALOG_PROPERTY_KEYS, normalize_aws_s3_catalog_properties,
     object_store_config_from_aws_s3_catalog_properties,
+    object_store_config_from_aws_s3_catalog_property_pairs,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
 pub use physical_reader::{

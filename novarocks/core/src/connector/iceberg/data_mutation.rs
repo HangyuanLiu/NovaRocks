@@ -265,9 +265,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 let manifest = plan_manifest_for_table(
                     &table,
                     source_location,
-                    fs_io::object_store_config_from_catalog_properties(&entry.properties)
-                        .map_err(map_provider_error)?
-                        .as_ref(),
+                    novarocks_fs::object_store_config_from_aws_s3_catalog_property_pairs(
+                        &entry.properties,
+                    )
+                    .map_err(map_provider_error)?
+                    .as_ref(),
                 )
                 .map_err(map_provider_error)?;
                 let mapping_digest = manifest
@@ -378,10 +380,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         );
         let op_kind = match planned {
             PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } => {
-                let object_store = fs_io::object_store_config_from_catalog_properties(
-                    &entry.properties,
-                )
-                .map_err(|error| connector_error_as_pre_dispatch(map_provider_error(error)))?;
+                let object_store =
+                    novarocks_fs::object_store_config_from_aws_s3_catalog_property_pairs(
+                        &entry.properties,
+                    )
+                    .map_err(|error| connector_error_as_pre_dispatch(map_provider_error(error)))?;
                 revalidate_manifest_for_table(
                     &table,
                     payload

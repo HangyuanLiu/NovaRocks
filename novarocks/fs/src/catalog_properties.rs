@@ -131,6 +131,20 @@ pub fn object_store_config_from_aws_s3_catalog_properties(
     }))
 }
 
+/// Decodes catalog property pairs without requiring application code to
+/// duplicate the transient map conversion. The resulting credentials remain
+/// process-local and cannot be persisted as catalog state.
+pub fn object_store_config_from_aws_s3_catalog_property_pairs(
+    properties: &[(String, String)],
+) -> Result<Option<ObjectStoreConfig>, String> {
+    object_store_config_from_aws_s3_catalog_properties(
+        &properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
 fn first_nonempty_property<'a>(
     properties: &'a BTreeMap<String, String>,
     keys: &[&str],
@@ -170,6 +184,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 mod tests {
     use super::{
         normalize_aws_s3_catalog_properties, object_store_config_from_aws_s3_catalog_properties,
+        object_store_config_from_aws_s3_catalog_property_pairs,
     };
     use std::collections::BTreeMap;
 
@@ -263,5 +278,20 @@ mod tests {
         assert_eq!(config.retry_min_delay_ms, None);
         assert_eq!(config.timeout_ms, None);
         assert_eq!(config.io_timeout_ms, Some(10));
+    }
+
+    #[test]
+    fn parses_property_pairs_without_an_application_wrapper() {
+        let config = object_store_config_from_aws_s3_catalog_property_pairs(&[
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://localhost:9000".to_string(),
+            ),
+            ("aws.s3.access_key".to_string(), "ak".to_string()),
+            ("aws.s3.secret_key".to_string(), "sk".to_string()),
+        ])
+        .expect("parse property pairs")
+        .expect("complete credentials");
+        assert_eq!(config.endpoint, "http://localhost:9000");
     }
 }
