@@ -25,6 +25,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_connector_iceberg::commit::{MvProvenanceV1, RefreshTechnique};
 use novarocks_connector_iceberg::iceberg::spec::Transform;
 use novarocks_spi::connector::{
@@ -177,6 +178,15 @@ impl MvStorageObservation for IcebergMvStorageObservationAdapter {
 
             for namespace in namespaces {
                 validate_namespace_owner(&namespace, &instance_id)?;
+                if let Err(error) = normalize_identifier(namespace.namespace.as_ref()) {
+                    tracing::warn!(
+                        catalog,
+                        namespace = %namespace.namespace,
+                        error,
+                        "skip Iceberg namespace outside the Native identifier contract during lake MV discovery"
+                    );
+                    continue;
+                }
                 reserve_payload(&context, &mut budget, namespace.namespace.as_ref())?;
                 let mut tables =
                     exact_lease

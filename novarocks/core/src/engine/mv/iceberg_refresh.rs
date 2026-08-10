@@ -22608,6 +22608,27 @@ mod tests {
         assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
     }
 
+    #[test]
+    fn discover_iceberg_mvs_skips_legacy_namespace_names() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        std::fs::create_dir_all(env._warehouse_dir.path().join("statistics-sqlt-deadbeef"))
+            .expect("create legacy Iceberg namespace directory");
+
+        let discovered = discover_lake_packages_for_test(&env.state, "ice", "analytics")
+            .expect("legacy namespace name must not abort MV lake discovery");
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].table.table.as_ref(), "mv_orders");
+    }
+
     /// Read the [`MvProvenanceV1`] carried by an MV table's current snapshot
     /// summary, reloading the table fresh from the catalog. Returns `None` when
     /// there is no current snapshot or the snapshot carries no provenance.

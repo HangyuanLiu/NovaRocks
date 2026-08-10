@@ -562,7 +562,7 @@ impl FrontendQuerySession {
         let mut query_options = state.execution_settings.query_options();
         query_options.apply_sql_hints(&sql);
         let is_query = is_query_statement(&sql);
-        let worker = task::spawn_blocking(move || {
+        let mut worker = task::spawn_blocking(move || {
             #[cfg(feature = "mv-first-refresh-staging-test-support")]
             let result = if let Some(mv_name) = parse_mvx2w_native_staging_command(&sql) {
                 staging_engine
@@ -658,12 +658,16 @@ impl FrontendQuerySession {
             (result, completion)
         });
         let result = if let Some(seconds) = query_timeout_secs {
-            match tokio::time::timeout(Duration::from_secs(seconds), worker).await {
+            match tokio::time::timeout(Duration::from_secs(seconds), &mut worker).await {
                 Ok(result) => result.map_err(|error| internal_error(error.to_string()))?,
                 Err(_) => {
                     self.cancel_current(QueryCancellationReason::DeadlineExceeded {
                         timeout_ms: seconds.saturating_mul(1_000),
                     });
+                    // A timeout is not complete until the worker releases the
+                    // statement lease. Waiting here also fences Backend abort
+                    // acknowledgement before this session admits its next SQL.
+                    let _ = worker.await;
                     return Err(QueryServiceError::new(
                         QueryServiceErrorKind::Timeout,
                         format!("query timed out after {} ms", seconds.saturating_mul(1_000)),

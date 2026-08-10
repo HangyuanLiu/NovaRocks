@@ -2851,11 +2851,22 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "query_control_fragment_backend_limit",
         "fail_fragment_after_start_be_index",
     ];
+    const LIFECYCLE_EVIDENCE_MARKERS: &[&str] = &[
+        "NOVAROCKS_QUERY_INIT_",
+        "NOVAROCKS_QUERY_CONTROL_",
+        "NOVAROCKS_QUERY_FRAGMENT_",
+        "NOVAROCKS_QUERY_LIFECYCLE_",
+        "NOVAROCKS_QUERY_TERMINAL_",
+    ];
     sql.lines().any(|line| {
         let line = line.trim_start();
         DIRECTIVES
             .iter()
             .any(|directive| line.starts_with(&format!("-- @{directive}=")))
+            || (line.starts_with("-- @be_log")
+                && LIFECYCLE_EVIDENCE_MARKERS
+                    .iter()
+                    .any(|marker| line.contains(marker)))
     })
 }
 
@@ -3804,7 +3815,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_fault_preflight_only_matches_explicit_directives() {
+    fn lifecycle_fault_preflight_matches_faults_and_lifecycle_evidence() {
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @drop_next_init_ack_be_index=1\nSELECT 1;"
         ));
@@ -3819,6 +3830,9 @@ mod tests {
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @fail_fragment_after_start_be_index=1\nSELECT 1;"
+        ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3\nSELECT 1;"
         ));
         assert!(!sql_text_has_query_lifecycle_fault_directive(
             "-- query-control-heartbeat-loss is only a case name\nSELECT 1;"

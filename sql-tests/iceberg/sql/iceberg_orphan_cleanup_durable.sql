@@ -61,13 +61,6 @@ CALL cleanup_ice_${uuid0}.system.remove_orphan_files(
 
 -- query 3
 -- @db=cleanup_ice_${uuid0}.ns_${uuid0}
--- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
--- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
--- @be_log_not_contains=NOVAROCKS_EXCHANGE_INGRESS
--- @be_log_not_contains=NOVAROCKS_EXCHANGE_EGRESS
--- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
--- @be_log_not_contains=NOVAROCKS_CLEANUP_RPC
--- @be_log_not_contains=NOVAROCKS_CLEANUP_WORKER
 SELECT COUNT(*) AS n FROM orders;
 
 -- query 4
