@@ -525,7 +525,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use novarocks_spi::state_store::FeDeploymentView;
+    use novarocks_spi::state_store::{
+        FeDeploymentView, StateStore,
+        conformance::{FaultGate, FaultInjectingStateStore},
+    };
     use novarocks_state_store::{
         SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
         StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
@@ -632,6 +635,81 @@ mod tests {
         );
 
         drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    #[tokio::test]
+    async fn commit_response_loss_recovers_create_and_exact_drop_without_new_identity() {
+        let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
+        let registry =
+            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let mut host = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "catalog-attachment-commit-unknown-test".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: directory.path().join("state-store.sqlite"),
+                            deployment_owner: "catalog-attachment-commit-unknown-test".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
+                topology_revision: Bytes::from_static(b"catalog-attachment-commit-unknown-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite StateStore");
+        let store = host.state_store().expect("ready StateStore");
+        let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+        let fault_store: Arc<dyn StateStore> = fault.clone();
+        let repository = CatalogAttachmentRepository::open(fault_store)
+            .await
+            .expect("open catalog attachment repository");
+
+        let requested = attachment(vec![("type".into(), "iceberg".into())]);
+        let create_gate = FaultGate::new();
+        fault.lose_next_post_dispatch_response(create_gate.clone());
+        let create_task = tokio::spawn({
+            let repository = repository.clone();
+            let requested = requested.clone();
+            async move { repository.create(requested).await }
+        });
+        create_gate.wait_reached().await;
+        create_gate.release().await;
+        let created = create_task
+            .await
+            .expect("create task joins")
+            .expect("commit resolution recovers create");
+        assert_eq!(created.attachment.attachment_id, requested.attachment_id);
+        assert_eq!(repository.list().await.expect("list attachments").len(), 1);
+
+        let drop_gate = FaultGate::new();
+        fault.lose_next_post_dispatch_response(drop_gate.clone());
+        let drop_task = tokio::spawn({
+            let repository = repository.clone();
+            async move { repository.drop_exact(created).await }
+        });
+        drop_gate.wait_reached().await;
+        drop_gate.release().await;
+        drop_task
+            .await
+            .expect("drop task joins")
+            .expect("commit resolution recovers exact drop");
+        assert!(repository.list().await.expect("list after drop").is_empty());
+
+        drop(repository);
+        drop(fault);
         drop(store);
         host.shutdown(Instant::now() + Duration::from_secs(5))
             .await
