@@ -2891,7 +2891,18 @@ fn cow_selection_from_matched_and_insert(
                         field.field().name()
                     )
                 })?;
-            columns.push(old_rows.column(ordinal).clone());
+            columns.push(
+                crate::exec::expr::cast_array_to_target(
+                    old_rows.column(ordinal),
+                    field.field().data_type(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "cast provider COW before-image field `{}` to its sealed contract: {error}",
+                        field.field().name()
+                    )
+                })?,
+            );
         }
         for field in contract.after_fields() {
             fields.push(Arc::new(field.field().clone()));
@@ -2904,7 +2915,18 @@ fn cow_selection_from_matched_and_insert(
                         field.field().name()
                     )
                 })?;
-            columns.push(new_rows.column(ordinal).clone());
+            columns.push(
+                crate::exec::expr::cast_array_to_target(
+                    new_rows.column(ordinal),
+                    field.field().data_type(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "cast provider COW after-image field `{}` to its sealed contract: {error}",
+                        field.field().name()
+                    )
+                })?,
+            );
         }
         fields.push(Arc::new(contract.effect_field().field().clone()));
         columns.push(Arc::new(Int8Array::from(vec![
@@ -2946,7 +2968,18 @@ fn cow_selection_from_matched_and_insert(
                         field.field().name()
                     )
                 })?;
-            columns.push(insert_batch.column(ordinal).clone());
+            columns.push(
+                crate::exec::expr::cast_array_to_target(
+                    insert_batch.column(ordinal),
+                    field.field().data_type(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "cast provider COW MERGE INSERT field `{}` to its sealed contract: {error}",
+                        field.field().name()
+                    )
+                })?,
+            );
         }
         fields.push(Arc::new(contract.effect_field().field().clone()));
         columns.push(Arc::new(Int8Array::from(vec![
