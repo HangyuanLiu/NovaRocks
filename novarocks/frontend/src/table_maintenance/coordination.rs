@@ -43,6 +43,8 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use super::model::MaintenanceAuthorityV1;
+
 const RESOURCE_KEY_DOMAIN_V1: &[u8] = b"frontend/table-maintenance/table/v1\0";
 
 pub const MAINTENANCE_LEASE_DURATION: Duration = Duration::from_secs(15);
@@ -297,6 +299,20 @@ impl MaintenanceLeaseAttempt {
 
     pub fn fence(&self) -> LeaseFence {
         self.inner.fence_rx.borrow().clone()
+    }
+
+    /// Returns the canonical provenance that must be persisted with a fenced
+    /// repository transition. It is read from the held guard so the attempt id
+    /// and token always describe the same lease epoch.
+    pub async fn durable_authority(
+        &self,
+    ) -> Result<MaintenanceAuthorityV1, MaintenanceCoordinationError> {
+        self.ensure_active()
+            .map_err(|error| MaintenanceCoordinationError::RenewalTask(error.to_string()))?;
+        let guard = self.inner.guard.lock().await;
+        let token = guard.token().encode_v1()?;
+        MaintenanceAuthorityV1::try_new(self.attempt_id(), token.to_vec())
+            .map_err(MaintenanceCoordinationError::RenewalTask)
     }
 
     pub fn fence_validator(&self) -> MaintenanceFenceValidator {

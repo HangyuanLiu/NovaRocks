@@ -38,20 +38,24 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::coordination::MaintenanceFenceValidator;
 use super::model::{
-    CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_SCHEMA_VERSION,
-    CleanupBatchCheckpoint, CleanupOperation, CleanupOperationCreate, CleanupOperationState,
-    CleanupPlanPayload, DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES,
-    DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES, DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
-    DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
-    DistributedRewriteOpaquePayload, DistributedRewriteOperation,
-    DistributedRewriteOperationCreate, DistributedRewriteOperationState,
-    DistributedRewritePlanPayload, METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES,
-    METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION, MetadataMaintenanceExactOwner,
-    MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
+    CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION,
+    CLEANUP_OPERATION_SCHEMA_VERSION, CleanupBatchCheckpoint, CleanupOperation,
+    CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
+    DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES, DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES,
+    DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION,
+    DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION, DistributedRewriteAttemptCheckpoint,
+    DistributedRewriteAttemptDisposition, DistributedRewriteOpaquePayload,
+    DistributedRewriteOperation, DistributedRewriteOperationCreate,
+    DistributedRewriteOperationState, DistributedRewritePlanPayload,
+    METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES, METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION,
+    METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION, MaintenanceAuthorityV1,
+    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationState,
-    MetadataMaintenancePlanPayload, OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate,
-    OptimizeJobOutcome, StoredCleanupBatchV4, StoredCleanupOperationV4, StoredCleanupPlanV4,
+    MetadataMaintenancePlanPayload, OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION,
+    OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate, OptimizeJobOutcome,
+    StoredCleanupBatchV4, StoredCleanupOperationV4, StoredCleanupPlanV4,
     StoredCleanupTransactionActionV4, StoredCleanupTransactionV4,
     StoredDistributedRewriteAttemptV3, StoredDistributedRewriteOperationV3,
     StoredDistributedRewritePayloadKindV3, StoredDistributedRewritePayloadV3,
@@ -96,6 +100,36 @@ const CLEANUP_STATE_PREFIX: &str = "novarocks/frontend/table-maintenance/v4/clea
 const CLEANUP_TRANSACTION_PREFIX: &str =
     "novarocks/frontend/table-maintenance/v4/cleanup/transactions/";
 
+fn is_optimize_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION | OPTIMIZE_JOB_SCHEMA_VERSION
+    )
+}
+
+fn is_metadata_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION
+            | METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION
+    )
+}
+
+fn is_rewrite_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION
+            | DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+    )
+}
+
+fn is_cleanup_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION | CLEANUP_OPERATION_SCHEMA_VERSION
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryErrorKind {
     AlreadyActive,
@@ -103,6 +137,7 @@ pub enum RepositoryErrorKind {
     InvalidTransition,
     Corruption,
     CommitUnknown,
+    AuthorityLost,
     Store,
 }
 
@@ -130,6 +165,10 @@ impl RepositoryError {
 
     fn store(message: impl Into<String>) -> Self {
         Self::new(RepositoryErrorKind::Store, message)
+    }
+
+    fn authority_lost(message: impl Into<String>) -> Self {
+        Self::new(RepositoryErrorKind::AuthorityLost, message)
     }
 
     fn with_context(self, context: impl fmt::Display) -> Self {
@@ -283,9 +322,9 @@ impl OptimizeJobRepository {
             operation_id,
             "claim frontend optimize job",
             |transaction| {
-                Box::pin(
-                    async move { apply_claim(transaction, operation_id, job_id, now_ms).await },
-                )
+                Box::pin(async move {
+                    apply_claim(transaction, operation_id, job_id, now_ms, None).await
+                })
             },
         )
         .await;
@@ -320,6 +359,71 @@ impl OptimizeJobRepository {
         }
     }
 
+    /// Claims a pending V1 job and installs the caller's durable authority in
+    /// the same transaction as the state/index transition. The validator is
+    /// dynamic: it must read the latest lease fence at transaction time.
+    pub async fn claim_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<Option<OptimizeJob>> {
+        validate_job_id(job_id, "fenced claim optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced claim frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_claim(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+
+        match result {
+            Ok(success) => success.value,
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                let recovered = self
+                    .resolve_commit_unknown(
+                        transaction_id,
+                        operation_id,
+                        StoredOptimizeOperationActionV1::Claim,
+                        Some(job_id),
+                        &format!("fenced claim optimize job {job_id}"),
+                        error,
+                    )
+                    .await?;
+                if recovered.state != OptimizeJobState::Running {
+                    return Err(RepositoryError::corruption(format!(
+                        "fenced claim optimize job {job_id} authoritative result is not RUNNING"
+                    )));
+                }
+                Ok(Some(recovered))
+            }
+            Err(failure) => Err(format_run_failure(
+                &format!("fenced claim optimize job {job_id}"),
+                failure,
+            )),
+        }
+    }
+
     pub async fn record_outcome(
         &self,
         job_id: i64,
@@ -335,7 +439,7 @@ impl OptimizeJobRepository {
             |transaction| {
                 let outcome = outcome.clone();
                 Box::pin(async move {
-                    apply_record_outcome(transaction, operation_id, job_id, outcome).await
+                    apply_record_outcome(transaction, operation_id, job_id, outcome, None).await
                 })
             },
         )
@@ -350,6 +454,48 @@ impl OptimizeJobRepository {
         .await
     }
 
+    pub async fn record_outcome_fenced(
+        &self,
+        job_id: i64,
+        outcome: OptimizeJobOutcome,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fenced record optimize job outcome")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced record frontend optimize job outcome",
+            |transaction| {
+                let outcome = outcome.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_record_outcome(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        outcome,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::RecordOutcome,
+            job_id,
+            "fenced record outcome for optimize job",
+        )
+        .await
+    }
+
     pub async fn finish(&self, job_id: i64, now_ms: i64) -> RepositoryResult<()> {
         validate_job_id(job_id, "finish optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -359,9 +505,9 @@ impl OptimizeJobRepository {
             operation_id,
             "finish frontend optimize job",
             |transaction| {
-                Box::pin(
-                    async move { apply_finish(transaction, operation_id, job_id, now_ms).await },
-                )
+                Box::pin(async move {
+                    apply_finish(transaction, operation_id, job_id, now_ms, None).await
+                })
             },
         )
         .await;
@@ -371,6 +517,47 @@ impl OptimizeJobRepository {
             StoredOptimizeOperationActionV1::Finish,
             job_id,
             "finish optimize job",
+        )
+        .await
+    }
+
+    pub async fn finish_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fenced finish optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced finish frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_finish(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Finish,
+            job_id,
+            "fenced finish optimize job",
         )
         .await
     }
@@ -386,7 +573,7 @@ impl OptimizeJobRepository {
             |transaction| {
                 let message = message.clone();
                 Box::pin(async move {
-                    apply_fail(transaction, operation_id, job_id, now_ms, message).await
+                    apply_fail(transaction, operation_id, job_id, now_ms, message, None).await
                 })
             },
         )
@@ -397,6 +584,50 @@ impl OptimizeJobRepository {
             StoredOptimizeOperationActionV1::Fail,
             job_id,
             "fail optimize job",
+        )
+        .await
+    }
+
+    pub async fn fail_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        message: String,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fenced fail optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced fail frontend optimize job",
+            |transaction| {
+                let message = message.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_fail(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        message,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Fail,
+            job_id,
+            "fenced fail optimize job",
         )
         .await
     }
@@ -805,7 +1036,7 @@ async fn apply_create(
                     Ok(counter) => counter,
                     Err(error) => return Ok(Err(error)),
                 };
-            if counter.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION || counter.last_job_id < 0 {
+            if !is_optimize_schema_version(counter.schema_version) || counter.last_job_id < 0 {
                 return Ok(Err(RepositoryError::corruption(
                     "optimize job counter is corrupt",
                 )));
@@ -831,6 +1062,7 @@ async fn apply_create(
         started_at_ms: None,
         finished_at_ms: None,
         last_operation_id: *operation_id.as_uuid(),
+        authority: None,
     };
     let counter = StoredOptimizeCounterV1 {
         schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
@@ -883,11 +1115,48 @@ async fn apply_create(
     Ok(Ok(OptimizeJob::from(&stored)))
 }
 
+fn validate_authority(authority: &MaintenanceAuthorityV1) -> RepositoryResult<()> {
+    authority
+        .validate()
+        .map_err(|error| RepositoryError::corruption(format!("invalid durable authority: {error}")))
+}
+
+async fn validate_fenced_authority(
+    transaction: &mut dyn WriteTransaction,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> RepositoryResult<()> {
+    validate_authority(authority)?;
+    validator(transaction).await.map_err(|error| {
+        RepositoryError::authority_lost(format!("maintenance authority lost: {error}"))
+    })
+}
+
+async fn validate_bound_fenced_authority(
+    transaction: &mut dyn WriteTransaction,
+    durable: Option<&MaintenanceAuthorityV1>,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> RepositoryResult<()> {
+    let Some(durable) = durable else {
+        return Err(RepositoryError::authority_lost(
+            "maintenance operation has no durable authority",
+        ));
+    };
+    if durable != authority {
+        return Err(RepositoryError::authority_lost(
+            "maintenance operation authority does not match this attempt",
+        ));
+    }
+    validate_fenced_authority(transaction, authority, validator).await
+}
+
 async fn apply_claim(
     transaction: &mut dyn WriteTransaction,
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<Option<OptimizeJob>> {
     let Some(mut job) = (match load_job_from_transaction(transaction, job_id).await? {
         Ok(job) => job,
@@ -915,6 +1184,14 @@ async fn apply_claim(
     if let Err(error) = require_active_index(transaction, &job.stored, "claim optimize job").await?
     {
         return Ok(Err(error));
+    }
+
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+            return Ok(Err(error));
+        }
+        job.stored.schema_version = OPTIMIZE_JOB_SCHEMA_VERSION;
+        job.stored.authority = Some(authority.clone());
     }
 
     job.stored.state = StoredOptimizeJobStateV1::Running;
@@ -964,6 +1241,7 @@ async fn apply_record_outcome(
     operation_id: OperationId,
     job_id: i64,
     outcome: OptimizeJobOutcome,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<()> {
     let mut job =
         match require_running_job(transaction, job_id, "record optimize job outcome").await? {
@@ -976,6 +1254,18 @@ async fn apply_record_outcome(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            job.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+        {
+            return Ok(Err(error));
+        }
+    }
     let key = match job_key(job_id) {
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
@@ -1002,11 +1292,24 @@ async fn apply_finish(
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<()> {
     let mut job = match require_running_job(transaction, job_id, "finish optimize job").await? {
         Ok(job) => job,
         Err(error) => return Ok(Err(error)),
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            job.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+        {
+            return Ok(Err(error));
+        }
+    }
     if job.stored.outcome.is_none() {
         return Ok(Err(RepositoryError::new(
             RepositoryErrorKind::InvalidTransition,
@@ -1032,11 +1335,24 @@ async fn apply_fail(
     job_id: i64,
     now_ms: i64,
     message: String,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<()> {
     let mut job = match require_running_job(transaction, job_id, "fail optimize job").await? {
         Ok(job) => job,
         Err(error) => return Ok(Err(error)),
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            job.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+        {
+            return Ok(Err(error));
+        }
+    }
     job.stored.state = StoredOptimizeJobStateV1::Failed;
     job.stored.error_message = Some(message);
     job.stored.finished_at_ms = Some(now_ms);
@@ -1218,7 +1534,7 @@ fn decode_job_record(record: StateRecord) -> RepositoryResult<StoredOptimizeJobV
 }
 
 fn validate_stored_job(stored: &StoredOptimizeJobV1) -> RepositoryResult<()> {
-    if stored.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION {
+    if !is_optimize_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(format!(
             "unsupported optimize job schema version: {}",
             stored.schema_version
@@ -1300,7 +1616,7 @@ fn operation_record(
 }
 
 fn validate_operation_marker(marker: &StoredOptimizeOperationV1) -> RepositoryResult<()> {
-    if marker.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION {
+    if !is_optimize_schema_version(marker.schema_version) {
         return Err(RepositoryError::corruption(
             "optimize operation marker has an unsupported schema version",
         ));
@@ -2308,6 +2624,7 @@ async fn apply_metadata_create(
         created_at_ms: request.created_at_ms,
         started_at_ms: None,
         finished_at_ms: None,
+        authority: None,
     };
     let operation_key = match metadata_operation_key(request.operation_id) {
         Ok(key) => key,
@@ -2931,7 +3248,7 @@ fn validate_metadata_error(message: &str) -> RepositoryResult<()> {
 fn validate_metadata_operation(
     stored: &StoredMetadataMaintenanceOperationV2,
 ) -> RepositoryResult<()> {
-    if stored.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION {
+    if !is_metadata_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "metadata maintenance operation has unsupported schema version",
         ));
@@ -3022,7 +3339,7 @@ fn encode_metadata_payload(
 fn validate_stored_metadata_payload(
     stored: &StoredMetadataMaintenancePayloadV2,
 ) -> RepositoryResult<()> {
-    if stored.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION {
+    if !is_metadata_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "metadata maintenance payload has unsupported schema version",
         ));
@@ -3055,7 +3372,7 @@ fn metadata_transaction_record(
 fn validate_metadata_transaction_marker(
     marker: &StoredMetadataMaintenanceTransactionV2,
 ) -> RepositoryResult<()> {
-    if marker.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION
+    if !is_metadata_schema_version(marker.schema_version)
         || marker.operation_id != marker.post_operation.operation_id
     {
         return Err(RepositoryError::corruption(
@@ -3929,6 +4246,7 @@ async fn apply_rewrite_create(
         created_at_ms: request.created_at_ms,
         started_at_ms: None,
         finished_at_ms: None,
+        authority: None,
     };
     let operation_key = rewrite_operation_key(request.operation_id)?;
     let pending_key = rewrite_state_key(
@@ -4232,7 +4550,7 @@ async fn require_rewrite_state_and_active(
     };
     let decoded: StoredSharedActiveFenceV3 =
         decode_rewrite_json(active.value.as_bytes(), "shared maintenance active fence")?;
-    if decoded.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+    if !is_rewrite_schema_version(decoded.schema_version)
         || decoded.family != SharedMaintenanceOperationFamilyV3::DistributedRewrite
         || decoded.operation_id != operation.operation_id
     {
@@ -4335,7 +4653,7 @@ fn validate_rewrite_error(message: &str) -> RepositoryResult<()> {
 fn validate_rewrite_operation(
     stored: &StoredDistributedRewriteOperationV3,
 ) -> RepositoryResult<()> {
-    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+    if !is_rewrite_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "distributed rewrite operation has unsupported schema version",
         ));
@@ -4451,7 +4769,7 @@ fn decode_rewrite_payload(
 ) -> RepositoryResult<StoredDistributedRewritePayloadV3> {
     let stored: StoredDistributedRewritePayloadV3 =
         decode_rewrite_json(record.value.as_bytes(), "distributed rewrite payload")?;
-    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+    if !is_rewrite_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "distributed rewrite payload has unsupported schema version",
         ));
@@ -4468,7 +4786,7 @@ fn decode_rewrite_attempt(
 ) -> RepositoryResult<StoredDistributedRewriteAttemptV3> {
     let stored: StoredDistributedRewriteAttemptV3 =
         decode_rewrite_json(record.value.as_bytes(), "distributed rewrite attempt")?;
-    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+    if !is_rewrite_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "distributed rewrite attempt has unsupported schema version",
         ));
@@ -5175,6 +5493,7 @@ async fn apply_cleanup_create(
         created_at_ms: request.created_at_ms,
         started_at_ms: None,
         finished_at_ms: None,
+        authority: None,
     };
     let (marker_key, marker_value) = cleanup_transaction_record(
         transaction_id,
@@ -5669,7 +5988,7 @@ async fn require_cleanup_active(
     };
     let fence: StoredSharedActiveFenceV3 =
         decode_rewrite_json(active.value.as_bytes(), "shared cleanup active fence")?;
-    if fence.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+    if !is_rewrite_schema_version(fence.schema_version)
         || fence.family != SharedMaintenanceOperationFamilyV3::Cleanup
         || fence.operation_id != operation.operation_id
     {
@@ -5763,7 +6082,7 @@ fn validate_cleanup_error(error: &str) -> RepositoryResult<()> {
     Ok(())
 }
 fn validate_cleanup_operation(stored: &StoredCleanupOperationV4) -> RepositoryResult<()> {
-    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+    if !is_cleanup_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "cleanup operation has unsupported schema version",
         ));
@@ -5874,7 +6193,7 @@ fn encode_cleanup_plan(plan: &CleanupPlanPayload, operation_id: Uuid) -> Reposit
 }
 fn decode_cleanup_plan(record: StateRecord) -> RepositoryResult<StoredCleanupPlanV4> {
     let stored: StoredCleanupPlanV4 = decode_cleanup_json(record.value.as_bytes(), "cleanup plan")?;
-    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+    if !is_cleanup_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "cleanup plan has unsupported schema version",
         ));
@@ -5917,7 +6236,7 @@ fn encode_cleanup_batch(
 fn decode_cleanup_batch(record: StateRecord) -> RepositoryResult<StoredCleanupBatchV4> {
     let stored: StoredCleanupBatchV4 =
         decode_cleanup_json(record.value.as_bytes(), "cleanup batch")?;
-    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+    if !is_cleanup_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "cleanup batch has unsupported schema version",
         ));

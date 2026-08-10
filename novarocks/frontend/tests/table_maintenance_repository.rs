@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks_frontend::table_maintenance::coordination::{
+    MaintenanceAuthorityFailure, MaintenanceFenceValidator,
+};
+use novarocks_frontend::table_maintenance::model::MaintenanceAuthorityV1;
 use novarocks_frontend::table_maintenance::model::{OptimizeJobCreate, OptimizeJobOutcome};
 use novarocks_frontend::table_maintenance::repository::{
     OptimizeJobRepository, RepositoryErrorKind,
@@ -33,6 +37,9 @@ use novarocks_spi::state_store::{
     FeDeploymentView, Key, KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction,
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, WriteTransaction,
+};
+use novarocks_state_store::coordination::{
+    ControlPlaneIncarnation, CoordinationError, FencingToken, ResourceEpoch,
 };
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -254,6 +261,83 @@ async fn claim_atomically_moves_pending_job_to_running() {
     assert!(raw_key_exists(store.as_ref(), &raw_key("state/running/0000000000000001")).await);
     assert!(raw_key_exists(store.as_ref(), &active_key(&created.target)).await);
     assert_eq!(raw_prefix_count(store.as_ref(), "operations/").await, 2);
+}
+
+fn test_authority() -> MaintenanceAuthorityV1 {
+    let token = FencingToken::new(
+        "table-maintenance-repository-test",
+        ControlPlaneIncarnation::new(1).expect("test incarnation"),
+        ResourceEpoch::new(1).expect("test epoch"),
+    )
+    .expect("test fencing token")
+    .encode_v1()
+    .expect("encode test fencing token");
+    MaintenanceAuthorityV1::try_new(Uuid::now_v7(), token.to_vec()).expect("test authority")
+}
+
+#[tokio::test]
+async fn fenced_claim_validates_authority_in_the_mutating_transaction() {
+    let (_temp, _store, repository) = fixture().await;
+    let created = repository
+        .create(create_request("ice", "db", "fenced", 10, 100))
+        .await
+        .expect("create optimize job");
+    let rejecting: MaintenanceFenceValidator = Arc::new(|_| {
+        Box::pin(async {
+            Err(MaintenanceAuthorityFailure::Coordination(
+                CoordinationError::clock_unsafe(),
+            ))
+        })
+    });
+
+    let error = repository
+        .claim_fenced(created.job_id, 200, test_authority(), rejecting)
+        .await
+        .expect_err("failed fence must reject the claim transaction");
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    assert_eq!(
+        repository.list_pending().await.unwrap(),
+        vec![created.clone()]
+    );
+
+    let accepting: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let durable_authority = test_authority();
+    let claimed = repository
+        .claim_fenced(
+            created.job_id,
+            201,
+            durable_authority.clone(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect("validated fence may claim")
+        .expect("pending job is claimed");
+    assert_eq!(claimed.state, OptimizeJobState::Running);
+
+    let stale = repository
+        .record_outcome_fenced(
+            created.job_id,
+            outcome(11),
+            test_authority(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect_err("another attempt must not write a claimed job");
+    assert_eq!(stale.kind(), RepositoryErrorKind::AuthorityLost);
+
+    repository
+        .record_outcome_fenced(
+            created.job_id,
+            outcome(11),
+            durable_authority.clone(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect("durable attempt records outcome");
+    repository
+        .finish_fenced(created.job_id, 202, durable_authority, accepting)
+        .await
+        .expect("durable attempt finishes job");
 }
 
 #[tokio::test]
@@ -832,7 +916,7 @@ async fn repository_open_fails_fast_on_unknown_job_schema_version() {
     let temp = TempDir::new().unwrap();
     let store = open_sqlite(&temp.path().join("state.sqlite")).await;
     let payload = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "job_id": 1,
         "target": {
             "catalog": "ice",
