@@ -20,6 +20,7 @@ use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_spi::state_store::Key;
 
 const PREFIX: &str = "novarocks/frontend/mv/v1";
@@ -101,11 +102,12 @@ pub(crate) fn target_lookup_catalog_prefix(catalog: &str) -> Result<Key, String>
 /// are returned so catalog DROP can observe the same index domain used by MV
 /// writers without introducing a second catalog index.
 pub(crate) fn dependency_by_upstream_catalog_prefixes(catalog: &str) -> Result<Vec<Key>, String> {
-    let catalog = normalize_identifier(catalog)?;
+    let catalog = ConnectorInstanceId::parse(catalog)
+        .map_err(|error| format!("invalid catalog attachment instance ID: {error}"))?;
     let mut prefixes = Vec::with_capacity(6);
     for storage in ["starrocks", "iceberg", "external_table"] {
         for object in ["table", "mv"] {
-            let identity_prefix = format!("{storage}|{object}|{catalog}|");
+            let identity_prefix = format!("{storage}|{object}|{}|", catalog.as_str());
             prefixes.push(key_from_path(&format!(
                 "dependency/by-upstream/{}",
                 hex::encode(identity_prefix.as_bytes())
@@ -395,5 +397,40 @@ mod tests {
                 .iter()
                 .any(|prefix| upstream_key.as_bytes().starts_with(prefix.as_bytes()))
         );
+    }
+
+    #[test]
+    fn dependency_catalog_prefixes_cover_every_existing_storage_and_object_form() {
+        let catalog = "warehouse-main.v2";
+        let prefixes =
+            dependency_by_upstream_catalog_prefixes(catalog).expect("catalog dependency prefixes");
+        assert_eq!(prefixes.len(), 6);
+
+        for storage_engine in [
+            MvDependencyStorageEngine::StarRocks,
+            MvDependencyStorageEngine::Iceberg,
+            MvDependencyStorageEngine::ExternalTable,
+        ] {
+            for object_type in [
+                MvDependencyObjectType::Table,
+                MvDependencyObjectType::MaterializedView,
+            ] {
+                let upstream = MvDependencyObjectRef {
+                    catalog: Some(catalog.to_ascii_uppercase()),
+                    database_or_namespace: "sales".to_string(),
+                    name: "orders".to_string(),
+                    object_type: object_type.clone(),
+                    storage_engine: storage_engine.clone(),
+                };
+                let upstream_key =
+                    dependency_by_upstream_key(&upstream, 7).expect("upstream dependency key");
+                assert!(
+                    prefixes
+                        .iter()
+                        .any(|prefix| upstream_key.as_bytes().starts_with(prefix.as_bytes())),
+                    "catalog prefix must cover {storage_engine:?}/{object_type:?}"
+                );
+            }
+        }
     }
 }

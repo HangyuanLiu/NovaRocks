@@ -3137,16 +3137,17 @@ pub(crate) async fn ensure_no_catalog_references_transaction(
     catalog: &str,
     page_size: usize,
 ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
-    let target_records = range_transaction(
-        transaction,
-        target_lookup_catalog_prefix(catalog).map_err(invalid_state_store)?,
-        page_size,
-    )
-    .await?;
-    if !target_records.is_empty() {
-        return Err(conflict_state_store(
-            "catalog has a materialized view target",
-        ));
+    // Existing target lookup keys use SQL identifiers, a strict subset of
+    // ConnectorInstanceId. Attachments such as `warehouse-main` have no
+    // representable target prefix in that legacy key layout, but can still be
+    // referenced by dependency keys below.
+    if let Ok(target_prefix) = target_lookup_catalog_prefix(catalog) {
+        let target_records = range_transaction(transaction, target_prefix, page_size).await?;
+        if !target_records.is_empty() {
+            return Err(conflict_state_store(
+                "catalog has a materialized view target",
+            ));
+        }
     }
     for prefix in dependency_by_upstream_catalog_prefixes(catalog).map_err(invalid_state_store)? {
         if !range_transaction(transaction, prefix, page_size)
