@@ -619,6 +619,10 @@ fn query_service_error_mapping_keeps_wire_concerns_in_core() {
         map_query_service_error(QueryServiceErrorKind::Interrupted),
         ErrorKind::ER_QUERY_INTERRUPTED
     );
+    assert_eq!(
+        map_query_service_error(QueryServiceErrorKind::Unavailable),
+        ErrorKind::ER_UNKNOWN_ERROR
+    );
 }
 
 #[cfg(unix)]
