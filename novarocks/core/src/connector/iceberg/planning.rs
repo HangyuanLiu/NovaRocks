@@ -32,7 +32,7 @@ pub(crate) fn validate_planned_files(
     files: &[IcebergDataFileInfo],
 ) -> Result<(), ConnectorError> {
     for file in files {
-        super::reader::validate_delete_apply_cost(file)?;
+        novarocks_connector_iceberg::delete_file::validate_delete_apply_cost(file)?;
     }
     let Some(table) = table else {
         return Ok(());

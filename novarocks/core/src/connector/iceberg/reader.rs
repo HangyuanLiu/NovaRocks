@@ -42,19 +42,19 @@ use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot,
 };
+#[cfg(test)]
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::equality_delete::{
     EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_with_context,
 };
 use novarocks_connector_iceberg::delete_file::{
-    IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+    delete_specs_for_data_file, included_positions_for_data_file,
 };
 use novarocks_connector_iceberg::position_delete::load_position_deletes_with_context;
 use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
-    IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
-    IcebergPhysicalPredicateValue,
+    IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
+    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
 };
 use novarocks_connector_iceberg::schema_mapping::{
     apply_name_mapping_to_schema as provider_apply_name_mapping_to_schema,
@@ -225,14 +225,14 @@ impl IcebergBatchReader {
         // physical reader. Connector terminal lifecycle must be able to stop
         // every provider-owned I/O path, not only the data-file decoder.
         let cancellation = file_context.cancellation.clone();
-        let delete_specs = delete_specs(file)?;
+        let delete_specs = delete_specs_for_data_file(file)?;
         let position_deletes =
             load_position_deletes_with_context(&delete_specs, &file.path, &access, &file_context)
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
         let equality_deletes =
             load_equality_delete_sets_with_context(&delete_specs, &access, &file_context)
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
-        let included_positions = included_positions(file)?;
+        let included_positions = included_positions_for_data_file(file)?;
         let bound_file = access
             .bind_location(&file.path, FileIdentity::new(&file.path, file_size, None))
             .map_err(map_file_error)?;
@@ -423,87 +423,6 @@ fn physical_format(path: &str) -> Result<FileFormat, ConnectorError> {
         ConnectorErrorKind::Unsupported,
         format!("Iceberg data file format is not declared or supported: {path}"),
     ))
-}
-
-pub(super) fn validate_delete_apply_cost(file: &IcebergDataFileInfo) -> Result<(), ConnectorError> {
-    const MAX_DELETE_FILES: usize = 1024;
-    const MAX_DELETE_BYTES: i64 = 512 * 1024 * 1024;
-    if file.delete_files.len() > MAX_DELETE_FILES {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            format!(
-                "too many Iceberg delete files attached to {}: count={} max={MAX_DELETE_FILES}",
-                file.path,
-                file.delete_files.len()
-            ),
-        ));
-    }
-    let total_bytes = file
-        .delete_files
-        .iter()
-        .try_fold(0_i64, |total, delete| {
-            total.checked_add(delete.length.unwrap_or_default().max(0))
-        })
-        .ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                format!("Iceberg delete byte total overflows for {}", file.path),
-            )
-        })?;
-    if total_bytes > MAX_DELETE_BYTES {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            format!(
-                "Iceberg delete files attached to {} exceed byte limit: bytes={total_bytes} max={MAX_DELETE_BYTES}",
-                file.path
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn delete_specs(file: &IcebergDataFileInfo) -> Result<Vec<IcebergDeleteFileSpec>, ConnectorError> {
-    validate_delete_apply_cost(file)?;
-    file.delete_files
-        .iter()
-        .map(|delete| {
-            let file_format = match delete.file_format {
-                IcebergDeleteFileFormat::Parquet => IcebergFileFormat::Parquet,
-                IcebergDeleteFileFormat::Puffin => IcebergFileFormat::Puffin,
-            };
-            let file_content = match delete.file_content {
-                IcebergDeleteFileContent::Position => IcebergFileContent::PositionDeletes,
-                IcebergDeleteFileContent::Equality => IcebergFileContent::EqualityDeletes,
-            };
-            Ok(IcebergDeleteFileSpec {
-                path: delete.path.clone(),
-                file_format,
-                file_content,
-                length: delete.length.and_then(|length| u64::try_from(length).ok()),
-                content_offset: delete.content_offset,
-                content_size_in_bytes: delete.content_size_in_bytes,
-            })
-        })
-        .collect()
-}
-
-fn included_positions(
-    file: &IcebergDataFileInfo,
-) -> Result<Option<roaring::RoaringTreemap>, ConnectorError> {
-    let Some(positions) = &file.included_positions else {
-        return Ok(None);
-    };
-    let mut included = roaring::RoaringTreemap::new();
-    for position in positions {
-        let position = u64::try_from(*position).map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("Iceberg included position is negative for {}", file.path),
-            )
-        })?;
-        included.insert(position);
-    }
-    Ok(Some(included))
 }
 
 struct IcebergFileFacts<'a> {

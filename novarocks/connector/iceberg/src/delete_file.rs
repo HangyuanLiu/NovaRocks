@@ -17,7 +17,10 @@
 
 use std::collections::HashMap;
 
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
 use crate::iceberg::spec::Struct;
+use crate::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergFileFormat {
@@ -72,6 +75,93 @@ impl IcebergDeleteFileSpec {
     }
 }
 
+/// Validate the bounded physical delete work attached to one Iceberg data
+/// file before any reader opens external files.
+pub fn validate_delete_apply_cost(file: &IcebergDataFileInfo) -> Result<(), ConnectorError> {
+    const MAX_DELETE_FILES: usize = 1024;
+    const MAX_DELETE_BYTES: i64 = 512 * 1024 * 1024;
+    if file.delete_files.len() > MAX_DELETE_FILES {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!(
+                "too many Iceberg delete files attached to {}: count={} max={MAX_DELETE_FILES}",
+                file.path,
+                file.delete_files.len()
+            ),
+        ));
+    }
+    let total_bytes = file
+        .delete_files
+        .iter()
+        .try_fold(0_i64, |total, delete| {
+            total.checked_add(delete.length.unwrap_or_default().max(0))
+        })
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                format!("Iceberg delete byte total overflows for {}", file.path),
+            )
+        })?;
+    if total_bytes > MAX_DELETE_BYTES {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!(
+                "Iceberg delete files attached to {} exceed byte limit: bytes={total_bytes} max={MAX_DELETE_BYTES}",
+                file.path
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Turn sealed Iceberg delete facts into the provider's physical I/O specs.
+pub fn delete_specs_for_data_file(
+    file: &IcebergDataFileInfo,
+) -> Result<Vec<IcebergDeleteFileSpec>, ConnectorError> {
+    validate_delete_apply_cost(file)?;
+    file.delete_files
+        .iter()
+        .map(|delete| {
+            let file_format = match delete.file_format {
+                IcebergDeleteFileFormat::Parquet => IcebergFileFormat::Parquet,
+                IcebergDeleteFileFormat::Puffin => IcebergFileFormat::Puffin,
+            };
+            let file_content = match delete.file_content {
+                IcebergDeleteFileContent::Position => IcebergFileContent::PositionDeletes,
+                IcebergDeleteFileContent::Equality => IcebergFileContent::EqualityDeletes,
+            };
+            Ok(IcebergDeleteFileSpec {
+                path: delete.path.clone(),
+                file_format,
+                file_content,
+                length: delete.length.and_then(|length| u64::try_from(length).ok()),
+                content_offset: delete.content_offset,
+                content_size_in_bytes: delete.content_size_in_bytes,
+            })
+        })
+        .collect()
+}
+
+/// Validate and normalize an optional exact row-position inclusion set.
+pub fn included_positions_for_data_file(
+    file: &IcebergDataFileInfo,
+) -> Result<Option<roaring::RoaringTreemap>, ConnectorError> {
+    let Some(positions) = &file.included_positions else {
+        return Ok(None);
+    };
+    let mut included = roaring::RoaringTreemap::new();
+    for position in positions {
+        let position = u64::try_from(*position).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("Iceberg included position is negative for {}", file.path),
+            )
+        })?;
+        included.insert(position);
+    }
+    Ok(Some(included))
+}
+
 /// The partition facts needed to write a position delete against one data file.
 ///
 /// These are extracted from the Iceberg manifest and deliberately retain the
@@ -114,6 +204,7 @@ pub fn insert_referenced_data_file_partition(
 mod tests {
     use super::*;
     use crate::iceberg::spec::Struct;
+    use crate::scan_model::IcebergDeleteFileInfo;
 
     #[test]
     fn parquet_position_delete_sets_required_content() {
@@ -143,6 +234,47 @@ mod tests {
         assert_eq!(spec.length, Some(512));
         assert_eq!(spec.content_offset, Some(12));
         assert_eq!(spec.content_size_in_bytes, Some(34));
+    }
+
+    #[test]
+    fn converts_sealed_delete_and_position_facts_for_physical_io() {
+        let mut file = IcebergDataFileInfo::for_test("data.parquet", 10, 1);
+        file.included_positions = Some(vec![3, 7]);
+        file.delete_files.push(IcebergDeleteFileInfo {
+            path: "delete.parquet".to_string(),
+            file_format: IcebergDeleteFileFormat::Parquet,
+            file_content: IcebergDeleteFileContent::Position,
+            length: Some(42),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: None,
+            partition_spec_id: None,
+            partition_key: None,
+            equality_column_names: Vec::new(),
+            equality_field_ids: Vec::new(),
+        });
+
+        let specs = delete_specs_for_data_file(&file).expect("delete specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].file_format, IcebergFileFormat::Parquet);
+        assert_eq!(specs[0].file_content, IcebergFileContent::PositionDeletes);
+        assert_eq!(
+            included_positions_for_data_file(&file)
+                .expect("positions")
+                .expect("present")
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+    }
+
+    #[test]
+    fn rejects_negative_included_position_as_corrupt_data() {
+        let mut file = IcebergDataFileInfo::for_test("data.parquet", 10, 1);
+        file.included_positions = Some(vec![-1]);
+
+        let error = included_positions_for_data_file(&file).expect_err("negative position");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 
     #[test]
