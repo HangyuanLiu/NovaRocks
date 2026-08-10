@@ -27,6 +27,8 @@ use novarocks_state_store::{
     StateStoreHost, StateStoreHostConfig, builtin_state_store_provider_registry,
 };
 
+use crate::catalog_application::FrontendCatalogApplicationPort;
+use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::connector::ConnectorControlHost;
 use crate::coordination::FrontendCoordinationRuntime;
 use crate::coordinator::{BackendQueryActivity, FrontendDistributedQueryCoordinator};
@@ -61,6 +63,7 @@ pub enum FrontendApplicationErrorKind {
     TableMaintenanceServiceOpen,
     MvServiceOpen,
     StatisticsApplicationServiceOpen,
+    CatalogApplicationServiceOpen,
     ConnectorControlHost,
     ClusterBackendOpen,
     CoordinatorOpen,
@@ -112,6 +115,7 @@ pub struct FrontendApplicationHost {
     dml_recovery_controller: Option<DmlRecoveryController>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
+    catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     table_maintenance_service:
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
@@ -258,6 +262,7 @@ impl FrontendApplicationHost {
             dml_recovery_controller: None,
             statistics_application_service: None,
             statistics_application_port: None,
+            catalog_application_port: None,
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
@@ -293,6 +298,27 @@ impl FrontendApplicationHost {
                 }
             }
         }
+        host.catalog_application_port = match host.state_store() {
+            Some(store) => match CatalogAttachmentRepository::open(store).await {
+                Ok(repository) => Some(Arc::new(FrontendCatalogApplicationPort::new(
+                    repository,
+                    Arc::clone(&host.connector_control),
+                    tokio::runtime::Handle::current(),
+                ))),
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                            error,
+                        ))
+                        .await);
+                }
+            },
+            None => Some(Arc::new(FrontendCatalogApplicationPort::unavailable(
+                Arc::clone(&host.connector_control),
+                tokio::runtime::Handle::current(),
+            ))),
+        };
         match ClusterBackendService::open(
             backend,
             host.state_store(),
@@ -509,6 +535,16 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .expect("statistics application port is installed before host open returns"),
         )
+    }
+
+    pub fn catalog_application_port(
+        &self,
+    ) -> Arc<dyn novarocks::catalog_application::CatalogApplicationPort> {
+        Arc::clone(
+            self.catalog_application_port
+                .as_ref()
+                .expect("catalog application port is installed before host open returns"),
+        ) as Arc<dyn novarocks::catalog_application::CatalogApplicationPort>
     }
 
     pub fn table_maintenance_service(
@@ -826,6 +862,7 @@ impl FrontendApplicationHost {
         // its deployment lock.
         self.statistics_application_port.take();
         self.statistics_application_service.take();
+        self.catalog_application_port.take();
         self.view_service.take();
         self.mv_application_service.take();
         self.mv_service.take();
