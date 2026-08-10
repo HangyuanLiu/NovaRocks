@@ -174,6 +174,14 @@ impl CatalogAttachmentRepository {
             Err(RunFailure::Operation(error)) if error.kind() == StateStoreErrorKind::PreconditionFailed => {
                 Err(CatalogAttachmentError::new(CatalogAttachmentErrorKind::AlreadyExists, "catalog attachment already exists"))
             }
+            Err(RunFailure::RetryExhausted(error))
+                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
+            {
+                Err(CatalogAttachmentError::new(
+                    CatalogAttachmentErrorKind::AlreadyExists,
+                    "catalog attachment already exists",
+                ))
+            }
             Err(RunFailure::CommitUnknown { transaction_id, error }) => {
                 self.resolve_create_unknown(operation_id, transaction_id, attachment, error).await
             }
@@ -225,6 +233,14 @@ impl CatalogAttachmentRepository {
             Ok(_) => Ok(()),
             Err(RunFailure::Operation(error)) if error.kind() == StateStoreErrorKind::PreconditionFailed => {
                 Err(CatalogAttachmentError::new(CatalogAttachmentErrorKind::Conflict, "catalog attachment changed before drop"))
+            }
+            Err(RunFailure::RetryExhausted(error))
+                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
+            {
+                Err(CatalogAttachmentError::new(
+                    CatalogAttachmentErrorKind::Conflict,
+                    "catalog attachment changed before drop",
+                ))
             }
             Err(RunFailure::CommitUnknown { transaction_id, error }) => {
                 match self.store.resolve_commit(&transaction_id).await.map_err(store)? {
@@ -388,6 +404,17 @@ fn run_failure(context: &str, failure: RunFailure) -> CatalogAttachmentError {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+    use novarocks_spi::state_store::FeDeploymentView;
+    use novarocks_state_store::{
+        SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
+        StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+        builtin_state_store_provider_registry,
+    };
+
     use super::*;
 
     fn attachment(properties: Vec<(String, String)>) -> CatalogAttachment {
@@ -414,5 +441,72 @@ mod tests {
             ("z".into(), "1".into()),
             ("a".into(), "2".into()),
         ])).is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_create_is_absent_cas_and_drop_requires_the_frozen_version() {
+        let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
+        let registry = builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let mut host = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "catalog-attachment-test".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: directory.path().join("state-store.sqlite"),
+                            deployment_owner: "catalog-attachment-test".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
+                topology_revision: Bytes::from_static(b"catalog-attachment-test-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite StateStore");
+        assert_eq!(host.provider_id(), SQLITE_STATE_STORE_PROVIDER_ID);
+        let store = host.state_store().expect("ready StateStore");
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+
+        let first = repository.create(attachment(vec![("type".into(), "iceberg".into())]))
+            .await
+            .expect("first create");
+        assert_eq!(
+            repository
+                .create(attachment(vec![("type".into(), "iceberg".into())]))
+                .await
+                .expect_err("second create must conflict")
+                .kind(),
+            CatalogAttachmentErrorKind::AlreadyExists
+        );
+        repository.drop_exact(first.clone()).await.expect("exact drop");
+        let replacement = repository
+            .create(attachment(vec![("type".into(), "iceberg".into())]))
+            .await
+            .expect("recreate after drop");
+        assert_ne!(first.attachment.attachment_id, replacement.attachment.attachment_id);
+        assert_eq!(
+            repository
+                .drop_exact(first)
+                .await
+                .expect_err("stale exact delete must conflict")
+                .kind(),
+            CatalogAttachmentErrorKind::Conflict
+        );
+
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
     }
 }
