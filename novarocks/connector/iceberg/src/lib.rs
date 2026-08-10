@@ -50,6 +50,7 @@ pub mod resources;
 pub(crate) mod row_lineage_synth;
 pub mod scan_model;
 pub mod schema_facts;
+pub mod schema_mapping;
 pub mod stats_assembler;
 pub mod stats_loader;
 pub mod theta_sketch;

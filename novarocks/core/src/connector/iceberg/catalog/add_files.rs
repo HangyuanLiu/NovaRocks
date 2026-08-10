@@ -177,7 +177,8 @@ fn plan_manifest(
         {
             return Err("ADD FILES Parquet footer total exceeds 64 MiB".to_string());
         }
-        let (identified, total) = super::super::reader::schema_field_id_coverage(&footer.schema)?;
+        let (identified, total) =
+            novarocks_connector_iceberg::schema_mapping::schema_field_id_coverage(&footer.schema)?;
         let (mode, source_schema) = if identified == total {
             (AddFilesSchemaIdentityMode::EmbeddedFieldIds, footer.schema)
         } else if identified != 0 {
@@ -194,7 +195,10 @@ fn plan_manifest(
             })?;
             (
                 AddFilesSchemaIdentityMode::ExistingNameMapping,
-                super::super::reader::apply_name_mapping_to_schema(&footer.schema, mapping)?,
+                novarocks_connector_iceberg::schema_mapping::apply_name_mapping_to_schema(
+                    &footer.schema,
+                    mapping,
+                )?,
             )
         };
         if expected_mode.is_some_and(|expected| expected != mode) {
