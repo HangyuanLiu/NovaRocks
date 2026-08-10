@@ -978,6 +978,7 @@ mod tests {
         ConnectorWritePreparation::try_new(
             request.owner().clone(),
             table,
+            crate::connector::ConnectorWriteTargetRef::main(),
             intent,
             ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap(),
             ConnectorWriteInputShape::Data { fields },

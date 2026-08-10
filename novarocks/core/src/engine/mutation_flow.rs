@@ -152,6 +152,7 @@ struct DmlChangeStreamPreparations {
 impl DmlChangeStreamPreparations {
     fn prepare(
         materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+        target_ref: &str,
         branch_set: DmlChangeStreamBranchSet,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Self, String> {
@@ -159,6 +160,7 @@ impl DmlChangeStreamPreparations {
 
         let prepare = |input| {
             materialization.prepare_write(
+                target_ref,
                 ConnectorWriteIntent::RowDelta,
                 ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 input,
@@ -366,6 +368,9 @@ pub(crate) trait MutationExecution: Send + Sync {
         false
     }
     fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError>;
+    fn abort_terminal(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String>;
     fn commit(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -574,6 +579,7 @@ pub(crate) fn prepare_update_mutation(
         let planning_lease = materialization.planning_lease.clone();
         let preparations = DmlChangeStreamPreparations::prepare(
             &materialization,
+            &target_ref,
             DmlChangeStreamBranchSet::UpdateMor,
             connector_context.clone(),
         )?;
@@ -689,6 +695,7 @@ pub(crate) fn prepare_merge_mutation(
         };
         let preparations = DmlChangeStreamPreparations::prepare(
             &materialization,
+            "main",
             branch_set,
             connector_context.clone(),
         )?;
@@ -1942,6 +1949,20 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
         )
     }
 
+    fn abort_terminal(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+        let session = self
+            .operation_session
+            .lock()
+            .expect("MOR UPDATE operation session lock poisoned")
+            .clone()
+            .expect("MOR UPDATE abort requires a retained operation session");
+        session
+            .abort(self.connector_context.clone())
+            .map_err(|error| format!("abort MOR UPDATE connector operation: {error}"))
+    }
+
     fn commit(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -2050,6 +2071,20 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
         )
     }
 
+    fn abort_terminal(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+        let session = self
+            .operation_session
+            .lock()
+            .expect("MOR MERGE operation session lock poisoned")
+            .clone()
+            .expect("MOR MERGE abort requires a retained operation session");
+        session
+            .abort(self.connector_context.clone())
+            .map_err(|error| format!("abort MOR MERGE connector operation: {error}"))
+    }
+
     fn commit(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -2106,6 +2141,7 @@ fn build_cow_update_distributed_write(
             &target.table,
         )?;
     let (_, rewrite_preparation) = materialization.prepare_write(
+        target_ref,
         novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
         novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
         row_lineage_input_request(target_columns),
@@ -2469,6 +2505,14 @@ impl MutationExecution for DistributedCowUpdateExecutor {
             self.connector_context.clone(),
             reason,
         )
+    }
+
+    fn abort_terminal(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+        self.operation_session
+            .abort(self.connector_context.clone())
+            .map_err(|error| format!("abort COW UPDATE connector operation: {error}"))
     }
 
     fn commit(
@@ -3282,6 +3326,7 @@ pub(crate) fn stage_prepared_merge_mutation(
                     &target.table,
                 )?;
             let (_, preparation) = materialization.prepare_write(
+                "main",
                 novarocks_spi::connector::ConnectorWriteIntent::Append,
                 novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 novarocks_spi::connector::ConnectorWriteInputRequest::Data {
@@ -4551,6 +4596,18 @@ impl MutationExecution for DistributedMergeExecutor {
             self.connector_context.clone(),
             reason,
         )
+    }
+
+    fn abort_terminal(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+        let cow = self
+            .cow_operation
+            .as_ref()
+            .expect("MERGE typed abort requires a sealed connector operation");
+        cow.session
+            .abort(self.connector_context.clone())
+            .map_err(|error| format!("abort COW MERGE connector operation: {error}"))
     }
 
     fn commit(

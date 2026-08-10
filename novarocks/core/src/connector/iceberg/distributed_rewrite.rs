@@ -1876,6 +1876,7 @@ fn rewrite_cohort_preparation(
     match super::provider::prepare_iceberg_write(
         ConnectorWritePreparationRequest {
             table: request.operation().table().clone(),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent,
             purpose: ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             input,

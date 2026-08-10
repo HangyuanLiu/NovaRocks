@@ -6020,33 +6020,47 @@ pub(crate) fn prepare_iceberg_write(
     }
 
     let input = bind_iceberg_write_input(&request, owner, &metadata)?;
+    let target_snapshot_id =
+        iceberg_write_target_snapshot_id(&metadata, request.target_ref.as_str())?;
     let table_uuid = table.table_uuid.as_deref().ok_or_else(|| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             "admitted Iceberg write table is missing its table UUID",
         )
     })?;
-    let snapshot = table
-        .current_snapshot_id
-        .map_or_else(|| "none".to_string(), |id| id.to_string());
+    let snapshot = target_snapshot_id.map_or_else(|| "none".to_string(), |id| id.to_string());
     let base_version = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-        "iceberg/write-base/v1/{table_uuid}/{snapshot}"
+        "iceberg/write-base/v1/{table_uuid}/{}/{snapshot}",
+        request.target_ref.as_str()
     )))?;
     let preparation_payload = Bytes::from(format!(
-        "iceberg/write-preparation/v1/{}/{}/{snapshot}",
+        "iceberg/write-preparation/v1/{}/{}/{}/{snapshot}",
         owner.instance_id.as_str(),
-        table_uuid
+        table_uuid,
+        request.target_ref.as_str()
     ));
     Ok(ConnectorWritePreparationOutcome::Prepared(
         ConnectorWritePreparation::try_new(
             owner.clone(),
             request.table,
+            request.target_ref,
             request.intent,
             base_version,
             input,
             preparation_payload,
         )?,
     ))
+}
+
+fn iceberg_write_target_snapshot_id(
+    metadata: &TableMetadata,
+    target_ref: &str,
+) -> Result<Option<i64>, ConnectorError> {
+    if target_ref == "main" {
+        return Ok(metadata.current_snapshot_id());
+    }
+    novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(metadata, target_ref)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))
 }
 
 fn bind_iceberg_write_input(
@@ -6056,14 +6070,20 @@ fn bind_iceberg_write_input(
 ) -> Result<ConnectorWriteInputShape, ConnectorError> {
     Ok(match &request.input {
         ConnectorWriteInputRequest::Data { fields } => ConnectorWriteInputShape::Data {
-            fields: bind_iceberg_write_fields(fields, owner, &request.table, request.intent, 1)?,
+            fields: bind_iceberg_write_fields(
+                &exact_iceberg_data_write_fields(metadata, fields)?,
+                owner,
+                &request.table,
+                request.intent,
+                1,
+            )?,
         },
         ConnectorWriteInputRequest::RowLineage {
             data_fields,
             row_identity_fields,
         } => ConnectorWriteInputShape::RowLineage {
             data_fields: bind_iceberg_write_fields(
-                data_fields,
+                &exact_iceberg_data_write_fields(metadata, data_fields)?,
                 owner,
                 &request.table,
                 request.intent,
@@ -6132,7 +6152,7 @@ fn bind_iceberg_write_input(
         ConnectorWriteInputRequest::EqualityDelete { equality_fields } => {
             ConnectorWriteInputShape::EqualityDelete {
                 equality_fields: bind_iceberg_write_fields(
-                    equality_fields,
+                    &exact_requested_iceberg_write_fields(metadata, equality_fields)?,
                     owner,
                     &request.table,
                     request.intent,
@@ -6141,6 +6161,92 @@ fn bind_iceberg_write_input(
             }
         }
     })
+}
+
+/// Rebuild SQL-proposed data fields from the Provider-owned frozen Iceberg
+/// schema before signing them. Arrow offset width is part of the execution
+/// contract: Iceberg `binary` is `Binary`, while Iceberg `variant` is the
+/// engine's encoded `LargeBinary` representation.
+fn exact_iceberg_data_write_fields(
+    metadata: &TableMetadata,
+    requested: &[ConnectorWriteFieldRequest],
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    for request in requested {
+        if metadata
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .all(|field| !field.name.eq_ignore_ascii_case(request.field().name()))
+        {
+            return Err(invalid_iceberg_write_activation(format!(
+                "Iceberg write input column `{}` is absent from the frozen target schema",
+                request.field().name()
+            )));
+        }
+    }
+    let requested_all = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| {
+            ConnectorWriteFieldRequest::new(Field::new(
+                &field.name,
+                DataType::Null,
+                !field.required,
+            ))
+        })
+        .collect::<Vec<_>>();
+    exact_requested_iceberg_write_fields(metadata, &requested_all)
+}
+
+fn exact_requested_iceberg_write_fields(
+    metadata: &TableMetadata,
+    requested: &[ConnectorWriteFieldRequest],
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    let iceberg_schema = metadata.current_schema();
+    let arrow_schema =
+        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .map_err(|error| {
+                invalid_iceberg_write_activation(format!(
+                    "convert frozen Iceberg write schema to Arrow: {error}"
+                ))
+            })?;
+    requested
+        .iter()
+        .map(|request| {
+            let requested_name = request.field().name();
+            let (ordinal, iceberg_field) = iceberg_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.name.eq_ignore_ascii_case(requested_name))
+                .ok_or_else(|| {
+                    invalid_iceberg_write_activation(format!(
+                        "Iceberg write input column `{requested_name}` is absent from the frozen target schema"
+                    ))
+                })?;
+            let arrow_field = arrow_schema.field(ordinal);
+            let data_type = match iceberg_field.field_type.as_ref() {
+                Type::Primitive(PrimitiveType::Variant) => DataType::LargeBinary,
+                Type::Primitive(PrimitiveType::Binary) => DataType::Binary,
+                Type::Primitive(PrimitiveType::Timestamptz) => {
+                    DataType::Timestamp(TimeUnit::Microsecond, None)
+                }
+                Type::Primitive(PrimitiveType::TimestamptzNs) => {
+                    DataType::Timestamp(TimeUnit::Nanosecond, None)
+                }
+                _ => arrow_field.data_type().clone(),
+            };
+            Ok(ConnectorWriteFieldRequest::new(Field::new(
+                &iceberg_field.name,
+                data_type,
+                !iceberg_field.required,
+            )))
+        })
+        .collect()
 }
 
 /// Position-delete and deletion-vector SQL only name the fixed row identity.
@@ -6243,6 +6349,7 @@ pub(crate) fn register_iceberg_first_refresh_write_service_from_preparation(
     empty_input_policy: IcebergMvPrimaryEmptyInputPolicy,
 ) -> Result<(), ConnectorError> {
     preparation.validate()?;
+    validate_preparation_target_ref(preparation, &payload.target_ref)?;
     let sink_spec = iceberg_data_sink_spec_from_preparation(preparation, entry)?;
     let writer_handle_payload = encode_data_sink_spec_handle_payload(&sink_spec)
         .map_err(|error| invalid_iceberg_write_activation(error))?;
@@ -6431,6 +6538,7 @@ pub(crate) fn register_iceberg_cow_write_service_from_preparations(
         let (sink_spec, preparation_digest) = {
             let preparation = cohort.preparation();
             preparation.validate()?;
+            validate_preparation_target_ref(preparation, target_ref)?;
             (
                 iceberg_data_sink_spec_from_preparation(preparation, entry)?,
                 preparation.digest(),
@@ -6503,6 +6611,7 @@ fn register_iceberg_write_service_from_preparation_payload(
     writer_handle_payload: Bytes,
     commit_executor: Arc<dyn IcebergWriteReportCommitter>,
 ) -> Result<(), ConnectorError> {
+    validate_preparation_target_ref(preparation, target_ref)?;
     let plan_payload = IcebergWritePlanPayloadV1 {
         version: 1,
         target: format!(
@@ -6526,6 +6635,19 @@ fn register_iceberg_write_service_from_preparation_payload(
         )?;
         Ok(Arc::new(IcebergWriteControlService::new(context)))
     })
+}
+
+fn validate_preparation_target_ref(
+    preparation: &ConnectorWritePreparation,
+    target_ref: &str,
+) -> Result<(), ConnectorError> {
+    if preparation.target_ref().as_str() != target_ref {
+        return Err(invalid_iceberg_write_activation(format!(
+            "Iceberg write preparation targets ref `{}`, but activation requested `{target_ref}`",
+            preparation.target_ref().as_str()
+        )));
+    }
+    Ok(())
 }
 
 /// Rehydrate a data-file sink entirely within the Iceberg provider.  The
@@ -6558,6 +6680,8 @@ pub(crate) fn iceberg_data_sink_spec_from_preparation(
             format!("decode admitted Iceberg write preparation metadata: {error}"),
         )
     })?;
+    iceberg.current_snapshot_id =
+        iceberg_write_target_snapshot_id(&metadata, preparation.target_ref().as_str())?;
     let mode = match preparation.input() {
         ConnectorWriteInputShape::Data { .. } => IcebergWriteSinkMode::Data,
         ConnectorWriteInputShape::RowLineage { .. } => IcebergWriteSinkMode::RowLineageData,
@@ -6662,6 +6786,15 @@ pub(crate) fn iceberg_row_write_sink_spec_from_preparation(
         )
     })?;
     validate_row_write_metadata_matches_open_table(&metadata, open_metadata)?;
+    let prepared_target_snapshot =
+        iceberg_write_target_snapshot_id(&metadata, preparation.target_ref().as_str())?;
+    let open_target_snapshot =
+        iceberg_write_target_snapshot_id(open_metadata, preparation.target_ref().as_str())?;
+    if prepared_target_snapshot != open_target_snapshot {
+        return Err(invalid_iceberg_write_activation(
+            "opened Iceberg write target ref no longer matches the sealed preparation",
+        ));
+    }
 
     let (mode, target_columns, position_delete_output_descriptor, equality_columns) =
         match preparation.input() {
@@ -6714,7 +6847,7 @@ pub(crate) fn iceberg_row_write_sink_spec_from_preparation(
             }
         };
 
-    iceberg.current_snapshot_id = metadata.current_snapshot_id();
+    iceberg.current_snapshot_id = prepared_target_snapshot;
     let table_location = metadata.location().to_string();
     let data_location = metadata
         .properties()
@@ -6999,6 +7132,7 @@ impl IcebergQueryTableMaterialization {
     /// request; Core neither decodes it nor reacquires a current generation.
     pub(crate) fn prepare_write(
         &self,
+        target_ref: &str,
         intent: ConnectorWriteIntent,
         purpose: ConnectorWriteAdmissionPurpose,
         input: ConnectorWriteInputRequest,
@@ -7012,6 +7146,8 @@ impl IcebergQueryTableMaterialization {
             .control()
             .prepare_write(ConnectorWritePreparationRequest {
                 table: self.read_table.clone(),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
+                    .map_err(|error| format!("validate Iceberg write target ref: {error}"))?,
                 intent,
                 purpose,
                 input,
@@ -9031,6 +9167,7 @@ mod tests {
             .expect("fixture table admission");
         let request = ConnectorWritePreparationRequest {
             table: metadata.table,
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input: ConnectorWriteInputRequest::PositionDelete {
@@ -9063,6 +9200,155 @@ mod tests {
             identity_fields[0].token(),
             partition_source_fields[0].token()
         );
+    }
+
+    #[test]
+    fn spi5c1_row_write_preparation_freezes_the_named_branch_snapshot() {
+        use novarocks_connector_iceberg::iceberg::spec::{SnapshotReference, SnapshotRetention};
+
+        let lease = fixture_planning_lease("iceberg");
+        let owner = ConnectorExecutionBindingKey {
+            instance_id: ConnectorInstanceId::parse("iceberg").expect("fixture instance ID"),
+            incarnation: lease.binding().incarnation(),
+        };
+        let admitted = lease
+            .binding()
+            .metadata()
+            .load_table(ConnectorTableRequest {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: owner.instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("orders"),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: crate::connector::test_request_context(),
+            })
+            .expect("fixture table admission");
+        let metadata = super::super::test_metadata::metadata_with_two_snapshots()
+            .into_builder(None)
+            .set_ref(
+                "dev",
+                SnapshotReference::new(1, SnapshotRetention::branch(None, None, None)),
+            )
+            .expect("set dev branch")
+            .build()
+            .expect("build metadata with dev branch")
+            .metadata;
+        let mut payload: TablePayload = decode_payload(
+            admitted.table.payload(),
+            "fixture admitted Iceberg write table",
+        )
+        .expect("decode fixture table payload");
+        let table_info = payload.table_info.as_mut().expect("fixture table info");
+        table_info.current_snapshot_id = metadata.current_snapshot_id();
+        table_info.serialized_metadata =
+            Some(serde_json::to_string(&metadata).expect("serialize branch metadata"));
+        let table = ConnectorTableHandle::try_new(
+            owner.instance_id.clone(),
+            encode_payload(&payload, "fixture branch table", 1024 * 1024)
+                .expect("encode branch table payload"),
+        )
+        .expect("branch table handle");
+        let request = ConnectorWritePreparationRequest {
+            table,
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse("dev")
+                .expect("dev target ref"),
+            intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: ConnectorWriteInputRequest::DeletionVector {
+                identity_fields: vec![
+                    ConnectorWriteFieldRequest::new(Field::new("_file", DataType::Utf8, false)),
+                    ConnectorWriteFieldRequest::new(Field::new("_pos", DataType::Int64, false)),
+                ],
+                partition_source_fields: Vec::new(),
+            },
+            context: crate::connector::test_request_context(),
+        };
+        let ConnectorWritePreparationOutcome::Prepared(preparation) =
+            prepare_iceberg_write(request, &owner).expect("prepare branch write")
+        else {
+            panic!("branch write admission must be prepared");
+        };
+        assert_eq!(preparation.target_ref().as_str(), "dev");
+
+        let warehouse = tempfile::TempDir::new().expect("warehouse tempdir");
+        let entry = super::super::catalog::registry::build_catalog_entry(
+            "iceberg",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse.path().display().to_string(),
+                ),
+            ],
+        )
+        .expect("fixture catalog entry");
+        let (sink, _) =
+            iceberg_row_write_sink_spec_from_preparation(&preparation, &entry, &metadata)
+                .expect("derive branch DV sink");
+        assert_eq!(sink.iceberg.current_snapshot_id, Some(1));
+
+        let drifted = metadata
+            .clone()
+            .into_builder(None)
+            .set_ref(
+                "dev",
+                SnapshotReference::new(2, SnapshotRetention::branch(None, None, None)),
+            )
+            .expect("move dev branch")
+            .build()
+            .expect("build drifted branch metadata")
+            .metadata;
+        let error = iceberg_row_write_sink_spec_from_preparation(&preparation, &entry, &drifted)
+            .expect_err("branch drift must fail before writer activation");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn mv_write_admission_signs_exact_provider_binary_and_variant_layout() {
+        use std::collections::HashMap;
+
+        use novarocks_connector_iceberg::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
+            SortOrder, TableMetadataBuilder, Type,
+        };
+
+        let metadata = TableMetadataBuilder::new(
+            IcebergSchema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "state", Type::Primitive(PrimitiveType::Binary))
+                        .into(),
+                    NestedField::optional(2, "payload", Type::Primitive(PrimitiveType::Variant))
+                        .into(),
+                ])
+                .build()
+                .expect("provider schema"),
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///novarocks-test/provider-layout".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("provider metadata builder")
+        .build()
+        .expect("provider metadata")
+        .metadata;
+        let fields = exact_iceberg_data_write_fields(
+            &metadata,
+            &[
+                ConnectorWriteFieldRequest::new(Field::new("state", DataType::LargeBinary, false)),
+                ConnectorWriteFieldRequest::new(Field::new("payload", DataType::Binary, true)),
+            ],
+        )
+        .expect("provider-signed write layout");
+
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].field().name(), "state");
+        assert_eq!(fields[0].field().data_type(), &DataType::Binary);
+        assert!(!fields[0].field().is_nullable());
+        assert_eq!(fields[1].field().name(), "payload");
+        assert_eq!(fields[1].field().data_type(), &DataType::LargeBinary);
+        assert!(fields[1].field().is_nullable());
     }
 
     #[test]

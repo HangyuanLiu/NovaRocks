@@ -4904,13 +4904,14 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     crate::connector::validate_request_context(connector_context)?;
+    let optimizer_settings = change_stream_write_optimizer_settings();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
     let planned_dp =
         crate::sql::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
             physical_plan,
             dag.clone(),
             pre_expand_keyed_assert,
-            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            &optimizer_settings,
         )?;
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
@@ -4926,10 +4927,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         connector_context,
         query_table_bindings,
         scan_binding_resolver,
-        scan_preparation_options(
-            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
-            &maintenance_execution,
-        )?,
+        scan_preparation_options(&optimizer_settings, &maintenance_execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -5143,6 +5141,18 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
         Option<Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>>,
 }
 
+fn change_stream_write_optimizer_settings()
+-> crate::sql::optimizer::options::SessionOptimizerSettings {
+    let mut settings = crate::sql::optimizer::options::SessionOptimizerSettings::default();
+    // A change-stream write carries old/new row pairs and target locators across
+    // independent fragments. A query runtime filter may describe only one data
+    // branch, so pushing it into a locator scan can suppress rows required by a
+    // DELETE. Keep this system-generated mutation plan free of runtime filters;
+    // its explicit predicates and connector pruning remain enabled.
+    settings.enable_global_runtime_filter = Some(false);
+    settings
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     state: &Arc<StandaloneState>,
@@ -5168,7 +5178,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         crate::sql::compiler::SqlSessionContext {
             current_catalog: None,
             current_database: current_database.to_string(),
-            optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            optimizer_settings: change_stream_write_optimizer_settings(),
         },
         crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
@@ -5211,7 +5221,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
         crate::sql::compiler::SqlSessionContext {
             current_catalog: None,
             current_database: String::new(),
-            optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            optimizer_settings: change_stream_write_optimizer_settings(),
         },
         crate::sql::compiler::SqlPlanningEnvironment::NotApplicable,
         &statistics,
@@ -7329,6 +7339,12 @@ mysql_port = 47892
             &bindings,
         ));
     }
+
+    #[test]
+    fn change_stream_write_planning_disables_query_runtime_filters() {
+        assert!(!super::change_stream_write_optimizer_settings().global_runtime_filter_enabled());
+    }
+
     #[test]
     fn sqlparser_insert_values_preserves_array_literals() {
         use crate::sql::parser::dialect::StarRocksDialect;

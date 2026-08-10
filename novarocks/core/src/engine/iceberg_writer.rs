@@ -265,6 +265,7 @@ fn prepare_iceberg_distributed_write(
     let preparation = prepare_iceberg_connector_write(
         &write_lease,
         target,
+        target_ref,
         intent,
         ConnectorWriteInputRequest::Data {
             fields: write_columns
@@ -449,7 +450,7 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
 pub(crate) fn iceberg_change_stream_provider_binding_template(
     _state: &Arc<StandaloneState>,
     _target: &TargetBackend,
-    _binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
+    binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
@@ -462,6 +463,13 @@ pub(crate) fn iceberg_change_stream_provider_binding_template(
         return Err(
             "change-stream provider preparation does not match its exact write lease".to_string(),
         );
+    }
+    if preparation.target_ref().as_str() != binding.target_ref() {
+        return Err(format!(
+            "change-stream provider preparation targets ref `{}`, but binding targets `{}`",
+            preparation.target_ref().as_str(),
+            binding.target_ref()
+        ));
     }
     Ok(
         crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
@@ -622,8 +630,13 @@ where
     // Provider admission is deliberately before the local service registry
     // mutation. A typed denial (notably managed-MV ordinary DML) therefore
     // leaves no operation entry that could later be activated accidentally.
-    let templates =
-        build_iceberg_connector_write_templates(target, operation_id, exact_lease, cohorts)?;
+    let templates = build_iceberg_connector_write_templates(
+        target,
+        target_ref,
+        operation_id,
+        exact_lease,
+        cohorts,
+    )?;
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
     let services = state
@@ -677,8 +690,13 @@ where
     }
     // As above, prepare against the exact retained generation before local
     // lazy activation is visible to a later SPI planning request.
-    let templates =
-        build_iceberg_connector_write_templates(target, operation_id, exact_lease, cohorts)?;
+    let templates = build_iceberg_connector_write_templates(
+        target,
+        target_ref,
+        operation_id,
+        exact_lease,
+        cohorts,
+    )?;
     let services = state
         .iceberg_catalogs
         .read()
@@ -693,6 +711,7 @@ where
 #[allow(clippy::type_complexity)]
 fn build_iceberg_connector_write_templates(
     target: &TargetBackend,
+    target_ref: &str,
     operation_id: ConnectorWriteOperationId,
     exact_lease: &ConnectorWriteLease,
     cohorts: Vec<(
@@ -705,6 +724,7 @@ fn build_iceberg_connector_write_templates(
 ) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
     build_iceberg_connector_write_templates_with_purpose(
         target,
+        target_ref,
         operation_id,
         exact_lease,
         ConnectorWriteAdmissionPurpose::OrdinaryDml,
@@ -715,6 +735,7 @@ fn build_iceberg_connector_write_templates(
 #[allow(clippy::type_complexity)]
 fn build_iceberg_connector_write_templates_with_purpose(
     target: &TargetBackend,
+    target_ref: &str,
     operation_id: ConnectorWriteOperationId,
     exact_lease: &ConnectorWriteLease,
     purpose: ConnectorWriteAdmissionPurpose,
@@ -743,6 +764,7 @@ fn build_iceberg_connector_write_templates_with_purpose(
                 let preparation = prepare_iceberg_connector_write(
                     exact_lease,
                     target,
+                    target_ref,
                     intent,
                     ConnectorWriteInputRequest::Data {
                         fields: input_schema
@@ -776,6 +798,7 @@ fn build_iceberg_connector_write_templates_with_purpose(
 pub(crate) fn prepare_iceberg_connector_write(
     exact_lease: &ConnectorWriteLease,
     target: &TargetBackend,
+    target_ref: &str,
     intent: ConnectorWriteIntent,
     input: ConnectorWriteInputRequest,
     purpose: ConnectorWriteAdmissionPurpose,
@@ -786,6 +809,8 @@ pub(crate) fn prepare_iceberg_connector_write(
         .control()
         .prepare_write(ConnectorWritePreparationRequest {
             table,
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
+                .map_err(|error| format!("validate Iceberg write target ref: {error}"))?,
             intent,
             purpose,
             input,
@@ -1061,6 +1086,23 @@ impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMut
             self.connector_context.clone(),
             reason,
         )
+    }
+
+    fn abort_terminal(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+        let session = self
+            .operation_session
+            .lock()
+            .expect("prepared Iceberg mutation session lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                "prepared Iceberg mutation terminal abort requires a retained operation session"
+                    .to_string()
+            })?;
+        session
+            .abort(self.connector_context.clone())
+            .map_err(|error| error.to_string())
     }
 
     fn commit(

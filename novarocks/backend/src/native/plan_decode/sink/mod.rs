@@ -139,7 +139,7 @@ pub(crate) fn decode_fragment_sink_program_with_context(
                     "native connector writer requires the backend decode context",
                 )
             })?;
-            decode_connector_write_sink_program(connector, fragment, context)
+            decode_connector_write_sink_program(connector, fragment, layout, context)
                 .map(FragmentSinkProgram::ConnectorWrite)
                 .map_err(|error| error.into_native(path.field("connector_write")))
         }
@@ -214,6 +214,7 @@ fn decode_statistics_sink(
 fn decode_connector_write_sink_program(
     sink: &plan::ConnectorWriteFragmentSink,
     fragment: &plan::PlanFragment,
+    layout: &Layout,
     context: &NativePlanDecodeContext,
 ) -> Result<ConnectorWriteSinkProgram, NativeFragmentLeafDecodeError> {
     let envelope = sink.handle.as_ref().ok_or_else(|| {
@@ -369,10 +370,19 @@ fn decode_connector_write_sink_program(
     let root_input_width = root_schema.fields().len();
     let (expected_schema, input_ordinals) =
         decode_connector_write_input(sink.input.as_ref(), root_schema)?;
+    let expression_projection = if fragment.output_exprs.is_empty() {
+        None
+    } else {
+        Some(decode_connector_write_output_expressions(
+            &fragment.output_exprs,
+            layout,
+            context,
+        )?)
+    };
     let (_, query_expire) = query_expire_durations(context.query_options());
     let request = ConnectorOpenWriterRequest {
         handle,
-        expected_schema,
+        expected_schema: Arc::clone(&expected_schema),
         context: ConnectorRequestContext::try_new(
             Instant::now() + query_expire,
             context.connector_cancellation()?,
@@ -387,15 +397,54 @@ fn decode_connector_write_sink_program(
             )
         })?,
     };
-    ConnectorWriteSinkProgram::try_new(binding, request, root_input_width, input_ordinals).map_err(
-        |error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "handle",
-                error,
+    match expression_projection {
+        Some((arena, exprs)) => ConnectorWriteSinkProgram::try_new_with_expression_projection(
+            binding,
+            request,
+            root_input_width,
+            arena,
+            exprs,
+            expected_schema,
+        ),
+        None => {
+            ConnectorWriteSinkProgram::try_new(binding, request, root_input_width, input_ordinals)
+        }
+    }
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "handle", error)
+    })
+}
+
+fn decode_connector_write_output_expressions(
+    output_exprs: &[expr::Expr],
+    layout: &Layout,
+    context: &NativePlanDecodeContext,
+) -> Result<(ExprArena, Vec<novarocks::exec::expr::ExprId>), NativeFragmentLeafDecodeError> {
+    let mut arena = ExprArena::default();
+    let exprs = output_exprs
+        .iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            decode_sink_expression(
+                expression,
+                &mut arena,
+                layout,
+                Some(context),
+                FieldPath::root("plan_fragment")
+                    .field("output_exprs")
+                    .index(index),
             )
-        },
-    )
+            .map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "output_exprs",
+                    error,
+                )
+                .append_index(index)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((arena, exprs))
 }
 
 fn decode_connector_write_input(
@@ -1027,10 +1076,96 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_change_stream_branch_kind, decode_fragment_sink_assignment};
+    use std::sync::Arc;
+
+    use arrow::array::{Array, BinaryArray, LargeBinaryArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks::common::ids::SlotId;
+    use novarocks::exec::chunk::{Chunk, ChunkSchema};
     use novarocks::runtime::fragment::FragmentSinkAssignment;
-    use novarocks_protocol::{novarocks as proto, plan};
+    use novarocks_protocol::{expr, novarocks as proto, plan};
     use novarocks_types::change_stream::ChangeStreamBranchKind;
+
+    use super::{
+        decode_change_stream_branch_kind, decode_connector_write_output_expressions,
+        decode_fragment_sink_assignment,
+    };
+    use crate::native::plan_decode::context::NativePlanDecodeContext;
+    use crate::native::plan_decode::layout::Layout;
+    use crate::native::type_decode::encode_type;
+
+    fn binary_to_variant_expression(column_id: u32) -> expr::Expr {
+        let operand = expr::Expr {
+            r#type: Some(encode_type(&DataType::Binary).expect("binary type")),
+            nullable: true,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: None,
+            })),
+        };
+        let target = encode_type(&DataType::LargeBinary).expect("variant type");
+        expr::Expr {
+            r#type: Some(target.clone()),
+            nullable: true,
+            kind: Some(expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(operand)),
+                target: Some(target),
+            }))),
+        }
+    }
+
+    #[test]
+    fn connector_write_output_expressions_project_binary_to_exact_variant_layout() {
+        let slot = SlotId::new(17);
+        let layout = Layout::for_slots([slot]);
+        let context = NativePlanDecodeContext::default();
+        let (arena, exprs) = decode_connector_write_output_expressions(
+            &[binary_to_variant_expression(slot.as_u32())],
+            &layout,
+            &context,
+        )
+        .expect("connector write output expression decodes");
+
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "state",
+            DataType::Binary,
+            true,
+        )]));
+        let input = Arc::new(BinaryArray::from(vec![
+            Some(b"one".as_slice()),
+            None,
+            Some(b"three".as_slice()),
+        ]));
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(input_schema.as_ref(), &[slot])
+                .expect("input chunk schema");
+        let chunk = Chunk::try_new_with_columns(chunk_schema, vec![input]).expect("input chunk");
+        let arrays = exprs
+            .iter()
+            .map(|expr| arena.eval(*expr, &chunk))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("projection evaluates");
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "state",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let projected =
+            RecordBatch::try_new(Arc::clone(&target_schema), arrays).expect("projected batch");
+
+        assert_eq!(projected.schema().as_ref(), target_schema.as_ref());
+        assert_eq!(projected.column(0).data_type(), &DataType::LargeBinary);
+        let values = projected
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("variant array");
+        assert_eq!(values.value(0), b"one");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), b"three");
+    }
 
     #[test]
     fn change_stream_branch_kind_decoding_uses_neutral_values_and_rejects_invalid_wire_values() {

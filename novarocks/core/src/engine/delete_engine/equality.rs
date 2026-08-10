@@ -229,6 +229,7 @@ fn prepare_equality_delete_distributed_write(
     let preparation = crate::engine::iceberg_writer::prepare_iceberg_connector_write(
         &write_lease,
         target,
+        "main",
         ConnectorWriteIntent::RowDelta,
         ConnectorWriteInputRequest::EqualityDelete {
             equality_fields: delete_columns

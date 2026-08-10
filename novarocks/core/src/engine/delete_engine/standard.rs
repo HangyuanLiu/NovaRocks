@@ -379,6 +379,7 @@ fn prepare_delete_dv_write(
     let preparation = row_delete_preparation(
         &write_lease,
         target,
+        target_ref,
         ConnectorWriteInputRequest::DeletionVector {
             identity_fields: position_delete_identity_field_requests(),
             partition_source_fields: Vec::new(),
@@ -503,6 +504,7 @@ fn prepare_delete_write(
     let preparation = row_delete_preparation(
         &write_lease,
         target,
+        target_ref,
         ConnectorWriteInputRequest::PositionDelete {
             identity_fields: position_delete_identity_field_requests(),
             partition_source_fields: Vec::new(),
@@ -631,6 +633,7 @@ fn write_input_columns(
 fn row_delete_preparation(
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     target: &TargetBackend,
+    target_ref: &str,
     input: ConnectorWriteInputRequest,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::ConnectorWritePreparation, String> {
@@ -638,6 +641,7 @@ fn row_delete_preparation(
     crate::engine::iceberg_writer::prepare_iceberg_connector_write(
         write_lease,
         target,
+        target_ref,
         intent,
         input,
         ConnectorWriteAdmissionPurpose::OrdinaryDml,

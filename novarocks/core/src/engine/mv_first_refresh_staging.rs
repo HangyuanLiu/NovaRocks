@@ -639,6 +639,7 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     let preparation = crate::engine::iceberg_writer::prepare_iceberg_connector_write(
         exact_lease,
         &target,
+        prepared.staging_branch(),
         intent,
         novarocks_spi::connector::ConnectorWriteInputRequest::Data {
             fields: prepared
