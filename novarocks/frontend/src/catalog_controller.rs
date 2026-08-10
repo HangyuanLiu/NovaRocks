@@ -230,7 +230,166 @@ impl FrontendCatalogController {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
+    use bytes::Bytes;
+    use novarocks::catalog_application::{CatalogAdmission, CatalogApplicationPort};
+    use novarocks_spi::connector::{
+        ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
+        ConnectorError, ConnectorProviderId,
+    };
+    use novarocks_spi::state_store::{
+        ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction,
+        StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
+        StateStoreMetricsSnapshot, TransactionId, WriteTransaction,
+        conformance::FaultInjectingStateStore,
+    };
+    use novarocks_state_store::{
+        SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
+        StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+        builtin_state_store_provider_registry,
+    };
+
     use super::*;
+    use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
+    use crate::connector::ConnectorControlHost;
+
+    struct ReadyFactory;
+
+    struct PollUnavailableStore {
+        inner: Arc<dyn StateStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl StateStore for PollUnavailableStore {
+        fn limits(&self) -> &StateStoreLimits {
+            self.inner.limits()
+        }
+
+        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+            self.inner.metrics_snapshot()
+        }
+
+        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+            self.inner.begin_read().await
+        }
+
+        async fn begin_write(
+            &self,
+            transaction_id: TransactionId,
+            purpose: &str,
+        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+            self.inner.begin_write(transaction_id, purpose).await
+        }
+
+        async fn poll_changes(
+            &self,
+            _request: &ChangePollRequest,
+        ) -> Result<ChangePage, StateStoreError> {
+            Err(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "injected catalog controller outage",
+            ))
+        }
+
+        async fn identity(
+            &self,
+        ) -> Result<novarocks_spi::state_store::StoreIdentity, StateStoreError> {
+            self.inner.identity().await
+        }
+
+        async fn resolve_commit(
+            &self,
+            transaction_id: &TransactionId,
+        ) -> Result<CommitResolution, StateStoreError> {
+            self.inner.resolve_commit(transaction_id).await
+        }
+    }
+
+    impl ConnectorControlFactory for ReadyFactory {
+        fn provider_id(&self) -> &ConnectorProviderId {
+            static PROVIDER: std::sync::OnceLock<ConnectorProviderId> = std::sync::OnceLock::new();
+            PROVIDER.get_or_init(|| ConnectorProviderId::parse("iceberg").expect("provider ID"))
+        }
+
+        fn create_control(
+            &self,
+            request: ConnectorControlFactoryRequest,
+        ) -> Result<ConnectorControlCreation, ConnectorError> {
+            ConnectorControlCreation::try_new(
+                &request,
+                crate::connector::control_host::tests::test_control_binding(1),
+                Vec::new(),
+            )
+        }
+    }
+
+    async fn open_store() -> (tempfile::TempDir, StateStoreHost, Arc<dyn StateStore>) {
+        let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
+        let registry =
+            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let host = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "catalog-controller-test".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: directory.path().join("state-store.sqlite"),
+                            deployment_owner: "catalog-controller-test".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                // SQLite is a single-FE StateStore provider. This fixture
+                // still instantiates two independent local controller hosts
+                // over its shared StateStore surface; it is not a production
+                // multi-process deployment claim.
+                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
+                topology_revision: Bytes::from_static(b"catalog-controller-test-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite StateStore");
+        assert_eq!(host.provider_id(), SQLITE_STATE_STORE_PROVIDER_ID);
+        let store = host.state_store().expect("ready StateStore");
+        (directory, host, store)
+    }
+
+    fn attachment() -> CatalogAttachment {
+        CatalogAttachment {
+            attachment_id: uuid::Uuid::now_v7(),
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("catalog.analytics")
+                .expect("instance ID"),
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            display_name: "catalog.analytics".to_string(),
+            durable_properties: Vec::new(),
+            created_at_ms: 1,
+        }
+    }
+
+    fn projection(
+        repository: CatalogAttachmentRepository,
+    ) -> (
+        Arc<ConnectorControlHost>,
+        Arc<FrontendCatalogApplicationPort>,
+    ) {
+        let control = Arc::new(
+            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory)])
+                .expect("control host"),
+        );
+        let port = Arc::new(FrontendCatalogApplicationPort::new(
+            repository,
+            Arc::clone(&control),
+            tokio::runtime::Handle::current(),
+        ));
+        (control, port)
+    }
 
     #[test]
     fn defaults_match_the_cp2_operational_contract() {
@@ -242,5 +401,162 @@ mod tests {
         assert_eq!(config.retry_max, Duration::from_secs(5));
         assert_eq!(config.worker_count, 8);
         assert_eq!(config.shutdown_deadline, Duration::from_secs(5));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_frontend_controllers_converge_after_change_gap_and_catalog_removal() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let created = repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+
+        let (_first_control, first_port) = projection(repository.clone());
+        let (_second_control, second_port) = projection(repository.clone());
+        let first = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&first_port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("first controller");
+        let second = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&second_port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("second controller");
+        let first_cursor = first.bootstrap().await.expect("first bootstrap");
+        let second_cursor = second.bootstrap().await.expect("second bootstrap");
+        assert!(matches!(
+            first_port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Ready(_)
+        ));
+        assert!(matches!(
+            second_port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Ready(_)
+        ));
+
+        repository
+            .drop_exact(created.clone())
+            .await
+            .expect("remove durable attachment");
+
+        // A retention gap is only a wakeup: each controller rereads the
+        // attachment repository instead of trusting the synthetic page state.
+        let identity = store.identity().await.expect("store identity");
+        let change = store
+            .poll_changes(&ChangePollRequest {
+                after: Some(first_cursor.clone()),
+                page_size: 256,
+            })
+            .await
+            .expect("read change page");
+        let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+        fault.script_next_change_page(novarocks_spi::state_store::ChangePage {
+            resync_required: true,
+            ..change
+        });
+        let fault_store: Arc<dyn StateStore> = fault.clone();
+        let fault_controller = FrontendCatalogController::new(
+            fault_store,
+            Arc::clone(&first_port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("fault controller");
+        let mut first_identity = Some(identity.clone());
+        let mut first_cursor = Some(first_cursor);
+        let mut force_resync = false;
+        fault_controller
+            .poll_once(&mut first_identity, &mut first_cursor, &mut force_resync)
+            .await
+            .expect("retention gap resync");
+        assert!(!force_resync);
+
+        let mut second_identity = Some(identity);
+        let mut second_cursor = Some(second_cursor);
+        let mut second_force_resync = true;
+        second
+            .poll_once(
+                &mut second_identity,
+                &mut second_cursor,
+                &mut second_force_resync,
+            )
+            .await
+            .expect("second controller authoritative resync");
+        assert!(matches!(
+            first_port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Absent
+        ));
+        assert!(matches!(
+            second_port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Absent
+        ));
+
+        drop(fault_controller);
+        drop(fault);
+        drop(first);
+        drop(second);
+        drop(first_port);
+        drop(second_port);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn freshness_expiry_unpublishes_ready_catalogs_before_retrying() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let created = repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+        let (_control, port) = projection(repository.clone());
+        let bootstrap = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("bootstrap controller");
+        bootstrap.bootstrap().await.expect("bootstrap projection");
+        assert!(matches!(
+            port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Ready(_)
+        ));
+
+        let mut config = CatalogProjectionConfig::default();
+        config.poll_interval = Duration::from_millis(1);
+        config.freshness_budget = Duration::from_millis(10);
+        config.retry_initial = Duration::from_millis(1);
+        config.retry_max = Duration::from_millis(2);
+        let unavailable_store: Arc<dyn StateStore> = Arc::new(PollUnavailableStore {
+            inner: Arc::clone(&store),
+        });
+        let controller =
+            FrontendCatalogController::new(unavailable_store, Arc::clone(&port), config)
+                .expect("outage controller");
+        controller.start().expect("start outage controller");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(matches!(
+            port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Unavailable { .. }
+        ));
+        controller.shutdown().await.expect("shutdown controller");
+
+        drop(controller);
+        drop(bootstrap);
+        drop(port);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
     }
 }

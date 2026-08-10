@@ -649,8 +649,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
+    use novarocks::mv::dependency::model::{
+        MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+    };
     use novarocks_spi::state_store::{
-        FeDeploymentView, StateStore,
+        CommitOutcome, FeDeploymentView, Precondition, StateStore, TransactionId,
         conformance::{FaultGate, FaultInjectingStateStore},
     };
     use novarocks_state_store::{
@@ -834,6 +837,98 @@ mod tests {
 
         drop(repository);
         drop(fault);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    #[tokio::test]
+    async fn fenced_drop_rejects_a_materialized_view_dependency_and_keeps_attachment() {
+        let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
+        let registry =
+            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let mut host = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "catalog-attachment-mv-fence-test".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: directory.path().join("state-store.sqlite"),
+                            deployment_owner: "catalog-attachment-mv-fence-test".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
+                topology_revision: Bytes::from_static(b"catalog-attachment-mv-fence-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite StateStore");
+        let store = host.state_store().expect("ready StateStore");
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let created = repository
+            .create(attachment(vec![("type".into(), "iceberg".into())]))
+            .await
+            .expect("create catalog attachment");
+
+        let upstream = MvDependencyObjectRef {
+            catalog: Some(created.attachment.instance_id.as_str().to_string()),
+            database_or_namespace: "sales".to_string(),
+            name: "orders".to_string(),
+            object_type: MvDependencyObjectType::Table,
+            storage_engine: MvDependencyStorageEngine::Iceberg,
+        };
+        let dependency_key = crate::mv::repository::key::dependency_by_upstream_key(&upstream, 1)
+            .expect("MV upstream dependency key");
+        let mut transaction = store
+            .begin_write(
+                TransactionId::from(Uuid::now_v7()),
+                "seed materialized view dependency for catalog drop fence",
+            )
+            .await
+            .expect("begin seed transaction");
+        transaction
+            .put(
+                dependency_key,
+                Bytes::from_static(b"dependency index marker")
+                    .try_into()
+                    .expect("StateStore value"),
+                Precondition::Absent,
+            )
+            .await
+            .expect("write dependency index marker");
+        assert!(matches!(
+            transaction.commit().await,
+            CommitOutcome::Committed(_)
+        ));
+
+        assert_eq!(
+            repository
+                .drop_exact_fenced_by_materialized_views(created.clone(), 256)
+                .await
+                .expect_err("referenced catalog drop must conflict")
+                .kind(),
+            CatalogAttachmentErrorKind::Conflict
+        );
+        assert_eq!(
+            repository
+                .get(&created.attachment.instance_id)
+                .await
+                .expect("read attachment after rejected drop"),
+            Some(created)
+        );
+
+        drop(repository);
         drop(store);
         host.shutdown(Instant::now() + Duration::from_secs(5))
             .await
