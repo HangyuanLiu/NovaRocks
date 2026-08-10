@@ -26,7 +26,7 @@ use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
-use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -38,12 +38,13 @@ pub fn compose_backend_execution_installers(
     let object_store = config.connector.object_store_config().map_err(|error| {
         anyhow::anyhow!("resolve connector startup object-store binding: {error}")
     })?;
-    let binding = IcebergReadBinding::new(
+    let resources = FsAccessResources::new(
         object_store,
         FsAccessResolver::new(),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
         std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
     );
+    let binding = IcebergReadBinding::from_resources(resources);
     let iceberg_installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
         vec![std::sync::Arc::new(IcebergConnectorInstaller::new(binding))];
     let expected = novarocks_spi::connector::ConnectorProviderId::parse(

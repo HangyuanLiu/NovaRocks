@@ -59,7 +59,6 @@ pub(crate) mod variant_write;
 pub(crate) mod write_commit;
 pub(crate) mod write_contract;
 pub(crate) mod write_control;
-pub(crate) mod write_descriptor;
 pub(crate) mod write_execution;
 pub(crate) mod write_service;
 

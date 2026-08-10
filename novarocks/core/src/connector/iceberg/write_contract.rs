@@ -47,13 +47,13 @@ use super::report::{
 use super::sink_plan::{
     IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan, PositionDeleteDataFilePartition,
 };
-use super::write_descriptor::{
-    IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, decode_partition_descriptor,
-    encode_partition_descriptor,
-};
 use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
 use novarocks_connector_iceberg::scan_model::{
     IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+};
+use novarocks_connector_iceberg::write_descriptor::{
+    IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, decode_partition_descriptor,
+    encode_partition_descriptor,
 };
 
 /// Provider-private facts retained until native writer registration. SQL
