@@ -1941,7 +1941,49 @@ impl MetadataMaintenanceOperationRepository {
             |transaction| {
                 let request = request.clone();
                 Box::pin(async move {
-                    apply_metadata_create(transaction, transaction_operation_id, request).await
+                    apply_metadata_create(transaction, transaction_operation_id, request, None)
+                        .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Create,
+            request.operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn create_admitted(
+        &self,
+        request: MetadataMaintenanceOperationCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_create(&request)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!(
+            "admitted create metadata maintenance operation {}",
+            request.operation_id
+        );
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "admitted create frontend metadata maintenance operation",
+            |transaction| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_metadata_create(
+                        transaction,
+                        transaction_operation_id,
+                        request,
+                        Some(&admission),
+                    )
+                    .await
                 })
             },
         )
@@ -2808,9 +2850,17 @@ async fn apply_metadata_create(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
     request: MetadataMaintenanceOperationCreate,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     if let Err(error) = validate_metadata_create(&request) {
         return Ok(Err(error));
+    }
+    if let Some(admission) = admission {
+        if let Err(error) = admission.validate_in(transaction).await {
+            return Ok(Err(RepositoryError::authority_lost(format!(
+                "maintenance write admission lost: {error}"
+            ))));
+        }
     }
     let existing = match load_metadata_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
