@@ -73,8 +73,7 @@ pub(crate) struct IcebergCatalogEntry {
     /// endpoints, or warehouse identity.
     configuration: IcebergCatalogConfiguration,
     table_cache: Arc<std::sync::RwLock<HashMap<(String, String), IcebergLoadedTable>>>,
-    data_files_cache:
-        Arc<std::sync::RwLock<HashMap<(String, String, Option<i64>), Vec<DataFileWithStats>>>>,
+    data_files_cache: novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache,
 }
 
 #[derive(Clone, Debug)]
@@ -194,10 +193,7 @@ impl IcebergCatalogEntry {
             if let Ok(mut cache) = self.table_cache.write() {
                 cache.remove(&(ns.clone(), tbl.clone()));
             }
-            if let Ok(mut cache) = self.data_files_cache.write() {
-                cache
-                    .retain(|(cached_ns, cached_tbl, _), _| cached_ns != &ns || cached_tbl != &tbl);
-            }
+            self.data_files_cache.invalidate_table(&ns, &tbl);
         }
     }
 
@@ -217,13 +213,8 @@ impl IcebergCatalogEntry {
         table_name: &str,
         snapshot_id: Option<i64>,
     ) -> Result<Option<Vec<DataFileWithStats>>, String> {
-        let ns = normalize_identifier(namespace_name)?;
-        let tbl = normalize_identifier(table_name)?;
-        let cache = self
-            .data_files_cache
-            .read()
-            .map_err(|e| format!("iceberg data-file cache lock: {e}"))?;
-        Ok(cache.get(&(ns, tbl, snapshot_id)).cloned())
+        self.data_files_cache
+            .get(namespace_name, table_name, snapshot_id)
     }
 
     pub(crate) fn cache_data_files(
@@ -233,14 +224,8 @@ impl IcebergCatalogEntry {
         snapshot_id: Option<i64>,
         data_files: Vec<DataFileWithStats>,
     ) -> Result<(), String> {
-        let ns = normalize_identifier(namespace_name)?;
-        let tbl = normalize_identifier(table_name)?;
-        let mut cache = self
-            .data_files_cache
-            .write()
-            .map_err(|e| format!("iceberg data-file cache lock: {e}"))?;
-        cache.insert((ns, tbl, snapshot_id), data_files);
-        Ok(())
+        self.data_files_cache
+            .insert(namespace_name, table_name, snapshot_id, data_files)
     }
 }
 
@@ -1365,7 +1350,8 @@ pub(crate) fn build_catalog_entry(
     Ok(IcebergCatalogEntry {
         configuration,
         table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        data_files_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        data_files_cache:
+            novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache::default(),
     })
 }
 
@@ -2791,7 +2777,8 @@ mod data_file_with_stats_tests {
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
             },
             table_cache: Arc::new(RwLock::new(HashMap::new())),
-            data_files_cache: Arc::new(RwLock::new(HashMap::new())),
+            data_files_cache:
+                novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache::default(),
         };
         entry
             .cache_data_files("Db1", "Tbl1", Some(7), vec![data_file("file:///a.parquet")])
