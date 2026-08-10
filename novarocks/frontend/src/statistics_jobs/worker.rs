@@ -51,6 +51,7 @@ pub const STATISTICS_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 pub const STATISTICS_MAX_CLOCK_SKEW: Duration = Duration::from_secs(1);
 pub const STATISTICS_TAKEOVER_OBSERVATION: Duration = Duration::from_secs(2);
 const STATISTICS_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS: usize = 8;
 const MAX_STATISTICS_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -234,7 +235,7 @@ async fn run_worker(
                     }
                     Err(error) => Err(error),
                 };
-                let release = guard.release(OperationId::new_v7()).await;
+                let release = release_worker_lease(&mut guard).await;
                 result?;
                 release
                     .map_err(|error| format!("release statistics worker lease failed: {error}"))?;
@@ -246,6 +247,28 @@ async fn run_worker(
             _ = tokio::time::sleep(STATISTICS_WORKER_POLL_INTERVAL) => {}
         }
     }
+}
+
+async fn release_worker_lease(
+    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+) -> Result<(), CoordinationError> {
+    for attempt in 1..=STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS {
+        match guard.release(OperationId::new_v7()).await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == CoordinationErrorKind::OperationNotCommitted
+                    && attempt < STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS =>
+            {
+                // A definite transaction conflict leaves the guard active and
+                // clears its recovery state, so releasing under a fresh
+                // operation ID is safe. This is common during FE shutdown
+                // while other StateStore-backed workers finish their writes.
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("statistics lease release attempts are non-zero")
 }
 
 async fn recover_incomplete(

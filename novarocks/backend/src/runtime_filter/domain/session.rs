@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter::{
-    LiveTerminal, PartitionId, ProducerSequence, RuntimeFilterBindOutcome, RuntimeFilterBindingId,
-    RuntimeFilterConsumerContract, RuntimeFilterContractViolation,
+    LiveTerminal, LogicalVersion, PartitionId, ProducerSequence, RuntimeFilterBindOutcome,
+    RuntimeFilterBindingId, RuntimeFilterConsumerContract, RuntimeFilterContractViolation,
     RuntimeFilterContractViolationKind, RuntimeFilterContribution, RuntimeFilterExecutionContract,
     RuntimeFilterProducer, RuntimeFilterProducerFailure, RuntimeFilterProducerHandle,
     RuntimeFilterProducerOpenRequest, RuntimeFilterSnapshot, RuntimeFilterSubmitOutcome,
@@ -591,6 +591,7 @@ impl BackendRuntimeFilterSession {
         snapshot: &BackendReducedLogicalSnapshot,
         terminal: Option<LiveTerminal>,
     ) -> Result<(), RuntimeFilterContractViolation> {
+        let logical_version = self.materialized_logical_version(snapshot);
         for consumer in self.consumers.values() {
             let outcome = match (snapshot.domain(), consumer.contract.contract()) {
                 (
@@ -600,7 +601,7 @@ impl BackendRuntimeFilterSession {
                     snapshot.channel_id().get(),
                     domain,
                     schema,
-                    snapshot.logical_version(),
+                    logical_version,
                     &consumer.profile,
                     crate::runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
@@ -615,7 +616,7 @@ impl BackendRuntimeFilterSession {
                             Ok(query) => SnapshotAcquireOutcome::Published(Arc::new(
                                 RuntimeFilterSnapshot::new(
                                     consumer.contract.binding_id(),
-                                    snapshot.logical_version(),
+                                    logical_version,
                                     schema.digest(),
                                     Arc::new(query),
                                 ),
@@ -641,7 +642,7 @@ impl BackendRuntimeFilterSession {
                     snapshot.channel_id().get(),
                     order,
                     bound,
-                    snapshot.logical_version(),
+                    logical_version,
                     &consumer.profile,
                     &crate::runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
@@ -654,7 +655,7 @@ impl BackendRuntimeFilterSession {
                         Ok(query) => SnapshotAcquireOutcome::Published(Arc::new(
                             RuntimeFilterSnapshot::new(
                                 consumer.contract.binding_id(),
-                                snapshot.logical_version(),
+                                logical_version,
                                 order.digest(),
                                 Arc::new(query),
                             ),
@@ -709,6 +710,16 @@ impl BackendRuntimeFilterSession {
             .any(|group| group.route_edge_ids().contains(&route))
     }
 
+    fn materialized_logical_version(
+        &self,
+        snapshot: &BackendReducedLogicalSnapshot,
+    ) -> LogicalVersion {
+        match self.channel.lifecycle() {
+            super::BackendChannelLifecycle::CompleteOnce => LogicalVersion::FIRST,
+            super::BackendChannelLifecycle::MonotonicUpdates => snapshot.logical_version(),
+        }
+    }
+
     fn dispatch_outbound_snapshot(
         &self,
         snapshot: &BackendReducedLogicalSnapshot,
@@ -722,6 +733,7 @@ impl BackendRuntimeFilterSession {
         else {
             return Ok(());
         };
+        let logical_version = self.materialized_logical_version(snapshot);
         for group in self.channel.outbound_materialization_groups().values() {
             let frame = match (snapshot.domain(), self.channel.execution_contract()) {
                 (
@@ -731,7 +743,7 @@ impl BackendRuntimeFilterSession {
                     snapshot.channel_id().get(),
                     domain,
                     schema,
-                    snapshot.logical_version(),
+                    logical_version,
                     group.profile(),
                     crate::runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
@@ -782,7 +794,7 @@ impl BackendRuntimeFilterSession {
                     snapshot.channel_id().get(),
                     order,
                     bound,
-                    snapshot.logical_version(),
+                    logical_version,
                     group.profile(),
                     &crate::runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
@@ -1406,6 +1418,51 @@ mod tests {
         assert_eq!(
             session.availability_progress(),
             BackendCoverageProgress::Satisfied
+        );
+    }
+
+    #[test]
+    fn complete_once_materialization_uses_first_version_after_multiple_reductions() {
+        let (session, fixture) = session();
+        let producer_contract = fixture.producer_contract();
+        let binding_id = producer_contract.binding_id();
+        let RuntimeFilterBindOutcome::Bound(_) = session
+            .open_producer(
+                instance(37),
+                RuntimeFilterProducerOpenRequest::new(producer_contract, 1),
+            )
+            .unwrap()
+        else {
+            panic!("installed producer must bind")
+        };
+        let first = session
+            .submit(
+                binding_id,
+                instance(37),
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                fixture.membership_contribution_with_values([3, 9]),
+            )
+            .unwrap()
+            .publication
+            .expect("first reduction publishes internally");
+        let second = session
+            .submit(
+                binding_id,
+                instance(37),
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                fixture.membership_contribution_with_values([12, 18]),
+            )
+            .unwrap()
+            .publication
+            .expect("second reduction publishes internally");
+
+        assert_eq!(first.logical_version(), LogicalVersion::FIRST);
+        assert_eq!(second.logical_version(), LogicalVersion::new(2));
+        assert_eq!(
+            session.materialized_logical_version(&second),
+            LogicalVersion::FIRST
         );
     }
 
