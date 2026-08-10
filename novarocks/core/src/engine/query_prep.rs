@@ -396,7 +396,7 @@ pub(crate) fn external_schema_columns_for_statement(
     }
 
     let materialization =
-        crate::connector::iceberg::provider::load_schema_materialization_with_lease(
+        crate::engine::query_planning::catalog_materializer::load_connector_table_materialization_with_lease(
             state.connector_control.as_ref(),
             crate::connector::connector_request_context(
                 None,
@@ -635,7 +635,7 @@ mod tests {
             .split("/// Returns true if `table_name`")
             .next()
             .expect("statement schema lookup boundary");
-        assert!(lookup.contains("load_schema_materialization_with_lease"));
+        assert!(lookup.contains("load_connector_table_materialization_with_lease"));
         assert!(!lookup.contains("register("));
         assert!(!lookup.contains("drop_local_table_registration_if_exists"));
     }

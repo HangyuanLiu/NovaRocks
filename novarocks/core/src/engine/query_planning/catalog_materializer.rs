@@ -39,6 +39,119 @@ use crate::sql::catalog::{
 };
 use crate::sql::planner::table::TableDef;
 
+/// Provider-neutral table facts admitted for one request.  Core projects the
+/// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
+/// never decodes a provider table handle or metadata payload.
+#[derive(Clone)]
+pub(crate) struct ConnectorQueryTableMaterialization {
+    pub(crate) schema_version: Option<Vec<u8>>,
+    pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) read_table: novarocks_spi::connector::ConnectorTableHandle,
+    pub(crate) read_schema: arrow::datatypes::SchemaRef,
+    pub(crate) read_selector: novarocks_spi::connector::ConnectorReadSelector,
+    pub(crate) sql_ukfk_facts: crate::sql::planner::table::SqlUkFkTableFacts,
+    pub(crate) statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+}
+
+pub(crate) fn load_connector_table_materialization_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
+        ConnectorTableResolution,
+    };
+
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let planning_lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    let metadata = planning_lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    connector_table_materialization_from_metadata(metadata, planning_lease)
+}
+
+pub(crate) fn connector_table_materialization_from_metadata(
+    metadata: novarocks_spi::connector::ConnectorTableMetadata,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    use novarocks_spi::connector::{
+        ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+    };
+
+    let mut columns = Vec::new();
+    let mut row_lineage_metadata_columns = Vec::new();
+    for (ordinal, field) in metadata.schema.fields().iter().enumerate() {
+        let fact = metadata.planning_facts.column_facts().get(ordinal);
+        let logical_type = match fact.map(|fact| fact.semantic_kind()) {
+            Some(ConnectorTableColumnSemanticKind::Bitmap) => {
+                Some(novarocks_catalog::schema::SqlType::Bitmap)
+            }
+            Some(ConnectorTableColumnSemanticKind::Hll) => {
+                Some(novarocks_catalog::schema::SqlType::Hll)
+            }
+            _ => None,
+        };
+        let column = novarocks_catalog::schema::ColumnDef {
+            name: field.name().to_string(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type,
+        };
+        match fact.map(|fact| fact.role()) {
+            Some(ConnectorTableColumnRole::RowLineageSystem) => {
+                row_lineage_metadata_columns.push(column)
+            }
+            _ if matches!(
+                fact.map(|fact| fact.visibility()),
+                Some(ConnectorTableColumnVisibility::Hidden)
+            ) => {}
+            _ => columns.push(column),
+        }
+    }
+    let statistics_pin = metadata
+        .statistics_data_version
+        .clone()
+        .map(
+            |data_version| crate::connector::backend::ResolvedTableStatisticsPin {
+                table: metadata.table.clone(),
+                data_version,
+            },
+        );
+    Ok(ConnectorQueryTableMaterialization {
+        schema_version: metadata.version.map(|version| version.to_vec()),
+        columns,
+        row_lineage_metadata_columns,
+        read_table: metadata.table,
+        read_schema: metadata.schema.clone(),
+        read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+        sql_ukfk_facts:
+            crate::sql::planner::table::SqlUkFkTableFacts::from_connector_planning_facts(
+                &metadata.schema,
+                &metadata.planning_facts,
+            ),
+        statistics_pin,
+        planning_lease,
+    })
+}
+
 /// Convert an admitted Iceberg provider envelope into the one SQL-facing
 /// table shape.  The caller supplies the token allocated by
 /// `QueryTableBindingStore`; every concrete descriptor remains paired with

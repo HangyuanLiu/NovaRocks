@@ -52,15 +52,15 @@ impl CatalogRuntimeMetadata {
         }
     }
 
-    fn from_iceberg_materialization(
+    fn from_connector_materialization(
         identity: TableIdentity,
-        materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+        materialization: &crate::engine::query_planning::catalog_materializer::ConnectorQueryTableMaterialization,
     ) -> Self {
         Self {
             table: CatalogTable {
                 identity,
                 columns: materialization.columns.clone(),
-                hidden_columns: materialization.iceberg_row_lineage_metadata_columns.clone(),
+                hidden_columns: materialization.row_lineage_metadata_columns.clone(),
             },
         }
     }
@@ -135,7 +135,7 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
     ) -> Result<CatalogRuntimeMetadata, String> {
         let identity = TableIdentity::new(&self.name, namespace, table);
         let materialization =
-            crate::connector::iceberg::provider::load_schema_materialization_with_lease(
+            crate::engine::query_planning::catalog_materializer::load_connector_table_materialization_with_lease(
                 self.controls.as_ref(),
                 crate::connector::connector_request_context(
                     None,
@@ -146,8 +146,8 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
                 table,
             )?;
         self.cache
-            .get_or_build_validated(&identity, materialization.schema_id, || {
-                Ok(CatalogRuntimeMetadata::from_iceberg_materialization(
+            .get_or_build_validated(&identity, materialization.schema_version.clone(), || {
+                Ok(CatalogRuntimeMetadata::from_connector_materialization(
                     identity.clone(),
                     &materialization,
                 ))
