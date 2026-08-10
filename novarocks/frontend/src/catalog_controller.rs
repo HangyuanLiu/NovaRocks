@@ -243,7 +243,7 @@ mod tests {
     use novarocks_spi::state_store::{
         ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction,
         StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-        StateStoreMetricsSnapshot, TransactionId, WriteTransaction,
+        StateStoreMetricsSnapshot, StoreIdentity, TransactionId, WriteTransaction,
         conformance::FaultInjectingStateStore,
     };
     use novarocks_state_store::{
@@ -260,6 +260,12 @@ mod tests {
 
     struct PollUnavailableStore {
         inner: Arc<dyn StateStore>,
+    }
+
+    struct IdentityChangedStore {
+        inner: Arc<dyn StateStore>,
+        identity: StoreIdentity,
+        page: ChangePage,
     }
 
     #[async_trait::async_trait]
@@ -298,6 +304,47 @@ mod tests {
             &self,
         ) -> Result<novarocks_spi::state_store::StoreIdentity, StateStoreError> {
             self.inner.identity().await
+        }
+
+        async fn resolve_commit(
+            &self,
+            transaction_id: &TransactionId,
+        ) -> Result<CommitResolution, StateStoreError> {
+            self.inner.resolve_commit(transaction_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateStore for IdentityChangedStore {
+        fn limits(&self) -> &StateStoreLimits {
+            self.inner.limits()
+        }
+
+        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+            self.inner.metrics_snapshot()
+        }
+
+        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+            self.inner.begin_read().await
+        }
+
+        async fn begin_write(
+            &self,
+            transaction_id: TransactionId,
+            purpose: &str,
+        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+            self.inner.begin_write(transaction_id, purpose).await
+        }
+
+        async fn poll_changes(
+            &self,
+            _request: &ChangePollRequest,
+        ) -> Result<ChangePage, StateStoreError> {
+            Ok(self.page.clone())
+        }
+
+        async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+            Ok(self.identity.clone())
         }
 
         async fn resolve_commit(
@@ -569,6 +616,92 @@ mod tests {
 
         drop(controller);
         drop(bootstrap);
+        drop(port);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_identity_change_discards_the_cursor_and_forces_authoritative_resync() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let created = repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+        let (_control, port) = projection(repository.clone());
+        let controller = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("controller");
+        let cursor = controller.bootstrap().await.expect("bootstrap projection");
+        assert!(matches!(
+            port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Ready(_)
+        ));
+        repository
+            .drop_exact(created.clone())
+            .await
+            .expect("remove durable attachment");
+
+        let original_identity = store.identity().await.expect("original identity");
+        let high_watermark = store
+            .poll_changes(&ChangePollRequest {
+                after: None,
+                page_size: 256,
+            })
+            .await
+            .expect("read current high watermark")
+            .high_watermark;
+        let changed_identity = StoreIdentity {
+            store_id: uuid::Uuid::now_v7(),
+            cluster_id: original_identity.cluster_id.clone(),
+            initial_incarnation: original_identity.initial_incarnation + 1,
+        };
+        let changed_store: Arc<dyn StateStore> = Arc::new(IdentityChangedStore {
+            inner: Arc::clone(&store),
+            page: ChangePage {
+                hints: Vec::new(),
+                next_cursor: ChangeCursor::new(
+                    changed_identity.store_id,
+                    high_watermark.clone(),
+                    u32::MAX,
+                )
+                .expect("changed identity cursor"),
+                high_watermark,
+                resync_required: false,
+            },
+            identity: changed_identity.clone(),
+        });
+        let changed_controller = FrontendCatalogController::new(
+            changed_store,
+            Arc::clone(&port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("changed-identity controller");
+        let mut known_identity = Some(original_identity);
+        let mut cursor = Some(cursor);
+        let mut force_resync = false;
+        changed_controller
+            .poll_once(&mut known_identity, &mut cursor, &mut force_resync)
+            .await
+            .expect("identity-change resync");
+        assert_eq!(known_identity, Some(changed_identity));
+        assert!(!force_resync);
+        assert!(matches!(
+            port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Absent
+        ));
+
+        drop(changed_controller);
+        drop(controller);
         drop(port);
         drop(repository);
         drop(store);
