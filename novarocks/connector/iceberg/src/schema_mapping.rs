@@ -133,7 +133,7 @@ fn mapped_field_for_name<'a>(
 }
 
 fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
-    let identified = usize::from(parse_field_id(field)?.is_some());
+    let identified = usize::from(field_id_for_arrow_field(field)?.is_some());
     if is_variant_struct_data_type(field.data_type()) {
         return Ok((identified, 1));
     }
@@ -165,7 +165,7 @@ fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
     Ok((identified + children_identified, 1 + children_total))
 }
 
-fn parse_field_id(field: &Field) -> Result<Option<i32>, String> {
+pub fn field_id_for_arrow_field(field: &Field) -> Result<Option<i32>, String> {
     field
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
@@ -178,6 +178,23 @@ fn parse_field_id(field: &Field) -> Result<Option<i32>, String> {
             })
         })
         .transpose()
+}
+
+pub fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Result<bool, String> {
+    let mut found_unidentified_variant = false;
+    for field in schema.fields() {
+        if is_variant_struct_data_type(field.data_type()) {
+            if field_id_for_arrow_field(field)?.is_none() {
+                found_unidentified_variant = true;
+            }
+            continue;
+        }
+        let (identified, total) = field_id_coverage(field.as_ref())?;
+        if identified != total {
+            return Ok(false);
+        }
+    }
+    Ok(found_unidentified_variant)
 }
 
 pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {

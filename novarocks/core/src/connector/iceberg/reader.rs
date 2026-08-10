@@ -58,7 +58,9 @@ use novarocks_connector_iceberg::scan_model::{
 };
 use novarocks_connector_iceberg::schema_mapping::{
     apply_name_mapping_to_schema as provider_apply_name_mapping_to_schema,
+    field_id_for_arrow_field as provider_field_id_for_arrow_field,
     schema_field_id_coverage as provider_schema_field_id_coverage,
+    unidentified_fields_are_only_opaque_variants as provider_unidentified_fields_are_only_opaque_variants,
 };
 
 pub(crate) struct IcebergBatchReader {
@@ -658,7 +660,8 @@ fn apply_name_mapping_to_batch(
         // and value children are not table fields), so a missing ID there is
         // safe to align by name when no rename mapping is required. Keep the
         // mixed-ID rejection for ordinary fields and nested structs.
-        if name_mapping.is_none() && unidentified_fields_are_only_opaque_variants(&batch.schema())?
+        if name_mapping.is_none()
+            && provider_unidentified_fields_are_only_opaque_variants(&batch.schema())?
         {
             return Ok(batch);
         }
@@ -672,6 +675,7 @@ fn apply_name_mapping_to_batch(
         .map_err(|error| format!("apply Iceberg name mapping to batch schema: {error}"))
 }
 
+#[cfg(test)]
 pub(super) fn schema_field_id_coverage(schema: &SchemaRef) -> Result<(usize, usize), String> {
     schema
         .fields()
@@ -682,6 +686,7 @@ pub(super) fn schema_field_id_coverage(schema: &SchemaRef) -> Result<(usize, usi
         })
 }
 
+#[cfg(test)]
 pub(super) fn apply_name_mapping_to_schema(
     schema: &SchemaRef,
     name_mapping: &novarocks_connector_iceberg::iceberg::spec::NameMapping,
@@ -703,6 +708,7 @@ pub(super) fn apply_name_mapping_to_schema(
     )))
 }
 
+#[cfg(test)]
 fn map_field_id_recursive(
     field: &Field,
     mappings: &[Arc<novarocks_connector_iceberg::iceberg::spec::MappedField>],
@@ -767,6 +773,7 @@ fn map_field_id_recursive(
     Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
 }
 
+#[cfg(test)]
 fn mapped_field_for_name<'a>(
     mappings: &'a [Arc<novarocks_connector_iceberg::iceberg::spec::MappedField>],
     name: &str,
@@ -785,6 +792,7 @@ fn mapped_field_for_name<'a>(
     Ok(mapped)
 }
 
+#[cfg(test)]
 fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
     let identified = usize::from(parse_field_id(field)?.is_some());
     if crate::formats::parquet::is_variant_struct_data_type(field.data_type()) {
@@ -818,6 +826,7 @@ fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
     Ok((identified + children_identified, 1 + children_total))
 }
 
+#[cfg(test)]
 fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Result<bool, String> {
     let mut found_unidentified_variant = false;
     for field in schema.fields() {
@@ -835,6 +844,7 @@ fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Result<bo
     Ok(found_unidentified_variant)
 }
 
+#[cfg(test)]
 fn parse_field_id(field: &Field) -> Result<Option<i32>, String> {
     field
         .metadata()
@@ -854,11 +864,11 @@ fn source_index_for_target(
     source_fields: &[arrow::datatypes::FieldRef],
     target: &Field,
 ) -> Result<Option<usize>, String> {
-    let target_id = parse_field_id(target)?;
+    let target_id = provider_field_id_for_arrow_field(target)?;
     if let Some(target_id) = target_id {
         let mut any_source_id = false;
         for (index, source) in source_fields.iter().enumerate() {
-            let source_id = parse_field_id(source.as_ref())?;
+            let source_id = provider_field_id_for_arrow_field(source.as_ref())?;
             any_source_id |= source_id.is_some();
             if source_id == Some(target_id) {
                 return Ok(Some(index));
