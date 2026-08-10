@@ -385,7 +385,7 @@ fn prepare_frontend_first_refresh_write(
         .fields()
         .iter()
         .map(|field| field.id)
-        .collect();
+        .collect::<Vec<_>>();
     let partition_spec_id = schema_contract
         .target
         .partition
@@ -14095,7 +14095,7 @@ fn admit_mv_data_write_target(
                 column.nullable,
             ))
         })
-        .collect();
+        .collect::<Vec<_>>();
     let (_, preparation) = materialization.prepare_write(
         novarocks_spi::connector::ConnectorWriteIntent::Append,
         novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
@@ -16350,6 +16350,11 @@ fn prepare_imv_change_stream_writer(
             refresh_plan.connector_operation_id,
             connector_context.clone(),
             exact_lease,
+            table_bindings.admitted_iceberg_write_preparation(
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+            )?,
         )?;
     crate::engine::prepare_planned_iceberg_change_stream_write(
         planned.prepared,

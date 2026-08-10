@@ -140,8 +140,12 @@ pub(crate) fn admit_prepared_connector_write_target(
         );
     }
     let columns = admitted_write_input_columns(&preparation)?;
-    let key =
-        QueryTableBindingKey::write_target(&identity.catalog, &identity.namespace, &identity.table);
+    let key = QueryTableBindingKey::write_target(
+        &identity.catalog,
+        &identity.namespace,
+        &identity.table,
+        preparation.digest(),
+    );
     bindings.resolve_or_insert_with_id(key, |binding| {
         let planner = crate::sql::planner::table::TableDef {
             name: identity.table.clone(),

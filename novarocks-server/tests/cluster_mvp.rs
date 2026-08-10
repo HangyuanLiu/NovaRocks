@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
 use novarocks_frontend::dml::{
-    CtasSagaPhase, ExternalFactOutcome, OperationKind, OperationPayload, OperationState,
-    StatementNextAction, TruncateLifecyclePhase,
+    ConnectorWriteFinalizationRecord, ConnectorWriteLifecycleRecord, CtasSagaPhase,
+    ExternalFactOutcome, OperationKind, OperationPayload, OperationState, StatementNextAction,
+    TruncateLifecyclePhase,
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
@@ -2769,14 +2770,16 @@ fn cross_process_three_be_frontend_delete_service_lifecycle() {
             .iter()
             .filter(|operation| operation.state == OperationState::Finalized)
             .count(),
-        2
+        3,
+        "standard, equality, and known-empty DELETE terminalize exactly once"
     );
     assert_eq!(
         row_deltas
             .iter()
             .filter(|operation| operation.state == OperationState::Aborted)
             .count(),
-        1
+        0,
+        "known-empty DELETE is a terminal no-op, not an abort"
     );
     runtime
         .block_on(host.shutdown())
@@ -3356,32 +3359,51 @@ enable_path_style_access = true
     assert!(
         row_deltas
             .iter()
-            .filter(|operation| operation.state == OperationState::Finalized)
-            .all(|operation| operation.commit_outcome.is_some()),
-        "non-empty UPDATE/MERGE must retain commit outcomes: {row_deltas:?}"
+            .filter(|operation| !matches!(
+                &operation.payload,
+                OperationPayload::ConnectorWriteLifecycle(
+                    ConnectorWriteLifecycleRecord::KnownEmpty
+                )
+            ))
+            .all(|operation| matches!(
+                &operation.payload,
+                OperationPayload::ConnectorWriteLifecycle(
+                    ConnectorWriteLifecycleRecord::KnownCommitted {
+                        finalization: ConnectorWriteFinalizationRecord::Complete,
+                        ..
+                    }
+                )
+            )),
+        "non-empty UPDATE/MERGE must retain committed terminal facts: {row_deltas:?}"
     );
     assert!(
         row_deltas
             .iter()
-            .filter(|operation| operation.state == OperationState::Aborted)
-            .all(|operation| operation.commit_outcome.is_none()),
-        "zero-effect UPDATE must be aborted without a commit outcome: {row_deltas:?}"
+            .filter(|operation| matches!(
+                &operation.payload,
+                OperationPayload::ConnectorWriteLifecycle(
+                    ConnectorWriteLifecycleRecord::KnownEmpty
+                )
+            ))
+            .count()
+            == 1,
+        "zero-effect UPDATE must persist a provider-neutral known-empty terminal fact: {row_deltas:?}"
     );
     assert_eq!(
         row_deltas
             .iter()
             .filter(|operation| operation.state == OperationState::Finalized)
             .count(),
-        3,
-        "non-empty UPDATE and both MERGEs must be finalized: {row_deltas:?}"
+        4,
+        "zero-effect UPDATE, non-empty UPDATE, and both MERGEs must be finalized: {row_deltas:?}"
     );
     assert_eq!(
         row_deltas
             .iter()
             .filter(|operation| operation.state == OperationState::Aborted)
             .count(),
-        1,
-        "zero-effect UPDATE must have one Aborted record: {row_deltas:?}"
+        0,
+        "known-empty UPDATE must not synthesize an aborted terminal record: {row_deltas:?}"
     );
     assert!(
         row_deltas

@@ -447,29 +447,30 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
 /// provider service is intentionally not registered here; DML activates the
 /// binding only after it retains the exact session that will stage it.
 pub(crate) fn iceberg_change_stream_provider_binding_template(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
+    _state: &Arc<StandaloneState>,
+    _target: &TargetBackend,
+    _binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
+    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
-    let mut templates = build_iceberg_connector_write_templates(
-        target,
-        operation_id,
-        exact_lease,
-        vec![(
-            cohort_id,
-            ConnectorWriteIntent::RowDelta,
-            Arc::new(Schema::empty()),
-            binding.provider_payload(),
+    preparation
+        .validate()
+        .map_err(|error| format!("validate change-stream provider preparation: {error}"))?;
+    if preparation.owner() != exact_lease.binding_key() {
+        return Err(
+            "change-stream provider preparation does not match its exact write lease".to_string(),
+        );
+    }
+    Ok(
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
+            operation_id,
+            preparation.clone(),
             context,
-        )],
-    )?;
-    Ok(templates
-        .pop()
-        .expect("single Iceberg change-stream binding returns one planning template"))
+            exact_lease.clone(),
+        ),
+    )
 }
 
 /// Register the provider service only after the exact operation session is
@@ -521,6 +522,7 @@ pub(crate) fn activate_iceberg_change_stream_connector_write(
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
+    preparation: ConnectorWritePreparation,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     let target_ref = commit_executor.target_ref.clone();
     let binding =
@@ -537,27 +539,28 @@ pub(crate) fn activate_iceberg_change_stream_connector_write(
                 commit_executor: Arc::clone(&commit_executor),
             },
         )?;
-    let provider_payload = binding.provider_payload();
-    let target_ref = binding.target_ref().to_string();
-    let mut templates = reserve_iceberg_connector_write_cohort_service_with_exact_lease(
+    let template = iceberg_change_stream_provider_binding_template(
         state,
         target,
-        &target_ref,
+        &binding,
         operation_id,
-        vec![(
-            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
-            ConnectorWriteIntent::RowDelta,
-            Arc::new(Schema::empty()),
-            provider_payload,
-            context,
-        )],
-        binding.activation_digest(),
+        context,
         exact_lease,
-        binding.control_service_factory(),
+        &preparation,
     )?;
-    Ok(templates
-        .pop()
-        .expect("single Iceberg change-stream cohort registration returns one template"))
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    services
+        .register_lazy(
+            operation_id,
+            binding.activation_digest(),
+            binding.control_service_factory(),
+        )
+        .map_err(|error| format!("reserve Iceberg change-stream write service: {error}"))?;
+    Ok(template)
 }
 
 #[allow(clippy::too_many_arguments)]

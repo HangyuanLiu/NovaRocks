@@ -6807,12 +6807,12 @@ fn position_delete_columns_and_descriptor(
     let pos = identity_fields[1].field();
     if !file
         .name()
-        .eq_ignore_ascii_case(ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN)
+        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
         || file.data_type() != &DataType::Utf8
         || file.is_nullable()
         || !pos
             .name()
-            .eq_ignore_ascii_case(ICEBERG_POSITION_DELETE_POS_COLUMN)
+            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
         || pos.data_type() != &DataType::Int64
         || pos.is_nullable()
     {
@@ -7304,6 +7304,54 @@ pub(crate) fn frozen_rewrite_source_table_handle(
             &payload,
             "Iceberg frozen rewrite source table",
             novarocks_spi::connector::MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES,
+        )?,
+    )
+}
+
+/// Convert an invisible staged-create table into the same opaque Iceberg table
+/// carrier used by normal Provider-signed write preparation. The staged-create
+/// adapter may prove ownership of the invisible table, but generic CTAS must
+/// never pass the staged-create handle payload to the normal table decoder.
+pub(crate) fn staged_iceberg_write_table_handle(
+    owner: ConnectorInstanceId,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Result<ConnectorTableHandle, ConnectorError> {
+    let metadata = table.metadata();
+    let ident = table.identifier();
+    let table_info = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
+        catalog: owner.as_str().to_string(),
+        namespace: ident.namespace.to_string(),
+        table: ident.name.clone(),
+        table_uuid: Some(metadata.uuid().to_string()),
+        current_snapshot_id: metadata.current_snapshot_id(),
+        schema_id: metadata.current_schema_id(),
+        location: metadata.location().to_string(),
+        schema: super::catalog::backend::iceberg_schema_def_for_codegen(metadata.current_schema()),
+        serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
+            internal(format!("serialize staged Iceberg write metadata: {error}"))
+        })?),
+        serialized_metadata_rows: None,
+    };
+    let payload = TablePayload {
+        namespace: ident.namespace.to_string(),
+        table: ident.name.clone(),
+        table_info: Some(table_info),
+        metadata_columns: iceberg_metadata_column_names(metadata),
+        metadata_table_type: None,
+        prepared_files: Vec::new(),
+        explicit_files: None,
+        logical_type_columns: BTreeMap::new(),
+        hidden_columns: super::catalog::backend::hidden_internal_column_names_from_metadata(
+            metadata,
+        ),
+        frozen_rewrite: None,
+    };
+    ConnectorTableHandle::try_new(
+        owner,
+        encode_payload(
+            &payload,
+            "Iceberg staged write table",
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         )?,
     )
 }

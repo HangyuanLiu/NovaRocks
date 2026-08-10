@@ -60,7 +60,11 @@ pub(crate) enum QueryTableBindingSelector {
     /// for the same physical table because the writer's frozen physical
     /// schema may include hidden lineage or MV state columns that a scan does
     /// not expose.
-    WriteTarget,
+    /// One provider-signed terminal writer target. Multiple physical sink
+    /// shapes for the same table (for example MOR change streams) must retain
+    /// distinct bindings, rather than allowing one shape to stand in for
+    /// another during SQL sink projection.
+    WriteTarget([u8; 32]),
     Snapshot(i64),
     TimestampMillis(i64),
     Metadata(SqlMetadataTableKind),
@@ -96,12 +100,17 @@ impl QueryTableBindingKey {
     /// Reserve an exact terminal writer target.  A write must never reuse a
     /// same-name read binding: those bindings carry different SQL facts while
     /// both remain valid for their independently frozen application roles.
-    pub(crate) fn write_target(catalog: &str, namespace: &str, table: &str) -> Self {
+    pub(crate) fn write_target(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        preparation_digest: [u8; 32],
+    ) -> Self {
         Self::new(
             catalog,
             namespace,
             table,
-            QueryTableBindingSelector::WriteTarget,
+            QueryTableBindingSelector::WriteTarget(preparation_digest),
         )
     }
 
@@ -557,7 +566,73 @@ impl QueryTableBindingStore {
         namespace: &str,
         table: &str,
     ) -> Result<SqlTableBindingId, String> {
-        let key = QueryTableBindingKey::write_target(catalog, namespace, table);
+        let matches = self
+            .captured_bindings()
+            .into_iter()
+            .filter(|(_, binding)| {
+                binding.resolved.catalog.identity.catalog == catalog
+                    && binding.resolved.catalog.identity.namespace == namespace
+                    && binding.resolved.catalog.identity.table == table
+                    && binding.write_target_admission.is_some()
+            })
+            .collect::<Vec<_>>();
+        let [binding] = matches.as_slice() else {
+            return Err(format!(
+                "SQL write target {catalog}.{namespace}.{table} does not have exactly one admitted Iceberg provider preparation"
+            ));
+        };
+        let binding = &binding.1;
+        let ScanSource::Sql(source) = &binding.resolved.planner.source;
+        Ok(source.binding)
+    }
+
+    /// Return the unique Provider-signed preparation admitted for a terminal
+    /// write target.  Callers that need more than one shape must use their
+    /// explicit preparation instead of allowing target lookup to choose one.
+    pub(crate) fn admitted_iceberg_write_preparation(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<ConnectorWritePreparation, String> {
+        let matches = self
+            .captured_bindings()
+            .into_iter()
+            .filter(|(_, binding)| {
+                binding.resolved.catalog.identity.catalog == catalog
+                    && binding.resolved.catalog.identity.namespace == namespace
+                    && binding.resolved.catalog.identity.table == table
+                    && binding.write_target_admission.is_some()
+            })
+            .collect::<Vec<_>>();
+        let [(_, binding)] = matches.as_slice() else {
+            return Err(format!(
+                "SQL write target {catalog}.{namespace}.{table} does not have exactly one admitted Iceberg provider preparation"
+            ));
+        };
+        binding
+            .write_target_admission
+            .as_ref()
+            .map(|admission| admission.preparation.clone())
+            .ok_or_else(|| {
+                format!(
+                    "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"
+                )
+            })
+    }
+
+    /// Return one explicitly admitted writer binding for its sealed
+    /// preparation. This is required when a single terminal operation has
+    /// multiple writer shapes for the same physical target.
+    pub(crate) fn admitted_iceberg_write_binding_id_for_preparation(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        preparation: &ConnectorWritePreparation,
+    ) -> Result<SqlTableBindingId, String> {
+        let key =
+            QueryTableBindingKey::write_target(catalog, namespace, table, preparation.digest());
         let Some(binding) = self.binding_for_key(&key) else {
             return Err(format!(
                 "SQL write target {catalog}.{namespace}.{table} was not admitted into this query binding store"
@@ -823,7 +898,7 @@ mod tests {
                 || Ok(local_binding()),
             )
             .expect("scan token");
-        let writer_key = QueryTableBindingKey::write_target("ice", "db", "orders");
+        let writer_key = QueryTableBindingKey::write_target("ice", "db", "orders", [1; 32]);
         let writer = store
             .resolve_or_insert(writer_key.clone(), || Ok(local_binding()))
             .expect("writer token");

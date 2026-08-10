@@ -34,7 +34,7 @@ use novarocks_spi::connector::{
     ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase,
     ConnectorStagedCreateReconcileOutcome, ConnectorStagedCreateReconcilePhase,
     ConnectorStagedCreateReconcileRequest, ConnectorStagedTableHandle,
-    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest, ConnectorTableHandle,
+    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorWriteOperationCompletion, CreatePolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization,
 };
@@ -668,11 +668,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 )?,
             );
             // The staged target is intentionally invisible to ordinary
-            // metadata lookup. Its provider-owned staged handle is therefore
-            // the only valid opaque table carrier for this writer binding.
-            let table = ConnectorTableHandle::try_new(
+            // metadata lookup. Project it into the provider's normal opaque
+            // table carrier here, while the provider still owns the staged
+            // table. Generic CTAS can then request a normal signed write
+            // preparation without decoding the staged-create handle.
+            let table = super::provider::staged_iceberg_write_table_handle(
                 self.descriptor.instance_id.clone(),
-                request.handle.provider_payload().clone(),
+                staged_table,
             )?;
             let binding = ConnectorStagedWritePlanningBinding::try_new(
                 &request.handle,

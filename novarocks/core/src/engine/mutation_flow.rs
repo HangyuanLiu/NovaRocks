@@ -85,6 +85,47 @@ fn row_lineage_input_request(
     }
 }
 
+fn deletion_vector_input_request() -> novarocks_spi::connector::ConnectorWriteInputRequest {
+    use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
+
+    ConnectorWriteInputRequest::DeletionVector {
+        identity_fields: vec![
+            ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                DataType::Utf8,
+                false,
+            )),
+            ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                DataType::Int64,
+                false,
+            )),
+        ],
+        // The Iceberg Provider derives frozen partition-source fields from
+        // the exact admitted metadata. SQL never reconstructs them.
+        partition_source_fields: Vec::new(),
+    }
+}
+
+fn data_input_request(
+    columns: &[novarocks_catalog::schema::ColumnDef],
+) -> novarocks_spi::connector::ConnectorWriteInputRequest {
+    use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
+
+    ConnectorWriteInputRequest::Data {
+        fields: columns
+            .iter()
+            .map(|column| {
+                ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                ))
+            })
+            .collect(),
+    }
+}
+
 /// Logical change-stream branches remain a mutation-kernel decision. SQL owns
 /// their physical layout binding and the Iceberg connector owns terminal
 /// handles and aggregate report routing.
@@ -96,6 +137,75 @@ enum DmlChangeStreamBranchSet {
         matched_delete: bool,
         not_matched_insert: bool,
     },
+}
+
+/// Every terminal change-stream branch is admitted independently.  A
+/// RowLineage signature cannot authorize a deletion-vector or data-file sink,
+/// even when they target the same table and are committed atomically.
+#[derive(Clone)]
+struct DmlChangeStreamPreparations {
+    deletion_vectors: Option<novarocks_spi::connector::ConnectorWritePreparation>,
+    row_lineage: Option<novarocks_spi::connector::ConnectorWritePreparation>,
+    data: Option<novarocks_spi::connector::ConnectorWritePreparation>,
+}
+
+impl DmlChangeStreamPreparations {
+    fn prepare(
+        materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+        branch_set: DmlChangeStreamBranchSet,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Self, String> {
+        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
+
+        let prepare = |input| {
+            materialization.prepare_write(
+                ConnectorWriteIntent::RowDelta,
+                ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input,
+                context.clone(),
+            )
+        };
+        let branch_kinds = branch_set.branch_kinds();
+        Ok(Self {
+            deletion_vectors: branch_kinds
+                .contains(&crate::sql::common::ChangeStreamBranchKind::DeleteDv)
+                .then(|| prepare(deletion_vector_input_request()))
+                .transpose()?
+                .map(|(_, preparation)| preparation),
+            row_lineage: branch_kinds
+                .contains(&crate::sql::common::ChangeStreamBranchKind::ReuseData)
+                .then(|| prepare(row_lineage_input_request(&materialization.columns)))
+                .transpose()?
+                .map(|(_, preparation)| preparation),
+            data: branch_kinds
+                .contains(&crate::sql::common::ChangeStreamBranchKind::FreshData)
+                .then(|| prepare(data_input_request(&materialization.columns)))
+                .transpose()?
+                .map(|(_, preparation)| preparation),
+        })
+    }
+
+    fn for_branch(
+        &self,
+        branch: crate::sql::common::ChangeStreamBranchKind,
+    ) -> Result<&novarocks_spi::connector::ConnectorWritePreparation, String> {
+        let preparation = match branch {
+            crate::sql::common::ChangeStreamBranchKind::DeleteDv => &self.deletion_vectors,
+            crate::sql::common::ChangeStreamBranchKind::ReuseData => &self.row_lineage,
+            crate::sql::common::ChangeStreamBranchKind::FreshData => &self.data,
+        };
+        preparation.as_ref().ok_or_else(|| {
+            format!("change-stream branch {branch:?} has no Provider-signed write preparation")
+        })
+    }
+
+    fn primary(&self) -> &novarocks_spi::connector::ConnectorWritePreparation {
+        self.row_lineage
+            .as_ref()
+            .or(self.deletion_vectors.as_ref())
+            .or(self.data.as_ref())
+            .expect("change-stream branch set always has a signed preparation")
+    }
 }
 
 impl DmlChangeStreamBranchSet {
@@ -150,18 +260,20 @@ fn build_dml_change_stream_write_plan(
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
     branch_set: DmlChangeStreamBranchSet,
+    preparations: &DmlChangeStreamPreparations,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     use crate::sql::planner::distributed::write::change_stream::{
         ChangeStreamWriteLayoutBranch, ChangeStreamWriteLayoutRequest,
         bind_change_stream_write_layout,
     };
-    let target_binding = table_bindings.admitted_iceberg_write_binding_id(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
     let mut branches = Vec::new();
     for branch_kind in branch_set.branch_kinds() {
+        let target_binding = table_bindings.admitted_iceberg_write_binding_id_for_preparation(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            preparations.for_branch(branch_kind)?,
+        )?;
         let mode = match branch_kind {
             crate::sql::common::ChangeStreamBranchKind::DeleteDv => {
                 crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::DeletionVectors
@@ -179,7 +291,8 @@ fn build_dml_change_stream_write_plan(
             mode,
             crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
             None,
-        )?;
+        )
+        .map_err(|error| format!("build {branch_kind:?} change-stream sink: {error}"))?;
         branches.push(ChangeStreamWriteLayoutBranch { branch_kind, sink });
     }
     let target_partition_source_columns = target_partition_source_column_names(
@@ -321,7 +434,7 @@ pub(crate) struct PreparedMorUpdateWriteTarget {
     /// Provider-signed writer facts frozen with `planning_lease`. They are
     /// admitted into the same query-local store as the producer compile, never
     /// rebuilt during stage/preparation.
-    pub(crate) preparation: novarocks_spi::connector::ConnectorWritePreparation,
+    pub(crate) preparations: DmlChangeStreamPreparations,
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
@@ -346,7 +459,7 @@ pub(crate) struct PreparedMergeMutation {
 /// Frozen MOR writer facts for MERGE.  The producer query and its terminal
 /// sink must use the same admission lease and physical target envelope.
 pub(crate) struct PreparedMorMergeWriteTarget {
-    pub(crate) preparation: novarocks_spi::connector::ConnectorWritePreparation,
+    pub(crate) preparations: DmlChangeStreamPreparations,
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
@@ -459,15 +572,14 @@ pub(crate) fn prepare_update_mutation(
         // independent clone, so the stored writer envelope has one explicit
         // generation authority.
         let planning_lease = materialization.planning_lease.clone();
-        let (_, preparation) = materialization.prepare_write(
-            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            row_lineage_input_request(&materialization.columns),
+        let preparations = DmlChangeStreamPreparations::prepare(
+            &materialization,
+            DmlChangeStreamBranchSet::UpdateMor,
             connector_context.clone(),
         )?;
         Some(PreparedMorUpdateWriteTarget {
             read_snapshot_id,
-            preparation,
+            preparations,
             planning_lease,
         })
     } else {
@@ -564,14 +676,24 @@ pub(crate) fn prepare_merge_mutation(
                 &target.table,
             )?;
         let planning_lease = materialization.planning_lease.clone();
-        let (_, preparation) = materialization.prepare_write(
-            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            row_lineage_input_request(&materialization.columns),
+        let branch_set = DmlChangeStreamBranchSet::Merge {
+            matched_update: matches!(
+                stmt.matched.as_ref().map(|clause| &clause.action),
+                Some(MergeMatchedAction::Update { .. })
+            ),
+            matched_delete: matches!(
+                stmt.matched.as_ref().map(|clause| &clause.action),
+                Some(MergeMatchedAction::Delete)
+            ),
+            not_matched_insert: stmt.not_matched.is_some(),
+        };
+        let preparations = DmlChangeStreamPreparations::prepare(
+            &materialization,
+            branch_set,
             connector_context.clone(),
         )?;
         Some(PreparedMorMergeWriteTarget {
-            preparation,
+            preparations,
             planning_lease,
         })
     } else {
@@ -708,7 +830,7 @@ pub(crate) fn stage_prepared_update_mutation(
         IcebergUpdateMode::MergeOnRead => {
             let PreparedMorUpdateWriteTarget {
                 read_snapshot_id,
-                preparation,
+                preparations,
                 planning_lease: write_planning_lease,
             } = mor_write_target.ok_or_else(|| {
                 "MOR UPDATE reached stage without an admitted frozen write target".to_string()
@@ -744,7 +866,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 metadata.last_sequence_number() + 1,
                 &execution,
                 &connector_context,
-                &preparation,
+                &preparations,
                 write_planning_lease,
             )?;
             let abort_cleanup =
@@ -785,6 +907,7 @@ pub(crate) fn stage_prepared_update_mutation(
                     operation_id,
                     connector_context.clone(),
                     &write_lease,
+                    preparations.primary(),
                 )?;
             let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
                 state: Arc::clone(state),
@@ -973,7 +1096,7 @@ fn build_update_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
+    preparations: &DmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
@@ -1016,16 +1139,18 @@ fn build_update_mor_change_stream_write_plan(
     // intentionally precedes compilation, so `build_dml_change_stream_write_plan`
     // can recover the write token from the same store that resolves producer
     // scans. No preparation phase is allowed to reacquire current/latest.
-    crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
-        table_bindings.as_ref(),
-        crate::sql::planner::table::SqlTableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
-        preparation.clone(),
-        write_planning_lease,
-    )?;
+    for branch in DmlChangeStreamBranchSet::UpdateMor.branch_kinds() {
+        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+            table_bindings.as_ref(),
+            crate::sql::planner::table::SqlTableIdentity {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            preparations.for_branch(branch)?.clone(),
+            write_planning_lease.clone(),
+        )?;
+    }
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         state,
         &query,
@@ -1048,6 +1173,7 @@ fn build_update_mor_change_stream_write_plan(
         })?,
         execution.clone(),
         DmlChangeStreamBranchSet::UpdateMor,
+        preparations,
     )?;
     plan.pre_expand_keyed_assert = Some(DmlPreExpandKeyedAssert {
         key_column_name: "__nr_row_id".to_string(),
@@ -2972,7 +3098,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             .map(|snapshot| snapshot.snapshot_id());
         let metadata = table.metadata();
         let PreparedMorMergeWriteTarget {
-            preparation,
+            preparations,
             planning_lease: write_planning_lease,
         } = mor_write_target.ok_or_else(|| {
             "MOR MERGE reached stage without an admitted frozen write target".to_string()
@@ -3008,7 +3134,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             metadata.last_sequence_number() + 1,
             &execution,
             &connector_context,
-            &preparation,
+            &preparations,
             write_planning_lease,
         )?;
         let abort_cleanup =
@@ -3049,6 +3175,7 @@ pub(crate) fn stage_prepared_merge_mutation(
                 operation_id,
                 connector_context.clone(),
                 &write_lease,
+                preparations.primary(),
             )?;
         let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
             state: Arc::clone(state),
@@ -3812,7 +3939,7 @@ fn build_merge_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
+    preparations: &DmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt
@@ -3942,16 +4069,23 @@ fn build_merge_mor_change_stream_write_plan(
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let table_bindings = analyzer_provider.query_table_bindings();
-    crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
-        table_bindings.as_ref(),
-        crate::sql::planner::table::SqlTableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
-        preparation.clone(),
-        write_planning_lease,
-    )?;
+    let branch_set = DmlChangeStreamBranchSet::Merge {
+        matched_update: has_matched_update,
+        matched_delete: has_matched_delete,
+        not_matched_insert: has_not_matched_insert,
+    };
+    for branch in branch_set.branch_kinds() {
+        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+            table_bindings.as_ref(),
+            crate::sql::planner::table::SqlTableIdentity {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            preparations.for_branch(branch)?.clone(),
+            write_planning_lease.clone(),
+        )?;
+    }
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         state,
         &query,
@@ -3976,11 +4110,8 @@ fn build_merge_mor_change_stream_write_plan(
             "MOR MERGE change-stream compilation did not retain query table bindings".to_string()
         })?,
         execution.clone(),
-        DmlChangeStreamBranchSet::Merge {
-            matched_update: has_matched_update,
-            matched_delete: has_matched_delete,
-            not_matched_insert: has_not_matched_insert,
-        },
+        branch_set,
+        preparations,
     )?;
     if has_matched_update || has_matched_delete {
         plan.pre_expand_keyed_assert = Some(DmlPreExpandKeyedAssert {
