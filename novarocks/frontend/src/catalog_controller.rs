@@ -111,10 +111,12 @@ impl FrontendCatalogController {
             .reconcile_with_page_size(self.config.page_size)
             .await
             .map_err(|error| error.to_string())?;
-        page.next_cursor
+        let cursor = ChangeCursor::new(identity.store_id, page.high_watermark, u32::MAX)
+            .map_err(|error| error.to_string())?;
+        cursor
             .decode(identity.store_id)
             .map_err(|error| error.to_string())?;
-        Ok(page.next_cursor)
+        Ok(cursor)
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
@@ -430,6 +432,21 @@ mod tests {
         .expect("second controller");
         let first_cursor = first.bootstrap().await.expect("first bootstrap");
         let second_cursor = second.bootstrap().await.expect("second bootstrap");
+        let high_watermark = store
+            .poll_changes(&ChangePollRequest {
+                after: None,
+                page_size: 256,
+            })
+            .await
+            .expect("read bootstrap high watermark")
+            .high_watermark;
+        assert_eq!(
+            first_cursor
+                .decode(store.identity().await.expect("store identity").store_id)
+                .expect("decode bootstrap cursor")
+                .0,
+            high_watermark
+        );
         assert!(matches!(
             first_port.admit_catalog(&created.attachment.instance_id),
             CatalogAdmission::Ready(_)
