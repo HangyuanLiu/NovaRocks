@@ -370,6 +370,10 @@ pub(crate) struct CatalogServiceMaterializer<'a> {
     service: &'a crate::engine::query_planning::catalog_runtime::QueryCatalogService,
     bindings: Arc<QueryTableBindingStore>,
     loader: Box<dyn QueryTableBindingLoader + 'a>,
+    /// Frontend-owned attachment admission. The loader still owns the exact
+    /// connector lease; this gate preserves Absent versus Unavailable before
+    /// Core can materialize an external table.
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
     /// Request-scoped synthetic relations used by application rewrite flows.
     /// They are intentionally kept next to the binding store instead of the
     /// shared memory catalog: SQL can only observe their projected tokenized
@@ -441,6 +445,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
             service,
             bindings,
             loader,
+            catalog_application: None,
             query_local_overlays: overlays
                 .into_iter()
                 .map(|overlay| (overlay.key(), overlay))
@@ -450,6 +455,27 @@ impl<'a> CatalogServiceMaterializer<'a> {
 
     pub(crate) fn query_table_bindings(&self) -> Arc<QueryTableBindingStore> {
         Arc::clone(&self.bindings)
+    }
+
+    pub(crate) fn with_catalog_application(
+        mut self,
+        catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    ) -> Self {
+        self.catalog_application = catalog_application;
+        self
+    }
+
+    fn require_catalog_admission(&self, catalog: &str) -> Result<(), String> {
+        let Some(application) = self.catalog_application else {
+            return Ok(());
+        };
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
+            .map_err(|error| format!("invalid catalog instance `{catalog}`: {error}"))?;
+        application
+            .admit_catalog(&instance_id)
+            .require_ready()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// Publish one application-resolved table only after its scan has been
@@ -506,6 +532,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 Ok(self.bindings.binding(token)?.resolved.clone())
             }
             Some(catalog) => {
+                self.require_catalog_admission(catalog)?;
                 let key = QueryTableBindingKey::analysis_lookup(catalog, database, table);
                 let token = self.bind_for_sql(key, |binding_id| {
                     self.loader
@@ -544,6 +571,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 .expect("catalog service local read lock")
                 .get(database, table),
             Some(catalog) => {
+                self.require_catalog_admission(catalog)?;
                 let key =
                     QueryTableBindingKey::metadata(catalog, database, table, metadata_table_type);
                 let token = self.bind_for_sql(key, |binding_id| {
@@ -716,6 +744,42 @@ mod tests {
         }
     }
 
+    struct UnavailableCatalogApplication;
+
+    impl crate::catalog_application::CatalogApplicationPort for UnavailableCatalogApplication {
+        fn create_catalog(
+            &self,
+            _command: crate::catalog_application::CatalogCreateCommand,
+        ) -> Result<
+            crate::catalog_application::CatalogRuntimeObservation,
+            crate::catalog_application::CatalogApplicationError,
+        > {
+            Err(crate::catalog_application::CatalogApplicationError::new(
+                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+                "projection is stale",
+            ))
+        }
+
+        fn drop_catalog(
+            &self,
+            _command: crate::catalog_application::CatalogDropCommand,
+        ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+            Err(crate::catalog_application::CatalogApplicationError::new(
+                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+                "projection is stale",
+            ))
+        }
+
+        fn admit_catalog(
+            &self,
+            _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        ) -> crate::catalog_application::CatalogAdmission {
+            crate::catalog_application::CatalogAdmission::Unavailable {
+                reason: "projection is stale".to_string(),
+            }
+        }
+    }
+
     #[test]
     fn sqlx2_application_materializer_projects_local_scan_before_publication() {
         let binding =
@@ -738,6 +802,26 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("different request binding"));
+    }
+
+    #[test]
+    fn catalog_application_admission_fails_closed_before_external_materialization() {
+        let service = crate::engine::query_planning::catalog_runtime::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
+        let application = UnavailableCatalogApplication;
+        let materializer = CatalogServiceMaterializer::new(
+            Some("ice"),
+            &service,
+            bindings,
+            Box::new(OverlayLoader),
+        )
+        .with_catalog_application(Some(&application));
+
+        let error = materializer
+            .resolve_table_for_analysis(None, "db", "orders")
+            .expect_err("stale projection must not materialize a table");
+
+        assert_eq!(error, "projection is stale");
     }
 
     #[test]

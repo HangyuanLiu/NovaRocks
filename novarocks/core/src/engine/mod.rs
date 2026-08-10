@@ -129,6 +129,27 @@ pub(crate) fn build_catalog_service_provider<'a>(
     )
 }
 
+/// Builds the request-local SQL materializer with the Frontend-owned catalog
+/// admission gate. Legacy embedded paths intentionally use the ungated helper
+/// above until CP-2 removes their legacy attachment owner.
+pub(crate) fn build_catalog_service_provider_with_application<'a>(
+    current_catalog: Option<&'a str>,
+    catalog_service: &'a QueryCatalogService,
+    controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    lookup_mode: TableLookupMode,
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
+    build_catalog_service_provider(
+        current_catalog,
+        catalog_service,
+        controls,
+        connector_context,
+        lookup_mode,
+    )
+    .with_catalog_application(catalog_application)
+}
+
 /// Build the application catalog facade for one admitted query, optionally
 /// supplying generated relations that are scoped to that request.  These
 /// overlays are projected into SQL binding tokens before analysis and never
@@ -1924,12 +1945,13 @@ impl StandaloneSession {
                     crate::sql::explain::ExplainLevel::Normal
                 });
                 let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
-                let analyzer_provider = build_catalog_service_provider(
+                let analyzer_provider = build_catalog_service_provider_with_application(
                     current_catalog,
                     &catalog_service_snapshot,
                     self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
+                    self.inner.catalog_application.as_deref(),
                 );
                 let result = explain_query_with_sql_compiler_kernel(
                     &prepared,
@@ -1992,12 +2014,13 @@ impl StandaloneSession {
                     )?;
                 }
                 let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
-                let analyzer_provider = build_catalog_service_provider(
+                let analyzer_provider = build_catalog_service_provider_with_application(
                     current_catalog,
                     &catalog_service_snapshot,
                     self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
+                    self.inner.catalog_application.as_deref(),
                 );
                 let (request, _, _) = prepare_query_with_sql_compiler_kernel(
                     &prepared,
@@ -2041,12 +2064,13 @@ impl StandaloneSession {
             connector_context,
         )?;
         let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
-        let analyzer_provider = build_catalog_service_provider(
+        let analyzer_provider = build_catalog_service_provider_with_application(
             current_catalog,
             &catalog_service_snapshot,
             self.inner.connector_control.as_ref(),
             connector_context.clone(),
             TableLookupMode::ExplainStats,
+            self.inner.catalog_application.as_deref(),
         );
         let planning_start = std::time::Instant::now();
         let (request, distributed_plan, connector_static_planning) =
