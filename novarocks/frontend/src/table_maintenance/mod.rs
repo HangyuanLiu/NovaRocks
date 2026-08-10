@@ -61,6 +61,7 @@ use self::repository::{
 use self::result::{action_result, optimize_jobs_result};
 use self::worker::OptimizeWorker;
 
+pub mod coordination;
 pub mod model;
 pub mod parser;
 pub mod repository;
