@@ -16382,11 +16382,30 @@ fn execute_imv_change_stream_writer(
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive Iceberg MV change-stream write lease: {error}"))?;
+    let primary_write_binding = planned
+        .topology
+        .writer_routes
+        .first()
+        .ok_or_else(|| "IMV change-stream topology has no writer routes".to_string())?
+        .sink
+        .contract
+        .target
+        .binding;
+    let primary_preparation = table_bindings
+        .binding(primary_write_binding)?
+        .write_target_admission
+        .as_ref()
+        .ok_or_else(|| {
+            "IMV change-stream primary writer binding has no Provider preparation".to_string()
+        })?
+        .preparation
+        .clone();
     let connector_write =
         crate::engine::iceberg_writer::register_iceberg_change_stream_provider_binding(
             state,
             target,
             &binding,
+            primary_preparation,
             refresh_plan.connector_operation_id,
             connector_context.clone(),
             &write_lease,
