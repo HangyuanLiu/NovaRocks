@@ -5,6 +5,7 @@
 //! Iceberg-owned use of connector-neutral physical file I/O.
 
 use std::num::NonZeroUsize;
+use std::time::Instant;
 
 use bytes::Bytes;
 use novarocks_fs::{
@@ -13,6 +14,7 @@ use novarocks_fs::{
     PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{ConnectorReaderMetricsSnapshot, ConnectorRequestContext};
 
 use crate::scan_model::{
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
@@ -86,6 +88,63 @@ pub fn iceberg_data_file_format(path: &str) -> Result<FileFormat, ConnectorError
         ConnectorErrorKind::Unsupported,
         format!("Iceberg data file format is not declared or supported: {path}"),
     ))
+}
+
+/// Reject an expired or cancelled connector reader request before starting or
+/// continuing provider I/O.
+pub fn validate_reader_request_context(
+    context: &ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    if context.cancellation().is_cancelled() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "connector request was cancelled",
+        ));
+    }
+    if Instant::now() >= context.deadline() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "connector request deadline elapsed",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve the connector-neutral error taxonomy at the provider's physical
+/// filesystem boundary.
+pub fn map_file_error(error: novarocks_fs::FileError) -> ConnectorError {
+    let kind = match error.kind() {
+        novarocks_fs::FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
+        novarocks_fs::FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
+        novarocks_fs::FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
+        novarocks_fs::FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
+        novarocks_fs::FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
+        novarocks_fs::FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
+        novarocks_fs::FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
+        novarocks_fs::FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
+        novarocks_fs::FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
+        novarocks_fs::FileErrorKind::Internal => ConnectorErrorKind::Internal,
+    };
+    ConnectorError::new(kind, error.to_string())
+}
+
+/// Project physical read metrics into the connector-neutral reader snapshot.
+pub fn connector_metrics(
+    metrics: novarocks_fs::FileMetricsSnapshot,
+) -> ConnectorReaderMetricsSnapshot {
+    ConnectorReaderMetricsSnapshot {
+        bytes_read: metrics.bytes_read,
+        read_requests: metrics.read_requests,
+        rows_decoded: metrics.rows_decoded,
+        batches_delivered: metrics.batches_delivered,
+        cache_hits: metrics.cache_hits,
+        cache_misses: metrics.cache_misses,
+        io_time_ns: metrics.io_time_ns,
+        decode_time_ns: metrics.decode_time_ns,
+        row_groups_read: metrics.row_groups_read,
+        row_groups_pruned: metrics.row_groups_pruned,
+        delayed_materialization_ranges: metrics.delayed_materialization_ranges,
+    }
 }
 
 pub fn read_parquet_batches(
@@ -165,7 +224,18 @@ pub fn read_bytes(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    struct NeverCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn lowers_static_predicates_by_iceberg_field_id() {
@@ -213,6 +283,24 @@ mod tests {
                 .expect_err("unsupported")
                 .kind(),
             ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn rejects_expired_reader_context_before_provider_io() {
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() - Duration::from_millis(1),
+            Arc::new(NeverCancelled),
+            1,
+            1,
+        )
+        .expect("context");
+
+        assert_eq!(
+            validate_reader_request_context(&context)
+                .expect_err("expired")
+                .kind(),
+            ConnectorErrorKind::DeadlineExceeded
         );
     }
 }

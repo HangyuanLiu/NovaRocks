@@ -23,7 +23,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, Int64Array, StringArray, UInt64Array,
@@ -33,9 +32,9 @@ use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
-    FileBatchReader, FileCancellation, FileError, FileErrorKind, FileFormat, FileIdentity,
-    FileMetricsSnapshot, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FsAccessHandle, PhysicalPruning, open_file_reader,
+    FileBatchReader, FileCancellation, FileFormat, FileIdentity, FileProjection, FileReadBudget,
+    FileReadContext, FileReadRange, FileReadRequest, FsAccessHandle, PhysicalPruning,
+    open_file_reader,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
@@ -51,7 +50,8 @@ use novarocks_connector_iceberg::delete_file::{
     delete_specs_for_data_file, included_positions_for_data_file,
 };
 use novarocks_connector_iceberg::file_reader::{
-    iceberg_data_file_format, physical_predicates_to_file_predicates,
+    connector_metrics, iceberg_data_file_format, map_file_error,
+    physical_predicates_to_file_predicates, validate_reader_request_context,
 };
 use novarocks_connector_iceberg::position_delete::load_position_deletes_with_context;
 use novarocks_connector_iceberg::scan_model::{IcebergDataFileInfo, IcebergPhysicalPredicate};
@@ -213,7 +213,7 @@ impl IcebergBatchReader {
         equality_match_only: bool,
         cancel_on_close: bool,
     ) -> Result<Self, ConnectorError> {
-        validate_context(&request.context)?;
+        validate_reader_request_context(&request.context)?;
         let file_size = u64::try_from(file.size).map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -281,7 +281,7 @@ impl IcebergBatchReader {
     }
 
     fn validate_context(&self) -> Result<(), ConnectorError> {
-        if let Err(error) = validate_context(&self.context) {
+        if let Err(error) = validate_reader_request_context(&self.context) {
             self.cancellation.cancel();
             return Err(error);
         }
@@ -445,56 +445,6 @@ fn apply_delete_filters(
             )
         })?;
     Ok((batch, Some(positions)))
-}
-
-fn validate_context(
-    context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Cancelled,
-            "connector request was cancelled",
-        ));
-    }
-    if Instant::now() >= context.deadline() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::DeadlineExceeded,
-            "connector request deadline elapsed",
-        ));
-    }
-    Ok(())
-}
-
-fn map_file_error(error: FileError) -> ConnectorError {
-    let kind = match error.kind() {
-        FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
-        FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
-        FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
-        FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
-        FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
-        FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
-        FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
-        FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
-        FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        FileErrorKind::Internal => ConnectorErrorKind::Internal,
-    };
-    ConnectorError::new(kind, error.to_string())
-}
-
-fn connector_metrics(metrics: FileMetricsSnapshot) -> ConnectorReaderMetricsSnapshot {
-    ConnectorReaderMetricsSnapshot {
-        bytes_read: metrics.bytes_read,
-        read_requests: metrics.read_requests,
-        rows_decoded: metrics.rows_decoded,
-        batches_delivered: metrics.batches_delivered,
-        cache_hits: metrics.cache_hits,
-        cache_misses: metrics.cache_misses,
-        io_time_ns: metrics.io_time_ns,
-        decode_time_ns: metrics.decode_time_ns,
-        row_groups_read: metrics.row_groups_read,
-        row_groups_pruned: metrics.row_groups_pruned,
-        delayed_materialization_ranges: metrics.delayed_materialization_ranges,
-    }
 }
 
 fn apply_name_mapping_to_batch(
