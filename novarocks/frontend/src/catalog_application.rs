@@ -340,7 +340,7 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
                 ))
             };
         };
-        self.block_on(repository.drop_exact(existing))?;
+        self.block_on(repository.drop_exact_fenced_by_materialized_views(existing, 256))?;
         self.retire_projection(&command.instance_id);
         // Durable deletion is authoritative. A local generation can be absent
         // or already retiring; either case converges through reconciliation.

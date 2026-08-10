@@ -181,6 +181,19 @@ impl CatalogAttachmentRepository {
         self.drop_with_operation(operation_id, expected).await
     }
 
+    /// Deletes the attachment only when the same StateStore transaction proves
+    /// that no MV target or dependency still refers to this exact catalog.
+    /// This is the DROP half of the CP-2 MV/catalog serializability fence.
+    pub(crate) async fn drop_exact_fenced_by_materialized_views(
+        &self,
+        expected: CatalogAttachmentVersioned,
+        page_size: usize,
+    ) -> Result<(), CatalogAttachmentError> {
+        let operation_id = OperationId::new_v7();
+        self.drop_fenced_with_operation(operation_id, expected, page_size)
+            .await
+    }
+
     async fn create_with_operation(
         &self,
         operation_id: OperationId,
@@ -336,6 +349,101 @@ impl CatalogAttachmentRepository {
                 }
             }
             Err(error) => Err(run_failure("drop catalog attachment", error)),
+        }
+    }
+
+    async fn drop_fenced_with_operation(
+        &self,
+        operation_id: OperationId,
+        expected: CatalogAttachmentVersioned,
+        page_size: usize,
+    ) -> Result<(), CatalogAttachmentError> {
+        let key = attachment_key(&expected.attachment.instance_id).map_err(invalid)?;
+        let version = expected.version.clone();
+        let catalog = expected.attachment.instance_id.as_str().to_string();
+        let outcome = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "drop catalog attachment with materialized view fence",
+            |transaction| {
+                let key = key.clone();
+                let version = version.clone();
+                let catalog = catalog.clone();
+                Box::pin(async move {
+                    crate::mv::repository::ensure_no_catalog_references_transaction(
+                        transaction,
+                        &catalog,
+                        page_size,
+                    )
+                    .await?;
+                    transaction
+                        .delete(key, Precondition::Version(version))
+                        .await?;
+                    Ok(())
+                })
+            },
+        )
+        .await;
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(RunFailure::Operation(error))
+                if matches!(
+                    error.kind(),
+                    StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
+                ) =>
+            {
+                Err(CatalogAttachmentError::new(
+                    CatalogAttachmentErrorKind::Conflict,
+                    error.to_string(),
+                ))
+            }
+            Err(RunFailure::RetryExhausted(error))
+                if matches!(
+                    error.kind(),
+                    StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
+                ) =>
+            {
+                Err(CatalogAttachmentError::new(
+                    CatalogAttachmentErrorKind::Conflict,
+                    error.to_string(),
+                ))
+            }
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => match self
+                .store
+                .resolve_commit(&transaction_id)
+                .await
+                .map_err(store)?
+            {
+                CommitResolution::Committed(_) => Ok(()),
+                CommitResolution::NotCommitted => {
+                    Box::pin(self.drop_fenced_with_operation(operation_id, expected, page_size))
+                        .await
+                }
+                CommitResolution::Unresolved => {
+                    match self.get(&expected.attachment.instance_id).await? {
+                        Some(current)
+                            if current.attachment.attachment_id
+                                == expected.attachment.attachment_id =>
+                        {
+                            Err(CatalogAttachmentError::new(
+                                CatalogAttachmentErrorKind::CommitUnknown,
+                                format!(
+                                    "fenced catalog attachment drop commit outcome is unknown: {error}"
+                                ),
+                            ))
+                        }
+                        _ => Ok(()),
+                    }
+                }
+            },
+            Err(error) => Err(run_failure(
+                "drop catalog attachment with materialized view fence",
+                error,
+            )),
         }
     }
 
