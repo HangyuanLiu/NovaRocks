@@ -39,10 +39,10 @@ use novarocks_spi::state_store::{
     StoreIdentity, TransactionId, Value, WriteTransaction,
 };
 use novarocks_state_store::coordination::{
-    ControlPlaneIncarnation, CoordinationError, FencingToken, ResourceEpoch,
+    ControlPlaneIncarnation, CoordinationError, FencingToken, IncarnationGate, ResourceEpoch,
 };
 use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
@@ -909,6 +909,32 @@ async fn commit_unknown_recovery_accepts_legal_successor_without_mutation_retry(
         OptimizeJobState::Finished
     );
     assert_eq!(recovering_writes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn admitted_create_fails_closed_when_the_gate_leaves_write_open() {
+    let (_temp, store, repository) = fixture().await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    let snapshot = gate.bootstrap(OperationId::new_v7()).await.unwrap();
+    let admission = gate.admit_writes().await.unwrap();
+    let created = repository
+        .create_admitted(
+            create_request("ice", "db", "admitted", 10, 100),
+            admission.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.state, OptimizeJobState::Pending);
+
+    gate.begin_restore(&snapshot, OperationId::new_v7())
+        .await
+        .unwrap();
+    let error = repository
+        .create_admitted(create_request("ice", "db", "closed", 11, 101), admission)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    assert_eq!(repository.list().await.unwrap(), vec![created]);
 }
 
 #[tokio::test]
