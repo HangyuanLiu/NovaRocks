@@ -1790,7 +1790,7 @@ impl IcebergWriteControlServiceContext {
     ) -> Result<(), ConnectorError> {
         if self
             .preparation_digest
-            .is_some_and(|expected| expected != request.preparation.digest())
+            .is_some_and(|expected| expected != request.activation.preparation().digest())
         {
             return Err(invalid(
                 "Iceberg write service was activated for a different provider preparation",
@@ -1800,7 +1800,7 @@ impl IcebergWriteControlServiceContext {
             .cohort_preparation_digests
             .as_ref()
             .and_then(|digests| digests.get(&request.cohort_id))
-            .is_some_and(|expected| *expected != request.preparation.digest())
+            .is_some_and(|expected| *expected != request.activation.preparation().digest())
         {
             return Err(invalid(
                 "Iceberg write cohort was activated for a different provider preparation",
@@ -2329,27 +2329,41 @@ mod tests {
         let operation_id = ConnectorWriteOperationId::from_bytes([1; 16]);
         let cohort_id = ConnectorWriteCohortId::primary(operation_id);
         let execution_id = ConnectorWriteExecutionId::new([2; 16], 3);
+        let preparation = ConnectorWritePreparation::try_new(
+            owner.clone(),
+            ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::from_static(b"t"))
+                .expect("table"),
+            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+            ConnectorWriteIntent::Append,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base version"),
+            ConnectorWriteInputShape::Data {
+                fields: vec![ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("id", DataType::Int32, false),
+                )],
+            },
+            Bytes::from_static(b"provider-signed-preparation"),
+        )
+        .expect("preparation");
+        let context = context();
+        let activation = novarocks_spi::connector::ConnectorWriteActivation::try_new(
+            owner.clone(),
+            &novarocks_spi::connector::ConnectorWriteActivationRequest {
+                operation_id,
+                source: novarocks_spi::connector::ConnectorWriteActivationSource::Prepared(
+                    preparation.clone(),
+                ),
+                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+                context: context.clone(),
+            },
+            vec![(cohort_id, preparation)],
+        )
+        .expect("activation");
         ConnectorWritePlanningRequest {
             operation_id,
             cohort_id,
             execution_id,
-            preparation: ConnectorWritePreparation::try_new(
-                owner.clone(),
-                ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::from_static(b"t"))
-                    .expect("table"),
-                novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                ConnectorWriteIntent::Append,
-                ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
-                    .expect("base version"),
-                ConnectorWriteInputShape::Data {
-                    fields: vec![ConnectorWriteFieldBinding::new(
-                        ConnectorWriteFieldToken::from_bytes([1; 32]),
-                        Field::new("id", DataType::Int32, false),
-                    )],
-                },
-                Bytes::from_static(b"provider-signed-preparation"),
-            )
-            .expect("preparation"),
+            activation: activation.cohort(cohort_id).expect("cohort"),
             expected_writers: vec![ConnectorWriterIdentity::new(
                 operation_id,
                 cohort_id,
@@ -2360,7 +2374,7 @@ mod tests {
                 0,
                 owner,
             )],
-            context: context(),
+            context,
         }
     }
 
@@ -2372,7 +2386,7 @@ mod tests {
     ) -> (ConnectorWriteCommitRequest, ConnectorWriteAbortRequest) {
         let descriptor = ConnectorWriteCohortDescriptor::new(
             request.cohort_id,
-            request.preparation.intent(),
+            request.activation.preparation().intent(),
             request.stable_digest(&owner).expect("planning digest"),
         );
         let sealed = ConnectorSealedWriteCohortSet::try_new(request.operation_id, vec![descriptor])

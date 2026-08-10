@@ -2443,44 +2443,60 @@ mod tests {
         let mut query_id_bytes = [0; 16];
         query_id_bytes[..8].copy_from_slice(&query_id.high().to_be_bytes());
         query_id_bytes[8..].copy_from_slice(&query_id.low().to_be_bytes());
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("valid context");
+        let preparation = ConnectorWritePreparation::try_new(
+            owner.clone(),
+            ConnectorTableHandle::try_new(
+                owner.instance_id.clone(),
+                Bytes::from_static(b"test-table"),
+            )
+            .expect("valid table"),
+            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+            novarocks_spi::connector::ConnectorWriteIntent::Append,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"test-base"))
+                .expect("valid base version"),
+            ConnectorWriteInputShape::Data {
+                fields: vec![ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("value", DataType::Int64, false),
+                )],
+            },
+            Bytes::from_static(b"test-preparation"),
+        )
+        .expect("valid preparation");
+        let cohort_id = manifest.cohort_id();
+        let activation = novarocks_spi::connector::ConnectorWriteActivation::try_new(
+            owner.clone(),
+            &novarocks_spi::connector::ConnectorWriteActivationRequest {
+                operation_id,
+                source: novarocks_spi::connector::ConnectorWriteActivationSource::Prepared(
+                    preparation.clone(),
+                ),
+                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+                context: context.clone(),
+            },
+            vec![(cohort_id, preparation)],
+        )
+        .expect("valid activation");
         manifest
             .plan(
                 lease,
                 ConnectorWritePlanningRequest {
                     operation_id,
-                    cohort_id: manifest.cohort_id(),
+                    cohort_id,
                     execution_id: ConnectorWriteExecutionId::new(
                         query_id_bytes,
                         execution_id.attempt_id().get(),
                     ),
-                    preparation: ConnectorWritePreparation::try_new(
-                        owner.clone(),
-                        ConnectorTableHandle::try_new(
-                            owner.instance_id.clone(),
-                            Bytes::from_static(b"test-table"),
-                        )
-                        .expect("valid table"),
-                        novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                        novarocks_spi::connector::ConnectorWriteIntent::Append,
-                        ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"test-base"))
-                            .expect("valid base version"),
-                        ConnectorWriteInputShape::Data {
-                            fields: vec![ConnectorWriteFieldBinding::new(
-                                ConnectorWriteFieldToken::from_bytes([1; 32]),
-                                Field::new("value", DataType::Int64, false),
-                            )],
-                        },
-                        Bytes::from_static(b"test-preparation"),
-                    )
-                    .expect("valid preparation"),
+                    activation: activation.cohort(cohort_id).expect("activated cohort"),
                     expected_writers: Vec::new(),
-                    context: ConnectorRequestContext::try_new(
-                        Instant::now() + Duration::from_secs(1),
-                        Arc::new(NeverCancelled),
-                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-                    )
-                    .expect("valid context"),
+                    context,
                 },
             )
             .expect("provider returns the frozen writer manifest")

@@ -43,8 +43,8 @@ use crate::engine::iceberg_writer::{
 };
 use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use novarocks_connector_iceberg::commit::AbortLog;
-use novarocks_execution::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 use novarocks_connector_iceberg::schema_facts::row_lineage_enabled;
+use novarocks_execution::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WholeTableRewriteTarget {

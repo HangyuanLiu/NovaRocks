@@ -331,21 +331,22 @@ impl ConnectorDistributedRewriteSession {
         let write_session = if plan.cohorts().is_empty() {
             None
         } else {
-            lease.activate_rewrite(&plan)?;
+            let activation = lease.activate_rewrite(&plan, context.clone())?;
             let write_lease = lease.derive_write_lease()?;
             let templates = plan
                 .cohorts()
                 .iter()
                 .map(|cohort| {
-                    ConnectorWritePlanningTemplate::new_in_cohort(
-                        plan.operation_id(),
-                        cohort.cohort_id(),
-                        cohort.preparation().clone(),
+                    let activated = activation.cohort(cohort.cohort_id()).ok_or_else(|| {
+                        invalid("distributed rewrite activation omitted a sealed cohort")
+                    })?;
+                    ConnectorWritePlanningTemplate::from_activated_cohort(
+                        activated,
                         context.clone(),
                         write_lease.clone(),
                     )
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             let registration = ConnectorWriteOperationRegistration::try_new(templates)
                 .map_err(|error| invalid(format!("register rewrite cohorts: {error}")))?;
             Some(ConnectorWriteOperationSession::try_begin(
@@ -782,8 +783,9 @@ mod tests {
         fn activate_rewrite(
             &self,
             _plan: &ConnectorDistributedRewritePlan,
-        ) -> Result<(), ConnectorError> {
-            Ok(())
+            _context: ConnectorRequestContext,
+        ) -> Result<novarocks_spi::connector::ConnectorWriteActivation, ConnectorError> {
+            unreachable!()
         }
         fn checkpoint_attempt(
             &self,

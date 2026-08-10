@@ -6465,7 +6465,7 @@ fn activate_iceberg_direct_row_mutation(
             ));
         }
     }
-    ConnectorRowMutationExecutionPlan::try_direct(routes)
+    ConnectorRowMutationExecutionPlan::try_direct(preparation.clone(), routes)
 }
 
 fn activate_iceberg_cow_row_mutation(
@@ -6568,7 +6568,12 @@ fn activate_iceberg_cow_row_mutation(
         routes.push(route);
     }
     let sealed = ConnectorSealedWriteCohortSet::try_new(preparation.operation_id(), descriptors)?;
-    ConnectorRowMutationExecutionPlan::try_copy_on_write(routes, sealed, recipes)
+    ConnectorRowMutationExecutionPlan::try_copy_on_write(
+        preparation.clone(),
+        routes,
+        sealed,
+        recipes,
+    )
 }
 
 fn iceberg_row_mutation_snapshot(

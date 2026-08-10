@@ -2736,6 +2736,16 @@ fn build_cow_update_distributed_execution(
         .0
         .operation_id();
     let write_lease = write.write_lease.clone();
+    let activation = write_lease
+        .activate_write(novarocks_spi::connector::ConnectorWriteActivationRequest {
+            operation_id,
+            source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
+                write.provider_plan.clone(),
+            ),
+            intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| format!("activate exact COW UPDATE generation: {error}"))?;
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
@@ -2746,14 +2756,16 @@ fn build_cow_update_distributed_execution(
             .provider_binding
             .rewrite_cohort_for_file(&file_plan.old_file)
             .map_err(|error| format!("resolve Provider COW rewrite cohort: {error}"))?;
+        let cohort = activation.cohort(cohort_id).ok_or_else(|| {
+            "exact COW UPDATE activation omitted a provider-sealed rewrite cohort".to_string()
+        })?;
         cohort_templates.push(
-            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
-                operation_id,
-                cohort_id,
-                write.rewrite_preparation.clone(),
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+                cohort,
                 connector_context.clone(),
                 write_lease.clone(),
-            ),
+            )
+            .map_err(|error| format!("build activated COW UPDATE template: {error}"))?,
         );
         if cohort_by_old_file
             .insert(file_plan.old_file.clone(), cohort_id)
@@ -3812,6 +3824,16 @@ fn prepare_cow_merge_operation(
         .0
         .operation_id();
     let write_lease = write.write_lease.clone();
+    let activation = write_lease
+        .activate_write(novarocks_spi::connector::ConnectorWriteActivationRequest {
+            operation_id,
+            source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
+                write.provider_plan.clone(),
+            ),
+            intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| format!("activate exact COW MERGE generation: {error}"))?;
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
@@ -3822,14 +3844,16 @@ fn prepare_cow_merge_operation(
             .provider_binding
             .rewrite_cohort_for_file(&file_plan.old_file)
             .map_err(|error| format!("resolve Provider COW MERGE rewrite cohort: {error}"))?;
+        let cohort = activation.cohort(cohort_id).ok_or_else(|| {
+            "exact COW MERGE activation omitted a provider-sealed rewrite cohort".to_string()
+        })?;
         templates.push(
-            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
-                operation_id,
-                cohort_id,
-                write.rewrite_preparation.clone(),
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+                cohort,
                 connector_context.clone(),
                 write_lease.clone(),
-            ),
+            )
+            .map_err(|error| format!("build activated COW MERGE template: {error}"))?,
         );
         cohort_by_old_file.insert(file_plan.old_file.clone(), cohort_id);
     }
@@ -3844,14 +3868,16 @@ fn prepare_cow_merge_operation(
             .find(|route| route.cohort_id() == cohort_id)
             .map(|route| route.preparation().clone())
             .ok_or_else(|| "Provider COW append cohort has no route preparation".to_string())?;
+        let cohort = activation.cohort(cohort_id).ok_or_else(|| {
+            "exact COW MERGE activation omitted a provider-sealed append cohort".to_string()
+        })?;
         templates.push(
-            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
-                operation_id,
-                cohort_id,
-                preparation.clone(),
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+                cohort,
                 connector_context.clone(),
                 write_lease.clone(),
-            ),
+            )
+            .map_err(|error| format!("build activated COW MERGE template: {error}"))?,
         );
         (Some(cohort_id), Some(preparation))
     } else {

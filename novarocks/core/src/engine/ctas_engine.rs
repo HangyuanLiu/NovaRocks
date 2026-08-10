@@ -571,13 +571,11 @@ impl CoreCtasTargetSession {
             ConnectorWritePreparationOutcome::Prepared(preparation) => preparation,
             ConnectorWritePreparationOutcome::Denied(error) => return Err(error),
         };
-        Ok(
-            crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-                binding.operation_id(),
-                preparation,
-                binding.context().clone(),
-                self.write_lease.clone(),
-            ),
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+            binding.operation_id(),
+            preparation,
+            binding.context().clone(),
+            self.write_lease.clone(),
         )
     }
 

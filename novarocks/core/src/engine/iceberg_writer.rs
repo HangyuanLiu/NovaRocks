@@ -409,14 +409,13 @@ fn register_insert_connector_write(
         committer,
     )
     .map_err(|error| format!("activate Iceberg data writer from preparation: {error}"))?;
-    Ok(
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-            operation_id,
-            preparation,
-            context,
-            exact_lease.clone(),
-        ),
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+        operation_id,
+        preparation,
+        context,
+        exact_lease.clone(),
     )
+    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
 }
 
 pub(crate) fn register_iceberg_change_stream_provider_binding(
@@ -449,14 +448,13 @@ pub(crate) fn register_iceberg_change_stream_provider_binding(
                 .map_err(|error| format!("build Iceberg change-stream write service: {error}"))?,
         )
         .map_err(|error| format!("register Iceberg change-stream write service: {error}"))?;
-    Ok(
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-            operation_id,
-            preparation,
-            context,
-            exact_lease.clone(),
-        ),
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+        operation_id,
+        preparation,
+        context,
+        exact_lease.clone(),
     )
+    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
 }
 
 /// Build the inert registration sealed before exact-session admission. The
@@ -486,14 +484,13 @@ pub(crate) fn iceberg_change_stream_provider_binding_template(
             binding.target_ref()
         ));
     }
-    Ok(
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-            operation_id,
-            preparation.clone(),
-            context,
-            exact_lease.clone(),
-        ),
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+        operation_id,
+        preparation.clone(),
+        context,
+        exact_lease.clone(),
     )
+    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
 }
 
 /// Register the provider service only after the exact operation session is
@@ -792,15 +789,21 @@ fn build_iceberg_connector_write_templates_with_purpose(
                     context.clone(),
                 )?;
                 let _provider_payload = provider_payload;
-                Ok(
-                    crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
-                        operation_id,
-                        cohort_id,
-                        preparation,
-                        context,
-                        exact_lease.clone(),
-                    ),
+                if cohort_id
+                    != novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id)
+                {
+                    return Err(
+                        "ordinary connector write activation may only produce the primary cohort"
+                            .to_string(),
+                    );
+                }
+                crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+                    operation_id,
+                    preparation,
+                    context,
+                    exact_lease.clone(),
                 )
+                .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
             },
         )
         .collect()
@@ -871,14 +874,13 @@ pub(crate) fn register_iceberg_row_connector_write(
         committer,
     )
     .map_err(|error| format!("activate Iceberg row writer from preparation: {error}"))?;
-    Ok(
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-            operation_id,
-            preparation,
-            context,
-            exact_lease.clone(),
-        ),
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+        operation_id,
+        preparation,
+        context,
+        exact_lease.clone(),
     )
+    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
 }
 
 /// Resolve an opaque Iceberg write target through the connector metadata

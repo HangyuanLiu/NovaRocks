@@ -17,8 +17,10 @@ use novarocks_connector_iceberg::commit::{
 };
 use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
-    ConnectorRequestContext, ConnectorWriteInputRequest, ConnectorWriteLease,
-    ConnectorWriteOperationId,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
+    ConnectorManagedPublicationTechnique, ConnectorRequestContext,
+    ConnectorStagedPublicationBaseFact, ConnectorWriteActivationIntent, ConnectorWriteInputRequest,
+    ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
 use crate::connector::iceberg::commit::CommitOpKind;
@@ -245,14 +247,46 @@ pub(crate) fn activate_first_refresh_connector_write(
         empty_input_policy,
     )
     .map_err(|error| format!("activate Iceberg first-refresh writer from preparation: {error}"))?;
-    Ok(
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-            operation_id,
-            preparation,
-            connector_context,
-            exact_lease.clone(),
-        ),
+    let managed_publication = ConnectorManagedPublicationIntent::try_new(
+        prepared.publication_intent().refresh_id(),
+        prepared.publication_intent().mv_id(),
+        prepared.publication_intent().marker_token(),
+        match prepared.publication_intent().technique() {
+            MvRefreshPublicationTechnique::Full => ConnectorManagedPublicationTechnique::Full,
+            MvRefreshPublicationTechnique::Incremental => {
+                ConnectorManagedPublicationTechnique::Incremental
+            }
+        },
+        prepared
+            .publication_intent()
+            .bases()
+            .iter()
+            .map(|base| ConnectorStagedPublicationBaseFact {
+                table: base.table_fqn().into(),
+                uuid: base.table_uuid().into(),
+                from_version: base.from_snapshot(),
+                to_version: base.to_snapshot(),
+            })
+            .collect(),
+        prepared.publication_intent().definition_fingerprint(),
+        match empty_input_policy {
+            crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot => {
+                ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit
+            }
+            crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite => {
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
+            }
+        },
     )
+    .map_err(|error| format!("build managed MV publication activation intent: {error}"))?;
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared_with_intent(
+        operation_id,
+        preparation,
+        ConnectorWriteActivationIntent::ManagedPublication(managed_publication),
+        connector_context,
+        exact_lease.clone(),
+    )
+    .map_err(|error| format!("activate exact Iceberg MV write generation: {error}"))
 }
 
 fn validate_first_refresh_target_contract(

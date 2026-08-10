@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::common::types::UniqueId;
-use crate::connector::iceberg::stats_assembler::FileSketchSet;
+use novarocks_connector_iceberg::stats_assembler::FileSketchSet;
 use novarocks_execution::runtime::fragment::io::{
     FragmentCommitLease, FragmentCommitPort, FragmentCommitReport, FragmentSinkLoadStats,
     TabletCommitInfo as ExecutionTabletCommitInfo, TabletFailInfo as ExecutionTabletFailInfo,

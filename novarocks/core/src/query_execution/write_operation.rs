@@ -34,6 +34,7 @@ struct ConnectorWriteOperationSessionInner {
     sealed: ConnectorSealedWriteCohortSet,
     cohorts: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanningTemplate>,
     lease: ConnectorWriteLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
     state: Mutex<OperationState>,
 }
 
@@ -54,7 +55,7 @@ struct CohortState {
 enum TerminalDecision {
     Commit([u8; 32]),
     Abort([u8; 32]),
-    KnownEmptyNoOp,
+    KnownEmptyAbort([u8; 32]),
 }
 
 impl ConnectorWriteOperationSession {
@@ -81,6 +82,7 @@ impl ConnectorWriteOperationSession {
         let owner = lease.binding_key().clone();
         let mut cohorts = BTreeMap::new();
         let mut descriptors = Vec::new();
+        let mut context = None;
         for template in registration.into_cohorts() {
             if template.operation_id() != operation_id {
                 return Err(invalid(
@@ -88,6 +90,9 @@ impl ConnectorWriteOperationSession {
                 ));
             }
             let cohort_id = template.cohort_id();
+            if context.is_none() {
+                context = Some(template.request_context().clone());
+            }
             let descriptor = ConnectorWriteCohortDescriptor::new(
                 cohort_id,
                 template.intent(),
@@ -101,6 +106,7 @@ impl ConnectorWriteOperationSession {
             descriptors.push(descriptor);
         }
         let sealed = ConnectorSealedWriteCohortSet::try_new(operation_id, descriptors)?;
+        let context = context.ok_or_else(|| invalid("connector write operation has no cohorts"))?;
         let state = OperationState {
             cohorts: cohorts
                 .keys()
@@ -117,6 +123,7 @@ impl ConnectorWriteOperationSession {
                 sealed,
                 cohorts,
                 lease,
+                context,
                 state: Mutex::new(state),
             }),
         })
@@ -164,31 +171,55 @@ impl ConnectorWriteOperationSession {
     }
 
     /// Seal an operation that the frontend has established needs no writer
-    /// attempt. This is an internal terminal decision and never contacts the
-    /// connector provider.
+    /// attempt. The exact provider still receives a bounded abort so its
+    /// activation reservation is released without fabricating a commit.
     pub(crate) fn finish_known_empty_noop(&self) -> Result<(), ConnectorError> {
-        let mut state = self.lock_state()?;
-        if state.recovery_only {
-            return Err(invalid(
-                "connector write recovery session cannot finish a known-empty operation",
-            ));
+        let request = {
+            let mut state = self.lock_state()?;
+            if state.recovery_only {
+                return Err(invalid(
+                    "connector write recovery session cannot finish a known-empty operation",
+                ));
+            }
+            if state
+                .cohorts
+                .values()
+                .any(|cohort| cohort.accepted.is_some() || !cohort.superseded.is_empty())
+            {
+                return Err(invalid(
+                    "connector write operation with accepted or superseded attempts cannot finish as known-empty",
+                ));
+            }
+            let request = ConnectorWriteAbortRequest::try_new(
+                self.inner.owner.clone(),
+                self.inner.sealed.clone(),
+                Vec::new(),
+                self.inner.context.clone(),
+            )?;
+            match state.terminal {
+                Some(TerminalDecision::KnownEmptyAbort(digest))
+                    if digest == request.aggregate_digest => {}
+                Some(_) => {
+                    return Err(invalid(
+                        "connector write operation already has another terminal decision",
+                    ));
+                }
+                None => {
+                    state.terminal =
+                        Some(TerminalDecision::KnownEmptyAbort(request.aggregate_digest));
+                }
+            }
+            request
+        };
+        match self.inner.lease.control().abort(request)? {
+            ConnectorWriteAbortOutcome::KnownUncommitted { .. } => Ok(()),
+            ConnectorWriteAbortOutcome::KnownCommitted { .. } => Err(invalid(
+                "connector provider reported a known-empty operation already committed",
+            )),
+            ConnectorWriteAbortOutcome::CommitUnknown { .. } => Err(invalid(
+                "connector provider could not prove a known-empty operation uncommitted",
+            )),
         }
-        if state.terminal.is_some() {
-            return Err(invalid(
-                "connector write operation already has a terminal decision",
-            ));
-        }
-        if state
-            .cohorts
-            .values()
-            .any(|cohort| cohort.accepted.is_some() || !cohort.superseded.is_empty())
-        {
-            return Err(invalid(
-                "connector write operation with accepted or superseded attempts cannot finish as known-empty",
-            ));
-        }
-        state.terminal = Some(TerminalDecision::KnownEmptyNoOp);
-        Ok(())
     }
 
     pub fn contains_cohort(&self, cohort_id: ConnectorWriteCohortId) -> bool {
@@ -412,7 +443,7 @@ impl ConnectorWriteOperationSession {
             }
             if matches!(
                 state.terminal,
-                Some(TerminalDecision::Abort(_)) | Some(TerminalDecision::KnownEmptyNoOp)
+                Some(TerminalDecision::Abort(_)) | Some(TerminalDecision::KnownEmptyAbort(_))
             ) {
                 return Err(invalid(
                     "connector write operation already has another terminal decision",
@@ -450,7 +481,7 @@ impl ConnectorWriteOperationSession {
             let mut state = self.lock_state()?;
             if matches!(
                 state.terminal,
-                Some(TerminalDecision::Commit(_)) | Some(TerminalDecision::KnownEmptyNoOp)
+                Some(TerminalDecision::Commit(_)) | Some(TerminalDecision::KnownEmptyAbort(_))
             ) {
                 return Err(invalid(
                     "connector write operation already has another terminal decision",
@@ -835,29 +866,42 @@ mod tests {
         cohort_id: ConnectorWriteCohortId,
         exact_lease: ConnectorWriteLease,
     ) -> ConnectorWritePlanningTemplate {
-        ConnectorWritePlanningTemplate::new_in_cohort(
-            operation_id,
-            cohort_id,
-            ConnectorWritePreparation::try_new(
-                owner(),
-                ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
-                    .expect("table handle"),
-                novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                ConnectorWriteIntent::Append,
-                ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
-                    .expect("base version"),
-                ConnectorWriteInputShape::Data {
-                    fields: vec![ConnectorWriteFieldBinding::new(
-                        ConnectorWriteFieldToken::from_bytes([1; 32]),
-                        Field::new("value", DataType::Int64, true),
-                    )],
-                },
-                Bytes::from_static(b"provider-plan"),
-            )
-            .expect("preparation"),
-            context(),
+        let context = context();
+        let preparation = ConnectorWritePreparation::try_new(
+            owner(),
+            ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
+                .expect("table handle"),
+            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+            ConnectorWriteIntent::Append,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base version"),
+            ConnectorWriteInputShape::Data {
+                fields: vec![ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("value", DataType::Int64, true),
+                )],
+            },
+            Bytes::from_static(b"provider-plan"),
+        )
+        .expect("preparation");
+        let activation = novarocks_spi::connector::ConnectorWriteActivation::try_new(
+            owner(),
+            &novarocks_spi::connector::ConnectorWriteActivationRequest {
+                operation_id,
+                source: novarocks_spi::connector::ConnectorWriteActivationSource::Prepared(
+                    preparation.clone(),
+                ),
+                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+                context: context.clone(),
+            },
+            vec![(cohort_id, preparation)],
+        )
+        .expect("activation");
+        ConnectorWritePlanningTemplate::from_activated_cohort(
+            activation.cohort(cohort_id).expect("cohort"),
+            context,
             exact_lease,
         )
+        .expect("template")
     }
 
     fn lease(
@@ -1102,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn known_empty_noop_is_local_terminal_and_blocks_later_provider_calls() {
+    fn known_empty_noop_releases_provider_reservation_and_blocks_later_commits() {
         let operation_id = ConnectorWriteOperationId::from_bytes([11; 16]);
         let cohort_id = ConnectorWriteCohortId::primary(operation_id);
         let plan_calls = Arc::new(AtomicUsize::new(0));
@@ -1126,10 +1170,10 @@ mod tests {
 
         session
             .finish_known_empty_noop()
-            .expect("known-empty operation succeeds locally");
+            .expect("known-empty operation releases its provider reservation");
         assert_eq!(plan_calls.load(Ordering::SeqCst), 0);
         assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
 
         let plan_error = match session.plan_manifest(&manifest(
             operation_id,
@@ -1149,13 +1193,12 @@ mod tests {
             .abort(context())
             .expect_err("terminal known-empty operation cannot abort");
         assert!(abort_error.to_string().contains("terminal"));
-        let terminal_error = session
+        session
             .finish_known_empty_noop()
-            .expect_err("known-empty decision is terminal");
-        assert!(terminal_error.to_string().contains("terminal"));
+            .expect("known-empty provider abort is retryable");
         assert_eq!(plan_calls.load(Ordering::SeqCst), 0);
         assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

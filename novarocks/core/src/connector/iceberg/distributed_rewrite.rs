@@ -23,12 +23,14 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorStagedReport,
-    ConnectorStagedReportSummary, ConnectorWriteAdmissionPurpose, ConnectorWriteAttemptCompletion,
-    ConnectorWriteCohortId, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriterIdentity,
-    ConnectorWriterTerminalState,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorRequestContext,
+    ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorWriteActivation,
+    ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorWriteActivationSource, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteFieldRequest,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
+    ConnectorWriterIdentity, ConnectorWriterTerminalState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -581,7 +583,8 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteAdapter {
     fn activate_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
-    ) -> Result<(), ConnectorError> {
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
         plan.validate()?;
         if plan.owner() != self.binding_key() {
             return Err(invalid(
@@ -593,21 +596,38 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteAdapter {
             .lock()
             .map_err(|_| internal("Iceberg rewrite activation cache lock poisoned"))?;
         match activated.get(&plan.operation_id()) {
-            Some(existing) if existing == &plan.plan_digest() => return Ok(()),
-            Some(_) => {
+            Some(existing) if existing != &plan.plan_digest() => {
                 return Err(invalid(
                     "Iceberg rewrite activation conflicts with frozen plan",
                 ));
             }
+            Some(_) => {}
             None => {}
         }
-        let service = self.build_service(plan)?;
-        let operation_id = plan.operation_id();
-        let digest = plan.plan_digest();
-        self.services
-            .register_lazy(operation_id, digest, move || Ok(Arc::clone(&service)))?;
-        activated.insert(operation_id, digest);
-        Ok(())
+        if !activated.contains_key(&plan.operation_id()) {
+            let service = self.build_service(plan)?;
+            let operation_id = plan.operation_id();
+            let digest = plan.plan_digest();
+            self.services
+                .register_lazy(operation_id, digest, move || Ok(Arc::clone(&service)))?;
+            activated.insert(operation_id, digest);
+        }
+        let source = plan.cohorts().first().ok_or_else(|| {
+            invalid("Iceberg rewrite activation requires at least one provider cohort")
+        })?;
+        ConnectorWriteActivation::try_new(
+            self.binding_key().clone(),
+            &ConnectorWriteActivationRequest {
+                operation_id: plan.operation_id(),
+                source: ConnectorWriteActivationSource::Prepared(source.preparation().clone()),
+                intent: ConnectorWriteActivationIntent::Ordinary,
+                context,
+            },
+            plan.cohorts()
+                .iter()
+                .map(|cohort| (cohort.cohort_id(), cohort.preparation().clone()))
+                .collect(),
+        )
     }
 
     fn checkpoint_attempt(
