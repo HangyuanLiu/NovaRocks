@@ -305,6 +305,13 @@ impl FrontendCatalogApplicationPort {
         }
     }
 
+    pub(crate) fn projection_count(&self) -> usize {
+        self.projections
+            .lock()
+            .map(|projections| projections.len())
+            .unwrap_or_default()
+    }
+
     fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
         if let Ok(mut projections) = self.projections.lock() {
             projections.remove(instance_id);

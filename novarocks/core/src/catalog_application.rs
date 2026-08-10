@@ -145,6 +145,24 @@ pub trait CatalogRuntimePublisherSink: Send + Sync {
     ) -> Result<(), CatalogApplicationError>;
 }
 
+/// Process-local health facts for the Frontend-owned catalog projection.
+///
+/// The durable attachment remains in StateStore; these fields only describe
+/// the local controller that projects it into a runtime generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatalogProjectionMetricsSnapshot {
+    pub projected_catalogs: usize,
+    pub successful_polls: u64,
+    pub failed_polls: u64,
+    pub resyncs: u64,
+    pub freshness_expiries: u64,
+}
+
+/// Publishes Frontend-owned projection health to the process metrics endpoint.
+pub fn publish_catalog_projection_metrics(snapshot: CatalogProjectionMetricsSnapshot) {
+    crate::service::metrics_http::publish_catalog_projection_metrics(snapshot);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,7 +20,7 @@
 //! Change pages are intentionally only wakeups. Every relevant hint and every
 //! retention gap triggers a complete authoritative attachment reread.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,14 @@ use tokio::task::JoinHandle;
 
 use crate::catalog_application::FrontendCatalogApplicationPort;
 use crate::catalog_attachment::attachment_prefix;
+
+#[derive(Default)]
+struct CatalogProjectionMetrics {
+    successful_polls: AtomicU64,
+    failed_polls: AtomicU64,
+    resyncs: AtomicU64,
+    freshness_expiries: AtomicU64,
+}
 
 #[derive(Clone, Debug)]
 pub struct CatalogProjectionConfig {
@@ -61,6 +69,7 @@ pub struct FrontendCatalogController {
     config: CatalogProjectionConfig,
     stopping: AtomicBool,
     bootstrap_state: Mutex<Option<(StoreIdentity, ChangeCursor)>>,
+    metrics: CatalogProjectionMetrics,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -90,6 +99,7 @@ impl FrontendCatalogController {
             config,
             stopping: AtomicBool::new(false),
             bootstrap_state: Mutex::new(None),
+            metrics: CatalogProjectionMetrics::default(),
             worker: Mutex::new(None),
         }))
     }
@@ -113,6 +123,8 @@ impl FrontendCatalogController {
             .reconcile_with_page_size(self.config.page_size, self.config.worker_count)
             .await
             .map_err(|error| error.to_string())?;
+        self.metrics.resyncs.fetch_add(1, Ordering::Relaxed);
+        self.publish_metrics();
         let cursor = ChangeCursor::new(identity.store_id, page.high_watermark, u32::MAX)
             .map_err(|error| error.to_string())?;
         cursor
@@ -159,7 +171,24 @@ impl FrontendCatalogController {
             }
         }
         self.projection.unpublish_all();
+        self.publish_metrics();
         Ok(())
+    }
+
+    pub fn metrics_snapshot(
+        &self,
+    ) -> novarocks::catalog_application::CatalogProjectionMetricsSnapshot {
+        novarocks::catalog_application::CatalogProjectionMetricsSnapshot {
+            projected_catalogs: self.projection.projection_count(),
+            successful_polls: self.metrics.successful_polls.load(Ordering::Relaxed),
+            failed_polls: self.metrics.failed_polls.load(Ordering::Relaxed),
+            resyncs: self.metrics.resyncs.load(Ordering::Relaxed),
+            freshness_expiries: self.metrics.freshness_expiries.load(Ordering::Relaxed),
+        }
+    }
+
+    fn publish_metrics(&self) {
+        novarocks::catalog_application::publish_catalog_projection_metrics(self.metrics_snapshot());
     }
 
     async fn run(&self) {
@@ -176,6 +205,7 @@ impl FrontendCatalogController {
         let mut last_fresh = Instant::now();
         let mut retry = self.config.retry_initial;
         let mut force_resync = identity.is_none();
+        let mut fail_closed = false;
 
         while !self.stopping.load(Ordering::Acquire) {
             let outcome = self
@@ -185,14 +215,25 @@ impl FrontendCatalogController {
                 Ok(()) => {
                     last_fresh = Instant::now();
                     retry = self.config.retry_initial;
+                    fail_closed = false;
+                    self.metrics
+                        .successful_polls
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.publish_metrics();
                     tokio::time::sleep(self.config.poll_interval).await;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "catalog attachment projection poll failed");
-                    if last_fresh.elapsed() >= self.config.freshness_budget {
+                    self.metrics.failed_polls.fetch_add(1, Ordering::Relaxed);
+                    if !fail_closed && last_fresh.elapsed() >= self.config.freshness_budget {
                         self.projection.unpublish_all();
+                        self.metrics
+                            .freshness_expiries
+                            .fetch_add(1, Ordering::Relaxed);
                         force_resync = true;
+                        fail_closed = true;
                     }
+                    self.publish_metrics();
                     tokio::time::sleep(retry).await;
                     retry = retry.saturating_mul(2).min(self.config.retry_max);
                 }
@@ -239,6 +280,8 @@ impl FrontendCatalogController {
                 .reconcile_with_page_size(self.config.page_size, self.config.worker_count)
                 .await
                 .map_err(|error| error.to_string())?;
+            self.metrics.resyncs.fetch_add(1, Ordering::Relaxed);
+            self.publish_metrics();
             *force_resync = false;
         }
         Ok(())
@@ -638,6 +681,10 @@ mod tests {
             port.admit_catalog(&created.attachment.instance_id),
             CatalogAdmission::Unavailable { .. }
         ));
+        let metrics = controller.metrics_snapshot();
+        assert_eq!(metrics.projected_catalogs, 0);
+        assert!(metrics.failed_polls > 0);
+        assert_eq!(metrics.freshness_expiries, 1);
         controller.shutdown().await.expect("shutdown controller");
 
         drop(controller);
