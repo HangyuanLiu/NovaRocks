@@ -5415,8 +5415,49 @@ impl CleanupOperationRepository {
             move |transaction, transaction_id| {
                 let plan = plan.clone();
                 Box::pin(async move {
-                    apply_cleanup_plan(transaction, transaction_id, operation_id, plan, now_ms)
-                        .await
+                    apply_cleanup_plan(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        plan,
+                        now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn plan_fenced(
+        &self,
+        operation_id: Uuid,
+        plan: CleanupPlanPayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_plan(&plan)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Plan,
+            "fenced persist frontend connector cleanup plan",
+            move |transaction, transaction_id| {
+                let plan = plan.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_plan(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        plan,
+                        now_ms,
+                        Some((&authority, &validator)),
+                    )
+                    .await
                 })
             },
         )
@@ -5955,6 +5996,7 @@ async fn apply_cleanup_plan(
     operation_id: Uuid,
     plan: CleanupPlanPayload,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     if let Err(error) = validate_cleanup_plan(&plan) {
         return Ok(Err(error));
@@ -5965,6 +6007,20 @@ async fn apply_cleanup_plan(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Some(durable) = operation.stored.authority.as_ref() {
+            if let Err(error) =
+                validate_bound_fenced_authority(transaction, Some(durable), authority, validator)
+                    .await
+            {
+                return Ok(Err(error));
+            }
+        } else if let Err(error) =
+            validate_fenced_authority(transaction, authority, validator).await
+        {
+            return Ok(Err(error));
+        }
+    }
     if operation.stored.state == CleanupOperationState::Planned
         && operation.stored.plan_digest == Some(plan.plan_digest)
     {
@@ -5984,6 +6040,9 @@ async fn apply_cleanup_plan(
     )
     .await??;
     operation.stored.plan_digest = Some(plan.plan_digest);
+    if let Some((authority, _)) = fenced {
+        operation.stored.authority = Some(authority.clone());
+    }
     operation.stored.manifest_digest = Some(plan.manifest_digest);
     operation.stored.candidate_count = Some(plan.candidate_count);
     operation.stored.batch_count = Some(plan.batch_count);

@@ -771,6 +771,34 @@ async fn cleanup_persists_only_bounded_artifact_handles_and_releases_terminal_fe
 }
 
 #[tokio::test]
+async fn fenced_cleanup_plan_rejects_a_stale_attempt() {
+    let (_temp, _store, repository) = cleanup_fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository
+        .create(cleanup_create(operation_id))
+        .await
+        .unwrap();
+    let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let authority = fenced_authority();
+    let error = repository
+        .plan_fenced(
+            operation_id,
+            cleanup_plan(),
+            11,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    let planned = repository
+        .plan_fenced(operation_id, cleanup_plan(), 11, authority, validator)
+        .await
+        .unwrap();
+    assert_eq!(planned.state, CleanupOperationState::Planned);
+}
+
+#[tokio::test]
 async fn cleanup_shared_fence_blocks_other_maintenance_and_unknown_requires_recovery() {
     let (_temp, store, repository) = cleanup_fixture().await;
     let operation_id = Uuid::now_v7();
