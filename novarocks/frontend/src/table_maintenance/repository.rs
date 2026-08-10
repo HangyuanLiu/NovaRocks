@@ -3887,10 +3887,38 @@ impl DistributedRewriteOperationRepository {
             .await
     }
 
+    /// Creates a V3 child under the exact authority installed on its claimed
+    /// V1 parent. A child never acquires a second table lease.
+    pub async fn create_for_claimed_optimize_job_fenced(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        claimed_optimize_job_id: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_authority(&authority)?;
+        self.create_inner_fenced(
+            request,
+            Some(claimed_optimize_job_id),
+            Some((authority, validator)),
+        )
+        .await
+    }
+
     async fn create_inner(
         &self,
         request: DistributedRewriteOperationCreate,
         claimed_optimize_job_id: Option<i64>,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.create_inner_fenced(request, claimed_optimize_job_id, None)
+            .await
+    }
+
+    async fn create_inner_fenced(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        claimed_optimize_job_id: Option<i64>,
+        fenced: Option<(MaintenanceAuthorityV1, MaintenanceFenceValidator)>,
     ) -> RepositoryResult<DistributedRewriteOperation> {
         validate_rewrite_create(&request)?;
         let transaction_operation_id = OperationId::new_v7();
@@ -3902,12 +3930,16 @@ impl DistributedRewriteOperationRepository {
             "create frontend distributed rewrite operation",
             |transaction| {
                 let request = request.clone();
+                let fenced = fenced.clone();
                 Box::pin(async move {
                     apply_rewrite_create(
                         transaction,
                         transaction_operation_id,
                         request,
                         claimed_optimize_job_id,
+                        fenced
+                            .as_ref()
+                            .map(|(authority, validator)| (authority, validator)),
                     )
                     .await
                 })
@@ -4447,6 +4479,7 @@ async fn apply_rewrite_create(
     transaction_operation_id: OperationId,
     request: DistributedRewriteOperationCreate,
     claimed_optimize_job_id: Option<i64>,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<DistributedRewriteOperation> {
     if let Err(error) = validate_rewrite_create(&request) {
         return Ok(Err(error));
@@ -4509,6 +4542,18 @@ async fn apply_rewrite_create(
                 "create distributed rewrite operation failed: active optimize job {active_job_id} is not the claimed running target"
             ))));
         }
+        if let Some((authority, validator)) = fenced {
+            if let Err(error) = validate_bound_fenced_authority(
+                transaction,
+                active_job.authority.as_ref(),
+                authority,
+                validator,
+            )
+            .await
+            {
+                return Ok(Err(error));
+            }
+        }
     } else if let Some(claimed_job_id) = claimed_optimize_job_id {
         return Ok(Err(RepositoryError::corruption(format!(
             "create distributed rewrite operation failed: claimed optimize job {claimed_job_id} has no active target index"
@@ -4549,7 +4594,7 @@ async fn apply_rewrite_create(
         created_at_ms: request.created_at_ms,
         started_at_ms: None,
         finished_at_ms: None,
-        authority: None,
+        authority: fenced.map(|(authority, _)| authority.clone()),
     };
     let operation_key = rewrite_operation_key(request.operation_id)?;
     let pending_key = rewrite_state_key(

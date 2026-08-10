@@ -441,6 +441,46 @@ async fn v1_optimize_and_v2_metadata_operations_are_mutually_exclusive() {
 }
 
 #[tokio::test]
+async fn v1_child_rewrite_copies_the_claimed_authority_without_a_second_lease() {
+    let (_temp, store, repository) = rewrite_fixture().await;
+    let optimize = OptimizeJobRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    let parent = optimize
+        .create(OptimizeJobCreate {
+            target: target(),
+            base_snapshot_id: 1,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let authority = fenced_authority();
+    optimize
+        .claim_fenced(parent.job_id, 11, authority.clone(), Arc::clone(&validator))
+        .await
+        .unwrap();
+
+    let request = rewrite_create(Uuid::now_v7());
+    let error = repository
+        .create_for_claimed_optimize_job_fenced(
+            request.clone(),
+            parent.job_id,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+
+    let child = repository
+        .create_for_claimed_optimize_job_fenced(request, parent.job_id, authority, validator)
+        .await
+        .unwrap();
+    assert_eq!(child.state, DistributedRewriteOperationState::Pending);
+}
+
+#[tokio::test]
 async fn distributed_rewrite_persists_plan_attempts_and_terminal_fence() {
     let (_temp, _store, repository) = rewrite_fixture().await;
     let operation_id = Uuid::now_v7();
