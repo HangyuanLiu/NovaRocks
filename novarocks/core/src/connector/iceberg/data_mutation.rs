@@ -48,9 +48,9 @@ use super::commit::{
     CleanupAttempt, CleanupPathMapper, CommitServiceError, IcebergCommitCollector,
     RecoveryEvidence, RunInput, run_iceberg_commit,
 };
-use super::fs_io;
 use super::provider::decode_data_mutation_table_target;
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
+use novarocks_connector_iceberg::fs_io;
 
 const PLAN_PAYLOAD_VERSION: u16 = 1;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;

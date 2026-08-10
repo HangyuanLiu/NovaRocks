@@ -50,7 +50,6 @@ use crate::connector::iceberg::commit::{
 };
 use crate::connector::iceberg::commit::{CommitOpKind, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
-use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
 use crate::connector::iceberg::write_service::IcebergWriteServiceRegistry;
 use crate::sql::literal::{literal_to_i128_for_integer, parse_datetime_string_to_nanos};
@@ -58,6 +57,7 @@ use crate::sql::{ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, Table
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::{ColumnDefault, SqlType};
+use novarocks_connector_iceberg::fs_io;
 
 #[derive(Default)]
 pub(crate) struct IcebergCatalogRegistry {
@@ -257,7 +257,7 @@ impl IcebergCatalogEntry {
 fn resolve_warehouse_access_for_entry(
     entry: &IcebergCatalogEntry,
     context: &str,
-) -> Result<crate::connector::iceberg::fs_io::IcebergFsAccess, String> {
+) -> Result<novarocks_connector_iceberg::fs_io::IcebergFsAccess, String> {
     let object_store_config = entry
         .s3_config
         .as_ref()

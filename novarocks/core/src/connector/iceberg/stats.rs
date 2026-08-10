@@ -522,7 +522,7 @@ fn build_stats_file_io(
     let scheme = location.split("://").next().unwrap_or("");
     let is_s3 = matches!(scheme, "s3" | "s3a" | "oss");
     if !is_s3 {
-        return Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(location, None));
+        return Ok(novarocks_connector_iceberg::fs_io::build_file_io_for_location(location, None));
     }
 
     let properties = cloud_properties
@@ -537,7 +537,7 @@ fn build_stats_file_io(
             .to_string()
     })?;
     Ok(
-        crate::connector::iceberg::fs_io::build_file_io_for_location(
+        novarocks_connector_iceberg::fs_io::build_file_io_for_location(
             location,
             Some(&object_store_config),
         ),

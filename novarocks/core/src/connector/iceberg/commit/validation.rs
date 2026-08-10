@@ -540,7 +540,10 @@ mod tests {
                 novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["d", "t"]).unwrap(),
             )
             .file_io(
-                crate::connector::iceberg::fs_io::build_file_io_for_location("file:///tmp/x", None),
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(
+                    "file:///tmp/x",
+                    None,
+                ),
             )
             .metadata(metadata)
             .build()

@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     fn make_local_file_io(location: &str) -> novarocks_connector_iceberg::iceberg::io::FileIO {
-        crate::connector::iceberg::fs_io::build_file_io_for_location(location, None)
+        novarocks_connector_iceberg::fs_io::build_file_io_for_location(location, None)
     }
 
     async fn write_puffin_dv_file(

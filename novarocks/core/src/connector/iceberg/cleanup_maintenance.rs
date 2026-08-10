@@ -35,9 +35,9 @@ use super::catalog::registry::{
 use super::commit::remove_orphan_files::{
     ScannedFile, canonical_object_mtime_ms, collect_orphan_candidates,
 };
-use super::fs_io;
 use super::provider::decode_data_mutation_table_target;
 use crate::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
+use novarocks_connector_iceberg::fs_io;
 
 const ARTIFACT_VERSION: u16 = 1;
 const MAX_ARTIFACT_PARTS: usize = 64;

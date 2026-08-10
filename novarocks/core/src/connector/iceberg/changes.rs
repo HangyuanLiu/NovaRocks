@@ -1939,7 +1939,7 @@ pub(crate) fn build_factory_for_table_location(
     location: &str,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<novarocks_fs::FsAccessHandle, String> {
-    crate::connector::iceberg::fs_io::reader_factory_for_table_location(
+    novarocks_connector_iceberg::fs_io::reader_factory_for_table_location(
         location,
         object_store_config,
     )
@@ -1998,7 +1998,7 @@ pub(crate) fn normalize_delete_projection_path(
     match parsed.scheme() {
         novarocks_fs::FsScheme::Local => Ok(parsed.path().to_string()),
         novarocks_fs::FsScheme::ObjectStore => {
-            let access = crate::connector::iceberg::fs_io::resolve_access_for_location(
+            let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
                 path,
                 object_store_config,
             )
@@ -2029,7 +2029,7 @@ pub(crate) fn normalize_delete_projection_path(
                 })
         }
         novarocks_fs::FsScheme::Hdfs => {
-            crate::connector::iceberg::fs_io::normalize_hdfs_path_parse_only(path).map_err(|e| {
+            novarocks_connector_iceberg::fs_io::normalize_hdfs_path_parse_only(path).map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "normalize hdfs delete reverse projection path {path}: {e}"
                 ))

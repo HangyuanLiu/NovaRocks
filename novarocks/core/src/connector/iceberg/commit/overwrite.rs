@@ -769,7 +769,8 @@ mod enumerate_tests {
         .unwrap()
         .metadata;
 
-        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None);
+        let file_io =
+            novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None);
         let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
         Table::builder()
             .file_io(file_io)

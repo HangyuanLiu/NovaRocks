@@ -768,13 +768,13 @@ pub(crate) fn build_staged_file_io(
         })?;
         let object_store_config = s3.to_object_store_config();
         return Ok(
-            crate::connector::iceberg::fs_io::build_file_io_for_location(
+            novarocks_connector_iceberg::fs_io::build_file_io_for_location(
                 data_location,
                 Some(&object_store_config),
             ),
         );
     }
-    Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(data_location, None))
+    Ok(novarocks_connector_iceberg::fs_io::build_file_io_for_location(data_location, None))
 }
 
 fn normalize_path(path: &str) -> Result<String, String> {
@@ -810,7 +810,7 @@ pub(crate) fn write_parquet_file(
             )
         })?;
         let object_store_cfg = s3.to_object_store_config();
-        let access = crate::connector::iceberg::fs_io::resolve_access_for_location(
+        let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
             path,
             Some(&object_store_cfg),
         )

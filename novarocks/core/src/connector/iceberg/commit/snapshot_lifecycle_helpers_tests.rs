@@ -167,7 +167,7 @@ mod tests {
         // Empty snapshot_ids → no I/O, empty result.
         // Use an empty local table metadata object (no snapshots at all) so metadata is valid.
         let metadata = build_test_metadata_with_snapshots(vec![], vec![]);
-        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+        let file_io = novarocks_connector_iceberg::fs_io::build_file_io_for_location(
             "file:///novarocks-test/table",
             None,
         );

@@ -574,7 +574,7 @@ mod tests {
             ManifestContentType, NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Type,
         };
         use std::sync::Arc;
-        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+        let file_io = novarocks_connector_iceberg::fs_io::build_file_io_for_location(
             "file:///tmp/novarocks-truncate-test",
             None,
         );

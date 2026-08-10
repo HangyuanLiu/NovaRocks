@@ -723,7 +723,9 @@ mod tests {
         .expect("metadata")
         .metadata;
         let table = Table::builder()
-            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
+            .file_io(
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
+            )
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),

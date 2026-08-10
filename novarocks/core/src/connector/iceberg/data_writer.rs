@@ -1931,7 +1931,7 @@ mod tests {
                     .expect("table ident"),
             )
             .file_io(
-                crate::connector::iceberg::fs_io::build_file_io_for_location(
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(
                     &file_io_location,
                     None,
                 ),
@@ -2387,7 +2387,9 @@ mod tests {
             .identifier(
                 novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
             )
-            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
+            .file_io(
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
+            )
             .metadata(metadata)
             .build()
             .expect("table");
@@ -2530,7 +2532,9 @@ mod tests {
                 novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t_shred"])
                     .unwrap(),
             )
-            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
+            .file_io(
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
+            )
             .metadata(metadata)
             .build()
             .expect("table");
@@ -2610,7 +2614,9 @@ mod tests {
             .identifier(
                 novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
             )
-            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
+            .file_io(
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
+            )
             .metadata(metadata)
             .build()
             .expect("table");

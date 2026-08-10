@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::connector::iceberg::catalog::registry::block_on_iceberg;
-use crate::connector::iceberg::fs_io;
+use novarocks_connector_iceberg::fs_io;
 use novarocks_fs::ObjectStoreConfig;
 use novarocks_spi::connector::{
     ConnectorDataMutationSourceScope, MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES,
