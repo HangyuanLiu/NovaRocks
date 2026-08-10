@@ -468,7 +468,7 @@ pub(crate) fn build_iceberg_delta_table_def_with_files(
     let mut frozen_files = data_files
         .iter()
         .cloned()
-        .map(crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+        .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
         .collect::<Vec<_>>();
     let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         entry,

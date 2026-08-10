@@ -2303,7 +2303,7 @@ fn build_cow_rewrite_query_local_overlay(
     // because its default snapshot is main.
     let materialization = materialization.with_frozen_files_at_snapshot(
         vec![
-            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
+            novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info(
                 data_file,
             ),
         ],

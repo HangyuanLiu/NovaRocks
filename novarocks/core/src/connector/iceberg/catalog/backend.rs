@@ -433,26 +433,6 @@ fn hidden_internal_column_names(
     out
 }
 
-pub(crate) fn data_file_with_stats_to_iceberg_data_file_info(
-    file: DataFileWithStats,
-) -> IcebergDataFileInfo {
-    IcebergDataFileInfo {
-        path: file.path,
-        size: file.size,
-        row_count: file.record_count,
-        column_stats: file.column_stats,
-        partition_spec_id: file.partition_spec_id,
-        partition_key: file.partition_key,
-        first_row_id: file.first_row_id,
-        data_sequence_number: file.data_sequence_number,
-        ivm_change_op: None,
-        included_positions: None,
-        delete_files: file.delete_files,
-        manifest_path: file.manifest_path,
-        partition_values: file.partition_field_values,
-    }
-}
-
 fn build_iceberg_table_info(
     catalog_name: &str,
     namespace_name: &str,
@@ -1042,7 +1022,10 @@ mod tests {
             delete_files: vec![],
         };
 
-        let data_file = data_file_with_stats_to_iceberg_data_file_info(file);
+        let data_file =
+            novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info(
+                file,
+            );
 
         assert_eq!(data_file.partition_spec_id, Some(7));
         assert_eq!(data_file.partition_key.as_deref(), Some("city=A"));

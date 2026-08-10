@@ -866,9 +866,7 @@ fn framework_locator_query_local_overlay(
     )?;
     let files = filter_locator_data_files_by_partition(target_table, files, partition_filter)?
         .into_iter()
-        .map(
-            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
-        )
+        .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
         .collect::<Vec<_>>();
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(target_catalog_name)
         .map_err(|error| error.to_string())?;
@@ -1277,9 +1275,7 @@ fn register_framework_locator_control_fixture(
     let planned_files = files
         .iter()
         .cloned()
-        .map(
-            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
-        )
+        .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
         .collect();
     crate::connector::iceberg::provider::register_planned_table_files_control_fixture(
         state.connector_control.as_ref(),

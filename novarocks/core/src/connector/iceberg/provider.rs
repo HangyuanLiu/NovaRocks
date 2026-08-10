@@ -4931,7 +4931,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 extract_data_files_with_stats_at(&loaded.table, snapshot_id)
                     .map_err(map_iceberg_error)?
                     .into_iter()
-                    .map(super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+                    .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
                     .collect()
             }
         };
@@ -5654,7 +5654,7 @@ fn build_table_payload(
         prepared_files = data_files
             .iter()
             .cloned()
-            .map(super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+            .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
             .collect();
     }
     let mut table_info = novarocks_connector_iceberg::scan_model::IcebergTableInfo {

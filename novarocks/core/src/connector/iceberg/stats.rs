@@ -22,7 +22,6 @@ use std::sync::{Arc, RwLock};
 use arrow::datatypes::DataType;
 
 use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
-use crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info;
 use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats_at, load_table};
 use crate::connector::stats::StatsProviderError;
 use crate::sql::optimizer::statistics::Confidence;
@@ -30,6 +29,7 @@ use crate::sql::optimizer::stats_input::{
     BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
 };
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info;
 use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
 use novarocks_connector_iceberg::schema_facts::iceberg_schema_def;
 
