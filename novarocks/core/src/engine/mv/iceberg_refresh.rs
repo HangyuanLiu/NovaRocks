@@ -17125,12 +17125,6 @@ fn build_imv_change_stream_routes(
         ConnectorWriteRouteId,
     };
 
-    let target_binding = bindings.admitted_iceberg_write_binding_id(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
-
     producer_branches
         .iter()
         .copied()
@@ -17138,6 +17132,11 @@ fn build_imv_change_stream_routes(
         .map(|(idx, producer_branch)| {
             let (sink, partition_ordinals) = match producer_branch {
                 ImvChangeStreamProducerRoute::Deletion => {
+                    let target_binding = mv_change_stream_write_binding_for_mode(
+                        bindings,
+                        target,
+                        SqlWriteSinkMode::DeletionVectors,
+                    )?;
                     let sink = sql_write_plan_input_for_admitted_target(
                         bindings,
                         target_binding,
@@ -17153,6 +17152,11 @@ fn build_imv_change_stream_routes(
                     (sink, vec![file_ordinal])
                 }
                 ImvChangeStreamProducerRoute::ExistingData => {
+                    let target_binding = mv_change_stream_write_binding_for_mode(
+                        bindings,
+                        target,
+                        SqlWriteSinkMode::RowLineageData,
+                    )?;
                     let sink = sql_write_plan_input_for_admitted_target(
                         bindings,
                         target_binding,
@@ -17165,6 +17169,11 @@ fn build_imv_change_stream_routes(
                     (sink, partition_ordinals)
                 }
                 ImvChangeStreamProducerRoute::AppendedData => {
+                    let target_binding = mv_change_stream_write_binding_for_mode(
+                        bindings,
+                        target,
+                        SqlWriteSinkMode::Data,
+                    )?;
                     let sink = sql_write_plan_input_for_admitted_target(
                         bindings,
                         target_binding,
