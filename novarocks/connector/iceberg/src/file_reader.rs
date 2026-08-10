@@ -12,6 +12,7 @@ use novarocks_fs::{
     FileReadRange, FileReadRequest, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
     PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
 };
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::scan_model::{
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
@@ -68,6 +69,23 @@ pub fn physical_predicates_to_file_predicates(
             )
         })
         .collect()
+}
+
+/// Resolve the physical decoder from an Iceberg data file path.
+pub fn iceberg_data_file_format(path: &str) -> Result<FileFormat, ConnectorError> {
+    let path = path.split('?').next().unwrap_or(path);
+    if path.to_ascii_lowercase().ends_with(".orc") {
+        return Ok(FileFormat::Orc);
+    }
+    if path.to_ascii_lowercase().ends_with(".parquet")
+        || path.to_ascii_lowercase().ends_with(".parq")
+    {
+        return Ok(FileFormat::Parquet);
+    }
+    Err(ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        format!("Iceberg data file format is not declared or supported: {path}"),
+    ))
 }
 
 pub fn read_parquet_batches(
@@ -177,6 +195,24 @@ mod tests {
                 op: MinMaxPredicateOp::Ge,
                 value: MinMaxPredicateValue::Int32(20_000),
             }
+        );
+    }
+
+    #[test]
+    fn resolves_iceberg_physical_file_format_without_query_suffix() {
+        assert_eq!(
+            iceberg_data_file_format("s3://warehouse/part-0.parquet?version=1").expect("parquet"),
+            FileFormat::Parquet
+        );
+        assert_eq!(
+            iceberg_data_file_format("file:///warehouse/part-1.orc").expect("orc"),
+            FileFormat::Orc
+        );
+        assert_eq!(
+            iceberg_data_file_format("file:///warehouse/part-2.avro")
+                .expect_err("unsupported")
+                .kind(),
+            ConnectorErrorKind::Unsupported
         );
     }
 }

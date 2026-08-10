@@ -50,7 +50,9 @@ use super::equality_delete::{
 use novarocks_connector_iceberg::delete_file::{
     delete_specs_for_data_file, included_positions_for_data_file,
 };
-use novarocks_connector_iceberg::file_reader::physical_predicates_to_file_predicates;
+use novarocks_connector_iceberg::file_reader::{
+    iceberg_data_file_format, physical_predicates_to_file_predicates,
+};
 use novarocks_connector_iceberg::position_delete::load_position_deletes_with_context;
 use novarocks_connector_iceberg::scan_model::{IcebergDataFileInfo, IcebergPhysicalPredicate};
 use novarocks_connector_iceberg::schema_mapping::{
@@ -233,7 +235,7 @@ impl IcebergBatchReader {
         let bound_file = access
             .bind_location(&file.path, FileIdentity::new(&file.path, file_size, None))
             .map_err(map_file_error)?;
-        let format = physical_format(&file.path)?;
+        let format = iceberg_data_file_format(&file.path)?;
         // ORC has no physical predicate support. Its SQL residual stays in
         // Core because Iceberg reports such predicates as Unsupported.
         let predicates = if format == FileFormat::Parquet {
@@ -354,22 +356,6 @@ impl Drop for IcebergBatchReader {
     fn drop(&mut self) {
         let _ = self.close();
     }
-}
-
-fn physical_format(path: &str) -> Result<FileFormat, ConnectorError> {
-    let path = path.split('?').next().unwrap_or(path);
-    if path.to_ascii_lowercase().ends_with(".orc") {
-        return Ok(FileFormat::Orc);
-    }
-    if path.to_ascii_lowercase().ends_with(".parquet")
-        || path.to_ascii_lowercase().ends_with(".parq")
-    {
-        return Ok(FileFormat::Parquet);
-    }
-    Err(ConnectorError::new(
-        ConnectorErrorKind::Unsupported,
-        format!("Iceberg data file format is not declared or supported: {path}"),
-    ))
 }
 
 struct IcebergFileFacts<'a> {
