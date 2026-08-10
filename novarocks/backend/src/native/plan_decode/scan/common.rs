@@ -24,11 +24,11 @@ use super::super::context::NativePlanDecodeContext;
 use super::super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use super::super::layout::Layout;
 use crate::native::type_decode::{decode_field_type, decode_type};
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::{common, plan};
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub(super) struct ProvenancedOutputColumn {
@@ -249,7 +249,7 @@ pub(super) fn output_column_data_type(
 }
 
 pub(super) fn scan_batch_size(
-    query_options: Option<&novarocks::runtime::query_options::QueryOptions>,
+    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
 ) -> Result<usize, NativeFragmentLeafDecodeError> {
     let Some(value) = query_options.and_then(|opts| opts.batch_size()) else {
         return Ok(4096);

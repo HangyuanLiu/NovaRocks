@@ -29,7 +29,7 @@ use novarocks::cache::CacheOptions;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks::runtime::fragment::FragmentSubmission;
+use novarocks_execution::runtime::fragment::FragmentSubmission;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId as ExecutionQueryId;
@@ -156,7 +156,9 @@ impl NativeFragmentRequest {
         self.query_options().runtime_profile_report_interval()
     }
     pub(crate) fn query_expire_durations(&self) -> (Duration, Duration) {
-        novarocks::runtime::query_options::query_expire_durations(Some(self.query_options()))
+        novarocks_execution::runtime::query_options::query_expire_durations(Some(
+            self.query_options(),
+        ))
     }
     pub(crate) fn cache_options(&self) -> Result<CacheOptions, NativeFragmentIngressError> {
         CacheOptions::from_query_options(Some(self.query_options()))
@@ -167,7 +169,7 @@ impl NativeFragmentRequest {
     }
     pub(crate) fn uses_result_sink(&self) -> bool {
         self.submission.program().sink().kind()
-            == novarocks::exec::fragment::program::FragmentSinkKind::Result
+            == novarocks_execution::exec::fragment::program::FragmentSinkKind::Result
     }
     pub(crate) fn root_plan_node_id(&self) -> i32 {
         self.submission.program().root_plan_node_id().get()
@@ -176,7 +178,7 @@ impl NativeFragmentRequest {
         self.submission
     }
 
-    fn query_options(&self) -> &novarocks::runtime::query_options::QueryOptions {
+    fn query_options(&self) -> &novarocks_execution::runtime::query_options::QueryOptions {
         self.submission.instance().runtime_options().query_options()
     }
 }

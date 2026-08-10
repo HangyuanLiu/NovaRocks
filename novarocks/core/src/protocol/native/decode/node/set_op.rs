@@ -18,15 +18,15 @@
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::{super::decode_type, DecodedNode, NativePlanDecodeContext};
-use crate::common::ids::SlotId;
-use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::project::ProjectNode;
-use crate::exec::node::set_op::{SetOpKind, SetOpNode};
-use crate::exec::node::union_all::UnionAllNode;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::project::ProjectNode;
+use novarocks_execution::exec::node::set_op::{SetOpKind, SetOpNode};
+use novarocks_execution::exec::node::union_all::UnionAllNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, plan};
+use novarocks_types::SlotId;
 
 pub(super) fn lower_set_op_node(
     node: &plan::DistributedNode,
@@ -252,9 +252,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::tests::{lower, one_col_values_node_with, output_column, physical_node};
-    use crate::common::ids::SlotId;
-    use crate::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::plan;
+    use novarocks_types::SlotId;
 
     #[test]
     fn union_all_retags_child_slots_when_sidecar_is_missing() {

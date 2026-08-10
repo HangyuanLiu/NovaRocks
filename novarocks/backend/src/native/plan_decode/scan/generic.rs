@@ -31,18 +31,18 @@ use novarocks_spi::connector::{
     ConnectorScanHandle, ConnectorSplit,
 };
 
-use novarocks::common::ids::SlotId;
 use novarocks::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
-use novarocks::exec::chunk::ChunkSchema;
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::node::scan::BoundScanRanges;
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::formats::parquet::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
 use novarocks::protocol::ProtocolErrorKind;
-use novarocks::runtime::query_options::query_expire_durations;
+use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::scan::BoundScanRanges;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 
 use super::super::context::NativePlanDecodeContext;
 use super::super::error::NativeFragmentLeafDecodeError;
@@ -267,7 +267,7 @@ pub(super) fn lower_connector_read_scan(
         })?,
     );
     ctx.capture_scan_ranges(node.node_id, BoundScanRanges::None);
-    let scan_node = novarocks::exec::node::scan::ScanNode::new(source)
+    let scan_node = novarocks_execution::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_schema.clone())
         .with_limit(parse_scan_limit(node.limit)?)

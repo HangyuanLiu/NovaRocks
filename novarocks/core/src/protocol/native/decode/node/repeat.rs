@@ -22,13 +22,13 @@ use arrow::datatypes::{DataType, Field};
 
 use super::super::layout::Layout;
 use super::DecodedNode;
-use crate::common::ids::SlotId;
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::node::repeat::RepeatNode;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::node::repeat::RepeatNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 
 pub(super) fn lower_repeat_node(
     node: &plan::DistributedNode,
@@ -220,9 +220,9 @@ fn repeat_grouping_values(
 #[cfg(test)]
 mod tests {
     use super::super::tests::{lower, physical_node, two_col_values_node};
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::ExecNodeKind;
     use crate::protocol::common::error::ProtocolErrorKind;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::plan;
 
     fn valid_repeat() -> plan::RepeatNode {

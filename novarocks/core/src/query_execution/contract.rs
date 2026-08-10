@@ -32,7 +32,7 @@ use crate::query_execution::request_context::QueryExecutionContext;
 pub use crate::query_execution::statistics::StatisticsCollectionProgram;
 pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorWriteCohortId,
     ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationId,
@@ -53,8 +53,9 @@ pub struct ResolvedQueryOptions {
 impl ResolvedQueryOptions {
     pub(crate) fn from_upstream(options: Option<QueryOptions>) -> Self {
         let mut runtime = options.unwrap_or_default();
-        let pipeline_dop =
-            crate::runtime::exec_env::calc_pipeline_dop(runtime.pipeline_dop.unwrap_or_default());
+        let pipeline_dop = novarocks_execution::runtime::exec_env::calc_pipeline_dop(
+            runtime.pipeline_dop.unwrap_or_default(),
+        );
         debug_assert!(pipeline_dop > 0, "resolved pipeline DOP must be positive");
         runtime.pipeline_dop = Some(pipeline_dop);
         Self { runtime }
@@ -79,7 +80,9 @@ impl ResolvedQueryOptions {
 
     pub fn runtime_filter_lifecycle(&self) -> RuntimeFilterLifecycleView {
         let (delivery_expire, query_expire) =
-            crate::runtime::query_options::query_expire_durations(Some(&self.runtime));
+            novarocks_execution::runtime::query_options::query_expire_durations(Some(
+                &self.runtime,
+            ));
         RuntimeFilterLifecycleView {
             delivery_expire,
             query_expire,

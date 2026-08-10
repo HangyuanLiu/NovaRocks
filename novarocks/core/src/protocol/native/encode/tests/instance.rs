@@ -40,7 +40,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
             included_positions: vec![3, 5, 8],
             serialized_split: Some("{\"split\":1}".to_string()),
             use_iceberg_jni_metadata_reader: true,
-            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_DELETE),
+            ivm_change_op: Some(novarocks_execution::exec::change_op::CHANGE_OP_DELETE),
             file_pruning_min_max_values: Some(BTreeMap::from([(
                 0,
                 crate::runtime::scan_range::FilePruningMinMaxValue {
@@ -60,9 +60,9 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     scan_range.has_more = Some(false);
     let mut scan_ranges = BTreeMap::new();
     scan_ranges.insert(11, vec![scan_range]);
-    let destination = crate::runtime::endpoint::FragmentDestination::new(
+    let destination = novarocks_execution::runtime::endpoint::FragmentDestination::new(
         novarocks_types::UniqueId::new(3, 4),
-        crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
+        novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
             .expect("destination endpoint"),
     );
     let mut per_exch_num_senders = BTreeMap::new();
@@ -72,14 +72,14 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         instance_index: 5,
         finst_id: novarocks_types::UniqueId::new(1, 2),
         backend_idx: 7,
-        endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
+        endpoint: novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
             .expect("placement endpoint"),
         scan_ranges,
         connector_splits: BTreeMap::new(),
         destinations: vec![destination],
         per_exch_num_senders,
     };
-    let query_options = crate::runtime::query_options::QueryOptions {
+    let query_options = novarocks_execution::runtime::query_options::QueryOptions {
         batch_size: Some(4096),
         query_timeout: Some(60),
         query_delivery_timeout: Some(30),
@@ -94,7 +94,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         group_concat_max_len: Some(65_535),
         enable_join_runtime_bitset_filter: Some(false),
         global_runtime_filter_build_max_size: Some(1 << 19),
-        cache: crate::runtime::query_options::QueryCacheOptions {
+        cache: novarocks_execution::runtime::query_options::QueryCacheOptions {
             enable_scan_datacache: true,
             enable_populate_datacache: true,
             enable_datacache_async_populate_mode: true,
@@ -147,7 +147,9 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert!(file.use_iceberg_jni_metadata_reader);
     assert_eq!(
         file.change_op,
-        Some(i32::from(crate::exec::change_op::CHANGE_OP_DELETE))
+        Some(i32::from(
+            novarocks_execution::exec::change_op::CHANGE_OP_DELETE
+        ))
     );
     let pruning = file
         .file_pruning_min_max_values

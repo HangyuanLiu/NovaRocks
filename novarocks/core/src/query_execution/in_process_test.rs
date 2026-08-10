@@ -46,13 +46,17 @@ use crate::query_execution::contract::{
 use crate::query_execution::lifecycle::{AttemptId, FragmentTerminalSnapshot, QueryExecutionId};
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::write::WriteTerminalBuilder;
-use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
-use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
-use crate::runtime::fragment::prepare_fragment;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-use crate::runtime::profile::Profiler;
-use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
+use novarocks_execution::runtime::fragment::fact::{
+    FragmentCancelReason, FragmentOutcome, FragmentTerminalFact,
+};
+use novarocks_execution::runtime::fragment::io::{
+    NoopFragmentEventSink, UnavailableFragmentLookupClient,
+};
+use novarocks_execution::runtime::fragment::prepare_fragment;
+use novarocks_execution::runtime::profile::Profiler;
+use novarocks_execution::runtime::query_options::query_expire_durations;
 
 static NEXT_TEST_QUERY_ID: AtomicI64 = AtomicI64::new(1);
 const TEST_QUERY_ID_HIGH: i64 = i64::MIN + 0x4e52;
@@ -171,8 +175,9 @@ pub(crate) fn execute(
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let connector_registry = Arc::new(crate::connector::ConnectorRegistry::new());
-    let exchange = crate::runtime::fragment::io::exchange::in_process_test_exchange_transmitter();
-    let result_writer = crate::runtime::fragment::io::result::in_process_test_result_writer();
+    let exchange =
+        crate::runtime::fragment_test_io_exchange::in_process_test_exchange_transmitter();
+    let result_writer = crate::runtime::fragment_test_io_result::in_process_test_result_writer();
     let lookup = Arc::new(UnavailableFragmentLookupClient);
     let events = Arc::new(NoopFragmentEventSink);
     let profile_enabled = parts.completion.intent() == DistributedQueryIntent::Profile;

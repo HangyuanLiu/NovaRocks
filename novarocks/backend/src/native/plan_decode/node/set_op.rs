@@ -19,15 +19,15 @@ use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
 use crate::native::type_decode::decode_type;
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::ChunkSchemaRef;
-use novarocks::exec::expr::{ExprArena, ExprNode};
-use novarocks::exec::node::project::ProjectNode;
-use novarocks::exec::node::set_op::{SetOpKind, SetOpNode};
-use novarocks::exec::node::union_all::UnionAllNode;
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::project::ProjectNode;
+use novarocks_execution::exec::node::set_op::{SetOpKind, SetOpNode};
+use novarocks_execution::exec::node::union_all::UnionAllNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, plan};
+use novarocks_types::SlotId;
 
 pub(super) fn lower_set_op_node(
     node: &plan::DistributedNode,

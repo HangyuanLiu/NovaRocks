@@ -20,10 +20,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks_protocol::common;
+use novarocks_types::SlotId;
 
 use super::type_decode::decode_field_type;
 
@@ -38,14 +38,14 @@ pub(crate) fn chunk_schema_from_output_columns(
 pub(crate) struct NativeOutputLayout {
     slot_ids: Vec<SlotId>,
     chunk_schema: ChunkSchemaRef,
-    slot_schemas: Vec<novarocks::exec::chunk::ChunkSlotSchema>,
+    slot_schemas: Vec<novarocks_execution::exec::chunk::ChunkSlotSchema>,
 }
 
 impl NativeOutputLayout {
     fn new(
         slot_ids: Vec<SlotId>,
         chunk_schema: ChunkSchemaRef,
-        slot_schemas: Vec<novarocks::exec::chunk::ChunkSlotSchema>,
+        slot_schemas: Vec<novarocks_execution::exec::chunk::ChunkSlotSchema>,
     ) -> Self {
         Self {
             slot_ids,
@@ -60,7 +60,7 @@ impl NativeOutputLayout {
     pub(crate) fn chunk_schema(&self) -> ChunkSchemaRef {
         self.chunk_schema.clone()
     }
-    pub(crate) fn slot_schemas(&self) -> &[novarocks::exec::chunk::ChunkSlotSchema] {
+    pub(crate) fn slot_schemas(&self) -> &[novarocks_execution::exec::chunk::ChunkSlotSchema] {
         &self.slot_schemas
     }
 }
@@ -126,9 +126,9 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 #[cfg(test)]
 mod tests {
     use super::decode_output_layout;
-    use novarocks::common::ids::SlotId;
     use novarocks::protocol::FieldPath;
     use novarocks_protocol::common;
+    use novarocks_types::SlotId;
 
     fn int_column(column_id: u32) -> common::OutputColumn {
         common::OutputColumn {

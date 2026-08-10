@@ -27,7 +27,6 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
-use crate::common::ids::SlotId;
 use crate::runtime::descriptor_snapshot::is_iceberg_v3_row_position;
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
 use crate::runtime::query_context::{QueryId, query_context_manager};
@@ -36,6 +35,7 @@ use novarocks_spi::connector::{
     ConnectorPrepareSplitRequest, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
+use novarocks_types::SlotId;
 
 struct LookupCancellation {
     query_id: QueryId,
@@ -110,7 +110,7 @@ fn execute_connector_lookup_request(
         .collect::<Result<Vec<_>, _>>()?;
     let row_id_index = lookup_metas
         .iter()
-        .position(|meta| crate::exec::row_position::is_row_id(&meta.name));
+        .position(|meta| novarocks_execution::exec::row_position::is_row_id(&meta.name));
     let mut provider_fields = lookup_metas
         .iter()
         .map(|meta| meta.field.as_ref().clone())

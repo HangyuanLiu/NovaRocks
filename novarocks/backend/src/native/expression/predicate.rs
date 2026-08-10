@@ -20,9 +20,9 @@
 use arrow::datatypes::DataType;
 
 use super::{lower_expr_list, lower_required_child};
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::FieldPath;
+use novarocks_execution::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::expr;
 use novarocks_types::comparison_common_type;
 
@@ -243,9 +243,9 @@ mod tests {
     };
     use arrow::array::{Array, BooleanArray};
     use arrow::datatypes::DataType;
-    use novarocks::common::ids::SlotId;
-    use novarocks::exec::expr::{ExprNode, LiteralValue};
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     use novarocks_protocol::expr;
+    use novarocks_types::SlotId;
 
     #[test]
     fn in_list_casts_numeric_candidates_to_string_operand_type() {

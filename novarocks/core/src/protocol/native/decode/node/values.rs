@@ -27,11 +27,11 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::{ExprArena, cast_array_to_target};
-use crate::exec::node::values::ValuesNode;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use novarocks_execution::exec::expr::{ExprArena, cast_array_to_target};
+use novarocks_execution::exec::node::values::ValuesNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, plan};
 
 pub(super) fn lower_values_node(
@@ -235,10 +235,10 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::common::ids::SlotId;
-    use crate::exec::expr::ExprArena;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
     use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

@@ -34,9 +34,11 @@ use super::runtime::{
     ConnectorBatchReaderIter, ConnectorReadScanSource, ConnectorSplitAppend,
     IncrementalConnectorSplitAdapter,
 };
-use crate::common::ids::SlotId;
-use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::scan::{BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanSource};
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+use novarocks_execution::exec::node::scan::{
+    BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanSource,
+};
+use novarocks_types::SlotId;
 
 struct FakeReader {
     batches: Vec<Result<Option<RecordBatch>, ConnectorError>>,
@@ -331,7 +333,7 @@ impl ConnectorBatchReader for MetricsReader {
 
 #[test]
 fn file_read_profile_receives_metrics_deltas_once() {
-    let profile = crate::runtime::profile::RuntimeProfile::new("file-read");
+    let profile = novarocks_execution::runtime::profile::RuntimeProfile::new("file-read");
     let reader = MetricsReader {
         step: 0,
         metrics: ConnectorReaderMetricsSnapshot::default(),
@@ -451,7 +453,7 @@ fn read_scan_profile_counts_prepared_units_before_reader_open() {
     )
     .expect("prepare source");
     let op = source.bind(BoundScanRanges::None).expect("bind source");
-    let profile = crate::runtime::profile::RuntimeProfile::new("connector");
+    let profile = novarocks_execution::runtime::profile::RuntimeProfile::new("connector");
     op.execute_iter(
         ScanMorsel::ConnectorScanUnit {
             index: 0,
