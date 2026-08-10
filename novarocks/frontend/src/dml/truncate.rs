@@ -24,9 +24,9 @@
 
 use bytes::Bytes;
 use novarocks::engine::truncate_engine::{
-    PlanTruncateRequest, PreparedTruncate, TruncateDispatchState, TruncateEffect, TruncateEngine,
-    TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization, TruncateOutcome,
-    TruncatePlanError, TruncatePlanFacts, TruncateReceipt,
+    PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateDispatchState, TruncateEffect,
+    TruncateEngine, TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization,
+    TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncateReceipt,
 };
 use novarocks::query_execution::request_context::RequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -39,12 +39,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::{DmlError, DmlErrorKind};
 use crate::dml::model::{
     CreateStatementOperationRequest, DML_EXTERNAL_FACT_ENCODED_LIMIT, DmlOperationId,
     DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, OperationKind,
-    OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
-    StatementNextAction, StoredOperation, TruncateLifecyclePhase, TruncateLifecycleRecord,
+    OperationPayload, OperationState, OperationTarget, StatementNextAction, StoredOperation,
+    TruncateLifecyclePhase, TruncateLifecycleRecord,
 };
 use crate::dml::service::DmlService;
 
@@ -98,9 +99,6 @@ impl DmlService {
 
         let operation_id = DmlOperationId::new_v7();
         let connector_operation_id = Uuid::now_v7();
-        let journal = self
-            .require_journal()
-            .map_err(|error| journal_error(error, operation_id))?;
         let session = context.session();
         let initial_record = TruncateLifecycleRecord {
             phase: TruncateLifecyclePhase::Preparing,
@@ -122,8 +120,8 @@ impl DmlService {
             session.current_database(),
             &command.target_ref,
         );
-        let mut stored = journal
-            .create_statement_operation(CreateStatementOperationRequest {
+        let mut active = self
+            .begin_statement_operation(CreateStatementOperationRequest {
                 operation_id,
                 mutation_id: Uuid::now_v7(),
                 operation_kind: OperationKind::Truncate,
@@ -134,69 +132,93 @@ impl DmlService {
             })
             .map_err(|error| journal_error(error, operation_id))?;
 
-        let prepared = match engine.plan_truncate(PlanTruncateRequest {
-            command,
-            current_catalog: session.current_catalog().map(ToOwned::to_owned),
-            current_database: session.current_database().to_string(),
-            mutation_operation_id: connector_operation_id.into_bytes(),
-            query_options: query_options.cloned(),
-            execution: context.execution().clone(),
-        }) {
-            Ok(prepared) => prepared,
-            Err(error) => match finish_plan_failure(journal, stored, error) {
-                Ok(()) => unreachable!("a failed TRUNCATE plan cannot produce success"),
-                Err(error) => return Err(error),
-            },
-        };
-
-        if let Err(failure) = validate_plan_facts(connector_operation_id, &stored, &prepared.facts)
-        {
-            return match persist_known_uncommitted(journal, stored, failure) {
-                Ok(()) => unreachable!("invalid TRUNCATE plan facts cannot produce success"),
-                Err(error) => Err(error),
-            };
-        }
-        let planned = planned_record(&prepared.facts, connector_operation_id);
-        stored = persist(journal, stored, OperationState::Committing, planned.clone())?;
-        if let Err(error) = preflight_external_truth(journal, &stored) {
-            return match persist_known_uncommitted(
-                journal,
-                stored,
-                TruncateFailure {
-                    kind: TruncateFailureKind::ResourceExhausted,
-                    message: format!(
-                        "TRUNCATE journal cannot retain the worst-case post-dispatch truth: {error}"
-                    ),
-                },
-            ) {
-                Ok(()) => unreachable!("failed TRUNCATE preflight cannot produce success"),
-                Err(error) => Err(error),
-            };
-        }
-        stored = persist(
-            journal,
-            stored,
-            OperationState::Committing,
-            TruncateLifecycleRecord {
-                phase: TruncateLifecyclePhase::Executing,
-                ..planned
-            },
-        )?;
-
-        finish_outcome(
+        let result = execute_truncate_operation(
             engine,
-            journal,
-            stored,
-            &prepared,
-            engine.execute_truncate(prepared.handle.as_ref()),
-            true,
-        )?;
+            context,
+            query_options,
+            command,
+            connector_operation_id,
+            &mut active,
+        );
+        let _ = active.release();
+        result?;
         Ok(Some(()))
     }
 }
 
+fn execute_truncate_operation(
+    engine: &dyn TruncateEngine,
+    context: &RequestContext,
+    query_options: Option<&QueryOptions>,
+    command: TruncateCommand,
+    connector_operation_id: Uuid,
+    active: &mut ActiveDmlOperation,
+) -> Result<(), DmlError> {
+    let session = context.session();
+    let mut stored = active.stored.clone();
+
+    active.check_before_dispatch()?;
+    let prepared = match engine.plan_truncate(PlanTruncateRequest {
+        command,
+        current_catalog: session.current_catalog().map(ToOwned::to_owned),
+        current_database: session.current_database().to_string(),
+        mutation_operation_id: connector_operation_id.into_bytes(),
+        query_options: query_options.cloned(),
+        execution: context.execution().clone(),
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => match finish_plan_failure(active, stored, error) {
+            Ok(()) => unreachable!("a failed TRUNCATE plan cannot produce success"),
+            Err(error) => return Err(error),
+        },
+    };
+
+    if let Err(failure) = validate_plan_facts(connector_operation_id, &stored, &prepared.facts) {
+        return match persist_known_uncommitted(active, stored, failure) {
+            Ok(()) => unreachable!("invalid TRUNCATE plan facts cannot produce success"),
+            Err(error) => Err(error),
+        };
+    }
+    let planned = planned_record(&prepared.facts, connector_operation_id);
+    stored = persist(active, stored, OperationState::Committing, planned.clone())?;
+    if let Err(error) = preflight_external_truth(active, &stored) {
+        return match persist_known_uncommitted(
+            active,
+            stored,
+            TruncateFailure {
+                kind: TruncateFailureKind::ResourceExhausted,
+                message: format!(
+                    "TRUNCATE journal cannot retain the worst-case post-dispatch truth: {error}"
+                ),
+            },
+        ) {
+            Ok(()) => unreachable!("failed TRUNCATE preflight cannot produce success"),
+            Err(error) => Err(error),
+        };
+    }
+    stored = persist(
+        active,
+        stored,
+        OperationState::Committing,
+        TruncateLifecycleRecord {
+            phase: TruncateLifecyclePhase::Executing,
+            ..planned
+        },
+    )?;
+
+    active.check_before_dispatch()?;
+    finish_outcome(
+        engine,
+        active,
+        stored,
+        &prepared,
+        engine.execute_truncate(prepared.handle.as_ref()),
+        true,
+    )
+}
+
 fn finish_plan_failure(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     error: TruncatePlanError,
 ) -> Result<(), DmlError> {
@@ -217,7 +239,7 @@ fn finish_plan_failure(
 
 fn finish_outcome(
     engine: &dyn TruncateEngine,
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     prepared: &PreparedTruncate,
     outcome: TruncateOutcome,
@@ -320,6 +342,7 @@ fn finish_outcome(
                 StatementNextAction::Reconcile,
             )?;
             let stored = persist(journal, stored, OperationState::CommitUnknown, reconciling)?;
+            journal.check_before_dispatch()?;
             let reconciled = engine.reconcile_truncate(prepared.handle.as_ref(), &evidence);
             finish_outcome(engine, journal, stored, prepared, reconciled, false)
         }
@@ -335,7 +358,7 @@ fn finish_outcome(
 }
 
 fn persist_known_committed(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     facts: &TruncatePlanFacts,
     effect: TruncateEffect,
@@ -426,7 +449,7 @@ fn persist_known_committed(
 }
 
 fn persist_invalid_committed_receipt(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     retained_evidence: Option<String>,
     failure: TruncateFailure,
@@ -479,7 +502,7 @@ fn persist_invalid_committed_receipt(
 }
 
 fn persist_known_uncommitted(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     failure: TruncateFailure,
 ) -> Result<(), DmlError> {
@@ -511,7 +534,7 @@ fn persist_known_uncommitted(
 }
 
 fn persist_possibly_dispatched(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     mut stored: StoredOperation,
     failure: TruncateFailure,
 ) -> Result<(), DmlError> {
@@ -556,7 +579,7 @@ fn persist_possibly_dispatched(
 }
 
 fn persist_reconcile_corruption(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     first_evidence: String,
     message: impl Into<String>,
@@ -592,20 +615,15 @@ fn persist_reconcile_corruption(
 }
 
 fn persist(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     state: OperationState,
     record: TruncateLifecycleRecord,
 ) -> Result<StoredOperation, DmlError> {
     journal
-        .mutate_statement_operation(OperationMutationRequest {
-            operation_id: stored.operation_id,
-            expected_revision: stored.revision,
-            mutation_id: Uuid::now_v7(),
-            state,
-            payload: OperationPayload::TruncateLifecycle(record),
-        })
-        .map_err(|error| journal_error(error, stored.operation_id))
+        .mutate_statement(state, OperationPayload::TruncateLifecycle(record), None)
+        .map_err(|error| journal_error(error, stored.operation_id))?;
+    Ok(journal.stored.clone())
 }
 
 fn planned_record(
@@ -675,7 +693,7 @@ fn durable_evidence(stored: &StoredOperation) -> Result<Option<String>, DmlError
 }
 
 fn preflight_external_truth(
-    journal: &dyn crate::dml::journal::OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: &StoredOperation,
 ) -> Result<(), DmlError> {
     let representative_failure = encode_failure(&TruncateFailure {
@@ -698,7 +716,7 @@ fn preflight_external_truth(
             failure: Some(representative_failure.clone()),
         },
     )?);
-    journal.preflight_statement_operation(&unknown)?;
+    journal.journal.preflight_statement_operation(&unknown)?;
 
     let mut committed = stored.clone();
     committed.state = OperationState::FinalizeFailedKnownCommitted;
@@ -716,7 +734,7 @@ fn preflight_external_truth(
             failure: None,
         },
     )?);
-    journal.preflight_statement_operation(&committed)
+    journal.journal.preflight_statement_operation(&committed)
 }
 
 fn validate_plan_facts(

@@ -18,17 +18,24 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteReceipt,
     ExternalMutationEvidence,
 };
+use novarocks_state_store::coordination::FencingToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Ordinary DML journal values are intentionally an atomic format. There is
 /// no persisted predecessor to read or migrate.
-pub const DML_OPERATION_SCHEMA_VERSION: u8 = 4;
+pub const DML_OPERATION_SCHEMA_VERSION: u8 = 5;
 pub const DML_UNFINISHED_SCHEMA_VERSION: u8 = 1;
+pub const DML_COORDINATION_RESOURCE_CODEC_VERSION: u8 = 1;
+pub const DML_RECOVERY_DUE_SCHEMA_VERSION: u8 = 1;
+pub const DML_RECOVERY_SHARD_COUNT: u8 = 16;
+pub const DML_FOREGROUND_RECOVERY_VISIBILITY_MS: i64 = 18_000;
+pub const DML_RECOVERY_PAGE_SIZE: usize = 128;
 pub const DML_EXTERNAL_FACT_ENCODED_LIMIT: usize = 16 * 1024;
 pub const DML_CONNECTOR_WRITE_WIRE_LIMIT: usize = 128 * 1024;
 /// CTAS retains four phase facts in one StateStore value. Bound each complete
@@ -63,6 +70,83 @@ impl fmt::Display for DmlOperationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+/// Canonical CP-1 fencing-token v1 bytes retained for durable audit and
+/// recovery identity. This is deliberately not a serialized `LeaseFence`:
+/// the exact StateStore record version remains a live-guard capability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DmlFencingTokenV1(Vec<u8>);
+
+impl DmlFencingTokenV1 {
+    pub fn try_from_token(token: &FencingToken) -> Result<Self, String> {
+        token
+            .encode_v1()
+            .map(|bytes| Self(bytes.to_vec()))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        let token = FencingToken::decode_v1(Bytes::copy_from_slice(&bytes))
+            .map_err(|error| error.to_string())?;
+        let canonical = token.encode_v1().map_err(|error| error.to_string())?;
+        if canonical.as_ref() != bytes.as_slice() {
+            return Err("DML fencing token is not canonical v1 encoding".to_string());
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn try_decode(&self) -> Result<FencingToken, String> {
+        Self::try_from_bytes(self.0.clone()).and_then(|canonical| {
+            FencingToken::decode_v1(Bytes::from(canonical.0)).map_err(|error| error.to_string())
+        })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Durable identity of the live operation lease that last claimed an
+/// operation. UUIDv7 holder/attempt identities are intentionally separate
+/// from the statement's provider-facing `attempt_id` string.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlCoordinationProvenance {
+    pub resource_codec_version: u8,
+    pub holder_id: Uuid,
+    pub coordination_attempt_id: Uuid,
+    pub fencing_token: DmlFencingTokenV1,
+    pub acquired_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmlCoordinationClaimRequest {
+    pub operation_id: DmlOperationId,
+    pub expected_revision: u64,
+    pub mutation_id: Uuid,
+    pub provenance: DmlCoordinationProvenance,
+    pub recovery_due_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmlRecoveryDueRescheduleRequest {
+    pub operation_id: DmlOperationId,
+    pub expected_revision: u64,
+    pub mutation_id: Uuid,
+    pub recovery_due_at_ms: Option<i64>,
+}
+
+/// A bounded due-index result. Every field is copied from both the operation
+/// and its index value so callers can reject a stale candidate after lease
+/// acquisition without treating the scan as authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmlRecoveryCandidate {
+    pub operation_id: DmlOperationId,
+    pub operation_revision: u64,
+    pub last_mutation_id: Uuid,
+    pub coordination_attempt_id: Option<Uuid>,
+    pub recovery_due_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -681,6 +765,8 @@ pub struct StoredOperation {
     pub base_snapshot_map: BTreeMap<String, i64>,
     pub staged_artifacts: Vec<String>,
     pub payload: OperationPayload,
+    pub coordination_provenance: Option<DmlCoordinationProvenance>,
+    pub recovery_due_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub finished_at_ms: Option<i64>,

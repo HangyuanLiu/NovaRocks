@@ -30,6 +30,9 @@ pub enum DmlErrorKind {
     Commit,
     CommittedButUnfinalized,
     Admission,
+    CoordinationContended,
+    CoordinationLost,
+    CoordinationUnresolved,
 }
 
 #[derive(Debug)]
@@ -38,7 +41,7 @@ pub struct DmlError {
     message: String,
     operation_id: Option<DmlOperationId>,
     next_action: Option<StatementNextAction>,
-    committed_receipt: Option<ConnectorWriteReceipt>,
+    committed_receipt: Option<Box<ConnectorWriteReceipt>>,
 }
 
 impl DmlError {
@@ -92,13 +95,56 @@ impl DmlError {
             message: format!("{error}; do not retry commit"),
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::RetryFinalize),
-            committed_receipt,
+            committed_receipt: committed_receipt.map(Box::new),
+        }
+    }
+
+    pub(crate) fn committed_outcome_not_durable(
+        operation_id: DmlOperationId,
+        committed_receipt: ConnectorWriteReceipt,
+        error: impl fmt::Display,
+    ) -> Self {
+        Self {
+            kind: DmlErrorKind::CoordinationUnresolved,
+            message: format!(
+                "provider returned a known-committed outcome but the durable journal write failed: {error}; do not retry commit"
+            ),
+            operation_id: Some(operation_id),
+            next_action: Some(StatementNextAction::ManualInspect),
+            committed_receipt: Some(Box::new(committed_receipt)),
+        }
+    }
+
+    pub(crate) fn ambiguous_outcome_not_durable(
+        operation_id: DmlOperationId,
+        error: impl fmt::Display,
+    ) -> Self {
+        Self {
+            kind: DmlErrorKind::CoordinationUnresolved,
+            message: format!(
+                "provider outcome is ambiguous and could not be recorded as durable terminal truth: {error}; do not retry commit"
+            ),
+            operation_id: Some(operation_id),
+            next_action: Some(StatementNextAction::ManualInspect),
+            committed_receipt: None,
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn admission(error: impl fmt::Display) -> Self {
         Self::new(DmlErrorKind::Admission, error)
+    }
+
+    pub(crate) fn coordination_contended(error: impl fmt::Display) -> Self {
+        Self::new(DmlErrorKind::CoordinationContended, error)
+    }
+
+    pub(crate) fn coordination_lost(error: impl fmt::Display) -> Self {
+        Self::new(DmlErrorKind::CoordinationLost, error)
+    }
+
+    pub(crate) fn coordination_unresolved(error: impl fmt::Display) -> Self {
+        Self::new(DmlErrorKind::CoordinationUnresolved, error)
     }
 
     pub const fn kind(&self) -> DmlErrorKind {
@@ -113,8 +159,8 @@ impl DmlError {
         self.next_action
     }
 
-    pub const fn committed_receipt(&self) -> Option<&ConnectorWriteReceipt> {
-        self.committed_receipt.as_ref()
+    pub fn committed_receipt(&self) -> Option<&ConnectorWriteReceipt> {
+        self.committed_receipt.as_deref()
     }
 }
 

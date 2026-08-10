@@ -30,7 +30,9 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
-use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
+use crate::dml::runner::{
+    ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
+};
 use crate::dml::service::DmlService;
 
 struct DeleteWriteExecutor<'a> {
@@ -141,7 +143,9 @@ impl DmlService {
             engine,
             prepared: &prepared,
         };
-        self.run_write(write_transaction_spec(&prepared), &executor)?;
+        let spec = write_transaction_spec(&prepared);
+        let operation = self.begin_write_operation(preparing_request(&spec))?;
+        ActiveWriteTransactionRunner::new(operation, &executor).run(spec)?;
         Ok(Some(()))
     }
 }

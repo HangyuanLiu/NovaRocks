@@ -29,7 +29,9 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
-use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
+use crate::dml::runner::{
+    ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
+};
 use crate::dml::service::DmlService;
 
 struct MutationWriteExecutor<'a> {
@@ -165,15 +167,17 @@ impl DmlService {
                 kind,
             })
             .map_err(DmlError::executor)?;
-        // Preparation is deliberately inert.  Requiring the journal after it
-        // but before `run_write` guarantees durable intent precedes matching,
-        // cohort registration and all staging side effects.
+        // Preparation is deliberately inert. The admitted and claimed intent
+        // below precedes matching, cohort registration and all staging side
+        // effects.
         self.require_journal()?;
         let executor = MutationWriteExecutor {
             engine,
             prepared: &prepared,
         };
-        self.run_write(write_transaction_spec(&prepared, subkind), &executor)?;
+        let spec = write_transaction_spec(&prepared, subkind);
+        let operation = self.begin_write_operation(preparing_request(&spec))?;
+        ActiveWriteTransactionRunner::new(operation, &executor).run(spec)?;
         Ok(Some(()))
     }
 }
@@ -186,8 +190,8 @@ mod tests {
 
     use novarocks::common::app_config::ClusterRole;
     use novarocks::engine::mutation_engine::{
-        MutationAbort, MutationCommit, MutationEngine, MutationPrepared, MutationStageOutcome,
-        MutationStatementKind, PrepareMutationRequest, PreparedMutation,
+        MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
+        PreparedMutation,
     };
     use novarocks::query_execution::backend::BackendTopologySnapshot;
     use novarocks::query_execution::cancellation::QueryCancellationSource;
@@ -237,7 +241,9 @@ mod tests {
             &self,
             _prepared: &dyn MutationPrepared,
         ) -> Result<MutationStageOutcome, String> {
-            assert_eq!(self.journal.list_operations().unwrap().len(), 1);
+            let operations = self.journal.list_operations().unwrap();
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0].state, OperationState::Writing);
             self.events.lock().expect("events").push("stage");
             Ok(MutationStageOutcome::NoOp)
         }

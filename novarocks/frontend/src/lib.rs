@@ -17,6 +17,7 @@
 
 pub mod application;
 pub mod connector;
+mod coordination;
 pub mod coordinator;
 pub mod deployment;
 pub mod dml;

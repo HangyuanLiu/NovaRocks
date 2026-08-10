@@ -32,6 +32,7 @@ use novarocks::query_execution::request_context::RequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
+use crate::dml::runner::{ActiveWriteTransactionRunner, preparing_request};
 use crate::dml::service::DmlService;
 
 pub use command::{InsertCommand, InsertCommandSource, convert_insert_command};
@@ -160,7 +161,10 @@ impl DmlService {
             .map_err(DmlError::executor)?;
         let spec = write_transaction_spec(&prepared);
         let executor = IcebergInsertWriteExecutor::new(engine, &prepared);
-        self.run_write(spec, &executor).map(|_| ())
+        let operation = self.begin_write_operation(preparing_request(&spec))?;
+        ActiveWriteTransactionRunner::new(operation, &executor)
+            .run(spec)
+            .map(|_| ())
     }
 }
 

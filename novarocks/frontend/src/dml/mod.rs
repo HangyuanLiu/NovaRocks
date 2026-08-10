@@ -24,6 +24,7 @@
 //! SQL routing land in DML-2.
 
 pub mod add_files;
+mod coordination;
 pub mod ctas;
 mod delete;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod journal;
 pub mod model;
 pub mod mutation;
 pub mod reconcile;
+pub(crate) mod recovery;
 pub mod runner;
 pub mod service;
 pub mod state_store_journal;
@@ -39,21 +41,24 @@ pub mod truncate;
 
 pub use error::{DmlError, DmlErrorKind};
 pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
-pub use journal::OperationJournal;
+pub use journal::{
+    DmlIntentAdmissionValidator, DmlMutationAuthority, DmlMutationAuthorityValidator,
+    OperationJournal, dml_operation_resource_key,
+};
 pub use model::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
     ConnectorWriteFailureKind, ConnectorWriteFailureRecord, ConnectorWriteFinalizationRecord,
     ConnectorWriteLifecycleRecord, ConnectorWriteReceiptWire, CreatePreparingRequest,
-    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlOperationId,
-    DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, ExternalMutationEvidenceWire,
-    OperationFact, OperationKind, OperationMutationRequest, OperationPayload, OperationState,
-    OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
-    TruncateLifecyclePhase, TruncateLifecycleRecord, WriteTransactionOutcome, WriteTransactionSpec,
+    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlCoordinationClaimRequest,
+    DmlCoordinationProvenance, DmlFencingTokenV1, DmlOperationId, DmlRecoveryCandidate,
+    DmlRecoveryDueRescheduleRequest, DurableExternalFact, DurableMutationSummary,
+    ExternalFactOutcome, ExternalMutationEvidenceWire, OperationFact, OperationKind,
+    OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
+    SourceScopeOwnership, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
+    TruncateLifecycleRecord, WriteTransactionOutcome, WriteTransactionSpec,
 };
-pub use runner::{
-    AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,
-};
+pub use runner::{CoordinatedWriteReport, WriteExecutor};
 pub use service::DmlService;
 pub use state_store_journal::StateStoreOperationJournal;
 

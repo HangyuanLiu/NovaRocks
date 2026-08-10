@@ -36,8 +36,8 @@ use novarocks_frontend::statistics_jobs::service::{
     StatisticsTableStatRow, TableStatisticsReader,
 };
 use novarocks_frontend::statistics_jobs::worker::{
-    StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
-    StatisticsCollectedAttempt,
+    STATISTICS_LEASE_RENEW_INTERVAL, StatisticsAnalyzeWorker, StatisticsAnalyzeWorkerCoordination,
+    StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsCollectedAttempt,
 };
 use novarocks_spi::connector::{
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
@@ -46,8 +46,9 @@ use novarocks_spi::connector::{
 use novarocks_spi::state_store::{
     Direction, FeDeploymentView, Key, KeyRange, RangeRequest, StateStore,
 };
+use novarocks_state_store::coordination::IncarnationGate;
 use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
@@ -229,6 +230,46 @@ struct TransientlyFailingStatisticsExecutor {
     attempts: AtomicUsize,
 }
 
+struct RenewingStatisticsExecutor {
+    published: AtomicUsize,
+}
+
+impl StatisticsAttemptExecutor for RenewingStatisticsExecutor {
+    fn collect(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
+        std::thread::sleep(STATISTICS_LEASE_RENEW_INTERVAL + Duration::from_millis(250));
+        Ok(Box::new(()))
+    }
+
+    fn prepare_publish(
+        &self,
+        job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<ExternalMutationEvidence, StatisticsAttemptError> {
+        Ok(publication_evidence(job))
+    }
+
+    fn publish(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+        _evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.published.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        unreachable!("fresh statistics attempt must not reconcile")
+    }
+}
+
 impl StatisticsAttemptExecutor for TransientlyFailingStatisticsExecutor {
     fn collect(
         &self,
@@ -342,6 +383,86 @@ async fn worker_claims_collects_and_publishes_under_the_fenced_lease() {
     worker.shutdown().expect("shutdown worker");
 
     assert_eq!(concrete_executor.collected.load(Ordering::Acquire), 1);
+    assert_eq!(concrete_executor.published.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_does_not_claim_new_submitted_jobs_while_restore_is_reconciling() {
+    let (_temp, store, repository) = fixture().await;
+    StatisticsAnalyzeWorkerCoordination::open(Arc::clone(&store))
+        .await
+        .expect("bootstrap statistics coordination");
+    let gate = IncarnationGate::new(store);
+    let open = gate.load().await.expect("load write-open control plane");
+    gate.begin_restore(&open, OperationId::new_v7())
+        .await
+        .expect("begin restore");
+
+    let job = repository
+        .create(request("restore_blocked_worker_orders", 10))
+        .await
+        .expect("create submitted job");
+    let concrete_executor = Arc::new(SucceedingStatisticsExecutor {
+        collected: AtomicUsize::new(0),
+        published: AtomicUsize::new(0),
+    });
+    let executor: Arc<dyn StatisticsAttemptExecutor> = concrete_executor.clone();
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::new(repository.clone()),
+        executor,
+    )
+    .await
+    .expect("start worker in reconciling mode");
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    worker.shutdown().expect("shutdown worker");
+
+    let current = repository
+        .get(job.job_id)
+        .await
+        .expect("read submitted job")
+        .expect("durable job");
+    assert_eq!(current.state, StatisticsJobState::Submitted);
+    assert_eq!(concrete_executor.collected.load(Ordering::Acquire), 0);
+    assert_eq!(concrete_executor.published.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_uses_the_latest_fence_after_lease_renewal() {
+    let (_temp, _store, repository) = fixture().await;
+    let job = repository
+        .create(request("renewed_worker_orders", 10))
+        .await
+        .expect("create job");
+    let concrete_executor = Arc::new(RenewingStatisticsExecutor {
+        published: AtomicUsize::new(0),
+    });
+    let executor: Arc<dyn StatisticsAttemptExecutor> = concrete_executor.clone();
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::new(repository.clone()),
+        Arc::clone(&executor),
+    )
+    .await
+    .expect("start worker");
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let current = repository
+                .get(job.job_id)
+                .await
+                .expect("read job")
+                .expect("durable job");
+            if current.state == StatisticsJobState::Succeeded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker must finish after renewing its lease");
+    worker.shutdown().expect("shutdown worker");
     assert_eq!(concrete_executor.published.load(Ordering::Acquire), 1);
 }
 

@@ -22,8 +22,8 @@
 //! session; it is never recreated after a durable plan or evidence barrier.
 
 use novarocks::engine::add_files_engine::{
-    AddFilesDispatchState, AddFilesEffect, AddFilesEngine, AddFilesEvidence, AddFilesFailure,
-    AddFilesFailureKind, AddFilesFinalization, AddFilesOutcome, AddFilesPlanError,
+    AddFilesCommand, AddFilesDispatchState, AddFilesEffect, AddFilesEngine, AddFilesEvidence,
+    AddFilesFailure, AddFilesFailureKind, AddFilesFinalization, AddFilesOutcome, AddFilesPlanError,
     AddFilesPlanFacts, AddFilesReceipt, PlanAddFilesRequest, PreparedAddFiles,
 };
 use novarocks::query_execution::request_context::RequestContext;
@@ -34,7 +34,9 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::{DmlError, DmlErrorKind};
+#[cfg(test)]
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
@@ -70,9 +72,6 @@ impl DmlService {
 
         let operation_id = DmlOperationId::new_v7();
         let connector_operation_id = Uuid::now_v7();
-        let journal = self
-            .require_journal()
-            .map_err(|error| journal_error(error, operation_id))?;
         let session = context.session();
         let initial = AddFilesLifecycleRecord {
             phase: AddFilesLifecyclePhase::Preparing,
@@ -96,8 +95,8 @@ impl DmlService {
             outcome: None,
             next_action: StatementNextAction::None,
         };
-        let mut stored = journal
-            .create_statement_operation(CreateStatementOperationRequest {
+        let mut active = self
+            .begin_statement_operation(CreateStatementOperationRequest {
                 operation_id,
                 mutation_id: Uuid::now_v7(),
                 operation_kind: OperationKind::AddFiles,
@@ -112,82 +111,106 @@ impl DmlService {
             })
             .map_err(|error| journal_error(error, operation_id))?;
 
-        let prepared = match engine.plan_add_files(PlanAddFilesRequest {
-            command,
-            current_catalog: session.current_catalog().map(ToOwned::to_owned),
-            current_database: session.current_database().to_string(),
-            mutation_operation_id: connector_operation_id.into_bytes(),
-            query_options: query_options.cloned(),
-            execution: context.execution().clone(),
-        }) {
-            Ok(prepared) => prepared,
-            Err(error) => return finish_plan_failure(journal, stored, error).map(|_| None),
-        };
-
-        if let Err(failure) = validate_plan_facts(connector_operation_id, &stored, &prepared.facts)
-        {
-            return persist_known_uncommitted(journal, stored, failure).map(|_| None);
-        }
-        let plan_artifact = artifact(
-            AddFilesArtifactKind::Plan,
-            prepared.facts.public_plan_wire.clone(),
-        )?;
-        let planned = planned_record(
-            &prepared.facts,
-            connector_operation_id,
-            plan_artifact.descriptor.clone(),
-        );
-        let reserve = AddFilesMutationRequest {
-            operation: OperationMutationRequest {
-                operation_id: stored.operation_id,
-                expected_revision: stored.revision,
-                mutation_id: Uuid::now_v7(),
-                state: OperationState::Committing,
-                payload: OperationPayload::AddFilesLifecycle(planned.clone()),
-            },
-            artifacts: vec![plan_artifact],
-            source_action: Some(AddFilesSourceAction::Reserve {
-                provider_id: prepared.facts.provider_id.clone(),
-                scope_digest: scope_digest(&prepared.facts),
-                ownership: SourceScopeOwnership::ReservedImmutable,
-            }),
-        };
-        journal
-            .preflight_add_files_mutation(&reserve)
-            .map_err(|error| journal_error(error, stored.operation_id))?;
-        stored = apply(journal, reserve)?;
-
-        // This second durable write is deliberately distinct from reservation:
-        // the plan and ownership are visible before execution is admitted.
-        let executing = AddFilesLifecycleRecord {
-            phase: AddFilesLifecyclePhase::Executing,
-            ..planned
-        };
-        stored = apply(
-            journal,
-            mutation(
-                stored,
-                OperationState::Committing,
-                executing,
-                Vec::new(),
-                None,
-            ),
-        )?;
-
-        finish_outcome(
+        let result = execute_add_files_operation(
             engine,
-            journal,
-            stored,
-            &prepared,
-            engine.execute_add_files(prepared.handle.as_ref()),
-            true,
-        )
-        .map(Some)
+            context,
+            query_options,
+            command,
+            connector_operation_id,
+            &mut active,
+        );
+        let _ = active.release();
+        result.map(Some)
     }
 }
 
+fn execute_add_files_operation(
+    engine: &dyn AddFilesEngine,
+    context: &RequestContext,
+    query_options: Option<&QueryOptions>,
+    command: AddFilesCommand,
+    connector_operation_id: Uuid,
+    active: &mut ActiveDmlOperation,
+) -> Result<u32, DmlError> {
+    let session = context.session();
+    let mut stored = active.stored.clone();
+
+    active.check_before_dispatch()?;
+    let prepared = match engine.plan_add_files(PlanAddFilesRequest {
+        command,
+        current_catalog: session.current_catalog().map(ToOwned::to_owned),
+        current_database: session.current_database().to_string(),
+        mutation_operation_id: connector_operation_id.into_bytes(),
+        query_options: query_options.cloned(),
+        execution: context.execution().clone(),
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => return finish_plan_failure(active, stored, error),
+    };
+
+    if let Err(failure) = validate_plan_facts(connector_operation_id, &stored, &prepared.facts) {
+        return persist_known_uncommitted(active, stored, failure);
+    }
+    let plan_artifact = artifact(
+        AddFilesArtifactKind::Plan,
+        prepared.facts.public_plan_wire.clone(),
+    )?;
+    let planned = planned_record(
+        &prepared.facts,
+        connector_operation_id,
+        plan_artifact.descriptor.clone(),
+    );
+    let reserve = AddFilesMutationRequest {
+        operation: OperationMutationRequest {
+            operation_id: stored.operation_id,
+            expected_revision: stored.revision,
+            mutation_id: Uuid::now_v7(),
+            state: OperationState::Committing,
+            payload: OperationPayload::AddFilesLifecycle(planned.clone()),
+        },
+        artifacts: vec![plan_artifact],
+        source_action: Some(AddFilesSourceAction::Reserve {
+            provider_id: prepared.facts.provider_id.clone(),
+            scope_digest: scope_digest(&prepared.facts),
+            ownership: SourceScopeOwnership::ReservedImmutable,
+        }),
+    };
+    active
+        .journal
+        .preflight_add_files_mutation(&reserve)
+        .map_err(|error| journal_error(error, stored.operation_id))?;
+    stored = apply(active, reserve)?;
+
+    // This second durable write is deliberately distinct from reservation:
+    // the plan and ownership are visible before execution is admitted.
+    let executing = AddFilesLifecycleRecord {
+        phase: AddFilesLifecyclePhase::Executing,
+        ..planned
+    };
+    stored = apply(
+        active,
+        mutation(
+            stored,
+            OperationState::Committing,
+            executing,
+            Vec::new(),
+            None,
+        ),
+    )?;
+
+    active.check_before_dispatch()?;
+    finish_outcome(
+        engine,
+        active,
+        stored,
+        &prepared,
+        engine.execute_add_files(prepared.handle.as_ref()),
+        true,
+    )
+}
+
 fn finish_plan_failure(
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     error: AddFilesPlanError,
 ) -> Result<u32, DmlError> {
@@ -203,7 +226,7 @@ fn finish_plan_failure(
 
 fn finish_outcome(
     engine: &dyn AddFilesEngine,
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     prepared: &PreparedAddFiles,
     outcome: AddFilesOutcome,
@@ -242,7 +265,7 @@ fn finish_outcome(
 
 fn persist_unknown_then_reconcile(
     engine: &dyn AddFilesEngine,
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     prepared: &PreparedAddFiles,
     failure: AddFilesFailure,
@@ -277,6 +300,7 @@ fn persist_unknown_then_reconcile(
         };
     if let Some(descriptor) = first_evidence.as_ref() {
         let existing = journal
+            .journal
             .load_add_files_artifact(stored.operation_id, descriptor)
             .map_err(|error| journal_error(error, stored.operation_id))?;
         if existing.bytes != evidence.wire_bytes {
@@ -355,12 +379,13 @@ fn persist_unknown_then_reconcile(
             None,
         ),
     )?;
+    journal.check_before_dispatch()?;
     let reconciled = engine.reconcile_add_files(prepared.handle.as_ref(), &evidence);
     finish_outcome(engine, journal, stored, prepared, reconciled, false)
 }
 
 fn persist_known_committed(
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     facts: &AddFilesPlanFacts,
     _effect: AddFilesEffect,
@@ -452,7 +477,7 @@ fn persist_known_committed(
 /// frontend cannot retain its receipt.  Record that ownership truth and stop
 /// at manual inspection; releasing or freezing this source would be false.
 fn persist_committed_manual(
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     facts: &AddFilesPlanFacts,
     message: String,
@@ -510,7 +535,7 @@ fn persist_committed_manual(
 }
 
 fn persist_known_uncommitted(
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     failure: AddFilesFailure,
 ) -> Result<u32, DmlError> {
@@ -560,7 +585,7 @@ fn persist_known_uncommitted(
 }
 
 fn persist_contract_failure(
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     failure: AddFilesFailure,
     dispatch: AddFilesDispatchState,
@@ -576,7 +601,7 @@ fn persist_contract_failure(
 }
 
 fn persist_frozen_manual(
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     failure: AddFilesFailure,
     evidence: Option<AddFilesArtifact>,
@@ -634,13 +659,14 @@ fn persist_frozen_manual(
 }
 
 fn apply(
-    journal: &dyn OperationJournal,
+    journal: &mut ActiveDmlOperation,
     request: AddFilesMutationRequest,
 ) -> Result<StoredOperation, DmlError> {
     let operation_id = request.operation.operation_id;
     journal
-        .apply_add_files_mutation(request)
-        .map_err(|error| journal_error(error, operation_id))
+        .apply_add_files_mutation(request, None)
+        .map_err(|error| journal_error(error, operation_id))?;
+    Ok(journal.stored.clone())
 }
 
 fn mutation(
@@ -1244,6 +1270,8 @@ mod tests {
                 base_snapshot_map: BTreeMap::new(),
                 staged_artifacts: Vec::new(),
                 payload: request.payload,
+                coordination_provenance: None,
+                recovery_due_at_ms: None,
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,

@@ -24,22 +24,23 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use novarocks_spi::connector::ExternalMutationEvidence;
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::OperationId;
 use novarocks_state_store::coordination::{
-    AcquireOutcome, AttemptId, ClockHealth, CoordinationError, CoordinationErrorKind, HolderId,
-    IncarnationGate, LeaseClock, LeaseFence, LeaseManager, LeaseSettings, ResourceKey,
+    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseFence, LeaseManager,
+    ResourceKey, WriteAdmission,
 };
 use uuid::Uuid;
 
 use super::model::{StatisticsJob, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState};
 use super::repository::FenceValidator;
 use super::repository::StatisticsJobRepository;
+use crate::coordination::FrontendCoordinationRuntime;
 
 /// One process-wide lease protects all durable ANALYZE attempts for a frontend
 /// deployment. It is deliberately not keyed by table or session.
@@ -152,9 +153,25 @@ impl StatisticsAnalyzeWorker {
         repository: Arc<StatisticsJobRepository>,
         executor: Arc<dyn StatisticsAttemptExecutor>,
     ) -> Result<Self, String> {
-        let coordination = StatisticsAnalyzeWorkerCoordination::open(repository.store())
+        let frontend_coordination = FrontendCoordinationRuntime::open(repository.store())
             .await
             .map_err(|error| format!("open statistics worker coordination failed: {error}"))?;
+        Self::start_with_coordination(
+            runtime,
+            repository,
+            executor,
+            StatisticsAnalyzeWorkerCoordination::from_frontend(&frontend_coordination)
+                .map_err(|error| error.to_string())?,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_coordination(
+        runtime: &tokio::runtime::Handle,
+        repository: Arc<StatisticsJobRepository>,
+        executor: Arc<dyn StatisticsAttemptExecutor>,
+        coordination: StatisticsAnalyzeWorkerCoordination,
+    ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let wakeup = Arc::new(tokio::sync::Notify::new());
         let join = runtime.spawn(run_worker(
@@ -182,6 +199,12 @@ impl StatisticsAnalyzeWorker {
             return Ok(());
         };
         let joined = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                return Err(
+                    "statistics worker cannot synchronously join from a current-thread Tokio runtime"
+                        .to_string(),
+                );
+            }
             tokio::task::block_in_place(|| runtime.block_on(join))
         } else {
             tokio::runtime::Builder::new_current_thread()
@@ -211,28 +234,38 @@ async fn run_worker(
             .map_err(|error| format!("acquire statistics worker lease failed: {error}"))?
         {
             AcquireOutcome::Acquired(mut guard) => {
-                let fence = StatisticsAnalyzeWorkerCoordination::fence_validator(guard.fence());
+                let current_fence = CurrentLeaseFence::new(guard.fence());
+                let fence = current_fence.validator();
                 process_cancellation_requests(&repository, now_unix_millis(), &fence).await?;
                 recover_incomplete(&repository, now_unix_millis(), &fence).await?;
                 let result = reconcile_publishing(
                     repository.as_ref(),
                     &executor,
                     &mut guard,
+                    &current_fence,
                     &fence,
                     stop.as_ref(),
                 )
                 .await;
                 let result = match result {
-                    Ok(()) => {
-                        process_submitted(
-                            repository.as_ref(),
-                            &executor,
-                            &mut guard,
-                            &fence,
-                            stop.as_ref(),
-                        )
-                        .await
-                    }
+                    Ok(()) => match coordination.admit_submitted_claims(&current_fence).await {
+                        Ok(claim_fence) => {
+                            process_submitted(
+                                repository.as_ref(),
+                                &executor,
+                                &mut guard,
+                                &current_fence,
+                                &claim_fence,
+                                &fence,
+                                stop.as_ref(),
+                            )
+                            .await
+                        }
+                        Err(error) if error.kind() == CoordinationErrorKind::WriteClosed => Ok(()),
+                        Err(error) => {
+                            Err(format!("admit submitted statistics jobs failed: {error}"))
+                        }
+                    },
                     Err(error) => Err(error),
                 };
                 let release = release_worker_lease(&mut guard).await;
@@ -253,7 +286,14 @@ async fn release_worker_lease(
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
 ) -> Result<(), CoordinationError> {
     for attempt in 1..=STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS {
-        match guard.release(OperationId::new_v7()).await {
+        let operation_id = OperationId::new_v7();
+        let result = match guard.release(operation_id).await {
+            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                guard.recover_release(operation_id).await
+            }
+            result => result,
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(error)
                 if error.kind() == CoordinationErrorKind::OperationNotCommitted
@@ -339,6 +379,7 @@ async fn reconcile_publishing(
     repository: &StatisticsJobRepository,
     executor: &Weak<dyn StatisticsAttemptExecutor>,
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    current_fence: &CurrentLeaseFence,
     fence: &FenceValidator,
     stop: &AtomicBool,
 ) -> Result<(), String> {
@@ -362,7 +403,7 @@ async fn reconcile_publishing(
         })?;
         let evidence = ExternalMutationEvidence::try_from_wire_v1(evidence)
             .map_err(|error| format!("decode statistics publication evidence: {error}"))?;
-        let outcome = run_with_lease_renewal(guard, {
+        let outcome = run_with_lease_renewal(guard, current_fence, {
             let executor = Arc::clone(&executor);
             let job = job.clone();
             move || executor.reconcile(&job, &evidence)
@@ -419,6 +460,8 @@ async fn process_submitted(
     repository: &StatisticsJobRepository,
     executor: &Weak<dyn StatisticsAttemptExecutor>,
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    current_fence: &CurrentLeaseFence,
+    claim_fence: &FenceValidator,
     fence: &FenceValidator,
     stop: &AtomicBool,
 ) -> Result<(), String> {
@@ -441,7 +484,7 @@ async fn process_submitted(
             return Ok(());
         };
         let Some(preparing) = repository
-            .claim(job.job_id, now_unix_millis(), fence)
+            .claim(job.job_id, now_unix_millis(), claim_fence)
             .await
             .map_err(|error| format!("claim statistics job {} failed: {error}", job.job_id))?
         else {
@@ -460,7 +503,7 @@ async fn process_submitted(
             .map_err(|error| {
                 format!("start statistics job {} failed: {error}", preparing.job_id)
             })?;
-        let collect = run_with_lease_renewal(guard, {
+        let collect = run_with_lease_renewal(guard, current_fence, {
             let executor = Arc::clone(&executor);
             let running = running.clone();
             move || executor.collect(&running)
@@ -504,7 +547,7 @@ async fn process_submitted(
                 })?;
             continue;
         }
-        let evidence = run_with_lease_renewal(guard, {
+        let evidence = run_with_lease_renewal(guard, current_fence, {
             let executor = Arc::clone(&executor);
             let running = running.clone();
             let collected = Arc::clone(&collected);
@@ -530,7 +573,7 @@ async fn process_submitted(
                     running.job_id
                 )
             })?;
-        let publish = run_with_lease_renewal(guard, {
+        let publish = run_with_lease_renewal(guard, current_fence, {
             let executor = Arc::clone(&executor);
             let publishing = publishing.clone();
             let collected = Arc::clone(&collected);
@@ -637,6 +680,7 @@ fn retry_backoff(attempt: u32) -> Duration {
 
 async fn run_with_lease_renewal<T, F>(
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    current_fence: &CurrentLeaseFence,
     work: F,
 ) -> Result<T, StatisticsAttemptError>
 where
@@ -653,12 +697,21 @@ where
                 ))?;
             }
             _ = tokio::time::sleep(guard.renew_after()) => {
-                guard.renew(OperationId::new_v7()).await.map_err(|error| {
-                    StatisticsAttemptError::reconcile(
+                let operation_id = OperationId::new_v7();
+                let renewal = match guard.renew(operation_id).await {
+                    Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                        guard.recover_renew(operation_id).await
+                    }
+                    result => result,
+                };
+                if let Err(error) = renewal {
+                    let _ = task.await;
+                    return Err(StatisticsAttemptError::reconcile(
                         StatisticsJobErrorKind::Internal,
                         format!("statistics worker lease renewal failed: {error}"),
-                    )
-                })?;
+                    ));
+                }
+                current_fence.replace(guard.fence())?;
             }
         }
     }
@@ -681,75 +734,28 @@ fn now_unix_millis() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-/// Production wall/monotonic clock for the statistics worker. Tests inject a
-/// deterministic `LeaseClock` directly through `open_with_clock`.
-#[derive(Debug)]
-pub struct SystemStatisticsLeaseClock {
-    monotonic_origin: Instant,
-}
-
-impl Default for SystemStatisticsLeaseClock {
-    fn default() -> Self {
-        Self {
-            monotonic_origin: Instant::now(),
-        }
-    }
-}
-
-impl LeaseClock for SystemStatisticsLeaseClock {
-    fn wall_time_millis(&self) -> Result<u64, CoordinationError> {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| CoordinationError::clock_unsafe())
-            .and_then(|duration| {
-                u64::try_from(duration.as_millis()).map_err(|_| CoordinationError::clock_unsafe())
-            })
-    }
-
-    fn monotonic_time_millis(&self) -> u64 {
-        u64::try_from(self.monotonic_origin.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    fn health(&self) -> ClockHealth {
-        ClockHealth::Healthy
-    }
-}
-
 /// Coordination facade used by the durable worker. Opening it may bootstrap a
 /// missing coordination record, but never mutates an already bootstrapped
 /// incarnation's restore/write mode.
 #[derive(Clone)]
 pub struct StatisticsAnalyzeWorkerCoordination {
+    frontend: FrontendCoordinationRuntime,
     manager: LeaseManager,
     resource: ResourceKey,
 }
 
 impl StatisticsAnalyzeWorkerCoordination {
     pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
-        Self::open_with_clock(store, Arc::new(SystemStatisticsLeaseClock::default())).await
+        let frontend = FrontendCoordinationRuntime::open(store).await?;
+        Self::from_frontend(&frontend)
     }
 
-    pub async fn open_with_clock(
-        store: Arc<dyn StateStore>,
-        clock: Arc<dyn LeaseClock>,
+    pub(crate) fn from_frontend(
+        frontend: &FrontendCoordinationRuntime,
     ) -> Result<Self, CoordinationError> {
-        let gate = IncarnationGate::new(Arc::clone(&store));
-        match gate.load().await {
-            Ok(_) => {}
-            Err(error) if error.kind() == CoordinationErrorKind::NotBootstrapped => {
-                gate.bootstrap(OperationId::new_v7()).await?;
-            }
-            Err(error) => return Err(error),
-        }
-        let holder = HolderId::try_from(Bytes::from(Uuid::now_v7().to_string()))?;
-        let settings = LeaseSettings::new(
-            STATISTICS_LEASE_DURATION,
-            STATISTICS_LEASE_RENEW_INTERVAL,
-            STATISTICS_MAX_CLOCK_SKEW,
-            STATISTICS_TAKEOVER_OBSERVATION,
-        )?;
         Ok(Self {
-            manager: LeaseManager::new(store, holder, clock, settings)?,
+            frontend: frontend.clone(),
+            manager: frontend.lease_manager(),
             resource: ResourceKey::try_from(Bytes::from_static(
                 STATISTICS_ANALYZE_WORKER_RESOURCE_BYTES,
             ))?,
@@ -757,13 +763,28 @@ impl StatisticsAnalyzeWorkerCoordination {
     }
 
     pub async fn acquire(&self) -> Result<AcquireOutcome, CoordinationError> {
-        self.manager
-            .acquire(
-                self.resource.clone(),
-                AttemptId::try_from(Uuid::now_v7())?,
-                OperationId::new_v7(),
-            )
+        let attempt = AttemptId::try_from(Uuid::now_v7())?;
+        let operation_id = OperationId::new_v7();
+        match self
+            .manager
+            .acquire(self.resource.clone(), attempt, operation_id)
             .await
+        {
+            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                self.manager
+                    .recover_acquire(self.resource.clone(), attempt, operation_id)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn admit_submitted_claims(
+        &self,
+        current_fence: &CurrentLeaseFence,
+    ) -> Result<FenceValidator, CoordinationError> {
+        let admission = self.frontend.admit_writes().await?;
+        Ok(current_fence.validator_with_admission(admission))
     }
 
     /// Creates the validator used by repository mutation transactions. The
@@ -780,5 +801,72 @@ impl StatisticsAnalyzeWorkerCoordination {
                     .map_err(|error| error.to_string())
             })
         })
+    }
+}
+
+struct CurrentLeaseFence {
+    fence: Arc<RwLock<LeaseFence>>,
+}
+
+impl CurrentLeaseFence {
+    fn new(fence: LeaseFence) -> Self {
+        Self {
+            fence: Arc::new(RwLock::new(fence)),
+        }
+    }
+
+    fn validator(&self) -> FenceValidator {
+        let current = Arc::clone(&self.fence);
+        Arc::new(move |transaction| {
+            let fence = match current.read() {
+                Ok(fence) => fence.clone(),
+                Err(_) => {
+                    return Box::pin(async {
+                        Err("statistics worker fence lock poisoned".to_string())
+                    });
+                }
+            };
+            Box::pin(async move {
+                fence
+                    .validate_in(transaction)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    fn validator_with_admission(&self, admission: WriteAdmission) -> FenceValidator {
+        let current = Arc::clone(&self.fence);
+        Arc::new(move |transaction| {
+            let admission = admission.clone();
+            let fence = match current.read() {
+                Ok(fence) => fence.clone(),
+                Err(_) => {
+                    return Box::pin(async {
+                        Err("statistics worker fence lock poisoned".to_string())
+                    });
+                }
+            };
+            Box::pin(async move {
+                admission
+                    .validate_in(transaction)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                fence
+                    .validate_in(transaction)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    fn replace(&self, fence: LeaseFence) -> Result<(), StatisticsAttemptError> {
+        *self.fence.write().map_err(|_| {
+            StatisticsAttemptError::permanent(
+                StatisticsJobErrorKind::Internal,
+                "statistics worker fence lock poisoned",
+            )
+        })? = fence;
+        Ok(())
     }
 }

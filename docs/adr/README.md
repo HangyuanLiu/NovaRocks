@@ -163,6 +163,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0032 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（active）
 - ADR-0033 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
 - ADR-0046 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（active）
+- ADR-0051 — Frontend DML 为何使用 operation-scoped StateStore authority、且不把它宣称为 external commit fencing（active）
 
 #### 历史
 

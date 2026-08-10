@@ -28,6 +28,7 @@ use novarocks_spi::connector::{
     ConnectorWriteReceipt, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
+use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
@@ -69,12 +70,12 @@ pub trait WriteExecutor {
     fn finalize(&self, spec: &WriteTransactionSpec) -> Result<(), String>;
 }
 
-pub trait WriteAdmission: Send + Sync {
+pub(crate) trait WriteAdmission: Send + Sync {
     fn admit(&self) -> Result<(), DmlError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AlwaysAdmit;
+pub(crate) struct AlwaysAdmit;
 
 impl WriteAdmission for AlwaysAdmit {
     fn admit(&self) -> Result<(), DmlError> {
@@ -82,7 +83,7 @@ impl WriteAdmission for AlwaysAdmit {
     }
 }
 
-pub struct WriteTransactionRunner<'a, E: WriteExecutor> {
+pub(crate) struct WriteTransactionRunner<'a, E: WriteExecutor> {
     journal: &'a dyn OperationJournal,
     executor: &'a E,
     admission: &'a dyn WriteAdmission,
@@ -103,16 +104,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
 
     pub fn run(&self, spec: WriteTransactionSpec) -> Result<WriteTransactionOutcome, DmlError> {
         self.admission.admit()?;
-        let operation_id = self.journal.create_preparing(CreatePreparingRequest {
-            operation_kind: spec.operation_kind,
-            operation_subkind: spec.operation_subkind.clone(),
-            target: spec.target.clone(),
-            attempt_id: spec.attempt_id.clone(),
-            base_snapshot_id: spec.base_snapshot_id,
-            base_snapshot_map: spec.base_snapshot_map.clone(),
-            staged_artifacts: Vec::new(),
-            created_at_ms: now_unix_millis(),
-        })?;
+        let operation_id = self.journal.create_preparing(preparing_request(&spec))?;
 
         let report = match self.executor.run_coordinated_write(&spec) {
             Ok(report) => report,
@@ -268,6 +260,277 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
     }
 }
 
+/// Build the durable intent that must be admitted and claimed before provider
+/// code is allowed to observe the write transaction.
+pub(crate) fn preparing_request(spec: &WriteTransactionSpec) -> CreatePreparingRequest {
+    CreatePreparingRequest {
+        operation_kind: spec.operation_kind,
+        operation_subkind: spec.operation_subkind.clone(),
+        target: spec.target.clone(),
+        attempt_id: spec.attempt_id.clone(),
+        base_snapshot_id: spec.base_snapshot_id,
+        base_snapshot_map: spec.base_snapshot_map.clone(),
+        staged_artifacts: Vec::new(),
+        created_at_ms: now_unix_millis(),
+    }
+}
+
+/// Fenced production write runner. The active operation owns the current
+/// expected revision and dynamically validates the live lease fence for every
+/// journal mutation.
+pub(crate) struct ActiveWriteTransactionRunner<'a, E: WriteExecutor> {
+    operation: ActiveDmlOperation,
+    executor: &'a E,
+}
+
+impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
+    pub(crate) fn new(operation: ActiveDmlOperation, executor: &'a E) -> Self {
+        Self {
+            operation,
+            executor,
+        }
+    }
+
+    pub(crate) fn run(
+        mut self,
+        spec: WriteTransactionSpec,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        let result = self.run_inner(&spec);
+        // Releasing the lease is cleanup, not part of the SQL commit outcome.
+        // In particular, a terminal durable fact must remain authoritative if
+        // release itself cannot be confirmed.
+        let _ = self.operation.release();
+        result
+    }
+
+    fn run_inner(
+        &mut self,
+        spec: &WriteTransactionSpec,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        self.transition_recoverable(OperationState::Writing)?;
+        self.operation.check_before_dispatch()?;
+        let report = match self.executor.run_coordinated_write(spec) {
+            Ok(report) => report,
+            Err(message) => return self.known_uncommitted(message),
+        };
+        match report {
+            CoordinatedWriteReport::Aborted { reason } => self.known_uncommitted(reason),
+            CoordinatedWriteReport::NoOp => {
+                self.transition_recoverable(OperationState::Committing)?;
+                self.record_outcome(&ExternalMutationOutcome::KnownCommitted {
+                    effect: novarocks_spi::connector::ExternalMutationEffect::NoOp,
+                    receipt: empty_receipt()?,
+                    finalization: ExternalMutationFinalization::Complete,
+                })?;
+                self.operation.transition(OperationState::Finalized, None)?;
+                Ok(WriteTransactionOutcome {
+                    operation_id: Some(self.operation.operation_id()),
+                    committed_receipt: None,
+                })
+            }
+            CoordinatedWriteReport::CommitRequired(handle) => {
+                self.transition_recoverable(OperationState::Committing)?;
+                self.operation.check_before_dispatch()?;
+                match self.executor.commit(spec, &handle) {
+                    Ok(outcome) => self.complete_terminal(spec, outcome),
+                    // The provider call has crossed the commit dispatch
+                    // boundary. An adapter/envelope error cannot prove that
+                    // the external mutation did not commit, so keep the
+                    // durable operation in its recoverable Committing state.
+                    Err(message) => Err(DmlError::ambiguous_outcome_not_durable(
+                        self.operation.operation_id(),
+                        message,
+                    )),
+                }
+            }
+            CoordinatedWriteReport::AbortRequired { reason, handle } => {
+                self.transition_recoverable(OperationState::Aborting)?;
+                self.operation.check_before_dispatch()?;
+                match self.executor.abort(spec, &handle) {
+                    Ok(outcome) => self.complete_abort(spec, &reason, outcome),
+                    // Abort dispatch can race an external commit and its
+                    // result adapter can fail after observing provider state.
+                    // Preserve Aborting + recovery eligibility until a typed
+                    // terminal outcome can be recorded.
+                    Err(message) => Err(DmlError::ambiguous_outcome_not_durable(
+                        self.operation.operation_id(),
+                        message,
+                    )),
+                }
+            }
+        }
+    }
+
+    fn complete_abort(
+        &mut self,
+        spec: &WriteTransactionSpec,
+        stage_reason: &str,
+        outcome: ConnectorWriteAbortOutcome,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        let fact = reconcile::operation_fact_from_abort_outcome(&outcome)
+            .map_err(DmlError::journal_corruption)?;
+        if let Err(error) = self.record_fact(fact) {
+            return match &outcome {
+                ConnectorWriteAbortOutcome::KnownCommitted { receipt, .. } => {
+                    Err(DmlError::committed_outcome_not_durable(
+                        self.operation.operation_id(),
+                        receipt.clone(),
+                        error,
+                    ))
+                }
+                ConnectorWriteAbortOutcome::CommitUnknown { .. } => Err(
+                    DmlError::ambiguous_outcome_not_durable(self.operation.operation_id(), error),
+                ),
+                ConnectorWriteAbortOutcome::KnownUncommitted { .. } => Err(error),
+            };
+        }
+        match outcome {
+            ConnectorWriteAbortOutcome::KnownCommitted { receipt, .. } => {
+                self.finish_committed(spec, receipt)
+            }
+            ConnectorWriteAbortOutcome::KnownUncommitted { .. } => {
+                Err(DmlError::executor(stage_reason))
+            }
+            ConnectorWriteAbortOutcome::CommitUnknown { failure, .. } => {
+                Err(DmlError::commit(failure.message()))
+            }
+        }
+    }
+
+    fn complete_terminal(
+        &mut self,
+        spec: &WriteTransactionSpec,
+        outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        if let Err(error) = self.record_outcome(&outcome) {
+            return match &outcome {
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
+                    receipt,
+                    ..
+                } => Err(DmlError::committed_outcome_not_durable(
+                    self.operation.operation_id(),
+                    receipt.clone(),
+                    error,
+                )),
+                ExternalMutationOutcome::CommitUnknown { .. } => Err(
+                    DmlError::ambiguous_outcome_not_durable(self.operation.operation_id(), error),
+                ),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: novarocks_spi::connector::ExternalMutationEffect::NoOp,
+                    ..
+                }
+                | ExternalMutationOutcome::KnownUncommitted { .. } => Err(error),
+            };
+        }
+        match outcome {
+            ExternalMutationOutcome::KnownCommitted {
+                effect: novarocks_spi::connector::ExternalMutationEffect::NoOp,
+                ..
+            } => {
+                self.operation.transition(OperationState::Finalized, None)?;
+                Ok(WriteTransactionOutcome {
+                    operation_id: Some(self.operation.operation_id()),
+                    committed_receipt: None,
+                })
+            }
+            ExternalMutationOutcome::KnownCommitted { receipt, .. } => {
+                self.finish_committed(spec, receipt)
+            }
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                Err(DmlError::commit(failure.message()))
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+                Err(DmlError::commit(failure.message()))
+            }
+        }
+    }
+
+    fn finish_committed(
+        &mut self,
+        spec: &WriteTransactionSpec,
+        receipt: ConnectorWriteReceipt,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        if let Err(error) = self.transition_recoverable(OperationState::Finalizing) {
+            return Err(DmlError::committed_but_unfinalized(
+                self.operation.operation_id(),
+                Some(receipt),
+                error,
+            ));
+        }
+        if let Err(error) = self.operation.check_before_dispatch() {
+            return Err(DmlError::committed_but_unfinalized(
+                self.operation.operation_id(),
+                Some(receipt),
+                error,
+            ));
+        }
+        if let Err(message) = self.executor.finalize(spec) {
+            let failure =
+                ConnectorMutationFailure::new(ConnectorMutationFailureKind::Internal, message);
+            let fact = reconcile::operation_fact_from_finalize_failure(&receipt, &failure)
+                .map_err(DmlError::journal_corruption)?;
+            if let Err(error) = self.record_fact(fact) {
+                return Err(DmlError::committed_but_unfinalized(
+                    self.operation.operation_id(),
+                    Some(receipt),
+                    error,
+                ));
+            }
+            return Err(DmlError::committed_but_unfinalized(
+                self.operation.operation_id(),
+                Some(receipt),
+                "post-commit finalization failed",
+            ));
+        }
+        if let Err(error) = self.operation.transition(OperationState::Finalized, None) {
+            return Err(DmlError::committed_but_unfinalized(
+                self.operation.operation_id(),
+                Some(receipt),
+                error,
+            ));
+        }
+        Ok(WriteTransactionOutcome {
+            operation_id: Some(self.operation.operation_id()),
+            committed_receipt: Some(receipt),
+        })
+    }
+
+    fn record_outcome(
+        &mut self,
+        outcome: &ExternalMutationOutcome<ConnectorWriteReceipt>,
+    ) -> Result<(), DmlError> {
+        let fact = reconcile::operation_fact_from_outcome(outcome)
+            .map_err(DmlError::journal_corruption)?;
+        self.record_fact(fact)
+    }
+
+    fn known_uncommitted(&mut self, message: String) -> Result<WriteTransactionOutcome, DmlError> {
+        let failure =
+            ConnectorMutationFailure::new(ConnectorMutationFailureKind::Internal, message.clone());
+        self.record_outcome(&ExternalMutationOutcome::KnownUncommitted { failure })?;
+        Err(DmlError::executor(message))
+    }
+
+    fn record_fact(&mut self, fact: crate::dml::model::OperationFact) -> Result<(), DmlError> {
+        let recovery_due_at_ms = if fact.state.is_finished() {
+            None
+        } else {
+            self.recovery_due()
+        };
+        self.operation.record_fact(fact, recovery_due_at_ms)
+    }
+
+    fn recovery_due(&self) -> Option<i64> {
+        self.operation.stored.recovery_due_at_ms
+    }
+
+    fn transition_recoverable(&mut self, to: OperationState) -> Result<(), DmlError> {
+        let recovery_due_at_ms = self.recovery_due();
+        self.operation.transition(to, recovery_due_at_ms)
+    }
+}
+
 fn empty_receipt() -> Result<ConnectorWriteReceipt, DmlError> {
     ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"connector-write-noop"))
         .map_err(DmlError::journal_corruption)
@@ -277,11 +540,83 @@ fn empty_receipt() -> Result<ConnectorWriteReceipt, DmlError> {
 mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
+    use std::sync::Arc;
 
     use super::*;
     use crate::dml::journal::testing::InMemoryOperationJournal;
 
     struct KnownUncommittedAbortExecutor;
+
+    struct CommitEnvelopeFailureExecutor;
+
+    impl WriteExecutor for CommitEnvelopeFailureExecutor {
+        type CommitHandle = ();
+        type AbortHandle = Infallible;
+
+        fn run_coordinated_write(
+            &self,
+            _spec: &WriteTransactionSpec,
+        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+            Ok(CoordinatedWriteReport::CommitRequired(()))
+        }
+
+        fn abort(
+            &self,
+            _spec: &WriteTransactionSpec,
+            handle: &Self::AbortHandle,
+        ) -> Result<ConnectorWriteAbortOutcome, String> {
+            match *handle {}
+        }
+
+        fn commit(
+            &self,
+            _spec: &WriteTransactionSpec,
+            _handle: &Self::CommitHandle,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+            Err("encode terminal commit receipt".to_string())
+        }
+
+        fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
+            panic!("unresolved commit must not finalize")
+        }
+    }
+
+    struct AbortEnvelopeFailureExecutor;
+
+    impl WriteExecutor for AbortEnvelopeFailureExecutor {
+        type CommitHandle = Infallible;
+        type AbortHandle = ();
+
+        fn run_coordinated_write(
+            &self,
+            _spec: &WriteTransactionSpec,
+        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+            Ok(CoordinatedWriteReport::AbortRequired {
+                reason: "stage requires abort".to_string(),
+                handle: (),
+            })
+        }
+
+        fn abort(
+            &self,
+            _spec: &WriteTransactionSpec,
+            _handle: &Self::AbortHandle,
+        ) -> Result<ConnectorWriteAbortOutcome, String> {
+            Err("encode terminal abort evidence".to_string())
+        }
+
+        fn commit(
+            &self,
+            _spec: &WriteTransactionSpec,
+            handle: &Self::CommitHandle,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+            match *handle {}
+        }
+
+        fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
+            panic!("unresolved abort must not finalize")
+        }
+    }
 
     impl WriteExecutor for KnownUncommittedAbortExecutor {
         type CommitHandle = Infallible;
@@ -353,5 +688,82 @@ mod tests {
             journal.only_operation().state,
             OperationState::FailedKnownUncommitted
         );
+    }
+
+    #[test]
+    fn active_runner_persists_terminal_abort_through_active_operation() {
+        let journal = Arc::new(InMemoryOperationJournal::default());
+        let operation_id = journal
+            .create_preparing(preparing_request(&spec()))
+            .expect("intent");
+        let stored = journal.load(operation_id).unwrap().unwrap();
+        let operation = ActiveDmlOperation::legacy(journal.clone(), stored);
+
+        let error = ActiveWriteTransactionRunner::new(operation, &KnownUncommittedAbortExecutor)
+            .run(spec())
+            .expect_err("known-uncommitted abort must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Executor: MOR UPDATE matched target row: duplicate _row_id=7"
+        );
+        assert_eq!(
+            journal.only_operation().state,
+            OperationState::FailedKnownUncommitted
+        );
+    }
+
+    #[test]
+    fn active_runner_keeps_commit_dispatch_adapter_failure_recoverable() {
+        let journal = Arc::new(InMemoryOperationJournal::default());
+        let operation_id = journal
+            .create_preparing(preparing_request(&spec()))
+            .expect("intent");
+        let stored = journal.load(operation_id).unwrap().unwrap();
+        let operation = ActiveDmlOperation::legacy(journal.clone(), stored);
+
+        let error = ActiveWriteTransactionRunner::new(operation, &CommitEnvelopeFailureExecutor)
+            .run(spec())
+            .expect_err("terminal receipt encoding failure must remain unresolved");
+
+        assert_eq!(
+            error.kind(),
+            crate::dml::error::DmlErrorKind::CoordinationUnresolved
+        );
+        assert_eq!(error.operation_id(), Some(operation_id));
+        assert_eq!(
+            error.next_action(),
+            Some(crate::dml::model::StatementNextAction::ManualInspect)
+        );
+        let stored = journal.only_operation();
+        assert_eq!(stored.state, OperationState::Committing);
+        assert!(stored.recovery_due_at_ms.is_some());
+    }
+
+    #[test]
+    fn active_runner_keeps_abort_dispatch_adapter_failure_recoverable() {
+        let journal = Arc::new(InMemoryOperationJournal::default());
+        let operation_id = journal
+            .create_preparing(preparing_request(&spec()))
+            .expect("intent");
+        let stored = journal.load(operation_id).unwrap().unwrap();
+        let operation = ActiveDmlOperation::legacy(journal.clone(), stored);
+
+        let error = ActiveWriteTransactionRunner::new(operation, &AbortEnvelopeFailureExecutor)
+            .run(spec())
+            .expect_err("terminal abort evidence encoding failure must remain unresolved");
+
+        assert_eq!(
+            error.kind(),
+            crate::dml::error::DmlErrorKind::CoordinationUnresolved
+        );
+        assert_eq!(error.operation_id(), Some(operation_id));
+        assert_eq!(
+            error.next_action(),
+            Some(crate::dml::model::StatementNextAction::ManualInspect)
+        );
+        let stored = journal.only_operation();
+        assert_eq!(stored.state, OperationState::Aborting);
+        assert!(stored.recovery_due_at_ms.is_some());
     }
 }

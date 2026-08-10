@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
 use novarocks_frontend::dml::{
-    ConnectorWriteFinalizationRecord, ConnectorWriteLifecycleRecord, CtasSagaPhase,
-    ExternalFactOutcome, OperationKind, OperationPayload, OperationState, StatementNextAction,
-    TruncateLifecyclePhase,
+    AddFilesLifecyclePhase, ConnectorWriteFinalizationRecord, ConnectorWriteLifecycleRecord,
+    CtasSagaPhase, ExternalFactOutcome, OperationKind, OperationPayload, OperationState,
+    StatementNextAction, TruncateLifecyclePhase,
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
@@ -3101,6 +3101,188 @@ enable_path_style_access = true
     runtime
         .block_on(host.shutdown())
         .expect("CTAS/TRUNCATE inspection host shutdown");
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_frontend_add_files_lifecycle() {
+    let Ok(rest_uri) = std::env::var("NOVAROCKS_ICEBERG_REST_URI") else {
+        eprintln!(
+            "SKIP cross_process_three_be_frontend_add_files_lifecycle: \
+             NOVAROCKS_ICEBERG_REST_URI is not configured"
+        );
+        return;
+    };
+    let rest_warehouse = std::env::var("NOVAROCKS_ICEBERG_REST_WAREHOUSE")
+        .expect("ADD FILES lifecycle acceptance requires NOVAROCKS_ICEBERG_REST_WAREHOUSE");
+    let s3_endpoint = std::env::var("AWS_S3_ENDPOINT")
+        .expect("ADD FILES lifecycle acceptance requires AWS_S3_ENDPOINT");
+    let s3_access_key = std::env::var("AWS_S3_ACCESS_KEY_ID")
+        .expect("ADD FILES lifecycle acceptance requires AWS_S3_ACCESS_KEY_ID");
+    let s3_secret_key = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+        .expect("ADD FILES lifecycle acceptance requires AWS_S3_SECRET_ACCESS_KEY");
+    let spark_sql = std::env::var("NOVAROCKS_SPARK_SQL")
+        .expect("ADD FILES lifecycle acceptance requires NOVAROCKS_SPARK_SQL");
+
+    let _guard = lock_cluster_mvp();
+    let fixture_dir =
+        tempfile::tempdir_in(runtime_dir()).expect("create ADD FILES lifecycle fixture directory");
+    let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
+    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let suffix = std::process::id();
+    let namespace = format!("dml_add_files_cluster_{suffix}");
+    let table = "imported_orders";
+    let source = format!("cp3-add-files-{suffix}");
+    let catalog = "add_files_lifecycle_ice";
+    let cluster_id = "frontend-add-files-lifecycle";
+
+    let spark_program = format!(
+        r#"CREATE NAMESPACE IF NOT EXISTS ice_rest.{namespace};
+DROP TABLE IF EXISTS ice_rest.{namespace}.{table};
+CREATE TABLE ice_rest.{namespace}.{table} (
+  new_id BIGINT,
+  new_note STRING
+) USING iceberg
+TBLPROPERTIES (
+  'format-version' = '3',
+  'write.row-lineage' = 'true',
+  'schema.name-mapping.default' = '[{{"field-id":1,"names":["new_id","old_id"]}},{{"field-id":2,"names":["new_note","old_note"]}}]'
+);
+INSERT OVERWRITE DIRECTORY 's3a://warehouse/{source}'
+USING parquet
+SELECT old_note, old_id
+FROM VALUES
+  ('alpha', CAST(11 AS BIGINT)),
+  ('beta', CAST(22 AS BIGINT))
+AS source(old_note, old_id);
+"#
+    );
+    let spark_file = TempFileBuilder::new()
+        .prefix("cp3-add-files-")
+        .suffix(".sql")
+        .tempfile_in(runtime_dir())
+        .expect("create ADD FILES Spark SQL file");
+    std::fs::write(spark_file.path(), spark_program).expect("write ADD FILES Spark SQL");
+    let spark_output = Command::new(spark_sql)
+        .arg(spark_file.path())
+        .output()
+        .expect("run Spark ADD FILES fixture");
+    assert!(
+        spark_output.status.success(),
+        "Spark ADD FILES fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&spark_output.stdout),
+        String::from_utf8_lossy(&spark_output.stderr)
+    );
+
+    let be_object_store = format!(
+        r#"
+[connector.object_store]
+endpoint = "{s3_endpoint}"
+access_key_id = "{s3_access_key}"
+access_key_secret = "{s3_secret_key}"
+enable_path_style_access = true
+"#
+    );
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
+            &state_store_path,
+            &metadata_path,
+            cluster_id,
+            &be_object_store,
+        );
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG {catalog} PROPERTIES(
+            "type"="iceberg",
+            "iceberg.catalog.type"="rest",
+            "uri"="{rest_uri}",
+            "warehouse"="{rest_warehouse}",
+            "aws.s3.endpoint"="{s3_endpoint}",
+            "aws.s3.access_key"="{s3_access_key}",
+            "aws.s3.secret_key"="{s3_secret_key}",
+            "aws.s3.region"="us-east-1",
+            "aws.s3.enable_path_style_access"="true")"#,
+    ))
+    .expect("create REST ADD FILES lifecycle catalog");
+    let scheduled_before = scheduled_fragments(&mut conn);
+    conn.query_drop(format!(
+        "ALTER TABLE {catalog}.{namespace}.{table} ADD FILES FROM 's3://warehouse/{source}'"
+    ))
+    .expect("execute frontend-only ADD FILES");
+    assert_eq!(
+        scheduled_fragments(&mut conn),
+        scheduled_before,
+        "ADD FILES must not initialize or schedule backend fragments"
+    );
+    let rows: Vec<(i64, String)> = conn
+        .query(format!(
+            "SELECT new_id, new_note FROM {catalog}.{namespace}.{table} ORDER BY new_id"
+        ))
+        .expect("read ADD FILES rows");
+    assert_eq!(
+        rows,
+        vec![(11, "alpha".to_string()), (22, "beta".to_string())]
+    );
+
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let restored_rows: Vec<(i64, String)> = conn
+        .query(format!(
+            "SELECT new_id, new_note FROM {catalog}.{namespace}.{table} ORDER BY new_id"
+        ))
+        .expect("read ADD FILES rows after FE restart");
+    assert_eq!(restored_rows, rows);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build ADD FILES StateStore inspection runtime");
+    let host = runtime
+        .block_on(FrontendApplicationHost::open(
+            Some(sqlite_state_store_config(&state_store_path, cluster_id)),
+            frontend_execution_config(),
+            ClusterBackendOpenConfig::new(
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                Vec::new(),
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("valid ADD FILES inspection backend config"),
+        ))
+        .expect("reopen ADD FILES DML StateStore");
+    let dml = host.dml_service();
+    let operations = dml
+        .list_operations()
+        .expect("list durable ADD FILES operations");
+    let operation = operations
+        .iter()
+        .find(|operation| {
+            operation.operation_kind == OperationKind::AddFiles
+                && operation.target.catalog == catalog
+                && operation.target.namespace == namespace
+                && operation.target.table == table
+        })
+        .expect("durable ADD FILES operation");
+    assert_eq!(operation.state, OperationState::Finalized);
+    assert!(operation.coordination_provenance.is_some());
+    let OperationPayload::AddFilesLifecycle(record) = &operation.payload else {
+        panic!("ADD FILES must persist its typed lifecycle payload")
+    };
+    assert_eq!(record.phase, AddFilesLifecyclePhase::Committed);
+    assert_eq!(record.next_action, StatementNextAction::None);
+    assert!(operation.recovery_due_at_ms.is_none());
+    drop(dml);
+    runtime
+        .block_on(host.shutdown())
+        .expect("ADD FILES inspection host shutdown");
 }
 
 #[cfg(unix)]

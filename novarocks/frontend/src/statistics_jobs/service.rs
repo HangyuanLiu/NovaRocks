@@ -34,9 +34,10 @@ use super::model::{
 };
 use super::repository::{StatisticsJobRepository, StatisticsJobRepositoryError};
 use super::worker::{
-    StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
-    StatisticsCollectedAttempt,
+    StatisticsAnalyzeWorker, StatisticsAnalyzeWorkerCoordination, StatisticsAttemptError,
+    StatisticsAttemptExecutor, StatisticsCollectedAttempt,
 };
+use crate::coordination::FrontendCoordinationRuntime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzeTableStatement {
@@ -389,6 +390,7 @@ pub struct FrontendStatisticsApplicationPort {
     service: StatisticsApplicationService,
     table_statistics: std::sync::RwLock<Option<std::sync::Arc<dyn TableStatisticsReader>>>,
     runtime: tokio::runtime::Handle,
+    coordination: Option<StatisticsAnalyzeWorkerCoordination>,
     attempt_executor: Mutex<Option<Arc<dyn StatisticsAttemptExecutor>>>,
     worker: Mutex<Option<StatisticsAnalyzeWorker>>,
 }
@@ -399,9 +401,28 @@ impl FrontendStatisticsApplicationPort {
             service,
             table_statistics: std::sync::RwLock::new(None),
             runtime,
+            coordination: None,
             attempt_executor: Mutex::new(None),
             worker: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_frontend_coordination(
+        service: StatisticsApplicationService,
+        runtime: tokio::runtime::Handle,
+        frontend: &FrontendCoordinationRuntime,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            service,
+            table_statistics: std::sync::RwLock::new(None),
+            runtime,
+            coordination: Some(
+                StatisticsAnalyzeWorkerCoordination::from_frontend(frontend)
+                    .map_err(|error| error.to_string())?,
+            ),
+            attempt_executor: Mutex::new(None),
+            worker: Mutex::new(None),
+        })
     }
 
     /// Called only after Core has opened its pin-aware statistics reader.
@@ -452,12 +473,21 @@ impl FrontendStatisticsApplicationPort {
         if executor_slot.is_some() {
             return Err("statistics attempt executor is already bound".to_string());
         }
-        let worker = tokio::task::block_in_place(|| {
-            self.runtime.block_on(StatisticsAnalyzeWorker::start(
+        let worker = tokio::task::block_in_place(|| match self.coordination.clone() {
+            Some(coordination) => {
+                self.runtime
+                    .block_on(StatisticsAnalyzeWorker::start_with_coordination(
+                        &self.runtime,
+                        Arc::new(repository),
+                        Arc::clone(&adapter),
+                        coordination,
+                    ))
+            }
+            None => self.runtime.block_on(StatisticsAnalyzeWorker::start(
                 &self.runtime,
                 Arc::new(repository),
                 Arc::clone(&adapter),
-            ))
+            )),
         })?;
         let mut worker_slot = self
             .worker
