@@ -150,6 +150,7 @@ pub enum QueryServiceErrorKind {
     Interrupted,
     Timeout,
     InvalidValue,
+    Unavailable,
     Internal,
 }
 

@@ -603,6 +603,7 @@ fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
         QueryServiceErrorKind::Interrupted => ErrorKind::ER_QUERY_INTERRUPTED,
         QueryServiceErrorKind::Timeout => ErrorKind::ER_UNKNOWN_ERROR,
         QueryServiceErrorKind::InvalidValue => ErrorKind::ER_WRONG_VALUE,
+        QueryServiceErrorKind::Unavailable => ErrorKind::ER_UNKNOWN_ERROR,
         QueryServiceErrorKind::Internal => ErrorKind::ER_UNKNOWN_ERROR,
     }
 }

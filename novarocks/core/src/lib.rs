@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod tests;
 
+pub mod catalog_application;
 pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;
