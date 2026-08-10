@@ -1810,7 +1810,7 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<AbortCleanupOperator, String> {
     if let Some(s3_config) = entry.object_store_config() {
-        let access = crate::connector::iceberg::fs_io::resolve_access_for_location(
+        let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
             &entry.warehouse_uri,
             Some(s3_config),
         )
