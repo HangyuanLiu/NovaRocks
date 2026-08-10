@@ -555,6 +555,7 @@ impl CoreCtasTargetSession {
                 .control()
                 .prepare_write(ConnectorWritePreparationRequest {
                     table: binding.table().clone(),
+                    target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                     intent: binding.intent(),
                     purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                     input: ConnectorWriteInputRequest::Data {

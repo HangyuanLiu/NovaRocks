@@ -1264,6 +1264,7 @@ mod tests {
                     Bytes::from_static(b"table"),
                 )
                 .expect("table"),
+                novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 ConnectorWriteIntent::Append,
                 ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
                     .expect("base version"),

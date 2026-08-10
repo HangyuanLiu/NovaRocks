@@ -842,6 +842,7 @@ mod tests {
                 owner(),
                 ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
                     .expect("table handle"),
+                novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 ConnectorWriteIntent::Append,
                 ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
                     .expect("base version"),

@@ -429,6 +429,7 @@ impl ConnectorWriteBaseVersion {
 #[derive(Clone)]
 pub struct ConnectorWritePreparationRequest {
     pub table: ConnectorTableHandle,
+    pub target_ref: ConnectorWriteTargetRef,
     pub intent: ConnectorWriteIntent,
     pub purpose: ConnectorWriteAdmissionPurpose,
     pub input: ConnectorWriteInputRequest,
@@ -443,7 +444,42 @@ impl ConnectorWritePreparationRequest {
                 "connector write preparation table does not match the exact control owner",
             ));
         }
+        self.target_ref.validate()?;
         validate_input_request(&self.input)
+    }
+}
+
+/// SQL-visible write reference selected before Provider admission.
+///
+/// The name itself is semantic input (for example, an Iceberg branch); the
+/// Provider remains the sole owner of resolving it to an external version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorWriteTargetRef(Arc<str>);
+
+impl ConnectorWriteTargetRef {
+    pub fn parse(value: impl Into<Arc<str>>) -> Result<Self, ConnectorError> {
+        let value = value.into();
+        let target = Self(value);
+        target.validate()?;
+        Ok(target)
+    }
+
+    pub fn main() -> Self {
+        Self(Arc::from("main"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        if self.0.is_empty() || self.0.len() > 256 || self.0.chars().any(char::is_control) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write target ref must contain 1..=256 non-control bytes",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -453,6 +489,7 @@ impl ConnectorWritePreparationRequest {
 pub struct ConnectorWritePreparation {
     owner: ConnectorExecutionBindingKey,
     table: ConnectorTableHandle,
+    target_ref: ConnectorWriteTargetRef,
     intent: ConnectorWriteIntent,
     base_version: ConnectorWriteBaseVersion,
     input: ConnectorWriteInputShape,
@@ -464,6 +501,7 @@ impl ConnectorWritePreparation {
     pub fn try_new(
         owner: ConnectorExecutionBindingKey,
         table: ConnectorTableHandle,
+        target_ref: ConnectorWriteTargetRef,
         intent: ConnectorWriteIntent,
         base_version: ConnectorWriteBaseVersion,
         input: ConnectorWriteInputShape,
@@ -475,13 +513,23 @@ impl ConnectorWritePreparation {
                 "connector write preparation table does not match its owner",
             ));
         }
+        target_ref.validate()?;
         base_version.validate()?;
         input.validate()?;
         validate_handle_payload(&payload)?;
-        let digest = preparation_digest(&owner, &table, intent, &base_version, &input, &payload);
+        let digest = preparation_digest(
+            &owner,
+            &table,
+            &target_ref,
+            intent,
+            &base_version,
+            &input,
+            &payload,
+        );
         Ok(Self {
             owner,
             table,
+            target_ref,
             intent,
             base_version,
             input,
@@ -494,6 +542,7 @@ impl ConnectorWritePreparation {
         let expected = Self::try_new(
             self.owner.clone(),
             self.table.clone(),
+            self.target_ref.clone(),
             self.intent,
             self.base_version.clone(),
             self.input.clone(),
@@ -513,6 +562,9 @@ impl ConnectorWritePreparation {
     }
     pub fn table(&self) -> &ConnectorTableHandle {
         &self.table
+    }
+    pub fn target_ref(&self) -> &ConnectorWriteTargetRef {
+        &self.target_ref
     }
     pub const fn intent(&self) -> ConnectorWriteIntent {
         self.intent
@@ -2085,6 +2137,7 @@ fn validate_input_request(request: &ConnectorWriteInputRequest) -> Result<(), Co
 fn preparation_digest(
     owner: &ConnectorExecutionBindingKey,
     table: &ConnectorTableHandle,
+    target_ref: &ConnectorWriteTargetRef,
     intent: ConnectorWriteIntent,
     base_version: &ConnectorWriteBaseVersion,
     input: &ConnectorWriteInputShape,
@@ -2095,6 +2148,7 @@ fn preparation_digest(
     digest_owner(&mut hasher, owner);
     digest_bytes(&mut hasher, table.owner().as_str().as_bytes());
     digest_bytes(&mut hasher, table.payload());
+    digest_bytes(&mut hasher, target_ref.as_str().as_bytes());
     hasher.update([write_intent_tag(intent)]);
     hasher.update(base_version.digest);
     match input {
@@ -2288,6 +2342,7 @@ mod tests {
         let preparation = ConnectorWritePreparation::try_new(
             owner.clone(),
             table,
+            ConnectorWriteTargetRef::main(),
             ConnectorWriteIntent::Append,
             ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base version"),
             ConnectorWriteInputShape::Data {
@@ -2327,6 +2382,7 @@ mod tests {
         let error = ConnectorWritePreparation::try_new(
             owner.clone(),
             foreign_table,
+            ConnectorWriteTargetRef::main(),
             ConnectorWriteIntent::Append,
             ConnectorWriteBaseVersion::try_new(Bytes::new()).expect("base"),
             ConnectorWriteInputShape::Data {

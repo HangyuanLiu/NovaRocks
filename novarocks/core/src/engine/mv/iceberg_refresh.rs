@@ -12995,7 +12995,7 @@ fn refresh_iceberg_join_mv(
             #[cfg(feature = "mv-first-refresh-staging-test-support")]
             {
                 let (_bindings, plan, factory) =
-                    compile_canonical_select_for_imv_for_maintenance(state, &ctx)
+                    compile_canonical_select_for_imv_for_maintenance(state, &ctx, "main")
                         .map_err(|error| IcebergMvRefreshExecutionError::from(error.message))?;
                 let append = crate::mv::refresh::join_first_refresh::build_join_first_refresh_append_logical_plan(
                     &ctx.rewrite,
@@ -13410,7 +13410,7 @@ fn repartition_iceberg_join_mv_overwrite(
         }
     };
     let (target_bindings, plan, factory) =
-        match compile_canonical_select_for_imv_for_maintenance(state, ctx) {
+        match compile_canonical_select_for_imv_for_maintenance(state, ctx, staging_branch) {
             Ok(planned) => planned,
             Err(err) => {
                 return Err(
@@ -13628,17 +13628,19 @@ fn first_refresh_iceberg_join_mv(
         }
     };
     let (target_bindings, plan, factory) =
-        compile_canonical_select_for_imv_for_maintenance(state, ctx).map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err.message,
-                connector_context,
-            )
-        })?;
+        compile_canonical_select_for_imv_for_maintenance(state, ctx, staging_branch).map_err(
+            |err| {
+                handle_iceberg_mv_commit_error(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err.message,
+                    connector_context,
+                )
+            },
+        )?;
     let logical_input =
         crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput { plan, factory };
     let refresh_marker =
@@ -14076,6 +14078,7 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_base_overlays(
 fn compile_canonical_select_for_imv_for_maintenance(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
+    target_ref: &str,
 ) -> Result<
     (
         Arc<QueryTableBindingStore>,
@@ -14115,12 +14118,13 @@ fn compile_canonical_select_for_imv_for_maintenance(
         &target_planning_materialization.planning_lease,
     )
     .map_err(RefreshError::user)?;
-    admit_mv_data_write_target(
+    admit_mv_change_stream_write_targets(
         bindings.as_ref(),
         &target_planning_materialization,
         &target.catalog,
         &target.namespace,
         &target.table,
+        target_ref,
         connector_context.clone(),
     )
     .map_err(RefreshError::user)?;
@@ -14133,12 +14137,13 @@ fn compile_canonical_select_for_imv_for_maintenance(
     Ok((bindings, plan, factory))
 }
 
-fn admit_mv_data_write_target(
+fn admit_mv_change_stream_write_targets(
     bindings: &QueryTableBindingStore,
     materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
     catalog: &str,
     namespace: &str,
     table: &str,
+    target_ref: &str,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let fields = materialization
@@ -14152,23 +14157,68 @@ fn admit_mv_data_write_target(
             ))
         })
         .collect::<Vec<_>>();
-    let (_, preparation) = materialization.prepare_write(
-        novarocks_spi::connector::ConnectorWriteIntent::Append,
-        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
-        novarocks_spi::connector::ConnectorWriteInputRequest::Data { fields },
-        context,
-    )?;
-    crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
-        bindings,
-        crate::sql::planner::table::SqlTableIdentity {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
+    use novarocks_spi::connector::{
+        ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
+    };
+
+    let row_identity_fields = vec![
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            DataType::Int64,
+            false,
+        )),
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            DataType::Int64,
+            true,
+        )),
+    ];
+    let deletion_identity_fields = vec![
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            DataType::Utf8,
+            false,
+        )),
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            DataType::Int64,
+            false,
+        )),
+    ];
+    let inputs = [
+        ConnectorWriteInputRequest::Data {
+            fields: fields.clone(),
         },
-        preparation,
-        materialization.planning_lease.clone(),
-    )
-    .map(|_| ())
+        ConnectorWriteInputRequest::RowLineage {
+            data_fields: fields,
+            row_identity_fields,
+        },
+        ConnectorWriteInputRequest::DeletionVector {
+            identity_fields: deletion_identity_fields,
+            partition_source_fields: Vec::new(),
+        },
+    ];
+    let identity = crate::sql::planner::table::SqlTableIdentity {
+        catalog: catalog.to_string(),
+        namespace: namespace.to_string(),
+        table: table.to_string(),
+    };
+    for input in inputs {
+        let (_, preparation) = materialization.prepare_write(
+            target_ref,
+            ConnectorWriteIntent::RowDelta,
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            input,
+            context.clone(),
+        )?;
+        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+            bindings,
+            identity.clone(),
+            preparation,
+            materialization.planning_lease.clone(),
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -15462,14 +15512,6 @@ fn execute_join_delta_branches_logical(
         &target_bindings,
         &target_planning_materialization.planning_lease,
     )?;
-    admit_mv_data_write_target(
-        target_bindings.as_ref(),
-        &target_planning_materialization,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        connector_context.clone(),
-    )?;
     let (plan, factory) = compile_canonical_select_for_imv_with_bindings(
         state,
         ctx,
@@ -15564,6 +15606,35 @@ fn execute_join_delta_branches_logical(
             ));
         }
     };
+    let target_write_materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_with_lease(
+            state.connector_control.as_ref(),
+            connector_context.clone(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )?;
+    if target_write_materialization.table_uuid() != Some(ctx.rewrite.target_table_uuid.as_str())
+        || target_write_materialization.current_snapshot_id() != ctx.rewrite.target_snapshot_id
+    {
+        return Err(format!(
+            "IMV target changed before staging write admission: expected uuid={} snapshot={:?}, got uuid={:?} snapshot={:?}",
+            ctx.rewrite.target_table_uuid,
+            ctx.rewrite.target_snapshot_id,
+            target_write_materialization.table_uuid(),
+            target_write_materialization.current_snapshot_id(),
+        )
+        .into());
+    }
+    admit_mv_change_stream_write_targets(
+        target_bindings.as_ref(),
+        &target_write_materialization,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        &staging_branch,
+        connector_context.clone(),
+    )?;
     let target_backend = iceberg_mv_target_backend(target);
     let populated = execute_join_incremental_refresh_write(
         &target_table,
@@ -16394,6 +16465,24 @@ fn prepare_imv_change_stream_writer(
                 })
                 .flatten()
         });
+    let primary_write_binding = planned
+        .topology
+        .writer_branches
+        .first()
+        .ok_or_else(|| "IMV change-stream topology has no writer branches".to_string())?
+        .sink
+        .contract
+        .target
+        .binding;
+    let primary_preparation = table_bindings
+        .binding(primary_write_binding)?
+        .write_target_admission
+        .as_ref()
+        .ok_or_else(|| {
+            "IMV change-stream primary writer binding has no Provider preparation".to_string()
+        })?
+        .preparation
+        .clone();
     let connector_write =
         crate::engine::iceberg_writer::activate_iceberg_change_stream_connector_write(
             state,
@@ -16406,11 +16495,7 @@ fn prepare_imv_change_stream_writer(
             refresh_plan.connector_operation_id,
             connector_context.clone(),
             exact_lease,
-            table_bindings.admitted_iceberg_write_preparation(
-                &target.catalog,
-                &target.namespace,
-                &target.table,
-            )?,
+            primary_preparation,
         )?;
     crate::engine::prepare_planned_iceberg_change_stream_write(
         planned.prepared,
@@ -16469,12 +16554,13 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             &target.namespace,
             &target.table,
         )?;
-    admit_mv_data_write_target(
+    admit_mv_change_stream_write_targets(
         target_bindings.as_ref(),
         &target_materialization,
         &target.catalog,
         &target.namespace,
         &target.table,
+        &request.staging_branch,
         crate::connector::connector_request_context_for_execution(None, execution)?,
     )?;
     let rewrite_evidence = match evidence {
@@ -16969,14 +17055,8 @@ fn build_imv_change_stream_branches(
     use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec;
     use crate::sql::planner::distributed::write::contract::{
-        ConnectorWriteInputBinding, SqlWritePlanInput, SqlWriteSinkMode,
+        ConnectorWriteInputBinding, SqlWriteSinkMode,
     };
-
-    let target_binding = bindings.admitted_iceberg_write_binding_id(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
 
     producer_branches
         .iter()
@@ -16988,6 +17068,15 @@ fn build_imv_change_stream_branches(
                 ImvChangeStreamProducerBranch::ReuseData => ChangeStreamBranchKind::ReuseData,
                 ImvChangeStreamProducerBranch::FreshData => ChangeStreamBranchKind::FreshData,
             };
+            let target_binding = mv_change_stream_write_binding_for_mode(
+                bindings,
+                target,
+                match producer_branch {
+                    ImvChangeStreamProducerBranch::DeleteDv => SqlWriteSinkMode::DeletionVectors,
+                    ImvChangeStreamProducerBranch::ReuseData => SqlWriteSinkMode::RowLineageData,
+                    ImvChangeStreamProducerBranch::FreshData => SqlWriteSinkMode::Data,
+                },
+            )?;
             let (sink, partition_ordinals) = match producer_branch {
                 ImvChangeStreamProducerBranch::DeleteDv => {
                     let sink = sql_write_plan_input_for_admitted_target(
@@ -17042,6 +17131,52 @@ fn build_imv_change_stream_branches(
             })
         })
         .collect()
+}
+
+fn mv_change_stream_write_binding_for_mode(
+    bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    mode: crate::sql::planner::distributed::write::contract::SqlWriteSinkMode,
+) -> Result<crate::sql::binding::SqlTableBindingId, String> {
+    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
+    use crate::sql::planner::table::ScanSource;
+    use novarocks_spi::connector::ConnectorWriteInputShape;
+
+    let matches = bindings
+        .captured_bindings()
+        .into_iter()
+        .filter(|(_, binding)| {
+            binding.resolved.catalog.identity.catalog == target.catalog
+                && binding.resolved.catalog.identity.namespace == target.namespace
+                && binding.resolved.catalog.identity.table == target.table
+                && binding
+                    .write_target_admission
+                    .as_ref()
+                    .is_some_and(|admission| {
+                        matches!(
+                            (mode, admission.preparation.input()),
+                            (
+                                SqlWriteSinkMode::Data,
+                                ConnectorWriteInputShape::Data { .. }
+                            ) | (
+                                SqlWriteSinkMode::RowLineageData,
+                                ConnectorWriteInputShape::RowLineage { .. }
+                            ) | (
+                                SqlWriteSinkMode::DeletionVectors,
+                                ConnectorWriteInputShape::DeletionVector { .. }
+                            )
+                        )
+                    })
+        })
+        .collect::<Vec<_>>();
+    let [(_, binding)] = matches.as_slice() else {
+        return Err(format!(
+            "IMV change-stream target {}.{}.{} does not have exactly one Provider preparation for mode {mode:?}",
+            target.catalog, target.namespace, target.table
+        ));
+    };
+    let ScanSource::Sql(source) = &binding.resolved.planner.source;
+    Ok(source.binding)
 }
 
 fn output_ordinals_for_sink_columns(
@@ -17536,12 +17671,13 @@ fn incremental_refresh_iceberg_mv_with_changes(
         &target_bindings,
         &target_planning_materialization.planning_lease,
     )?;
-    admit_mv_data_write_target(
+    admit_mv_change_stream_write_targets(
         target_bindings.as_ref(),
         &target_planning_materialization,
         &target.catalog,
         &target.namespace,
         &target.table,
+        &staging_branch,
         connector_context.clone(),
     )?;
     let imv_rewrite_input = sql_imv_planning_input(&ctx, target_binding, rewrite_evidence)?;

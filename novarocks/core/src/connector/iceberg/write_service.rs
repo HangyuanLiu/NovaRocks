@@ -2324,6 +2324,7 @@ mod tests {
                 owner.clone(),
                 ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::from_static(b"t"))
                     .expect("table"),
+                novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 ConnectorWriteIntent::Append,
                 ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
                     .expect("base version"),

@@ -459,6 +459,31 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
         abort.execution.abort(abort.reason.clone())
     }
 
+    fn abort_mutation_terminal(
+        &self,
+        prepared: &dyn MutationPrepared,
+        abort: &dyn MutationAbort,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+        let prepared = prepared_handle(prepared)?;
+        let abort = abort_handle(abort)
+            .map_err(|error| format!("invalid mutation abort handle: {error:?}"))?;
+        if prepared.operation.kind != abort.kind
+            || prepared.operation.attempt_id != abort.attempt_id
+        {
+            return Err(
+                "mutation abort handle does not belong to this prepared mutation".to_string(),
+            );
+        }
+        if prepared.state.swap(TERMINAL, Ordering::AcqRel) == TERMINAL {
+            return Err("mutation abort was decided more than once".to_string());
+        }
+        *prepared
+            .finalizer
+            .lock()
+            .expect("mutation finalizer lock poisoned") = Some(Arc::clone(&abort.execution));
+        abort.execution.abort_terminal()
+    }
+
     fn commit_mutation(
         &self,
         prepared: &dyn MutationPrepared,
@@ -563,6 +588,7 @@ mod tests {
     use crate::engine::mutation_flow::MutationExecution;
     use crate::query_execution::ConnectorWriteCompletion;
     use crate::query_execution::outcome::QueryExecutionResult;
+    use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
 
     struct TestExecution {
         abort_outcome: Mutex<Option<Result<CommitOutcome, CommitServiceError>>>,
@@ -593,6 +619,13 @@ mod tests {
                 .expect("test abort outcome lock")
                 .take()
                 .expect("abort called only once")
+        }
+
+        fn abort_terminal(&self) -> Result<ConnectorWriteAbortOutcome, String> {
+            self.abort_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: ExternalMutationFinalization::Complete,
+            })
         }
 
         fn commit(
@@ -700,6 +733,36 @@ mod tests {
 
         let error = engine.abort_mutation(&prepared, &abort).unwrap_err();
         assert!(matches!(error, CommitServiceError::InvalidInput { .. }));
+        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn terminal_abort_consumes_the_exact_handle_once_and_returns_connector_truth() {
+        let engine = Arc::new(crate::engine::StandaloneState::default());
+        let prepared = prepared(MutationStatementKind::Update, "update-attempt");
+        let execution = Arc::new(TestExecution::known_uncommitted());
+        let abort = abort_handle(
+            MutationStatementKind::Update,
+            "update-attempt",
+            Arc::clone(&execution),
+        );
+
+        let outcome = engine
+            .abort_mutation_terminal(&prepared, &abort)
+            .expect("terminal abort outcome");
+        assert_eq!(
+            outcome,
+            ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: ExternalMutationFinalization::Complete,
+            }
+        );
+        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
+        assert_eq!(prepared.state.load(Ordering::Acquire), super::TERMINAL);
+
+        let error = engine
+            .abort_mutation_terminal(&prepared, &abort)
+            .expect_err("terminal abort must be one-shot");
+        assert!(error.contains("decided more than once"));
         assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
     }
 }

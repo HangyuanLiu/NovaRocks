@@ -126,7 +126,7 @@ impl OperatorFactory for SplitDataStreamSinkFactory {
             split_arena: Arc::clone(&self.split_arena),
             split_exprs: self.split_exprs.clone(),
             sinks,
-            finished: false,
+            finishing: false,
         })
     }
 
@@ -145,7 +145,7 @@ struct SplitDataStreamSinkOperator {
     split_arena: Arc<ExprArena>,
     split_exprs: Vec<ExprId>,
     sinks: Vec<InnerSinkRuntime>,
-    finished: bool,
+    finishing: bool,
 }
 
 impl Operator for SplitDataStreamSinkOperator {
@@ -194,13 +194,13 @@ impl Operator for SplitDataStreamSinkOperator {
     }
 
     fn is_finished(&self) -> bool {
-        self.finished
+        self.finishing && self.sinks.iter().all(|sink| sink.op.is_finished())
     }
 }
 
 impl ProcessorOperator for SplitDataStreamSinkOperator {
     fn need_input(&self) -> bool {
-        if self.finished {
+        if self.is_finished() || self.finishing {
             return false;
         }
         for sink in &self.sinks {
@@ -222,7 +222,7 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
         if let Some(err) = self.init_error.as_ref() {
             return Err(err.clone());
         }
-        if self.finished {
+        if self.is_finished() || self.finishing {
             return Ok(());
         }
         if chunk.is_empty() || self.sinks.is_empty() {
@@ -258,7 +258,7 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
         if let Some(err) = self.init_error.as_ref() {
             return Err(err.clone());
         }
-        if self.finished {
+        if self.finishing {
             return Ok(());
         }
         for sink in &mut self.sinks {
@@ -268,12 +268,12 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
                 .ok_or_else(|| "inner data stream op missing processor operator".to_string())?;
             inner.set_finishing(state)?;
         }
-        self.finished = true;
+        self.finishing = true;
         Ok(())
     }
 
     fn sink_observable(&self) -> Option<Arc<Observable>> {
-        if self.finished {
+        if self.is_finished() {
             return None;
         }
         // Return the first inner sink's observable unconditionally.
@@ -325,7 +325,8 @@ fn split_chunk_by_exprs(
     }
 
     if !remaining.is_empty() {
-        out[0] = Some(remaining);
+        let mask = eval_split_mask(arena, split_exprs[0], &remaining)?;
+        out[0] = filter_chunk_by_mask(&remaining, &mask)?;
     }
     Ok(out)
 }
@@ -372,4 +373,158 @@ fn filter_chunk_by_mask(chunk: &Chunk, mask: &[bool]) -> Result<Option<Chunk>, S
     let filtered = filter_record_batch(&chunk.batch, &predicate)
         .map_err(|e| format!("split sink filter chunk failed: {e}"))?;
     Ok(Some(Chunk::new_like(filtered, chunk)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use arrow::array::{BooleanArray, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::split_chunk_by_exprs;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+    use crate::exec::pipeline::schedule::observer::Observable;
+    use crate::runtime::runtime_state::RuntimeState;
+
+    use super::{InnerSinkRuntime, SplitDataStreamSinkOperator};
+
+    struct PendingFinishSink {
+        name: String,
+        finishing: bool,
+        finished: Arc<AtomicBool>,
+        observable: Arc<Observable>,
+    }
+
+    impl PendingFinishSink {
+        fn new(name: &str, finished: Arc<AtomicBool>) -> Self {
+            Self {
+                name: name.to_string(),
+                finishing: false,
+                finished,
+                observable: Arc::new(Observable::new()),
+            }
+        }
+    }
+
+    impl Operator for PendingFinishSink {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished.load(Ordering::SeqCst)
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for PendingFinishSink {
+        fn need_input(&self) -> bool {
+            !self.finishing && !self.is_finished()
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finishing = true;
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            (!self.is_finished()).then(|| Arc::clone(&self.observable))
+        }
+    }
+
+    #[test]
+    fn split_sink_waits_for_inner_sinks_to_finish() {
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_done = Arc::new(AtomicBool::new(false));
+        let mut op = SplitDataStreamSinkOperator {
+            name: "SPLIT_DATA_STREAM_SINK(test)".to_string(),
+            init_error: None,
+            split_arena: Arc::new(ExprArena::default()),
+            split_exprs: Vec::new(),
+            sinks: vec![
+                InnerSinkRuntime {
+                    op: Box::new(PendingFinishSink::new("first", Arc::clone(&first_done))),
+                },
+                InnerSinkRuntime {
+                    op: Box::new(PendingFinishSink::new("second", Arc::clone(&second_done))),
+                },
+            ],
+            finishing: false,
+        };
+
+        let state = RuntimeState::default();
+        op.set_finishing(&state).expect("set finishing");
+        assert!(!op.is_finished(), "wrapper must wait for async inner sinks");
+        assert!(op.sink_observable().is_some());
+
+        first_done.store(true, Ordering::SeqCst);
+        assert!(!op.is_finished(), "wrapper must wait for every inner sink");
+
+        second_done.store(true, Ordering::SeqCst);
+        assert!(op.is_finished());
+        assert!(op.sink_observable().is_none());
+    }
+
+    #[test]
+    fn split_sink_applies_the_first_branch_predicate_instead_of_using_it_as_fallback() {
+        let predicate_slot = SlotId::new(1);
+        let value_slot = SlotId::new(2);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("selected", DataType::Boolean, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(BooleanArray::from(vec![true, false])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .expect("input batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            schema.as_ref(),
+            &[predicate_slot, value_slot],
+        )
+        .expect("input chunk schema");
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+
+        let mut arena = ExprArena::default();
+        let predicate = arena.push_typed(ExprNode::SlotId(predicate_slot), DataType::Boolean);
+        let split = split_chunk_by_exprs(&arena, &[predicate], chunk).expect("split chunk");
+        let selected = split[0].as_ref().expect("matching first branch rows");
+
+        assert_eq!(selected.len(), 1);
+        let values = selected
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("value column");
+        assert_eq!(values.values(), &[10]);
+    }
 }

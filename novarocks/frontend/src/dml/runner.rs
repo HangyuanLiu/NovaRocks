@@ -148,11 +148,11 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                     Err(message) => self.known_uncommitted(operation_id, message),
                 }
             }
-            CoordinatedWriteReport::AbortRequired { reason: _, handle } => {
+            CoordinatedWriteReport::AbortRequired { reason, handle } => {
                 self.journal
                     .transition(operation_id, OperationState::Aborting)?;
                 match self.executor.abort(&spec, &handle) {
-                    Ok(outcome) => self.complete_abort(operation_id, &spec, outcome),
+                    Ok(outcome) => self.complete_abort(operation_id, &spec, &reason, outcome),
                     Err(message) => self.known_uncommitted(operation_id, message),
                 }
             }
@@ -163,6 +163,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         &self,
         operation_id: DmlOperationId,
         spec: &WriteTransactionSpec,
+        stage_reason: &str,
         outcome: ConnectorWriteAbortOutcome,
     ) -> Result<WriteTransactionOutcome, DmlError> {
         let fact = reconcile::operation_fact_from_abort_outcome(&outcome)
@@ -173,7 +174,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                 self.finish_committed(operation_id, spec, receipt)
             }
             ConnectorWriteAbortOutcome::KnownUncommitted { .. } => {
-                Err(DmlError::executor("connector write aborted before commit"))
+                Err(DmlError::executor(stage_reason))
             }
             ConnectorWriteAbortOutcome::CommitUnknown { failure, .. } => {
                 Err(DmlError::commit(failure.message()))
@@ -270,4 +271,87 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
 fn empty_receipt() -> Result<ConnectorWriteReceipt, DmlError> {
     ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"connector-write-noop"))
         .map_err(DmlError::journal_corruption)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::convert::Infallible;
+
+    use super::*;
+    use crate::dml::journal::testing::InMemoryOperationJournal;
+
+    struct KnownUncommittedAbortExecutor;
+
+    impl WriteExecutor for KnownUncommittedAbortExecutor {
+        type CommitHandle = Infallible;
+        type AbortHandle = ();
+
+        fn run_coordinated_write(
+            &self,
+            _spec: &WriteTransactionSpec,
+        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+            Ok(CoordinatedWriteReport::AbortRequired {
+                reason: "MOR UPDATE matched target row: duplicate _row_id=7".to_string(),
+                handle: (),
+            })
+        }
+
+        fn abort(
+            &self,
+            _spec: &WriteTransactionSpec,
+            _handle: &Self::AbortHandle,
+        ) -> Result<ConnectorWriteAbortOutcome, String> {
+            Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: ExternalMutationFinalization::Complete,
+            })
+        }
+
+        fn commit(
+            &self,
+            _spec: &WriteTransactionSpec,
+            handle: &Self::CommitHandle,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+            match *handle {}
+        }
+
+        fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
+            panic!("known-uncommitted abort must not finalize")
+        }
+    }
+
+    fn spec() -> WriteTransactionSpec {
+        WriteTransactionSpec {
+            target: crate::dml::model::OperationTarget {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "target".to_string(),
+                ref_name: None,
+            },
+            operation_kind: crate::dml::model::OperationKind::RowDelta,
+            operation_subkind: Some("UPDATE".to_string()),
+            attempt_id: "update-attempt".to_string(),
+            base_snapshot_id: Some(7),
+            base_snapshot_map: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn known_uncommitted_abort_surfaces_the_original_stage_reason() {
+        let journal = InMemoryOperationJournal::default();
+        let runner =
+            WriteTransactionRunner::new(&journal, &KnownUncommittedAbortExecutor, &AlwaysAdmit);
+
+        let error = runner
+            .run(spec())
+            .expect_err("duplicate source match must fail after terminal abort");
+        assert_eq!(
+            error.to_string(),
+            "Executor: MOR UPDATE matched target row: duplicate _row_id=7"
+        );
+        assert_eq!(
+            journal.only_operation().state,
+            OperationState::FailedKnownUncommitted
+        );
+    }
 }

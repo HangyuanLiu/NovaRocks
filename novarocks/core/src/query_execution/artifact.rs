@@ -2460,6 +2460,7 @@ mod tests {
                             Bytes::from_static(b"test-table"),
                         )
                         .expect("valid table"),
+                        novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                         novarocks_spi::connector::ConnectorWriteIntent::Append,
                         ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"test-base"))
                             .expect("valid base version"),

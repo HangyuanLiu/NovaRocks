@@ -691,6 +691,7 @@ mod tests {
         ConnectorWritePreparation::try_new(
             owner,
             table,
+            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             ConnectorWriteIntent::Overwrite,
             ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap(),
             ConnectorWriteInputShape::Data { fields },

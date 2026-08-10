@@ -405,14 +405,16 @@ pub(crate) fn transform_variant_columns_for_write(
             let raw = lb.value(row);
             if raw.len() < 4 {
                 return Err(format!(
-                    "variant_write: row {row} payload too short ({} bytes)",
+                    "variant_write: column `{}` row {row} payload too short ({} bytes)",
+                    annotated_schema.field(idx).name(),
                     raw.len()
                 ));
             }
             let total = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
             if 4 + total > raw.len() {
                 return Err(format!(
-                    "variant_write: row {row} declared total {total} exceeds payload {}",
+                    "variant_write: column `{}` row {row} declared total {total} exceeds payload {}",
+                    annotated_schema.field(idx).name(),
                     raw.len() - 4
                 ));
             }
