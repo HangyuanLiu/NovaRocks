@@ -31,6 +31,7 @@ use novarocks_spi::state_store::{
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
     WriteTransaction,
 };
+use novarocks_state_store::coordination::WriteAdmission;
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use serde::de::DeserializeOwned;
@@ -236,7 +237,9 @@ impl OptimizeJobRepository {
             "create frontend optimize job",
             |transaction| {
                 let request = request.clone();
-                Box::pin(async move { apply_create(transaction, operation_id, request).await })
+                Box::pin(
+                    async move { apply_create(transaction, operation_id, request, None).await },
+                )
             },
         )
         .await;
@@ -261,6 +264,34 @@ impl OptimizeJobRepository {
                 &format!("create optimize job for {context}"),
                 failure,
             )),
+        }
+    }
+
+    /// Validates application-owned write admission in the same transaction as
+    /// the pending record/index creation.
+    pub async fn create_admitted(
+        &self,
+        request: OptimizeJobCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<OptimizeJob> {
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "admitted create frontend optimize job",
+            |transaction| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_create(transaction, operation_id, request, Some(&admission)).await
+                })
+            },
+        )
+        .await;
+        match result {
+            Ok(success) => success.value,
+            Err(failure) => Err(format_run_failure("admitted create optimize job", failure)),
         }
     }
 
@@ -939,7 +970,15 @@ async fn apply_create(
     transaction: &mut dyn WriteTransaction,
     operation_id: OperationId,
     request: OptimizeJobCreate,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<OptimizeJob> {
+    if let Some(admission) = admission {
+        if let Err(error) = admission.validate_in(transaction).await {
+            return Ok(Err(RepositoryError::authority_lost(format!(
+                "maintenance write admission lost: {error}"
+            ))));
+        }
+    }
     let active_key = match active_target_key(&request.target) {
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
