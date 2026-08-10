@@ -865,7 +865,7 @@ fn prepare_frontend_incremental_write(
         &catalogs,
         Arc::new(target_entry),
         iceberg_catalog,
-        target_loaded.table,
+        target_loaded.into_table(),
         contract.affected_partitions.clone(),
         state.mv_refresh_pruning_limits,
     )?;
@@ -4772,7 +4772,7 @@ fn reload_iceberg_mv_target_table(
 ) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
     entry.invalidate_table_cache(&target.namespace, &target.table);
     crate::connector::iceberg::catalog::load_table(entry, &target.namespace, &target.table)
-        .map(|loaded| loaded.table)
+        .map(|loaded| loaded.into_table())
 }
 
 fn iceberg_mv_table_ident(target: &IcebergMvTarget) -> Result<TableIdent, String> {
@@ -8890,7 +8890,7 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
         mv_definition,
         target_entry,
         iceberg_catalog,
-        target_table: target_loaded.table,
+        target_table: target_loaded.into_table(),
         base_refs,
     };
     refresh_iceberg_mv_with_planned_partitions(
@@ -15317,7 +15317,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
             &iceberg_catalog_guard,
             Arc::new(target_entry),
             iceberg_catalog,
-            target_loaded.table,
+            target_loaded.into_table(),
             state.mv_refresh_pruning_limits,
         )?
     };
@@ -21732,7 +21732,7 @@ mod tests {
         };
         crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
             .expect("load iceberg table")
-            .table
+            .into_table()
     }
 
     fn create_identity_partitioned_base_table(
@@ -22689,7 +22689,7 @@ mod tests {
         entry.invalidate_table_cache(namespace, table);
         let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
             .expect("load target table for data-file count");
-        let table = loaded.table;
+        let table = loaded.into_table();
         data_block_on(async {
             let Some(current) = table.metadata().current_snapshot() else {
                 return 0usize;

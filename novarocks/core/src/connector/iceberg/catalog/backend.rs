@@ -605,20 +605,20 @@ mod tests {
             .build()
             .expect("table");
 
-        IcebergLoadedTable {
+        IcebergLoadedTable::new(
             table,
-            columns: vec![ColumnDef {
+            None,
+            vec![ColumnDef {
                 name: "id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
                 write_default: None,
                 logical_type: None,
             }],
-            logical_types: HashMap::new(),
-            key_desc: None,
-            column_aggregations: HashMap::new(),
-            object_store_config: None,
-        }
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        )
     }
 
     fn v3_row_lineage_loaded_table() -> IcebergLoadedTable {

@@ -220,7 +220,7 @@ impl IcebergDistributedRewritePlanner {
         let loaded = load_table(&entry, &namespace, &table_name).map_err(|error| {
             ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
         })?;
-        let table = loaded.table;
+        let table = loaded.into_table();
         let metadata = table.metadata();
         let base_snapshot_id = metadata
             .current_snapshot()
@@ -400,7 +400,7 @@ impl IcebergDistributedRewriteAdapter {
         entry.invalidate_table_cache(&artifact.namespace, &artifact.table);
         let table = load_table(&entry, &artifact.namespace, &artifact.table)
             .map_err(|error| unavailable(format!("reload frozen Iceberg rewrite table: {error}")))?
-            .table;
+            .into_table();
         validate_frozen_rewrite_table(&artifact, table.metadata())?;
         let catalog = build_iceberg_catalog(&entry)
             .map_err(|error| unavailable(format!("build Iceberg rewrite catalog: {error}")))?;
@@ -557,7 +557,7 @@ impl IcebergDistributedRewriteAdapter {
             .map_err(|error| {
                 unavailable(format!("load Iceberg rewrite checkpoint table: {error}"))
             })?
-            .table;
+            .into_table();
         Ok(table.file_io().clone())
     }
 }

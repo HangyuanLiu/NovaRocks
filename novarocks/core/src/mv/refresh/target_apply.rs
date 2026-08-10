@@ -720,7 +720,7 @@ mod tests {
         let target_table =
             crate::connector::iceberg::catalog::registry::load_table(&target_entry, "db", "mv")
                 .expect("load target table")
-                .table;
+                .into_table();
         let target_snapshot_id = target_table.metadata().current_snapshot_id();
         TargetFixture {
             _warehouse: warehouse,

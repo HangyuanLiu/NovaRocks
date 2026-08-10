@@ -233,7 +233,7 @@ impl RegisteredIcebergDataMutationBackend {
         let entry = self.entry()?;
         entry.invalidate_table_cache(namespace, table);
         let loaded = load_table(&entry, namespace, table).map_err(map_provider_error)?;
-        Ok((entry, loaded.table))
+        Ok((entry, loaded.into_table()))
     }
 }
 

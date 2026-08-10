@@ -7515,7 +7515,7 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
                     format!("reload Iceberg row-mutation target at activation: {error}"),
                 )
             })?
-            .table;
+            .into_table();
     let actual_snapshot_id = iceberg_ref_snapshot_from_metadata(table.metadata(), target_ref)?;
     if actual_snapshot_id != expected_snapshot_id {
         return Err(ConnectorError::new(

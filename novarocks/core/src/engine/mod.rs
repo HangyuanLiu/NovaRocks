@@ -5987,14 +5987,7 @@ mod build_iceberg_create_table_ddl_tests {
             .metadata(metadata)
             .build()
             .expect("table");
-        IcebergLoadedTable {
-            table,
-            columns: vec![],
-            logical_types: HashMap::new(),
-            key_desc: None,
-            column_aggregations: HashMap::new(),
-            object_store_config: None,
-        }
+        IcebergLoadedTable::new(table, None, vec![], HashMap::new(), None, HashMap::new())
     }
 
     #[test]

@@ -185,7 +185,7 @@ impl IcebergMetadataMaintenanceAdapter {
         entry.invalidate_table_cache(&namespace, &table_name);
         let loaded = load_table(&entry, &namespace, &table_name)
             .map_err(|error| unavailable(format!("load Iceberg table for maintenance: {error}")))?;
-        let table = loaded.table;
+        let table = loaded.into_table();
         let metadata = table.metadata();
         let (older_than_ms, retain_last) = match request.operation() {
             ConnectorMetadataMaintenanceOperation::RewriteMetadataLayout { .. } => (None, None),

@@ -78,12 +78,45 @@ pub(crate) struct IcebergCatalogEntry {
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergLoadedTable {
-    pub table: novarocks_connector_iceberg::iceberg::table::Table,
+    physical: novarocks_connector_iceberg::loaded_table::IcebergPhysicalTable,
     pub columns: Vec<ColumnDef>,
     pub logical_types: HashMap<String, SqlType>,
     pub key_desc: Option<TableKeyDesc>,
     pub column_aggregations: HashMap<String, ColumnAggregation>,
-    pub object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+}
+
+impl IcebergLoadedTable {
+    pub(crate) fn new(
+        table: novarocks_connector_iceberg::iceberg::table::Table,
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+        columns: Vec<ColumnDef>,
+        logical_types: HashMap<String, SqlType>,
+        key_desc: Option<TableKeyDesc>,
+        column_aggregations: HashMap<String, ColumnAggregation>,
+    ) -> Self {
+        Self {
+            physical: novarocks_connector_iceberg::loaded_table::IcebergPhysicalTable::new(
+                table,
+                object_store_config,
+            ),
+            columns,
+            logical_types,
+            key_desc,
+            column_aggregations,
+        }
+    }
+
+    pub(crate) fn into_table(self) -> novarocks_connector_iceberg::iceberg::table::Table {
+        self.physical.into_table()
+    }
+}
+
+impl Deref for IcebergLoadedTable {
+    type Target = novarocks_connector_iceberg::loaded_table::IcebergPhysicalTable;
+
+    fn deref(&self) -> &Self::Target {
+        &self.physical
+    }
 }
 
 const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
@@ -1082,14 +1115,14 @@ pub(crate) fn load_table(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let loaded = IcebergLoadedTable {
+    let loaded = IcebergLoadedTable::new(
         table,
+        entry.object_store_config.clone(),
         columns,
         logical_types,
         key_desc,
         column_aggregations,
-        object_store_config: entry.object_store_config.clone(),
-    };
+    );
 
     // Cache the loaded table
     {

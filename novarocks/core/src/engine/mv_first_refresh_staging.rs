@@ -766,7 +766,7 @@ pub(crate) fn rebuild_frozen_mv_refresh_context(
         &target_identity.table,
     )
     .map_err(|error| format!("reload MV join staging target: {error}"))?
-    .table;
+    .into_table();
     if target_table.metadata().uuid().to_string() != facts.target_table_uuid {
         return Err(
             "MV refresh logical artifact target UUID drifted after preparation".to_string(),

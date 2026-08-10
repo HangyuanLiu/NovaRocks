@@ -1450,14 +1450,14 @@ fn framework_locator_loaded_table(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(crate::connector::iceberg::catalog::IcebergLoadedTable {
-        table: target_table.clone(),
-        columns,
-        logical_types: std::collections::HashMap::new(),
-        key_desc: None,
-        column_aggregations: std::collections::HashMap::new(),
+    Ok(crate::connector::iceberg::catalog::IcebergLoadedTable::new(
+        target_table.clone(),
         object_store_config,
-    })
+        columns,
+        std::collections::HashMap::new(),
+        None,
+        std::collections::HashMap::new(),
+    ))
 }
 
 #[cfg(test)]
@@ -2763,9 +2763,10 @@ mod tests {
     fn loaded_partitioned_apply_key_target(
         target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     ) -> crate::connector::iceberg::catalog::IcebergLoadedTable {
-        crate::connector::iceberg::catalog::IcebergLoadedTable {
-            table: target_table.clone(),
-            columns: vec![
+        crate::connector::iceberg::catalog::IcebergLoadedTable::new(
+            target_table.clone(),
+            None,
+            vec![
                 novarocks_catalog::schema::ColumnDef {
                     name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
@@ -2781,11 +2782,10 @@ mod tests {
                     logical_type: None,
                 },
             ],
-            logical_types: std::collections::HashMap::new(),
-            key_desc: None,
-            column_aggregations: std::collections::HashMap::new(),
-            object_store_config: None,
-        }
+            std::collections::HashMap::new(),
+            None,
+            std::collections::HashMap::new(),
+        )
     }
 
     fn assert_standard_mv_target_table_def_hides_physical_apply_key(

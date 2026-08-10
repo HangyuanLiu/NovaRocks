@@ -39,6 +39,7 @@ pub mod execution_declaration;
 pub mod file_reader;
 pub mod fs_io;
 pub mod hadoop_catalog;
+pub mod loaded_table;
 pub mod manifest;
 pub mod metadata_read;
 pub mod planning_facts;

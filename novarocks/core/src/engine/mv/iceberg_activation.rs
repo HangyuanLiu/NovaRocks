@@ -153,7 +153,7 @@ pub(crate) fn activate_first_refresh_connector_write(
     let target_table =
         crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)
             .map_err(|error| format!("reload MV first-refresh staging target: {error}"))?
-            .table;
+            .into_table();
     validate_first_refresh_target_contract(&target_table, prepared.target_contract())?;
     let ident = TableIdent::new(
         NamespaceIdent::new(target.namespace.clone()),

@@ -424,7 +424,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         entry.invalidate_table_cache(&namespace, &table_name);
         let loaded = load_table(&entry, &namespace, &table_name)
             .map_err(|error| unavailable(format!("load Iceberg cleanup table: {error}")))?;
-        let table = loaded.table;
+        let table = loaded.into_table();
         let metadata = table.metadata();
         let collected = block_on_iceberg(collect_orphan_candidates(
             build_catalog(&entry)?,
