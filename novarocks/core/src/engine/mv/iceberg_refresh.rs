@@ -1545,9 +1545,17 @@ impl MvEngine for StandaloneMvEngine {
         };
         #[cfg(test)]
         run_after_create_target_hook();
+        let loaded_target = crate::connector::metadata_load_connector_table_with_planning_lease(
+            &planning_lease,
+            self.connector_context.clone(),
+            &table.namespace,
+            &table.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .map_err(engine_target_error)?;
         let observation = match self.storage_observer.observe_created_target(
             &planning_lease,
-            &table,
+            &loaded_target,
             self.connector_context.clone(),
         ) {
             Ok(observation) => observation,

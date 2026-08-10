@@ -199,8 +199,16 @@ fn execute_request_with_context(
         Arc::clone(&state.iceberg_catalogs),
         Arc::clone(&state.connector_control),
     );
+    let loaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &table.namespace,
+        &table.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )
+    .map_err(|error| format!("load stateless rebuild table metadata: {error}"))?;
     let package = observer
-        .observe_lake_package(&exact_lease, &table, connector_context)
+        .observe_lake_package(&exact_lease, &loaded_table, connector_context)
         .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
         .ok_or_else(|| {
             format!(

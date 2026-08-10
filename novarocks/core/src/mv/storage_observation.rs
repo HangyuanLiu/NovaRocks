@@ -26,7 +26,7 @@ use std::collections::HashSet;
 
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableIdentity,
+    ConnectorTableIdentity, ConnectorTableMetadata,
 };
 
 use crate::mv::persistence::{descriptor::MvDescriptorV1, schema::MvPartitionContract};
@@ -234,12 +234,17 @@ pub(crate) enum MvPublishedRefreshTechnique {
     MetadataOnly,
 }
 
-/// Observation port implemented by the sole concrete Iceberg adapter.
+/// Observation port implemented by a composition-injected storage inspector.
+///
+/// The Core application loads metadata through the retained exact lease, then
+/// gives the inspector that sealed metadata value.  The port deliberately has
+/// no catalog entry, table handle downcast, or "current generation" lookup:
+/// only the provider implementation may interpret its opaque table handle.
 pub(crate) trait MvStorageObservation: Send + Sync {
     fn observe_created_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
+        metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvTargetCreationObservation, ConnectorError>;
 
@@ -251,7 +256,7 @@ pub(crate) trait MvStorageObservation: Send + Sync {
     fn observe_lake_package(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
+        metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<Option<MvLakePackageObservation>, ConnectorError>;
 }

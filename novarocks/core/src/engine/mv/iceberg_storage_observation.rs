@@ -32,6 +32,7 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
     ConnectorNamespaceIdentity, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableMetadata,
 };
 
 use crate::connector::iceberg::catalog::registry::{
@@ -128,10 +129,12 @@ impl MvStorageObservation for IcebergMvStorageObservationAdapter {
     fn observe_created_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
+        metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvTargetCreationObservation, ConnectorError> {
         validate_context(&context)?;
+        let table = &metadata.identity;
+        validate_loaded_metadata(exact_lease, metadata)?;
         let entry = self.exact_entry(exact_lease, table)?;
         entry.invalidate_table_cache(&table.namespace, &table.table);
         let loaded = load_table(&entry, &table.namespace, &table.table).map_err(internal)?;
@@ -237,10 +240,12 @@ impl MvStorageObservation for IcebergMvStorageObservationAdapter {
     fn observe_lake_package(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
+        metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
         validate_context(&context)?;
+        let table = &metadata.identity;
+        validate_loaded_metadata(exact_lease, metadata)?;
         let entry = self.exact_entry(exact_lease, table)?;
         entry.invalidate_table_cache(&table.namespace, &table.table);
         let loaded = match load_table(&entry, &table.namespace, &table.table) {
@@ -259,6 +264,20 @@ impl MvStorageObservation for IcebergMvStorageObservationAdapter {
         validate_context(&context)?;
         self.observe_loaded_package(table.clone(), &loaded)
     }
+}
+
+fn validate_loaded_metadata(
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+) -> Result<(), ConnectorError> {
+    validate_exact_lease(exact_lease, &metadata.identity)?;
+    if metadata.table.owner() != &metadata.identity.instance_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "MV storage observation metadata handle does not match its table identity",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_exact_lease(

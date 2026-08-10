@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks::common::app_config::ClusterRole;
-use novarocks::connector::iceberg::commit::CommitOpKind;
 use novarocks::engine::delete_engine::{
     DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatementKind,
     DeleteWriteReport, PrepareDeleteRequest, PreparedDelete,
@@ -100,7 +99,6 @@ impl DeleteEngine for FakeDeleteEngine {
                 table: "orders".to_string(),
                 target_ref: "main".to_string(),
                 attempt_id: "delete-test-attempt".to_string(),
-                commit_op_kind: CommitOpKind::RowDelta,
                 base_snapshot_id: Some(7),
             },
             handle: Arc::new(FakePrepared),
@@ -119,21 +117,6 @@ impl DeleteEngine for FakeDeleteEngine {
                 has_staged_files: true,
             },
         })
-    }
-
-    fn commit_delete(
-        &self,
-        _prepared: &dyn DeletePrepared,
-        _commit: &dyn DeleteCommit,
-    ) -> Result<
-        novarocks::connector::iceberg::commit::CommitOutcome,
-        novarocks::connector::iceberg::commit::CommitServiceError,
-    > {
-        Err(
-            novarocks::connector::iceberg::commit::CommitServiceError::invalid_input(
-                "test engine exposes only the terminal commit contract".to_string(),
-            ),
-        )
     }
 
     fn commit_delete_terminal(

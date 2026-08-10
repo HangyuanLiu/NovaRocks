@@ -28,8 +28,7 @@ use std::sync::Arc;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::commit::CommitServiceError;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
+use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::statistics::StatisticsEngine;
 use crate::engine::{StandaloneState, iceberg_writer};
@@ -206,12 +205,6 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
         prepared: &dyn IcebergPreparedInsert,
     ) -> Result<IcebergWriteReport, String>;
 
-    fn commit_iceberg_write(
-        &self,
-        prepared: &dyn IcebergPreparedInsert,
-        commit: &dyn IcebergInsertCommit,
-    ) -> Result<CommitOutcome, CommitServiceError>;
-
     fn commit_iceberg_write_terminal(
         &self,
         _prepared: &dyn IcebergPreparedInsert,
@@ -369,29 +362,6 @@ impl InsertEngine for Arc<StandaloneState> {
             prepared.prepared.run_coordinated_write()?,
             prepared.prepared.commit_op_kind(),
         ))
-    }
-
-    fn commit_iceberg_write(
-        &self,
-        prepared: &dyn IcebergPreparedInsert,
-        commit: &dyn IcebergInsertCommit,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let prepared = downcast_prepared(prepared).map_err(|message| {
-            CommitServiceError::known_uncommitted(
-                message,
-                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-            )
-        })?;
-        let commit = commit
-            .as_any()
-            .downcast_ref::<CoreIcebergInsertCommit>()
-            .ok_or_else(|| {
-                CommitServiceError::known_uncommitted(
-                    "foreign Iceberg INSERT commit handle".to_string(),
-                    crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-                )
-            })?;
-        prepared.prepared.commit(&commit.completion)
     }
 
     fn commit_iceberg_write_terminal(

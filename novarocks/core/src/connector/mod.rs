@@ -366,6 +366,34 @@ pub(crate) fn metadata_load_table_with_planning_lease(
     ))
 }
 
+/// Load the exact connector metadata admitted by a retained planning lease.
+///
+/// Consumers that need provider-owned interpretation must pass this value to
+/// a composition-injected application port.  They must not decode the opaque
+/// table handle or reopen the current connector generation themselves.
+pub(crate) fn metadata_load_connector_table_with_planning_lease(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<novarocks_spi::connector::ConnectorTableMetadata, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution,
+            context,
+        })
+        .map_err(|error| error.to_string())
+}
+
 fn sql_columns_from_connector_schema(
     schema: &arrow::datatypes::Schema,
 ) -> Vec<novarocks_catalog::schema::ColumnDef> {

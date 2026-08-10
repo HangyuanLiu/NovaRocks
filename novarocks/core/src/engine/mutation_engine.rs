@@ -25,8 +25,6 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::connector::iceberg::commit::CommitServiceError;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
@@ -137,32 +135,12 @@ pub trait MutationEngine: Send + Sync {
         prepared: &dyn MutationPrepared,
     ) -> Result<MutationStageOutcome, String>;
 
-    fn abort_mutation(
-        &self,
-        _prepared: &dyn MutationPrepared,
-        _abort: &dyn MutationAbort,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        Err(CommitServiceError::invalid_input(
-            "mutation engine does not expose a legacy Iceberg abort result".to_string(),
-        ))
-    }
-
     fn abort_mutation_terminal(
         &self,
         _prepared: &dyn MutationPrepared,
         _abort: &dyn MutationAbort,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
         Err("mutation engine does not expose a connector terminal abort outcome".to_string())
-    }
-
-    fn commit_mutation(
-        &self,
-        _prepared: &dyn MutationPrepared,
-        _commit: &dyn MutationCommit,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        Err(CommitServiceError::invalid_input(
-            "mutation engine does not expose a legacy Iceberg commit result".to_string(),
-        ))
     }
 
     fn commit_mutation_terminal(
@@ -232,26 +210,18 @@ fn prepared_handle(prepared: &dyn MutationPrepared) -> Result<&CoreMutationPrepa
         .ok_or_else(|| "mutation engine received a foreign prepared handle".to_string())
 }
 
-fn commit_handle(commit: &dyn MutationCommit) -> Result<&CoreMutationCommit, CommitServiceError> {
+fn commit_handle(commit: &dyn MutationCommit) -> Result<&CoreMutationCommit, String> {
     commit
         .as_any()
         .downcast_ref::<CoreMutationCommit>()
-        .ok_or_else(|| {
-            CommitServiceError::invalid_input(
-                "mutation engine received a foreign commit handle".to_string(),
-            )
-        })
+        .ok_or_else(|| "mutation engine received a foreign commit handle".to_string())
 }
 
-fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, CommitServiceError> {
+fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String> {
     abort
         .as_any()
         .downcast_ref::<CoreMutationAbort>()
-        .ok_or_else(|| {
-            CommitServiceError::invalid_input(
-                "mutation engine received a foreign abort handle".to_string(),
-            )
-        })
+        .ok_or_else(|| "mutation engine received a foreign abort handle".to_string())
 }
 
 impl MutationEngine for Arc<crate::engine::StandaloneState> {
@@ -433,40 +403,13 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
         }
     }
 
-    fn abort_mutation(
-        &self,
-        prepared: &dyn MutationPrepared,
-        abort: &dyn MutationAbort,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let prepared = prepared_handle(prepared).map_err(CommitServiceError::invalid_input)?;
-        let abort = abort_handle(abort)?;
-        if prepared.operation.kind != abort.kind
-            || prepared.operation.attempt_id != abort.attempt_id
-        {
-            return Err(CommitServiceError::invalid_input(
-                "mutation abort handle does not belong to this prepared mutation".to_string(),
-            ));
-        }
-        if prepared.state.swap(TERMINAL, Ordering::AcqRel) == TERMINAL {
-            return Err(CommitServiceError::invalid_input(
-                "mutation abort was decided more than once".to_string(),
-            ));
-        }
-        *prepared
-            .finalizer
-            .lock()
-            .expect("mutation finalizer lock poisoned") = Some(Arc::clone(&abort.execution));
-        abort.execution.abort(abort.reason.clone())
-    }
-
     fn abort_mutation_terminal(
         &self,
         prepared: &dyn MutationPrepared,
         abort: &dyn MutationAbort,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
         let prepared = prepared_handle(prepared)?;
-        let abort = abort_handle(abort)
-            .map_err(|error| format!("invalid mutation abort handle: {error:?}"))?;
+        let abort = abort_handle(abort)?;
         if prepared.operation.kind != abort.kind
             || prepared.operation.attempt_id != abort.attempt_id
         {
@@ -484,44 +427,6 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
         abort.execution.abort_terminal()
     }
 
-    fn commit_mutation(
-        &self,
-        prepared: &dyn MutationPrepared,
-        commit: &dyn MutationCommit,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let prepared = prepared_handle(prepared).map_err(CommitServiceError::invalid_input)?;
-        let commit = commit_handle(commit).map_err(|error| {
-            CommitServiceError::invalid_input(format!("invalid mutation commit handle: {error:?}"))
-        })?;
-        if prepared.operation.kind != commit.kind
-            || prepared.operation.attempt_id != commit.attempt_id
-        {
-            return Err(CommitServiceError::invalid_input(
-                "mutation commit handle does not belong to this prepared mutation".to_string(),
-            ));
-        }
-        if prepared.state.swap(TERMINAL, Ordering::AcqRel) == TERMINAL {
-            return Err(CommitServiceError::invalid_input(
-                "mutation commit was decided more than once".to_string(),
-            ));
-        }
-        *prepared
-            .finalizer
-            .lock()
-            .expect("mutation finalizer lock poisoned") = Some(Arc::clone(&commit.execution));
-        let completion = commit
-            .completion
-            .lock()
-            .expect("mutation commit completion lock poisoned")
-            .take()
-            .ok_or_else(|| {
-                CommitServiceError::invalid_input(
-                    "mutation commit completion was already consumed".to_string(),
-                )
-            })?;
-        commit.execution.commit(&completion)
-    }
-
     fn commit_mutation_terminal(
         &self,
         prepared: &dyn MutationPrepared,
@@ -533,8 +438,7 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
         String,
     > {
         let prepared = prepared_handle(prepared)?;
-        let commit = commit_handle(commit)
-            .map_err(|error| format!("invalid mutation commit handle: {error:?}"))?;
+        let commit = commit_handle(commit)?;
         if prepared.operation.kind != commit.kind
             || prepared.operation.attempt_id != commit.attempt_id
         {
@@ -698,24 +602,29 @@ mod tests {
     }
 
     #[test]
-    fn abort_rejects_foreign_and_cross_statement_handles_without_consuming_prepared_state() {
+    fn terminal_abort_rejects_foreign_and_cross_statement_handles_without_consuming_prepared_state()
+    {
         let engine = Arc::new(crate::engine::StandaloneState::default());
         let prepared = prepared(MutationStatementKind::Update, "update-attempt");
         let execution = Arc::new(TestExecution::known_uncommitted());
 
         let foreign = ForeignAbort;
-        let error = engine.abort_mutation(&prepared, &foreign).unwrap_err();
-        assert!(matches!(error, CommitServiceError::InvalidInput { .. }));
+        let error = engine
+            .abort_mutation_terminal(&prepared, &foreign)
+            .unwrap_err();
+        assert!(error.contains("foreign abort handle"));
         assert_eq!(prepared.state.load(Ordering::Acquire), STAGED);
 
         let merge_abort = abort_handle(MutationStatementKind::Merge, "update-attempt", execution);
-        let error = engine.abort_mutation(&prepared, &merge_abort).unwrap_err();
-        assert!(matches!(error, CommitServiceError::InvalidInput { .. }));
+        let error = engine
+            .abort_mutation_terminal(&prepared, &merge_abort)
+            .unwrap_err();
+        assert!(error.contains("does not belong"));
         assert_eq!(prepared.state.load(Ordering::Acquire), STAGED);
     }
 
     #[test]
-    fn abort_consumes_the_exact_handle_once_and_keeps_its_execution_for_finalization() {
+    fn terminal_abort_keeps_its_execution_for_finalization() {
         let engine = Arc::new(crate::engine::StandaloneState::default());
         let prepared = prepared(MutationStatementKind::Update, "update-attempt");
         let execution = Arc::new(TestExecution::known_uncommitted());
@@ -725,14 +634,21 @@ mod tests {
             Arc::clone(&execution),
         );
 
-        let outcome = engine.abort_mutation(&prepared, &abort).unwrap();
-        assert_eq!(outcome.new_snapshot_id, 0);
+        let outcome = engine.abort_mutation_terminal(&prepared, &abort).unwrap();
+        assert_eq!(
+            outcome,
+            ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: ExternalMutationFinalization::Complete,
+            }
+        );
         assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
         assert_eq!(prepared.state.load(Ordering::Acquire), super::TERMINAL);
         engine.finalize_mutation(&prepared).unwrap();
 
-        let error = engine.abort_mutation(&prepared, &abort).unwrap_err();
-        assert!(matches!(error, CommitServiceError::InvalidInput { .. }));
+        let error = engine
+            .abort_mutation_terminal(&prepared, &abort)
+            .unwrap_err();
+        assert!(error.contains("decided more than once"));
         assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
     }
 

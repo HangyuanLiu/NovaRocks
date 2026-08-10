@@ -232,21 +232,6 @@ impl InsertEngine for FakeInsertEngine {
         })
     }
 
-    fn commit_iceberg_write(
-        &self,
-        _prepared: &dyn IcebergPreparedInsert,
-        _commit: &dyn IcebergInsertCommit,
-    ) -> Result<
-        novarocks::connector::iceberg::commit::CommitOutcome,
-        novarocks::connector::iceberg::commit::CommitServiceError,
-    > {
-        Err(
-            novarocks::connector::iceberg::commit::CommitServiceError::invalid_input(
-                "test engine exposes only the terminal commit contract".to_string(),
-            ),
-        )
-    }
-
     fn commit_iceberg_write_terminal(
         &self,
         _prepared: &dyn IcebergPreparedInsert,

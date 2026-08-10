@@ -177,16 +177,6 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         has_iceberg_staged_output(completion, &self.commit_executor)
     }
 
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        )
-    }
-
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -199,7 +189,10 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
             self.connector_write.preparation().owner(),
             self.connector_write.operation_id(),
-            self.commit(completion),
+            crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
+                &self.commit_executor,
+                completion,
+            ),
         )
     }
 
@@ -329,7 +322,6 @@ fn prepare_equality_delete_distributed_write(
             table: target.table.clone(),
             target_ref: "main".to_string(),
             attempt_id: connector_operation_id.to_string(),
-            commit_op_kind: CommitOpKind::RowDelta,
             base_snapshot_id: current_snapshot_id,
         },
         Arc::new(executor),
