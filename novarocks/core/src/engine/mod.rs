@@ -44,7 +44,7 @@ use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
 #[cfg(test)]
 use crate::mv::application::UnavailableMvApplicationService;
-use crate::mv::application::{MvApplicationService, MvFirstRefreshWriteActivator};
+use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
 use crate::mv::repository::MvRepository;
 #[cfg(test)]
 use crate::mv::repository::UnavailableMvRepository;
@@ -1196,8 +1196,8 @@ pub struct StandaloneOpenServices {
     /// Receives the Core-owned provider activation adapter after the engine
     /// has its connector registry. The frontend remains the owner of every
     /// durable and external refresh transition.
-    pub mv_first_refresh_write_activator_sink:
-        Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
+    pub mv_refresh_provider_activation_sink:
+        Option<std::sync::Arc<dyn crate::mv::application::MvRefreshProviderActivationSink>>,
     /// Receives the provider-neutral MV background adapter after restore and
     /// table-maintenance recovery. The frontend owns all worker lifecycle.
     pub mv_background_engine_sink:
@@ -1254,7 +1254,7 @@ impl StandaloneOpenServices {
             statistics_target_resolver_sink: None,
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
-            mv_first_refresh_write_activator_sink: None,
+            mv_refresh_provider_activation_sink: None,
             mv_background_engine_sink: None,
             connector_control,
             table_maintenance_service,
@@ -1303,11 +1303,11 @@ impl StandaloneOpenServices {
         self
     }
 
-    pub fn with_mv_first_refresh_write_activator_sink(
+    pub fn with_mv_refresh_provider_activation_sink(
         mut self,
-        sink: Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
+        sink: Option<std::sync::Arc<dyn crate::mv::application::MvRefreshProviderActivationSink>>,
     ) -> Self {
-        self.mv_first_refresh_write_activator_sink = sink;
+        self.mv_refresh_provider_activation_sink = sink;
         self
     }
 
@@ -1321,9 +1321,9 @@ impl StandaloneOpenServices {
 }
 
 impl StandaloneNovaRocks {
-    pub fn mv_first_refresh_write_activator(&self) -> Arc<dyn MvFirstRefreshWriteActivator> {
+    pub fn mv_refresh_provider_activation(&self) -> Arc<dyn MvRefreshProviderActivation> {
         Arc::new(
-            crate::engine::mv_first_refresh_staging::StandaloneMvFirstRefreshWriteActivator::new(
+            crate::engine::mv::iceberg_activation::StandaloneMvRefreshProviderActivation::new(
                 Arc::downgrade(&self.inner),
             ),
         )
@@ -1397,7 +1397,7 @@ impl StandaloneNovaRocks {
             statistics_target_resolver_sink,
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
-            mv_first_refresh_write_activator_sink,
+            mv_refresh_provider_activation_sink,
             mv_background_engine_sink,
             connector_control,
             table_maintenance_service,
@@ -1454,8 +1454,8 @@ impl StandaloneNovaRocks {
         if let Some(sink) = statistics_attempt_executor_sink {
             sink.bind_statistics_attempt_executor(engine.statistics_attempt_executor())?;
         }
-        if let Some(sink) = mv_first_refresh_write_activator_sink {
-            sink.bind_mv_first_refresh_write_activator(engine.mv_first_refresh_write_activator())?;
+        if let Some(sink) = mv_refresh_provider_activation_sink {
+            sink.bind_mv_refresh_provider_activation(engine.mv_refresh_provider_activation())?;
         }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;

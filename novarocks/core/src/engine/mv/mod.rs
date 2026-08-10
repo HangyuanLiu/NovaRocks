@@ -17,6 +17,7 @@
 
 pub(crate) mod analysis_adapter;
 pub(crate) mod dependency;
+pub(crate) mod iceberg_activation;
 pub(crate) mod iceberg_aggregate_state;
 pub(crate) mod iceberg_backend;
 pub(crate) mod iceberg_guard;

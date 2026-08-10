@@ -24,10 +24,10 @@ use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
 use novarocks::mv::application::{
-    MvApplicationError, MvApplicationErrorKind, MvStatementResult, PreparedMvFirstRefreshWrite,
-    PreparedMvIncrementalWrite, PreparedMvRefresh, PreparedMvRefreshWork,
+    MvApplicationError, MvApplicationErrorKind, MvRefreshCommittedFacts,
+    MvRefreshProviderActivation, MvRefreshProviderActivationSink, MvRefreshPublishedFacts,
+    MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
-use novarocks::mv::application::{MvFirstRefreshWriteActivator, MvFirstRefreshWriteActivatorSink};
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
     FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
@@ -57,78 +57,76 @@ use sha2::{Digest, Sha256};
 pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
-    pub(super) first_refresh_activator: Arc<FrontendMvFirstRefreshWriteActivatorPort>,
+    pub(super) provider_activation: Arc<FrontendMvRefreshProviderActivationPort>,
 }
 
 /// Composition-owned indirection between the frontend lifecycle and the Core
 /// provider adapter. It is intentionally bound only after Core has opened its
 /// connector registry; no all-in-one direct call is available before then.
-pub(crate) struct FrontendMvFirstRefreshWriteActivatorPort {
-    activator: RwLock<Option<Arc<dyn MvFirstRefreshWriteActivator>>>,
+pub(crate) struct FrontendMvRefreshProviderActivationPort {
+    activation: RwLock<Option<Arc<dyn MvRefreshProviderActivation>>>,
 }
 
-impl FrontendMvFirstRefreshWriteActivatorPort {
+impl FrontendMvRefreshProviderActivationPort {
     pub(crate) fn new() -> Self {
         Self {
-            activator: RwLock::new(None),
+            activation: RwLock::new(None),
         }
     }
 
-    fn bind(&self, activator: Arc<dyn MvFirstRefreshWriteActivator>) -> Result<(), String> {
+    fn bind(&self, activation: Arc<dyn MvRefreshProviderActivation>) -> Result<(), String> {
         let mut current = self
-            .activator
+            .activation
             .write()
-            .map_err(|_| "MV first-refresh activator lock is poisoned".to_string())?;
+            .map_err(|_| "MV refresh provider activation lock is poisoned".to_string())?;
         if current.is_some() {
-            return Err("MV first-refresh activator is already bound".to_string());
+            return Err("MV refresh provider activation is already bound".to_string());
         }
-        *current = Some(activator);
+        *current = Some(activation);
         Ok(())
     }
 
-    fn bind_write(
+    fn activate_write(
         &self,
-        prepared: PreparedMvFirstRefreshWrite,
+        prepared: PreparedMvRefreshWrite,
         planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &novarocks::query_execution::request_context::QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, MvApplicationError> {
-        let activator = self
-            .activator
+        let activation = self
+            .activation
             .read()
-            .map_err(|_| unavailable("MV first-refresh activator lock is poisoned"))?
+            .map_err(|_| unavailable("MV refresh provider activation lock is poisoned"))?
             .clone()
-            .ok_or_else(|| unavailable("MV first-refresh provider activation is unavailable"))?;
-        activator
-            .bind_first_refresh_write(prepared, planning_lease, lease, execution)
+            .ok_or_else(|| unavailable("MV refresh provider activation is unavailable"))?;
+        activation
+            .activate_write(prepared, planning_lease, lease, execution)
             .map_err(invalid)
     }
 
-    fn bind_incremental_write(
+    fn interpret_write_commit(
         &self,
-        prepared: PreparedMvIncrementalWrite,
-        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-        lease: &novarocks_spi::connector::ConnectorWriteLease,
-        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<PreparedDistributedWriteRequest, MvApplicationError> {
-        let activator = self
-            .activator
+        intent: novarocks::mv::application::MvRefreshPublicationIntent,
+        receipt: &ConnectorWriteReceipt,
+    ) -> Result<MvRefreshCommittedFacts, MvApplicationError> {
+        let activation = self
+            .activation
             .read()
-            .map_err(|_| unavailable("MV first-refresh activator lock is poisoned"))?
+            .map_err(|_| unavailable("MV refresh provider activation lock is poisoned"))?
             .clone()
-            .ok_or_else(|| unavailable("MV incremental provider activation is unavailable"))?;
-        activator
-            .bind_incremental_refresh_write(prepared, planning_lease, lease, execution)
+            .ok_or_else(|| unavailable("MV refresh provider activation is unavailable"))?;
+        activation
+            .interpret_write_commit(intent, receipt)
             .map_err(invalid)
     }
 }
 
-impl MvFirstRefreshWriteActivatorSink for FrontendMvFirstRefreshWriteActivatorPort {
-    fn bind_mv_first_refresh_write_activator(
+impl MvRefreshProviderActivationSink for FrontendMvRefreshProviderActivationPort {
+    fn bind_mv_refresh_provider_activation(
         &self,
-        activator: Arc<dyn MvFirstRefreshWriteActivator>,
+        activation: Arc<dyn MvRefreshProviderActivation>,
     ) -> Result<(), String> {
-        self.bind(activator)
+        self.bind(activation)
     }
 }
 
@@ -207,17 +205,13 @@ pub(super) fn execute(
                 .map_err(repository_error)?;
             Ok(MvStatementResult::Ok)
         }
-        PreparedMvRefreshWork::DataProducing {
-            first_refresh_writes,
-            incremental_writes,
-        } => execute_data_refresh(
+        PreparedMvRefreshWork::DataProducing { write } => execute_data_refresh(
             repository,
             dependencies,
             &planning_lease,
             attempt,
             finalize,
-            first_refresh_writes,
-            incremental_writes,
+            write,
             base_snapshots,
             connector_context,
             execution,
@@ -232,17 +226,11 @@ fn execute_data_refresh(
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: novarocks::mv::application::MvRefreshAttemptIdentity,
     finalize: MvRefreshFinalizeFacts,
-    first_refresh_writes: Vec<PreparedMvFirstRefreshWrite>,
-    incremental_writes: Vec<PreparedMvIncrementalWrite>,
+    prepared: PreparedMvRefreshWrite,
     base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
     execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
-    if first_refresh_writes.len() + incremental_writes.len() != 1 {
-        return Err(invalid(
-            "MV refresh data preparation must produce exactly one staged distributed write",
-        ));
-    }
     let mutation_lease = planning_lease
         .derive_mutation_lease()
         .map_err(|error| unavailable(error.to_string()))?;
@@ -274,35 +262,18 @@ fn execute_data_refresh(
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| unavailable(error.to_string()))?;
-    let write = match (
-        first_refresh_writes.into_iter().next(),
-        incremental_writes.into_iter().next(),
-    ) {
-        (Some(first_refresh), None) => {
-            if first_refresh.operation_id() != attempt.write_operation_id {
-                return Err(invalid(
-                    "SQL-prepared MV first-refresh write does not use the frontend-preallocated operation ID",
-                ));
-            }
-            dependencies.first_refresh_activator.bind_write(
-                first_refresh,
-                planning_lease,
-                &write_lease,
-                execution,
-            )?
-        }
-        (None, Some(incremental)) => {
-            if incremental.operation_id() != attempt.write_operation_id {
-                return Err(invalid(
-                    "SQL-prepared MV incremental write does not use the frontend-preallocated operation ID",
-                ));
-            }
-            dependencies
-                .first_refresh_activator
-                .bind_incremental_write(incremental, planning_lease, &write_lease, execution)?
-        }
-        _ => unreachable!("checked exactly one prepared MV write"),
-    };
+    if prepared.operation_id() != attempt.write_operation_id {
+        return Err(invalid(
+            "SQL-prepared MV write does not use the frontend-preallocated operation ID",
+        ));
+    }
+    let publication_intent = prepared.publication_intent().clone();
+    let write = dependencies.provider_activation.activate_write(
+        prepared,
+        planning_lease,
+        &write_lease,
+        execution,
+    )?;
     if write.write_operation_id() != attempt.write_operation_id {
         return Err(invalid(
             "SQL-prepared MV write does not use the frontend-preallocated operation ID",
@@ -366,14 +337,11 @@ fn execute_data_refresh(
         &completion,
         connector_context.clone(),
     )?;
-    let committed_version = receipt.committed_version().ok_or_else(|| {
-        invalid("MV refresh connector write committed without a provider version")
-    })?;
-    let rows = i64::try_from(receipt.resulting_row_count().ok_or_else(|| {
-        invalid("MV refresh connector write committed without resulting row-count fact")
-    })?)
-    .map_err(|_| invalid("MV refresh committed row count exceeds i64 range"))?;
-    let frontend_version = frontend_version(committed_version)?;
+    let committed = dependencies
+        .provider_activation
+        .interpret_write_commit(publication_intent, &receipt)?;
+    let committed_version = committed.committed_version().clone();
+    let write_frontend_version = frontend_version(&committed_version)?;
 
     recovery_phase_barrier("write-committed")?;
 
@@ -398,14 +366,25 @@ fn execute_data_refresh(
         },
         connector_context.clone(),
     );
-    record_catalog_action(
+    let publication = record_catalog_action(
         repository,
         attempt.refresh_id,
         FrontendMvRefreshActionPhase::Publication,
         attempt.publication_operation_id,
         publication,
-        Some(frontend_version.clone()),
+        Some(write_frontend_version.clone()),
     )?;
+    let publication_version = publication
+        .receipt
+        .committed_version()
+        .cloned()
+        // The existing persistence contract permits an AlterRef receipt without
+        // an explicit version. Preserve its write-commit fallback rather than
+        // fabricating a new provider fact at the frontend boundary.
+        .unwrap_or(committed_version);
+    let published =
+        MvRefreshPublishedFacts::try_new(committed, publication_version).map_err(invalid)?;
+    let published_frontend_version = frontend_version(published.publication_version())?;
 
     recovery_phase_barrier("publication-committed")?;
 
@@ -434,10 +413,10 @@ fn execute_data_refresh(
     repository
         .finalize_refresh(MvRefreshFinalizeRequest {
             refresh_id: attempt.refresh_id,
-            rows,
+            rows: published.committed().resulting_row_count(),
             base_snapshots,
             base_table_uuids: finalize.base_table_uuids,
-            target_snapshot_id: frontend_version.snapshot_id,
+            target_snapshot_id: published_frontend_version.snapshot_id,
         })
         .map_err(|error| {
             MvApplicationError::new(
@@ -454,18 +433,9 @@ fn new_ledger(
     has_external_actions: bool,
 ) -> Result<FrontendMvRefreshLedger, MvApplicationError> {
     let cohort_ids = match &refresh.work {
-        PreparedMvRefreshWork::DataProducing {
-            first_refresh_writes,
-            incremental_writes,
-        } => first_refresh_writes
-            .iter()
-            .map(|write| hex::encode(write.primary_cohort().to_bytes()))
-            .chain(
-                incremental_writes
-                    .iter()
-                    .map(|write| hex::encode(write.primary_cohort().to_bytes())),
-            )
-            .collect(),
+        PreparedMvRefreshWork::DataProducing { write } => {
+            vec![hex::encode(write.primary_cohort().to_bytes())]
+        }
         PreparedMvRefreshWork::NoOp | PreparedMvRefreshWork::MetadataOnly => Vec::new(),
     };
     if has_external_actions && cohort_ids.is_empty() {
@@ -887,21 +857,23 @@ mod tests {
     use std::sync::Arc;
 
     use novarocks::mv::application::{
-        MvFirstRefreshWriteActivator, MvFirstRefreshWriteActivatorSink,
-        PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite,
+        MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshProviderActivationSink,
+        MvRefreshPublicationIntent, PreparedMvRefreshWrite,
     };
     use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
     use novarocks::query_execution::request_context::QueryExecutionContext;
-    use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
+    use novarocks_spi::connector::{
+        ConnectorControlPlanningLease, ConnectorWriteLease, ConnectorWriteReceipt,
+    };
 
-    use super::FrontendMvFirstRefreshWriteActivatorPort;
+    use super::FrontendMvRefreshProviderActivationPort;
 
     struct FakeActivator;
 
-    impl MvFirstRefreshWriteActivator for FakeActivator {
-        fn bind_first_refresh_write(
+    impl MvRefreshProviderActivation for FakeActivator {
+        fn activate_write(
             &self,
-            _prepared: PreparedMvFirstRefreshWrite,
+            _prepared: PreparedMvRefreshWrite,
             _planning_lease: &ConnectorControlPlanningLease,
             _exact_lease: &ConnectorWriteLease,
             _execution: &QueryExecutionContext,
@@ -909,26 +881,24 @@ mod tests {
             unreachable!("the composition test never binds a write")
         }
 
-        fn bind_incremental_refresh_write(
+        fn interpret_write_commit(
             &self,
-            _prepared: PreparedMvIncrementalWrite,
-            _planning_lease: &ConnectorControlPlanningLease,
-            _exact_lease: &ConnectorWriteLease,
-            _execution: &QueryExecutionContext,
-        ) -> Result<PreparedDistributedWriteRequest, String> {
-            unreachable!("the composition test never binds a write")
+            _intent: MvRefreshPublicationIntent,
+            _receipt: &ConnectorWriteReceipt,
+        ) -> Result<MvRefreshCommittedFacts, String> {
+            unreachable!("the composition test never interprets a receipt")
         }
     }
 
     #[test]
-    fn first_refresh_activator_is_bound_once_after_frontend_composition() {
-        let port = FrontendMvFirstRefreshWriteActivatorPort::new();
-        port.bind_mv_first_refresh_write_activator(Arc::new(FakeActivator))
+    fn provider_activation_is_bound_once_after_frontend_composition() {
+        let port = FrontendMvRefreshProviderActivationPort::new();
+        port.bind_mv_refresh_provider_activation(Arc::new(FakeActivator))
             .expect("first Core activation adapter binds");
 
         let error = port
-            .bind_mv_first_refresh_write_activator(Arc::new(FakeActivator))
+            .bind_mv_refresh_provider_activation(Arc::new(FakeActivator))
             .expect_err("a second Core activation adapter must fail closed");
-        assert_eq!(error, "MV first-refresh activator is already bound");
+        assert_eq!(error, "MV refresh provider activation is already bound");
     }
 }

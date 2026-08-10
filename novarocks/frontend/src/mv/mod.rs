@@ -26,5 +26,5 @@ pub(crate) mod scheduler;
 mod service;
 
 pub use recovery::FrontendMvRecoverySummary;
-pub(crate) use refresh::FrontendMvFirstRefreshWriteActivatorPort;
+pub(crate) use refresh::FrontendMvRefreshProviderActivationPort;
 pub use service::FrontendMvService;

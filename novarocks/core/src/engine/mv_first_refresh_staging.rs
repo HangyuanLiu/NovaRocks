@@ -8,10 +8,9 @@
 //! MVX-2W exercises it through the native fixture; MVX-2 will make the route
 //! switch only after that fixture proves the data plane.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Weak};
 
-use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorControlPlanningLease, ConnectorControlResolver,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
@@ -19,8 +18,6 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, CreateOrReplacePolicy,
 };
 
-use crate::connector::iceberg::commit::CommitOpKind;
-use crate::connector::iceberg::write_control::IcebergFirstRefreshWritePlanPayloadV2;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
@@ -29,10 +26,10 @@ use crate::engine::{
     StandaloneState, execute_query_as_iceberg_staging_in_operation_with_connector_context,
     iceberg_write_shuffle_by_output_name,
 };
-use crate::mv::application::PreparedMvIncrementalWrite;
 use crate::mv::application::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, MvFirstRefreshWritePreparer,
-    MvFirstRefreshWriteRequest, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
+    MvFirstRefreshWriteRequest, MvRefreshPublicationBase, MvRefreshPublicationIntent,
+    MvRefreshPublicationTechnique, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
 };
 use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
@@ -44,61 +41,6 @@ use crate::sql::mv_refresh::first_refresh::{
     SqlMvFirstRefreshArtifact, SqlMvFirstRefreshArtifactInput, SqlMvFirstRefreshPlanner,
     SqlMvFirstRefreshPlannerInput,
 };
-
-/// Core-side implementation installed into the frontend composition through
-/// the typed MV activation port. It retains only a weak engine reference, so
-/// it cannot keep an engine or an all-in-one runtime alive past shutdown.
-pub(crate) struct StandaloneMvFirstRefreshWriteActivator {
-    state: Weak<StandaloneState>,
-}
-
-impl StandaloneMvFirstRefreshWriteActivator {
-    pub(crate) fn new(state: Weak<StandaloneState>) -> Self {
-        Self { state }
-    }
-}
-
-impl crate::mv::application::MvFirstRefreshWriteActivator
-    for StandaloneMvFirstRefreshWriteActivator
-{
-    fn bind_first_refresh_write(
-        &self,
-        prepared: PreparedMvFirstRefreshWrite,
-        planning_lease: &ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        execution: &QueryExecutionContext,
-    ) -> Result<PreparedDistributedWriteRequest, String> {
-        let state = self.state.upgrade().ok_or_else(|| {
-            "MV first-refresh write activator is unavailable during engine shutdown".to_string()
-        })?;
-        bind_prepared_mv_first_refresh_staging(
-            &state,
-            prepared,
-            planning_lease,
-            exact_lease,
-            execution,
-        )
-    }
-
-    fn bind_incremental_refresh_write(
-        &self,
-        prepared: PreparedMvIncrementalWrite,
-        planning_lease: &ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        execution: &QueryExecutionContext,
-    ) -> Result<PreparedDistributedWriteRequest, String> {
-        let state = self.state.upgrade().ok_or_else(|| {
-            "MV incremental write activator is unavailable during engine shutdown".to_string()
-        })?;
-        crate::engine::mv::iceberg_refresh::bind_prepared_mv_incremental_staging(
-            &state,
-            prepared,
-            planning_lease,
-            exact_lease,
-            execution,
-        )
-    }
-}
 
 /// Bounded facts emitted by the feature-gated native fixture.  This deliberately
 /// contains no report frame, provider receipt, Arrow batch, or query result.
@@ -264,19 +206,9 @@ where
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive MV first-refresh test write lease: {error}"))?;
-    let template = activate_mv_first_refresh_connector_write(
+    let template = crate::engine::mv::iceberg_activation::activate_first_refresh_connector_write(
         state,
         &prepared,
-        std::collections::BTreeMap::from([
-            (
-                "novarocks.mv.first-refresh-test".to_string(),
-                "true".to_string(),
-            ),
-            (
-                "novarocks.mv.first-refresh-operation".to_string(),
-                operation_id.to_string(),
-            ),
-        ]),
         connector_context.clone(),
         &write_lease,
     )?;
@@ -364,7 +296,11 @@ pub(crate) fn prepare_mv_first_refresh_sql_write(
         operation_id,
         observed_binding,
     )?;
-    MvFirstRefreshWritePreparer::prepare(request, physical_sql)
+    MvFirstRefreshWritePreparer::prepare(
+        request,
+        physical_sql,
+        legacy_fixture_publication_intent(ctx, staging_branch)?,
+    )
 }
 
 /// Freeze a join first-refresh request behind immutable refresh facts. The
@@ -396,6 +332,49 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
     MvFirstRefreshWritePreparer::prepare_join_logical(
         request,
         frozen_logical_context_with_base_overlays(state, ctx)?,
+        legacy_fixture_publication_intent(ctx, staging_branch)?,
+    )
+}
+
+/// The native fixture never enters the current frontend-owned refresh route.
+/// Give it an explicit test-only publication value rather than reintroducing
+/// a raw provider property map into the application artifact.
+fn legacy_fixture_publication_intent(
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    staging_branch: &str,
+) -> Result<MvRefreshPublicationIntent, String> {
+    let bases = ctx
+        .rewrite
+        .pin
+        .to_snapshot_map()
+        .into_iter()
+        .map(|(table_fqn, to_snapshot)| {
+            MvRefreshPublicationBase::try_new(
+                table_fqn.clone(),
+                ctx.rewrite
+                    .pin
+                    .to_table_uuid_map()
+                    .get(&table_fqn)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("MV first-refresh fixture has no UUID fact for {table_fqn}")
+                    })?,
+                ctx.rewrite.previous_snapshot_ids.get(&table_fqn).copied(),
+                to_snapshot,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    MvRefreshPublicationIntent::try_new(
+        1,
+        ctx.rewrite.mv_definition.mv_id,
+        "fixture".to_string(),
+        MvRefreshPublicationTechnique::Full,
+        bases,
+        "fixture".to_string(),
+        ctx.rewrite.target.catalog.clone(),
+        ctx.rewrite.target.namespace.clone(),
+        ctx.rewrite.target.table.clone(),
+        staging_branch.to_string(),
     )
 }
 
@@ -542,169 +521,6 @@ fn mv_first_refresh_request(
 /// must have been derived from the retained target control binding. This is
 /// the first point that mutates the provider write-service registry; SQL
 /// artifact preparation remains side-effect free.
-pub(crate) fn activate_mv_first_refresh_connector_write(
-    state: &Arc<StandaloneState>,
-    prepared: &PreparedMvFirstRefreshWrite,
-    mut provenance_properties: std::collections::BTreeMap<String, String>,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    if prepared.observed_binding() != exact_lease.binding_key() {
-        return Err("MV first-refresh write lease drifted from prepared binding".to_string());
-    }
-    for (key, value) in prepared.provenance_properties() {
-        if provenance_properties
-            .insert(key.clone(), value.clone())
-            .is_some()
-        {
-            return Err("MV first-refresh provenance was supplied twice".to_string());
-        }
-    }
-    let operation_id: ConnectorWriteOperationId = prepared.operation_id();
-    let target = crate::engine::backend_resolver::TargetBackend {
-        backend_name: "iceberg",
-        catalog: prepared.target_catalog().to_string(),
-        namespace: prepared.target_namespace().to_string(),
-        table: prepared.target_name().to_string(),
-    };
-    // The staging branch was just created through the provider mutation
-    // contract.  The refresh context intentionally remains immutable, so its
-    // table handle predates that mutation.  Reload only in this provider
-    // activation adapter: this is the authoritative read used to validate the
-    // ref CAS facts and construct the writer, never a SQL-preparation side
-    // effect.
-    let entry = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| {
-            format!("read Iceberg catalog registry for first-refresh activation: {error}")
-        })?
-        .get(&target.catalog)?;
-    entry.invalidate_table_cache(&target.namespace, &target.table);
-    let target_table =
-        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)
-            .map_err(|error| format!("reload MV first-refresh staging target: {error}"))?
-            .table;
-    validate_first_refresh_target_contract(&target_table, prepared.target_contract())?;
-    let ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
-        &target_table,
-        &ident,
-        prepared.staging_branch(),
-        match prepared.write_mode() {
-            MvStagedRefreshWriteMode::Append => CommitOpKind::FastAppend,
-            MvStagedRefreshWriteMode::FullOverwrite => CommitOpKind::Overwrite,
-        },
-    );
-    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(
-        crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
-            catalog,
-            table: target_table.clone(),
-            collector: Arc::clone(&collector),
-            fs: abort_cleanup.fs,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
-            target_ref: prepared.staging_branch().to_string(),
-            snapshot_properties: std::collections::BTreeMap::new(),
-        },
-    );
-    let payload = IcebergFirstRefreshWritePlanPayloadV2 {
-        version: 2,
-        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
-        target_ref: prepared.staging_branch().to_string(),
-        expected_snapshot_id: prepared.expected_target_snapshot_id(),
-        staging_path: collector.staging_dir.clone(),
-        provenance_properties,
-    };
-    let intent = match prepared.write_mode() {
-        MvStagedRefreshWriteMode::Append => novarocks_spi::connector::ConnectorWriteIntent::Append,
-        MvStagedRefreshWriteMode::FullOverwrite => {
-            novarocks_spi::connector::ConnectorWriteIntent::Overwrite
-        }
-    };
-    let empty_input_policy = match prepared.write_mode() {
-            MvStagedRefreshWriteMode::Append => {
-                crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
-            }
-            MvStagedRefreshWriteMode::FullOverwrite => {
-                crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
-            }
-        };
-    let preparation = crate::engine::iceberg_writer::prepare_iceberg_connector_write(
-        exact_lease,
-        &target,
-        prepared.staging_branch(),
-        intent,
-        novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-            fields: prepared
-                .target_contract()
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| {
-                    novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                        field.as_ref().clone(),
-                    )
-                })
-                .collect(),
-        },
-        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
-        connector_context.clone(),
-    )?;
-    let services = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
-        .write_services();
-    crate::connector::iceberg::provider::register_iceberg_first_refresh_write_service_from_preparation(
-        services,
-        operation_id,
-        &preparation,
-        payload,
-        &entry,
-        commit_executor,
-        empty_input_policy,
-    )
-    .map_err(|error| format!("activate Iceberg first-refresh writer from preparation: {error}"))?;
-    Ok(
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-            operation_id,
-            preparation,
-            connector_context,
-            exact_lease.clone(),
-        ),
-    )
-}
-
-fn validate_first_refresh_target_contract(
-    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    contract: &MvFirstRefreshTargetContract,
-) -> Result<(), String> {
-    let actual_schema = target_table.metadata().current_schema();
-    let actual_arrow_schema =
-        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(actual_schema)
-            .map_err(|error| {
-                format!("convert MV first-refresh activation schema to Arrow: {error}")
-            })?;
-    let actual_field_ids = actual_schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| field.id)
-        .collect::<Vec<_>>();
-    contract.validate_observed(
-        &actual_arrow_schema,
-        &actual_field_ids,
-        target_table.metadata().default_partition_spec_id(),
-    )
-}
-
 /// Bind an SQL-shaped first-refresh artifact only after the frontend has
 /// retained its exact write lease and admitted an immutable query execution.
 /// The result is the same generic result-free writer request used by all
@@ -731,10 +547,9 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
         crate::connector::connector_request_context_for_execution(None, execution)?;
     let root_hash_column = prepared.root_hash_column().to_string();
     let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column.clone());
-    let template = activate_mv_first_refresh_connector_write(
+    let template = crate::engine::mv::iceberg_activation::activate_first_refresh_connector_write(
         state,
         &prepared,
-        std::collections::BTreeMap::new(),
         connector_context.clone(),
         exact_lease,
     )?;
