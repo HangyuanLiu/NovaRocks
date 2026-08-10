@@ -174,6 +174,61 @@ pub(crate) fn iceberg_query_binding_from_materialization(
     )
 }
 
+/// Project a provider-neutral SPI metadata materialization into the
+/// request-local SQL binding.  The generic path is intentionally restricted
+/// to a current base-table read: time-travel and provider aliases retain their
+/// separately frozen provider-owned facts until their dedicated adapters run.
+pub(crate) fn connector_query_binding_from_materialization(
+    materialization: ConnectorQueryTableMaterialization,
+    catalog: &str,
+    namespace: &str,
+    sql_table_name: &str,
+    binding: SqlTableBindingId,
+) -> Result<QueryTableBinding, String> {
+    use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity};
+
+    if materialization.read_selector != novarocks_spi::connector::ConnectorReadSelector::Current {
+        return Err(
+            "generic connector materialization must use the current read selector".to_string(),
+        );
+    }
+    let planner = TableDef {
+        name: sql_table_name.to_string(),
+        columns: materialization.columns,
+        iceberg_row_lineage_metadata_columns: materialization.row_lineage_metadata_columns,
+        source: ScanSource::Sql(
+            SqlScanSource::new(
+                binding,
+                SqlTableIdentity {
+                    catalog: catalog.to_string(),
+                    namespace: namespace.to_string(),
+                    table: sql_table_name.to_string(),
+                },
+                SqlScanKind::Data {
+                    version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                },
+            )
+            .with_ukfk_facts(materialization.sql_ukfk_facts),
+        ),
+    };
+    Ok(QueryTableBinding {
+        resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+        statistics_pin: materialization.statistics_pin.clone(),
+        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+        scan_materialization: Some(QueryScanMaterialization {
+            table: materialization.read_table,
+            schema: materialization.read_schema,
+            selector: materialization.read_selector,
+            statistics_pin: materialization.statistics_pin,
+            planning_lease: materialization.planning_lease,
+        }),
+        mv_target_read: None,
+        write_target_admission: None,
+        frozen_snapshot_materializations: BTreeMap::new(),
+        delta_runtime_plans: BTreeMap::new(),
+    })
+}
+
 /// Equivalent to [`iceberg_query_binding_from_materialization`] with
 /// application-admitted snapshot-window delta facts.  SQL still receives only
 /// the binding token; preparation recovers this map from the same store.

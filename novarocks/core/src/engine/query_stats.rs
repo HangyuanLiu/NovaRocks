@@ -31,7 +31,10 @@ use crate::engine::query_planning::bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
     QueryTableBindingStore, parse_time_travel_overlay_identity,
 };
-use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
+use crate::engine::query_planning::catalog_materializer::{
+    QueryTableBindingLoader, connector_query_binding_from_materialization,
+    load_connector_table_materialization_with_lease,
+};
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -254,22 +257,20 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                     binding_id,
                 );
         }
-        let materialization =
-            crate::connector::iceberg::provider::load_schema_materialization_with_lease(
-                self.controls,
-                self.connector_context.clone(),
-                catalog,
-                namespace,
-                table,
-            )?;
-        crate::engine::query_planning::catalog_materializer::
-            iceberg_query_binding_from_materialization(
-                materialization,
-                catalog,
-                namespace,
-                table,
-                binding_id,
-            )
+        let materialization = load_connector_table_materialization_with_lease(
+            self.controls,
+            self.connector_context.clone(),
+            catalog,
+            namespace,
+            table,
+        )?;
+        connector_query_binding_from_materialization(
+            materialization,
+            catalog,
+            namespace,
+            table,
+            binding_id,
+        )
     }
 
     fn load_metadata_table(
@@ -723,5 +724,19 @@ mod unified_tests {
         );
         assert_eq!(parse_time_travel_overlay_identity("orders"), None);
         assert_eq!(parse_time_travel_overlay_identity("__sqlx1_tt__bad"), None);
+    }
+
+    #[test]
+    fn strict_base_table_admission_uses_the_spi_materialization_path() {
+        let source = include_str!("query_stats.rs");
+        let strict_base = source
+            .split("fn load_strict_base_table")
+            .nth(1)
+            .expect("strict base table loader")
+            .split("fn load_metadata_table")
+            .next()
+            .expect("metadata loader boundary");
+        assert!(strict_base.contains("load_connector_table_materialization_with_lease"));
+        assert!(!strict_base.contains("load_schema_materialization_with_lease"));
     }
 }
