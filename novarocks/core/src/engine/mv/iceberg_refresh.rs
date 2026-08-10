@@ -16518,9 +16518,9 @@ fn prepare_imv_change_stream_writer(
         });
     let primary_write_binding = planned
         .topology
-        .writer_branches
+        .writer_routes
         .first()
-        .ok_or_else(|| "IMV change-stream topology has no writer branches".to_string())?
+        .ok_or_else(|| "IMV change-stream topology has no writer routes".to_string())?
         .sink
         .contract
         .target

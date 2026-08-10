@@ -79,9 +79,9 @@ use novarocks_spi::connector::{
     ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
     ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
     ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    ConnectorWriteRouteId, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
+    ConnectorWriteRouteId, ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy,
+    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
     StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
     StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
     StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
@@ -6486,6 +6486,7 @@ fn activate_iceberg_cow_row_mutation(
     let rewrite_preparation = ConnectorWritePreparation::try_new(
         preparation.owner().clone(),
         preparation.table().clone(),
+        ConnectorWriteTargetRef::main(),
         ConnectorWriteIntent::RowDelta,
         preparation.base_version().clone(),
         iceberg_cow_rewrite_input(preparation)?,
@@ -6535,6 +6536,7 @@ fn activate_iceberg_cow_row_mutation(
         let append_preparation = ConnectorWritePreparation::try_new(
             preparation.owner().clone(),
             preparation.table().clone(),
+            ConnectorWriteTargetRef::main(),
             ConnectorWriteIntent::Append,
             preparation.base_version().clone(),
             ConnectorWriteInputShape::Data {
@@ -6612,6 +6614,7 @@ fn iceberg_row_mutation_route(
     let route_preparation = ConnectorWritePreparation::try_new(
         preparation.owner().clone(),
         preparation.table().clone(),
+        ConnectorWriteTargetRef::main(),
         ConnectorWriteIntent::RowDelta,
         preparation.base_version().clone(),
         input,

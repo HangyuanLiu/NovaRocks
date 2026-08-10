@@ -321,6 +321,29 @@ fn split_chunk_by_exprs(
             .collect();
     }
 
+    let mut out = vec![None; split_exprs.len()];
+    let mut remaining = chunk;
+
+    for idx in (1..split_exprs.len()).rev() {
+        if remaining.is_empty() {
+            break;
+        }
+        let mask = eval_split_mask(arena, split_exprs[idx], &remaining)?;
+        let matched = mask.iter().filter(|flag| **flag).count();
+        if matched == 0 {
+            continue;
+        }
+        if matched == remaining.len() {
+            out[idx] = Some(remaining);
+            return Ok(out);
+        }
+
+        out[idx] = filter_chunk_by_mask(&remaining, &mask)?;
+        let remaining_mask = mask.into_iter().map(|flag| !flag).collect::<Vec<_>>();
+        remaining = filter_chunk_by_mask(&remaining, &remaining_mask)?
+            .ok_or_else(|| "split sink produced empty remaining chunk unexpectedly".to_string())?;
+    }
+
     if !remaining.is_empty() {
         let mask = eval_split_mask(arena, split_exprs[0], &remaining)?;
         out[0] = filter_chunk_by_mask(&remaining, &mask)?;
@@ -463,6 +486,7 @@ mod tests {
             init_error: None,
             split_arena: Arc::new(ExprArena::default()),
             split_exprs: Vec::new(),
+            fanout: false,
             sinks: vec![
                 InnerSinkRuntime {
                     op: Box::new(PendingFinishSink::new("first", Arc::clone(&first_done))),
@@ -512,7 +536,7 @@ mod tests {
 
         let mut arena = ExprArena::default();
         let predicate = arena.push_typed(ExprNode::SlotId(predicate_slot), DataType::Boolean);
-        let split = split_chunk_by_exprs(&arena, &[predicate], chunk).expect("split chunk");
+        let split = split_chunk_by_exprs(&arena, &[predicate], chunk, false).expect("split chunk");
         let selected = split[0].as_ref().expect("matching first branch rows");
 
         assert_eq!(selected.len(), 1);
