@@ -58,6 +58,7 @@ use crate::runtime::global_async_runtime::data_block_on;
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 use novarocks_connector_iceberg::position_delete_descriptor::canonical_output_schema;
+use novarocks_connector_iceberg::row_lineage_synth::ICEBERG_ROW_ID_COL;
 
 /// BE execution capability rooted only in process-startup storage bindings.
 #[derive(Clone)]
@@ -325,15 +326,12 @@ impl IcebergDataBatchWriter {
     }
 
     fn append_row_lineage_batch(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        let row_id_idx = batch
-            .schema()
-            .index_of(novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL)
-            .map_err(|_| {
-                error(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg row-lineage writer input is missing _row_id",
-                )
-            })?;
+        let row_id_idx = batch.schema().index_of(ICEBERG_ROW_ID_COL).map_err(|_| {
+            error(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg row-lineage writer input is missing _row_id",
+            )
+        })?;
         let row_ids = batch
             .column(row_id_idx)
             .as_any()

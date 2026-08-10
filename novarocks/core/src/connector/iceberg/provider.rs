@@ -126,6 +126,7 @@ use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
 use novarocks_connector_iceberg::execution_declaration::{
     IcebergInstanceDistribution, decode_access_binding,
 };
+use novarocks_connector_iceberg::row_lineage_synth as iceberg_row_lineage;
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -134,6 +135,7 @@ use novarocks_connector_iceberg::scan_model::{
 #[cfg(test)]
 use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use novarocks_connector_iceberg::schema_facts::{iceberg_schema_def, row_lineage_enabled};
+use novarocks_connector_iceberg::schema_mapping::is_variant_struct_data_type;
 
 #[derive(Clone, Deserialize, Serialize)]
 struct IcebergDeltaSplitPayload {
@@ -1820,12 +1822,12 @@ impl IcebergControlProvider {
         if row_lineage_enabled(loaded.table.metadata()) {
             storage_fields.extend([
                 Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+                    iceberg_row_lineage::ICEBERG_ROW_ID_COL,
                     DataType::Int64,
                     false,
                 )),
                 Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL,
                     DataType::Int64,
                     true,
                 )),
@@ -1845,8 +1847,8 @@ impl IcebergControlProvider {
                         format!("Iceberg rewrite projection index {index} is outside the table schema"),
                     )
                 })?;
-                if novarocks_execution::exec::row_position::is_iceberg_row_id(storage_field.name())
-                    || novarocks_execution::exec::row_position::is_iceberg_last_updated_sequence_number(
+                if iceberg_row_lineage::is_iceberg_row_id(storage_field.name())
+                    || iceberg_row_lineage::is_iceberg_last_updated_sequence_number(
                         storage_field.name(),
                     )
                 {
@@ -6850,8 +6852,8 @@ fn iceberg_cow_rewrite_input(
 ) -> Result<ConnectorWriteInputShape, ConnectorError> {
     let contract = preparation.match_contract();
     let lineage = [
-        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        iceberg_row_lineage::ICEBERG_ROW_ID_COL,
+        iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL,
     ]
     .into_iter()
     .map(|name| {
@@ -7976,8 +7978,8 @@ pub(crate) fn iceberg_data_sink_spec_from_preparation(
     if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
         iceberg.schema.fields.extend([
             novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                name: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                field_id: iceberg_row_lineage::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: iceberg_row_lineage::ICEBERG_ROW_ID_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -7985,8 +7987,9 @@ pub(crate) fn iceberg_data_sink_spec_from_preparation(
                 children: Vec::new(),
             },
             novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                name: novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                field_id:
+                    iceberg_row_lineage::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -8219,12 +8222,12 @@ fn position_delete_columns_and_descriptor(
     let pos = identity_fields[1].field();
     if !file
         .name()
-        .eq_ignore_ascii_case(novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL)
+        .eq_ignore_ascii_case(iceberg_row_lineage::ICEBERG_FILE_PATH_COL)
         || file.data_type() != &DataType::Utf8
         || file.is_nullable()
         || !pos
             .name()
-            .eq_ignore_ascii_case(novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL)
+            .eq_ignore_ascii_case(iceberg_row_lineage::ICEBERG_ROW_POS_COL)
         || pos.data_type() != &DataType::Int64
         || pos.is_nullable()
     {
@@ -9371,7 +9374,7 @@ fn map_iceberg_fact_columns<'a>(
             };
             !inspection.schema().fields().iter().any(|field| {
                 field.name().eq_ignore_ascii_case(root)
-                    && crate::formats::parquet::is_variant_struct_data_type(field.data_type())
+                    && is_variant_struct_data_type(field.data_type())
             })
         })
         .collect::<Vec<_>>();
@@ -9898,14 +9901,14 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
     let mut target_columns = materialization.columns.clone();
     target_columns.extend([
         novarocks_catalog::schema::ColumnDef {
-            name: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            name: iceberg_row_lineage::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         novarocks_catalog::schema::ColumnDef {
-            name: novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            name: iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
             data_type: DataType::Int64,
             nullable: true,
             write_default: None,

@@ -58,6 +58,7 @@ use novarocks_connector_iceberg::scan_model::{IcebergDataFileInfo, IcebergPhysic
 use novarocks_connector_iceberg::schema_mapping::{
     apply_name_mapping_to_schema as provider_apply_name_mapping_to_schema,
     field_id_for_arrow_field as provider_field_id_for_arrow_field,
+    is_variant_struct_data_type as provider_is_variant_struct_data_type,
     schema_field_id_coverage as provider_schema_field_id_coverage,
     unidentified_fields_are_only_opaque_variants as provider_unidentified_fields_are_only_opaque_variants,
 };
@@ -478,175 +479,6 @@ fn apply_name_mapping_to_batch(
 }
 
 #[cfg(test)]
-pub(super) fn schema_field_id_coverage(schema: &SchemaRef) -> Result<(usize, usize), String> {
-    schema
-        .fields()
-        .iter()
-        .try_fold((0usize, 0usize), |(identified, total), field| {
-            let (field_identified, field_total) = field_id_coverage(field.as_ref())?;
-            Ok::<_, String>((identified + field_identified, total + field_total))
-        })
-}
-
-#[cfg(test)]
-pub(super) fn apply_name_mapping_to_schema(
-    schema: &SchemaRef,
-    name_mapping: &novarocks_connector_iceberg::iceberg::spec::NameMapping,
-) -> Result<SchemaRef, String> {
-    let mappings = name_mapping
-        .fields()
-        .iter()
-        .cloned()
-        .map(Arc::new)
-        .collect::<Vec<_>>();
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| map_field_id_recursive(field.as_ref(), &mappings))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    )))
-}
-
-#[cfg(test)]
-fn map_field_id_recursive(
-    field: &Field,
-    mappings: &[Arc<novarocks_connector_iceberg::iceberg::spec::MappedField>],
-) -> Result<Field, String> {
-    let mapped = mapped_field_for_name(mappings, field.name())?;
-    let field_id = mapped.field_id().ok_or_else(|| {
-        format!(
-            "Iceberg name mapping entry for {} does not contain a field ID",
-            field.name()
-        )
-    })?;
-    let mut metadata = field.metadata().clone();
-    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-    let data_type = match field.data_type() {
-        data_type if crate::formats::parquet::is_variant_struct_data_type(data_type) => {
-            data_type.clone()
-        }
-        DataType::Struct(children) => DataType::Struct(
-            children
-                .iter()
-                .map(|child| map_field_id_recursive(child.as_ref(), mapped.fields()))
-                .collect::<Result<Vec<_>, _>>()?
-                .into(),
-        ),
-        DataType::List(child) => DataType::List(Arc::new(map_field_id_recursive(
-            child.as_ref(),
-            mapped.fields(),
-        )?)),
-        DataType::LargeList(child) => DataType::LargeList(Arc::new(map_field_id_recursive(
-            child.as_ref(),
-            mapped.fields(),
-        )?)),
-        DataType::FixedSizeList(child, size) => DataType::FixedSizeList(
-            Arc::new(map_field_id_recursive(child.as_ref(), mapped.fields())?),
-            *size,
-        ),
-        DataType::Map(entries, sorted) => {
-            let DataType::Struct(entry_fields) = entries.data_type() else {
-                return Err(format!(
-                    "Iceberg mapped map field {} has non-struct entries",
-                    field.name()
-                ));
-            };
-            if entry_fields.len() != 2 {
-                return Err(format!(
-                    "Iceberg mapped map field {} must have key and value entries",
-                    field.name()
-                ));
-            }
-            let key = map_field_id_recursive(entry_fields[0].as_ref(), mapped.fields())?;
-            let value = map_field_id_recursive(entry_fields[1].as_ref(), mapped.fields())?;
-            let entries = Field::new(
-                entries.name(),
-                DataType::Struct(vec![key, value].into()),
-                entries.is_nullable(),
-            )
-            .with_metadata(entries.metadata().clone());
-            DataType::Map(Arc::new(entries), *sorted)
-        }
-        data_type => data_type.clone(),
-    };
-    Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
-}
-
-#[cfg(test)]
-fn mapped_field_for_name<'a>(
-    mappings: &'a [Arc<novarocks_connector_iceberg::iceberg::spec::MappedField>],
-    name: &str,
-) -> Result<&'a novarocks_connector_iceberg::iceberg::spec::MappedField, String> {
-    let mut matches = mappings
-        .iter()
-        .filter(|mapped| mapped.names().iter().any(|candidate| candidate == name));
-    let mapped = matches
-        .next()
-        .ok_or_else(|| format!("Iceberg name mapping does not contain physical field {name}"))?;
-    if matches.next().is_some() {
-        return Err(format!(
-            "Iceberg name mapping contains duplicate aliases for physical field {name}"
-        ));
-    }
-    Ok(mapped)
-}
-
-#[cfg(test)]
-fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
-    let identified = usize::from(parse_field_id(field)?.is_some());
-    if crate::formats::parquet::is_variant_struct_data_type(field.data_type()) {
-        return Ok((identified, 1));
-    }
-    let (children_identified, children_total) = match field.data_type() {
-        DataType::Struct(children) => {
-            children
-                .iter()
-                .try_fold((0usize, 0usize), |(identified, total), child| {
-                    let (child_identified, child_total) = field_id_coverage(child.as_ref())?;
-                    Ok::<_, String>((identified + child_identified, total + child_total))
-                })?
-        }
-        DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _) => {
-            field_id_coverage(child.as_ref())?
-        }
-        DataType::Map(entries, _) => {
-            let DataType::Struct(children) = entries.data_type() else {
-                return Err(format!("map field {} has non-struct entries", field.name()));
-            };
-            children
-                .iter()
-                .try_fold((0usize, 0usize), |(identified, total), child| {
-                    let (child_identified, child_total) = field_id_coverage(child.as_ref())?;
-                    Ok::<_, String>((identified + child_identified, total + child_total))
-                })?
-        }
-        _ => (0, 0),
-    };
-    Ok((identified + children_identified, 1 + children_total))
-}
-
-#[cfg(test)]
-fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Result<bool, String> {
-    let mut found_unidentified_variant = false;
-    for field in schema.fields() {
-        if crate::formats::parquet::is_variant_struct_data_type(field.data_type()) {
-            if parse_field_id(field)?.is_none() {
-                found_unidentified_variant = true;
-            }
-            continue;
-        }
-        let (identified, total) = field_id_coverage(field.as_ref())?;
-        if identified != total {
-            return Ok(false);
-        }
-    }
-    Ok(found_unidentified_variant)
-}
-
-#[cfg(test)]
 fn parse_field_id(field: &Field) -> Result<Option<i32>, String> {
     field
         .metadata()
@@ -720,7 +552,7 @@ fn align_batch_to_schema(
                             )
                         })?
                 } else if matches!(target.data_type(), DataType::LargeBinary)
-                    && crate::formats::parquet::is_variant_struct_data_type(source.data_type())
+                    && provider_is_variant_struct_data_type(source.data_type())
                 {
                     crate::formats::parquet::collapse_variant_struct_to_largebinary(
                         &source,
@@ -1067,8 +899,12 @@ mod tests {
         )
         .expect("mapping");
 
-        let mapped = apply_name_mapping_to_schema(&schema, &mapping).expect("recursive mapping");
-        assert_eq!(schema_field_id_coverage(&mapped).expect("coverage"), (7, 7));
+        let mapped =
+            provider_apply_name_mapping_to_schema(&schema, &mapping).expect("recursive mapping");
+        assert_eq!(
+            provider_schema_field_id_coverage(&mapped).expect("coverage"),
+            (7, 7)
+        );
         assert_eq!(parse_field_id(mapped.field(0)).expect("map ID"), Some(5));
         assert_eq!(parse_field_id(mapped.field(1)).expect("list ID"), Some(3));
         assert_eq!(parse_field_id(mapped.field(2)).expect("struct ID"), Some(1));
@@ -1086,7 +922,7 @@ mod tests {
         )
         .expect("mapping");
         assert!(
-            apply_name_mapping_to_schema(&schema, &mapping)
+            provider_apply_name_mapping_to_schema(&schema, &mapping)
                 .expect_err("nested mapping must be complete")
                 .contains("does not contain physical field missing")
         );
@@ -1095,7 +931,10 @@ mod tests {
             field_with_id("identified", 1, false),
             Field::new("unidentified", DataType::Int32, false),
         ]));
-        assert_eq!(schema_field_id_coverage(&mixed).expect("coverage"), (1, 2));
+        assert_eq!(
+            provider_schema_field_id_coverage(&mixed).expect("coverage"),
+            (1, 2)
+        );
     }
 
     #[test]
@@ -1104,7 +943,10 @@ mod tests {
             field_with_id("id", 1, false),
             physical_variant_field("payload", Some(2)),
         ]));
-        assert_eq!(schema_field_id_coverage(&schema).expect("coverage"), (2, 2));
+        assert_eq!(
+            provider_schema_field_id_coverage(&schema).expect("coverage"),
+            (2, 2)
+        );
 
         let ordinary_struct = Arc::new(Schema::new(vec![
             Field::new(
@@ -1118,7 +960,7 @@ mod tests {
             )])),
         ]));
         assert_eq!(
-            schema_field_id_coverage(&ordinary_struct).expect("ordinary struct coverage"),
+            provider_schema_field_id_coverage(&ordinary_struct).expect("ordinary struct coverage"),
             (1, 2)
         );
     }
@@ -1130,7 +972,10 @@ mod tests {
             physical_variant_field("payload", None),
         ]));
 
-        assert!(unidentified_fields_are_only_opaque_variants(&schema).expect("variant coverage"));
+        assert!(
+            provider_unidentified_fields_are_only_opaque_variants(&schema)
+                .expect("variant coverage")
+        );
     }
 
     #[test]
@@ -1139,8 +984,12 @@ mod tests {
         let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping =
             serde_json::from_str(r#"[{"field-id":2,"names":["payload"]}]"#).expect("mapping");
 
-        let mapped = apply_name_mapping_to_schema(&schema, &mapping).expect("variant mapping");
-        assert_eq!(schema_field_id_coverage(&mapped).expect("coverage"), (1, 1));
+        let mapped =
+            provider_apply_name_mapping_to_schema(&schema, &mapping).expect("variant mapping");
+        assert_eq!(
+            provider_schema_field_id_coverage(&mapped).expect("coverage"),
+            (1, 1)
+        );
         assert_eq!(
             parse_field_id(mapped.field(0)).expect("variant field ID"),
             Some(2)

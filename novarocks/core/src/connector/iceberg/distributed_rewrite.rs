@@ -57,6 +57,9 @@ use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
 use novarocks_connector_iceberg::manifest::DataFileWithStats;
 use novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info;
+use novarocks_connector_iceberg::row_lineage_synth::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
+};
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
 };
@@ -1865,8 +1868,7 @@ fn rewrite_cohort_preparation(
                 .filter(|field| {
                     matches!(
                         field.field().name().as_str(),
-                        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
-                            | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                        ICEBERG_ROW_ID_COL | ICEBERG_LAST_UPDATED_SEQ_COL
                     )
                 })
                 .cloned()
@@ -1876,8 +1878,7 @@ fn rewrite_cohort_preparation(
                 .filter(|field| {
                     !matches!(
                         field.field().name().as_str(),
-                        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
-                            | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                        ICEBERG_ROW_ID_COL | ICEBERG_LAST_UPDATED_SEQ_COL
                     )
                 })
                 .collect();
@@ -1934,13 +1935,9 @@ pub(crate) fn rewrite_input_schema(
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } if row_lineage_data => {
             let mut fields = physical_schema.fields().to_vec();
             fields.extend([
+                Arc::new(Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false)),
                 Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                    DataType::Int64,
-                    false,
-                )),
-                Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    ICEBERG_LAST_UPDATED_SEQ_COL,
                     DataType::Int64,
                     true,
                 )),

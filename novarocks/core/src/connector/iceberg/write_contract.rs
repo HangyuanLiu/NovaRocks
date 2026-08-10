@@ -48,6 +48,10 @@ use super::sink_plan::{
     IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan, PositionDeleteDataFilePartition,
 };
 use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
+use novarocks_connector_iceberg::row_lineage_synth::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
+};
 use novarocks_connector_iceberg::scan_model::{
     IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
@@ -496,8 +500,8 @@ pub(crate) fn encode_frozen_data_rewrite_handle_payload(
     if row_lineage_data {
         data_input_schema.extend([
             IcebergSchemaFieldDef {
-                field_id: novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                name: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                field_id: ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: ICEBERG_ROW_ID_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -505,9 +509,8 @@ pub(crate) fn encode_frozen_data_rewrite_handle_payload(
                 children: Vec::new(),
             },
             IcebergSchemaFieldDef {
-                field_id:
-                    novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                name: novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                field_id: ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -2133,12 +2136,12 @@ mod tests {
         let raw_schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
             arrow::datatypes::Field::new(
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+                ICEBERG_ROW_ID_COL,
                 arrow::datatypes::DataType::Int64,
                 false,
             ),
             arrow::datatypes::Field::new(
-                novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                ICEBERG_LAST_UPDATED_SEQ_COL,
                 arrow::datatypes::DataType::Int64,
                 true,
             ),
@@ -2150,14 +2153,14 @@ mod tests {
                 .metadata()
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
                 .map(|value| value.parse::<i32>().expect("field id")),
-            Some(novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID)
+            Some(ICEBERG_RESERVED_FIELD_ID_ROW_ID)
         );
         assert_eq!(
             plan.output_schema.fields()[2]
                 .metadata()
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
                 .map(|value| value.parse::<i32>().expect("field id")),
-            Some(novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
+            Some(ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
         );
     }
 
@@ -2168,8 +2171,8 @@ mod tests {
         spec.iceberg.serialized_metadata = Some(unpartitioned_metadata_json());
         spec.iceberg.schema.fields.extend([
             IcebergSchemaFieldDef {
-                field_id: novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                name: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                field_id: ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: ICEBERG_ROW_ID_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -2177,9 +2180,8 @@ mod tests {
                 children: Vec::new(),
             },
             IcebergSchemaFieldDef {
-                field_id:
-                    novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                name: novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                field_id: ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -2191,12 +2193,12 @@ mod tests {
         let raw_schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
             arrow::datatypes::Field::new(
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+                ICEBERG_ROW_ID_COL,
                 arrow::datatypes::DataType::Int64,
                 false,
             ),
             arrow::datatypes::Field::new(
-                novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                ICEBERG_LAST_UPDATED_SEQ_COL,
                 arrow::datatypes::DataType::Int64,
                 true,
             ),
@@ -2209,7 +2211,7 @@ mod tests {
                 .metadata()
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
                 .map(|value| value.parse::<i32>().expect("field id")),
-            Some(novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID)
+            Some(ICEBERG_RESERVED_FIELD_ID_ROW_ID)
         );
     }
 

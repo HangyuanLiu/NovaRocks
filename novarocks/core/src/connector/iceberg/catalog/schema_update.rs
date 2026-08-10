@@ -2261,6 +2261,9 @@ use crate::engine::statement::{
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::SqlType;
 use novarocks_connector_iceberg::commit::commit_with_retry;
+use novarocks_connector_iceberg::row_lineage_synth::{
+    is_iceberg_last_updated_sequence_number, is_iceberg_row_id,
+};
 
 #[cfg(test)]
 pub(crate) fn apply_change_to_schema_for_test(
@@ -2895,11 +2898,7 @@ fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
         }
     };
     for name in names {
-        if novarocks_execution::exec::row_position::is_iceberg_row_id(name)
-            || novarocks_execution::exec::row_position::is_iceberg_last_updated_sequence_number(
-                name,
-            )
-        {
+        if is_iceberg_row_id(name) || is_iceberg_last_updated_sequence_number(name) {
             return Err(format!(
                 "Iceberg schema evolution cannot modify reserved column `{name}`"
             ));

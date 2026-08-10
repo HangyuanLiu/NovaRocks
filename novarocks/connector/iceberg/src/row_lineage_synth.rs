@@ -25,9 +25,25 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::Schema;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+/// Iceberg v2 row-level-delete virtual column names.
+pub const ICEBERG_FILE_PATH_COL: &str = "_file";
+pub const ICEBERG_ROW_POS_COL: &str = "_pos";
+
+/// Iceberg v3 row-lineage virtual column names.
+pub const ICEBERG_ROW_ID_COL: &str = "_row_id";
+pub const ICEBERG_LAST_UPDATED_SEQ_COL: &str = "_last_updated_sequence_number";
+
 /// Iceberg v3 reserved field IDs from the table-format specification.
-pub(crate) const ICEBERG_RESERVED_FIELD_ID_ROW_ID: i32 = i32::MAX - 107;
-pub(crate) const ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER: i32 = i32::MAX - 108;
+pub const ICEBERG_RESERVED_FIELD_ID_ROW_ID: i32 = i32::MAX - 107;
+pub const ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER: i32 = i32::MAX - 108;
+
+pub fn is_iceberg_row_id(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ICEBERG_ROW_ID_COL)
+}
+
+pub fn is_iceberg_last_updated_sequence_number(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
+}
 
 /// Indices of stored row-lineage columns (`_row_id`, `_last_updated_seq`) in a
 /// batch schema, if present.

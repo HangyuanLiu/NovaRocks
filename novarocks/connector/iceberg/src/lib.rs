@@ -49,8 +49,9 @@ pub mod position_delete_descriptor;
 pub mod read_snapshot;
 pub mod ref_snapshot;
 pub mod resources;
-#[allow(dead_code)] // Provider reader integration lands with the remaining physical reader move.
-pub(crate) mod row_lineage_synth;
+/// Iceberg virtual-column and row-lineage facts. These names and reserved
+/// field IDs are defined by the table format, not by the execution engine.
+pub mod row_lineage_synth;
 pub mod scan_model;
 pub mod schema_facts;
 pub mod schema_mapping;

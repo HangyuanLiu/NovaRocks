@@ -34,7 +34,7 @@ use novarocks_connector_iceberg::iceberg::writer::file_writer::location_generato
 };
 use novarocks_connector_iceberg::iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use novarocks_connector_iceberg::iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use novarocks_execution::exec::row_position::{
+use novarocks_connector_iceberg::row_lineage_synth::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
