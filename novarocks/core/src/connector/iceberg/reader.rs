@@ -56,6 +56,10 @@ use novarocks_connector_iceberg::scan_model::{
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
     IcebergPhysicalPredicateValue,
 };
+use novarocks_connector_iceberg::schema_mapping::{
+    apply_name_mapping_to_schema as provider_apply_name_mapping_to_schema,
+    schema_field_id_coverage as provider_schema_field_id_coverage,
+};
 
 pub(crate) struct IcebergBatchReader {
     reader: Box<dyn FileBatchReader>,
@@ -643,7 +647,7 @@ fn apply_name_mapping_to_batch(
     batch: RecordBatch,
     name_mapping: Option<&novarocks_connector_iceberg::iceberg::spec::NameMapping>,
 ) -> Result<RecordBatch, String> {
-    let (identified, total) = schema_field_id_coverage(&batch.schema())?;
+    let (identified, total) = provider_schema_field_id_coverage(&batch.schema())?;
     if identified == total {
         return Ok(batch);
     }
@@ -663,7 +667,7 @@ fn apply_name_mapping_to_batch(
     let Some(name_mapping) = name_mapping else {
         return Ok(batch);
     };
-    let schema = apply_name_mapping_to_schema(&batch.schema(), name_mapping)?;
+    let schema = provider_apply_name_mapping_to_schema(&batch.schema(), name_mapping)?;
     RecordBatch::try_new(schema, batch.columns().to_vec())
         .map_err(|error| format!("apply Iceberg name mapping to batch schema: {error}"))
 }
