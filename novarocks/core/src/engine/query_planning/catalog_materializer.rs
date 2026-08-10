@@ -175,9 +175,8 @@ pub(crate) fn iceberg_query_binding_from_materialization(
 }
 
 /// Project a provider-neutral SPI metadata materialization into the
-/// request-local SQL binding.  The generic path is intentionally restricted
-/// to a current base-table read: time-travel and provider aliases retain their
-/// separately frozen provider-owned facts until their dedicated adapters run.
+/// request-local SQL binding. Provider aliases retain their separately frozen
+/// provider-owned facts until their dedicated adapters run.
 pub(crate) fn connector_query_binding_from_materialization(
     materialization: ConnectorQueryTableMaterialization,
     catalog: &str,
@@ -187,11 +186,24 @@ pub(crate) fn connector_query_binding_from_materialization(
 ) -> Result<QueryTableBinding, String> {
     use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity};
 
-    if materialization.read_selector != novarocks_spi::connector::ConnectorReadSelector::Current {
-        return Err(
-            "generic connector materialization must use the current read selector".to_string(),
-        );
-    }
+    let (scan_kind, frozen_snapshot_id) = match materialization.read_selector {
+        novarocks_spi::connector::ConnectorReadSelector::Current => (
+            SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+            None,
+        ),
+        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id) => {
+            let version =
+                crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id);
+            (SqlScanKind::FrozenInputSet { version }, Some(snapshot_id))
+        }
+        novarocks_spi::connector::ConnectorReadSelector::TimestampMicros(timestamp_micros) => {
+            return Err(format!(
+                "connector read selector timestamp {timestamp_micros} must resolve to a snapshot before SQL materialization"
+            ));
+        }
+    };
     let planner = TableDef {
         name: sql_table_name.to_string(),
         columns: materialization.columns,
@@ -204,13 +216,28 @@ pub(crate) fn connector_query_binding_from_materialization(
                     namespace: namespace.to_string(),
                     table: sql_table_name.to_string(),
                 },
-                SqlScanKind::Data {
-                    version: crate::sql::planner::table::SqlTableVersionSelector::Current,
-                },
+                scan_kind,
             )
             .with_ukfk_facts(materialization.sql_ukfk_facts),
         ),
     };
+    let frozen_snapshot_materializations = frozen_snapshot_id
+        .into_iter()
+        .map(|snapshot_id| {
+            (
+                snapshot_id,
+                QueryScanMaterialization {
+                    table: materialization.read_table.clone(),
+                    schema: materialization.read_schema.clone(),
+                    selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
+                        snapshot_id,
+                    ),
+                    statistics_pin: materialization.statistics_pin.clone(),
+                    planning_lease: materialization.planning_lease.clone(),
+                },
+            )
+        })
+        .collect();
     Ok(QueryTableBinding {
         resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
         statistics_pin: materialization.statistics_pin.clone(),
@@ -224,7 +251,7 @@ pub(crate) fn connector_query_binding_from_materialization(
         }),
         mv_target_read: None,
         write_target_admission: None,
-        frozen_snapshot_materializations: BTreeMap::new(),
+        frozen_snapshot_materializations,
         delta_runtime_plans: BTreeMap::new(),
     })
 }

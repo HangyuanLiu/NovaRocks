@@ -238,32 +238,20 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         table: &str,
         binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
-        if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
-            let materialization =
-                crate::connector::iceberg::provider::load_time_travel_materialization_with_lease(
-                    self.controls,
-                    self.connector_context.clone(),
-                    catalog,
-                    namespace,
-                    base_table,
-                    snapshot_id,
-                )?;
-            return crate::engine::query_planning::catalog_materializer::
-                iceberg_query_binding_from_materialization(
-                    materialization,
-                    catalog,
-                    namespace,
-                    table,
-                    binding_id,
-                );
-        }
-        let materialization = load_connector_table_materialization_with_lease(
+        let (base_table, snapshot_id) = parse_time_travel_overlay_identity(table)
+            .map(|(base_table, snapshot_id)| (base_table, Some(snapshot_id)))
+            .unwrap_or((table, None));
+        let mut materialization = load_connector_table_materialization_with_lease(
             self.controls,
             self.connector_context.clone(),
             catalog,
             namespace,
-            table,
+            base_table,
         )?;
+        if let Some(snapshot_id) = snapshot_id {
+            materialization.read_selector =
+                novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id);
+        }
         connector_query_binding_from_materialization(
             materialization,
             catalog,
@@ -738,5 +726,6 @@ mod unified_tests {
             .expect("metadata loader boundary");
         assert!(strict_base.contains("load_connector_table_materialization_with_lease"));
         assert!(!strict_base.contains("load_schema_materialization_with_lease"));
+        assert!(!strict_base.contains("connector::iceberg::provider"));
     }
 }
