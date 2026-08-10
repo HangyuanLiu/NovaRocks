@@ -1021,7 +1021,7 @@ pub(crate) fn execute_drop_database_statement(
         tables.sort();
         let mut views = if matches!(
             entry.kind,
-            crate::connector::iceberg::catalog::registry::IcebergCatalogKind::Rest
+            novarocks_connector_iceberg::catalog_config::IcebergCatalogKind::Rest
         ) {
             crate::connector::iceberg::catalog::views::list_views(&entry, &target.namespace)?
         } else {

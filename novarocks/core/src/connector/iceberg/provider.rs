@@ -1041,7 +1041,7 @@ impl IcebergControlProvider {
         };
         let staged_create_supported = matches!(
             control_entry.kind,
-            super::catalog::registry::IcebergCatalogKind::Rest
+            novarocks_connector_iceberg::catalog_config::IcebergCatalogKind::Rest
         );
         let write_key = ConnectorExecutionBindingKey {
             instance_id: descriptor.instance_id.clone(),

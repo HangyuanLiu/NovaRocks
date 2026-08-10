@@ -390,7 +390,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let entry = &self.entry;
         if !matches!(
             entry.kind,
-            super::catalog::registry::IcebergCatalogKind::Rest
+            novarocks_connector_iceberg::catalog_config::IcebergCatalogKind::Rest
         ) {
             self.operations
                 .lock()
