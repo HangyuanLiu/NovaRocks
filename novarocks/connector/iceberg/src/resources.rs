@@ -20,12 +20,48 @@
 //! Construction belongs to the server composition root.  These values never
 //! discover a runtime or credentials from process-global state.
 
+use std::future::Future;
+
 use crate::access_binding::IcebergReadBinding;
+
+#[derive(Clone)]
+pub struct IcebergCatalogRuntime {
+    handle: tokio::runtime::Handle,
+}
+
+impl IcebergCatalogRuntime {
+    pub fn new(handle: tokio::runtime::Handle) -> Self {
+        Self { handle }
+    }
+
+    /// Runs one provider future on the explicitly injected runtime without
+    /// probing the caller's Tokio context. A dedicated joining thread keeps a
+    /// synchronous SPI factory safe when it is invoked from a runtime worker.
+    pub fn block_on<F>(&self, future: F) -> Result<F::Output, String>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = self.handle.clone();
+        std::thread::Builder::new()
+            .name("iceberg-catalog-runtime".to_string())
+            .spawn(move || handle.block_on(future))
+            .map_err(|error| format!("spawn Iceberg catalog runtime bridge: {error}"))?
+            .join()
+            .map_err(|_| "Iceberg catalog runtime bridge panicked".to_string())
+    }
+}
+
+impl std::fmt::Debug for IcebergCatalogRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IcebergCatalogRuntime(<explicit tokio handle>)")
+    }
+}
 
 #[derive(Clone)]
 pub struct IcebergControlResources {
     planning_binding: IcebergReadBinding,
-    catalog_runtime: tokio::runtime::Handle,
+    catalog_runtime: IcebergCatalogRuntime,
 }
 
 impl IcebergControlResources {
@@ -35,7 +71,7 @@ impl IcebergControlResources {
     ) -> Self {
         Self {
             planning_binding,
-            catalog_runtime,
+            catalog_runtime: IcebergCatalogRuntime::new(catalog_runtime),
         }
     }
 
@@ -43,7 +79,7 @@ impl IcebergControlResources {
         &self.planning_binding
     }
 
-    pub fn catalog_runtime(&self) -> &tokio::runtime::Handle {
+    pub fn catalog_runtime(&self) -> &IcebergCatalogRuntime {
         &self.catalog_runtime
     }
 }
@@ -53,7 +89,7 @@ impl std::fmt::Debug for IcebergControlResources {
         formatter
             .debug_struct("IcebergControlResources")
             .field("planning_binding", &self.planning_binding)
-            .field("catalog_runtime", &"<explicit tokio handle>")
+            .field("catalog_runtime", &self.catalog_runtime)
             .finish()
     }
 }
@@ -105,5 +141,6 @@ mod tests {
             execution.binding().access_binding(),
             binding.access_binding()
         );
+        assert_eq!(control.catalog_runtime().block_on(async { 7_u8 }), Ok(7));
     }
 }
