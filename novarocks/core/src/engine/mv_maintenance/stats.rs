@@ -112,7 +112,8 @@ pub(crate) fn collect_table_stats(
         format!("load iceberg table {catalog}.{namespace}.{table} for maintenance failed: {e}")
     })?;
     let metadata = loaded.metadata();
-    let preserve_row_lineage = crate::connector::iceberg::catalog::row_lineage_enabled(metadata);
+    let preserve_row_lineage =
+        novarocks_connector_iceberg::schema_facts::row_lineage_enabled(metadata);
     let compaction_stats = crate::connector::iceberg::catalog::registry::block_on_iceberg(
         crate::connector::iceberg::commit::current_live_data_file_compaction_stats(
             &loaded,

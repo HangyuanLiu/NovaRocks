@@ -491,10 +491,8 @@ pub(crate) fn encode_frozen_data_rewrite_handle_payload(
         .cloned()
         .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
     let mut data_input_schema =
-        crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen(
-            metadata.current_schema(),
-        )
-        .fields;
+        novarocks_connector_iceberg::schema_facts::iceberg_schema_def(metadata.current_schema())
+            .fields;
     if row_lineage_data {
         data_input_schema.extend([
             IcebergSchemaFieldDef {

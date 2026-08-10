@@ -39,7 +39,6 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization,
 };
 
-use super::catalog::backend::iceberg_schema_def_for_codegen;
 use super::catalog::registry::{
     IcebergCatalogEntry, RestStagedPrepareFailure, RestStagedTableCreate, block_on_iceberg,
     prepare_rest_staged_table,
@@ -48,6 +47,7 @@ use super::write_contract::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 use super::write_service::IcebergWriteServiceRegistry;
+use novarocks_connector_iceberg::schema_facts::iceberg_schema_def;
 
 const EVIDENCE_VERSION: u16 = 1;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
@@ -68,7 +68,7 @@ fn staged_data_sink_spec(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: metadata.current_schema_id(),
         location: metadata.location().to_string(),
-        schema: iceberg_schema_def_for_codegen(metadata.current_schema()),
+        schema: iceberg_schema_def(metadata.current_schema()),
         serialized_metadata: Some(
             serde_json::to_string(metadata)
                 .map_err(|error| internal(format!("serialize staged table metadata: {error}")))?,

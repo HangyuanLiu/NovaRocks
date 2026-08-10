@@ -95,7 +95,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::catalog::IcebergCatalogEntry;
-use super::catalog::backend::iceberg_schema_def_for_codegen;
 use super::catalog::registry::{
     IcebergCatalogRegistry, create_namespace, create_table, drop_namespace, drop_table,
     extract_data_files_with_stats_at, list_namespaces, list_tables, load_table, namespace_exists,
@@ -134,6 +133,7 @@ use novarocks_connector_iceberg::scan_model::{
 };
 #[cfg(test)]
 use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+use novarocks_connector_iceberg::schema_facts::{iceberg_schema_def, row_lineage_enabled};
 
 #[derive(Clone, Deserialize, Serialize)]
 struct IcebergDeltaSplitPayload {
@@ -1797,7 +1797,7 @@ impl IcebergControlProvider {
             })
             .collect::<Vec<_>>();
         let schema = super::schema::build_projected_output_schema_from_scan_model(
-            &iceberg_schema_def_for_codegen(loaded.table.metadata().current_schema()),
+            &iceberg_schema_def(loaded.table.metadata().current_schema()),
             &columns,
         )
         .map_err(|error| internal(format!("build Iceberg projected schema: {error}")))?;
@@ -1817,7 +1817,7 @@ impl IcebergControlProvider {
         )
         .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
         let mut storage_fields = storage_schema.fields().to_vec();
-        if super::catalog::backend::row_lineage_enabled(loaded.table.metadata()) {
+        if row_lineage_enabled(loaded.table.metadata()) {
             storage_fields.extend([
                 Arc::new(Field::new(
                     novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
@@ -5665,9 +5665,7 @@ fn build_table_payload(
         current_snapshot_id: metadata_table.metadata().current_snapshot_id(),
         schema_id: metadata_table.metadata().current_schema_id(),
         location: metadata_table.metadata().location().to_string(),
-        schema: super::catalog::backend::iceberg_schema_def_for_codegen(
-            metadata_table.metadata().current_schema(),
-        ),
+        schema: iceberg_schema_def(metadata_table.metadata().current_schema()),
         serialized_metadata: Some(
             serde_json::to_string(metadata_table.metadata())
                 .map_err(|error| internal(format!("serialize Iceberg table metadata: {error}")))?,
@@ -8790,7 +8788,7 @@ pub(crate) fn staged_iceberg_write_table_handle(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: metadata.current_schema_id(),
         location: metadata.location().to_string(),
-        schema: super::catalog::backend::iceberg_schema_def_for_codegen(metadata.current_schema()),
+        schema: iceberg_schema_def(metadata.current_schema()),
         serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
             internal(format!("serialize staged Iceberg write metadata: {error}"))
         })?),

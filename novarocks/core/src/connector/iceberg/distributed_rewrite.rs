@@ -290,7 +290,7 @@ impl IcebergDistributedRewritePlanner {
         let input_schema = rewrite_input_schema(
             request.operation(),
             physical_schema,
-            super::catalog::backend::row_lineage_enabled(metadata),
+            novarocks_connector_iceberg::schema_facts::row_lineage_enabled(metadata),
         );
         let cohorts = cohort_plans_from_artifact(
             request,
@@ -298,7 +298,7 @@ impl IcebergDistributedRewritePlanner {
             &artifact_location,
             &artifact.groups,
             input_schema,
-            super::catalog::backend::row_lineage_enabled(metadata),
+            novarocks_connector_iceberg::schema_facts::row_lineage_enabled(metadata),
         )?;
         let state_digest = rewrite_state_digest(
             metadata.uuid().to_string().as_bytes(),
@@ -485,7 +485,9 @@ impl IcebergDistributedRewriteAdapter {
                     encode_frozen_data_rewrite_handle_payload(
                         table.metadata(),
                         artifact.base_snapshot_id,
-                        super::catalog::backend::row_lineage_enabled(table.metadata()),
+                        novarocks_connector_iceberg::schema_facts::row_lineage_enabled(
+                            table.metadata(),
+                        ),
                     )
                     .map_err(|error| {
                         invalid(format!("encode data rewrite writer handle: {error}"))

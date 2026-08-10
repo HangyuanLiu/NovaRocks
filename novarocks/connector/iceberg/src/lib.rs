@@ -48,6 +48,7 @@ pub mod ref_snapshot;
 #[allow(dead_code)] // Provider reader integration lands with the remaining physical reader move.
 pub(crate) mod row_lineage_synth;
 pub mod scan_model;
+pub mod schema_facts;
 pub mod stats_assembler;
 pub mod stats_loader;
 pub mod theta_sketch;

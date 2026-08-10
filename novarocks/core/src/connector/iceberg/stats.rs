@@ -22,9 +22,7 @@ use std::sync::{Arc, RwLock};
 use arrow::datatypes::DataType;
 
 use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
-use crate::connector::iceberg::catalog::backend::{
-    data_file_with_stats_to_iceberg_data_file_info, iceberg_schema_def_for_codegen,
-};
+use crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info;
 use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats_at, load_table};
 use crate::connector::stats::StatsProviderError;
 use crate::sql::optimizer::statistics::Confidence;
@@ -33,6 +31,7 @@ use crate::sql::optimizer::stats_input::{
 };
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
+use novarocks_connector_iceberg::schema_facts::iceberg_schema_def;
 
 /// Provider-owned conversion of Iceberg manifest/Puffin artifacts into the
 /// neutral, immutable SQL statistics value.  SQL consumes only the returned
@@ -321,7 +320,7 @@ fn iceberg_table_info_for_stats(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: schema.schema_id(),
         location: metadata.location().to_string(),
-        schema: iceberg_schema_def_for_codegen(schema),
+        schema: iceberg_schema_def(schema),
         serialized_metadata: Some(serde_json::to_string(metadata).map_err(|err| {
             StatsProviderError::Metadata(format!("serialize iceberg table metadata failed: {err}"))
         })?),

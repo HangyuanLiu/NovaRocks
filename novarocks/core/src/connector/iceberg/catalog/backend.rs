@@ -26,8 +26,10 @@ use crate::sql::planner::table::{ScanSource, TableDef};
 #[cfg(test)]
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
 };
+#[cfg(test)]
+use novarocks_connector_iceberg::schema_facts::row_lineage_enabled;
 
 #[cfg(test)]
 use super::registry::load_table as reg_load_table;
@@ -471,119 +473,6 @@ fn build_iceberg_table_info(
         ),
         serialized_metadata_rows: None,
     })
-}
-
-pub(crate) fn iceberg_schema_def_for_codegen(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> IcebergSchemaDef {
-    iceberg_schema_def(schema)
-}
-
-fn iceberg_schema_def(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> IcebergSchemaDef {
-    IcebergSchemaDef {
-        fields: schema
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-    }
-}
-
-fn iceberg_field_def(
-    field: &novarocks_connector_iceberg::iceberg::spec::NestedField,
-) -> IcebergSchemaFieldDef {
-    let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    let write_default_json = field.write_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    IcebergSchemaFieldDef {
-        field_id: field.id,
-        name: field.name.clone(),
-        initial_default: field.initial_default.clone(),
-        write_default: field.write_default.clone(),
-        initial_default_json,
-        write_default_json,
-        children: iceberg_type_children(field.field_type.as_ref()),
-    }
-}
-
-fn iceberg_type_children(
-    ty: &novarocks_connector_iceberg::iceberg::spec::Type,
-) -> Vec<IcebergSchemaFieldDef> {
-    match ty {
-        novarocks_connector_iceberg::iceberg::spec::Type::Struct(struct_ty) => struct_ty
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-        novarocks_connector_iceberg::iceberg::spec::Type::List(list_ty) => {
-            vec![iceberg_field_def(list_ty.element_field.as_ref())]
-        }
-        novarocks_connector_iceberg::iceberg::spec::Type::Map(map_ty) => vec![
-            iceberg_field_def(map_ty.key_field.as_ref()),
-            iceberg_field_def(map_ty.value_field.as_ref()),
-        ],
-        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(_) => vec![],
-    }
-}
-
-/// Returns true when the table is Iceberg format-version=3 with
-/// `write.row-lineage=true`, meaning per-row `_row_id` and
-/// `_last_updated_sequence_number` metadata columns are available.
-#[cfg(test)]
-fn is_v3_row_lineage(metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata) -> bool {
-    let v3 = matches!(
-        metadata.format_version(),
-        novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-    );
-    let lineage = metadata
-        .properties()
-        .get("write.row-lineage")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    v3 && lineage
-}
-
-/// True iff the table can carry row-lineage metadata under the Iceberg V3
-/// spec rules: format-version is V3 AND `write.row-lineage` is not
-/// explicitly disabled. Per the Iceberg V3 spec, row-lineage is enabled
-/// by default on V3 tables; writers may opt out with
-/// `write.row-lineage=false`.
-///
-/// This is intentionally more permissive than `is_v3_row_lineage`. Schema-only
-/// table definitions use this to expose row-lineage metadata columns for
-/// catalog registration before scan files are bound, following V3-default
-/// semantics. Scan-binding table definitions remain stricter and use
-/// `is_v3_row_lineage` plus per-file `first_row_id` because ordinary scans can
-/// only synthesize row-lineage metadata when every bound file carries row IDs.
-/// OPTIMIZE preserves row-lineage whenever the writer would emit it on a fresh
-/// INSERT, which follows the V3-default semantics modelled here.
-pub(crate) fn row_lineage_enabled(
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-) -> bool {
-    if !matches!(
-        metadata.format_version(),
-        novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-    ) {
-        return false;
-    }
-    match metadata.properties().get("write.row-lineage") {
-        Some(v) => !v.eq_ignore_ascii_case("false"),
-        None => true,
-    }
 }
 
 /// Storage marker for an Iceberg table that has no data files yet.
