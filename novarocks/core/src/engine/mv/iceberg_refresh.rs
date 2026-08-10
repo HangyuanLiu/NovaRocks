@@ -1498,6 +1498,8 @@ impl MvEngine for StandaloneMvEngine {
                 "materialized view target empty-snapshot bootstrap",
             )?,
         };
+        #[cfg(test)]
+        run_after_create_target_hook();
         let observation = self
             .storage_observer
             .observe_created_target(&planning_lease, &table, self.connector_context.clone())
@@ -1508,8 +1510,6 @@ impl MvEngine for StandaloneMvEngine {
             .map_err(|error| {
                 engine_target_error(format!("MV CREATE observation lock poisoned: {error}"))
             })? = Some(observation.clone());
-        #[cfg(test)]
-        run_after_create_target_hook();
         Ok(CreatedMvTarget {
             target: plan.target.clone(),
             table_uuid: observation.table_uuid,

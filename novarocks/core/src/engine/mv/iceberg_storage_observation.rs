@@ -99,7 +99,7 @@ impl IcebergMvStorageObservationAdapter {
         let expected_package_id = format!("{}.{}", table.namespace, table.table);
         if descriptor.package_id != expected_package_id {
             return Err(corrupt(format!(
-                "Iceberg MV descriptor package ID mismatch for {}.{}.{}: expected {expected_package_id}, got {}",
+                "Iceberg MV descriptor package id mismatch for {}.{}.{}: expected {expected_package_id}, got {}",
                 table.instance_id.as_str(),
                 table.namespace,
                 table.table,
