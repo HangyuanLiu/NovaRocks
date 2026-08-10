@@ -22,14 +22,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::MaintenanceTarget;
+use novarocks_frontend::table_maintenance::coordination::MaintenanceFenceValidator;
 use novarocks_frontend::table_maintenance::model::{
     CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
     DistributedRewriteOperationKind, DistributedRewriteOperationState,
-    DistributedRewritePlanPayload, MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
-    MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
-    MetadataMaintenanceOperationState, MetadataMaintenancePlanPayload, OptimizeJobCreate,
+    DistributedRewritePlanPayload, MaintenanceAuthorityV1, MetadataMaintenanceExactOwner,
+    MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperationCreate,
+    MetadataMaintenanceOperationKind, MetadataMaintenanceOperationState,
+    MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use novarocks_frontend::table_maintenance::repository::{
     CleanupOperationRepository, DistributedRewriteOperationRepository,
@@ -38,6 +40,7 @@ use novarocks_frontend::table_maintenance::repository::{
     metadata_maintenance_payload_digest,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
+use novarocks_state_store::coordination::{ControlPlaneIncarnation, FencingToken, ResourceEpoch};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
@@ -180,6 +183,18 @@ fn opaque(payload: &[u8]) -> MetadataMaintenanceOpaquePayload {
     }
 }
 
+fn fenced_authority() -> MaintenanceAuthorityV1 {
+    let token = FencingToken::new(
+        "table-maintenance-operation-repository-test",
+        ControlPlaneIncarnation::new(1).unwrap(),
+        ResourceEpoch::new(1).unwrap(),
+    )
+    .unwrap()
+    .encode_v1()
+    .unwrap();
+    MaintenanceAuthorityV1::try_new(Uuid::now_v7(), token.to_vec()).unwrap()
+}
+
 fn rewrite_create(operation_id: Uuid) -> DistributedRewriteOperationCreate {
     let request_payload = br#"{"operation":"rewrite-data-files"}"#.to_vec();
     DistributedRewriteOperationCreate {
@@ -297,6 +312,61 @@ async fn persists_plan_before_running_and_releases_terminal_fence() {
             .payload,
         b"receipt"
     );
+}
+
+#[tokio::test]
+async fn fenced_metadata_transitions_reject_a_stale_attempt() {
+    let (_temp, _store, repository) = fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository.create(create(operation_id)).await.unwrap();
+    let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let authority = fenced_authority();
+    let plan_payload = b"fenced-plan".to_vec();
+    repository
+        .start_fenced(
+            operation_id,
+            MetadataMaintenancePlanPayload {
+                plan_digest: [4; 32],
+                payload_digest: metadata_maintenance_payload_digest(&plan_payload),
+                payload: plan_payload,
+                summary: [1, 2, 3, 4, 5],
+            },
+            11,
+            authority.clone(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+
+    let error = repository
+        .mark_reconcile_pending_fenced(
+            operation_id,
+            opaque(b"late-provider-response"),
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+
+    let reconciled = repository
+        .mark_reconcile_pending_fenced(
+            operation_id,
+            opaque(b"late-provider-response"),
+            authority.clone(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciled.state,
+        MetadataMaintenanceOperationState::ReconcilePending
+    );
+    let finished = repository
+        .finish_fenced(operation_id, opaque(b"receipt"), 12, authority, validator)
+        .await
+        .unwrap();
+    assert_eq!(finished.state, MetadataMaintenanceOperationState::Finished);
 }
 
 #[tokio::test]

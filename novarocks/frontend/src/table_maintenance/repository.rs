@@ -1946,6 +1946,58 @@ impl MetadataMaintenanceOperationRepository {
                         operation_id,
                         plan,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Start,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    /// Persists the plan checkpoint and binds the attempt that owns all later
+    /// provider-facing transitions for this metadata operation.
+    pub async fn start_fenced(
+        &self,
+        operation_id: Uuid,
+        plan: MetadataMaintenancePlanPayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &plan.payload,
+            plan.payload_digest,
+            "metadata maintenance plan payload",
+        )?;
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("fenced start metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced start frontend metadata maintenance operation",
+            |transaction| {
+                let plan = plan.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_start(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        plan,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -1988,6 +2040,55 @@ impl MetadataMaintenanceOperationRepository {
                         transaction_operation_id,
                         operation_id,
                         evidence,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::ReconcilePending,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        evidence: MetadataMaintenanceOpaquePayload,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &evidence.payload,
+            evidence.digest,
+            "metadata maintenance reconcile evidence",
+        )?;
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context =
+            format!("fenced reconcile-pending metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced record frontend metadata maintenance reconcile evidence",
+            |transaction| {
+                let evidence = evidence.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_reconcile_pending(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        evidence,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -2025,6 +2126,32 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    pub async fn finish_fenced(
+        &self,
+        operation_id: Uuid,
+        receipt: MetadataMaintenanceOpaquePayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &receipt.payload,
+            receipt.digest,
+            "metadata maintenance receipt",
+        )?;
+        validate_authority(&authority)?;
+        self.transition_terminal_fenced(
+            operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Finish,
+            Some(receipt),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     pub async fn fail(
         &self,
         operation_id: Uuid,
@@ -2038,6 +2165,28 @@ impl MetadataMaintenanceOperationRepository {
             None,
             Some(message),
             now_ms,
+        )
+        .await
+    }
+
+    pub async fn fail_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_error(&message)?;
+        validate_authority(&authority)?;
+        self.transition_terminal_fenced(
+            operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Fail,
+            None,
+            Some(message),
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -2067,6 +2216,53 @@ impl MetadataMaintenanceOperationRepository {
                         operation_id,
                         message,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Unresolve,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_error(&message)?;
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context =
+            format!("fenced mark metadata maintenance operation {operation_id} unresolved");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced mark frontend metadata maintenance operation unresolved",
+            |transaction| {
+                let message = message.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_unresolved(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        message,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -2373,6 +2569,55 @@ impl MetadataMaintenanceOperationRepository {
                         receipt,
                         message,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            action,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    async fn transition_terminal_fenced(
+        &self,
+        operation_id: Uuid,
+        action: StoredMetadataMaintenanceTransactionActionV2,
+        receipt: Option<MetadataMaintenanceOpaquePayload>,
+        message: Option<String>,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("fenced terminal metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced terminal frontend metadata maintenance operation",
+            |transaction| {
+                let receipt = receipt.clone();
+                let message = message.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_terminal(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        action,
+                        receipt,
+                        message,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -2692,6 +2937,7 @@ async fn apply_metadata_start(
     operation_id: Uuid,
     plan: MetadataMaintenancePlanPayload,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2705,6 +2951,21 @@ async fn apply_metadata_start(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_authority(authority) {
+            return Ok(Err(error));
+        }
+        if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+            return Ok(Err(error));
+        }
+        if let Some(durable) = operation.stored.authority.as_ref() {
+            if durable != authority {
+                return Ok(Err(RepositoryError::authority_lost(
+                    "metadata maintenance durable authority does not match attempt",
+                )));
+            }
+        }
+    }
     if operation.stored.state == MetadataMaintenanceOperationState::Running
         && operation.stored.plan_digest == Some(plan.plan_digest)
         && metadata_payload_matches(
@@ -2735,6 +2996,9 @@ async fn apply_metadata_start(
         return Ok(Err(error));
     }
     operation.stored.state = MetadataMaintenanceOperationState::Running;
+    if let Some((authority, _)) = fenced {
+        operation.stored.authority = Some(authority.clone());
+    }
     operation.stored.plan_digest = Some(plan.plan_digest);
     operation.stored.plan_summary = Some(plan.summary);
     operation.stored.started_at_ms = Some(now_ms);
@@ -2768,6 +3032,7 @@ async fn apply_metadata_reconcile_pending(
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     evidence: MetadataMaintenanceOpaquePayload,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2781,6 +3046,18 @@ async fn apply_metadata_reconcile_pending(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+        {
+            return Ok(Err(error));
+        }
+    }
     if operation.stored.state == MetadataMaintenanceOperationState::ReconcilePending
         && metadata_payload_matches(
             transaction,
@@ -2845,6 +3122,7 @@ async fn apply_metadata_terminal(
     receipt: Option<MetadataMaintenanceOpaquePayload>,
     message: Option<String>,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2858,6 +3136,18 @@ async fn apply_metadata_terminal(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+        {
+            return Ok(Err(error));
+        }
+    }
     let target_state = match action {
         StoredMetadataMaintenanceTransactionActionV2::Finish => {
             MetadataMaintenanceOperationState::Finished
@@ -2946,6 +3236,7 @@ async fn apply_metadata_unresolved(
     operation_id: Uuid,
     message: String,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2959,6 +3250,18 @@ async fn apply_metadata_unresolved(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+        {
+            return Ok(Err(error));
+        }
+    }
     if operation.stored.state == MetadataMaintenanceOperationState::Unresolved {
         return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
     }
