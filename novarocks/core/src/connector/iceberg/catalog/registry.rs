@@ -72,7 +72,7 @@ pub(crate) struct IcebergCatalogEntry {
     /// and application caches below; it must not re-model catalog credentials,
     /// endpoints, or warehouse identity.
     configuration: IcebergCatalogConfiguration,
-    table_cache: Arc<std::sync::RwLock<HashMap<(String, String), IcebergLoadedTable>>>,
+    physical_table_cache: novarocks_connector_iceberg::loaded_table::IcebergPhysicalTableCache,
     data_files_cache: novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache,
 }
 
@@ -223,21 +223,14 @@ impl IcebergCatalogEntry {
             normalize_identifier(namespace_name),
             normalize_identifier(table_name),
         ) {
-            if let Ok(mut cache) = self.table_cache.write() {
-                cache.remove(&(ns.clone(), tbl.clone()));
-            }
+            self.physical_table_cache.invalidate(&ns, &tbl);
             self.data_files_cache.invalidate_table(&ns, &tbl);
         }
     }
 
     #[cfg(test)]
     pub(crate) fn poison_table_cache_for_test(&self) {
-        let cache = Arc::clone(&self.table_cache);
-        let _ = std::thread::spawn(move || {
-            let _guard = cache.write().expect("table cache write lock");
-            panic!("injected table cache failure");
-        })
-        .join();
+        self.physical_table_cache.poison_for_test();
     }
 
     pub(crate) fn cached_data_files(
@@ -964,6 +957,71 @@ fn drop_s3_table_prefix(
     })?
 }
 
+fn project_loaded_table(
+    physical: novarocks_connector_iceberg::loaded_table::IcebergPhysicalTable,
+    namespace_name: &str,
+    table_name: &str,
+) -> Result<IcebergLoadedTable, String> {
+    let table = &physical.table;
+    let logical_types = parse_logical_type_properties(table.metadata().properties())?;
+    let key_desc = parse_table_key_desc_properties(table.metadata().properties())?;
+    let column_aggregations = parse_column_aggregation_properties(table.metadata().properties())?;
+    let iceberg_schema = table.metadata().current_schema();
+    let arrow_schema = schema_to_arrow_schema(iceberg_schema)
+        .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
+    let columns = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let field_name = normalize_identifier(field.name()).map_err(|e| {
+                format!(
+                    "normalize iceberg column name `{}` failed: {e}",
+                    field.name()
+                )
+            })?;
+            let nested = iceberg_schema
+                .field_by_name(field.name())
+                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
+            let logical_type_override = logical_types.get(&field_name);
+            let data_type = column_def_arrow_type_for_iceberg_field(
+                nested.field_type.as_ref(),
+                field.data_type(),
+                logical_type_override,
+            );
+            let logical_type = logical_type_override
+                .filter(|t| matches!(t, SqlType::Bitmap | SqlType::Hll))
+                .cloned();
+            Ok(ColumnDef {
+                name: field.name().clone(),
+                data_type,
+                nullable: field.is_nullable(),
+                write_default: nested
+                    .write_default
+                    .as_ref()
+                    .map(|literal| {
+                        convert_loaded_write_default(
+                            literal,
+                            nested.field_type.as_ref(),
+                            namespace_name,
+                            table_name,
+                            field.name(),
+                        )
+                    })
+                    .transpose()?,
+                logical_type,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(IcebergLoadedTable {
+        physical,
+        columns,
+        logical_types,
+        key_desc,
+        column_aggregations,
+    })
+}
+
 pub(crate) fn load_table(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
@@ -972,23 +1030,8 @@ pub(crate) fn load_table(
     let ns_name = normalize_identifier(namespace_name)?;
     let tbl_name = normalize_identifier(table_name)?;
 
-    // Check cache first
-    {
-        let cache = match entry.table_cache.read() {
-            Ok(cache) => cache,
-            Err(poisoned) => {
-                let message = format!("table cache lock: {poisoned}");
-                drop(poisoned.into_inner());
-                entry.table_cache.clear_poison();
-                if let Ok(mut cache) = entry.table_cache.write() {
-                    cache.clear();
-                }
-                return Err(message);
-            }
-        };
-        if let Some(cached) = cache.get(&(ns_name.clone(), tbl_name.clone())) {
-            return Ok(cached.clone());
-        }
+    if let Some(physical) = entry.physical_table_cache.get(&ns_name, &tbl_name)? {
+        return project_loaded_table(physical, &ns_name, &tbl_name);
     }
 
     let table = if entry.uses_remote_catalog() {
@@ -1053,87 +1096,14 @@ pub(crate) fn load_table(
             .map_err(|e| format!("build iceberg table: {e}"))?
     };
 
-    let logical_types = parse_logical_type_properties(table.metadata().properties())?;
-    let key_desc = parse_table_key_desc_properties(table.metadata().properties())?;
-    let column_aggregations = parse_column_aggregation_properties(table.metadata().properties())?;
-    let iceberg_schema = table.metadata().current_schema();
-    let arrow_schema = schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
-    let columns = arrow_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let field_name = normalize_identifier(field.name()).map_err(|e| {
-                format!(
-                    "normalize iceberg column name `{}` failed: {e}",
-                    field.name()
-                )
-            })?;
-            let nested = iceberg_schema
-                .field_by_name(field.name())
-                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
-            // Variant columns surface as Struct{metadata, value} in the
-            // iceberg arrow schema (PATCH 6), but NovaRocks carries variants
-            // internally as LargeBinary `[size:u32 LE | metadata | value]`.
-            // The data_writer's transform_variant_columns_for_write splits
-            // the LargeBinary into the Struct shape right before
-            // ParquetWriter::write, so we expose LargeBinary at the
-            // ColumnDef level for INSERT-side literal building.
-            let logical_type_override = logical_types.get(&field_name);
-            let data_type = column_def_arrow_type_for_iceberg_field(
-                nested.field_type.as_ref(),
-                field.data_type(),
-                logical_type_override,
-            );
-            // Only BITMAP/HLL need to surface as ColumnDef.logical_type: the
-            // Arrow data_type collapses both onto Binary, but the analyzer
-            // needs to reject ORDER BY / GROUP BY / comparison / key /
-            // distribution misuse. Other logical-type overrides (DATE) are
-            // already disambiguated by the Arrow data_type itself.
-            let logical_type = logical_type_override
-                .filter(|t| matches!(t, SqlType::Bitmap | SqlType::Hll))
-                .cloned();
-            Ok(ColumnDef {
-                name: field.name().clone(),
-                data_type,
-                nullable: field.is_nullable(),
-                write_default: nested
-                    .write_default
-                    .as_ref()
-                    .map(|literal| {
-                        convert_loaded_write_default(
-                            literal,
-                            nested.field_type.as_ref(),
-                            &ns_name,
-                            &tbl_name,
-                            field.name(),
-                        )
-                    })
-                    .transpose()?,
-                logical_type,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    let loaded = IcebergLoadedTable::new(
+    let physical = novarocks_connector_iceberg::loaded_table::IcebergPhysicalTable::new(
         table,
         entry.object_store_config.clone(),
-        columns,
-        logical_types,
-        key_desc,
-        column_aggregations,
     );
-
-    // Cache the loaded table
-    {
-        let mut cache = entry
-            .table_cache
-            .write()
-            .map_err(|e| format!("table cache lock: {e}"))?;
-        cache.insert((ns_name, tbl_name), loaded.clone());
-    }
-
-    Ok(loaded)
+    entry
+        .physical_table_cache
+        .insert(&ns_name, &tbl_name, physical.clone())?;
+    project_loaded_table(physical, &ns_name, &tbl_name)
 }
 
 fn convert_loaded_write_default(
@@ -1382,7 +1352,8 @@ pub(crate) fn build_catalog_entry(
     let configuration = parse_catalog_configuration(catalog_name, properties)?;
     Ok(IcebergCatalogEntry {
         configuration,
-        table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        physical_table_cache:
+            novarocks_connector_iceberg::loaded_table::IcebergPhysicalTableCache::default(),
         data_files_cache:
             novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache::default(),
     })
@@ -2745,9 +2716,7 @@ mod data_file_with_stats_tests {
     use super::{
         DataFileWithStats, IcebergCatalogConfiguration, IcebergCatalogEntry, IcebergCatalogKind,
     };
-    use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
 
     fn data_file(path: &str) -> DataFileWithStats {
         DataFileWithStats {
@@ -2809,7 +2778,8 @@ mod data_file_with_stats_tests {
                 object_store_config: None,
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
             },
-            table_cache: Arc::new(RwLock::new(HashMap::new())),
+            physical_table_cache:
+                novarocks_connector_iceberg::loaded_table::IcebergPhysicalTableCache::default(),
             data_files_cache:
                 novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache::default(),
         };
