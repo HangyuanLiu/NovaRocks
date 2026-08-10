@@ -98,8 +98,7 @@ pub trait MutationAbort: Send + Sync {
 }
 
 /// Stable facts available to the frontend before durable intent is created.
-/// `journal_commit_kind` is intentionally the RowDelta lifecycle family; the
-/// concrete COW/MOR provider action remains inside opaque handles/evidence.
+/// The concrete COW/MOR provider action remains inside opaque handles/evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationOperation {
     pub kind: MutationStatementKind,
@@ -108,7 +107,6 @@ pub struct MutationOperation {
     pub table: String,
     pub target_ref: String,
     pub attempt_id: String,
-    pub journal_commit_kind: CommitOpKind,
     pub base_snapshot_id: Option<i64>,
 }
 
@@ -141,15 +139,44 @@ pub trait MutationEngine: Send + Sync {
 
     fn abort_mutation(
         &self,
-        prepared: &dyn MutationPrepared,
-        abort: &dyn MutationAbort,
-    ) -> Result<CommitOutcome, CommitServiceError>;
+        _prepared: &dyn MutationPrepared,
+        _abort: &dyn MutationAbort,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        Err(CommitServiceError::invalid_input(
+            "mutation engine does not expose a legacy Iceberg abort result".to_string(),
+        ))
+    }
+
+    fn abort_mutation_terminal(
+        &self,
+        _prepared: &dyn MutationPrepared,
+        _abort: &dyn MutationAbort,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+        Err("mutation engine does not expose a connector terminal abort outcome".to_string())
+    }
 
     fn commit_mutation(
         &self,
-        prepared: &dyn MutationPrepared,
-        commit: &dyn MutationCommit,
-    ) -> Result<CommitOutcome, CommitServiceError>;
+        _prepared: &dyn MutationPrepared,
+        _commit: &dyn MutationCommit,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        Err(CommitServiceError::invalid_input(
+            "mutation engine does not expose a legacy Iceberg commit result".to_string(),
+        ))
+    }
+
+    fn commit_mutation_terminal(
+        &self,
+        _prepared: &dyn MutationPrepared,
+        _commit: &dyn MutationCommit,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        Err("mutation engine does not expose a connector terminal commit outcome".to_string())
+    }
 
     fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String>;
 }
@@ -309,7 +336,6 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
             table,
             target_ref,
             attempt_id: uuid::Uuid::new_v4().to_string(),
-            journal_commit_kind: CommitOpKind::RowDelta,
             base_snapshot_id,
         };
         let handle: Arc<dyn MutationPrepared> = Arc::new(CoreMutationPrepared {
@@ -439,7 +465,9 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
         commit: &dyn MutationCommit,
     ) -> Result<CommitOutcome, CommitServiceError> {
         let prepared = prepared_handle(prepared).map_err(CommitServiceError::invalid_input)?;
-        let commit = commit_handle(commit)?;
+        let commit = commit_handle(commit).map_err(|error| {
+            CommitServiceError::invalid_input(format!("invalid mutation commit handle: {error:?}"))
+        })?;
         if prepared.operation.kind != commit.kind
             || prepared.operation.attempt_id != commit.attempt_id
         {
@@ -467,6 +495,42 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
                 )
             })?;
         commit.execution.commit(&completion)
+    }
+
+    fn commit_mutation_terminal(
+        &self,
+        prepared: &dyn MutationPrepared,
+        commit: &dyn MutationCommit,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let prepared = prepared_handle(prepared)?;
+        let commit = commit_handle(commit)
+            .map_err(|error| format!("invalid mutation commit handle: {error:?}"))?;
+        if prepared.operation.kind != commit.kind
+            || prepared.operation.attempt_id != commit.attempt_id
+        {
+            return Err(
+                "mutation commit handle does not belong to this prepared mutation".to_string(),
+            );
+        }
+        if prepared.state.swap(TERMINAL, Ordering::AcqRel) == TERMINAL {
+            return Err("mutation commit was decided more than once".to_string());
+        }
+        *prepared
+            .finalizer
+            .lock()
+            .expect("mutation finalizer lock poisoned") = Some(Arc::clone(&commit.execution));
+        let completion = commit
+            .completion
+            .lock()
+            .expect("mutation commit completion lock poisoned")
+            .take()
+            .ok_or_else(|| "mutation commit completion was already consumed".to_string())?;
+        commit.execution.commit_terminal(&completion)
     }
 
     fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String> {
@@ -560,7 +624,6 @@ mod tests {
                 table: "t".to_string(),
                 target_ref: "main".to_string(),
                 attempt_id: attempt_id.to_string(),
-                journal_commit_kind: CommitOpKind::RowDelta,
                 base_snapshot_id: Some(7),
             },
             kernel: Mutex::new(None),

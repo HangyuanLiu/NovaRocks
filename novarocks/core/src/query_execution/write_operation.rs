@@ -63,9 +63,19 @@ impl ConnectorWriteOperationSession {
         lease: ConnectorWriteLease,
     ) -> Result<Self, ConnectorError> {
         let operation_id = registration.operation_id();
-        if registration.connector_instance_id() != &lease.binding_key().instance_id {
+        if registration.owner() != lease.binding_key() {
             return Err(invalid(
                 "connector write operation registration does not match the exact write lease",
+            ));
+        }
+        if registration
+            .clone()
+            .into_cohorts()
+            .iter()
+            .any(|template| !template.retains_lease_generation(&lease))
+        {
+            return Err(invalid(
+                "connector write operation registration does not retain the supplied exact lease generation",
             ));
         }
         let owner = lease.binding_key().clone();
@@ -122,6 +132,20 @@ impl ConnectorWriteOperationSession {
 
     pub fn sealed(&self) -> &ConnectorSealedWriteCohortSet {
         &self.inner.sealed
+    }
+
+    /// Return the Provider-signed preparation for one sealed cohort.  SQL may
+    /// project only its tagged Arrow layout and field tokens; the provider
+    /// payload remains opaque.
+    pub fn preparation(
+        &self,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> Result<novarocks_spi::connector::ConnectorWritePreparation, ConnectorError> {
+        self.inner
+            .cohorts
+            .get(&cohort_id)
+            .map(|template| template.preparation().clone())
+            .ok_or_else(|| invalid("connector write operation names an unknown cohort"))
     }
 
     /// Materialize the complete accepted aggregate without choosing commit or
@@ -666,15 +690,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
         CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
         ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
-        ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteIntent, ConnectorWritePlan,
-        ConnectorWritePlanningRequest, ConnectorWriterHandle, ConnectorWriterIdentity,
+        ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteControl,
+        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+        ConnectorWriteIntent, ConnectorWritePlan, ConnectorWritePlanningRequest,
+        ConnectorWritePreparation, ConnectorWriterHandle, ConnectorWriterIdentity,
         ConnectorWriterTerminalState, ExternalMutationFinalization,
     };
 
@@ -807,16 +833,29 @@ mod tests {
     fn template(
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
+        exact_lease: ConnectorWriteLease,
     ) -> ConnectorWritePlanningTemplate {
         ConnectorWritePlanningTemplate::new_in_cohort(
             operation_id,
             cohort_id,
-            ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
-                .expect("table handle"),
-            ConnectorWriteIntent::Append,
-            Arc::new(Schema::empty()),
-            Bytes::from_static(b"provider-plan"),
+            ConnectorWritePreparation::try_new(
+                owner(),
+                ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
+                    .expect("table handle"),
+                ConnectorWriteIntent::Append,
+                ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
+                    .expect("base version"),
+                ConnectorWriteInputShape::Data {
+                    fields: vec![ConnectorWriteFieldBinding::new(
+                        ConnectorWriteFieldToken::from_bytes([1; 32]),
+                        Field::new("value", DataType::Int64, true),
+                    )],
+                },
+                Bytes::from_static(b"provider-plan"),
+            )
+            .expect("preparation"),
             context(),
+            exact_lease,
         )
     }
 
@@ -932,14 +971,19 @@ mod tests {
         let release_calls = Arc::new(AtomicUsize::new(0));
         let plan_calls = Arc::new(AtomicUsize::new(0));
         let abort_calls = Arc::new(AtomicUsize::new(0));
+        let exact_lease = lease(
+            Arc::clone(&release_calls),
+            Arc::clone(&plan_calls),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&abort_calls),
+        );
         let session = ConnectorWriteOperationSession::try_begin(
-            ConnectorWriteOperationRegistration::single(template(operation_id, cohort_id)),
-            lease(
-                Arc::clone(&release_calls),
-                Arc::clone(&plan_calls),
-                Arc::new(AtomicUsize::new(0)),
-                Arc::clone(&abort_calls),
-            ),
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                exact_lease.clone(),
+            )),
+            exact_lease,
         )
         .expect("sealed operation session");
 
@@ -971,6 +1015,36 @@ mod tests {
     }
 
     #[test]
+    fn sealed_session_rejects_another_lease_for_the_same_binding() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([91; 16]);
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let planned_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let replacement_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let error = match ConnectorWriteOperationSession::try_begin(
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                planned_lease,
+            )),
+            replacement_lease,
+        ) {
+            Ok(_) => panic!("a replacement lease must not seal a prepared operation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exact lease generation"));
+    }
+
+    #[test]
     fn incomplete_operation_can_only_abort_and_then_forbids_staging() {
         let operation_id = ConnectorWriteOperationId::from_bytes([10; 16]);
         let first =
@@ -980,21 +1054,19 @@ mod tests {
         let release_calls = Arc::new(AtomicUsize::new(0));
         let plan_calls = Arc::new(AtomicUsize::new(0));
         let abort_calls = Arc::new(AtomicUsize::new(0));
+        let exact_lease = lease(
+            release_calls,
+            Arc::clone(&plan_calls),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&abort_calls),
+        );
         let registration = ConnectorWriteOperationRegistration::try_new(vec![
-            template(operation_id, first),
-            template(operation_id, second),
+            template(operation_id, first, exact_lease.clone()),
+            template(operation_id, second, exact_lease.clone()),
         ])
         .expect("two cohorts");
-        let session = ConnectorWriteOperationSession::try_begin(
-            registration,
-            lease(
-                release_calls,
-                Arc::clone(&plan_calls),
-                Arc::new(AtomicUsize::new(0)),
-                Arc::clone(&abort_calls),
-            ),
-        )
-        .expect("sealed operation session");
+        let session = ConnectorWriteOperationSession::try_begin(registration, exact_lease)
+            .expect("sealed operation session");
 
         let commit_error = session
             .commit(context())
@@ -1035,14 +1107,19 @@ mod tests {
         let plan_calls = Arc::new(AtomicUsize::new(0));
         let commit_calls = Arc::new(AtomicUsize::new(0));
         let abort_calls = Arc::new(AtomicUsize::new(0));
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&plan_calls),
+            Arc::clone(&commit_calls),
+            Arc::clone(&abort_calls),
+        );
         let session = ConnectorWriteOperationSession::try_begin(
-            ConnectorWriteOperationRegistration::single(template(operation_id, cohort_id)),
-            lease(
-                Arc::new(AtomicUsize::new(0)),
-                Arc::clone(&plan_calls),
-                Arc::clone(&commit_calls),
-                Arc::clone(&abort_calls),
-            ),
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                exact_lease.clone(),
+            )),
+            exact_lease,
         )
         .expect("sealed operation session");
 
@@ -1084,14 +1161,19 @@ mod tests {
     fn known_empty_noop_rejects_accepted_or_superseded_attempts() {
         let operation_id = ConnectorWriteOperationId::from_bytes([12; 16]);
         let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
         let session = ConnectorWriteOperationSession::try_begin(
-            ConnectorWriteOperationRegistration::single(template(operation_id, cohort_id)),
-            lease(
-                Arc::new(AtomicUsize::new(0)),
-                Arc::new(AtomicUsize::new(0)),
-                Arc::new(AtomicUsize::new(0)),
-                Arc::new(AtomicUsize::new(0)),
-            ),
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                exact_lease.clone(),
+            )),
+            exact_lease,
         )
         .expect("sealed operation session");
 

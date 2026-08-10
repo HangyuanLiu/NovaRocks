@@ -37,9 +37,7 @@ use novarocks_spi::connector::{
     ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
 };
 
-use crate::sql::planner::distributed::write::contract::{
-    SqlPositionDeleteOutputDescriptor, SqlWriteSinkMode,
-};
+use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
 
 use super::commit::DeletionVector;
 use super::report::{
@@ -124,41 +122,6 @@ pub(crate) fn iceberg_write_sink_mode(mode: SqlWriteSinkMode) -> IcebergWriteSin
         SqlWriteSinkMode::DeletionVectors => IcebergWriteSinkMode::DeletionVectors,
         SqlWriteSinkMode::EqualityDeletes => IcebergWriteSinkMode::EqualityDeletes,
     }
-}
-
-pub(crate) fn position_delete_descriptor_from_sql(
-    descriptor: &SqlPositionDeleteOutputDescriptor,
-) -> Result<
-    crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
-    String,
-> {
-    Ok(crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
-        file_path: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
-            output_expr_index: descriptor.file_path.output_expr_index,
-            name: descriptor.file_path.name.clone(),
-            data_type: descriptor.file_path.data_type.clone(),
-            field_id: descriptor.file_path.field_id,
-        },
-        pos: crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField {
-            output_expr_index: descriptor.pos.output_expr_index,
-            name: descriptor.pos.name.clone(),
-            data_type: descriptor.pos.data_type.clone(),
-            field_id: descriptor.pos.field_id,
-        },
-        partition_source_fields: descriptor
-            .partition_source_fields
-            .iter()
-            .map(|field| crate::connector::iceberg::position_delete_descriptor::PositionDeletePartitionSourceField {
-                output_expr_index: field.output_expr_index,
-                source_column_name: field.source_column_name.clone(),
-                partition_field_name: field.partition_field_name.clone(),
-                transform_expr: field.transform.sql_name(),
-                source_field_id: field.source_field_id,
-                data_type: field.data_type.clone(),
-            })
-            .collect(),
-        target_partition_spec_id: descriptor.target_partition_spec_id,
-    })
 }
 
 pub(crate) const ICEBERG_WRITE_PAYLOAD_VERSION: u32 = 1;

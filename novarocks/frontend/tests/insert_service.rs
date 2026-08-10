@@ -41,18 +41,19 @@ use novarocks::runtime::query_result::QueryResult;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_frontend::dml::model::DML_OPERATION_SCHEMA_VERSION;
 use novarocks_frontend::dml::{
-    CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest, DmlError,
-    DmlErrorKind, DmlOperationId, DmlService, OperationFact, OperationJournal, OperationState,
-    RecoveryEvidence, StoredOperation,
+    CreatePreparingRequest, DmlError, DmlErrorKind, DmlOperationId, DmlService, OperationFact,
+    OperationJournal, OperationState, StoredOperation,
 };
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlPlanningLease,
     ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
     ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
     ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
-    ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorTableMetadata, ConnectorTableRequest, ConnectorWriteReceipt, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use uuid::Uuid;
 
@@ -89,7 +90,7 @@ enum CommitBehavior {
 }
 
 struct FakePrepared {
-    commit_op_kind: CommitOpKind,
+    is_overwrite: bool,
 }
 
 impl IcebergPreparedInsert for FakePrepared {
@@ -191,11 +192,7 @@ impl InsertEngine for FakeInsertEngine {
         if let Some(message) = self.prepare_error.lock().unwrap().clone() {
             return Err(message);
         }
-        let commit_op_kind = match request.overwrite_mode {
-            InsertOverwriteMode::Append => CommitOpKind::FastAppend,
-            InsertOverwriteMode::FullTable => CommitOpKind::Overwrite,
-            InsertOverwriteMode::DynamicPartitions => CommitOpKind::OverwritePartitions,
-        };
+        let is_overwrite = !matches!(request.overwrite_mode, InsertOverwriteMode::Append);
         Ok(PreparedIcebergInsert {
             operation: IcebergInsertOperation {
                 catalog: request.target.catalog,
@@ -203,10 +200,10 @@ impl InsertEngine for FakeInsertEngine {
                 table: request.target.table,
                 target_ref: request.target_ref,
                 attempt_id: "fake-attempt".to_string(),
-                commit_op_kind,
+                is_overwrite,
                 base_snapshot_id: Some(10),
             },
-            handle: Arc::new(FakePrepared { commit_op_kind }),
+            handle: Arc::new(FakePrepared { is_overwrite }),
         })
     }
 
@@ -221,7 +218,7 @@ impl InsertEngine for FakeInsertEngine {
                     .as_any()
                     .downcast_ref::<FakePrepared>()
                     .ok_or_else(|| "foreign fake prepared handle".to_string())?;
-                if matches!(prepared.commit_op_kind, CommitOpKind::FastAppend) {
+                if !prepared.is_overwrite {
                     IcebergWriteReport::NoOp
                 } else {
                     IcebergWriteReport::CommitRequired(Arc::new(FakeCommit))
@@ -239,23 +236,36 @@ impl InsertEngine for FakeInsertEngine {
         &self,
         _prepared: &dyn IcebergPreparedInsert,
         _commit: &dyn IcebergInsertCommit,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<
+        novarocks::connector::iceberg::commit::CommitOutcome,
+        novarocks::connector::iceberg::commit::CommitServiceError,
+    > {
+        Err(
+            novarocks::connector::iceberg::commit::CommitServiceError::invalid_input(
+                "test engine exposes only the terminal commit contract".to_string(),
+            ),
+        )
+    }
+
+    fn commit_iceberg_write_terminal(
+        &self,
+        _prepared: &dyn IcebergPreparedInsert,
+        _commit: &dyn IcebergInsertCommit,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
         self.calls.lock().unwrap().push(Call::Commit);
         match *self.commit_behavior.lock().unwrap() {
-            CommitBehavior::Success => Ok(CommitOutcome {
-                new_snapshot_id: 11,
-                written_manifest_paths: Vec::new(),
+            CommitBehavior::Success => Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt: test_receipt(b"commit-success"),
+                finalization: ExternalMutationFinalization::Complete,
             }),
-            CommitBehavior::Unknown => Err(CommitServiceError::unknown(
-                "connection reset by peer".to_string(),
-                RecoveryEvidence {
-                    table_ident: "ice.db.t".to_string(),
-                    op_kind: CommitOpKind::FastAppend,
-                    base_snapshot_id: Some(10),
-                    base_sequence_number: 10,
-                    staging_dir: "s3://warehouse/_staging/fake".to_string(),
-                },
-            )),
+            CommitBehavior::Unknown => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "connection reset by peer",
+                ),
+                evidence: test_evidence(),
+            }),
         }
     }
 
@@ -383,11 +393,9 @@ impl OperationJournal for FakeJournal {
                 base_snapshot_id: request.base_snapshot_id,
                 base_snapshot_map: request.base_snapshot_map,
                 staged_artifacts: request.staged_artifacts,
-                commit_outcome: None,
-                cleanup_outcome: None,
-                recovery_evidence: None,
-                failure: None,
-                payload: novarocks_frontend::dml::model::OperationPayload::WriteV1,
+                payload: novarocks_frontend::dml::model::OperationPayload::ConnectorWriteLifecycle(
+                    novarocks_frontend::dml::model::ConnectorWriteLifecycleRecord::Pending,
+                ),
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,
@@ -416,10 +424,10 @@ impl OperationJournal for FakeJournal {
             .get_mut(operation_id.as_uuid())
             .expect("fake operation");
         operation.state = fact.state;
-        operation.commit_outcome = fact.commit_outcome;
-        operation.cleanup_outcome = fact.cleanup_outcome;
-        operation.recovery_evidence = fact.recovery_evidence;
-        operation.failure = fact.failure;
+        operation.payload =
+            novarocks_frontend::dml::model::OperationPayload::ConnectorWriteLifecycle(
+                fact.lifecycle,
+            );
         operation.revision += 1;
         Ok(())
     }
@@ -447,6 +455,25 @@ impl OperationJournal for FakeJournal {
             .cloned()
             .collect())
     }
+}
+
+fn test_receipt(bytes: &'static [u8]) -> ConnectorWriteReceipt {
+    ConnectorWriteReceipt::try_new(Bytes::from_static(bytes)).expect("test receipt")
+}
+
+fn test_evidence() -> ExternalMutationEvidence {
+    ExternalMutationEvidence::try_new(
+        1,
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
+        },
+        ConnectorInstanceIncarnation::from_bytes([1; 16]),
+        ConnectorMutationOperationId::from_bytes([2; 16]),
+        "test-insert",
+        Bytes::from_static(b"opaque-evidence"),
+    )
+    .expect("test evidence")
 }
 
 fn column(name: &str, nullable: bool) -> ColumnDef {
@@ -709,12 +736,17 @@ fn branch_insert_journals_the_prepared_branch_base_snapshot() {
     assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
     assert_eq!(operation.base_snapshot_id, Some(10));
     assert_eq!(operation.state, OperationState::Finalized);
+    let novarocks_frontend::dml::model::OperationPayload::ConnectorWriteLifecycle(
+        novarocks_frontend::dml::ConnectorWriteLifecycleRecord::KnownCommitted {
+            receipt_wire, ..
+        },
+    ) = operation.payload
+    else {
+        panic!("expected a provider-neutral commit receipt");
+    };
     assert_eq!(
-        operation
-            .commit_outcome
-            .as_ref()
-            .map(|outcome| outcome.snapshot_id),
-        Some(11)
+        receipt_wire.try_decode().expect("decode receipt"),
+        test_receipt(b"commit-success")
     );
 }
 
@@ -736,7 +768,7 @@ fn iceberg_without_journal_fails_before_prepare() {
 }
 
 #[test]
-fn iceberg_append_empty_records_aborted_noop() {
+fn iceberg_append_empty_records_known_empty_terminal_fact() {
     let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::FilelessOutput);
     let journal = Arc::new(FakeJournal::default());
@@ -745,7 +777,7 @@ fn iceberg_append_empty_records_aborted_noop() {
     service(Some(Arc::clone(&journal)), statistics)
         .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
         .unwrap();
-    assert_eq!(journal.states(), vec![OperationState::Aborted]);
+    assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert!(!engine.calls().contains(&Call::Commit));
     assert!(!engine.calls().contains(&Call::Finalize));
 }
@@ -870,7 +902,7 @@ fn writer_abort_is_recorded_without_commit() {
     let error = service(Some(Arc::clone(&journal)), statistics)
         .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
         .unwrap_err();
-    assert!(error.to_string().contains("aborted before commit"));
+    assert!(error.to_string().contains("writer aborted"));
     assert!(!engine.calls().contains(&Call::Commit));
     assert_eq!(
         journal.states(),

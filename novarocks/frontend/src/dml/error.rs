@@ -17,7 +17,9 @@
 
 use std::fmt;
 
-use crate::dml::model::{CommitOutcome, DmlOperationId, StatementNextAction};
+use novarocks_spi::connector::ConnectorWriteReceipt;
+
+use crate::dml::model::{DmlOperationId, StatementNextAction};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmlErrorKind {
@@ -36,7 +38,7 @@ pub struct DmlError {
     message: String,
     operation_id: Option<DmlOperationId>,
     next_action: Option<StatementNextAction>,
-    committed_outcome: Option<CommitOutcome>,
+    committed_receipt: Option<ConnectorWriteReceipt>,
 }
 
 impl DmlError {
@@ -46,7 +48,7 @@ impl DmlError {
             message: error.to_string(),
             operation_id: None,
             next_action: None,
-            committed_outcome: None,
+            committed_receipt: None,
         }
     }
 
@@ -82,7 +84,7 @@ impl DmlError {
 
     pub(crate) fn committed_but_unfinalized(
         operation_id: DmlOperationId,
-        committed_outcome: Option<CommitOutcome>,
+        committed_receipt: Option<ConnectorWriteReceipt>,
         error: impl fmt::Display,
     ) -> Self {
         Self {
@@ -90,7 +92,7 @@ impl DmlError {
             message: format!("{error}; do not retry commit"),
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::RetryFinalize),
-            committed_outcome,
+            committed_receipt,
         }
     }
 
@@ -111,8 +113,8 @@ impl DmlError {
         self.next_action
     }
 
-    pub const fn committed_outcome(&self) -> Option<&CommitOutcome> {
-        self.committed_outcome.as_ref()
+    pub const fn committed_receipt(&self) -> Option<&ConnectorWriteReceipt> {
+        self.committed_receipt.as_ref()
     }
 }
 
@@ -125,12 +127,8 @@ impl fmt::Display for DmlError {
         if let Some(next_action) = self.next_action {
             write!(formatter, " (next action {next_action:?})")?;
         }
-        if let Some(outcome) = &self.committed_outcome {
-            write!(
-                formatter,
-                " (known committed snapshot {})",
-                outcome.new_snapshot_id
-            )?;
+        if self.committed_receipt.is_some() {
+            write!(formatter, " (known committed connector write)")?;
         }
         Ok(())
     }

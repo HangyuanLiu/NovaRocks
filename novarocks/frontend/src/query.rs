@@ -1301,7 +1301,7 @@ mod tests {
     use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_catalog::schema::ColumnDef;
 
-    use crate::dml::{CommitOutcome, CommitServiceError};
+    use novarocks::connector::iceberg::commit::{CommitOutcome, CommitServiceError};
 
     #[derive(Default)]
     struct RecordingCoreCommand {

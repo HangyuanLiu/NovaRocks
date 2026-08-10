@@ -332,6 +332,7 @@ impl ConnectorDistributedRewriteSession {
             None
         } else {
             lease.activate_rewrite(&plan)?;
+            let write_lease = lease.derive_write_lease()?;
             let templates = plan
                 .cohorts()
                 .iter()
@@ -339,11 +340,9 @@ impl ConnectorDistributedRewriteSession {
                     ConnectorWritePlanningTemplate::new_in_cohort(
                         plan.operation_id(),
                         cohort.cohort_id(),
-                        plan.target().clone(),
-                        cohort.intent(),
-                        cohort.input_schema().clone(),
-                        cohort.provider_payload().clone(),
+                        cohort.preparation().clone(),
                         context.clone(),
+                        write_lease.clone(),
                     )
                 })
                 .collect();
@@ -351,7 +350,7 @@ impl ConnectorDistributedRewriteSession {
                 .map_err(|error| invalid(format!("register rewrite cohorts: {error}")))?;
             Some(ConnectorWriteOperationSession::try_begin(
                 registration,
-                lease.derive_write_lease()?,
+                write_lease,
             )?)
         };
 
@@ -647,8 +646,10 @@ mod tests {
         ConnectorDistributedRewritePlanningRequest, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
-        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteCohortId, ConnectorWriteControl,
-        ConnectorWritePlan, ConnectorWritePlanningRequest,
+        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteBaseVersion,
+        ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
+        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
     };
 
     use super::*;
@@ -667,6 +668,33 @@ mod tests {
             Arc::new(NeverCancelled),
             1024,
             4096,
+        )
+        .unwrap()
+    }
+
+    fn preparation(
+        owner: ConnectorExecutionBindingKey,
+        table: ConnectorTableHandle,
+        schema: &arrow::datatypes::SchemaRef,
+    ) -> ConnectorWritePreparation {
+        let fields = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([index as u8 + 1; 32]),
+                    field.as_ref().clone(),
+                )
+            })
+            .collect();
+        ConnectorWritePreparation::try_new(
+            owner,
+            table,
+            ConnectorWriteIntent::Overwrite,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap(),
+            ConnectorWriteInputShape::Data { fields },
+            Bytes::from_static(b"prepared"),
         )
         .unwrap()
     }
@@ -870,10 +898,9 @@ mod tests {
                 ConnectorDistributedRewriteCohortPlan::try_new(
                     ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
                     table.clone(),
-                    novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
                     schema.clone(),
                     [3; 32],
-                    Bytes::from_static(b"group"),
+                    preparation(key.clone(), table.clone(), &schema),
                     digest,
                 )
                 .unwrap()

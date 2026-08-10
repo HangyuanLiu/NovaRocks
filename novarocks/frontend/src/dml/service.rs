@@ -119,10 +119,7 @@ mod tests {
 
     use super::DmlService;
     use crate::dml::journal::testing::InMemoryOperationJournal;
-    use crate::dml::model::{
-        CommitOpKind, CommitOutcome, CommitServiceError, OperationKind, OperationState,
-        OperationTarget, WriteTransactionSpec,
-    };
+    use crate::dml::model::{OperationKind, OperationState, OperationTarget, WriteTransactionSpec};
     use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
 
     struct OkExecutor;
@@ -142,7 +139,7 @@ mod tests {
             &self,
             _spec: &WriteTransactionSpec,
             handle: &Self::AbortHandle,
-        ) -> Result<CommitOutcome, CommitServiceError> {
+        ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
             match *handle {}
         }
 
@@ -150,11 +147,22 @@ mod tests {
             &self,
             _spec: &WriteTransactionSpec,
             _handle: &(),
-        ) -> Result<CommitOutcome, CommitServiceError> {
-            Ok(CommitOutcome {
-                new_snapshot_id: 7,
-                written_manifest_paths: vec![],
-            })
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+            String,
+        > {
+            Ok(
+                novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted {
+                    effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
+                    receipt: novarocks_spi::connector::ConnectorWriteReceipt::try_new(
+                        bytes::Bytes::from_static(b"test-receipt"),
+                    )
+                    .expect("receipt"),
+                    finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                },
+            )
         }
 
         fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
@@ -172,7 +180,6 @@ mod tests {
             },
             operation_kind: OperationKind::InsertAppend,
             operation_subkind: None,
-            commit_op_kind: CommitOpKind::FastAppend,
             attempt_id: "a".to_string(),
             base_snapshot_id: None,
             base_snapshot_map: BTreeMap::new(),

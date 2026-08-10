@@ -29,7 +29,7 @@ use super::{
     ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
     ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
     ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorViewMetadata,
-    ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -753,7 +753,6 @@ pub trait ConnectorControlRegistry:
     + ConnectorMetadataMaintenanceResolver
     + ConnectorDistributedRewriteResolver
     + ConnectorCleanupMaintenanceResolver
-    + ConnectorWriteResolver
     + ConnectorStatisticsResolver
 {
     fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError>;

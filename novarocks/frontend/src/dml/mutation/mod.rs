@@ -28,9 +28,7 @@ use novarocks::query_execution::request_context::RequestContext;
 use novarocks::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
-use crate::dml::model::{
-    CommitOutcome, CommitServiceError, OperationKind, OperationTarget, WriteTransactionSpec,
-};
+use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
 use crate::dml::service::DmlService;
 
@@ -62,18 +60,23 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
         &self,
         _spec: &WriteTransactionSpec,
         handle: &Self::AbortHandle,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
         self.engine
-            .abort_mutation(self.prepared.handle.as_ref(), handle.as_ref())
+            .abort_mutation_terminal(self.prepared.handle.as_ref(), handle.as_ref())
     }
 
     fn commit(
         &self,
         _spec: &WriteTransactionSpec,
         handle: &Self::CommitHandle,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
         self.engine
-            .commit_mutation(self.prepared.handle.as_ref(), handle.as_ref())
+            .commit_mutation_terminal(self.prepared.handle.as_ref(), handle.as_ref())
     }
 
     fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
@@ -92,7 +95,6 @@ fn write_transaction_spec(prepared: &PreparedMutation, subkind: &str) -> WriteTr
         },
         operation_kind: OperationKind::RowDelta,
         operation_subkind: Some(subkind.to_string()),
-        commit_op_kind: operation.journal_commit_kind,
         attempt_id: operation.attempt_id.clone(),
         base_snapshot_id: operation.base_snapshot_id,
         base_snapshot_map: BTreeMap::new(),
@@ -196,7 +198,7 @@ mod tests {
     use super::*;
     use crate::dml::OperationJournal;
     use crate::dml::journal::testing::InMemoryOperationJournal;
-    use crate::dml::model::{CommitOpKind, CommitOutcome, CommitServiceError, OperationState};
+    use crate::dml::model::OperationState;
 
     struct TestPrepared;
 
@@ -225,7 +227,6 @@ mod tests {
                     table: "t".to_string(),
                     target_ref: "main".to_string(),
                     attempt_id: "mutation-test".to_string(),
-                    journal_commit_kind: CommitOpKind::RowDelta,
                     base_snapshot_id: Some(7),
                 },
                 handle: Arc::new(TestPrepared),
@@ -239,22 +240,6 @@ mod tests {
             assert_eq!(self.journal.list_operations().unwrap().len(), 1);
             self.events.lock().expect("events").push("stage");
             Ok(MutationStageOutcome::NoOp)
-        }
-
-        fn abort_mutation(
-            &self,
-            _prepared: &dyn MutationPrepared,
-            _abort: &dyn MutationAbort,
-        ) -> Result<CommitOutcome, CommitServiceError> {
-            unreachable!("no-op mutation must not abort")
-        }
-
-        fn commit_mutation(
-            &self,
-            _prepared: &dyn MutationPrepared,
-            _commit: &dyn MutationCommit,
-        ) -> Result<CommitOutcome, CommitServiceError> {
-            unreachable!("no-op mutation must not commit")
         }
 
         fn finalize_mutation(&self, _prepared: &dyn MutationPrepared) -> Result<(), String> {
@@ -293,7 +278,7 @@ mod tests {
         assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
         let record = journal.list_operations().unwrap().pop().unwrap();
         assert_eq!(record.operation_subkind.as_deref(), Some("UPDATE"));
-        assert_eq!(record.state, OperationState::Aborted);
+        assert_eq!(record.state, OperationState::Finalized);
     }
 
     #[test]
@@ -319,6 +304,6 @@ mod tests {
         assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
         let record = journal.list_operations().unwrap().pop().unwrap();
         assert_eq!(record.operation_subkind.as_deref(), Some("MERGE"));
-        assert_eq!(record.state, OperationState::Aborted);
+        assert_eq!(record.state, OperationState::Finalized);
     }
 }

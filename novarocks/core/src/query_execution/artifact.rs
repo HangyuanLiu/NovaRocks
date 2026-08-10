@@ -2139,17 +2139,19 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
         ConnectorRequestContext, ConnectorSplit, ConnectorTableHandle, ConnectorWriteAbortOutcome,
-        ConnectorWriteAbortRequest, ConnectorWriteCommitRequest, ConnectorWriteControl,
-        ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationId,
-        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
-        ConnectorWriteReconcileRequest, ConnectorWriterHandle,
+        ConnectorWriteAbortRequest, ConnectorWriteBaseVersion, ConnectorWriteCommitRequest,
+        ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteLease,
+        ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
+        ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
+        ConnectorWriterHandle,
     };
 
     use super::{
@@ -2469,12 +2471,26 @@ mod tests {
                         query_id_bytes,
                         execution_id.attempt_id().get(),
                     ),
-                    table: ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::new())
+                    preparation: ConnectorWritePreparation::try_new(
+                        owner.clone(),
+                        ConnectorTableHandle::try_new(
+                            owner.instance_id.clone(),
+                            Bytes::from_static(b"test-table"),
+                        )
                         .expect("valid table"),
-                    intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
-                    input_schema: Arc::new(Schema::empty()),
+                        novarocks_spi::connector::ConnectorWriteIntent::Append,
+                        ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"test-base"))
+                            .expect("valid base version"),
+                        ConnectorWriteInputShape::Data {
+                            fields: vec![ConnectorWriteFieldBinding::new(
+                                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                                Field::new("value", DataType::Int64, false),
+                            )],
+                        },
+                        Bytes::from_static(b"test-preparation"),
+                    )
+                    .expect("valid preparation"),
                     expected_writers: Vec::new(),
-                    provider_payload: Bytes::new(),
                     context: ConnectorRequestContext::try_new(
                         Instant::now() + Duration::from_secs(1),
                         Arc::new(NeverCancelled),

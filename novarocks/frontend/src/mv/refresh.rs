@@ -311,7 +311,7 @@ fn execute_data_refresh(
     let cohort_id = write.write_cohort_id();
     let session = dependencies
         .query_execution
-        .begin_write_operation_with_lease(write.registration(), write_lease)
+        .begin_write_operation(write.registration(), write_lease)
         .map_err(|error| invalid(error.to_string()))?;
     let registration = ConnectorWriteExecutionRegistration::try_new(session, cohort_id)
         .map_err(|error| invalid(error.to_string()))?;

@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
     ConnectorMetadataMaintenanceResolver, ConnectorProviderId, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorStatisticsResolver, ConnectorWriteLease,
 };
 
 /// FE process owner of logical Connector control generations. It contains no
@@ -938,15 +938,6 @@ impl ConnectorDistributedRewriteResolver for ConnectorControlHost {
         key: &ConnectorExecutionBindingKey,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
         Self::acquire_exact_distributed_rewrite(self, key)
-    }
-}
-
-impl ConnectorWriteResolver for ConnectorControlHost {
-    fn acquire_current_write(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorWriteLease, ConnectorError> {
-        self.acquire_write(instance_id)
     }
 }
 

@@ -923,54 +923,6 @@ fn test_distributed_rewrite_lease(
 }
 
 #[cfg(test)]
-impl novarocks_spi::connector::ConnectorWriteResolver for TestConnectorControlRegistry {
-    fn acquire_current_write(
-        &self,
-        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorWriteLease,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let binding = self
-            .active
-            .lock()
-            .map_err(|_| {
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Internal,
-                    "test connector control registry lock poisoned",
-                )
-            })?
-            .get(instance_id)
-            .cloned()
-            .ok_or_else(|| {
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
-                    format!(
-                        "connector control instance `{}` has no active write binding",
-                        instance_id.as_str()
-                    ),
-                )
-            })?;
-        let write = binding.write().cloned().ok_or_else(|| {
-            novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "test connector control binding has no distributed write capability",
-            )
-        })?;
-        let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
-            instance_id: binding.descriptor().instance_id.clone(),
-            incarnation: binding.incarnation(),
-        };
-        novarocks_spi::connector::ConnectorWriteLease::new_with_execution_distribution(
-            key,
-            write,
-            binding.execution_distribution().clone(),
-            || {},
-        )
-    }
-}
-
-#[cfg(test)]
 impl novarocks_spi::connector::ConnectorStatisticsResolver for TestConnectorControlRegistry {
     fn acquire_current_statistics(
         &self,
@@ -1083,26 +1035,11 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
     fn begin_write_operation(
         &self,
         registration: crate::query_execution::contract::ConnectorWriteOperationRegistration,
+        lease: novarocks_spi::connector::ConnectorWriteLease,
     ) -> Result<
         crate::query_execution::write_operation::ConnectorWriteOperationSession,
         crate::query_execution::contract::DistributedQueryError,
     > {
-        let Some(connector_control) = &self.connector_control else {
-            return Err(
-                crate::query_execution::contract::DistributedQueryError::new(
-                    crate::query_execution::contract::DistributedQueryErrorKind::Rejected,
-                    "distributed query coordinator has no connector write operation service",
-                ),
-            );
-        };
-        let lease = connector_control
-            .acquire_current_write(registration.connector_instance_id())
-            .map_err(|error| {
-                crate::query_execution::contract::DistributedQueryError::new(
-                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                    format!("acquire test connector write operation lease: {error}"),
-                )
-            })?;
         crate::query_execution::write_operation::ConnectorWriteOperationSession::try_begin(
             registration,
             lease,
@@ -4793,6 +4730,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         &prepared,
     )?;
     let cohort_id = connector_write.cohort_id();
+    let exact_lease = connector_write.lease();
     PreparedDistributedWriteRequest::new(
         prepared,
         native_bundle,
@@ -4801,6 +4739,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
             connector_write,
         ),
         cohort_id,
+        exact_lease,
     )
     .map_err(|error| error.to_string())
 }
@@ -5073,12 +5012,14 @@ fn prepare_distributed_write_request_with_execution(
         return Err("prepared connector write requires an unsealed write template".to_string());
     };
     let cohort_id = template.cohort_id();
+    let exact_lease = template.lease();
     PreparedDistributedWriteRequest::new(
         prepared,
         native_bundle,
         query_options,
         crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
         cohort_id,
+        exact_lease,
     )
     .map_err(|error| error.to_string())
 }
@@ -5110,7 +5051,7 @@ pub(crate) fn bind_prepared_distributed_write_request(
 ) -> Result<BoundDistributedWriteBinding, String> {
     let cohort_id = prepared.write_cohort_id();
     let session = query_execution
-        .begin_write_operation(prepared.registration())
+        .begin_write_operation(prepared.registration(), prepared.lease())
         .map_err(|error| error.to_string())?;
     let registration =
         match crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
@@ -5525,11 +5466,13 @@ fn execute_distributed_write_with_execution(
     let request = match connector_write {
         Some(DistributedConnectorWrite::Begin(template)) => {
             let cohort_id = template.cohort_id();
+            let exact_lease = template.lease();
             let session = query_execution
                 .begin_write_operation(
                     crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
                         template,
                     ),
+                    exact_lease,
                 )
                 .map_err(|error| error.to_string())?;
             let registration =
@@ -9068,123 +9011,12 @@ path = "meta/operations.sqlite"
         drop(engine);
     }
 
-    #[allow(dead_code)]
-    fn test_iceberg_write_sink_spec()
-    -> crate::connector::iceberg::write_contract::IcebergWriteSinkSpec {
-        crate::connector::iceberg::write_contract::IcebergWriteSinkSpec {
-            mode: crate::connector::iceberg::write_contract::IcebergWriteSinkMode::Data,
-            iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo {
-                catalog: "test_catalog".to_string(),
-                namespace: "test_db".to_string(),
-                table: "target_orders".to_string(),
-                table_uuid: Some("00000000-0000-0000-0000-000000000002".to_string()),
-                current_snapshot_id: Some(1),
-                schema_id: 1,
-                location: "file:///warehouse/target_orders".to_string(),
-                schema: novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
-                    fields: vec![
-                        novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                            field_id: 1,
-                            name: "id".to_string(),
-                            initial_default: None,
-                            write_default: None,
-                            initial_default_json: None,
-                            write_default_json: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                },
-                serialized_metadata: None,
-                serialized_metadata_rows: None,
-            },
-            target_columns: vec![novarocks_catalog::schema::ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }],
-            table_location: "file:///warehouse/target_orders".to_string(),
-            data_location: "file:///warehouse/target_orders/data".to_string(),
-            target_partition_spec_id: 0,
-            cloud_properties: BTreeMap::new(),
-            file_format: "parquet".to_string(),
-            compression:
-                crate::connector::iceberg::write_contract::IcebergWriteFileCompression::Snappy,
-            position_delete_output_descriptor: None,
-        }
-    }
-
     fn test_sql_write_plan_input(
-        bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+        _bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     ) -> crate::sql::planner::distributed::write::contract::SqlWritePlanInput {
-        use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingKey};
-        use crate::sql::catalog::ResolvedAnalyzerTable;
-        use crate::sql::planner::distributed::write::contract::{
-            ConnectorWriteInputBinding, SqlWritePartitionContract, SqlWriteSinkContract,
-            SqlWriteSinkMode, SqlWriteSinkTargetContract, SqlWriteTargetField,
-        };
-        use crate::sql::planner::table::{TableDef, test_sql_scan_source};
-
-        let column = novarocks_catalog::schema::ColumnDef {
-            name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        };
-        let binding = bindings
-            .resolve_or_insert_with_id(
-                QueryTableBindingKey::strict_base("test_catalog", "test_db", "target_orders"),
-                |binding| {
-                    Ok(QueryTableBinding::local(
-                        ResolvedAnalyzerTable::from_planner(
-                            Some("test_catalog"),
-                            "test_db",
-                            TableDef {
-                                name: "target_orders".to_string(),
-                                columns: vec![column.clone()],
-                                iceberg_row_lineage_metadata_columns: Vec::new(),
-                                source: test_sql_scan_source(
-                                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
-                                ),
-                            },
-                        ),
-                        binding,
-                    ))
-                },
-            )
-            .expect("test SQL write binding");
-        let target = SqlWriteSinkTargetContract::try_new(
-            binding,
-            crate::sql::planner::table::SqlTableIdentity {
-                catalog: "test_catalog".to_string(),
-                namespace: "test_db".to_string(),
-                table: "target_orders".to_string(),
-            },
-            Some(1),
-            vec![SqlWriteTargetField {
-                field_id: 1,
-                column: column.clone(),
-                is_hidden: false,
-            }],
-            SqlWritePartitionContract {
-                spec_id: 0,
-                fields: Vec::new(),
-            },
+        crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+            crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )
-        .expect("test SQL write target");
-        crate::sql::planner::distributed::write::contract::SqlWritePlanInput {
-            contract: SqlWriteSinkContract::try_new(
-                SqlWriteSinkMode::Data,
-                target,
-                vec![column],
-                None,
-            )
-            .expect("test SQL write contract"),
-            input: ConnectorWriteInputBinding::RootOutputByOrdinal,
-            root_output_exprs: None,
-        }
     }
 
     fn single_bucket_partition_metadata_json() -> String {

@@ -16,6 +16,7 @@
 // under the License.
 
 //! Provider-neutral distributed writer contract.
+//! Design: ADR-0044 (docs/adr/ADR-0044-connector-write-admission-and-terminal-facts.md)
 //!
 //! The frontend owns planning and external commit state. Backend execution
 //! bindings can only stage Arrow batches and return bounded opaque reports.
@@ -23,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -227,22 +228,328 @@ pub enum ConnectorWriteIntent {
     RowDelta,
 }
 
+/// The application semantic purpose presented to Provider write admission.
+/// It is separate from the physical write intent so a managed target can deny
+/// ordinary DML without granting a generic bypass to callers.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ConnectorWriteAdmissionPurpose {
+    OrdinaryDml,
+    MaterializedViewRefresh,
+}
+
+/// A provider-issued, preparation-local field identity. It is intentionally
+/// neither a catalog field ID nor a table-format source ID.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorWriteFieldToken([u8; 32]);
+
+impl ConnectorWriteFieldToken {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectorWriteFieldRequest {
+    field: Field,
+}
+
+impl ConnectorWriteFieldRequest {
+    pub fn new(field: Field) -> Self {
+        Self { field }
+    }
+
+    pub fn field(&self) -> &Field {
+        &self.field
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectorWriteFieldBinding {
+    token: ConnectorWriteFieldToken,
+    field: Field,
+}
+
+impl ConnectorWriteFieldBinding {
+    pub fn new(token: ConnectorWriteFieldToken, field: Field) -> Self {
+        Self { token, field }
+    }
+
+    pub const fn token(&self) -> ConnectorWriteFieldToken {
+        self.token
+    }
+
+    pub fn field(&self) -> &Field {
+        &self.field
+    }
+}
+
+/// SQL-owned input requirements submitted to the Provider during admission.
+/// Each variant contains the entire required set so callers cannot represent a
+/// row-delete mode with a missing descriptor or a conflicting optional field.
+#[derive(Clone, Debug)]
+pub enum ConnectorWriteInputRequest {
+    Data {
+        fields: Vec<ConnectorWriteFieldRequest>,
+    },
+    RowLineage {
+        data_fields: Vec<ConnectorWriteFieldRequest>,
+        row_identity_fields: Vec<ConnectorWriteFieldRequest>,
+    },
+    PositionDelete {
+        identity_fields: Vec<ConnectorWriteFieldRequest>,
+        partition_source_fields: Vec<ConnectorWriteFieldRequest>,
+    },
+    DeletionVector {
+        identity_fields: Vec<ConnectorWriteFieldRequest>,
+        partition_source_fields: Vec<ConnectorWriteFieldRequest>,
+    },
+    EqualityDelete {
+        equality_fields: Vec<ConnectorWriteFieldRequest>,
+    },
+}
+
+/// Provider-signed counterpart to [`ConnectorWriteInputRequest`].
+#[derive(Clone, Debug)]
+pub enum ConnectorWriteInputShape {
+    Data {
+        fields: Vec<ConnectorWriteFieldBinding>,
+    },
+    RowLineage {
+        data_fields: Vec<ConnectorWriteFieldBinding>,
+        row_identity_fields: Vec<ConnectorWriteFieldBinding>,
+    },
+    PositionDelete {
+        identity_fields: Vec<ConnectorWriteFieldBinding>,
+        partition_source_fields: Vec<ConnectorWriteFieldBinding>,
+    },
+    DeletionVector {
+        identity_fields: Vec<ConnectorWriteFieldBinding>,
+        partition_source_fields: Vec<ConnectorWriteFieldBinding>,
+    },
+    EqualityDelete {
+        equality_fields: Vec<ConnectorWriteFieldBinding>,
+    },
+}
+
+impl ConnectorWriteInputShape {
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        let mut tokens = HashSet::new();
+        let mut names = HashSet::new();
+        let fields: Vec<&ConnectorWriteFieldBinding> = match self {
+            Self::Data { fields } => fields.iter().collect(),
+            Self::RowLineage {
+                data_fields,
+                row_identity_fields,
+            } => data_fields.iter().chain(row_identity_fields).collect(),
+            Self::PositionDelete {
+                identity_fields,
+                partition_source_fields,
+            }
+            | Self::DeletionVector {
+                identity_fields,
+                partition_source_fields,
+            } => identity_fields
+                .iter()
+                .chain(partition_source_fields)
+                .collect(),
+            Self::EqualityDelete { equality_fields } => equality_fields.iter().collect(),
+        };
+        if fields.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write input shape must contain at least one field",
+            ));
+        }
+        for binding in fields {
+            if !tokens.insert(binding.token) || !names.insert(binding.field.name().to_owned()) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector write input shape contains a duplicate field token or name",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn fields(&self) -> Vec<&ConnectorWriteFieldBinding> {
+        match self {
+            Self::Data { fields } => fields.iter().collect(),
+            Self::RowLineage {
+                data_fields,
+                row_identity_fields,
+            } => data_fields.iter().chain(row_identity_fields).collect(),
+            Self::PositionDelete {
+                identity_fields,
+                partition_source_fields,
+            }
+            | Self::DeletionVector {
+                identity_fields,
+                partition_source_fields,
+            } => identity_fields
+                .iter()
+                .chain(partition_source_fields)
+                .collect(),
+            Self::EqualityDelete { equality_fields } => equality_fields.iter().collect(),
+        }
+    }
+}
+
+/// Opaque provider version captured during write admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorWriteBaseVersion {
+    payload: Bytes,
+    digest: [u8; 32],
+}
+
+impl ConnectorWriteBaseVersion {
+    pub fn try_new(payload: Bytes) -> Result<Self, ConnectorError> {
+        validate_handle_payload(&payload)?;
+        Ok(Self {
+            digest: sha256(&payload),
+            payload,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        validate_handle_payload(&self.payload)?;
+        if self.digest != sha256(&self.payload) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write base version digest does not match its payload",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectorWritePreparationRequest {
+    pub table: ConnectorTableHandle,
+    pub intent: ConnectorWriteIntent,
+    pub purpose: ConnectorWriteAdmissionPurpose,
+    pub input: ConnectorWriteInputRequest,
+    pub context: ConnectorRequestContext,
+}
+
+impl ConnectorWritePreparationRequest {
+    pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+        if self.table.owner() != &owner.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write preparation table does not match the exact control owner",
+            ));
+        }
+        validate_input_request(&self.input)
+    }
+}
+
+/// A sealed Provider admission result. The handle and base version are opaque
+/// to application callers; only the provider may interpret them.
+#[derive(Clone)]
+pub struct ConnectorWritePreparation {
+    owner: ConnectorExecutionBindingKey,
+    table: ConnectorTableHandle,
+    intent: ConnectorWriteIntent,
+    base_version: ConnectorWriteBaseVersion,
+    input: ConnectorWriteInputShape,
+    payload: Bytes,
+    digest: [u8; 32],
+}
+
+impl ConnectorWritePreparation {
+    pub fn try_new(
+        owner: ConnectorExecutionBindingKey,
+        table: ConnectorTableHandle,
+        intent: ConnectorWriteIntent,
+        base_version: ConnectorWriteBaseVersion,
+        input: ConnectorWriteInputShape,
+        payload: Bytes,
+    ) -> Result<Self, ConnectorError> {
+        if table.owner() != &owner.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write preparation table does not match its owner",
+            ));
+        }
+        base_version.validate()?;
+        input.validate()?;
+        validate_handle_payload(&payload)?;
+        let digest = preparation_digest(&owner, &table, intent, &base_version, &input, &payload);
+        Ok(Self {
+            owner,
+            table,
+            intent,
+            base_version,
+            input,
+            payload,
+            digest,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        let expected = Self::try_new(
+            self.owner.clone(),
+            self.table.clone(),
+            self.intent,
+            self.base_version.clone(),
+            self.input.clone(),
+            self.payload.clone(),
+        )?;
+        if expected.digest != self.digest {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write preparation digest does not match its contents",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
+    }
+    pub fn table(&self) -> &ConnectorTableHandle {
+        &self.table
+    }
+    pub const fn intent(&self) -> ConnectorWriteIntent {
+        self.intent
+    }
+    pub fn input(&self) -> &ConnectorWriteInputShape {
+        &self.input
+    }
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+#[derive(Clone)]
+pub enum ConnectorWritePreparationOutcome {
+    Prepared(ConnectorWritePreparation),
+    Denied(ConnectorError),
+}
+
 #[derive(Clone)]
 pub struct ConnectorWritePlanningRequest {
     pub operation_id: ConnectorWriteOperationId,
     pub cohort_id: ConnectorWriteCohortId,
     pub execution_id: ConnectorWriteExecutionId,
-    pub table: ConnectorTableHandle,
-    pub intent: ConnectorWriteIntent,
-    pub input_schema: SchemaRef,
+    pub preparation: ConnectorWritePreparation,
     pub expected_writers: Vec<ConnectorWriterIdentity>,
-    pub provider_payload: Bytes,
     pub context: ConnectorRequestContext,
 }
 
 impl ConnectorWritePlanningRequest {
     pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
-        validate_handle_payload(&self.provider_payload)?;
+        self.preparation.validate()?;
+        if self.preparation.owner() != owner {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write planning preparation does not match the exact control owner",
+            ));
+        }
         if self.expected_writers.is_empty() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -275,11 +582,15 @@ impl ConnectorWritePlanningRequest {
         &self,
         owner: &ConnectorExecutionBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
-        validate_handle_payload(&self.provider_payload)?;
-        if self.table.owner() != &owner.instance_id {
+        // This digest is also used while sealing a preparation, before the
+        // placement-frozen writer set exists. Writer validation remains
+        // mandatory in `validate`, which every provider planning request
+        // invokes after `ConnectorWriteManifest::plan` fills that set.
+        self.preparation.validate()?;
+        if self.preparation.owner() != owner {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector write planning table does not match the exact control owner",
+                "connector write planning preparation does not match the exact control owner",
             ));
         }
         let mut hasher = Sha256::new();
@@ -287,14 +598,7 @@ impl ConnectorWritePlanningRequest {
         digest_owner(&mut hasher, owner);
         hasher.update(self.operation_id.to_bytes());
         hasher.update(self.cohort_id.to_bytes());
-        digest_bytes(&mut hasher, self.table.owner().as_str().as_bytes());
-        digest_bytes(&mut hasher, self.table.payload());
-        hasher.update([write_intent_tag(self.intent)]);
-        // Exact-generation replay only compares plans produced by the same
-        // binary. Arrow's structural Debug form covers nested field names,
-        // types, nullability and metadata without introducing a wire codec.
-        digest_bytes(&mut hasher, format!("{:?}", self.input_schema).as_bytes());
-        digest_bytes(&mut hasher, &self.provider_payload);
+        hasher.update(self.preparation.digest());
         Ok(hasher.finalize().into())
     }
 }
@@ -808,6 +1112,147 @@ impl ConnectorWriteReceipt {
     pub const fn resulting_row_count(&self) -> Option<u64> {
         self.resulting_row_count
     }
+
+    /// Stable durable form for application journals. The provider payload is
+    /// carried opaquely and never decoded outside the provider.
+    pub fn try_to_wire_v1(&self) -> Result<Bytes, ConnectorError> {
+        self.validate()?;
+        const MAGIC: &[u8; 4] = b"CWR1";
+        let payload_len = u32::try_from(self.payload.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector write receipt exceeds wire bound",
+            )
+        })?;
+        let version = self.committed_version.as_ref();
+        let version_payload = version.map_or(&[][..], |value| value.payload().as_ref());
+        let version_len = u32::try_from(version_payload.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector committed version exceeds wire bound",
+            )
+        })?;
+        let mut encoded = Vec::with_capacity(
+            4 + 4 + self.payload.len() + 1 + 4 + version_payload.len() + 1 + 8 + 1 + 8,
+        );
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(&payload_len.to_be_bytes());
+        encoded.extend_from_slice(self.payload.as_ref());
+        encoded.push(u8::from(version.is_some()));
+        if let Some(version) = version {
+            encoded.extend_from_slice(&version_len.to_be_bytes());
+            encoded.extend_from_slice(version_payload);
+            match version.snapshot_id() {
+                Some(snapshot_id) => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(&snapshot_id.to_be_bytes());
+                }
+                None => encoded.push(0),
+            }
+        }
+        match self.resulting_row_count {
+            Some(count) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&count.to_be_bytes());
+            }
+            None => encoded.push(0),
+        }
+        Ok(Bytes::from(encoded))
+    }
+
+    pub fn try_from_wire_v1(bytes: &[u8]) -> Result<Self, ConnectorError> {
+        const MAGIC: &[u8; 4] = b"CWR1";
+        let mut offset = 0usize;
+        let read = |offset: &mut usize, len: usize| -> Result<&[u8], ConnectorError> {
+            let end = offset.checked_add(len).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "connector write receipt wire overflow",
+                )
+            })?;
+            let value = bytes.get(*offset..end).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "truncated connector write receipt wire",
+                )
+            })?;
+            *offset = end;
+            Ok(value)
+        };
+        if read(&mut offset, 4)? != MAGIC {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "unsupported connector write receipt wire version",
+            ));
+        }
+        let read_u32 = |offset: &mut usize| -> Result<usize, ConnectorError> {
+            let raw: [u8; 4] = read(offset, 4)?
+                .try_into()
+                .expect("fixed-width receipt length");
+            Ok(u32::from_be_bytes(raw) as usize)
+        };
+        let payload_len = read_u32(&mut offset)?;
+        let payload = Bytes::copy_from_slice(read(&mut offset, payload_len)?);
+        let version = match read(&mut offset, 1)?[0] {
+            0 => None,
+            1 => {
+                let version_len = read_u32(&mut offset)?;
+                let version_payload = Bytes::copy_from_slice(read(&mut offset, version_len)?);
+                let snapshot_id = match read(&mut offset, 1)?[0] {
+                    0 => None,
+                    1 => Some(i64::from_be_bytes(
+                        read(&mut offset, 8)?
+                            .try_into()
+                            .expect("fixed-width receipt snapshot"),
+                    )),
+                    _ => {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "invalid connector write receipt snapshot tag",
+                        ));
+                    }
+                };
+                Some(ConnectorCommittedVersion::try_new(
+                    version_payload,
+                    snapshot_id,
+                )?)
+            }
+            _ => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "invalid connector write receipt version tag",
+                ));
+            }
+        };
+        let row_count = match read(&mut offset, 1)?[0] {
+            0 => None,
+            1 => Some(u64::from_be_bytes(
+                read(&mut offset, 8)?
+                    .try_into()
+                    .expect("fixed-width receipt row count"),
+            )),
+            _ => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "invalid connector write receipt row-count tag",
+                ));
+            }
+        };
+        if offset != bytes.len() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write receipt wire has trailing bytes",
+            ));
+        }
+        match version {
+            Some(version) => Self::try_new_with_committed_facts(payload, version, row_count),
+            None if row_count.is_some() => Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write receipt row count requires a committed version",
+            )),
+            None => Self::try_new(payload),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1181,6 +1626,16 @@ pub enum ConnectorWriteAbortOutcome {
 pub trait ConnectorWriteControl: Send + Sync {
     fn binding_key(&self) -> &ConnectorExecutionBindingKey;
 
+    fn prepare_write(
+        &self,
+        _request: ConnectorWritePreparationRequest,
+    ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement write preparation",
+        ))
+    }
+
     fn plan_write(
         &self,
         request: ConnectorWritePlanningRequest,
@@ -1200,16 +1655,6 @@ pub trait ConnectorWriteControl: Send + Sync {
         &self,
         request: ConnectorWriteReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>;
-}
-
-/// FE-owned resolver for a live write-control generation. The returned lease
-/// keeps that exact generation alive through planning, commit, abort and
-/// reconcile; callers must not replace it with a later current incarnation.
-pub trait ConnectorWriteResolver: Send + Sync {
-    fn acquire_current_write(
-        &self,
-        instance_id: &super::ConnectorInstanceId,
-    ) -> Result<ConnectorWriteLease, ConnectorError>;
 }
 
 #[derive(Clone)]
@@ -1269,6 +1714,13 @@ impl ConnectorWriteLease {
 
     pub fn control(&self) -> &Arc<dyn ConnectorWriteControl> {
         &self.control
+    }
+
+    /// Return whether two leases retain the same provider control generation.
+    /// Clones of one lease compare equal here; independently-derived leases
+    /// compare equal only when they retain the same exact control capability.
+    pub fn retains_same_generation(&self, other: &Self) -> bool {
+        self.binding_key == other.binding_key && Arc::ptr_eq(&self.control, &other.control)
     }
 
     /// Retain metadata from the same control generation as this writer.
@@ -1589,6 +2041,108 @@ fn digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+fn validate_input_request(request: &ConnectorWriteInputRequest) -> Result<(), ConnectorError> {
+    let fields: Vec<&ConnectorWriteFieldRequest> = match request {
+        ConnectorWriteInputRequest::Data { fields } => fields.iter().collect(),
+        ConnectorWriteInputRequest::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } => data_fields.iter().chain(row_identity_fields).collect(),
+        ConnectorWriteInputRequest::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        }
+        | ConnectorWriteInputRequest::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } => identity_fields
+            .iter()
+            .chain(partition_source_fields)
+            .collect(),
+        ConnectorWriteInputRequest::EqualityDelete { equality_fields } => {
+            equality_fields.iter().collect()
+        }
+    };
+    if fields.is_empty() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector write input request must contain at least one field",
+        ));
+    }
+    let mut names = HashSet::new();
+    if fields
+        .iter()
+        .any(|field| !names.insert(field.field.name().to_owned()))
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector write input request contains a duplicate field name",
+        ));
+    }
+    Ok(())
+}
+
+fn preparation_digest(
+    owner: &ConnectorExecutionBindingKey,
+    table: &ConnectorTableHandle,
+    intent: ConnectorWriteIntent,
+    base_version: &ConnectorWriteBaseVersion,
+    input: &ConnectorWriteInputShape,
+    payload: &Bytes,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.connector-write-preparation.v1\0");
+    digest_owner(&mut hasher, owner);
+    digest_bytes(&mut hasher, table.owner().as_str().as_bytes());
+    digest_bytes(&mut hasher, table.payload());
+    hasher.update([write_intent_tag(intent)]);
+    hasher.update(base_version.digest);
+    match input {
+        ConnectorWriteInputShape::Data { fields } => {
+            hasher.update([1]);
+            digest_bound_fields(&mut hasher, fields);
+        }
+        ConnectorWriteInputShape::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } => {
+            hasher.update([2]);
+            digest_bound_fields(&mut hasher, data_fields);
+            digest_bound_fields(&mut hasher, row_identity_fields);
+        }
+        ConnectorWriteInputShape::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        } => {
+            hasher.update([3]);
+            digest_bound_fields(&mut hasher, identity_fields);
+            digest_bound_fields(&mut hasher, partition_source_fields);
+        }
+        ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } => {
+            hasher.update([4]);
+            digest_bound_fields(&mut hasher, identity_fields);
+            digest_bound_fields(&mut hasher, partition_source_fields);
+        }
+        ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
+            hasher.update([5]);
+            digest_bound_fields(&mut hasher, equality_fields);
+        }
+    }
+    digest_bytes(&mut hasher, payload);
+    hasher.finalize().into()
+}
+
+fn digest_bound_fields(hasher: &mut Sha256, fields: &[ConnectorWriteFieldBinding]) {
+    hasher.update((fields.len() as u64).to_be_bytes());
+    for field in fields {
+        hasher.update(field.token.to_bytes());
+        digest_bytes(hasher, format!("{:?}", field.field).as_bytes());
+    }
+}
+
 const fn write_intent_tag(intent: ConnectorWriteIntent) -> u8 {
     match intent {
         ConnectorWriteIntent::Append => 1,
@@ -1615,7 +2169,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field};
 
     use super::*;
     use crate::connector::{
@@ -1731,15 +2285,26 @@ mod tests {
         let table =
             ConnectorTableHandle::try_new(writer.binding_key().instance_id.clone(), Bytes::new())
                 .expect("table handle");
+        let preparation = ConnectorWritePreparation::try_new(
+            owner.clone(),
+            table,
+            ConnectorWriteIntent::Append,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base version"),
+            ConnectorWriteInputShape::Data {
+                fields: vec![ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([7; 32]),
+                    Field::new("x", DataType::Int64, true),
+                )],
+            },
+            Bytes::new(),
+        )
+        .expect("preparation");
         let request = ConnectorWritePlanningRequest {
             operation_id: writer.operation_id(),
             cohort_id: writer.cohort_id(),
             execution_id: writer.execution_id(),
-            table,
-            intent: ConnectorWriteIntent::Append,
-            input_schema: Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            preparation,
             expected_writers: vec![writer],
-            provider_payload: Bytes::new(),
             context: ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(1),
                 Arc::new(NotCancelled),
@@ -1749,6 +2314,64 @@ mod tests {
             .expect("context"),
         };
         request.validate(&owner).expect("exact writer owner");
+    }
+
+    #[test]
+    fn preparation_rejects_foreign_or_duplicate_field_tokens() {
+        let owner = key();
+        let foreign_table = ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("foreign").expect("foreign instance"),
+            Bytes::new(),
+        )
+        .expect("foreign table");
+        let error = ConnectorWritePreparation::try_new(
+            owner.clone(),
+            foreign_table,
+            ConnectorWriteIntent::Append,
+            ConnectorWriteBaseVersion::try_new(Bytes::new()).expect("base"),
+            ConnectorWriteInputShape::Data {
+                fields: vec![ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("x", DataType::Int64, true),
+                )],
+            },
+            Bytes::new(),
+        )
+        .err()
+        .expect("foreign table must fail");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+
+        let shape = ConnectorWriteInputShape::Data {
+            fields: vec![
+                ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("x", DataType::Int64, true),
+                ),
+                ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("y", DataType::Int64, true),
+                ),
+            ],
+        };
+        assert_eq!(
+            shape.validate().expect_err("duplicate token").kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn receipt_wire_round_trips_without_exposing_payload() {
+        let receipt = ConnectorWriteReceipt::try_new_with_committed_facts(
+            Bytes::from_static(b"provider receipt"),
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"version"), Some(7))
+                .expect("version"),
+            Some(13),
+        )
+        .expect("receipt");
+        let decoded =
+            ConnectorWriteReceipt::try_from_wire_v1(&receipt.try_to_wire_v1().expect("wire"))
+                .expect("decode receipt");
+        assert_eq!(decoded, receipt);
     }
 
     #[test]

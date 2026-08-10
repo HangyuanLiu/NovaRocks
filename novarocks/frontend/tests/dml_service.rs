@@ -22,10 +22,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_frontend::dml::{
-    CommitOpKind, CommitOutcome, CommitServiceError, CoordinatedWriteReport, DmlErrorKind,
-    DmlService, IcebergOperationFailureKind, IcebergOperationNextAction, OperationKind,
-    OperationState, OperationTarget, RecoveryEvidence, StateStoreOperationJournal, WriteExecutor,
-    WriteTransactionSpec,
+    CoordinatedWriteReport, DmlErrorKind, DmlService, OperationKind, OperationState,
+    OperationTarget, StateStoreOperationJournal, WriteExecutor, WriteTransactionSpec,
+};
+use novarocks_spi::connector::{
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAbortOutcome,
+    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::{
@@ -50,7 +53,7 @@ impl WriteExecutor for FakeExecutor {
         &self,
         _spec: &WriteTransactionSpec,
         handle: &Self::AbortHandle,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<ConnectorWriteAbortOutcome, String> {
         match *handle {}
     }
 
@@ -58,10 +61,11 @@ impl WriteExecutor for FakeExecutor {
         &self,
         _spec: &WriteTransactionSpec,
         _handle: &(),
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        Ok(CommitOutcome {
-            new_snapshot_id: 555,
-            written_manifest_paths: vec![],
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: receipt(b"commit-555"),
+            finalization: ExternalMutationFinalization::Complete,
         })
     }
 
@@ -87,7 +91,7 @@ impl WriteExecutor for KnownCommittedCommitErrorExecutor {
         &self,
         _spec: &WriteTransactionSpec,
         handle: &Self::AbortHandle,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    ) -> Result<ConnectorWriteAbortOutcome, String> {
         match *handle {}
     }
 
@@ -95,26 +99,21 @@ impl WriteExecutor for KnownCommittedCommitErrorExecutor {
         &self,
         _spec: &WriteTransactionSpec,
         _handle: &(),
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        Err(CommitServiceError::finalize_failed_known_committed(
-            Some(CommitOutcome {
-                new_snapshot_id: 777,
-                written_manifest_paths: vec!["manifest.avro".to_string()],
-            }),
-            "finalize failed inside commit service".to_string(),
-            RecoveryEvidence {
-                table_ident: "cat.ns.tbl".to_string(),
-                op_kind: CommitOpKind::FastAppend,
-                base_snapshot_id: Some(10),
-                base_sequence_number: 11,
-                staging_dir: "/warehouse/staging/attempt-1".to_string(),
-            },
-        ))
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: receipt(b"commit-777"),
+            finalization: ExternalMutationFinalization::Complete,
+        })
     }
 
     fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
-        panic!("runner must not finalize after commit reports a finalize failure")
+        Err("finalize failed after provider commit".to_string())
     }
+}
+
+fn receipt(bytes: &'static [u8]) -> ConnectorWriteReceipt {
+    ConnectorWriteReceipt::try_new(Bytes::from_static(bytes)).expect("test receipt")
 }
 
 async fn open_journal(
@@ -172,7 +171,6 @@ async fn dml_service_commits_over_real_state_store() {
         },
         operation_kind: OperationKind::InsertAppend,
         operation_subkind: None,
-        commit_op_kind: CommitOpKind::FastAppend,
         attempt_id: "attempt-1".to_string(),
         base_snapshot_id: None,
         base_snapshot_map: BTreeMap::new(),
@@ -182,14 +180,13 @@ async fn dml_service_commits_over_real_state_store() {
         .run_write(spec, &FakeExecutor)
         .expect("write succeeds");
     let id = outcome.operation_id.expect("committed operation id");
-    assert_eq!(outcome.committed_snapshot_id, Some(555));
+    assert_eq!(outcome.committed_receipt, Some(receipt(b"commit-555")));
 
     let stored = service
         .load_operation(id)
         .unwrap()
         .expect("operation persisted");
     assert_eq!(stored.state, OperationState::Finalized);
-    assert_eq!(stored.commit_outcome.unwrap().snapshot_id, 555);
     assert!(service.list_unfinished_operations().unwrap().is_empty());
 }
 
@@ -208,7 +205,6 @@ async fn known_committed_commit_error_persists_retry_finalize_fact_over_real_sta
         },
         operation_kind: OperationKind::InsertAppend,
         operation_subkind: None,
-        commit_op_kind: CommitOpKind::FastAppend,
         attempt_id: "attempt-1".to_string(),
         base_snapshot_id: Some(10),
         base_snapshot_map: BTreeMap::new(),
@@ -221,7 +217,7 @@ async fn known_committed_commit_error_persists_retry_finalize_fact_over_real_sta
     assert!(
         error
             .to_string()
-            .contains("finalize failed inside commit service")
+            .contains("post-commit finalization failed")
     );
 
     let stored = service
@@ -231,25 +227,22 @@ async fn known_committed_commit_error_persists_retry_finalize_fact_over_real_sta
         .next()
         .expect("operation persisted");
     assert_eq!(stored.state, OperationState::FinalizeFailedKnownCommitted);
-    let outcome = stored.commit_outcome.expect("commit outcome persisted");
-    assert_eq!(outcome.snapshot_id, 777);
-    assert_eq!(outcome.written_manifest_paths, vec!["manifest.avro"]);
-    let evidence = stored
-        .recovery_evidence
-        .expect("recovery evidence persisted");
-    assert_eq!(evidence.table_ident, "cat.ns.tbl");
-    assert_eq!(evidence.commit_op_kind, "fast_append");
-    assert_eq!(evidence.base_snapshot_id, Some(10));
-    assert_eq!(evidence.base_sequence_number, Some(11));
-    assert_eq!(evidence.staging_dir, "/warehouse/staging/attempt-1");
-    let failure = stored.failure.expect("failure classification persisted");
+    let novarocks_frontend::dml::OperationPayload::ConnectorWriteLifecycle(
+        novarocks_frontend::dml::ConnectorWriteLifecycleRecord::KnownCommitted {
+            receipt_wire,
+            finalization: novarocks_frontend::dml::ConnectorWriteFinalizationRecord::Failed(failure),
+        },
+    ) = stored.payload
+    else {
+        panic!("expected provider-neutral known-committed terminal fact");
+    };
+    assert_eq!(
+        receipt_wire.try_decode().expect("decode receipt"),
+        receipt(b"commit-777")
+    );
     assert_eq!(
         failure.kind,
-        IcebergOperationFailureKind::FinalizeKnownCommitted
+        novarocks_frontend::dml::ConnectorWriteFailureKind::Internal
     );
-    assert_eq!(failure.message, "finalize failed inside commit service");
-    assert_eq!(
-        failure.next_action,
-        IcebergOperationNextAction::RetryFinalize
-    );
+    assert_eq!(failure.message, "finalize failed after provider commit");
 }

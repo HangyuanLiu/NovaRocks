@@ -20,11 +20,10 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::iceberg::commit::CommitOpKind;
-use crate::connector::iceberg::write_contract::IcebergWriteSinkSpec;
 use crate::connector::iceberg::write_control::IcebergFirstRefreshWritePlanPayloadV2;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
+    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::engine::{
     StandaloneState, execute_query_as_iceberg_staging_in_operation_with_connector_context,
@@ -265,7 +264,7 @@ where
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive MV first-refresh test write lease: {error}"))?;
-    let (sink_spec, template) = activate_mv_first_refresh_connector_write(
+    let template = activate_mv_first_refresh_connector_write(
         state,
         &prepared,
         std::collections::BTreeMap::from([
@@ -284,7 +283,7 @@ where
     let registration = ConnectorWriteOperationRegistration::single(template);
     let session = state
         .query_execution
-        .begin_write_operation_with_lease(registration, write_lease)
+        .begin_write_operation(registration, write_lease)
         .map_err(|error| format!("seal MV first-refresh test write operation: {error}"))?;
     let write_registration =
         ConnectorWriteExecutionRegistration::try_new(session, prepared.primary_cohort())
@@ -292,7 +291,6 @@ where
     let (completion, summary) = execute_prepared_mv_first_refresh_staging(
         state,
         prepared,
-        sink_spec,
         planning_lease,
         execution,
         connector_context.clone(),
@@ -337,39 +335,6 @@ where
             format!("MV first-refresh test staging commit remains unknown: {failure}"),
         ),
     }
-}
-
-/// Build the ordinary data-writer sink from the target frozen by the MV
-/// refresh context.  This adapter owns concrete Iceberg table metadata; the
-/// SQL prepared artifact itself remains provider-neutral and contains none of
-/// these catalog handles.
-pub(crate) fn build_mv_first_refresh_sink_spec(
-    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
-) -> Result<IcebergWriteSinkSpec, String> {
-    let target = crate::engine::backend_resolver::TargetBackend {
-        backend_name: "iceberg",
-        catalog: ctx.rewrite.target.catalog.clone(),
-        namespace: ctx.rewrite.target.namespace.clone(),
-        table: ctx.rewrite.target.table.clone(),
-    };
-    let target_table = ctx.target_bindings.runtime().target_table();
-    let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
-        target_table.metadata().current_schema(),
-    )?;
-    let resolved = crate::connector::backend::ResolvedTable {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-        columns: columns.clone(),
-        statistics_pin: None,
-    };
-    crate::engine::iceberg_writer::build_insert_write_sink_spec(
-        &target,
-        &resolved,
-        target_table,
-        ctx.target_bindings.runtime().target_entry(),
-        &columns,
-    )
 }
 
 /// Freeze an SQL-shaped first refresh against the already-validated target
@@ -583,13 +548,7 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     mut provenance_properties: std::collections::BTreeMap<String, String>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
-) -> Result<
-    (
-        IcebergWriteSinkSpec,
-        crate::query_execution::contract::ConnectorWritePlanningTemplate,
-    ),
-    String,
-> {
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
     if prepared.observed_binding() != exact_lease.binding_key() {
         return Err("MV first-refresh write lease drifted from prepared binding".to_string());
     }
@@ -627,23 +586,6 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
             .map_err(|error| format!("reload MV first-refresh staging target: {error}"))?
             .table;
     validate_first_refresh_target_contract(&target_table, prepared.target_contract())?;
-    let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
-        target_table.metadata().current_schema(),
-    )?;
-    let resolved = crate::connector::backend::ResolvedTable {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-        columns,
-        statistics_pin: None,
-    };
-    let sink_spec = crate::engine::iceberg_writer::build_insert_write_sink_spec(
-        &target,
-        &resolved,
-        &target_table,
-        &entry,
-        &resolved.columns,
-    )?;
     let ident = TableIdent::new(
         NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
@@ -680,39 +622,63 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         staging_path: collector.staging_dir.clone(),
         provenance_properties,
     };
-    let writer_handle_payload =
-        crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload(
-            &sink_spec,
-        )?;
-    let template = crate::engine::iceberg_writer::activate_iceberg_first_refresh_connector_write(
-        state,
-        &target,
-        prepared.staging_branch(),
-        Arc::clone(prepared.target_contract().schema()),
-        writer_handle_payload,
-        payload,
-        commit_executor,
-        match prepared.write_mode() {
-            MvStagedRefreshWriteMode::Append => {
-                novarocks_spi::connector::ConnectorWriteIntent::Append
-            }
-            MvStagedRefreshWriteMode::FullOverwrite => {
-                novarocks_spi::connector::ConnectorWriteIntent::Overwrite
-            }
-        },
-        match prepared.write_mode() {
+    let intent = match prepared.write_mode() {
+        MvStagedRefreshWriteMode::Append => novarocks_spi::connector::ConnectorWriteIntent::Append,
+        MvStagedRefreshWriteMode::FullOverwrite => {
+            novarocks_spi::connector::ConnectorWriteIntent::Overwrite
+        }
+    };
+    let empty_input_policy = match prepared.write_mode() {
             MvStagedRefreshWriteMode::Append => {
                 crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
             }
             MvStagedRefreshWriteMode::FullOverwrite => {
                 crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
             }
-        },
-        operation_id,
-        connector_context,
+        };
+    let preparation = crate::engine::iceberg_writer::prepare_iceberg_connector_write(
         exact_lease,
+        &target,
+        intent,
+        novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+            fields: prepared
+                .target_contract()
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| {
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                        field.as_ref().clone(),
+                    )
+                })
+                .collect(),
+        },
+        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+        connector_context.clone(),
     )?;
-    Ok((sink_spec, template))
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    crate::connector::iceberg::provider::register_iceberg_first_refresh_write_service_from_preparation(
+        services,
+        operation_id,
+        &preparation,
+        payload,
+        &entry,
+        commit_executor,
+        empty_input_policy,
+    )
+    .map_err(|error| format!("activate Iceberg first-refresh writer from preparation: {error}"))?;
+    Ok(
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
+            operation_id,
+            preparation,
+            connector_context,
+            exact_lease.clone(),
+        ),
+    )
 }
 
 fn validate_first_refresh_target_contract(
@@ -764,7 +730,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
         crate::connector::connector_request_context_for_execution(None, execution)?;
     let root_hash_column = prepared.root_hash_column().to_string();
     let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column.clone());
-    let (sink_spec, template) = activate_mv_first_refresh_connector_write(
+    let template = activate_mv_first_refresh_connector_write(
         state,
         &prepared,
         std::collections::BTreeMap::new(),
@@ -774,15 +740,20 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let distributed = match prepared.into_execution_artifact() {
         MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-            let target_binding = admit_frozen_iceberg_write_target(
+            let target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                &sink_spec,
+                crate::sql::planner::table::SqlTableIdentity {
+                    catalog: target_catalog.clone(),
+                    namespace: target_namespace.clone(),
+                    table: target_name.clone(),
+                },
+                template.preparation().clone(),
                 planning_lease.clone(),
             )?;
             let sink = sql_write_plan_input_for_admitted_target(
                 bindings.as_ref(),
                 target_binding,
-                sink_spec.sql_mode(),
+                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
                 crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                 None,
             )?;
@@ -842,15 +813,20 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                     &bindings,
                     planning_lease,
                 )?;
-            let write_target_binding = admit_frozen_iceberg_write_target(
+            let write_target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                &sink_spec,
+                crate::sql::planner::table::SqlTableIdentity {
+                    catalog: target_catalog.clone(),
+                    namespace: target_namespace.clone(),
+                    table: target_name.clone(),
+                },
+                template.preparation().clone(),
                 planning_lease.clone(),
             )?;
             let sink = sql_write_plan_input_for_admitted_target(
                 bindings.as_ref(),
                 write_target_binding,
-                sink_spec.sql_mode(),
+                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
                 crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                 None,
             )?;
@@ -1075,7 +1051,6 @@ fn validate_frozen_join_base_facts(
 pub(crate) fn execute_prepared_mv_first_refresh_staging(
     state: &Arc<StandaloneState>,
     prepared: PreparedMvFirstRefreshWrite,
-    sink_spec: IcebergWriteSinkSpec,
     planning_lease: ConnectorControlPlanningLease,
     execution: &QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -1087,28 +1062,33 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
     {
         return Err("MV first-refresh staging registration identity mismatch".to_string());
     }
-    if sink_spec.target_columns.len() != prepared.target_contract().schema().fields().len() {
-        return Err(
-            "MV first-refresh staging sink schema does not match target contract".to_string(),
-        );
-    }
     let root_hash_column = prepared.root_hash_column().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
+    let target_identity = crate::sql::planner::table::SqlTableIdentity {
+        catalog: prepared.target_catalog().to_string(),
+        namespace: prepared.target_namespace().to_string(),
+        table: prepared.target_name().to_string(),
+    };
+    let preparation = registration
+        .session()
+        .preparation(registration.cohort_id())
+        .map_err(|error| format!("read MV first-refresh write preparation: {error}"))?;
     match prepared.into_execution_artifact() {
         MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
             let query = parse_query_from_sql(physical_sql.sql())?;
             let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column);
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-            let target_binding = admit_frozen_iceberg_write_target(
+            let target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                &sink_spec,
+                target_identity,
+                preparation,
                 planning_lease,
             )?;
             let sink = sql_write_plan_input_for_admitted_target(
                 bindings.as_ref(),
                 target_binding,
-                sink_spec.sql_mode(),
+                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
                 crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                 None,
             )?;

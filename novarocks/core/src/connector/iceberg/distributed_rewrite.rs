@@ -24,8 +24,10 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorStagedReport,
-    ConnectorStagedReportSummary, ConnectorWriteAttemptCompletion, ConnectorWriteCohortId,
-    ConnectorWriteIntent, ConnectorWriteReceipt, ConnectorWriterIdentity,
+    ConnectorStagedReportSummary, ConnectorWriteAdmissionPurpose, ConnectorWriteAttemptCompletion,
+    ConnectorWriteCohortId, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
+    ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriterIdentity,
     ConnectorWriterTerminalState,
 };
 use serde::{Deserialize, Serialize};
@@ -51,7 +53,6 @@ use super::write_service::{
 };
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::commit::CommitOpKind;
-use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
@@ -297,6 +298,7 @@ impl IcebergDistributedRewritePlanner {
             &artifact_location,
             &artifact.groups,
             input_schema,
+            super::catalog::backend::row_lineage_enabled(metadata),
         )?;
         let state_digest = rewrite_state_digest(
             metadata.uuid().to_string().as_bytes(),
@@ -401,12 +403,6 @@ impl IcebergDistributedRewriteAdapter {
         validate_frozen_rewrite_table(&artifact, table.metadata())?;
         let catalog = build_iceberg_catalog(&entry)
             .map_err(|error| unavailable(format!("build Iceberg rewrite catalog: {error}")))?;
-        let target = TargetBackend {
-            backend_name: "iceberg",
-            catalog: self.planner.instance_id.as_str().to_string(),
-            namespace: artifact.namespace.clone(),
-            table: artifact.table.clone(),
-        };
         let table_ident = TableIdent::new(
             NamespaceIdent::new(artifact.namespace.clone()),
             artifact.table.clone(),
@@ -442,11 +438,13 @@ impl IcebergDistributedRewriteAdapter {
         });
         let mut contexts = BTreeMap::new();
         for cohort in plan.cohorts() {
-            let group_payload = decode_group_payload(cohort.provider_payload())?;
             let group = artifact
                 .groups
                 .iter()
-                .find(|candidate| candidate.group_digest_hex == group_payload.group_digest_hex)
+                .find(|candidate| {
+                    decode_digest(&candidate.group_digest_hex, "Iceberg rewrite group")
+                        .is_ok_and(|digest| digest == cohort.group_digest())
+                })
                 .ok_or_else(|| invalid("Iceberg rewrite cohort names an unknown frozen group"))?;
             let group_digest = decode_digest(&group.group_digest_hex, "Iceberg rewrite group")?;
             let expected_cohort = ConnectorWriteCohortId::derive(
@@ -516,7 +514,11 @@ impl IcebergDistributedRewriteAdapter {
             };
             let context = IcebergWriteCohortContext::distributed_rewrite(
                 handle,
-                cohort.provider_payload().clone(),
+                group_payload_from_artifact(
+                    group,
+                    plan.manifest_digest(),
+                    &planned.artifact_location,
+                )?,
                 kind,
                 data_paths,
                 delete_paths,
@@ -938,12 +940,22 @@ fn attempt_artifact_location(
     completion: &ConnectorWriteAttemptCompletion,
     disposition: ConnectorDistributedRewriteAttemptDisposition,
 ) -> Result<String, ConnectorError> {
-    let group = plan
+    if !plan
         .cohorts()
         .iter()
-        .find(|cohort| cohort.cohort_id() == completion.cohort_id())
-        .ok_or_else(|| invalid("Iceberg rewrite attempt names an unknown cohort"))?;
-    let payload = decode_group_payload(group.provider_payload())?;
+        .any(|cohort| cohort.cohort_id() == completion.cohort_id())
+    {
+        return Err(invalid("Iceberg rewrite attempt names an unknown cohort"));
+    }
+    let payload: IcebergRewritePlanPayloadV1 = decode_canonical_json(
+        plan.provider_payload(),
+        "Iceberg distributed rewrite plan payload",
+    )?;
+    if payload.version != 1 {
+        return Err(invalid(
+            "Iceberg distributed rewrite plan payload version is unsupported",
+        ));
+    }
     Ok(format!(
         "{}/attempts/{}-{}-{:020}-{}.bin",
         payload.artifact_location,
@@ -1764,6 +1776,7 @@ pub(crate) fn cohort_plans_from_artifact(
     artifact_location: &str,
     groups: &[IcebergFrozenRewriteGroupV1],
     input_schema: SchemaRef,
+    row_lineage_data: bool,
 ) -> Result<Vec<ConnectorDistributedRewriteCohortPlan>, ConnectorError> {
     let intent = match request.operation() {
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
@@ -1782,30 +1795,110 @@ pub(crate) fn cohort_plans_from_artifact(
                 b"iceberg-distributed-rewrite-group",
                 group_digest,
             )?;
-            let payload = IcebergRewriteGroupPayloadV1 {
+            let source_payload = IcebergRewriteGroupPayloadV1 {
                 version: GROUP_PAYLOAD_VERSION,
                 group_digest_hex: group.group_digest_hex.clone(),
                 artifact_digest_hex: hex::encode(artifact_digest),
                 artifact_location: artifact_location.to_string(),
             };
-            let payload = canonical_payload(&payload)?;
-            let source_payload = decode_group_payload(&payload)?;
             let source = super::provider::frozen_rewrite_source_table_handle(
                 request.operation().table(),
                 request.operation(),
                 source_payload,
             )?;
+            let preparation = rewrite_cohort_preparation(
+                request,
+                intent,
+                input_schema.as_ref(),
+                row_lineage_data,
+            )?;
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
                 source,
-                intent,
                 input_schema.clone(),
                 arrow_schema_digest(&input_schema),
-                payload,
+                preparation,
                 group_digest,
             )
         })
         .collect()
+}
+
+fn rewrite_cohort_preparation(
+    request: &ConnectorDistributedRewritePlanningRequest,
+    intent: ConnectorWriteIntent,
+    input_schema: &Schema,
+    row_lineage_data: bool,
+) -> Result<ConnectorWritePreparation, ConnectorError> {
+    let fields = input_schema
+        .fields()
+        .iter()
+        .map(|field| ConnectorWriteFieldRequest::new((**field).clone()))
+        .collect::<Vec<_>>();
+    let input = match request.operation() {
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } if row_lineage_data => {
+            let row_identity_fields = fields
+                .iter()
+                .filter(|field| {
+                    matches!(
+                        field.field().name().as_str(),
+                        crate::exec::row_position::ICEBERG_ROW_ID_COL
+                            | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let data_fields = fields
+                .into_iter()
+                .filter(|field| {
+                    !matches!(
+                        field.field().name().as_str(),
+                        crate::exec::row_position::ICEBERG_ROW_ID_COL
+                            | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                    )
+                })
+                .collect();
+            ConnectorWriteInputRequest::RowLineage {
+                data_fields,
+                row_identity_fields,
+            }
+        }
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
+            ConnectorWriteInputRequest::Data { fields }
+        }
+        ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
+            ConnectorWriteInputRequest::PositionDelete {
+                identity_fields: fields,
+                partition_source_fields: Vec::new(),
+            }
+        }
+    };
+    match super::provider::prepare_iceberg_write(
+        ConnectorWritePreparationRequest {
+            table: request.operation().table().clone(),
+            intent,
+            purpose: ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            input,
+            context: request.context.clone(),
+        },
+        request.owner(),
+    )? {
+        ConnectorWritePreparationOutcome::Prepared(preparation) => Ok(preparation),
+        ConnectorWritePreparationOutcome::Denied(error) => Err(error),
+    }
+}
+
+fn group_payload_from_artifact(
+    group: &IcebergFrozenRewriteGroupV1,
+    artifact_digest: [u8; 32],
+    artifact_location: &str,
+) -> Result<Bytes, ConnectorError> {
+    canonical_payload(&IcebergRewriteGroupPayloadV1 {
+        version: GROUP_PAYLOAD_VERSION,
+        group_digest_hex: group.group_digest_hex.clone(),
+        artifact_digest_hex: hex::encode(artifact_digest),
+        artifact_location: artifact_location.to_string(),
+    })
 }
 
 pub(crate) fn rewrite_input_schema(

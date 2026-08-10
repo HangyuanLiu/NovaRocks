@@ -38,9 +38,10 @@ use novarocks_spi::connector::{
     ConnectorStagedReport, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
     ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteOperationId,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
-    ConnectorWriteReconcileRequest, ConnectorWriterTerminalState, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
+    ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
+    ConnectorWriterTerminalState, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use super::commit::{CommitServiceError, RecoveryEvidence};
@@ -224,11 +225,22 @@ pub(crate) trait IcebergWriteControlBackend: Send + Sync {
     }
 }
 
+/// Provider-owned admission hook.  The control adapter deliberately cannot
+/// decode an Iceberg table handle: only the provider which admitted that table
+/// can turn it into base-version, input-token, and managed-MV facts.
+pub(crate) type IcebergWritePreparationFactory = dyn Fn(
+        ConnectorWritePreparationRequest,
+        &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorWritePreparationOutcome, ConnectorError>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub(crate) struct IcebergWriteControlAdapter {
     key: ConnectorExecutionBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     backend: Arc<dyn IcebergWriteControlBackend>,
+    prepare: Arc<IcebergWritePreparationFactory>,
     operations: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteOperationRecord>>>,
     aborts: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteAbortRecord>>>,
     plans: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteOperationPlans>>>,
@@ -306,6 +318,14 @@ impl IcebergWriteControlAdapter {
         key: ConnectorExecutionBindingKey,
         backend: Arc<dyn IcebergWriteControlBackend>,
     ) -> Result<Self, ConnectorError> {
+        Self::new_with_preparation(key, backend, Arc::new(default_prepare))
+    }
+
+    pub(crate) fn new_with_preparation(
+        key: ConnectorExecutionBindingKey,
+        backend: Arc<dyn IcebergWriteControlBackend>,
+        prepare: Arc<IcebergWritePreparationFactory>,
+    ) -> Result<Self, ConnectorError> {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")?,
             instance_id: key.instance_id.clone(),
@@ -314,6 +334,7 @@ impl IcebergWriteControlAdapter {
             key,
             descriptor,
             backend,
+            prepare,
             operations: Arc::new(Mutex::new(HashMap::new())),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             plans: Arc::new(Mutex::new(HashMap::new())),
@@ -468,6 +489,14 @@ impl IcebergWriteControlAdapter {
 impl ConnectorWriteControl for IcebergWriteControlAdapter {
     fn binding_key(&self) -> &ConnectorExecutionBindingKey {
         &self.key
+    }
+
+    fn prepare_write(
+        &self,
+        request: ConnectorWritePreparationRequest,
+    ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+        request.validate(&self.key)?;
+        (self.prepare)(request, &self.key)
     }
 
     fn plan_write(
@@ -980,8 +1009,109 @@ fn failure(
     ConnectorMutationFailure::new(kind, message.into())
 }
 
+/// Translate the remaining in-process Iceberg commit runner into the sealed
+/// connector terminal contract before it reaches a frontend application
+/// owner.  The legacy runner remains provider-private during C1; its snapshot
+/// and recovery structures never cross this reverse port.
+pub(crate) fn terminal_outcome_from_iceberg_commit(
+    owner: &ConnectorExecutionBindingKey,
+    operation_id: ConnectorWriteOperationId,
+    result: Result<CommitOutcome, CommitServiceError>,
+) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+    let receipt = |outcome: &CommitOutcome| {
+        connector_write_receipt(outcome.new_snapshot_id, None).map_err(|error| error.to_string())
+    };
+    let evidence = |recovery: RecoveryEvidence| {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .map_err(|error| error.to_string())?,
+            instance_id: owner.instance_id.clone(),
+        };
+        let payload = canonical_json(
+            &LegacyIcebergTerminalEvidenceV1 {
+                version: 1,
+                table_ident: recovery.table_ident,
+                op_kind: format!("{:?}", recovery.op_kind),
+                base_snapshot_id: recovery.base_snapshot_id,
+                base_sequence_number: recovery.base_sequence_number,
+                staging_dir: recovery.staging_dir,
+            },
+            "legacy Iceberg terminal evidence",
+        )
+        .map_err(|error| error.to_string())?;
+        ExternalMutationEvidence::try_new(
+            ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION,
+            descriptor,
+            owner.incarnation,
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+                operation_id.to_bytes(),
+            ),
+            ICEBERG_WRITE_OPERATION_KIND,
+            payload,
+        )
+        .map_err(|error| error.to_string())
+    };
+    match result {
+        Ok(outcome) => Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: receipt(&outcome)?,
+            finalization: ExternalMutationFinalization::Complete,
+        }),
+        Err(CommitServiceError::KnownUncommitted { message, .. })
+        | Err(CommitServiceError::InvalidInput { message }) => {
+            Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure: failure(ConnectorMutationFailureKind::Conflict, message),
+            })
+        }
+        Err(CommitServiceError::Unknown {
+            message,
+            evidence: recovery,
+        }) => Ok(ExternalMutationOutcome::CommitUnknown {
+            failure: failure(ConnectorMutationFailureKind::Unavailable, message),
+            evidence: evidence(recovery)?,
+        }),
+        Err(CommitServiceError::FinalizeFailedKnownCommitted {
+            outcome,
+            finalize_error,
+            ..
+        }) => {
+            let outcome = outcome.ok_or_else(|| {
+                "Iceberg known-committed finalization failure did not retain a receipt".to_string()
+            })?;
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt: receipt(&outcome)?,
+                finalization: ExternalMutationFinalization::Failed(failure(
+                    ConnectorMutationFailureKind::Internal,
+                    finalize_error,
+                )),
+            })
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LegacyIcebergTerminalEvidenceV1 {
+    version: u16,
+    table_ident: String,
+    op_kind: String,
+    base_snapshot_id: Option<i64>,
+    base_sequence_number: i64,
+    staging_dir: String,
+}
+
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+
+fn default_prepare(
+    _: ConnectorWritePreparationRequest,
+    _: &ConnectorExecutionBindingKey,
+) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+    Err(ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "Iceberg write control was constructed without a provider admission factory",
+    ))
 }
 
 fn internal(message: impl Into<String>) -> ConnectorError {
@@ -993,13 +1123,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{DataType, Field};
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
         ConnectorRequestContext, ConnectorSealedWriteCohortSet, ConnectorTableHandle,
-        ConnectorWriteAttemptCompletion, ConnectorWriteCohortCompletion,
-        ConnectorWriteCohortDescriptor, ConnectorWriteExecutionId, ConnectorWriteIntent,
-        ConnectorWriteOperationCompletion, ConnectorWriterIdentity,
+        ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
+        ConnectorWriteCohortDescriptor, ConnectorWriteExecutionId, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
+        ConnectorWriteOperationCompletion, ConnectorWritePreparation, ConnectorWriterIdentity,
     };
 
     use super::*;
@@ -1126,15 +1257,26 @@ mod tests {
             operation_id,
             cohort_id,
             execution_id,
-            table: ConnectorTableHandle::try_new(
-                key.instance_id.clone(),
-                Bytes::from_static(b"table"),
+            preparation: ConnectorWritePreparation::try_new(
+                key.clone(),
+                ConnectorTableHandle::try_new(
+                    key.instance_id.clone(),
+                    Bytes::from_static(b"table"),
+                )
+                .expect("table"),
+                ConnectorWriteIntent::Append,
+                ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
+                    .expect("base version"),
+                ConnectorWriteInputShape::Data {
+                    fields: vec![ConnectorWriteFieldBinding::new(
+                        ConnectorWriteFieldToken::from_bytes([1; 32]),
+                        Field::new("value", DataType::Int64, true),
+                    )],
+                },
+                Bytes::from_static(payload),
             )
-            .expect("table"),
-            intent: ConnectorWriteIntent::Append,
-            input_schema: Arc::new(Schema::empty()),
+            .expect("preparation"),
             expected_writers: vec![writer(key, operation_id, cohort_id, execution_id)],
-            provider_payload: Bytes::from_static(payload),
             context: context(),
         }
     }
@@ -1160,7 +1302,7 @@ mod tests {
             .map(|request| {
                 ConnectorWriteCohortDescriptor::new(
                     request.cohort_id,
-                    request.intent,
+                    request.preparation.intent(),
                     request.stable_digest(&key).expect("stable digest"),
                 )
             })
@@ -1242,8 +1384,13 @@ mod tests {
         );
         assert!(adapter.plan_write(retry).is_ok());
         assert!(adapter.plan_write(second).is_ok());
-        let mut conflicting = first;
-        conflicting.provider_payload = Bytes::from_static(b"changed");
+        let conflicting = planning(
+            key.clone(),
+            operation_id,
+            first_cohort,
+            ConnectorWriteExecutionId::new([4; 16], 1),
+            b"changed",
+        );
         assert!(adapter.plan_write(conflicting).is_err());
     }
 

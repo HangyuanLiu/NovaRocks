@@ -48,31 +48,14 @@ impl QueryExecutionService {
         self.coordinator.execute(request)
     }
 
-    /// Acquire one exact frontend control generation and seal every cohort
+    /// Seal every cohort against the application-retained exact control lease
     /// before any distributed writer attempt is staged.
     pub fn begin_write_operation(
         &self,
         registration: ConnectorWriteOperationRegistration,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        self.coordinator.begin_write_operation(registration)
-    }
-
-    /// Seal a write operation against a caller-retained exact control binding.
-    ///
-    /// This is the only path for a prepared refresh artifact whose scan
-    /// preparation already observed a concrete connector generation. It must
-    /// never substitute a later current generation.
-    pub fn begin_write_operation_with_lease(
-        &self,
-        registration: ConnectorWriteOperationRegistration,
         lease: ConnectorWriteLease,
     ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        ConnectorWriteOperationSession::try_begin(registration, lease).map_err(|error| {
-            DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                format!("seal connector write operation cohorts: {error}"),
-            )
-        })
+        self.coordinator.begin_write_operation(registration, lease)
     }
 
     /// Seal a provider-frozen distributed rewrite against the composite lease

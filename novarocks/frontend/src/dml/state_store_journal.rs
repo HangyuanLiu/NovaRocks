@@ -35,16 +35,15 @@ use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
-    CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS, CreatePreparingRequest,
+    CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
+    ConnectorWriteFinalizationRecord, ConnectorWriteLifecycleRecord, CreatePreparingRequest,
     CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DML_CTAS_FACT_ENCODED_LIMIT,
     DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
-    DML_LEGACY_OPERATION_SCHEMA_VERSION, DML_OPERATION_SCHEMA_VERSION,
-    DML_PREVIOUS_OPERATION_SCHEMA_VERSION, DML_UNFINISHED_SCHEMA_VERSION, DmlOperationId,
-    DurableExternalFact, ExternalFactOutcome, IcebergCleanupOutcomeRecord,
-    IcebergCommitOutcomeRecord, IcebergOperationFailureRecord, IcebergRecoveryEvidenceRecord,
-    OperationFact, OperationKind, OperationMutationRequest, OperationPayload, OperationState,
-    OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
-    validate_operation_transition, validate_statement_operation_transition,
+    DML_OPERATION_SCHEMA_VERSION, DML_UNFINISHED_SCHEMA_VERSION, DmlOperationId,
+    DurableExternalFact, ExternalFactOutcome, OperationFact, OperationKind,
+    OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
+    SourceScopeOwnership, StatementNextAction, StoredOperation, validate_operation_transition,
+    validate_statement_operation_transition,
 };
 use crate::dml::now_unix_millis;
 
@@ -70,66 +69,6 @@ struct StoredAddFilesSourceScopeV1 {
 struct StoredUnfinishedOperationV1 {
     schema_version: u8,
     operation_id: DmlOperationId,
-}
-
-#[derive(Deserialize)]
-struct OperationSchemaProbe {
-    schema_version: u8,
-}
-
-#[derive(Deserialize)]
-struct StoredOperationV1 {
-    schema_version: u8,
-    operation_id: DmlOperationId,
-    revision: u64,
-    last_mutation_id: Uuid,
-    operation_kind: OperationKind,
-    #[serde(default)]
-    operation_subkind: Option<String>,
-    target: OperationTarget,
-    state: OperationState,
-    attempt_id: String,
-    base_snapshot_id: Option<i64>,
-    base_snapshot_map: std::collections::BTreeMap<String, i64>,
-    staged_artifacts: Vec<String>,
-    #[serde(default)]
-    commit_outcome: Option<IcebergCommitOutcomeRecord>,
-    #[serde(default)]
-    cleanup_outcome: Option<IcebergCleanupOutcomeRecord>,
-    #[serde(default)]
-    recovery_evidence: Option<IcebergRecoveryEvidenceRecord>,
-    #[serde(default)]
-    failure: Option<IcebergOperationFailureRecord>,
-    created_at_ms: i64,
-    updated_at_ms: i64,
-    finished_at_ms: Option<i64>,
-}
-
-impl From<StoredOperationV1> for StoredOperation {
-    fn from(value: StoredOperationV1) -> Self {
-        Self {
-            schema_version: value.schema_version,
-            operation_id: value.operation_id,
-            revision: value.revision,
-            last_mutation_id: value.last_mutation_id,
-            operation_kind: value.operation_kind,
-            operation_subkind: value.operation_subkind,
-            target: value.target,
-            state: value.state,
-            attempt_id: value.attempt_id,
-            base_snapshot_id: value.base_snapshot_id,
-            base_snapshot_map: value.base_snapshot_map,
-            staged_artifacts: value.staged_artifacts,
-            commit_outcome: value.commit_outcome,
-            cleanup_outcome: value.cleanup_outcome,
-            recovery_evidence: value.recovery_evidence,
-            failure: value.failure,
-            payload: OperationPayload::WriteV1,
-            created_at_ms: value.created_at_ms,
-            updated_at_ms: value.updated_at_ms,
-            finished_at_ms: value.finished_at_ms,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -433,11 +372,9 @@ impl StateStoreOperationJournal {
             base_snapshot_id: request.base_snapshot_id,
             base_snapshot_map: request.base_snapshot_map,
             staged_artifacts: request.staged_artifacts,
-            commit_outcome: None,
-            cleanup_outcome: None,
-            recovery_evidence: None,
-            failure: None,
-            payload: OperationPayload::WriteV1,
+            payload: OperationPayload::ConnectorWriteLifecycle(
+                ConnectorWriteLifecycleRecord::Pending,
+            ),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             finished_at_ms: None,
@@ -505,10 +442,6 @@ impl StateStoreOperationJournal {
             base_snapshot_id: None,
             base_snapshot_map: std::collections::BTreeMap::new(),
             staged_artifacts: Vec::new(),
-            commit_outcome: None,
-            cleanup_outcome: None,
-            recovery_evidence: None,
-            failure: None,
             payload: request.payload,
             created_at_ms: request.created_at_ms,
             updated_at_ms: request.created_at_ms,
@@ -1069,10 +1002,10 @@ impl StateStoreOperationJournal {
             validate_operation_transition(operation.state, fact.state)
                 .map_err(DmlError::journal_unavailable)?;
             if operation.state == fact.state {
-                let identical = operation.commit_outcome == fact.commit_outcome
-                    && operation.cleanup_outcome == fact.cleanup_outcome
-                    && operation.recovery_evidence == fact.recovery_evidence
-                    && operation.failure == fact.failure;
+                let identical = matches!(
+                    &operation.payload,
+                    OperationPayload::ConnectorWriteLifecycle(existing) if existing == &fact.lifecycle
+                );
                 if !identical {
                     return Err(DmlError::journal_unavailable(format!(
                         "conflicting DML operation fact replay for operation {operation_id} in state {}",
@@ -1081,19 +1014,7 @@ impl StateStoreOperationJournal {
                 }
             }
             operation.state = fact.state;
-            operation.commit_outcome = fact
-                .commit_outcome
-                .clone()
-                .or_else(|| operation.commit_outcome.clone());
-            operation.cleanup_outcome = fact
-                .cleanup_outcome
-                .clone()
-                .or_else(|| operation.cleanup_outcome.clone());
-            operation.recovery_evidence = fact
-                .recovery_evidence
-                .clone()
-                .or_else(|| operation.recovery_evidence.clone());
-            operation.failure = fact.failure.clone().or_else(|| operation.failure.clone());
+            operation.payload = OperationPayload::ConnectorWriteLifecycle(fact.lifecycle.clone());
             if fact.state.is_finished() {
                 operation.finished_at_ms = Some(now_unix_millis());
             }
@@ -1690,23 +1611,8 @@ fn encode_operation_with_limit(
 
 fn decode_operation(key: Key, value: Value) -> Result<StoredOperation, DmlError> {
     let key_id = decode_key(OPERATION_PREFIX, &key)?;
-    let probe: OperationSchemaProbe =
+    let operation: StoredOperation =
         serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
-    let operation = match probe.schema_version {
-        DML_LEGACY_OPERATION_SCHEMA_VERSION => {
-            let legacy: StoredOperationV1 =
-                serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
-            StoredOperation::from(legacy)
-        }
-        DML_PREVIOUS_OPERATION_SCHEMA_VERSION | DML_OPERATION_SCHEMA_VERSION => {
-            serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?
-        }
-        version => {
-            return Err(DmlError::journal_corruption(format!(
-                "unsupported frontend DML operation schema version: {version}"
-            )));
-        }
-    };
     validate_operation(&operation)?;
     if operation.operation_id != key_id {
         return Err(DmlError::journal_corruption(format!(
@@ -1746,23 +1652,10 @@ fn decode_unfinished(key: Key, value: Value) -> Result<DmlOperationId, DmlError>
 }
 
 fn validate_operation(operation: &StoredOperation) -> Result<(), DmlError> {
-    if !matches!(
-        operation.schema_version,
-        DML_LEGACY_OPERATION_SCHEMA_VERSION
-            | DML_PREVIOUS_OPERATION_SCHEMA_VERSION
-            | DML_OPERATION_SCHEMA_VERSION
-    ) {
+    if operation.schema_version != DML_OPERATION_SCHEMA_VERSION {
         return Err(DmlError::journal_corruption(format!(
             "unsupported frontend DML operation schema version: {}",
             operation.schema_version
-        )));
-    }
-    if operation.schema_version == DML_LEGACY_OPERATION_SCHEMA_VERSION
-        && operation.payload != OperationPayload::WriteV1
-    {
-        return Err(DmlError::journal_corruption(format!(
-            "legacy DML operation {} has a non-write payload",
-            operation.operation_id
         )));
     }
     validate_payload_shape(operation)?;
@@ -1808,7 +1701,7 @@ fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
             | OperationKind::RowDelta
             | OperationKind::MvRefresh
             | OperationKind::Maintenance,
-            OperationPayload::WriteV1,
+            OperationPayload::ConnectorWriteLifecycle(_),
         )
         | (OperationKind::CreateTableAsSelect, OperationPayload::CtasSaga(_))
         | (OperationKind::Truncate, OperationPayload::TruncateLifecycle(_))
@@ -1821,7 +1714,9 @@ fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
         }
     }
     match &operation.payload {
-        OperationPayload::WriteV1 => Ok(()),
+        OperationPayload::ConnectorWriteLifecycle(record) => {
+            validate_connector_write_lifecycle(record)
+        }
         OperationPayload::CtasSaga(record) => {
             validate_exact_connector_owner(
                 record.provider_id.as_deref(),
@@ -2241,34 +2136,76 @@ fn validate_external_fact(fact: Option<&DurableExternalFact>) -> Result<(), DmlE
 }
 
 fn validate_fact_shape(operation: &StoredOperation) -> Result<(), DmlError> {
-    if operation.commit_outcome.is_some()
-        && !matches!(
+    let OperationPayload::ConnectorWriteLifecycle(record) = &operation.payload else {
+        return Ok(());
+    };
+    let state_allows = match record {
+        ConnectorWriteLifecycleRecord::Pending => !matches!(
             operation.state,
             OperationState::Committed
-                | OperationState::Finalizing
-                | OperationState::Finalized
-                | OperationState::FinalizeFailedKnownCommitted
-        )
-    {
-        return Err(DmlError::journal_corruption(format!(
-            "DML operation {} has a commit outcome in state {}",
-            operation.operation_id,
-            operation.state.as_str()
-        )));
-    }
-    if operation.failure.is_some()
-        && !matches!(
-            operation.state,
-            OperationState::CommitUnknown
+                | OperationState::CommitUnknown
                 | OperationState::FailedKnownUncommitted
                 | OperationState::FinalizeFailedKnownCommitted
-        )
-    {
-        return Err(DmlError::journal_corruption(format!(
-            "DML operation {} has failure evidence in state {}",
+                | OperationState::Finalized
+        ),
+        ConnectorWriteLifecycleRecord::KnownEmpty => matches!(
+            operation.state,
+            OperationState::Committed | OperationState::Finalizing | OperationState::Finalized
+        ),
+        ConnectorWriteLifecycleRecord::KnownCommitted { finalization, .. } => match finalization {
+            ConnectorWriteFinalizationRecord::Complete => matches!(
+                operation.state,
+                OperationState::Committed | OperationState::Finalizing | OperationState::Finalized
+            ),
+            ConnectorWriteFinalizationRecord::Failed(_) => {
+                operation.state == OperationState::FinalizeFailedKnownCommitted
+            }
+        },
+        ConnectorWriteLifecycleRecord::KnownUncommitted { .. } => {
+            operation.state == OperationState::FailedKnownUncommitted
+        }
+        ConnectorWriteLifecycleRecord::CommitUnknown { .. } => {
+            operation.state == OperationState::CommitUnknown
+        }
+    };
+    if state_allows {
+        Ok(())
+    } else {
+        Err(DmlError::journal_corruption(format!(
+            "DML operation {} has lifecycle facts incompatible with state {}",
             operation.operation_id,
             operation.state.as_str()
-        )));
+        )))
+    }
+}
+
+fn validate_connector_write_lifecycle(
+    record: &ConnectorWriteLifecycleRecord,
+) -> Result<(), DmlError> {
+    match record {
+        ConnectorWriteLifecycleRecord::Pending | ConnectorWriteLifecycleRecord::KnownEmpty => {
+            Ok(())
+        }
+        ConnectorWriteLifecycleRecord::KnownCommitted { receipt_wire, .. } => receipt_wire
+            .try_decode()
+            .map(|_| ())
+            .map_err(DmlError::journal_corruption),
+        ConnectorWriteLifecycleRecord::KnownUncommitted { failure }
+        | ConnectorWriteLifecycleRecord::CommitUnknown { failure, .. } => {
+            if failure.message.is_empty() {
+                Err(DmlError::journal_corruption(
+                    "connector write lifecycle failure message must not be empty",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }?;
+    if let ConnectorWriteLifecycleRecord::CommitUnknown { evidence_wire, .. } = record {
+        evidence_wire
+            .try_decode()
+            .map(|_| ())
+            .map_err(DmlError::journal_corruption)?;
     }
     Ok(())
 }

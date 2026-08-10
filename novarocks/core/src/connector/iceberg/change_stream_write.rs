@@ -44,7 +44,6 @@ use super::write_service::{
 };
 use crate::connector::iceberg::write_contract::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
-use crate::engine::query_planning::write_sink::iceberg_write_sink_spec_from_admitted_sql_input;
 use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
 use novarocks_spi::connector::{ConnectorError, ConnectorWriteOperationId};
 
@@ -209,7 +208,7 @@ fn change_stream_writer_handle_payloads(
             )
         })?;
         let mut sink_spec =
-            iceberg_write_sink_spec_from_admitted_sql_input(table_bindings, &branch.sink, entry)?;
+            iceberg_sink_spec_from_sealed_preparation(table_bindings, &branch.sink, entry, table)?;
         sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
         let payload = match sink_spec.mode {
             IcebergWriteSinkMode::DeletionVectors => {
@@ -234,6 +233,42 @@ fn change_stream_writer_handle_payloads(
         return Err("change-stream topology has no terminal writer fragments".to_string());
     }
     Ok(payloads)
+}
+
+fn iceberg_sink_spec_from_sealed_preparation(
+    table_bindings: &QueryTableBindingStore,
+    sink: &crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    entry: &IcebergCatalogEntry,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let binding = table_bindings.binding(sink.contract.target.binding)?;
+    let preparation = binding
+        .write_target_admission
+        .as_ref()
+        .ok_or_else(|| "change-stream writer target is missing sealed preparation".to_string())?
+        .preparation
+        .clone();
+    match preparation.input() {
+        novarocks_spi::connector::ConnectorWriteInputShape::Data { .. }
+        | novarocks_spi::connector::ConnectorWriteInputShape::RowLineage { .. } => {
+            crate::connector::iceberg::provider::iceberg_data_sink_spec_from_preparation(
+                &preparation,
+                entry,
+            )
+            .map_err(|error| error.to_string())
+        }
+        novarocks_spi::connector::ConnectorWriteInputShape::PositionDelete { .. }
+        | novarocks_spi::connector::ConnectorWriteInputShape::DeletionVector { .. }
+        | novarocks_spi::connector::ConnectorWriteInputShape::EqualityDelete { .. } => {
+            crate::connector::iceberg::provider::iceberg_row_write_sink_spec_from_preparation(
+                &preparation,
+                entry,
+                table.metadata(),
+            )
+            .map(|(spec, _)| spec)
+            .map_err(|error| error.to_string())
+        }
+    }
 }
 
 pub(crate) fn position_delete_index_storage_config(

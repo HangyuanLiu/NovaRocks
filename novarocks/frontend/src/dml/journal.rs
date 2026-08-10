@@ -106,8 +106,8 @@ pub(crate) mod testing {
 
     use super::*;
     use crate::dml::model::{
-        DML_OPERATION_SCHEMA_VERSION, OperationPayload, validate_operation_transition,
-        validate_statement_operation_transition,
+        ConnectorWriteLifecycleRecord, DML_OPERATION_SCHEMA_VERSION, OperationPayload,
+        validate_operation_transition, validate_statement_operation_transition,
     };
     use crate::dml::now_unix_millis;
 
@@ -144,11 +144,9 @@ pub(crate) mod testing {
                 base_snapshot_id: request.base_snapshot_id,
                 base_snapshot_map: request.base_snapshot_map,
                 staged_artifacts: request.staged_artifacts,
-                commit_outcome: None,
-                cleanup_outcome: None,
-                recovery_evidence: None,
-                failure: None,
-                payload: OperationPayload::WriteV1,
+                payload: OperationPayload::ConnectorWriteLifecycle(
+                    ConnectorWriteLifecycleRecord::Pending,
+                ),
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,
@@ -193,10 +191,8 @@ pub(crate) mod testing {
             validate_operation_transition(operation.state, fact.state)
                 .map_err(DmlError::journal_unavailable)?;
             if operation.state == fact.state {
-                let identical = operation.commit_outcome == fact.commit_outcome
-                    && operation.cleanup_outcome == fact.cleanup_outcome
-                    && operation.recovery_evidence == fact.recovery_evidence
-                    && operation.failure == fact.failure;
+                let identical = operation.payload
+                    == OperationPayload::ConnectorWriteLifecycle(fact.lifecycle.clone());
                 if !identical {
                     return Err(DmlError::journal_unavailable(format!(
                         "conflicting DML operation fact replay for operation {operation_id}"
@@ -204,16 +200,7 @@ pub(crate) mod testing {
                 }
             }
             operation.state = fact.state;
-            operation.commit_outcome = fact
-                .commit_outcome
-                .or_else(|| operation.commit_outcome.clone());
-            operation.cleanup_outcome = fact
-                .cleanup_outcome
-                .or_else(|| operation.cleanup_outcome.clone());
-            operation.recovery_evidence = fact
-                .recovery_evidence
-                .or_else(|| operation.recovery_evidence.clone());
-            operation.failure = fact.failure.or_else(|| operation.failure.clone());
+            operation.payload = OperationPayload::ConnectorWriteLifecycle(fact.lifecycle);
             operation.revision += 1;
             operation.last_mutation_id = Uuid::now_v7();
             operation.updated_at_ms = now_unix_millis();
@@ -273,10 +260,6 @@ pub(crate) mod testing {
                 base_snapshot_id: None,
                 base_snapshot_map: BTreeMap::new(),
                 staged_artifacts: Vec::new(),
-                commit_outcome: None,
-                cleanup_outcome: None,
-                recovery_evidence: None,
-                failure: None,
                 payload: request.payload,
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
