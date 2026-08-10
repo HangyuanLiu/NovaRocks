@@ -67,7 +67,7 @@ impl StreamReplay {
         }
         self.highest = Some(sequence);
         self.digest = Some(digest);
-        Ok(Some(BackendReductionApply::SequenceAdvancedEqual))
+        Ok(None)
     }
 }
 
@@ -104,6 +104,30 @@ impl BackendReductionState {
 
     pub(crate) const fn policy(&self) -> &BackendInstallPolicy {
         &self.policy
+    }
+
+    pub(crate) fn latest_snapshot(&self) -> Option<BackendReducedLogicalSnapshot> {
+        let version = self.version?;
+        match self.policy.producer().contract() {
+            RuntimeFilterExecutionContract::Membership(_) => {
+                Some(BackendReducedLogicalSnapshot::membership(
+                    self.policy.channel().channel_id(),
+                    version,
+                    self.membership
+                        .as_ref()
+                        .expect("membership contract owns reducer")
+                        .domain()
+                        .clone(),
+                ))
+            }
+            RuntimeFilterExecutionContract::Ordered(_) => {
+                Some(BackendReducedLogicalSnapshot::ordered_bound(
+                    self.policy.channel().channel_id(),
+                    version,
+                    self.ordered.clone()?,
+                ))
+            }
+        }
     }
 
     pub(crate) fn submit(
@@ -166,28 +190,9 @@ impl BackendReductionState {
         })?;
         self.version = Some(version);
         self.streams.insert(stream, next_replay);
-        let snapshot = match self.policy.producer().contract() {
-            RuntimeFilterExecutionContract::Membership(_) => {
-                BackendReducedLogicalSnapshot::membership(
-                    self.policy.channel().channel_id(),
-                    version,
-                    self.membership
-                        .as_ref()
-                        .expect("membership reducer")
-                        .domain()
-                        .clone(),
-                )
-            }
-            RuntimeFilterExecutionContract::Ordered(_) => {
-                BackendReducedLogicalSnapshot::ordered_bound(
-                    self.policy.channel().channel_id(),
-                    version,
-                    self.ordered
-                        .clone()
-                        .expect("ordered contribution produced a bound"),
-                )
-            }
-        };
+        let snapshot = self
+            .latest_snapshot()
+            .expect("changed reduction owns a current logical snapshot");
         Ok((BackendReductionApply::Applied { version }, Some(snapshot)))
     }
 

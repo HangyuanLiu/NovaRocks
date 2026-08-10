@@ -76,6 +76,35 @@ impl BackendRuntimeFilterFixture {
         self.membership_contribution.clone()
     }
 
+    pub(crate) fn membership_contribution_with_values(
+        &self,
+        values: impl IntoIterator<Item = i64>,
+    ) -> RuntimeFilterContribution {
+        let RuntimeFilterExecutionContract::Membership(schema) = self.producer_contract.contract()
+        else {
+            panic!("membership fixture must use a membership contract")
+        };
+        let encoded = contribution::encode_contribution(
+            &contribution::RuntimeFilterContribution::membership(
+                contribution::ValueDomainDelta::new(
+                    contribution::MembershipValues::int64(values),
+                    false,
+                ),
+            ),
+            contribution::ContributionCodecExpectation::membership(
+                schema.data_type(),
+                schema.digest(),
+            ),
+            1024,
+        )
+        .expect("fixture contribution fits its budget");
+        RuntimeFilterContribution::new(
+            RuntimeFilterContributionKind::Membership,
+            *encoded.schema_digest(),
+            encoded.into_parts().1,
+        )
+    }
+
     pub(crate) fn contribution_with_digest(&self, digest: [u8; 32]) -> RuntimeFilterContribution {
         RuntimeFilterContribution::new(
             RuntimeFilterContributionKind::Membership,

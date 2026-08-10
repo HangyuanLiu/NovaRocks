@@ -336,7 +336,16 @@ impl RuntimeFilterParticipant {
             }
             _ => return rejected(DELIVERY_REJECTION),
         };
-        match session.publish_materialized(route_edge_id, outcome) {
+        let terminal = match envelope.kind() {
+            BackendEnvelopeKind::FinalArtifact => {
+                Some(novarocks_execution::runtime_filter::LiveTerminal::Completed)
+            }
+            BackendEnvelopeKind::CompletedWithoutArtifact => {
+                Some(novarocks_execution::runtime_filter::LiveTerminal::CompletedWithoutArtifact)
+            }
+            _ => None,
+        };
+        match session.publish_materialized(route_edge_id, outcome, terminal) {
             Ok(()) => BackendIngressResult::accepted(),
             Err(_) => rejected(DELIVERY_REJECTION),
         }

@@ -27,7 +27,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use novarocks_execution::runtime_filter::{
-    PartitionId, ProducerSequence, RuntimeFilterBindOutcome, RuntimeFilterBindingId,
+    LiveTerminal, PartitionId, ProducerSequence, RuntimeFilterBindOutcome, RuntimeFilterBindingId,
     RuntimeFilterConsumerContract, RuntimeFilterContractViolation,
     RuntimeFilterContractViolationKind, RuntimeFilterContribution, RuntimeFilterExecutionContract,
     RuntimeFilterProducer, RuntimeFilterProducerFailure, RuntimeFilterProducerHandle,
@@ -329,7 +329,9 @@ impl BackendRuntimeFilterSession {
             .submit(stream, sequence, contribution)
             .map_err(reduction_violation)?;
         if let Some(snapshot) = publication.as_ref() {
-            self.publish_reduced_snapshot(snapshot)?;
+            if self.channel.lifecycle() == super::BackendChannelLifecycle::MonotonicUpdates {
+                self.publish_reduced_snapshot(snapshot, None)?;
+            }
         }
         Ok(BackendRuntimeFilterSessionSubmission {
             outcome: match apply {
@@ -410,7 +412,25 @@ impl BackendRuntimeFilterSession {
         }
         self.mark_satisfied(install.coverage_witness());
         Ok(match self.availability_progress() {
-            BackendCoverageProgress::Satisfied => RuntimeFilterSubmitOutcome::PendingFinalSnapshot,
+            BackendCoverageProgress::Satisfied => {
+                let publication = self.reduction.as_ref().and_then(|reduction| {
+                    reduction
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .latest_snapshot()
+                });
+                match publication {
+                    Some(snapshot) => {
+                        let terminal = Some(LiveTerminal::Completed);
+                        self.publish_reduced_snapshot(&snapshot, terminal)?;
+                        RuntimeFilterSubmitOutcome::PendingFinalSnapshot
+                    }
+                    None => {
+                        self.publish_terminal(LiveTerminal::CompletedWithoutArtifact)?;
+                        RuntimeFilterSubmitOutcome::CompletedWithoutArtifact
+                    }
+                }
+            }
             BackendCoverageProgress::Pending => RuntimeFilterSubmitOutcome::CoverageStillPossible,
             BackendCoverageProgress::Impossible => {
                 RuntimeFilterSubmitOutcome::CompletedWithoutArtifact
@@ -471,6 +491,7 @@ impl BackendRuntimeFilterSession {
         &self,
         route_edge_id: BackendRouteEdgeId,
         outcome: SnapshotAcquireOutcome,
+        terminal: Option<LiveTerminal>,
     ) -> Result<(), RuntimeFilterContractViolation> {
         let consumer = self
             .consumers
@@ -484,7 +505,7 @@ impl BackendRuntimeFilterSession {
             })?;
         consumer
             .subscriptions
-            .publish(route_edge_id, outcome, None)
+            .publish(route_edge_id, outcome, terminal)
             .map_err(subscription_violation)
     }
 
@@ -494,6 +515,7 @@ impl BackendRuntimeFilterSession {
     fn publish_reduced_snapshot(
         &self,
         snapshot: &BackendReducedLogicalSnapshot,
+        terminal: Option<LiveTerminal>,
     ) -> Result<(), RuntimeFilterContractViolation> {
         for consumer in self.consumers.values() {
             let outcome = match (snapshot.domain(), consumer.contract.contract()) {
@@ -576,7 +598,22 @@ impl BackendRuntimeFilterSession {
             for route in &consumer.routes {
                 consumer
                     .subscriptions
-                    .publish(*route, outcome.clone(), None)
+                    .publish(*route, outcome.clone(), terminal)
+                    .map_err(subscription_violation)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_terminal(
+        &self,
+        terminal: LiveTerminal,
+    ) -> Result<(), RuntimeFilterContractViolation> {
+        for consumer in self.consumers.values() {
+            for route in &consumer.routes {
+                consumer
+                    .subscriptions
+                    .publish_terminal(*route, terminal)
                     .map_err(subscription_violation)?;
             }
         }
@@ -1023,6 +1060,7 @@ mod tests {
             .publish_materialized(
                 BackendRouteEdgeId::new(101),
                 SnapshotAcquireOutcome::Unavailable(UnavailableReason::ProducerFailed),
+                None,
             )
             .unwrap();
         assert!(matches!(
