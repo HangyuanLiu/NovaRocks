@@ -66,13 +66,10 @@ pub(crate) struct IcebergCatalogRegistry {
     write_services: IcebergWriteServiceRegistry,
 }
 
-#[derive(Clone)]
-pub(crate) struct IcebergCatalogEntry {
-    /// Provider-owned generation state. Core owns only the SQL projection
-    /// adapter and must not re-model catalog credentials, endpoint, warehouse,
-    /// or physical cache state.
-    control_state: novarocks_connector_iceberg::catalog_control::IcebergCatalogControlState,
-}
+/// Provider-owned control-generation state. Core only projects its physical
+/// table metadata into SQL/application types while the owner cut is in flight.
+pub(crate) type IcebergCatalogEntry =
+    novarocks_connector_iceberg::catalog_control::IcebergCatalogControlState;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergLoadedTable {
@@ -170,101 +167,6 @@ impl IcebergCatalogRegistry {
             .remove(&key)
             .map(|_| ())
             .ok_or_else(|| format!("unknown catalog: {catalog_name}"))
-    }
-}
-
-impl IcebergCatalogEntry {
-    pub(crate) fn configuration(&self) -> &IcebergCatalogConfiguration {
-        self.control_state.configuration()
-    }
-
-    pub(crate) fn properties(&self) -> &[(String, String)] {
-        &self.properties
-    }
-
-    pub(crate) fn is_s3(&self) -> bool {
-        self.object_store_config.is_some()
-    }
-
-    /// True when namespace/table state is owned by a remote Iceberg catalog
-    /// service (REST server or Hive Metastore) rather than NovaRocks' direct
-    /// filesystem / object-store warehouse layout (Hadoop). These
-    /// catalogs route namespace + table operations through the iceberg-rust
-    /// `Catalog` trait via `build_iceberg_catalog`.
-    pub(crate) fn uses_remote_catalog(&self) -> bool {
-        matches!(
-            self.kind,
-            IcebergCatalogKind::Rest | IcebergCatalogKind::Hive
-        )
-    }
-
-    pub(crate) fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
-        self.object_store_config.as_ref()
-    }
-
-    pub(crate) fn cloud_properties_map(&self) -> BTreeMap<String, String> {
-        let mut map = BTreeMap::new();
-        for (key, value) in &self.properties {
-            if novarocks_fs::AWS_S3_CATALOG_PROPERTY_KEYS.contains(&key.as_str()) {
-                map.insert(key.clone(), value.clone());
-            }
-        }
-        map
-    }
-
-    /// Drop the cached `IcebergLoadedTable` for `(namespace, table_name)` so
-    /// the next `load_table` call re-reads the metadata. Used by the
-    /// standalone INSERT / OVERWRITE / DELETE flows after a successful
-    /// commit so subsequent SELECTs see the new snapshot.
-    pub(crate) fn invalidate_table_cache(&self, namespace_name: &str, table_name: &str) {
-        if let (Ok(ns), Ok(tbl)) = (
-            normalize_identifier(namespace_name),
-            normalize_identifier(table_name),
-        ) {
-            self.control_state.invalidate_table(&ns, &tbl);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn poison_table_cache_for_test(&self) {
-        self.control_state.physical_table_cache().poison_for_test();
-    }
-
-    pub(crate) fn cached_data_files(
-        &self,
-        namespace_name: &str,
-        table_name: &str,
-        snapshot_id: Option<i64>,
-    ) -> Result<Option<Vec<DataFileWithStats>>, String> {
-        self.control_state
-            .data_files_cache()
-            .get(namespace_name, table_name, snapshot_id)
-    }
-
-    pub(crate) fn cache_data_files(
-        &self,
-        namespace_name: &str,
-        table_name: &str,
-        snapshot_id: Option<i64>,
-        data_files: Vec<DataFileWithStats>,
-    ) -> Result<(), String> {
-        self.control_state.data_files_cache().insert(
-            namespace_name,
-            table_name,
-            snapshot_id,
-            data_files,
-        )
-    }
-}
-
-// Keep the existing Core SQL adapters source-compatible while their remaining
-// application cache is removed. The provider configuration itself has a single
-// owner in novarocks-connector-iceberg.
-impl Deref for IcebergCatalogEntry {
-    type Target = IcebergCatalogConfiguration;
-
-    fn deref(&self) -> &Self::Target {
-        self.configuration()
     }
 }
 
@@ -1032,11 +934,7 @@ pub(crate) fn load_table(
     let ns_name = normalize_identifier(namespace_name)?;
     let tbl_name = normalize_identifier(table_name)?;
 
-    if let Some(physical) = entry
-        .control_state
-        .physical_table_cache()
-        .get(&ns_name, &tbl_name)?
-    {
+    if let Some(physical) = entry.physical_table_cache().get(&ns_name, &tbl_name)? {
         return project_loaded_table(physical, &ns_name, &tbl_name);
     }
 
@@ -1107,7 +1005,6 @@ pub(crate) fn load_table(
         entry.object_store_config.clone(),
     );
     entry
-        .control_state
         .physical_table_cache()
         .insert(&ns_name, &tbl_name, physical.clone())?;
     project_loaded_table(physical, &ns_name, &tbl_name)
@@ -1357,12 +1254,7 @@ pub(crate) fn build_catalog_entry(
     properties: &[(String, String)],
 ) -> Result<IcebergCatalogEntry, String> {
     let configuration = parse_catalog_configuration(catalog_name, properties)?;
-    Ok(IcebergCatalogEntry {
-        control_state:
-            novarocks_connector_iceberg::catalog_control::IcebergCatalogControlState::new(
-                configuration,
-            ),
-    })
+    Ok(IcebergCatalogEntry::new(configuration))
 }
 
 /// Build a `HadoopFileSystemCatalog` that writes metadata in the Hadoop naming
@@ -2763,20 +2655,15 @@ mod data_file_with_stats_tests {
 
     #[test]
     fn data_file_cache_is_snapshot_scoped_and_table_invalidation_clears_it() {
-        let entry = IcebergCatalogEntry {
-            control_state:
-                novarocks_connector_iceberg::catalog_control::IcebergCatalogControlState::new(
-                    IcebergCatalogConfiguration {
-                        kind: IcebergCatalogKind::Hadoop,
-                        warehouse_uri: "file:///tmp/warehouse".to_string(),
-                        rest_uri: None,
-                        hms_uris: None,
-                        properties: vec![],
-                        object_store_config: None,
-                        warehouse_path: PathBuf::from("/tmp/warehouse"),
-                    },
-                ),
-        };
+        let entry = IcebergCatalogEntry::new(IcebergCatalogConfiguration {
+            kind: IcebergCatalogKind::Hadoop,
+            warehouse_uri: "file:///tmp/warehouse".to_string(),
+            rest_uri: None,
+            hms_uris: None,
+            properties: vec![],
+            object_store_config: None,
+            warehouse_path: PathBuf::from("/tmp/warehouse"),
+        });
         entry
             .cache_data_files("Db1", "Tbl1", Some(7), vec![data_file("file:///a.parquet")])
             .expect("cache snapshot 7");
