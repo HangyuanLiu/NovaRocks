@@ -31,7 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use novarocks_connector_iceberg::catalog_config::{
-    IcebergCatalogKind, parse_catalog_configuration,
+    IcebergCatalogConfiguration, IcebergCatalogKind, parse_catalog_configuration,
 };
 use novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema;
 use novarocks_connector_iceberg::iceberg::spec::{
@@ -1385,12 +1385,8 @@ pub(crate) fn build_catalog_entry(
 pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog, String> {
-    let file_io = fs_io::build_file_io_for_location(&entry.warehouse_uri, entry.s3_config.as_ref());
-    Ok(
-        novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
-            file_io,
-            entry.warehouse_uri.clone(),
-        ),
+    novarocks_connector_iceberg::catalog_runtime::build_hadoop_catalog(
+        &provider_catalog_configuration(entry),
     )
 }
 
@@ -1405,47 +1401,10 @@ pub(crate) fn build_hadoop_catalog(
 pub(crate) async fn build_rest_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<novarocks_connector_iceberg::iceberg_catalog_rest::RestCatalog, String> {
-    use novarocks_connector_iceberg::iceberg::CatalogBuilder;
-    use novarocks_connector_iceberg::iceberg_catalog_rest::{
-        REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
-    };
-
-    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
-        return Err(format!(
-            "build_rest_catalog called on non-REST entry kind={:?}",
-            entry.kind
-        ));
-    }
-    let uri = entry.rest_uri.clone().ok_or_else(|| {
-        "REST iceberg catalog entry missing rest_uri (CREATE EXTERNAL CATALOG must set `uri`)"
-            .to_string()
-    })?;
-
-    // Carry through every user-supplied property except `type` (which is
-    // NovaRocks-internal) so OAuth credentials, prefix, signing-region and
-    // other RESTSessionCatalog options reach the iceberg-rust builder.
-    let mut props: HashMap<String, String> = HashMap::new();
-    for (k, v) in &entry.properties {
-        if k == "type" {
-            continue;
-        }
-        props.insert(k.clone(), v.clone());
-    }
-    props.insert(REST_CATALOG_PROP_URI.to_string(), uri);
-    if !entry.warehouse_uri.is_empty() {
-        props.insert(
-            REST_CATALOG_PROP_WAREHOUSE.to_string(),
-            entry.warehouse_uri.clone(),
-        );
-    }
-
-    let storage_factory = build_storage_factory_for_entry(entry)?;
-    let catalog_name = "rest".to_string();
-    RestCatalogBuilder::default()
-        .with_storage_factory(storage_factory)
-        .load(catalog_name, props)
-        .await
-        .map_err(|e| format!("build REST iceberg catalog: {e}"))
+    novarocks_connector_iceberg::catalog_runtime::build_rest_catalog(
+        &provider_catalog_configuration(entry),
+    )
+    .await
 }
 
 /// Build an Iceberg `HmsCatalog` for an entry whose
@@ -1455,67 +1414,22 @@ pub(crate) async fn build_rest_catalog(
 pub(crate) async fn build_hms_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<novarocks_connector_iceberg::iceberg_catalog_hms::HmsCatalog, String> {
-    use novarocks_connector_iceberg::iceberg::CatalogBuilder;
-    use novarocks_connector_iceberg::iceberg_catalog_hms::{
-        HMS_CATALOG_PROP_THRIFT_TRANSPORT, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
-        HmsCatalogBuilder, THRIFT_TRANSPORT_BUFFERED, THRIFT_TRANSPORT_FRAMED,
-    };
-
-    if !matches!(entry.kind, IcebergCatalogKind::Hive) {
-        return Err(format!(
-            "build_hms_catalog called on non-Hive entry kind={:?}",
-            entry.kind
-        ));
-    }
-    let uri = entry.hms_uris.clone().ok_or_else(|| {
-        "hive iceberg catalog entry missing hms_uris (CREATE EXTERNAL CATALOG must set `hive.metastore.uris`)"
-            .to_string()
-    })?;
-
-    let mut props: HashMap<String, String> = HashMap::new();
-    props.insert(HMS_CATALOG_PROP_URI.to_string(), uri);
-    if !entry.warehouse_uri.is_empty() {
-        props.insert(
-            HMS_CATALOG_PROP_WAREHOUSE.to_string(),
-            entry.warehouse_uri.clone(),
-        );
-    }
-    // thrift transport: default buffered; framed when hive.metastore.thrift.framed=true.
-    let framed = entry
-        .properties
-        .iter()
-        .find(|(k, _)| k == "hive.metastore.thrift.framed")
-        .map(|(_, v)| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-    props.insert(
-        HMS_CATALOG_PROP_THRIFT_TRANSPORT.to_string(),
-        if framed {
-            THRIFT_TRANSPORT_FRAMED.to_string()
-        } else {
-            THRIFT_TRANSPORT_BUFFERED.to_string()
-        },
-    );
-
-    let storage_factory = build_storage_factory_for_entry(entry)?;
-    HmsCatalogBuilder::default()
-        .with_storage_factory(storage_factory)
-        .load("hms", props)
-        .await
-        .map_err(|e| format!("build HMS iceberg catalog: {e}"))
+    novarocks_connector_iceberg::catalog_runtime::build_hms_catalog(
+        &provider_catalog_configuration(entry),
+    )
+    .await
 }
 
-fn build_storage_factory_for_entry(
-    entry: &IcebergCatalogEntry,
-) -> Result<Arc<dyn novarocks_connector_iceberg::iceberg::io::StorageFactory>, String> {
-    Ok(fs_io::build_storage_factory_for_location(
-        &entry.warehouse_uri,
-        entry.s3_config.as_ref(),
-    ))
+fn provider_catalog_configuration(entry: &IcebergCatalogEntry) -> IcebergCatalogConfiguration {
+    IcebergCatalogConfiguration {
+        kind: entry.kind,
+        warehouse_uri: entry.warehouse_uri.clone(),
+        rest_uri: entry.rest_uri.clone(),
+        hms_uris: entry.hms_uris.clone(),
+        properties: entry.properties.clone(),
+        object_store_config: entry.s3_config.clone(),
+        warehouse_path: entry.warehouse_path.clone(),
+    }
 }
 
 /// Synchronous dispatcher that returns an `Arc<dyn Catalog>` regardless of
