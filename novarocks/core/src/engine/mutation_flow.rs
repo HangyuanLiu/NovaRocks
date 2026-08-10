@@ -266,7 +266,7 @@ fn build_dml_change_stream_write_plan(
         ChangeStreamWriteLayoutRequest, ChangeStreamWriteLayoutRoute,
         bind_change_stream_write_layout,
     };
-    use novarocks_spi::connector::ConnectorWriteInputShape;
+    use novarocks_spi::connector::{ConnectorMutationRouteInput, ConnectorWriteInputShape};
 
     let mut routes = Vec::new();
     for route in &preparations.routes {
@@ -301,11 +301,39 @@ fn build_dml_change_stream_write_plan(
             None,
         )
         .map_err(|error| format!("build row-mutation route sink: {error}"))?;
+        // The Provider signs route field tokens, while SQL owns the physical
+        // producer layout.  Bind each token to this exact producer output here
+        // rather than treating the provider's match-contract ordinal as a
+        // planner output ordinal.  A logical Replace can therefore fan out to
+        // an identity-only delete route and an after-image data route.
+        let input_ordinals = route
+            .input()
+            .fields()
+            .into_iter()
+            .map(|field| {
+                producer
+                    .output_columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(field.field().name()))
+                    .ok_or_else(|| {
+                        format!(
+                            "row-mutation producer has no output for Provider route field `{}`",
+                            field.field().name()
+                        )
+                    })
+                    .and_then(|ordinal| {
+                        u32::try_from(ordinal).map_err(|_| {
+                            "row-mutation producer output ordinal exceeds u32".to_string()
+                        })
+                    })
+                    .map(|ordinal| ConnectorMutationRouteInput::new(field.token(), ordinal))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         routes.push(ChangeStreamWriteLayoutRoute {
             route_id: route.route_id(),
             cohort_id: route.cohort_id(),
             accepted_effects: route.accepted_effects().to_vec(),
-            input_ordinals: route.input_ordinals().to_vec(),
+            input_ordinals,
             partition_input_tokens: route.partition_fields().to_vec(),
             sink,
         });
@@ -1604,7 +1632,16 @@ fn build_merge_mor_change_event_expand_plan(
             expr: Some(pos_expr),
         },
     ];
-    let mut reuse_assignments = Vec::with_capacity(target_columns.len() + 2);
+    let mut reuse_assignments = vec![
+        ChangeEventOutputExpr {
+            output_column_id: file_output.column_id,
+            expr: Some(file_expr),
+        },
+        ChangeEventOutputExpr {
+            output_column_id: pos_output.column_id,
+            expr: Some(pos_expr),
+        },
+    ];
     let mut fresh_assignments = Vec::with_capacity(target_columns.len());
     for (name, output) in &target_outputs {
         let old_expr = child_column_expr(
@@ -2721,6 +2758,7 @@ fn build_cow_update_distributed_execution(
         Arc::new(
             crate::connector::iceberg::write_service::IcebergCowWriteReportCommitter::new(
                 Arc::clone(&commit_executor),
+                entry.clone(),
             ),
         );
     let services = state
@@ -3777,6 +3815,7 @@ fn prepare_cow_merge_operation(
         Arc::new(
             crate::connector::iceberg::write_service::IcebergCowWriteReportCommitter::new(
                 commit_executor,
+                entry.clone(),
             ),
         );
     let services = state

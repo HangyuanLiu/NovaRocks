@@ -6165,6 +6165,10 @@ pub(crate) fn prepare_iceberg_row_mutation(
             }
         }
     };
+    // A MERGE that can append has no target identity or before-image for its
+    // Insert rows.  The signed match layout therefore declares precisely those
+    // fields nullable; Delete/Replace validation still rejects null keys.
+    let insert_eligible = request.intent.accepts(ConnectorRowMutationEffect::Insert);
     let identity_fields = iceberg_metadata_arrow_fields(&payload.metadata_columns)?
         .into_iter()
         .enumerate()
@@ -6177,7 +6181,10 @@ pub(crate) fn prepare_iceberg_row_mutation(
             hasher.update((ordinal as u64).to_be_bytes());
             ConnectorMutationSourceField::new(
                 ConnectorWriteFieldToken::from_bytes(hasher.finalize().into()),
-                field.as_ref().clone(),
+                field
+                    .as_ref()
+                    .clone()
+                    .with_nullable(field.is_nullable() || insert_eligible),
                 ordinal as u32,
             )
         })
@@ -6234,7 +6241,10 @@ pub(crate) fn prepare_iceberg_row_mutation(
         .map(|(ordinal, field)| {
             ConnectorMutationTargetField::new(
                 iceberg_row_mutation_field_token(owner, &request.table, b"before", ordinal),
-                field.as_ref().clone(),
+                field
+                    .as_ref()
+                    .clone()
+                    .with_nullable(field.is_nullable() || insert_eligible),
                 target_start + u32::try_from(ordinal).expect("target ordinal fits u32"),
             )
         })
@@ -6416,23 +6426,30 @@ fn activate_iceberg_direct_row_mutation(
                     iceberg_row_mutation_direct_cohort(preparation, b"mor-delete")?,
                     b"mor-delete",
                     delete_effects,
-                    iceberg_position_input(preparation)?,
+                    iceberg_mor_delete_input(preparation)?,
                     iceberg_position_partition_tokens(preparation)?,
                 )?);
             }
-            let data_effects = admitted_effects(
-                preparation,
-                &[
-                    ConnectorRowMutationEffect::Replace,
-                    ConnectorRowMutationEffect::Insert,
-                ],
-            );
-            if !data_effects.is_empty() {
+            let replacement_effects =
+                admitted_effects(preparation, &[ConnectorRowMutationEffect::Replace]);
+            if !replacement_effects.is_empty() {
                 routes.push(iceberg_row_mutation_route(
                     preparation,
-                    iceberg_row_mutation_direct_cohort(preparation, b"mor-data")?,
-                    b"mor-data",
-                    data_effects,
+                    iceberg_row_mutation_direct_cohort(preparation, b"mor-replacement")?,
+                    b"mor-replacement",
+                    replacement_effects,
+                    iceberg_cow_rewrite_input(preparation)?,
+                    Vec::new(),
+                )?);
+            }
+            let insert_effects =
+                admitted_effects(preparation, &[ConnectorRowMutationEffect::Insert]);
+            if !insert_effects.is_empty() {
+                routes.push(iceberg_row_mutation_route(
+                    preparation,
+                    iceberg_row_mutation_direct_cohort(preparation, b"mor-insert")?,
+                    b"mor-insert",
+                    insert_effects,
                     ConnectorWriteInputShape::Data {
                         fields: target_bindings(preparation.match_contract().after_fields()),
                     },
@@ -6460,18 +6477,18 @@ fn activate_iceberg_cow_row_mutation(
     }
     selection.validate()?;
     let (rewrite_rows, has_append) = iceberg_cow_selection_groups(preparation, selection)?;
-    let base_snapshot_id = iceberg_row_mutation_snapshot(preparation)?;
     let mut routes = Vec::new();
     let mut descriptors = Vec::new();
     let mut recipes = Vec::new();
+    // A COW rewrite re-emits every live row from an old data file.  Preserve
+    // the row lineage alongside the replacement data so the writer retains
+    // the stable row-id and sequence-number semantics of the rewritten file.
     let rewrite_preparation = ConnectorWritePreparation::try_new(
         preparation.owner().clone(),
         preparation.table().clone(),
         ConnectorWriteIntent::RowDelta,
         preparation.base_version().clone(),
-        ConnectorWriteInputShape::Data {
-            fields: target_bindings(preparation.match_contract().after_fields()),
-        },
+        iceberg_cow_rewrite_input(preparation)?,
         iceberg_row_mutation_route_payload(preparation, b"cow-rewrite"),
     )?;
     for (old_file, row_ids) in rewrite_rows {
@@ -6504,7 +6521,7 @@ fn activate_iceberg_cow_row_mutation(
         recipes.push(ConnectorRowMutationCohortRecipe::try_new(
             cohort_id,
             route_id,
-            iceberg_cow_recipe_payload(b"rewrite", &old_file, &row_ids, base_snapshot_id)?,
+            iceberg_cow_recipe_payload(b"rewrite", &old_file, &row_ids)?,
         )?);
         routes.push(route);
     }
@@ -6542,7 +6559,7 @@ fn activate_iceberg_cow_row_mutation(
         recipes.push(ConnectorRowMutationCohortRecipe::try_new(
             cohort_id,
             route_id,
-            iceberg_cow_recipe_payload(b"append", "", &[], base_snapshot_id)?,
+            iceberg_cow_recipe_payload(b"append", "", &[])?,
         )?);
         routes.push(route);
     }
@@ -6701,24 +6718,21 @@ struct IcebergCowRecipePayloadV1 {
     role: String,
     old_file: String,
     matched_row_ids: Vec<i64>,
-    base_snapshot_id: i64,
 }
 
 fn iceberg_cow_recipe_payload(
     role: &[u8],
     old_file: &str,
     row_ids: &[i64],
-    base_snapshot_id: i64,
 ) -> Result<Bytes, ConnectorError> {
     let role = std::str::from_utf8(role).map_err(|_| {
         invalid_iceberg_row_mutation_activation("Iceberg COW recipe role is not UTF-8")
     })?;
     serde_json::to_vec(&IcebergCowRecipePayloadV1 {
-        version: 1,
+        version: 2,
         role: role.to_string(),
         old_file: old_file.to_string(),
         matched_row_ids: row_ids.to_vec(),
-        base_snapshot_id,
     })
     .map(Bytes::from)
     .map_err(|error| {
@@ -6732,9 +6746,8 @@ fn decode_iceberg_cow_recipe_payload(
     let recipe = serde_json::from_slice::<IcebergCowRecipePayloadV1>(payload).map_err(|error| {
         invalid_iceberg_row_mutation_activation(format!("decode Iceberg COW recipe: {error}"))
     })?;
-    if recipe.version != 1
+    if recipe.version != 2
         || !matches!(recipe.role.as_str(), "rewrite" | "append")
-        || recipe.base_snapshot_id <= 0
         || (recipe.role == "rewrite"
             && (recipe.old_file.is_empty() || recipe.matched_row_ids.is_empty()))
         || (recipe.role == "append"
@@ -6756,11 +6769,98 @@ fn decode_iceberg_cow_recipe_payload(
     Ok(recipe)
 }
 
+/// Resolve the physical COW base solely inside the Iceberg adapter.  The
+/// recipe deliberately contains only opaque cohort membership: a branch head
+/// is a provider metadata fact, not a Core-carried execution route.
+fn iceberg_row_mutation_base_snapshot_from_preparation(
+    preparation: &ConnectorWritePreparation,
+    target_ref: &str,
+) -> Result<i64, ConnectorError> {
+    let payload: TablePayload = decode_payload(
+        preparation.table().payload(),
+        "admitted Iceberg COW preparation table",
+    )?;
+    let table = payload.table_info.ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg COW preparation is missing its frozen table descriptor",
+        )
+    })?;
+    let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "admitted Iceberg COW preparation is missing frozen metadata",
+        )
+    })?;
+    let metadata: TableMetadata = serde_json::from_str(serialized).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode admitted Iceberg COW preparation metadata: {error}"),
+        )
+    })?;
+    iceberg_ref_snapshot_from_metadata(&metadata, target_ref)
+}
+
+fn iceberg_ref_snapshot_from_metadata(
+    metadata: &TableMetadata,
+    target_ref: &str,
+) -> Result<i64, ConnectorError> {
+    if target_ref.eq_ignore_ascii_case("main") {
+        return metadata.current_snapshot_id().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg COW preparation table has no current snapshot",
+            )
+        });
+    }
+    let reference = metadata.refs().get(target_ref).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::NotFound,
+            format!("Iceberg COW target branch `{target_ref}` does not exist in frozen metadata"),
+        )
+    })?;
+    if !reference.is_branch() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!("Iceberg COW target ref `{target_ref}` is not a branch"),
+        ));
+    }
+    Ok(reference.snapshot_id)
+}
+
 fn target_bindings(fields: &[ConnectorMutationTargetField]) -> Vec<ConnectorWriteFieldBinding> {
     fields
         .iter()
         .map(|field| ConnectorWriteFieldBinding::new(field.token(), field.field().clone()))
         .collect()
+}
+
+fn iceberg_cow_rewrite_input(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<ConnectorWriteInputShape, ConnectorError> {
+    let contract = preparation.match_contract();
+    let lineage = [
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+    ]
+    .into_iter()
+    .map(|name| {
+        contract
+            .identity_fields()
+            .iter()
+            .find(|field| field.field().name().eq_ignore_ascii_case(name))
+            .map(|field| ConnectorWriteFieldBinding::new(field.token(), field.field().clone()))
+            .ok_or_else(|| {
+                invalid_iceberg_row_mutation_activation(format!(
+                    "Iceberg COW identity lacks `{name}`"
+                ))
+            })
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok(ConnectorWriteInputShape::RowLineage {
+        data_fields: target_bindings(contract.after_fields()),
+        row_identity_fields: lineage,
+    })
 }
 
 fn iceberg_position_input(
@@ -6785,19 +6885,52 @@ fn iceberg_position_input(
     Ok(match preparation.strategy() {
         ConnectorRowMutationStrategy::DeletionVector => ConnectorWriteInputShape::DeletionVector {
             identity_fields: vec![
-                ConnectorWriteFieldBinding::new(file.token(), file.field().clone()),
-                ConnectorWriteFieldBinding::new(pos.token(), pos.field().clone()),
+                ConnectorWriteFieldBinding::new(
+                    file.token(),
+                    file.field().clone().with_nullable(false),
+                ),
+                ConnectorWriteFieldBinding::new(
+                    pos.token(),
+                    pos.field().clone().with_nullable(false),
+                ),
             ],
             partition_source_fields,
         },
         _ => ConnectorWriteInputShape::PositionDelete {
             identity_fields: vec![
-                ConnectorWriteFieldBinding::new(file.token(), file.field().clone()),
-                ConnectorWriteFieldBinding::new(pos.token(), pos.field().clone()),
+                ConnectorWriteFieldBinding::new(
+                    file.token(),
+                    file.field().clone().with_nullable(false),
+                ),
+                ConnectorWriteFieldBinding::new(
+                    pos.token(),
+                    pos.field().clone().with_nullable(false),
+                ),
             ],
             partition_source_fields,
         },
     })
+}
+
+fn iceberg_mor_delete_input(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<ConnectorWriteInputShape, ConnectorError> {
+    // MOR is admitted only for Iceberg v3 row-lineage tables.  Its delete
+    // half therefore uses the v3 deletion-vector writer, while its data half
+    // remains an ordinary row-lineage append route.
+    match iceberg_position_input(preparation)? {
+        ConnectorWriteInputShape::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        } => Ok(ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        }),
+        input @ ConnectorWriteInputShape::DeletionVector { .. } => Ok(input),
+        _ => Err(invalid_iceberg_row_mutation_activation(
+            "Iceberg MOR delete route did not derive a position identity input",
+        )),
+    }
 }
 
 fn iceberg_position_partition_bindings(
@@ -7350,14 +7483,55 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
     preparation: &ConnectorWritePreparation,
     target_ref: &str,
     entry: &IcebergCatalogEntry,
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    _table: &novarocks_connector_iceberg::iceberg::table::Table,
     commit_executor: Arc<dyn IcebergWriteReportCommitter>,
 ) -> Result<(), ConnectorError> {
     preparation.validate()?;
-    let (sink_spec, equality_columns) =
+    let expected_snapshot_id =
+        iceberg_row_mutation_base_snapshot_from_preparation(preparation, target_ref)?;
+    let table_target: TablePayload = decode_payload(
+        preparation.table().payload(),
+        "admitted Iceberg row-write service table",
+    )?;
+    let table_info = table_target.table_info.ok_or_else(|| {
+        invalid_iceberg_write_activation(
+            "admitted Iceberg row-write service is missing its frozen table descriptor",
+        )
+    })?;
+    // The generic carrier never asks Core to refresh or interpret Iceberg
+    // metadata.  Re-open here, under the provider's own cache ownership, and
+    // fail before staging if the branch head differs from the signed match.
+    entry.invalidate_table_cache(&table_info.namespace, &table_info.table);
+    let table =
+        super::catalog::registry::load_table(entry, &table_info.namespace, &table_info.table)
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    format!("reload Iceberg row-mutation target at activation: {error}"),
+                )
+            })?
+            .table;
+    let actual_snapshot_id = iceberg_ref_snapshot_from_metadata(table.metadata(), target_ref)?;
+    if actual_snapshot_id != expected_snapshot_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!(
+                "Iceberg row-mutation target ref `{target_ref}` changed after preparation: expected snapshot {expected_snapshot_id}, got {actual_snapshot_id}",
+            ),
+        ));
+    }
+    let (mut sink_spec, equality_columns) =
         iceberg_row_write_sink_spec_from_preparation(preparation, entry, table.metadata())?;
     validate_preparation_table_against_open_table(preparation, table.metadata())?;
-    let snapshot_id = sink_spec.iceberg.current_snapshot_id;
+    // The preparation freezes the table metadata (including branch refs), but
+    // its table descriptor's current snapshot is necessarily `main`. Resolve
+    // the selected ref inside the provider before deriving BE-only partition
+    // and existing-DV facts.  In particular a branch COW rewrite may have
+    // introduced data files that are absent from main.
+    let snapshot_id = Some(expected_snapshot_id);
+    sink_spec
+        .set_planned_snapshot_id(snapshot_id)
+        .map_err(invalid_iceberg_write_activation)?;
     let writer_handle_payload = match sink_spec.mode {
         IcebergWriteSinkMode::PositionDeletes => {
             let position_index_storage =
@@ -7379,7 +7553,7 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
         IcebergWriteSinkMode::DeletionVectors => {
             super::change_stream_write::frozen_deletion_vector_handle_payload(
                 &sink_spec,
-                table,
+                &table,
                 entry,
                 snapshot_id,
             )
@@ -7578,18 +7752,20 @@ pub(crate) fn register_iceberg_cow_write_service_from_execution_plan(
             ));
         }
         let decoded = decode_iceberg_cow_recipe_payload(recipe.payload())?;
+        let base_snapshot_id =
+            iceberg_row_mutation_base_snapshot_from_preparation(route.preparation(), target_ref)?;
         cohorts.push(match decoded.role.as_str() {
             "rewrite" => IcebergCowWriteCohort::Rewrite {
                 cohort_id: recipe.cohort_id(),
                 preparation: route.preparation().clone(),
-                base_snapshot_id: decoded.base_snapshot_id,
+                base_snapshot_id,
                 old_file: decoded.old_file,
                 matched_row_ids: decoded.matched_row_ids,
             },
             "append" => IcebergCowWriteCohort::Append {
                 cohort_id: recipe.cohort_id(),
                 preparation: route.preparation().clone(),
-                base_snapshot_id: decoded.base_snapshot_id,
+                base_snapshot_id,
             },
             _ => unreachable!("recipe decoder validates roles"),
         });
@@ -10286,7 +10462,6 @@ mod tests {
             b"rewrite",
             "s3://warehouse/orders/data-00042.parquet",
             &[9, 3, 17],
-            77,
         )
         .expect("encode COW recipe");
         let decoded = decode_iceberg_cow_recipe_payload(&payload).expect("decode COW recipe");
@@ -10294,7 +10469,6 @@ mod tests {
         assert_eq!(decoded.role, "rewrite");
         assert_eq!(decoded.old_file, "s3://warehouse/orders/data-00042.parquet");
         assert_eq!(decoded.matched_row_ids, vec![9, 3, 17]);
-        assert_eq!(decoded.base_snapshot_id, 77);
     }
 
     #[test]

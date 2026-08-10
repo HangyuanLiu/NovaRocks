@@ -615,6 +615,10 @@ pub struct SplitDataStreamSinkProgram {
     sinks: Vec<DataStreamSinkBranchProgram>,
     split_exprs: Vec<ExprId>,
     arena: ExprArena,
+    /// Logical row-mutation routes are filters and can intentionally overlap
+    /// (a Replace fans out to delete and replacement-data routes). Ordinary
+    /// stream splits retain their historical first-match partition semantics.
+    fanout: bool,
 }
 
 impl SplitDataStreamSinkProgram {
@@ -623,10 +627,20 @@ impl SplitDataStreamSinkProgram {
         split_exprs: Vec<ExprId>,
         arena: ExprArena,
     ) -> Result<Self, ExecPlanBuildError> {
+        Self::try_new_with_fanout(sinks, split_exprs, arena, false)
+    }
+
+    pub fn try_new_with_fanout(
+        sinks: Vec<DataStreamSinkBranchProgram>,
+        split_exprs: Vec<ExprId>,
+        arena: ExprArena,
+        fanout: bool,
+    ) -> Result<Self, ExecPlanBuildError> {
         let program = Self {
             sinks,
             split_exprs,
             arena,
+            fanout,
         };
         program.validate()?;
         Ok(program)
@@ -666,6 +680,10 @@ impl SplitDataStreamSinkProgram {
 
     pub fn split_exprs(&self) -> &[ExprId] {
         &self.split_exprs
+    }
+
+    pub const fn fanout(&self) -> bool {
+        self.fanout
     }
 
     pub const fn arena(&self) -> &ExprArena {

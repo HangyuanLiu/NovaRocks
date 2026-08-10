@@ -835,7 +835,8 @@ impl ConnectorBatchWriter for IcebergDeletionVectorBatchWriter {
                 return Err(error(
                     ConnectorErrorKind::InvalidRequest,
                     format!(
-                        "Iceberg deletion-vector handle has no frozen partition for data file `{referenced}`"
+                        "Iceberg deletion-vector handle has no frozen partition for data file `{referenced}` (frozen file count={})",
+                        self.handle.partitions.len(),
                     ),
                 ));
             }

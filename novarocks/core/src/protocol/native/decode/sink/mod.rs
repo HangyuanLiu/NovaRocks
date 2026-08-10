@@ -851,15 +851,14 @@ fn decode_change_stream_router_program(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        SplitDataStreamSinkProgram::try_new(streams, split_exprs, partition_arena).map_err(
-            |error| {
+        SplitDataStreamSinkProgram::try_new_with_fanout(streams, split_exprs, partition_arena, true)
+            .map_err(|error| {
                 NativeFragmentLeafDecodeError::at_field(
                     ProtocolErrorKind::InconsistentFields,
                     "branches",
                     error,
                 )
-            },
-        )
+            })
     })();
     decoded
 }
