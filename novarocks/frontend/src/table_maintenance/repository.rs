@@ -4204,6 +4204,49 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    pub async fn start_staging_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::StartStaging,
+            &[DistributedRewriteOperationState::Planned],
+            DistributedRewriteOperationState::Staging,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn checkpoint_attempt_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: DistributedRewriteAttemptCheckpoint,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_checkpoint(&checkpoint)?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Checkpoint,
+            &[DistributedRewriteOperationState::Staging],
+            DistributedRewriteOperationState::Staging,
+            None,
+            Some(checkpoint),
+            0,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     pub async fn get(
         &self,
         operation_id: Uuid,
@@ -4467,6 +4510,32 @@ impl DistributedRewriteOperationRepository {
             action,
             operation_id,
             "transition distributed rewrite operation",
+        )
+        .await
+    }
+
+    async fn rewrite_transition_fenced(
+        &self,
+        operation_id: Uuid,
+        action: StoredDistributedRewriteTransactionActionV3,
+        allowed: &[DistributedRewriteOperationState],
+        next: DistributedRewriteOperationState,
+        payload: Option<RewriteTransitionPayload>,
+        checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_authority(&authority)?;
+        self.rewrite_transition(
+            operation_id,
+            action,
+            allowed,
+            next,
+            payload,
+            checkpoint,
+            now_ms,
+            Some((authority, validator)),
         )
         .await
     }

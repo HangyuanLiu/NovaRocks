@@ -515,12 +515,27 @@ async fn v1_child_rewrite_copies_the_claimed_authority_without_a_second_lease() 
                 cohort_count: 1,
             },
             12,
-            authority,
-            validator,
+            authority.clone(),
+            Arc::clone(&validator),
         )
         .await
         .unwrap();
     assert_eq!(planned.state, DistributedRewriteOperationState::Planned);
+    let error = repository
+        .start_staging_fenced(
+            child.operation_id,
+            13,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    let staging = repository
+        .start_staging_fenced(child.operation_id, 13, authority, validator)
+        .await
+        .unwrap();
+    assert_eq!(staging.state, DistributedRewriteOperationState::Staging);
 }
 
 #[tokio::test]
