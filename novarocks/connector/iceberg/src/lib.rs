@@ -30,6 +30,7 @@ pub const PROVIDER_ID: &str = "iceberg";
 pub mod access_binding;
 pub mod catalog_cache;
 pub mod catalog_config;
+pub mod catalog_control;
 pub mod catalog_runtime;
 pub mod commit;
 pub mod default_value;

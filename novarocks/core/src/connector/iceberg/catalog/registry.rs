@@ -68,12 +68,10 @@ pub(crate) struct IcebergCatalogRegistry {
 
 #[derive(Clone)]
 pub(crate) struct IcebergCatalogEntry {
-    /// Provider-owned catalog configuration. Core owns only SQL projections
-    /// and application caches below; it must not re-model catalog credentials,
-    /// endpoints, or warehouse identity.
-    configuration: IcebergCatalogConfiguration,
-    physical_table_cache: novarocks_connector_iceberg::loaded_table::IcebergPhysicalTableCache,
-    data_files_cache: novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache,
+    /// Provider-owned generation state. Core owns only the SQL projection
+    /// adapter and must not re-model catalog credentials, endpoint, warehouse,
+    /// or physical cache state.
+    control_state: novarocks_connector_iceberg::catalog_control::IcebergCatalogControlState,
 }
 
 #[derive(Clone, Debug)]
@@ -177,7 +175,7 @@ impl IcebergCatalogRegistry {
 
 impl IcebergCatalogEntry {
     pub(crate) fn configuration(&self) -> &IcebergCatalogConfiguration {
-        &self.configuration
+        self.control_state.configuration()
     }
 
     pub(crate) fn properties(&self) -> &[(String, String)] {
@@ -223,14 +221,13 @@ impl IcebergCatalogEntry {
             normalize_identifier(namespace_name),
             normalize_identifier(table_name),
         ) {
-            self.physical_table_cache.invalidate(&ns, &tbl);
-            self.data_files_cache.invalidate_table(&ns, &tbl);
+            self.control_state.invalidate_table(&ns, &tbl);
         }
     }
 
     #[cfg(test)]
     pub(crate) fn poison_table_cache_for_test(&self) {
-        self.physical_table_cache.poison_for_test();
+        self.control_state.physical_table_cache().poison_for_test();
     }
 
     pub(crate) fn cached_data_files(
@@ -239,7 +236,8 @@ impl IcebergCatalogEntry {
         table_name: &str,
         snapshot_id: Option<i64>,
     ) -> Result<Option<Vec<DataFileWithStats>>, String> {
-        self.data_files_cache
+        self.control_state
+            .data_files_cache()
             .get(namespace_name, table_name, snapshot_id)
     }
 
@@ -250,8 +248,12 @@ impl IcebergCatalogEntry {
         snapshot_id: Option<i64>,
         data_files: Vec<DataFileWithStats>,
     ) -> Result<(), String> {
-        self.data_files_cache
-            .insert(namespace_name, table_name, snapshot_id, data_files)
+        self.control_state.data_files_cache().insert(
+            namespace_name,
+            table_name,
+            snapshot_id,
+            data_files,
+        )
     }
 }
 
@@ -1030,7 +1032,11 @@ pub(crate) fn load_table(
     let ns_name = normalize_identifier(namespace_name)?;
     let tbl_name = normalize_identifier(table_name)?;
 
-    if let Some(physical) = entry.physical_table_cache.get(&ns_name, &tbl_name)? {
+    if let Some(physical) = entry
+        .control_state
+        .physical_table_cache()
+        .get(&ns_name, &tbl_name)?
+    {
         return project_loaded_table(physical, &ns_name, &tbl_name);
     }
 
@@ -1101,7 +1107,8 @@ pub(crate) fn load_table(
         entry.object_store_config.clone(),
     );
     entry
-        .physical_table_cache
+        .control_state
+        .physical_table_cache()
         .insert(&ns_name, &tbl_name, physical.clone())?;
     project_loaded_table(physical, &ns_name, &tbl_name)
 }
@@ -1351,11 +1358,10 @@ pub(crate) fn build_catalog_entry(
 ) -> Result<IcebergCatalogEntry, String> {
     let configuration = parse_catalog_configuration(catalog_name, properties)?;
     Ok(IcebergCatalogEntry {
-        configuration,
-        physical_table_cache:
-            novarocks_connector_iceberg::loaded_table::IcebergPhysicalTableCache::default(),
-        data_files_cache:
-            novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache::default(),
+        control_state:
+            novarocks_connector_iceberg::catalog_control::IcebergCatalogControlState::new(
+                configuration,
+            ),
     })
 }
 
@@ -1400,7 +1406,7 @@ pub(crate) async fn build_hms_catalog(
 }
 
 fn provider_catalog_configuration(entry: &IcebergCatalogEntry) -> IcebergCatalogConfiguration {
-    entry.configuration.clone()
+    entry.configuration().clone()
 }
 
 /// Synchronous dispatcher that returns an `Arc<dyn Catalog>` regardless of
@@ -2769,19 +2775,18 @@ mod data_file_with_stats_tests {
     #[test]
     fn data_file_cache_is_snapshot_scoped_and_table_invalidation_clears_it() {
         let entry = IcebergCatalogEntry {
-            configuration: IcebergCatalogConfiguration {
-                kind: IcebergCatalogKind::Hadoop,
-                warehouse_uri: "file:///tmp/warehouse".to_string(),
-                rest_uri: None,
-                hms_uris: None,
-                properties: vec![],
-                object_store_config: None,
-                warehouse_path: PathBuf::from("/tmp/warehouse"),
-            },
-            physical_table_cache:
-                novarocks_connector_iceberg::loaded_table::IcebergPhysicalTableCache::default(),
-            data_files_cache:
-                novarocks_connector_iceberg::catalog_cache::IcebergDataFilesCache::default(),
+            control_state:
+                novarocks_connector_iceberg::catalog_control::IcebergCatalogControlState::new(
+                    IcebergCatalogConfiguration {
+                        kind: IcebergCatalogKind::Hadoop,
+                        warehouse_uri: "file:///tmp/warehouse".to_string(),
+                        rest_uri: None,
+                        hms_uris: None,
+                        properties: vec![],
+                        object_store_config: None,
+                        warehouse_path: PathBuf::from("/tmp/warehouse"),
+                    },
+                ),
         };
         entry
             .cache_data_files("Db1", "Tbl1", Some(7), vec![data_file("file:///a.parquet")])
