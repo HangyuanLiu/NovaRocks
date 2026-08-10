@@ -341,6 +341,11 @@ pub(crate) struct StandaloneState {
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned durable application boundary for typed statistics commands.
     pub(crate) statistics_application: Arc<dyn statistics_application::StatisticsApplicationPort>,
+    /// Frontend-owned catalog attachment control plane. Until CP-2 cutover,
+    /// standalone/test composition may leave this absent and exercise the
+    /// legacy handler; production composition installs it explicitly.
+    pub(crate) catalog_application:
+        Option<Arc<dyn crate::catalog_application::CatalogApplicationPort>>,
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
@@ -416,6 +421,7 @@ impl Default for StandaloneState {
             statistics_application: Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
+            catalog_application: None,
             connector_control: Arc::clone(&connector_control)
                 as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
             connector_control_factory_resolver: connector_control
@@ -1269,6 +1275,10 @@ pub struct StandaloneOpenServices {
     /// unavailable implementation so non-frontend compositions fail closed.
     pub statistics_application:
         std::sync::Arc<dyn statistics_application::StatisticsApplicationPort>,
+    /// Frontend-owned catalog attachment command and admission boundary.
+    /// CP-2 cutover makes this mandatory for production composition.
+    pub catalog_application:
+        Option<std::sync::Arc<dyn crate::catalog_application::CatalogApplicationPort>>,
     /// Receives the Core-owned target resolver once connector control is
     /// ready. It is intentionally distinct from command dispatch.
     pub statistics_target_resolver_sink:
@@ -1351,6 +1361,7 @@ impl StandaloneOpenServices {
             statistics_application: std::sync::Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
+            catalog_application: None,
             statistics_target_resolver_sink: None,
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
@@ -1388,6 +1399,14 @@ impl StandaloneOpenServices {
         >,
     ) -> Self {
         self.statistics_application = statistics_application;
+        self
+    }
+
+    pub fn with_catalog_application(
+        mut self,
+        catalog_application: std::sync::Arc<dyn crate::catalog_application::CatalogApplicationPort>,
+    ) -> Self {
+        self.catalog_application = Some(catalog_application);
         self
     }
 
@@ -1509,6 +1528,7 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             statistics_application,
+            catalog_application,
             statistics_target_resolver_sink,
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
@@ -1546,6 +1566,7 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             statistics_application,
+            catalog_application,
             connector_control,
             connector_control_factory_resolver,
             unified_statistics: Arc::new(
@@ -2813,6 +2834,20 @@ impl StandaloneSession {
             .lock()
             .map_err(|error| format!("catalog attachment lifecycle lock: {error}"))?;
         let normalized_catalog = normalize_identifier(&stmt.name)?;
+        if let Some(application) = &self.inner.catalog_application {
+            let instance_id =
+                novarocks_spi::connector::ConnectorInstanceId::parse(&normalized_catalog)
+                    .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+            application
+                .create_catalog(crate::catalog_application::CatalogCreateCommand {
+                    instance_id,
+                    display_name: stmt.name,
+                    properties: stmt.properties,
+                    if_not_exists: stmt.if_not_exists,
+                })
+                .map_err(|error| error.to_string())?;
+            return Ok(StatementResult::Ok);
+        }
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&normalized_catalog)
             .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
         match self
@@ -6163,6 +6198,10 @@ mod tests {
         StandaloneSession, StandaloneState, StatementResult, dispatch_statement,
         register_connector_backends,
     };
+    use crate::catalog_application::{
+        CatalogAdmission, CatalogApplicationError, CatalogApplicationPort, CatalogCreateCommand,
+        CatalogDropCommand, CatalogRuntimeObservation,
+    };
     use crate::engine::statistics::{
         CatalogTableStatistics, StatisticsEngine, StatisticsInsertObservation,
         StatisticsRequestContext, StatisticsService, StatisticsStatementResult,
@@ -6196,6 +6235,42 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct RecordingCatalogApplication {
+        creates: Mutex<Vec<CatalogCreateCommand>>,
+        drops: Mutex<Vec<CatalogDropCommand>>,
+    }
+
+    impl CatalogApplicationPort for RecordingCatalogApplication {
+        fn create_catalog(
+            &self,
+            command: CatalogCreateCommand,
+        ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+            let observation = CatalogRuntimeObservation {
+                attachment_id: Uuid::now_v7(),
+                instance_id: command.instance_id.clone(),
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("provider"),
+                generation: 1,
+            };
+            self.creates.lock().expect("creates").push(command);
+            Ok(observation)
+        }
+
+        fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError> {
+            self.drops.lock().expect("drops").push(command);
+            Ok(())
+        }
+
+        fn admit_catalog(
+            &self,
+            _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        ) -> CatalogAdmission {
+            CatalogAdmission::Absent
+        }
+    }
 
     #[derive(Default)]
     struct RecordingStatisticsApplicationPort {
@@ -6702,6 +6777,39 @@ mod tests {
             .expect("injected coordinator serves the planned query");
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn catalog_create_and_drop_route_through_the_injected_application_port() {
+        let application = Arc::new(RecordingCatalogApplication::default());
+        let state = Arc::new(StandaloneState {
+            catalog_application: Some(Arc::clone(&application) as Arc<dyn CatalogApplicationPort>),
+            ..Default::default()
+        });
+        let session = StandaloneSession {
+            inner: Arc::clone(&state),
+        };
+
+        session
+            .handle_create_catalog(crate::sql::parser::ast::CreateCatalogStmt {
+                name: "Warehouse".to_string(),
+                properties: vec![("type".to_string(), "iceberg".to_string())],
+                if_not_exists: true,
+            })
+            .expect("frontend catalog application accepts create");
+        super::execute_drop_catalog_statement(&state, "WAREHOUSE", true)
+            .expect("frontend catalog application accepts drop");
+
+        let creates = application.creates.lock().expect("creates");
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].instance_id.as_str(), "warehouse");
+        assert_eq!(creates[0].display_name, "Warehouse");
+        assert!(creates[0].if_not_exists);
+        drop(creates);
+        let drops = application.drops.lock().expect("drops");
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].instance_id.as_str(), "warehouse");
+        assert!(drops[0].if_exists);
     }
 
     #[test]

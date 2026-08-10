@@ -941,11 +941,22 @@ pub(crate) fn execute_drop_catalog_statement(
     catalog_name: &str,
     if_exists: bool,
 ) -> Result<StatementResult, String> {
+    let normalized_catalog = normalize_identifier(catalog_name)?;
+    if let Some(application) = &state.catalog_application {
+        let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
+            .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+        application
+            .drop_catalog(crate::catalog_application::CatalogDropCommand {
+                instance_id,
+                if_exists,
+            })
+            .map_err(|error| error.to_string())?;
+        return Ok(StatementResult::Ok);
+    }
     let _lifecycle = state
         .catalog_attachment_lifecycle
         .lock()
         .map_err(|error| format!("catalog attachment lifecycle lock: {error}"))?;
-    let normalized_catalog = normalize_identifier(catalog_name)?;
     let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
         .map_err(|error| format!("invalid connector instance ID: {error}"))?;
     match state
