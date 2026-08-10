@@ -9,8 +9,66 @@ use std::num::NonZeroUsize;
 use bytes::Bytes;
 use novarocks_fs::{
     FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget, FileReadContext,
-    FileReadRange, FileReadRequest, FsAccessHandle, PhysicalPruning, open_file_reader,
+    FileReadRange, FileReadRequest, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
+    PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
 };
+
+use crate::scan_model::{
+    IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
+    IcebergPhysicalPredicateValue,
+};
+
+/// Lower provider-owned Iceberg predicates into connector-neutral physical
+/// file predicates.  Field IDs remain authoritative across Iceberg renames.
+pub fn physical_predicates_to_file_predicates(
+    predicates: &[IcebergPhysicalPredicate],
+) -> Vec<ScanPredicate> {
+    predicates
+        .iter()
+        .filter_map(|predicate| {
+            let value = |value: &IcebergPhysicalPredicateValue| match value {
+                IcebergPhysicalPredicateValue::Boolean(value) => {
+                    MinMaxPredicateValue::Boolean(*value)
+                }
+                IcebergPhysicalPredicateValue::Int32(value) => MinMaxPredicateValue::Int32(*value),
+                IcebergPhysicalPredicateValue::Int64(value) => MinMaxPredicateValue::Int64(*value),
+                // Parquet exposes DATE statistics as INT32 day counts.
+                IcebergPhysicalPredicateValue::Date32(value) => MinMaxPredicateValue::Int32(*value),
+            };
+            let domain = match &predicate.domain {
+                IcebergPhysicalPredicateDomain::Range { op, value: literal } => {
+                    ScanPredicateDomain::Range {
+                        op: match op {
+                            IcebergPhysicalPredicateOp::Eq => MinMaxPredicateOp::Eq,
+                            IcebergPhysicalPredicateOp::Lt => MinMaxPredicateOp::Lt,
+                            IcebergPhysicalPredicateOp::Le => MinMaxPredicateOp::Le,
+                            IcebergPhysicalPredicateOp::Gt => MinMaxPredicateOp::Gt,
+                            IcebergPhysicalPredicateOp::Ge => MinMaxPredicateOp::Ge,
+                        },
+                        value: value(literal),
+                    }
+                }
+                IcebergPhysicalPredicateDomain::DiscreteSet { values } => {
+                    let values = values.iter().map(value).collect::<Vec<_>>();
+                    if values.is_empty() {
+                        return None;
+                    }
+                    let min = values.first()?.clone();
+                    let max = values.last()?.clone();
+                    ScanPredicateDomain::DiscreteSet { values, min, max }
+                }
+            };
+            Some(
+                ScanPredicate::new(
+                    predicate.column.clone(),
+                    domain,
+                    ScanPredicateSource::Static,
+                )
+                .with_physical_field_id(predicate.field_id),
+            )
+        })
+        .collect()
+}
 
 pub fn read_parquet_batches(
     access: &FsAccessHandle,
@@ -85,4 +143,40 @@ pub fn read_bytes(
             async move { file.read(range, &cancellation).await },
         ))
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowers_static_predicates_by_iceberg_field_id() {
+        let predicates = physical_predicates_to_file_predicates(&[
+            IcebergPhysicalPredicate {
+                field_id: 7,
+                column: "renamed".to_string(),
+                domain: IcebergPhysicalPredicateDomain::Range {
+                    op: IcebergPhysicalPredicateOp::Ge,
+                    value: IcebergPhysicalPredicateValue::Date32(20_000),
+                },
+            },
+            IcebergPhysicalPredicate {
+                field_id: 8,
+                column: "empty".to_string(),
+                domain: IcebergPhysicalPredicateDomain::DiscreteSet { values: Vec::new() },
+            },
+        ]);
+
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].column(), "renamed");
+        assert_eq!(predicates[0].physical_field_id(), Some(7));
+        assert_eq!(predicates[0].source(), ScanPredicateSource::Static);
+        assert_eq!(
+            predicates[0].domain(),
+            &ScanPredicateDomain::Range {
+                op: MinMaxPredicateOp::Ge,
+                value: MinMaxPredicateValue::Int32(20_000),
+            }
+        );
+    }
 }

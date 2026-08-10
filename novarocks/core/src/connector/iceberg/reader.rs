@@ -35,8 +35,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileBatchReader, FileCancellation, FileError, FileErrorKind, FileFormat, FileIdentity,
     FileMetricsSnapshot, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPruning,
-    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
+    FileReadRequest, FsAccessHandle, PhysicalPruning, open_file_reader,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
@@ -51,11 +50,9 @@ use super::equality_delete::{
 use novarocks_connector_iceberg::delete_file::{
     delete_specs_for_data_file, included_positions_for_data_file,
 };
+use novarocks_connector_iceberg::file_reader::physical_predicates_to_file_predicates;
 use novarocks_connector_iceberg::position_delete::load_position_deletes_with_context;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
-    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
-};
+use novarocks_connector_iceberg::scan_model::{IcebergDataFileInfo, IcebergPhysicalPredicate};
 use novarocks_connector_iceberg::schema_mapping::{
     apply_name_mapping_to_schema as provider_apply_name_mapping_to_schema,
     field_id_for_arrow_field as provider_field_id_for_arrow_field,
@@ -288,56 +285,6 @@ impl IcebergBatchReader {
         }
         Ok(())
     }
-}
-
-fn physical_predicates_to_file_predicates(
-    predicates: &[IcebergPhysicalPredicate],
-) -> Vec<ScanPredicate> {
-    predicates
-        .iter()
-        .filter_map(|predicate| {
-            let value = |value: &IcebergPhysicalPredicateValue| match value {
-                IcebergPhysicalPredicateValue::Boolean(value) => {
-                    MinMaxPredicateValue::Boolean(*value)
-                }
-                IcebergPhysicalPredicateValue::Int32(value) => MinMaxPredicateValue::Int32(*value),
-                IcebergPhysicalPredicateValue::Int64(value) => MinMaxPredicateValue::Int64(*value),
-                // Parquet exposes DATE statistics as INT32 day counts.
-                IcebergPhysicalPredicateValue::Date32(value) => MinMaxPredicateValue::Int32(*value),
-            };
-            let domain = match &predicate.domain {
-                IcebergPhysicalPredicateDomain::Range { op, value: literal } => {
-                    ScanPredicateDomain::Range {
-                        op: match op {
-                            IcebergPhysicalPredicateOp::Eq => MinMaxPredicateOp::Eq,
-                            IcebergPhysicalPredicateOp::Lt => MinMaxPredicateOp::Lt,
-                            IcebergPhysicalPredicateOp::Le => MinMaxPredicateOp::Le,
-                            IcebergPhysicalPredicateOp::Gt => MinMaxPredicateOp::Gt,
-                            IcebergPhysicalPredicateOp::Ge => MinMaxPredicateOp::Ge,
-                        },
-                        value: value(literal),
-                    }
-                }
-                IcebergPhysicalPredicateDomain::DiscreteSet { values } => {
-                    let values = values.iter().map(value).collect::<Vec<_>>();
-                    if values.is_empty() {
-                        return None;
-                    }
-                    let min = values.first()?.clone();
-                    let max = values.last()?.clone();
-                    ScanPredicateDomain::DiscreteSet { values, min, max }
-                }
-            };
-            Some(
-                ScanPredicate::new(
-                    predicate.column.clone(),
-                    domain,
-                    ScanPredicateSource::Static,
-                )
-                .with_physical_field_id(predicate.field_id),
-            )
-        })
-        .collect()
 }
 
 impl ConnectorBatchReader for IcebergBatchReader {
