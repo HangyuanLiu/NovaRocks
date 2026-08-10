@@ -424,6 +424,10 @@ impl ConnectorWriteBaseVersion {
         }
         Ok(())
     }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
 }
 
 #[derive(Clone)]
@@ -1688,6 +1692,31 @@ pub trait ConnectorWriteControl: Send + Sync {
         ))
     }
 
+    /// Plans a logical row mutation under this exact write control generation.
+    /// This contract is intentionally separate from ordinary write preparation:
+    /// providers own strategy, identity, opaque routes, and cohorts.
+    fn prepare_row_mutation(
+        &self,
+        _request: super::ConnectorRowMutationPreparationRequest,
+    ) -> Result<super::ConnectorRowMutationPreparationOutcome, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement row-mutation preparation",
+        ))
+    }
+
+    /// Activates a sealed direct route set or COW preparation plus bounded
+    /// selection. Implementations must not obtain a new control generation.
+    fn activate_row_mutation(
+        &self,
+        _request: super::ConnectorRowMutationActivationRequest,
+    ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement row-mutation activation",
+        ))
+    }
+
     fn plan_write(
         &self,
         request: ConnectorWritePlanningRequest,
@@ -1766,6 +1795,42 @@ impl ConnectorWriteLease {
 
     pub fn control(&self) -> &Arc<dyn ConnectorWriteControl> {
         &self.control
+    }
+
+    pub fn prepare_row_mutation(
+        &self,
+        request: super::ConnectorRowMutationPreparationRequest,
+    ) -> Result<super::ConnectorRowMutationPreparationOutcome, ConnectorError> {
+        request.validate(&self.binding_key)?;
+        let outcome = self.control.prepare_row_mutation(request)?;
+        if let super::ConnectorRowMutationPreparationOutcome::Prepared(preparation) = &outcome {
+            preparation.validate()?;
+            if preparation.owner() != &self.binding_key {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation preparation does not retain the lease generation",
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub fn activate_row_mutation(
+        &self,
+        request: super::ConnectorRowMutationActivationRequest,
+    ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
+        request.validate(&self.binding_key)?;
+        let plan = self.control.activate_row_mutation(request)?;
+        for route in plan.routes() {
+            route.validate()?;
+            if route.preparation().owner() != &self.binding_key {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "row-mutation route preparation does not retain the lease generation",
+                ));
+            }
+        }
+        Ok(plan)
     }
 
     /// Return whether two leases retain the same provider control generation.

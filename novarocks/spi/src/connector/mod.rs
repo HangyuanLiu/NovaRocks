@@ -32,6 +32,7 @@ mod mutation;
 mod predicate;
 mod read;
 mod read_session;
+mod row_mutation;
 mod scalar;
 mod staged_create;
 mod staged_publication_recovery;
@@ -156,6 +157,16 @@ pub use read::{
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,
     ConnectorReadSessionOutcome,
+};
+pub use row_mutation::{
+    CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
+    ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
+    ConnectorMutationTargetField, ConnectorRowMutationActivationRequest,
+    ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
+    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorRowMutationRoute, ConnectorRowMutationSelection, ConnectorRowMutationStrategy,
+    ConnectorWriteRouteId, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use staged_create::{
