@@ -415,6 +415,58 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
 }
 
 #[test]
+fn mv_target_sources_require_prepared_connector_reads() {
+    let sources = [
+        (
+            "SqlMvTargetLocator",
+            table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetLocator {
+                facts: table_model::SqlMvTargetLocatorScan {
+                    target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                    target_snapshot_id: Some(1),
+                    apply_key_column: "order_id".to_string(),
+                    branch_id_column: None,
+                },
+            }),
+        ),
+        (
+            "SqlMvTargetState",
+            table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetState {
+                facts: table_model::SqlMvTargetStateScan {
+                    target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                    target_snapshot_id: Some(1),
+                    aggregate_state_layout_version: 1,
+                    columns: Vec::new(),
+                    group_key_names: vec!["order_id".to_string()],
+                    aggregate_state_names: Vec::new(),
+                    physical_column_names: vec!["order_id".to_string()],
+                    row_id_column_name: "order_id".to_string(),
+                    row_filter: table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                        row_id_column_name: "order_id".to_string(),
+                        branch_scope: None,
+                    },
+                    partition_constraint:
+                        table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned,
+                },
+            }),
+        ),
+    ];
+
+    for (source_name, source) in sources {
+        let plan = iceberg_delta_distributed_plan_for_test();
+        let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
+            &plan,
+            Default::default(),
+        );
+        root_scan_for_test(&mut plan).table.source = source;
+        let plan = plan.seal().expect("seal MV target source fixture");
+
+        let error = encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect_err("unprepared MV target source must fail native submission");
+        assert!(error.contains(source_name), "{error}");
+    }
+}
+
+#[test]
 fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
     let plan = iceberg_delta_distributed_plan_for_test();
     let missing = encode_distributed_plan_with_context(

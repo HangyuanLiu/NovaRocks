@@ -64,6 +64,36 @@ fn retired_starrocks_native_scan_fields_remain_reserved() {
 }
 
 #[test]
+fn retired_mv_native_scan_fields_remain_reserved_and_fail_closed() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let scan_source = pool
+        .get_message_by_name("novarocks.plan.ScanSource")
+        .expect("ScanSource descriptor");
+
+    for field_number in [5, 6] {
+        assert!(
+            scan_source
+                .reserved_ranges()
+                .any(|range| range.contains(&field_number)),
+            "ScanSource field {field_number} must remain reserved"
+        );
+    }
+    for field_name in ["iceberg_mv_target_state", "iceberg_mv_target_locator"] {
+        assert!(
+            scan_source.reserved_names().any(|name| name == field_name),
+            "ScanSource {field_name} name must remain reserved"
+        );
+    }
+
+    for encoded in [&[0x2a, 0x00][..], &[0x32, 0x00][..]] {
+        let source = plan::ScanSource::decode(encoded)
+            .expect("retired source field remains decodable as an unknown field");
+        assert!(source.kind.is_none());
+    }
+}
+
+#[test]
 fn retired_starrocks_native_scan_wire_fields_fail_closed() {
     let source = plan::ScanSource::decode(&[0x3a, 0x00][..])
         .expect("retired source field remains decodable as an unknown field");

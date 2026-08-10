@@ -42,21 +42,28 @@
 //! W4 lights up the `full` level: instead of only *reading* the lake, the
 //! procedure proves SQLite is a rebuildable cache by clearing the MV's SQLite
 //! records (`drop_by_target`) and rebuilding them purely from the lake
-//! (`rebuild_one_discovered_mv_if_missing`), confirming the definition
+//! (`rebuild_one_lake_package_if_missing`), confirming the definition
 //! reappears. It then reports `AvailableLevel = full`, `RebuildSource = lake`,
 //! with the descriptor/provenance/waterline hashes derived from the rebuilt
 //! state. Because the clear is destructive, `full` is reached only when the
 //! request asks for it, still under the test-only env guard.
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::engine::mv::iceberg_storage_observation::IcebergMvStorageObservationAdapter;
 use crate::engine::{StandaloneState, StatementResult};
+use crate::mv::storage_observation::{
+    MvLakePackageObservation, MvLakePublication, MvStorageObservation,
+};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::procedure::CallProcedureStmt;
+use novarocks_spi::connector::{
+    ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+};
 
 pub(crate) const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
 const TEST_ENABLE_ENV: &str = "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD";
@@ -153,10 +160,11 @@ pub(crate) fn execute_novarocks_imv_stateless_rebuild(
     state: &Arc<StandaloneState>,
     stmt: &CallProcedureStmt,
     current_database: &str,
+    connector_context: ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     ensure_stateless_rebuild_enabled(std::env::var(TEST_ENABLE_ENV).ok().as_deref())?;
     let req = ImvStatelessRebuildRequest::from_call(stmt, current_database)?;
-    execute_request(state, &req)
+    execute_request_with_context(state, &req, connector_context)
 }
 
 /// Guard-free core of the procedure. `execute_novarocks_imv_stateless_rebuild`
@@ -167,48 +175,42 @@ pub(crate) fn execute_request(
     state: &Arc<StandaloneState>,
     req: &ImvStatelessRebuildRequest,
 ) -> Result<StatementResult, String> {
-    // Discovering the MV package and reading its descriptor IS the lake
-    // rebuild: it walks the Iceberg MV table descriptor and never consults
-    // SQLite. If it fails, fail loud.
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&req.catalog)?
+    let context =
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+    execute_request_with_context(state, req, context)
+}
+
+fn execute_request_with_context(
+    state: &Arc<StandaloneState>,
+    req: &ImvStatelessRebuildRequest,
+    connector_context: ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let instance_id = ConnectorInstanceId::parse(&req.catalog)
+        .map_err(|error| format!("parse stateless rebuild catalog identity: {error}"))?;
+    let exact_lease =
+        ConnectorControlResolver::acquire_current(state.connector_control.as_ref(), &instance_id)
+            .map_err(|error| format!("acquire stateless rebuild catalog generation: {error}"))?;
+    let table = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(req.namespace.as_str()),
+        table: Arc::from(req.mv.as_str()),
     };
-    let mv = crate::engine::mv::iceberg_discovery::discover_iceberg_mv_from_entry(
-        &entry,
-        &req.catalog,
-        &req.namespace,
-        &req.mv,
-    )?
-    .ok_or_else(|| {
-        format!(
-            "MV '{}.{}' not found among lake-native Iceberg MV packages in catalog '{}'",
-            req.namespace, req.mv, req.catalog
-        )
-    })?;
+    let observer = IcebergMvStorageObservationAdapter::new(
+        Arc::clone(&state.iceberg_catalogs),
+        Arc::clone(&state.connector_control),
+    );
+    let package = observer
+        .observe_lake_package(&exact_lease, &table, connector_context)
+        .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "MV '{}.{}' not found among lake-native Iceberg MV packages in catalog '{}'",
+                req.namespace, req.mv, req.catalog
+            )
+        })?;
 
-    let descriptor_hash = mv.descriptor.content_hash()?;
-
-    // W3a: the MV table's current snapshot may carry a `provenance.v1`
-    // summary property (stamped by every MV refresh since M3). When present,
-    // the server can reconstruct the provenance level purely from the lake;
-    // otherwise (no current snapshot, or an MV that was created but never
-    // refreshed) it falls back to the W1 package level.
-    let loaded =
-        crate::connector::iceberg::catalog::registry::load_table(&entry, &mv.namespace, &mv.table)?;
-    let provenance = loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|current| {
-            novarocks_connector_iceberg::commit::MvProvenanceV1::from_snapshot_summary(current)
-        })
-        .transpose()?
-        .flatten();
-    let (provenance_hash, waterline_hash, available) = provenance_level(provenance.as_ref())?;
+    let descriptor_hash = package.descriptor.content_hash()?;
+    let (provenance_hash, waterline_hash, available) = publication_level(&package.publication);
 
     // W4 `full`: the levels above only *read* the lake to prove the descriptor
     // (and, for `provenance`, the current-snapshot provenance) can be
@@ -219,7 +221,7 @@ pub(crate) fn execute_request(
     // behind the test-only env flag (checked by the caller) and runs only when
     // the requested level is `full`.
     if req.required_level == StatelessLevel::Full {
-        clear_sqlite_and_rebuild_from_lake(state, &entry, &mv)?;
+        clear_sqlite_and_rebuild_from_lake(state, &package)?;
         // The descriptor/provenance hashes are functions of the lake package,
         // which the round-trip left untouched, so they are identical to the
         // pre-rebuild values computed above. Reporting them from here documents
@@ -254,21 +256,20 @@ pub(crate) fn execute_request(
 /// record to begin with, or the rebuild failed to restore it, statelessness is
 /// unproven and we fail loud.
 ///
-/// The rebuild is *targeted* at the single discovered MV
-/// (`rebuild_one_discovered_mv_if_missing`) rather than sweeping every
+/// The rebuild is *targeted* at the single observed lake package
+/// (`rebuild_one_lake_package_if_missing`) rather than sweeping every
 /// registered catalog via `rebuild_imv_cache_from_lake`, so the probe touches
 /// only its own target.
 fn clear_sqlite_and_rebuild_from_lake(
     state: &Arc<StandaloneState>,
-    entry: &crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
-    mv: &crate::engine::mv::iceberg_discovery::DiscoveredIcebergMv,
+    package: &MvLakePackageObservation,
 ) -> Result<(), String> {
     // 1. Confirm the SQLite definition currently exists; the round-trip is only
     //    meaningful if there is a cached record to clear.
     let target = crate::mv::model::MvTarget {
-        catalog: Some(mv.catalog.clone()),
-        database: mv.namespace.clone(),
-        name: mv.table.clone(),
+        catalog: Some(package.table.instance_id.as_str().to_string()),
+        database: package.table.namespace.to_string(),
+        name: package.table.table.to_string(),
     };
     let existing = state
         .mv_repository
@@ -277,7 +278,11 @@ fn clear_sqlite_and_rebuild_from_lake(
     if existing.is_none() {
         return Err(format!(
             "{PROCEDURE_NAME} full level: MV '{}.{}' has no repository definition to clear (target {}.{}.{}); cannot prove a clear+rebuild round-trip",
-            mv.namespace, mv.public_name, mv.catalog, mv.namespace, mv.table
+            package.table.namespace,
+            package.table.table,
+            package.table.instance_id.as_str(),
+            package.table.namespace,
+            package.table.table
         ));
     }
 
@@ -290,12 +295,14 @@ fn clear_sqlite_and_rebuild_from_lake(
     if !dropped {
         return Err(format!(
             "{PROCEDURE_NAME} full level: expected to clear MV repository definition for target {}.{}.{}",
-            mv.catalog, mv.namespace, mv.table
+            package.table.instance_id.as_str(),
+            package.table.namespace,
+            package.table.table
         ));
     }
 
     // 3. Rebuild the single target MV purely from the lake package.
-    crate::engine::mv::lake_rebuild::rebuild_one_discovered_mv_if_missing(state, entry, mv)?;
+    crate::engine::mv::lake_rebuild::rebuild_one_lake_package_if_missing(state, package)?;
 
     // 4. Confirm the definition reappeared. If it did not, statelessness failed:
     //    the lake package did not carry enough to reconstruct the SQLite record.
@@ -306,32 +313,27 @@ fn clear_sqlite_and_rebuild_from_lake(
     if rebuilt.is_none() {
         return Err(format!(
             "{PROCEDURE_NAME} full level: MV repository definition for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
-            mv.catalog, mv.namespace, mv.table
+            package.table.instance_id.as_str(),
+            package.table.namespace,
+            package.table.table
         ));
     }
 
     Ok(())
 }
 
-/// Pure level-selection: given the MV table's current-snapshot
-/// provenance record (or `None` when there is no current snapshot, or the
-/// current snapshot predates provenance stamping), decide the
+/// Pure level-selection: given the observed package publication state, decide the
 /// `(ProvenanceHash, WaterlineHash, AvailableLevel)` triple.
-///
-/// `Some(prov)` reconstructs the `provenance` level with both hashes
-/// populated; `None` falls back to `package` with both hashes NULL. Isolated
-/// as a pure function so the level-selection contract is unit-testable
-/// without loading a live Iceberg table.
-fn provenance_level(
-    provenance: Option<&novarocks_connector_iceberg::commit::MvProvenanceV1>,
-) -> Result<(Option<String>, Option<String>, StatelessLevel), String> {
-    match provenance {
-        Some(prov) => Ok((
-            Some(prov.content_hash()?),
-            Some(prov.waterline_hash()?),
+fn publication_level(
+    publication: &MvLakePublication,
+) -> (Option<String>, Option<String>, StatelessLevel) {
+    match publication {
+        MvLakePublication::Published(facts) => (
+            Some(facts.provenance_hash.clone()),
+            Some(facts.waterline_hash.clone()),
             StatelessLevel::Provenance,
-        )),
-        None => Ok((None, None, StatelessLevel::Package)),
+        ),
+        MvLakePublication::NeverPublished => (None, None, StatelessLevel::Package),
     }
 }
 
@@ -391,6 +393,9 @@ fn column(name: &str, nullable: bool) -> QueryResultColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::storage_observation::{
+        MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+    };
     use crate::sql::parser::procedure::parse_call_procedure_sql;
 
     #[test]
@@ -406,40 +411,43 @@ mod tests {
         assert!(ensure_stateless_rebuild_enabled(Some("1")).is_ok());
     }
 
-    fn sample_provenance() -> novarocks_connector_iceberg::commit::MvProvenanceV1 {
-        use novarocks_connector_iceberg::commit::{
-            MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
-        };
-        MvProvenanceV1 {
-            provenance_version: MV_PROVENANCE_VERSION,
-            refresh_id: 1,
-            mv_id: 1,
-            token: "token-1".to_string(),
-            technique: RefreshTechnique::Full,
-            bases: vec![ProvenanceBase {
-                table_fqn: "ice.sales.orders".to_string(),
-                uuid: "uuid-orders".to_string(),
-                from_snapshot: None,
-                to_snapshot: 200,
-            }],
-            definition_fingerprint: "fp-abc".to_string(),
-            rows: 3,
-        }
+    fn sample_publication() -> MvLakePublication {
+        MvLakePublication::Published(
+            MvPublishedLakeFacts::try_new(
+                201,
+                1,
+                1,
+                "token-1".to_string(),
+                MvPublishedRefreshTechnique::Full,
+                vec![MvPublishedBaseFact {
+                    table_fqn: "ice.sales.orders".to_string(),
+                    table_uuid: "uuid-orders".to_string(),
+                    from_snapshot: None,
+                    to_snapshot: 200,
+                }],
+                "fp-abc".to_string(),
+                3,
+                "provenance-hash".to_string(),
+                "waterline-hash".to_string(),
+            )
+            .expect("valid publication"),
+        )
     }
 
     #[test]
-    fn provenance_level_reports_provenance_with_hashes_when_present() {
-        let prov = sample_provenance();
-        let (provenance_hash, waterline_hash, available) = provenance_level(Some(&prov)).unwrap();
+    fn publication_level_reports_provenance_with_observed_hashes() {
+        let publication = sample_publication();
+        let (provenance_hash, waterline_hash, available) = publication_level(&publication);
 
         assert_eq!(available, StatelessLevel::Provenance);
-        assert_eq!(provenance_hash, Some(prov.content_hash().unwrap()));
-        assert_eq!(waterline_hash, Some(prov.waterline_hash().unwrap()));
+        assert_eq!(provenance_hash.as_deref(), Some("provenance-hash"));
+        assert_eq!(waterline_hash.as_deref(), Some("waterline-hash"));
     }
 
     #[test]
-    fn provenance_level_falls_back_to_package_with_null_hashes_when_absent() {
-        let (provenance_hash, waterline_hash, available) = provenance_level(None).unwrap();
+    fn publication_level_falls_back_to_package_when_never_published() {
+        let (provenance_hash, waterline_hash, available) =
+            publication_level(&MvLakePublication::NeverPublished);
 
         assert_eq!(available, StatelessLevel::Package);
         assert_eq!(provenance_hash, None);

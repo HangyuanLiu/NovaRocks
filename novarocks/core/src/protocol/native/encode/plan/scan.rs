@@ -685,61 +685,14 @@ fn encode_scan_source(
         });
     }
 
-    Ok(plan::ScanSource {
-        kind: Some(match src {
-            table_model::ScanSource::Sql(source) => match &source.kind {
-                table_model::SqlScanKind::MvTargetState { facts } => {
-                    Kind::IcebergMvTargetState(plan::IcebergMvTargetState {
-                        catalog: source.table.catalog.clone(),
-                        database: source.table.namespace.clone(),
-                        table: source.table.table.clone(),
-                        target_table_uuid: facts.target_table_uuid.clone(),
-                        target_snapshot_id: facts.target_snapshot_id,
-                        aggregate_state_layout_version: u32::from(
-                            facts.aggregate_state_layout_version,
-                        ),
-                        columns: facts
-                            .columns
-                            .iter()
-                            .map(encode_column_def)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        group_key_names: facts.group_key_names.clone(),
-                        aggregate_state_names: facts.aggregate_state_names.clone(),
-                        physical_column_names: facts.physical_column_names.clone(),
-                        row_id_column_name: facts.row_id_column_name.clone(),
-                        row_filter: Some(encode_mv_target_state_row_filter(&facts.row_filter)),
-                        partition_constraint: match facts.partition_constraint {
-                            table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned => {
-                                plan::IcebergMvTargetStatePartitionConstraint::Unpartitioned as i32
-                            }
-                            table_model::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
-                                plan::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired as i32
-                            }
-                        },
-                    })
-                }
-                table_model::SqlScanKind::MvTargetLocator { facts } => {
-                    Kind::IcebergMvTargetLocator(plan::IcebergMvTargetLocator {
-                        catalog: source.table.catalog.clone(),
-                        database: source.table.namespace.clone(),
-                        table: source.table.table.clone(),
-                        target_table_uuid: facts.target_table_uuid.clone(),
-                        target_snapshot_id: facts.target_snapshot_id,
-                        apply_key_column: facts.apply_key_column.clone(),
-                        branch_id_column: facts.branch_id_column.clone(),
-                    })
-                }
-                _ => {
-                    return Err(format!(
-                        "native SQL scan node_id={} must be materialized as ConnectorReadSource before encoding",
-                        scan_node_id
-                            .map(|node_id| node_id.to_string())
-                            .unwrap_or_else(|| "<none>".to_string())
-                    ));
-                }
-            },
-        }),
-    })
+    let source_kind = scan_source_kind(src);
+    Err(format!(
+        "native SQL scan node_id={} source={} must be materialized as ConnectorReadSource before encoding",
+        scan_node_id
+            .map(|node_id| node_id.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        source_kind,
+    ))
 }
 
 fn encode_connector_expected_schema_ipc(
@@ -863,27 +816,6 @@ fn encode_connector_expected_schema_ipc(
         ));
     }
     Ok(bytes)
-}
-
-fn encode_mv_target_state_row_filter(
-    src: &table_model::SqlMvTargetStateRowFilter,
-) -> plan::IcebergMvTargetStateRowFilter {
-    use plan::iceberg_mv_target_state_row_filter::Kind;
-
-    plan::IcebergMvTargetStateRowFilter {
-        kind: Some(match src {
-            table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
-                row_id_column_name,
-                branch_scope,
-            } => Kind::DeltaInputRowIds(plan::DeltaInputRowIdsFilter {
-                row_id_column_name: row_id_column_name.clone(),
-                branch_scope: branch_scope.as_ref().map(|scope| plan::BranchScope {
-                    branch_id_column_name: scope.branch_id_column_name.clone(),
-                    branch_id: scope.branch_id,
-                }),
-            }),
-        }),
-    }
 }
 
 pub(super) fn encode_iceberg_table_info(
