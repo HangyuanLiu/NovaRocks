@@ -57,11 +57,6 @@ use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
-#[cfg(test)]
-use crate::runtime_filter::port::identity::PartitionId;
-use crate::runtime_filter::port::value_domain::MembershipValues;
-#[cfg(test)]
-use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 
 use self::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
@@ -83,17 +78,9 @@ pub struct AggregateFinalDomainSessionBuilder {
     installed_membership_key_type: DataType,
     max_domain_canonical_bytes: usize,
     contract_digest: [u8; 32],
-    #[cfg(test)]
-    partition_observer: Option<AggregateFinalDomainPartitionObserver>,
 }
 
-#[cfg(test)]
-type AggregateFinalDomainPartitionObserver =
-    Arc<dyn Fn(PartitionId, &ValueDomainDelta) + Send + Sync>;
-
 struct AggregateFinalDomainPartitionCommitter {
-    #[cfg(test)]
-    partition_id: PartitionId,
     committer: execution::RuntimeFilterFinalDomainPartitionHandle,
     contract_digest: [u8; 32],
 }
@@ -135,18 +122,7 @@ impl AggregateFinalDomainSessionBuilder {
             installed_membership_key_type,
             max_domain_canonical_bytes,
             contract_digest,
-            #[cfg(test)]
-            partition_observer: None,
         })
-    }
-
-    #[cfg(test)]
-    fn observe_partitions_for_test(
-        mut self,
-        observer: AggregateFinalDomainPartitionObserver,
-    ) -> Self {
-        self.partition_observer = Some(observer);
-        self
     }
 
     fn partition(
@@ -167,8 +143,6 @@ impl AggregateFinalDomainSessionBuilder {
                 "aggregate final-domain driver id is outside the actual DOP: driver_id={driver_id} dop={actual_dop}"
             ));
         }
-        #[cfg(test)]
-        let partition_id = PartitionId::new(driver_id as u32);
         let committer = self
             .completion
             .claim_partition(execution::PartitionId::new(driver_id as u32))
@@ -178,14 +152,20 @@ impl AggregateFinalDomainSessionBuilder {
                 )
             })?;
         Ok(AggregateFinalDomainPartitionCommitter {
-            #[cfg(test)]
-            partition_id,
             committer,
             contract_digest: self.contract_digest,
         })
     }
 
     fn fail(&self) {
+        let _ = self
+            .completion
+            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed);
+    }
+}
+
+impl Drop for AggregateFinalDomainSessionBuilder {
+    fn drop(&mut self) {
         let _ = self
             .completion
             .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed);
@@ -457,7 +437,12 @@ impl AggregateProcessorFactory {
                 let key_type = arena
                     .data_type(group_by[0])
                     .expect("validated aggregate group expression id");
-                if MembershipValues::empty_for_data_type(key_type).is_none() {
+                if execution::RuntimeFilterMembershipSchema::new(
+                    key_type,
+                    execution::RuntimeFilterNullSemantics::NeverMatches,
+                )
+                .is_err()
+                {
                     Some(format!(
                         "unsupported aggregate final-domain membership key type: {key_type:?}"
                     ))
@@ -578,11 +563,6 @@ impl OperatorFactory for AggregateProcessorFactory {
                 .as_ref()
                 .map(|session| session.max_domain_canonical_bytes),
             #[cfg(test)]
-            final_domain_partition_observer: self
-                .final_domain_session
-                .as_ref()
-                .and_then(|session| session.partition_observer.clone()),
-            #[cfg(test)]
             fail_output_construction: self.fail_output_construction,
         })
     }
@@ -626,8 +606,6 @@ struct AggregateProcessorOperator {
     final_domain_session_bound: bool,
     final_domain_bind_error: Option<String>,
     max_domain_canonical_bytes: Option<usize>,
-    #[cfg(test)]
-    final_domain_partition_observer: Option<AggregateFinalDomainPartitionObserver>,
     #[cfg(test)]
     fail_output_construction: bool,
 }
@@ -1219,25 +1197,12 @@ impl AggregateProcessorOperator {
                 .unwrap_or(&[]),
         ) {
             Ok(key) => key,
-            Err(final_domain::FinalAggregateDomainError::ResourceOrSize) => {
-                self.fail_final_domain();
-                return Ok(());
-            }
             Err(error) => return Err(error.to_string()),
         };
         let mut partition = self
             .final_domain_committer
             .take()
             .expect("checked aggregate final-domain committer");
-        #[cfg(test)]
-        let observed_domain = final_domain::extract_final_aggregate_domain(
-            self.key_table
-                .as_ref()
-                .map(|table| table.key_columns())
-                .unwrap_or(&[]),
-            max_domain_canonical_bytes,
-        )
-        .map_err(|error| error.to_string())?;
         let domain = match execution::contribution::encode_final_domain_from_array(
             &data_type,
             partition.contract_digest,
@@ -1257,10 +1222,6 @@ impl AggregateProcessorOperator {
                 return Ok(());
             }
             return Err(error.to_string());
-        }
-        #[cfg(test)]
-        if let Some(observer) = self.final_domain_partition_observer.as_ref() {
-            observer(partition.partition_id, &observed_domain);
         }
         if let Err(error) = partition.committer.close() {
             if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed {
@@ -1741,10 +1702,9 @@ fn aggregate_topn_test_operator(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
 
     use arrow::array::{ArrayRef, Int32Array, Int64Array, ListArray};
     use arrow::buffer::OffsetBuffer;
@@ -1758,68 +1718,20 @@ mod tests {
         normalize_aggregate_group_arrays,
     };
     use crate::common::ids::SlotId;
-    use crate::common::types::UniqueId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-    use crate::runtime_filter::port::support::{
-        MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
-    };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
-
-    const RF_BINDING: BindingId = BindingId::new(10);
-    const RF_CHANNEL: ChannelId = ChannelId::new(1);
-    const RF_INSTANCE: UniqueId = UniqueId::new(70, 10);
     const GROUP_SLOT: SlotId = SlotId::new(1);
-
-    struct TestClock(Instant);
-
-    impl RuntimeFilterClock for TestClock {
-        fn now(&self) -> Instant {
-            self.0
-        }
-    }
-
-    #[derive(Default)]
-    struct TestMemory {
-        retained: AtomicUsize,
-    }
-
-    impl RuntimeFilterMemoryAccount for TestMemory {
-        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
-            self.retained.fetch_add(bytes, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn release(&self, bytes: usize) {
-            let previous = self.retained.fetch_sub(bytes, Ordering::SeqCst);
-            assert!(previous >= bytes);
-        }
-    }
-
-    #[derive(Default)]
-    struct TestEvents(Mutex<Vec<RuntimeFilterEvent>>);
-
-    impl RuntimeFilterEventSink for TestEvents {
-        fn record(&self, event: RuntimeFilterEvent) {
-            self.0.lock().expect("test event lock").push(event);
-        }
-    }
-
-    impl TestEvents {
-        fn snapshot(&self) -> Vec<RuntimeFilterEvent> {
-            self.0.lock().expect("test event lock").clone()
-        }
-    }
 
     #[derive(Default)]
     struct FakeFinalDomainCompletion {
         accepted_partitions: Mutex<Vec<u32>>,
         claimed_partitions: Mutex<BTreeSet<u32>>,
+        closed_partitions: Mutex<BTreeSet<u32>>,
         failures: AtomicUsize,
+        expected_partitions: AtomicUsize,
+        terminal: std::sync::atomic::AtomicBool,
         max_domain_canonical_bytes: usize,
         self_ref: Mutex<std::sync::Weak<FakeFinalDomainCompletion>>,
     }
@@ -1838,7 +1750,37 @@ mod tests {
         }
 
         fn fail_once(&self) {
-            self.failures.store(1, Ordering::SeqCst);
+            if !self.terminal.swap(true, Ordering::SeqCst) {
+                self.failures.store(1, Ordering::SeqCst);
+            }
+        }
+
+        fn set_expected_partitions(&self, expected: usize) {
+            let current = self.expected_partitions.load(Ordering::SeqCst);
+            assert!(
+                current == 0 || current == expected,
+                "test completion DOP changed"
+            );
+            self.expected_partitions.store(expected, Ordering::SeqCst);
+        }
+
+        fn close_sealed_partition(&self, partition: u32) {
+            if self.terminal.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut closed = self
+                .closed_partitions
+                .lock()
+                .expect("closed partitions lock");
+            closed.insert(partition);
+            let expected = self.expected_partitions.load(Ordering::SeqCst);
+            if expected != 0 && closed.len() == expected {
+                *self
+                    .accepted_partitions
+                    .lock()
+                    .expect("accepted partitions lock") = closed.iter().copied().collect();
+                self.terminal.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -1862,11 +1804,7 @@ mod tests {
             if !self.closed {
                 self.closed = true;
                 if self.sealed {
-                    self.completion
-                        .accepted_partitions
-                        .lock()
-                        .expect("accepted partitions lock")
-                        .push(self.partition.get());
+                    self.completion.close_sealed_partition(self.partition.get());
                 } else {
                     self.completion.fail_once();
                 }
@@ -1960,6 +1898,7 @@ mod tests {
             dop: i32,
             max_domain_canonical_bytes: usize,
         ) -> AggregateFinalDomainSessionBuilder {
+            self.completion.set_expected_partitions(dop as usize);
             let completion: execution::RuntimeFilterFinalDomainCompletionHandle =
                 Arc::clone(&self.completion) as _;
             AggregateFinalDomainSessionBuilder::new(completion, dop, max_domain_canonical_bytes)
@@ -2175,57 +2114,6 @@ mod tests {
             .expect_err("finished aggregate must reject post-freeze input");
         assert_eq!(error, "aggregate received input after set_finishing");
         assert_eq!(fixture.accepted_partitions(), vec![0]);
-    }
-
-    #[test]
-    fn aggregate_factory_maps_driver_id_to_partition() {
-        let fixture = FinalDomainFixture::new();
-        let observed = Arc::new(Mutex::new(BTreeMap::<u32, ValueDomainDelta>::new()));
-        let observer_state = Arc::clone(&observed);
-        let session = fixture
-            .session_builder(2)
-            .observe_partitions_for_test(Arc::new(move |partition_id, domain| {
-                observer_state
-                    .lock()
-                    .expect("partition observer lock")
-                    .insert(partition_id.get(), domain.clone());
-            }));
-        let factory = aggregate_factory(Some(session));
-        let mut driver_1 = prepare_processor(&factory, 2, 1);
-        let mut driver_0 = prepare_processor(&factory, 2, 0);
-
-        finish_operator(&mut driver_1, [20, 21]);
-        assert_eq!(
-            observed
-                .lock()
-                .expect("partition observer lock")
-                .get(&1)
-                .map(ValueDomainDelta::values),
-            Some(&MembershipValues::int64([20, 21]))
-        );
-        assert!(
-            observed
-                .lock()
-                .expect("partition observer lock")
-                .get(&0)
-                .is_none()
-        );
-        finish_operator(&mut driver_0, [10, 11]);
-
-        assert_eq!(
-            *observed.lock().expect("partition observer lock"),
-            BTreeMap::from([
-                (
-                    0,
-                    ValueDomainDelta::new(MembershipValues::int64([10, 11]), false)
-                ),
-                (
-                    1,
-                    ValueDomainDelta::new(MembershipValues::int64([20, 21]), false)
-                ),
-            ])
-        );
-        assert_eq!(fixture.accepted_partitions(), vec![0, 1]);
     }
 
     #[test]

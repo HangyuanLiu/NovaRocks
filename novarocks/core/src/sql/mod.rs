@@ -18,9 +18,6 @@
 pub(crate) mod agg_mergeability;
 pub mod common;
 
-#[cfg(feature = "runtime-filter-test-support")]
-pub mod analysis;
-#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod analysis;
 pub(crate) mod binding;
 pub(crate) mod catalog;

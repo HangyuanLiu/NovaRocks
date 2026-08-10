@@ -517,7 +517,7 @@ fn execute_plan_with_pipeline(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
@@ -527,7 +527,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::common::types::UniqueId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
@@ -535,15 +534,8 @@ mod tests {
         AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
         WindowFunctionSpec, WindowType,
     };
-    use crate::exec::node::join::{
-        JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
-        JoinRuntimeFilterProducerBinding, JoinType,
-    };
+    use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
     use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
-    use crate::exec::node::runtime_filter::{
-        RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode, RuntimeFilterExecutionContract,
-        RuntimeFilterExecutionReduction,
-    };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
@@ -553,15 +545,9 @@ mod tests {
     use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
     use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
     use crate::exec::pipeline::schedule::observer::Observable;
-    use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime::runtime_state::RuntimeState;
-    use crate::runtime_filter::model::contract::{
-        ArtifactCapability, CompletionRequirement, ConsumerActivation, ContributionKind,
-    };
-    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
     use super::{
         PreparedPipelineExecution, execute_native_plan_with_pipeline, prepare_pipeline_execution,

@@ -18,7 +18,6 @@
 //! Borrow-only runtime-filter facts for the Frontend semantic encoder.
 
 use crate::protocol::native::encode::expr::encode_expr;
-use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::sql::planner::distributed::FragmentEdge;
 use crate::sql::planner::runtime_filter::coverage::Coverage;
@@ -26,12 +25,13 @@ use crate::sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
     RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
 };
-use novarocks_protocol::{common, expr};
+use arrow::datatypes::DataType;
+use novarocks_protocol::expr;
 
 use super::projection::PreparedFragmentSet;
 use super::runtime_filter_binding::{
-    PreparedReductionContract, PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
-    PreparedRuntimeFilterConsumerTarget, PreparedRuntimeFilterContract,
+    PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
+    PreparedRuntimeFilterConsumerTarget,
 };
 
 #[derive(Clone, Copy)]
@@ -103,48 +103,12 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
         encode_expr(self.binding.expression())
     }
 
-    pub fn contract(self) -> RuntimeFilterContractFacts<'a> {
-        match self.binding.contract() {
-            PreparedRuntimeFilterContract::Membership {
-                canonical_schema,
-                schema_digest,
-            } => RuntimeFilterContractFacts::Membership {
-                canonical_schema,
-                schema_digest: schema_digest.bytes(),
-            },
-            PreparedRuntimeFilterContract::Ordered {
-                keys,
-                comparator_digest,
-                order_contract_digest,
-            } => RuntimeFilterContractFacts::Ordered {
-                keys: keys
-                    .iter()
-                    .map(|key| RuntimeFilterOrderKeyFacts {
-                        r#type: encode_type(key.data_type())
-                            .expect("sealed order-key type is encodable"),
-                        direction: RuntimeFilterSortDirection::from_runtime(key.direction()),
-                        null_order: RuntimeFilterNullOrder::from_runtime(key.null_order()),
-                    })
-                    .collect(),
-                comparator_digest: comparator_digest.get(),
-                order_contract_digest: order_contract_digest.bytes(),
-            },
-        }
+    pub fn logical_domain(self) -> RuntimeFilterLogicalDomainFacts {
+        RuntimeFilterLogicalDomainFacts::from_sql(self.binding.logical_domain())
     }
 
     pub fn reduction(self) -> RuntimeFilterReductionFacts {
-        match self.binding.reduction() {
-            PreparedReductionContract::SetUnion => RuntimeFilterReductionFacts::SetUnion,
-            PreparedReductionContract::TightenOrderedBound => {
-                RuntimeFilterReductionFacts::TightenOrderedBound
-            }
-            PreparedReductionContract::MergeTopKSummary { k, contract_digest } => {
-                RuntimeFilterReductionFacts::MergeTopKSummary {
-                    k: k.get(),
-                    contract_digest: contract_digest.bytes(),
-                }
-            }
-        }
+        RuntimeFilterReductionFacts::from_sql(self.binding.reduction())
     }
 
     pub fn role(self) -> RuntimeFilterBindingRoleFacts {
@@ -187,29 +151,51 @@ pub enum RuntimeFilterApplyPoint {
     NodeOutput,
 }
 
-pub enum RuntimeFilterContractFacts<'a> {
+pub enum RuntimeFilterLogicalDomainFacts {
     Membership {
-        canonical_schema: &'a [u8],
-        schema_digest: [u8; 32],
+        value_type: DataType,
+        null_semantics: RuntimeFilterNullSemantics,
     },
     Ordered {
         keys: Vec<RuntimeFilterOrderKeyFacts>,
+        inclusive: bool,
         comparator_digest: [u8; 32],
-        order_contract_digest: [u8; 32],
     },
 }
 
-impl RuntimeFilterContractFacts<'_> {
-    pub fn ordered_keys(&self) -> &[RuntimeFilterOrderKeyFacts] {
-        match self {
-            Self::Membership { .. } => &[],
-            Self::Ordered { keys, .. } => keys,
+impl RuntimeFilterLogicalDomainFacts {
+    fn from_sql(
+        value: &crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain,
+    ) -> Self {
+        match value {
+            crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics,
+            } => Self::Membership {
+                value_type: value_type.clone(),
+                null_semantics: RuntimeFilterNullSemantics::from_sql(*null_semantics),
+            },
+            crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::OrderedBound(order) => {
+                Self::Ordered {
+                    keys: order
+                        .keys
+                        .iter()
+                        .map(|key| RuntimeFilterOrderKeyFacts {
+                            data_type: key.data_type.clone(),
+                            direction: RuntimeFilterSortDirection::from_sql(key.direction),
+                            null_order: RuntimeFilterNullOrder::from_sql(key.null_order),
+                        })
+                        .collect(),
+                    inclusive: order.inclusive,
+                    comparator_digest: order.comparator_digest.get(),
+                }
+            }
         }
     }
 }
 
 pub struct RuntimeFilterOrderKeyFacts {
-    pub r#type: common::TypeDesc,
+    pub data_type: DataType,
     pub direction: RuntimeFilterSortDirection,
     pub null_order: RuntimeFilterNullOrder,
 }
@@ -217,7 +203,25 @@ pub struct RuntimeFilterOrderKeyFacts {
 pub enum RuntimeFilterReductionFacts {
     SetUnion,
     TightenOrderedBound,
-    MergeTopKSummary { k: u32, contract_digest: [u8; 32] },
+    MergeTopKSummary { k: u32 },
+}
+
+impl RuntimeFilterReductionFacts {
+    fn from_sql(
+        value: crate::sql::planner::runtime_filter::contract::ReductionRequirement,
+    ) -> Self {
+        match value {
+            crate::sql::planner::runtime_filter::contract::ReductionRequirement::SetUnion => {
+                Self::SetUnion
+            }
+            crate::sql::planner::runtime_filter::contract::ReductionRequirement::TightenOrderedBound => {
+                Self::TightenOrderedBound
+            }
+            crate::sql::planner::runtime_filter::contract::ReductionRequirement::MergeTopKSummary(requirement) => {
+                Self::MergeTopKSummary { k: requirement.k().get() }
+            }
+        }
+    }
 }
 
 pub enum RuntimeFilterBindingRoleFacts {
@@ -375,8 +379,7 @@ impl RuntimeFilterConsumerTarget {
                     scan_domain_target: scan_domain.as_ref().map(|target| {
                         RuntimeFilterScanDomainTarget {
                             field_ordinal: target.field_ordinal,
-                            r#type: encode_type(&target.data_type)
-                                .expect("sealed scan-domain type is encodable"),
+                            data_type: target.data_type.clone(),
                             nullable: target.nullable,
                         }
                     }),
@@ -403,7 +406,7 @@ impl RuntimeFilterConsumerTarget {
 #[derive(Clone)]
 pub struct RuntimeFilterScanDomainTarget {
     pub field_ordinal: u32,
-    pub r#type: common::TypeDesc,
+    pub data_type: DataType,
     pub nullable: bool,
 }
 
@@ -424,13 +427,6 @@ impl RuntimeFilterSortDirection {
             }
         }
     }
-
-    fn from_runtime(value: crate::runtime_filter::model::contract::SortDirection) -> Self {
-        match value {
-            crate::runtime_filter::model::contract::SortDirection::Ascending => Self::Ascending,
-            crate::runtime_filter::model::contract::SortDirection::Descending => Self::Descending,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -444,13 +440,6 @@ impl RuntimeFilterNullOrder {
         match value {
             crate::sql::planner::runtime_filter::contract::NullOrder::First => Self::First,
             crate::sql::planner::runtime_filter::contract::NullOrder::Last => Self::Last,
-        }
-    }
-
-    fn from_runtime(value: crate::runtime_filter::model::contract::NullOrder) -> Self {
-        match value {
-            crate::runtime_filter::model::contract::NullOrder::First => Self::First,
-            crate::runtime_filter::model::contract::NullOrder::Last => Self::Last,
         }
     }
 }
@@ -476,10 +465,7 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
         self.prepared
             .runtime_filter_graph()
             .channels()
-            .map(|channel| RuntimeFilterChannelDeploymentFacts {
-                prepared: self.prepared,
-                channel,
-            })
+            .map(|channel| RuntimeFilterChannelDeploymentFacts { channel })
     }
 
     pub fn bindings(self) -> impl Iterator<Item = RuntimeFilterDeploymentBindingFacts<'a>> + 'a {
@@ -561,7 +547,6 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterChannelDeploymentFacts<'a> {
-    prepared: &'a PreparedFragmentSet,
     channel: &'a RuntimeFilterChannelSpec,
 }
 
@@ -570,65 +555,8 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
         self.channel.channel_id.get()
     }
 
-    pub fn logical_domain(self) -> RuntimeFilterDeploymentLogicalDomainFacts {
-        let binding = self.canonical_binding();
-        match &self.channel.logical_domain {
-            crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::Membership {
-                value_type,
-                null_semantics,
-            } => RuntimeFilterDeploymentLogicalDomainFacts::Membership {
-                value_type: encode_type(value_type).expect("sealed runtime-filter type is encodable"),
-                null_semantics: RuntimeFilterNullSemantics::from_sql(*null_semantics),
-                canonical_schema: match binding.contract() {
-                    PreparedRuntimeFilterContract::Membership {
-                        canonical_schema, ..
-                    } => canonical_schema.to_vec(),
-                    PreparedRuntimeFilterContract::Ordered { .. } => {
-                        unreachable!("sealed channel domain and binding contract agree")
-                    }
-                },
-                schema_digest: match binding.contract() {
-                    PreparedRuntimeFilterContract::Membership { schema_digest, .. } => {
-                        schema_digest.bytes()
-                    }
-                    PreparedRuntimeFilterContract::Ordered { .. } => {
-                        unreachable!("sealed channel domain and binding contract agree")
-                    }
-                },
-            },
-            crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::OrderedBound(
-                order,
-            ) => RuntimeFilterDeploymentLogicalDomainFacts::Ordered {
-                value_type: encode_type(
-                    &order
-                        .keys
-                        .first()
-                        .expect("sealed ordered runtime-filter domain has a key")
-                        .data_type,
-                )
-                .expect("sealed runtime-filter ordered value type is encodable"),
-                keys: order
-                    .keys
-                    .iter()
-                    .map(|key| RuntimeFilterOrderKeyFacts {
-                        r#type: encode_type(&key.data_type)
-                            .expect("sealed runtime-filter order-key type is encodable"),
-                        direction: RuntimeFilterSortDirection::from_sql(key.direction),
-                        null_order: RuntimeFilterNullOrder::from_sql(key.null_order),
-                    })
-                    .collect(),
-                comparator_digest: order.comparator_digest.get(),
-                order_contract_digest: match binding.contract() {
-                    PreparedRuntimeFilterContract::Ordered {
-                        order_contract_digest,
-                        ..
-                    } => order_contract_digest.bytes(),
-                    PreparedRuntimeFilterContract::Membership { .. } => {
-                        unreachable!("sealed channel domain and binding contract agree")
-                    }
-                },
-            },
-        }
+    pub fn logical_domain(self) -> RuntimeFilterLogicalDomainFacts {
+        RuntimeFilterLogicalDomainFacts::from_sql(&self.channel.logical_domain)
     }
 
     pub fn lifecycle(self) -> RuntimeFilterDeploymentLifecycleFacts {
@@ -650,19 +578,8 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
         RuntimeFilterCoverageFacts::from_sql(&self.channel.terminal_coverage)
     }
 
-    pub fn reduction(self) -> RuntimeFilterDeploymentReductionFacts {
-        match self.canonical_binding().reduction() {
-            PreparedReductionContract::SetUnion => RuntimeFilterDeploymentReductionFacts::SetUnion,
-            PreparedReductionContract::TightenOrderedBound => {
-                RuntimeFilterDeploymentReductionFacts::TightenOrderedBound
-            }
-            PreparedReductionContract::MergeTopKSummary { k, contract_digest } => {
-                RuntimeFilterDeploymentReductionFacts::MergeTopKSummary {
-                    k: k.get(),
-                    contract_digest: contract_digest.bytes(),
-                }
-            }
-        }
+    pub fn reduction(self) -> RuntimeFilterReductionFacts {
+        RuntimeFilterReductionFacts::from_sql(self.channel.reduction_requirement)
     }
 
     pub fn allowed_contribution_kinds(self) -> Vec<RuntimeFilterContributionKind> {
@@ -691,30 +608,6 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
             max_retries: self.channel.policy.max_retries,
         }
     }
-
-    fn canonical_binding(&self) -> &PreparedRuntimeFilterBinding {
-        self.prepared
-            .scheduling_view()
-            .fragments()
-            .flat_map(|fragment| fragment.runtime_filter_bindings().bindings())
-            .find(|binding| binding.channel_id() == self.channel.channel_id)
-            .expect("sealed runtime-filter channel has a materialized binding")
-    }
-}
-
-pub enum RuntimeFilterDeploymentLogicalDomainFacts {
-    Membership {
-        value_type: common::TypeDesc,
-        null_semantics: RuntimeFilterNullSemantics,
-        canonical_schema: Vec<u8>,
-        schema_digest: [u8; 32],
-    },
-    Ordered {
-        value_type: common::TypeDesc,
-        keys: Vec<RuntimeFilterOrderKeyFacts>,
-        comparator_digest: [u8; 32],
-        order_contract_digest: [u8; 32],
-    },
 }
 
 #[derive(Clone, Copy)]
@@ -740,13 +633,6 @@ impl RuntimeFilterNullSemantics {
 pub enum RuntimeFilterDeploymentLifecycleFacts {
     CompleteOnce,
     MonotonicUpdates,
-}
-
-#[derive(Clone, Copy)]
-pub enum RuntimeFilterDeploymentReductionFacts {
-    SetUnion,
-    TightenOrderedBound,
-    MergeTopKSummary { k: u32, contract_digest: [u8; 32] },
 }
 
 pub enum RuntimeFilterCoverageFacts {

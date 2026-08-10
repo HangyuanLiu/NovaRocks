@@ -522,7 +522,6 @@ fn utf8_value<'a>(
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
-    use std::collections::BTreeSet;
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
@@ -544,82 +543,23 @@ mod tests {
     use crate::exec::hash_table::key_builder::build_group_key_views;
     use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
     use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
-    use crate::exec::node::runtime_filter::{
-        RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
-    };
-    use crate::runtime_filter::model::contract::{
-        ComparatorDigest, CompletionRequirement, ContributionKind, NullOrder, OrderContract,
-        OrderKeyContract, SortDirection,
-    };
-    use crate::runtime_filter::port::ordered_bound::{
-        COMPARATOR_ALGORITHM_VERSION, OrderContractError,
-        RuntimeOrderContract as LegacyRuntimeOrderContract, comparator_digest_for_test,
-    };
+    use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
     use novarocks_execution::runtime_filter::contribution::{
-        OrderedScalar, OrderedTuple, RuntimeOrderContract,
+        OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey,
+        RuntimeOrderNullOrder as NullOrder, RuntimeOrderSortDirection as SortDirection,
     };
-
-    fn order_plan(
-        data_types: impl IntoIterator<Item = DataType>,
-        direction: SortDirection,
-        null_order: NullOrder,
-        inclusive: bool,
-    ) -> OrderContract {
-        let keys = data_types
-            .into_iter()
-            .map(|data_type| OrderKeyContract {
-                data_type,
-                direction,
-                null_order,
-            })
-            .collect::<Vec<_>>();
-        let comparator_digest = comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION);
-        OrderContract {
-            keys,
-            inclusive,
-            comparator_digest,
-        }
-    }
 
     fn runtime_contract(
         data_type: DataType,
         direction: SortDirection,
         null_order: NullOrder,
     ) -> Arc<RuntimeOrderContract> {
-        execution_contract_from_legacy(
-            &LegacyRuntimeOrderContract::try_from_plan(&order_plan(
-                [data_type],
-                direction,
-                null_order,
-                true,
-            ))
-            .expect("valid runtime order contract"),
-        )
-    }
-
-    fn execution_contract_from_legacy(
-        contract: &LegacyRuntimeOrderContract,
-    ) -> Arc<RuntimeOrderContract> {
         Arc::new(RuntimeOrderContract::from_frozen(
-            contract.keys().iter().map(|key| {
-                execution::contribution::RuntimeOrderKey::with_order(
-                    key.data_type().clone(),
-                    match key.direction() {
-                        SortDirection::Ascending => {
-                            execution::contribution::RuntimeOrderSortDirection::Ascending
-                        }
-                        SortDirection::Descending => {
-                            execution::contribution::RuntimeOrderSortDirection::Descending
-                        }
-                    },
-                    match key.null_order() {
-                        NullOrder::First => execution::contribution::RuntimeOrderNullOrder::First,
-                        NullOrder::Last => execution::contribution::RuntimeOrderNullOrder::Last,
-                    },
-                )
-            }),
-            contract.plan_comparator_digest().get(),
-            contract.digest().bytes(),
+            [RuntimeOrderKey::with_order(
+                data_type, direction, null_order,
+            )],
+            [0; 32],
+            [0; 32],
         ))
     }
 
@@ -869,43 +809,35 @@ mod tests {
 
     #[test]
     fn topn_boundary_rejects_float_multi_key_and_exclusive_contracts() {
-        let float_plan = OrderContract {
-            keys: vec![OrderKeyContract {
-                data_type: DataType::Float64,
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::Last,
-            }],
-            inclusive: true,
-            comparator_digest: ComparatorDigest::new([0; 32]),
-        };
         assert_eq!(
-            LegacyRuntimeOrderContract::try_from_plan(&float_plan),
-            Err(OrderContractError::UnsupportedSchema)
+            AggregateTopNBoundaryState::try_new(
+                NonZeroU32::new(2).unwrap(),
+                runtime_contract(DataType::Float64, SortDirection::Ascending, NullOrder::Last),
+            ),
+            Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
+                actual: DataType::Float64,
+            })
         );
 
-        let multi_key = execution_contract_from_legacy(
-            &LegacyRuntimeOrderContract::try_from_plan(&order_plan(
-                [DataType::Int64, DataType::Utf8],
-                SortDirection::Ascending,
-                NullOrder::Last,
-                true,
-            ))
-            .unwrap(),
-        );
+        let multi_key = Arc::new(RuntimeOrderContract::from_frozen(
+            [
+                RuntimeOrderKey::with_order(
+                    DataType::Int64,
+                    SortDirection::Ascending,
+                    NullOrder::Last,
+                ),
+                RuntimeOrderKey::with_order(
+                    DataType::Utf8,
+                    SortDirection::Ascending,
+                    NullOrder::Last,
+                ),
+            ],
+            [0; 32],
+            [0; 32],
+        ));
         assert_eq!(
             AggregateTopNBoundaryState::try_new(NonZeroU32::new(2).unwrap(), multi_key),
             Err(AggregateTopNBoundaryError::UnsupportedKeyArity { actual: 2 })
-        );
-
-        let exclusive = order_plan(
-            [DataType::Int64],
-            SortDirection::Ascending,
-            NullOrder::Last,
-            false,
-        );
-        assert_eq!(
-            LegacyRuntimeOrderContract::try_from_plan(&exclusive),
-            Err(OrderContractError::ExclusiveBound)
         );
     }
 

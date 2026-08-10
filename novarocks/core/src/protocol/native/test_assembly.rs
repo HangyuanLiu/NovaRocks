@@ -30,9 +30,7 @@ use std::sync::Arc;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::fragment::program::{
-    ExchangeInputContract, FragmentNodeId, RuntimeFilterContract, ScanSourceContract,
-};
+use crate::exec::fragment::program::{ExchangeInputContract, FragmentNodeId, ScanSourceContract};
 use crate::protocol::ProtocolError;
 use crate::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
 use crate::runtime::fragment::instance::{
@@ -243,15 +241,6 @@ pub trait NativeOutputLayoutDecoder: Send + Sync {
         columns: &[novarocks_protocol::common::OutputColumn],
         path: FieldPath,
     ) -> Result<NativeOutputLayout, ProtocolError>;
-}
-
-/// Backend-owned runtime-filter contract decoder invoked after plan assembly
-/// has consumed the binding table.
-pub trait RuntimeFilterExecutionContractDecoder: Send + Sync {
-    fn decode_runtime_filter_contract(
-        &self,
-        fragment: &plan::PlanFragment,
-    ) -> Result<RuntimeFilterContract, ProtocolError>;
 }
 
 /// Backend-owned exchange contract decoder invoked after the fragment sink

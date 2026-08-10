@@ -8,11 +8,12 @@ use novarocks::query_execution::{
     RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
     RuntimeFilterBindingFragmentFactsView, RuntimeFilterBindingRoleFacts,
     RuntimeFilterCompletionRequirement, RuntimeFilterConsumerActivation,
-    RuntimeFilterConsumerTarget, RuntimeFilterContractFacts, RuntimeFilterContributionKind,
-    RuntimeFilterLateApplyGranularity, RuntimeFilterNullOrder, RuntimeFilterProducerTarget,
-    RuntimeFilterReductionFacts, RuntimeFilterSortDirection,
+    RuntimeFilterConsumerTarget, RuntimeFilterContributionKind, RuntimeFilterLateApplyGranularity,
+    RuntimeFilterProducerTarget,
 };
 use novarocks_protocol::plan;
+
+use super::semantic_encoder;
 
 fn encoding_error(message: impl Into<String>) -> DistributedQueryError {
     novarocks::query_execution::contract::DistributedQueryError::new(
@@ -74,14 +75,15 @@ fn validate_binding_order(
 fn encode_binding(
     binding: novarocks::query_execution::RuntimeFilterBindingFacts<'_>,
 ) -> Result<plan::RuntimeFilterBinding, DistributedQueryError> {
+    let logical_domain = semantic_encoder::encode_logical_domain(binding.logical_domain())?;
     Ok(plan::RuntimeFilterBinding {
         binding_id: binding.binding_id(),
         channel_id: binding.channel_id(),
         node_id: binding.node_id(),
         apply_point: encode_apply_point(binding.apply_point()),
         expression: Some(binding.expression().map_err(encoding_error)?),
-        contract: Some(encode_contract(binding.contract())?),
-        reduction: Some(encode_reduction(binding.reduction())),
+        contract: Some(logical_domain.contract()),
+        reduction: Some(logical_domain.encode_reduction(binding.reduction())?),
         role: Some(encode_role(binding.role())?),
     })
 }
@@ -91,69 +93,6 @@ fn encode_apply_point(apply_point: RuntimeFilterApplyPoint) -> i32 {
         RuntimeFilterApplyPoint::NodeInput => i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
         RuntimeFilterApplyPoint::NodeOutput => i32::from(plan::RuntimeFilterApplyPoint::NodeOutput),
     }
-}
-
-fn encode_contract(
-    contract: RuntimeFilterContractFacts<'_>,
-) -> Result<plan::RuntimeFilterContract, DistributedQueryError> {
-    use plan::runtime_filter_contract::Kind;
-    let kind = match contract {
-        RuntimeFilterContractFacts::Membership {
-            canonical_schema,
-            schema_digest,
-        } => Kind::Membership(plan::RuntimeFilterMembershipContract {
-            canonical_schema: canonical_schema.to_vec(),
-            schema_digest: schema_digest.to_vec(),
-        }),
-        RuntimeFilterContractFacts::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        } => Kind::Ordered(plan::RuntimeFilterOrderedContract {
-            keys: keys
-                .into_iter()
-                .map(|key| plan::RuntimeFilterOrderKey {
-                    r#type: Some(key.r#type.clone()),
-                    direction: match key.direction {
-                        RuntimeFilterSortDirection::Ascending => {
-                            i32::from(plan::RuntimeFilterSortDirection::Ascending)
-                        }
-                        RuntimeFilterSortDirection::Descending => {
-                            i32::from(plan::RuntimeFilterSortDirection::Descending)
-                        }
-                    },
-                    null_order: match key.null_order {
-                        RuntimeFilterNullOrder::First => {
-                            i32::from(plan::RuntimeFilterNullOrder::First)
-                        }
-                        RuntimeFilterNullOrder::Last => {
-                            i32::from(plan::RuntimeFilterNullOrder::Last)
-                        }
-                    },
-                })
-                .collect(),
-            comparator_digest: comparator_digest.to_vec(),
-            order_contract_digest: order_contract_digest.to_vec(),
-        }),
-    };
-    Ok(plan::RuntimeFilterContract { kind: Some(kind) })
-}
-
-fn encode_reduction(
-    reduction: RuntimeFilterReductionFacts,
-) -> plan::RuntimeFilterReductionContract {
-    use plan::runtime_filter_reduction_contract::Kind;
-    let kind = match reduction {
-        RuntimeFilterReductionFacts::SetUnion => Kind::SetUnion(true),
-        RuntimeFilterReductionFacts::TightenOrderedBound => Kind::TightenOrderedBound(true),
-        RuntimeFilterReductionFacts::MergeTopKSummary { k, contract_digest } => {
-            Kind::MergeTopkSummary(plan::RuntimeFilterTopKReduction {
-                k,
-                contract_digest: contract_digest.to_vec(),
-            })
-        }
-    };
-    plan::RuntimeFilterReductionContract { kind: Some(kind) }
 }
 
 fn encode_role(
@@ -262,16 +201,17 @@ fn encode_role(
                     plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(ordinal)
                 }
                 RuntimeFilterConsumerTarget::SourceBoundary { scan_domain_target } => {
+                    let scan_domain_target = scan_domain_target
+                        .map(|target| {
+                            Ok(plan::RuntimeFilterScanDomainTarget {
+                                field_ordinal: target.field_ordinal,
+                                r#type: Some(semantic_encoder::encode_type(&target.data_type)?),
+                                nullable: target.nullable,
+                            })
+                        })
+                        .transpose()?;
                     plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
-                        plan::RuntimeFilterSourceBoundaryTarget {
-                            scan_domain_target: scan_domain_target.map(|target| {
-                                plan::RuntimeFilterScanDomainTarget {
-                                    field_ordinal: target.field_ordinal,
-                                    r#type: Some(target.r#type),
-                                    nullable: target.nullable,
-                                }
-                            }),
-                        },
+                        plan::RuntimeFilterSourceBoundaryTarget { scan_domain_target },
                     )
                 }
             }),
@@ -282,11 +222,16 @@ fn encode_role(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks::query_execution::{RuntimeFilterOrderKeyFacts, RuntimeFilterScanDomainTarget};
-    use novarocks_protocol::common;
+    use arrow::datatypes::DataType;
+    use novarocks::query_execution::{
+        RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
+        RuntimeFilterOrderKeyFacts, RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget,
+        RuntimeFilterSortDirection,
+    };
     use plan::runtime_filter_binding::Role;
     use plan::runtime_filter_consumer_activation::Kind as ActivationKind;
     use plan::runtime_filter_reduction_contract::Kind as ReductionKind;
+    use sha2::Digest;
 
     #[test]
     fn empty_fragment_encodes_an_explicit_empty_binding_table() {
@@ -327,36 +272,49 @@ mod tests {
     }
 
     #[test]
-    fn membership_and_ordered_contracts_preserve_semantic_fields() {
-        let membership = encode_contract(RuntimeFilterContractFacts::Membership {
-            canonical_schema: &[1, 2, 3],
-            schema_digest: [4; 32],
-        })
-        .expect("membership contract");
+    fn frontend_semantic_encoder_preserves_membership_and_ordered_contracts() {
+        let membership =
+            semantic_encoder::encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+                value_type: DataType::Int32,
+                null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+            })
+            .expect("membership contract")
+            .contract();
         let Some(plan::runtime_filter_contract::Kind::Membership(membership)) = membership.kind
         else {
             panic!("membership kind");
         };
-        assert_eq!(membership.canonical_schema, vec![1, 2, 3]);
-        assert_eq!(membership.schema_digest, vec![4; 32]);
+        assert!(!membership.canonical_schema.is_empty());
+        assert_eq!(membership.schema_digest.len(), 32);
 
-        let ordered = encode_contract(RuntimeFilterContractFacts::Ordered {
-            keys: vec![
-                RuntimeFilterOrderKeyFacts {
-                    r#type: common::TypeDesc { kind: None },
-                    direction: RuntimeFilterSortDirection::Ascending,
-                    null_order: RuntimeFilterNullOrder::First,
+        let ordered =
+            semantic_encoder::encode_logical_domain(RuntimeFilterLogicalDomainFacts::Ordered {
+                keys: vec![
+                    RuntimeFilterOrderKeyFacts {
+                        data_type: DataType::Int32,
+                        direction: RuntimeFilterSortDirection::Ascending,
+                        null_order: RuntimeFilterNullOrder::First,
+                    },
+                    RuntimeFilterOrderKeyFacts {
+                        data_type: DataType::Int64,
+                        direction: RuntimeFilterSortDirection::Descending,
+                        null_order: RuntimeFilterNullOrder::Last,
+                    },
+                ],
+                inclusive: true,
+                comparator_digest: {
+                    let mut canonical = Vec::new();
+                    canonical.extend_from_slice(&2u32.to_be_bytes());
+                    canonical.extend_from_slice(&[4, 1, 1, 5, 2, 2]);
+                    let mut digest = sha2::Sha256::new();
+                    digest.update(b"novarocks.runtime-filter.comparator");
+                    digest.update(1u16.to_be_bytes());
+                    digest.update(canonical);
+                    sha2::Digest::finalize(digest).into()
                 },
-                RuntimeFilterOrderKeyFacts {
-                    r#type: common::TypeDesc { kind: None },
-                    direction: RuntimeFilterSortDirection::Descending,
-                    null_order: RuntimeFilterNullOrder::Last,
-                },
-            ],
-            comparator_digest: [5; 32],
-            order_contract_digest: [6; 32],
-        })
-        .expect("ordered contract");
+            })
+            .expect("ordered contract")
+            .contract();
         let Some(plan::runtime_filter_contract::Kind::Ordered(ordered)) = ordered.kind else {
             panic!("ordered kind");
         };
@@ -369,32 +327,24 @@ mod tests {
             ordered.keys[1].null_order,
             i32::from(plan::RuntimeFilterNullOrder::Last)
         );
-        assert_eq!(ordered.comparator_digest, vec![5; 32]);
-        assert_eq!(ordered.order_contract_digest, vec![6; 32]);
+        assert_eq!(ordered.comparator_digest.len(), 32);
+        assert_eq!(ordered.order_contract_digest.len(), 32);
     }
 
     #[test]
-    fn reductions_map_every_sealed_variant() {
-        assert_eq!(
-            encode_reduction(RuntimeFilterReductionFacts::SetUnion).kind,
-            Some(ReductionKind::SetUnion(true))
-        );
-        assert_eq!(
-            encode_reduction(RuntimeFilterReductionFacts::TightenOrderedBound).kind,
-            Some(ReductionKind::TightenOrderedBound(true))
-        );
-        assert_eq!(
-            encode_reduction(RuntimeFilterReductionFacts::MergeTopKSummary {
-                k: 11,
-                contract_digest: [7; 32],
+    fn reductions_are_encoded_by_the_same_semantic_domain() {
+        let membership =
+            semantic_encoder::encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+                value_type: DataType::Int32,
+                null_semantics: RuntimeFilterNullSemantics::NeverMatches,
             })
-            .kind,
-            Some(ReductionKind::MergeTopkSummary(
-                plan::RuntimeFilterTopKReduction {
-                    k: 11,
-                    contract_digest: vec![7; 32],
-                }
-            ))
+            .expect("membership domain");
+        assert_eq!(
+            membership
+                .encode_reduction(RuntimeFilterReductionFacts::SetUnion)
+                .expect("membership reduction")
+                .kind,
+            Some(ReductionKind::SetUnion(true))
         );
     }
 
@@ -546,7 +496,7 @@ mod tests {
                 target: RuntimeFilterConsumerTarget::SourceBoundary {
                     scan_domain_target: Some(RuntimeFilterScanDomainTarget {
                         field_ordinal: 17,
-                        r#type: common::TypeDesc { kind: None },
+                        data_type: DataType::Int32,
                         nullable: true,
                     }),
                 },

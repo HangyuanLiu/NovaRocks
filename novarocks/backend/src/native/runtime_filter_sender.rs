@@ -99,7 +99,7 @@ impl BackendNativeRuntimeFilterTransportEnvelope {
         Ok(Self { envelope, deadline })
     }
 
-    fn into_parts(self) -> (Arc<BackendNativeRuntimeFilterEnvelope>, Duration) {
+    pub(crate) fn into_parts(self) -> (Arc<BackendNativeRuntimeFilterEnvelope>, Duration) {
         (self.envelope, self.deadline)
     }
 }

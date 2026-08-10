@@ -338,8 +338,6 @@ impl ScanExecutionBindings {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use arrow::datatypes::DataType;
 
     use super::*;

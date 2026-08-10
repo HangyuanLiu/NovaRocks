@@ -28,7 +28,6 @@ use novarocks_spi::connector::{
 
 use super::*;
 use crate::protocol::native::encode::plan as native_plan;
-use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergDeltaScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
@@ -39,13 +38,6 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::DataPartition;
 use crate::sql::planner::table as table_model;
 use novarocks_connector_iceberg::scan_model as iceberg_scan_model;
-
-fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static PreparedFragmentSet {
-    Box::leak(Box::new(
-        crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(plan)
-            .expect("materialize native encoder test binding tables"),
-    ))
-}
 
 #[test]
 fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
@@ -113,7 +105,6 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
         },
     )
     .expect("encode prepared delta binding");
@@ -240,7 +231,6 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
         },
     )
     .expect("encode ordinary Iceberg binding");
@@ -365,7 +355,6 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
         .expect("encode refresh binding");
@@ -476,7 +465,6 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
         },
     )
     .expect_err("delta source without prepared binding must fail");
@@ -496,7 +484,6 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
         },
     )
     .expect_err("binding at another node id must not be reused");
@@ -524,7 +511,6 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
         },
     )
     .expect_err("delta source with admitted connector binding must fail");
@@ -592,7 +578,6 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
         },
     )
     .expect("encode bound VARIANT scan");

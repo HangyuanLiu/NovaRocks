@@ -20,7 +20,6 @@ mod expr;
 mod instance;
 mod layout;
 mod node;
-mod runtime_filter;
 mod scan;
 mod sink;
 mod submission;
@@ -32,15 +31,7 @@ pub(crate) use instance::{
     NativeSubmissionMetadata, decode_destinations, decode_query_options, decode_scan_range_params,
 };
 #[allow(unused_imports)]
-pub(crate) use node::{
-    DecodedNode, NativePlanDecodeContext, decode_node, decode_node_with_runtime_filters,
-};
-pub(crate) use runtime_filter::{DecodedApplyPoint, NativeRuntimeFilterDecodeLedger};
-pub(in crate::protocol::native) use runtime_filter::{
-    decode_runtime_filter_activation, decode_runtime_filter_capability,
-    decode_runtime_filter_completion, decode_runtime_filter_contribution_kind,
-    decode_runtime_filter_logical_domain_and_reduction,
-};
+pub(crate) use node::{DecodedNode, NativePlanDecodeContext, decode_node};
 pub(crate) use sink::decode_fragment_sink_program_with_context;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_program};

@@ -57,10 +57,6 @@ mod statistics_sink;
 mod table_function_processor;
 mod values_source;
 
-#[cfg(feature = "runtime-filter-test-support")]
-pub use aggregate::AggregateFinalDomainSessionBuilder;
-#[cfg(not(feature = "runtime-filter-test-support"))]
-pub(crate) use aggregate::AggregateFinalDomainSessionBuilder;
 pub use aggregate::AggregateProcessorFactory;
 pub use aggregate::streaming_sink::AggregateStreamingSinkFactory;
 pub use aggregate::streaming_source::AggregateStreamingSourceFactory;
@@ -92,7 +88,8 @@ pub use noop_sink::NoopSinkFactory;
 pub use project_processor::ProjectProcessorFactory;
 pub use repeat_processor::RepeatProcessorFactory;
 pub(crate) use result_buffer_sink::ResultBufferSinkFactory;
-pub use result_sink::{ResultSinkFactory, ResultSinkHandle};
+#[cfg(test)]
+pub(crate) use result_sink::{ResultSinkFactory, ResultSinkHandle};
 pub use scan::ScanSourceFactory;
 pub(crate) use setop::{
     ExceptSharedState, IntersectSharedState, SetOpStageController, UnionAllSharedState,

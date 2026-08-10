@@ -21,71 +21,11 @@
 //! contract from a pipeline kernel.
 
 pub use execution::RuntimeFilterExecutionContract;
-#[cfg(test)]
 pub use execution::RuntimeFilterReduction as RuntimeFilterExecutionReduction;
 use novarocks_execution::runtime_filter as execution;
 
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-
-/// Legacy Core order values remain available only to Core-local test doubles.
-/// Production carriers keep the frozen Execution order contract verbatim.
-#[cfg(test)]
-pub(crate) fn core_order_keys(
-    keys: &[execution::contribution::RuntimeOrderKey],
-) -> std::sync::Arc<[crate::runtime_filter::port::ordered_bound::RuntimeOrderKey]> {
-    use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
-    use crate::runtime_filter::port::ordered_bound::RuntimeOrderKey;
-
-    keys.iter()
-        .map(|key| {
-            RuntimeOrderKey::new(
-                key.data_type().clone(),
-                match key.direction() {
-                    execution::contribution::RuntimeOrderSortDirection::Ascending => {
-                        SortDirection::Ascending
-                    }
-                    execution::contribution::RuntimeOrderSortDirection::Descending => {
-                        SortDirection::Descending
-                    }
-                },
-                match key.null_order() {
-                    execution::contribution::RuntimeOrderNullOrder::First => NullOrder::First,
-                    execution::contribution::RuntimeOrderNullOrder::Last => NullOrder::Last,
-                },
-            )
-        })
-        .collect::<Vec<_>>()
-        .into()
-}
-
-#[cfg(test)]
-pub(crate) fn execution_order_keys(
-    keys: &[crate::runtime_filter::port::ordered_bound::RuntimeOrderKey],
-) -> std::sync::Arc<[execution::contribution::RuntimeOrderKey]> {
-    use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
-
-    keys.iter()
-        .map(|key| {
-            execution::contribution::RuntimeOrderKey::with_order(
-                key.data_type().clone(),
-                match key.direction() {
-                    SortDirection::Ascending => {
-                        execution::contribution::RuntimeOrderSortDirection::Ascending
-                    }
-                    SortDirection::Descending => {
-                        execution::contribution::RuntimeOrderSortDirection::Descending
-                    }
-                },
-                match key.null_order() {
-                    NullOrder::First => execution::contribution::RuntimeOrderNullOrder::First,
-                    NullOrder::Last => execution::contribution::RuntimeOrderNullOrder::Last,
-                },
-            )
-        })
-        .collect::<Vec<_>>()
-        .into()
-}
 
 #[derive(Clone, Debug)]
 pub struct RuntimeFilterConsumerBinding {
@@ -158,50 +98,6 @@ impl RuntimeFilterConsumerBinding {
     pub const fn execution_contract(&self) -> &execution::RuntimeFilterExecutionContract {
         self.contract.contract()
     }
-}
-
-/// Builds a deliberately permissive consumer contract for Core-only legacy
-/// fixtures. Production fragment decoding must use the role-specific
-/// constructors in `novarocks-execution`.
-#[cfg(test)]
-pub(crate) fn test_consumer_contract(
-    binding_id: u32,
-    channel_id: u32,
-    activation: crate::runtime_filter::model::contract::ConsumerActivation,
-    contract: execution::RuntimeFilterExecutionContract,
-) -> execution::RuntimeFilterConsumerContract {
-    let activation = match activation {
-        crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
-            execution::ConsumerActivation::BlockingSnapshot
-        }
-        crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
-            late_apply,
-        } => execution::ConsumerActivation::NonBlockingLive {
-            late_apply: match late_apply {
-                crate::runtime_filter::model::contract::LateApplyGranularity::Row => {
-                    execution::RuntimeFilterLateApplyGranularity::Row
-                }
-                crate::runtime_filter::model::contract::LateApplyGranularity::Batch => {
-                    execution::RuntimeFilterLateApplyGranularity::Batch
-                }
-                crate::runtime_filter::model::contract::LateApplyGranularity::RowGroup => {
-                    execution::RuntimeFilterLateApplyGranularity::RowGroup
-                }
-                crate::runtime_filter::model::contract::LateApplyGranularity::Split => {
-                    execution::RuntimeFilterLateApplyGranularity::Split
-                }
-                crate::runtime_filter::model::contract::LateApplyGranularity::File => {
-                    execution::RuntimeFilterLateApplyGranularity::File
-                }
-            },
-        },
-    };
-    execution::RuntimeFilterConsumerContract::new(
-        execution::RuntimeFilterBindingId::new(binding_id),
-        execution::RuntimeFilterChannelId::new(channel_id),
-        activation,
-        contract,
-    )
 }
 
 #[cfg(test)]

@@ -87,28 +87,6 @@ impl ExchangeSourceFactory {
             arena,
         })
     }
-
-    #[cfg(test)]
-    fn new_native_with_consumers_for_test(
-        node: ExchangeSourceNode,
-        binding: ExchangeBinding,
-        arena: Arc<ExprArena>,
-        consumers: RuntimeFilterConsumerSet,
-    ) -> Result<Self, String> {
-        let name = node.profile_name();
-        exchange::register_expected_chunk_schema(
-            binding.key,
-            binding.expected_senders,
-            node.expected_chunk_schema(),
-        )?;
-        Ok(Self {
-            name,
-            node,
-            binding,
-            runtime_filter_execution: ExchangeSourceRuntimeFilterExecution { consumers },
-            arena,
-        })
-    }
 }
 
 impl OperatorFactory for ExchangeSourceFactory {
@@ -374,11 +352,18 @@ mod tests {
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_execution::runtime_filter::{
+        self as execution, RuntimeFilterArtifactQueryError, RuntimeFilterBindingId,
+        RuntimeFilterChannelId, RuntimeFilterConsumerContract, RuntimeFilterExecutionContract,
+        RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterScalarRef,
+    };
+    use novarocks_spi::connector::ConnectorScalarValue;
 
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::ExprArena;
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
     use crate::exec::pipeline::binding::ExchangeBinding;
     use crate::runtime::runtime_state::RuntimeState;
 
@@ -403,33 +388,153 @@ mod tests {
         (0..ints.len()).map(|row| ints.value(row)).collect()
     }
 
+    struct Int32MembershipQuery {
+        accepted: Vec<i32>,
+    }
+
+    impl execution::evaluator::RuntimeFilterArtifactQuery for Int32MembershipQuery {
+        fn data_type(&self) -> &DataType {
+            &DataType::Int32
+        }
+
+        fn matches_null(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(false)
+        }
+
+        fn has_non_null_matches(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(!self.accepted.is_empty())
+        }
+
+        fn non_null_value_may_match(
+            &self,
+            value: RuntimeFilterScalarRef<'_>,
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            match value {
+                RuntimeFilterScalarRef::Int32(value) => Ok(self.accepted.contains(&value)),
+                _ => Err(RuntimeFilterArtifactQueryError::ContractViolation),
+            }
+        }
+
+        fn non_null_range_may_match(
+            &self,
+            _: &ConnectorScalarValue,
+            _: &ConnectorScalarValue,
+        ) -> Result<bool, RuntimeFilterArtifactQueryError> {
+            Ok(true)
+        }
+    }
+
+    struct PublishedSubscription(Arc<execution::RuntimeFilterSnapshot>);
+
+    impl execution::BlockingSnapshotSubscription for PublishedSubscription {
+        fn acquire(&self, _: Duration) -> execution::SnapshotAcquireOutcome {
+            execution::SnapshotAcquireOutcome::Published(Arc::clone(&self.0))
+        }
+
+        fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    struct PublishedSession {
+        subscription: Arc<dyn execution::BlockingSnapshotSubscription>,
+    }
+
+    impl execution::RuntimeFilterSession for PublishedSession {
+        fn open_producer(
+            &self,
+            _: execution::RuntimeFilterProducerOpenRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+            execution::RuntimeFilterContractViolation,
+        > {
+            Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "consumer-only test session",
+            ))
+        }
+
+        fn subscribe(
+            &self,
+            _: execution::RuntimeFilterSubscriptionRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+            execution::RuntimeFilterContractViolation,
+        > {
+            Ok(execution::RuntimeFilterBindOutcome::Bound(
+                execution::RuntimeFilterSubscriptionHandle::Blocking(Arc::clone(
+                    &self.subscription,
+                )),
+            ))
+        }
+
+        fn open_final_domain_completion(
+            &self,
+            _: execution::RuntimeFilterFinalDomainOpenRequest,
+        ) -> Result<
+            execution::RuntimeFilterBindOutcome<
+                execution::RuntimeFilterFinalDomainCompletionHandle,
+            >,
+            execution::RuntimeFilterContractViolation,
+        > {
+            Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "consumer-only test session",
+            ))
+        }
+    }
+
+    fn membership_binding(expr_id: crate::exec::expr::ExprId) -> RuntimeFilterConsumerBinding {
+        let schema = RuntimeFilterMembershipSchema::new(
+            &DataType::Int32,
+            RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
+        let contract = RuntimeFilterConsumerContract::membership_blocking(
+            RuntimeFilterBindingId::new(1),
+            RuntimeFilterChannelId::new(2),
+            RuntimeFilterExecutionContract::Membership(schema),
+        )
+        .expect("membership consumer contract");
+        RuntimeFilterConsumerBinding::new(expr_id, contract, None)
+    }
+
+    fn published_runtime_state(accepted: Vec<i32>) -> RuntimeState {
+        let snapshot = Arc::new(execution::RuntimeFilterSnapshot::new(
+            RuntimeFilterBindingId::new(1),
+            execution::LogicalVersion::FIRST,
+            [0; 32],
+            Arc::new(Int32MembershipQuery { accepted }),
+        ));
+        let session: execution::RuntimeFilterSessionRef = Arc::new(PublishedSession {
+            subscription: Arc::new(PublishedSubscription(snapshot)),
+        });
+        RuntimeState::default().with_runtime_filter_session(Some(session))
+    }
+
     #[test]
     fn native_exchange_source_applies_the_shared_membership_mask() {
-        let (consumers, arena) =
-            crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
-                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
-            );
         let key = exchange::ExchangeKey {
             finst_id_hi: 91_001,
             finst_id_lo: 91_002,
             node_id: 91_003,
         };
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         let node = ExchangeSourceNode::new(
             key.node_id,
             Duration::from_secs(2),
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .unwrap(),
-        );
+        )
+        .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
         let binding = ExchangeBinding {
             key,
             expected_senders: 1,
         };
-        let factory = ExchangeSourceFactory::new_native_with_consumers_for_test(
-            node, binding, arena, consumers,
-        )
-        .unwrap();
-        let state = RuntimeState::default();
+        let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
+        let state = published_runtime_state(vec![2, 4]);
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
         source.bind_runtime_state(&state).unwrap();
@@ -447,31 +552,27 @@ mod tests {
 
     #[test]
     fn native_exchange_source_continues_after_first_chunk_is_fully_filtered() {
-        let (consumers, arena) =
-            crate::exec::operators::runtime_filter::tests_support::published_consumer_set(
-                crate::exec::operators::runtime_filter::tests_support::membership_bundle(&[2, 4]),
-            );
         let key = exchange::ExchangeKey {
             finst_id_hi: 91_011,
             finst_id_lo: 91_012,
             node_id: 91_013,
         };
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         let node = ExchangeSourceNode::new(
             key.node_id,
             Duration::from_secs(2),
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .unwrap(),
-        );
+        )
+        .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
         let binding = ExchangeBinding {
             key,
             expected_senders: 1,
         };
-        let factory = ExchangeSourceFactory::new_native_with_consumers_for_test(
-            node, binding, arena, consumers,
-        )
-        .unwrap();
-        let state = RuntimeState::default();
+        let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
+        let state = published_runtime_state(vec![2, 4]);
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
         source.bind_runtime_state(&state).unwrap();

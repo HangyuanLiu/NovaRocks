@@ -31,19 +31,9 @@ use novarocks_protocol::{common, plan};
 
 use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;
-#[cfg(test)]
-pub(in crate::protocol::native) use runtime_filter::encode_runtime_filter_runtime_producer_target;
-#[cfg(test)]
-pub(in crate::protocol::native) use runtime_filter::{
-    encode_runtime_filter_activation, encode_runtime_filter_capability,
-    encode_runtime_filter_completion, encode_runtime_filter_contribution_kind,
-    encode_runtime_filter_logical_domain, encode_runtime_filter_reduction_requirement,
-};
 
 mod output;
 mod relational;
-#[cfg(test)]
-mod runtime_filter;
 mod scan;
 mod topology;
 mod type_mapping;
@@ -73,21 +63,15 @@ pub(super) struct NativePlanEncodeContext<'a> {
     /// `None` only in bare-node/bare-fragment encoder unit tests, which never
     /// encode a write or router fragment.
     pub(super) write_contracts: ContextRef<'a, WriteContractCatalog>,
-    pub(super) runtime_filter_bindings: ContextRef<'a, PreparedFragmentSet>,
 }
 
 impl<'a> NativePlanEncodeContext<'a> {
-    fn complete(
-        src: &'a DistributedPlan,
-        scan_bindings: &'a ScanExecutionBindings,
-        runtime_filter_bindings: ContextRef<'a, PreparedFragmentSet>,
-    ) -> Self {
+    fn complete(src: &'a DistributedPlan, scan_bindings: &'a ScanExecutionBindings) -> Self {
         Self {
             scan_bindings: Some(scan_bindings),
             node_outputs: Some(src.node_outputs()),
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
-            runtime_filter_bindings,
         }
     }
 }
@@ -119,10 +103,9 @@ pub(super) fn encode_distributed_plan_from_prepared(
     prepared: &PreparedFragmentSet,
 ) -> Result<plan::DistributedPlan, String> {
     let _ = prepared;
-    let runtime_filter_bindings = None;
     encode_distributed_plan_with_context_inner(
         src,
-        NativePlanEncodeContext::complete(src, scan_bindings, runtime_filter_bindings),
+        NativePlanEncodeContext::complete(src, scan_bindings),
     )
 }
 
@@ -131,10 +114,6 @@ pub(super) fn encode_distributed_plan_with_context(
     src: &DistributedPlan,
     ctx: NativePlanEncodeContext<'_>,
 ) -> Result<plan::DistributedPlan, String> {
-    let runtime_filter_bindings = required_context_ref(ctx.runtime_filter_bindings, || {
-        "native distributed plan encoding requires prepared runtime filter binding tables"
-            .to_string()
-    })?;
     encode_distributed_plan_with_context_inner(
         src,
         NativePlanEncodeContext {
@@ -142,7 +121,6 @@ pub(super) fn encode_distributed_plan_with_context(
             node_outputs: Some(src.node_outputs()),
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
-            runtime_filter_bindings: Some(runtime_filter_bindings),
         },
     )
 }
@@ -185,7 +163,6 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_bindings: None,
         },
     )
 }

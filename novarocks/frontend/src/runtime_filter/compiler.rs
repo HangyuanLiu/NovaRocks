@@ -14,9 +14,7 @@ use novarocks::query_execution::{
     RuntimeFilterArtifactCapability, RuntimeFilterCompletionRequirement,
     RuntimeFilterConsumerActivation, RuntimeFilterContributionKind, RuntimeFilterCoverageFacts,
     RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
-    RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterDeploymentLogicalDomainFacts,
-    RuntimeFilterDeploymentReductionFacts, RuntimeFilterLateApplyGranularity,
-    RuntimeFilterNullOrder, RuntimeFilterSortDirection,
+    RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterLateApplyGranularity,
 };
 use novarocks_protocol::{common, filter, plan};
 use novarocks_types::UniqueId;
@@ -28,6 +26,7 @@ use super::model::{
     FrontendRuntimeFilterDeployment, FrontendRuntimeFilterDeploymentPolicy,
     FrontendRuntimeFilterLifecycle, FrontendRuntimeFilterParticipant, RuntimeFilterChannelPolicy,
 };
+use super::semantic_encoder;
 
 /// Owner-local query configuration captured before the schedule is sealed.
 /// The lifecycle is still validated for RF-off queries so enabling channels
@@ -190,87 +189,120 @@ struct RoleChannel {
 
 type Instances = BTreeMap<(u32, u32, u32), BTreeSet<UniqueId>>;
 
+/// Frontend-private, immutable deployment input copied from the sealed Core
+/// view before placement, routing and liveness compilation begins.
+struct DeploymentInput {
+    topology: BTreeMap<usize, String>,
+    fragment_edges: Vec<FragmentEdgeSpec>,
+    join_progress: BTreeMap<(u32, u32, u32), JoinProgressProof>,
+    channels: BTreeMap<u32, ChannelSpec>,
+    policies: Vec<RuntimeFilterChannelPolicy>,
+    bindings: BTreeMap<u32, BindingSpec>,
+    instances: Instances,
+}
+
+impl DeploymentInput {
+    fn from_sealed(view: RuntimeFilterScheduledView<'_>) -> Result<Self, DistributedQueryError> {
+        let topology = sealed_topology(view.clone())?;
+        let facts = view.deployment_facts();
+        let fragment_edges = facts
+            .fragment_edges()
+            .map(|edge| FragmentEdgeSpec {
+                source_fragment_id: edge.source_fragment_id(),
+                target_fragment_id: edge.target_fragment_id(),
+                target_exchange_node_id: edge.target_exchange_node_id(),
+            })
+            .collect();
+        let join_progress = facts
+            .join_progress()
+            .filter_map(|progress| match progress {
+                novarocks::query_execution::RuntimeFilterJoinProgressFacts::Proven {
+                    channel_id,
+                    producer_binding_id,
+                    producer_fragment_id,
+                    join_node_id,
+                    build_frontier,
+                    non_build_inputs,
+                } => Some(JoinProgressProof {
+                    channel_id,
+                    producer_binding_id,
+                    producer_fragment_id,
+                    join_node_id,
+                    build_frontier: build_frontier
+                        .into_iter()
+                        .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
+                        .collect(),
+                    non_build_inputs: non_build_inputs
+                        .into_iter()
+                        .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
+                        .collect(),
+                }),
+                novarocks::query_execution::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
+            })
+            .map(|proof| {
+                (
+                    (
+                        proof.channel_id,
+                        proof.producer_binding_id,
+                        proof.producer_fragment_id,
+                    ),
+                    proof,
+                )
+            })
+            .collect();
+        let (channels, policies) = materialize_channels(facts)?;
+        let (bindings, instances) = materialize_bindings(facts, &channels, &topology)?;
+        Ok(Self {
+            topology,
+            fragment_edges,
+            join_progress,
+            channels,
+            policies,
+            bindings,
+            instances,
+        })
+    }
+}
+
 fn compile_nonempty_deployment(
     view: RuntimeFilterScheduledView<'_>,
     config: FrontendRuntimeFilterDeploymentCompilerConfig,
 ) -> Result<EncodedRuntimeFilterDeployment, DistributedQueryError> {
-    let topology = sealed_topology(view.clone())?;
-    let facts = view.deployment_facts();
-    let fragment_edges = facts
-        .fragment_edges()
-        .map(|edge| FragmentEdgeSpec {
-            source_fragment_id: edge.source_fragment_id(),
-            target_fragment_id: edge.target_fragment_id(),
-            target_exchange_node_id: edge.target_exchange_node_id(),
-        })
-        .collect::<Vec<_>>();
-    let join_progress = facts
-        .join_progress()
-        .filter_map(|progress| match progress {
-            novarocks::query_execution::RuntimeFilterJoinProgressFacts::Proven {
-                channel_id,
-                producer_binding_id,
-                producer_fragment_id,
-                join_node_id,
-                build_frontier,
-                non_build_inputs,
-            } => Some(JoinProgressProof {
-                channel_id,
-                producer_binding_id,
-                producer_fragment_id,
-                join_node_id,
-                build_frontier: build_frontier
-                    .into_iter()
-                    .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
-                    .collect(),
-                non_build_inputs: non_build_inputs
-                    .into_iter()
-                    .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
-                    .collect(),
-            }),
-            novarocks::query_execution::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
-        })
-        .map(|proof| {
-            (
-                (
-                    proof.channel_id,
-                    proof.producer_binding_id,
-                    proof.producer_fragment_id,
-                ),
-                proof,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let (channels, policies) = materialize_channels(facts)?;
-    if channels.is_empty() {
+    let input = DeploymentInput::from_sealed(view.clone())?;
+    if input.channels.is_empty() {
         return Err(compilation_error(
             "runtime filter nonempty handoff has no channel facts",
         ));
     }
-    let (bindings, instances) = materialize_bindings(facts, &channels, &topology)?;
-    let roles = build_roles(&channels, &bindings, &instances, topology.len())?;
-    let wait_graph = build_wait_graph(&bindings, &fragment_edges, &join_progress)?;
+    let roles = build_roles(
+        &input.channels,
+        &input.bindings,
+        &input.instances,
+        input.topology.len(),
+    )?;
+    let wait_graph =
+        build_wait_graph(&input.bindings, &input.fragment_edges, &input.join_progress)?;
 
     let lifecycle_input = config.lifecycle.to_wire();
     let deployment_policy = FrontendRuntimeFilterDeploymentPolicy::derive(
-        policies,
-        topology.len(),
+        input.policies,
+        input.topology.len(),
         config.runtime_worker_count,
         lifecycle_input.delivery_expire_ms,
         lifecycle_input.query_expire_ms,
     )
     .map_err(|error| compilation_error(error.to_string()))?;
 
-    let mut participants = Vec::with_capacity(topology.len());
-    for (&backend_idx, _) in &topology {
+    let mut participants = Vec::with_capacity(input.topology.len());
+    for &backend_idx in input.topology.keys() {
         let participant_id = participant_id(backend_idx)?;
         let install = participant_install(
             participant_id,
-            &channels,
-            &bindings,
-            &instances,
+            &input.channels,
+            &input.bindings,
+            &input.instances,
             &roles,
-            &topology,
+            &input.topology,
             deployment_policy,
         )?;
         let participant =
@@ -287,7 +319,7 @@ fn compile_nonempty_deployment(
         view.clone().query_id_wire(),
         view.clone().deployment_epoch(),
         deployment_policy.lifecycle,
-        topology.keys().copied(),
+        input.topology.keys().copied(),
         participants,
         &wait_graph,
     )
@@ -337,7 +369,11 @@ fn materialize_channels(
     let mut policies = Vec::new();
     for fact in facts.channels() {
         let channel_id = require_nonzero(fact.channel_id(), "channel id")?;
-        let logical_domain = logical_domain(fact.logical_domain())?;
+        let encoded_domain = semantic_encoder::encode_logical_domain(fact.logical_domain())?;
+        let logical_domain = filter::RuntimeFilterLogicalDomain {
+            value_type: Some(encoded_domain.value_type()),
+            contract: Some(encoded_domain.contract()),
+        };
         let lifecycle = match fact.lifecycle() {
             RuntimeFilterDeploymentLifecycleFacts::CompleteOnce => {
                 filter::RuntimeFilterLifecycle::CompleteOnce as i32
@@ -348,7 +384,7 @@ fn materialize_channels(
         };
         let availability_coverage = coverage(fact.availability_coverage())?;
         let terminal_coverage = coverage(fact.terminal_coverage())?;
-        let reduction = reduction(fact.reduction())?;
+        let reduction = encoded_domain.encode_reduction(fact.reduction())?;
         let contribution_kinds = unique_contribution_kinds(fact.allowed_contribution_kinds())?;
         let required_capabilities = unique_capabilities(fact.required_consumer_capabilities())?;
         let policy = fact.policy();
@@ -1313,67 +1349,6 @@ fn valid_join_progress_proof(
         })
 }
 
-fn logical_domain(
-    value: RuntimeFilterDeploymentLogicalDomainFacts,
-) -> Result<filter::RuntimeFilterLogicalDomain, DistributedQueryError> {
-    match value {
-        RuntimeFilterDeploymentLogicalDomainFacts::Membership {
-            value_type,
-            canonical_schema,
-            schema_digest,
-            ..
-        } => Ok(filter::RuntimeFilterLogicalDomain {
-            value_type: Some(value_type),
-            contract: Some(plan::RuntimeFilterContract {
-                kind: Some(plan::runtime_filter_contract::Kind::Membership(
-                    plan::RuntimeFilterMembershipContract {
-                        canonical_schema,
-                        schema_digest: schema_digest.to_vec(),
-                    },
-                )),
-            }),
-        }),
-        RuntimeFilterDeploymentLogicalDomainFacts::Ordered {
-            value_type,
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        } => Ok(filter::RuntimeFilterLogicalDomain {
-            value_type: Some(value_type),
-            contract: Some(plan::RuntimeFilterContract {
-                kind: Some(plan::runtime_filter_contract::Kind::Ordered(
-                    plan::RuntimeFilterOrderedContract {
-                        keys: keys
-                            .into_iter()
-                            .map(|key| plan::RuntimeFilterOrderKey {
-                                r#type: Some(key.r#type),
-                                direction: match key.direction {
-                                    RuntimeFilterSortDirection::Ascending => {
-                                        plan::RuntimeFilterSortDirection::Ascending as i32
-                                    }
-                                    RuntimeFilterSortDirection::Descending => {
-                                        plan::RuntimeFilterSortDirection::Descending as i32
-                                    }
-                                },
-                                null_order: match key.null_order {
-                                    RuntimeFilterNullOrder::First => {
-                                        plan::RuntimeFilterNullOrder::First as i32
-                                    }
-                                    RuntimeFilterNullOrder::Last => {
-                                        plan::RuntimeFilterNullOrder::Last as i32
-                                    }
-                                },
-                            })
-                            .collect(),
-                        comparator_digest: comparator_digest.to_vec(),
-                        order_contract_digest: order_contract_digest.to_vec(),
-                    },
-                )),
-            }),
-        }),
-    }
-}
-
 fn coverage(
     value: RuntimeFilterCoverageFacts,
 ) -> Result<filter::RuntimeFilterCoverage, DistributedQueryError> {
@@ -1447,28 +1422,6 @@ fn coverage_is_any_of(coverage: &filter::RuntimeFilterCoverage) -> bool {
         coverage.kind,
         Some(filter::runtime_filter_coverage::Kind::AnyOf(_))
     )
-}
-
-fn reduction(
-    value: RuntimeFilterDeploymentReductionFacts,
-) -> Result<plan::RuntimeFilterReductionContract, DistributedQueryError> {
-    let kind = match value {
-        RuntimeFilterDeploymentReductionFacts::SetUnion => {
-            plan::runtime_filter_reduction_contract::Kind::SetUnion(true)
-        }
-        RuntimeFilterDeploymentReductionFacts::TightenOrderedBound => {
-            plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(true)
-        }
-        RuntimeFilterDeploymentReductionFacts::MergeTopKSummary { k, contract_digest } => {
-            plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(
-                plan::RuntimeFilterTopKReduction {
-                    k: require_nonzero(k, "top-k reduction k")?,
-                    contract_digest: contract_digest.to_vec(),
-                },
-            )
-        }
-    };
-    Ok(plan::RuntimeFilterReductionContract { kind: Some(kind) })
 }
 
 fn unique_contribution_kinds(
@@ -1724,4 +1677,150 @@ fn allocate_edge(next: &mut u32) -> Result<u32, DistributedQueryError> {
         compilation_error("runtime filter route edge identity space is exhausted")
     })?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn producer(binding_id: u32, fragment_id: u32, node_id: i32) -> BindingSpec {
+        BindingSpec {
+            binding_id,
+            channel_id: 1,
+            fragment_id,
+            node_id,
+            witness: Some(binding_id),
+            role: BindingRole::Producer {
+                completion: plan::RuntimeFilterCompletionRequirement::ProducerClosed as i32,
+            },
+        }
+    }
+
+    fn consumer(binding_id: u32, fragment_id: u32, blocking: bool) -> BindingSpec {
+        let kind = if blocking {
+            plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true)
+        } else {
+            plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
+                plan::RuntimeFilterLateApplyGranularity::Batch as i32,
+            )
+        };
+        BindingSpec {
+            binding_id,
+            channel_id: 1,
+            fragment_id,
+            node_id: 22,
+            witness: None,
+            role: BindingRole::Consumer {
+                capabilities: BTreeSet::from([Capability::Membership]),
+                activation: plan::RuntimeFilterConsumerActivation { kind: Some(kind) },
+            },
+        }
+    }
+
+    #[test]
+    fn fragment_dependency_closure_is_stable_under_input_order() {
+        let ordered = [
+            FragmentEdgeSpec {
+                source_fragment_id: 1,
+                target_fragment_id: 3,
+                target_exchange_node_id: 11,
+            },
+            FragmentEdgeSpec {
+                source_fragment_id: 2,
+                target_fragment_id: 3,
+                target_exchange_node_id: 12,
+            },
+            FragmentEdgeSpec {
+                source_fragment_id: 3,
+                target_fragment_id: 4,
+                target_exchange_node_id: 13,
+            },
+        ];
+        let reordered = [ordered[2], ordered[0], ordered[1]];
+
+        let dependencies = fragment_dependencies(&ordered).expect("sealed edges are valid");
+        assert_eq!(dependencies, fragment_dependencies(&reordered).unwrap());
+        assert_eq!(dependencies[&3], BTreeSet::from([1, 2]));
+        assert_eq!(dependencies[&4], BTreeSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn join_progress_proof_rejects_mismatch_and_invalid_frontiers() {
+        let producer = producer(7, 2, 100);
+        let edges = [
+            FragmentEdgeSpec {
+                source_fragment_id: 1,
+                target_fragment_id: 2,
+                target_exchange_node_id: 11,
+            },
+            FragmentEdgeSpec {
+                source_fragment_id: 3,
+                target_fragment_id: 2,
+                target_exchange_node_id: 13,
+            },
+        ];
+        let dependencies = fragment_dependencies(&edges).unwrap();
+        let valid = JoinProgressProof {
+            channel_id: 1,
+            producer_binding_id: 7,
+            producer_fragment_id: 2,
+            join_node_id: 100,
+            build_frontier: vec![(1, 11)],
+            non_build_inputs: vec![(3, 13)],
+        };
+        assert!(valid_join_progress_proof(
+            &valid,
+            &producer,
+            3,
+            &edges,
+            &dependencies
+        ));
+
+        let mut wrong_binding = valid.clone();
+        wrong_binding.producer_binding_id = 8;
+        let mut incomplete = valid.clone();
+        incomplete.non_build_inputs.clear();
+        let mut overlap = valid.clone();
+        overlap.non_build_inputs = vec![(1, 11), (3, 13)];
+        let mut duplicate = valid.clone();
+        duplicate.build_frontier.push((1, 11));
+
+        for (name, proof) in [
+            ("binding mismatch", wrong_binding),
+            ("incomplete frontier", incomplete),
+            ("overlapping frontier", overlap),
+            ("duplicate frontier edge", duplicate),
+        ] {
+            assert!(
+                !valid_join_progress_proof(&proof, &producer, 3, &edges, &dependencies),
+                "{name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn blocking_consumer_cycle_is_rejected_but_live_apply_is_not() {
+        let producer = producer(1, 1, 10);
+        let edge = FragmentEdgeSpec {
+            source_fragment_id: 2,
+            target_fragment_id: 1,
+            target_exchange_node_id: 20,
+        };
+        for (name, blocking, expected_live) in [
+            ("blocking snapshot", true, false),
+            ("nonblocking live apply", false, true),
+        ] {
+            let bindings = BTreeMap::from([
+                (producer.binding_id, producer.clone()),
+                (2, consumer(2, 2, blocking)),
+            ]);
+            let graph = build_wait_graph(&bindings, &[edge], &BTreeMap::new())
+                .expect("sealed facts can construct a wait graph");
+            assert_eq!(
+                graph.validate().is_ok(),
+                expected_live,
+                "{name} must have the expected liveness result"
+            );
+        }
+    }
 }
