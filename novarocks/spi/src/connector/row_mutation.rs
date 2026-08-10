@@ -29,7 +29,8 @@ use super::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorRequestContext,
     ConnectorSealedWriteCohortSet, ConnectorTableHandle, ConnectorWriteBaseVersion,
     ConnectorWriteCohortId, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-    ConnectorWriteOperationId, ConnectorWritePreparation, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWriteTargetRef,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
 };
 
 pub const CONNECTOR_ROW_MUTATION_CONTRACT_VERSION: u32 = 1;
@@ -475,6 +476,7 @@ pub struct ConnectorRowMutationPreparation {
     owner: ConnectorExecutionBindingKey,
     operation_id: ConnectorWriteOperationId,
     table: ConnectorTableHandle,
+    target_ref: ConnectorWriteTargetRef,
     intent: ConnectorRowMutationIntent,
     base_version: ConnectorWriteBaseVersion,
     match_contract: ConnectorMutationMatchContract,
@@ -489,6 +491,7 @@ impl ConnectorRowMutationPreparation {
         owner: ConnectorExecutionBindingKey,
         operation_id: ConnectorWriteOperationId,
         table: ConnectorTableHandle,
+        target_ref: ConnectorWriteTargetRef,
         intent: ConnectorRowMutationIntent,
         base_version: ConnectorWriteBaseVersion,
         match_contract: ConnectorMutationMatchContract,
@@ -513,6 +516,7 @@ impl ConnectorRowMutationPreparation {
             &owner,
             operation_id,
             &table,
+            &target_ref,
             &intent,
             &base_version,
             &match_contract,
@@ -523,6 +527,7 @@ impl ConnectorRowMutationPreparation {
             owner,
             operation_id,
             table,
+            target_ref,
             intent,
             base_version,
             match_contract,
@@ -536,6 +541,7 @@ impl ConnectorRowMutationPreparation {
             self.owner.clone(),
             self.operation_id,
             self.table.clone(),
+            self.target_ref.clone(),
             self.intent.clone(),
             self.base_version.clone(),
             self.match_contract.clone(),
@@ -558,6 +564,9 @@ impl ConnectorRowMutationPreparation {
     }
     pub fn table(&self) -> &ConnectorTableHandle {
         &self.table
+    }
+    pub fn target_ref(&self) -> &ConnectorWriteTargetRef {
+        &self.target_ref
     }
     pub fn intent(&self) -> &ConnectorRowMutationIntent {
         &self.intent
@@ -583,6 +592,7 @@ impl ConnectorRowMutationPreparation {
 pub struct ConnectorRowMutationPreparationRequest {
     pub operation_id: ConnectorWriteOperationId,
     pub table: ConnectorTableHandle,
+    pub target_ref: ConnectorWriteTargetRef,
     pub intent: ConnectorRowMutationIntent,
     pub context: ConnectorRequestContext,
 }
@@ -967,6 +977,7 @@ fn preparation_digest(
     owner: &ConnectorExecutionBindingKey,
     operation: ConnectorWriteOperationId,
     table: &ConnectorTableHandle,
+    target_ref: &ConnectorWriteTargetRef,
     intent: &ConnectorRowMutationIntent,
     base: &ConnectorWriteBaseVersion,
     contract: &ConnectorMutationMatchContract,
@@ -978,6 +989,7 @@ fn preparation_digest(
     digest_owner(&mut hasher, owner);
     hasher.update(operation.to_bytes());
     digest_bytes(&mut hasher, table.payload());
+    digest_bytes(&mut hasher, target_ref.as_str().as_bytes());
     match intent {
         ConnectorRowMutationIntent::Delete => hasher.update([1]),
         ConnectorRowMutationIntent::Update => hasher.update([2]),

@@ -6203,25 +6203,36 @@ pub(crate) fn prepare_iceberg_row_mutation(
             "admitted Iceberg row-mutation table is missing table UUID",
         )
     })?;
-    let snapshot = table
-        .current_snapshot_id
-        .map_or_else(|| "none".to_string(), |id| id.to_string());
+    let target_snapshot_id =
+        iceberg_write_target_snapshot_id(&metadata, request.target_ref.as_str())?;
+    let snapshot = target_snapshot_id.map_or_else(|| "none".to_string(), |id| id.to_string());
     let base_version = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-        "iceberg/row-mutation-base/v1/{table_uuid}/{snapshot}"
+        "iceberg/row-mutation-base/v1/{table_uuid}/{}/{snapshot}",
+        request.target_ref.as_str()
     )))?;
     // The match layout is provider-signed rather than name-derived by SQL:
     // source identities precede target before/after values and the logical
     // effect field is last.  The source/target ordinals are the sole cross
     // layer binding; these familiar Iceberg names never become a Core rule.
-    let target_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
-        metadata.current_schema(),
-    )
-    .map_err(|error| {
-        ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            format!("convert admitted Iceberg row-mutation schema to Arrow: {error}"),
-        )
-    })?;
+    let requested_target_fields = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| {
+            ConnectorWriteFieldRequest::new(Field::new(
+                &field.name,
+                DataType::Null,
+                !field.required,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let target_schema = Schema::new(
+        exact_requested_iceberg_write_fields(&metadata, &requested_target_fields)?
+            .into_iter()
+            .map(|field| Arc::new(field.field().clone()))
+            .collect::<Vec<_>>(),
+    );
     let target_start = u32::try_from(identity_fields.len()).map_err(|_| {
         ConnectorError::new(
             ConnectorErrorKind::ResourceExhausted,
@@ -6299,14 +6310,16 @@ pub(crate) fn prepare_iceberg_row_mutation(
         effect_field,
     )?;
     let payload = Bytes::from(format!(
-        "iceberg/row-mutation-preparation/v1/{}/{table_uuid}/{snapshot}/{strategy:?}",
-        owner.instance_id.as_str()
+        "iceberg/row-mutation-preparation/v1/{}/{table_uuid}/{}/{snapshot}/{strategy:?}",
+        owner.instance_id.as_str(),
+        request.target_ref.as_str()
     ));
     Ok(ConnectorRowMutationPreparationOutcome::Prepared(
         ConnectorRowMutationPreparation::try_new(
             owner.clone(),
             request.operation_id,
             request.table,
+            request.target_ref,
             request.intent,
             base_version,
             contract,
@@ -6486,7 +6499,7 @@ fn activate_iceberg_cow_row_mutation(
     let rewrite_preparation = ConnectorWritePreparation::try_new(
         preparation.owner().clone(),
         preparation.table().clone(),
-        ConnectorWriteTargetRef::main(),
+        preparation.target_ref().clone(),
         ConnectorWriteIntent::RowDelta,
         preparation.base_version().clone(),
         iceberg_cow_rewrite_input(preparation)?,
@@ -6536,7 +6549,7 @@ fn activate_iceberg_cow_row_mutation(
         let append_preparation = ConnectorWritePreparation::try_new(
             preparation.owner().clone(),
             preparation.table().clone(),
-            ConnectorWriteTargetRef::main(),
+            preparation.target_ref().clone(),
             ConnectorWriteIntent::Append,
             preparation.base_version().clone(),
             ConnectorWriteInputShape::Data {
@@ -6614,7 +6627,7 @@ fn iceberg_row_mutation_route(
     let route_preparation = ConnectorWritePreparation::try_new(
         preparation.owner().clone(),
         preparation.table().clone(),
-        ConnectorWriteTargetRef::main(),
+        preparation.target_ref().clone(),
         ConnectorWriteIntent::RowDelta,
         preparation.base_version().clone(),
         input,
@@ -8439,6 +8452,7 @@ impl IcebergQueryTableMaterialization {
     /// activation is a separate post-intent step and has no staging side effect.
     pub(crate) fn prepare_row_mutation(
         &self,
+        target_ref: &str,
         operation_id: ConnectorWriteOperationId,
         intent: ConnectorRowMutationIntent,
         context: ConnectorRequestContext,
@@ -8451,6 +8465,9 @@ impl IcebergQueryTableMaterialization {
             .prepare_row_mutation(ConnectorRowMutationPreparationRequest {
                 operation_id,
                 table: self.read_table.clone(),
+                target_ref: ConnectorWriteTargetRef::parse(target_ref).map_err(|error| {
+                    format!("validate Iceberg row-mutation target ref: {error}")
+                })?,
                 intent,
                 context: context.clone(),
             })

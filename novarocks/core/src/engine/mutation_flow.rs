@@ -159,6 +159,7 @@ struct ActivatedDmlChangeStreamPreparations {
 impl DmlChangeStreamPreparations {
     fn prepare(
         materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+        target_ref: &str,
         effect_set: DmlRowMutationEffectSet,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Self, String> {
@@ -171,8 +172,12 @@ impl DmlChangeStreamPreparations {
             },
         };
         let operation_id = ConnectorWriteOperationId::new();
-        let (lease, preparation) =
-            materialization.prepare_row_mutation(operation_id, intent, context.clone())?;
+        let (lease, preparation) = materialization.prepare_row_mutation(
+            target_ref,
+            operation_id,
+            intent,
+            context.clone(),
+        )?;
         Ok(Self {
             operation_id,
             lease,
@@ -613,6 +618,7 @@ pub(crate) fn prepare_update_mutation(
         let planning_lease = materialization.planning_lease.clone();
         let preparations = DmlChangeStreamPreparations::prepare(
             &materialization,
+            &target_ref,
             DmlRowMutationEffectSet::UpdateMor,
             connector_context.clone(),
         )?;
@@ -728,6 +734,7 @@ pub(crate) fn prepare_merge_mutation(
         };
         let preparations = DmlChangeStreamPreparations::prepare(
             &materialization,
+            "main",
             effect_set,
             connector_context.clone(),
         )?;
@@ -803,6 +810,7 @@ pub(crate) fn stage_prepared_update_mutation(
             let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
             let (row_mutation_lease, row_mutation_preparation) = materialization
                 .prepare_row_mutation(
+                    &target_ref,
                     operation_id,
                     novarocks_spi::connector::ConnectorRowMutationIntent::Update,
                     connector_context.clone(),
@@ -3583,7 +3591,12 @@ pub(crate) fn stage_prepared_merge_mutation(
                         novarocks_spi::connector::ConnectorRowMutationIntent::Update
                     };
                     let (row_mutation_lease, row_mutation_preparation) = materialization
-                        .prepare_row_mutation(operation_id, intent, connector_context.clone())?;
+                        .prepare_row_mutation(
+                            "main",
+                            operation_id,
+                            intent,
+                            connector_context.clone(),
+                        )?;
                     let selection = cow_selection_from_matched_and_insert(
                         &matched,
                         insert_selection_batch,
