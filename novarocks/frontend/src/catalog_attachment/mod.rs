@@ -29,3 +29,4 @@ pub use repository::{
     CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
     CatalogAttachmentRepository, CatalogAttachmentVersioned,
 };
+pub(crate) use repository::assert_attachment_versions;

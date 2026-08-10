@@ -262,6 +262,49 @@ impl CatalogAttachmentRepository {
     }
 }
 
+/// Re-check frozen attachment observations inside a caller-owned StateStore
+/// write transaction.  This is deliberately crate-visible rather than a
+/// repository cross-call: the caller owns the transaction which couples an MV
+/// definition/index write to catalog attachment existence.
+pub(crate) async fn assert_attachment_versions(
+    transaction: &mut dyn novarocks_spi::state_store::WriteTransaction,
+    expected: &[CatalogAttachmentVersioned],
+) -> Result<(), StateStoreError> {
+    for expected in expected {
+        let key = attachment_key(&expected.attachment.instance_id).map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::InvalidRequest,
+                "invalid catalog attachment observation key",
+            )
+        })?;
+        let Some(record) = transaction.get(&key).await? else {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::Conflict,
+                "catalog attachment disappeared before materialized view write",
+            ));
+        };
+        if record.version != expected.version {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::Conflict,
+                "catalog attachment changed before materialized view write",
+            ));
+        }
+        let current = decode_record(record).map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::Corruption,
+                "catalog attachment observation is corrupt",
+            )
+        })?;
+        if current.attachment.attachment_id != expected.attachment.attachment_id {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::Conflict,
+                "catalog attachment identity changed before materialized view write",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn decode_record(record: StateRecord) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
     let stored = decode(record.value.as_bytes()).map_err(corruption)?;
     let attachment = attachment_from(stored)?;

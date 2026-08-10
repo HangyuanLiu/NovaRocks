@@ -83,6 +83,35 @@ pub fn target_lookup_key(catalog: &str, namespace: &str, table: &str) -> Result<
     ))
 }
 
+/// Prefix for every materialized-view target in one external catalog.
+///
+/// The target lookup key encodes the catalog as an independent path component,
+/// so this is a bounded serializable range read rather than a full MV scan.
+pub(crate) fn target_lookup_catalog_prefix(catalog: &str) -> Result<Key, String> {
+    key_from_path(&format!("definition/by-target/{}/", encode_identifier(catalog)?))
+}
+
+/// Prefixes for every persisted upstream dependency in one external catalog.
+///
+/// Dependency identities are hex-encoded but retain the fixed
+/// `storage|object|catalog|` prefix byte-for-byte.  All storage/object forms
+/// are returned so catalog DROP can observe the same index domain used by MV
+/// writers without introducing a second catalog index.
+pub(crate) fn dependency_by_upstream_catalog_prefixes(catalog: &str) -> Result<Vec<Key>, String> {
+    let catalog = normalize_identifier(catalog)?;
+    let mut prefixes = Vec::with_capacity(6);
+    for storage in ["starrocks", "iceberg", "external_table"] {
+        for object in ["table", "mv"] {
+            let identity_prefix = format!("{storage}|{object}|{catalog}|");
+            prefixes.push(key_from_path(&format!(
+                "dependency/by-upstream/{}",
+                hex::encode(identity_prefix.as_bytes())
+            ))?);
+        }
+    }
+    Ok(prefixes)
+}
+
 pub fn refresh_by_id_key(refresh_id: i64) -> Result<Key, String> {
     key_from_path(&format!(
         "refresh/by-id/{}",
@@ -337,4 +366,30 @@ fn decode_dependency_identity(value: &str) -> Result<(), String> {
         return Err(format!("dependency identity is not canonical: {value}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_prefixes_match_the_existing_target_and_upstream_key_layout() {
+        let target = target_lookup_key("Warehouse", "sales", "orders")
+            .expect("target lookup key");
+        let target_prefix = target_lookup_catalog_prefix("warehouse").expect("target prefix");
+        assert!(target.as_bytes().starts_with(target_prefix.as_bytes()));
+
+        let upstream = MvDependencyObjectRef {
+            catalog: Some("WAREHOUSE".to_string()),
+            database_or_namespace: "sales".to_string(),
+            name: "orders".to_string(),
+            object_type: MvDependencyObjectType::Table,
+            storage_engine: MvDependencyStorageEngine::Iceberg,
+        };
+        let upstream_key = dependency_by_upstream_key(&upstream, 7).expect("upstream key");
+        assert!(dependency_by_upstream_catalog_prefixes("warehouse")
+            .expect("catalog dependency prefixes")
+            .iter()
+            .any(|prefix| upstream_key.as_bytes().starts_with(prefix.as_bytes())));
+    }
 }
