@@ -1500,10 +1500,33 @@ impl MvEngine for StandaloneMvEngine {
         };
         #[cfg(test)]
         run_after_create_target_hook();
-        let observation = self
-            .storage_observer
-            .observe_created_target(&planning_lease, &table, self.connector_context.clone())
-            .map_err(|error| engine_target_error(error.to_string()))?;
+        let observation = match self.storage_observer.observe_created_target(
+            &planning_lease,
+            &table,
+            self.connector_context.clone(),
+        ) {
+            Ok(observation) => observation,
+            Err(error) => {
+                let cleanup = require_known_committed_target_mutation(
+                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                        &mutation_lease,
+                        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+                        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                            table,
+                            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                            data_disposition:
+                                novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+                        },
+                        self.connector_context.clone(),
+                    ),
+                    "materialized view target observation cleanup",
+                )
+                .map(|_| ());
+                return Err(engine_target_error(format!(
+                    "{error}; target cleanup={cleanup:?}"
+                )));
+            }
+        };
         *prepared
             .created_target_observation
             .lock()
@@ -25865,7 +25888,7 @@ mod tests {
             .expect_err("post-create target inspection must fail");
         assert_eq!(
             err,
-            "table cache lock: poisoned lock: another task failed inside; target cleanup=Ok(())"
+            "Internal: table cache lock: poisoned lock: another task failed inside; target cleanup=Ok(())"
         );
         assert!(
             !env._warehouse_dir
