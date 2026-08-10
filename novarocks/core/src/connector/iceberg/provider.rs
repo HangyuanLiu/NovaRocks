@@ -43,18 +43,18 @@ use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorDataType, ConnectorDefaultValue,
     ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
-    ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
-    ConnectorMutationEffectField, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationMatchContract, ConnectorMutationOperationId, ConnectorMutationRouteInput,
-    ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorNamespaceRequest,
-    ConnectorOpenReaderRequest, ConnectorPartitionTransform, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReadNamedReference, ConnectorReadPurpose,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
-    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
+    ConnectorExecutionInstaller, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
+    ConnectorListViewsRequest, ConnectorMetadata, ConnectorMutationEffectField,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationMatchContract,
+    ConnectorMutationOperationId, ConnectorMutationRouteInput, ConnectorMutationSourceField,
+    ConnectorMutationTargetField, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
+    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
+    ConnectorReadNamedReference, ConnectorReadPurpose, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind, ConnectorReadSelector,
+    ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
     ConnectorRefreshPublicationGuard, ConnectorRequestContext,
     ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
     ConnectorRowMutationEffect, ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
@@ -124,6 +124,9 @@ use super::write_service::{
 };
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
+use novarocks_connector_iceberg::execution_declaration::{
+    IcebergInstanceDistribution, decode_access_binding,
+};
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -141,8 +144,6 @@ struct IcebergDeltaSplitPayload {
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
-const ICEBERG_DECLARATION_V1: u16 = 1;
-const DEFAULT_ACCESS_BINDING: &str = "default";
 const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
 const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 1;
@@ -406,54 +407,6 @@ fn statistics_scan_layout(
         .collect()
 }
 
-/// Provider-owned, secret-free declaration used to install an Iceberg read
-/// instance into a BE.  Catalog clients and credentials deliberately do not
-/// cross this boundary: the installer resolves the named binding from process
-/// startup composition.
-#[derive(Deserialize, Serialize)]
-struct IcebergDeclarationV1 {
-    version: u16,
-    access_binding: String,
-}
-
-#[derive(Clone)]
-struct IcebergInstanceDistribution {
-    descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
-}
-
-impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
-    fn declaration(
-        &self,
-        context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        if context.cancellation().is_cancelled() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Cancelled,
-                "connector request was cancelled",
-            ));
-        }
-        if Instant::now() >= context.deadline() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::DeadlineExceeded,
-                "connector request deadline elapsed",
-            ));
-        }
-        ConnectorExecutionDeclaration::try_new(
-            self.descriptor.clone(),
-            self.incarnation,
-            encode_payload(
-                &IcebergDeclarationV1 {
-                    version: ICEBERG_DECLARATION_V1,
-                    access_binding: DEFAULT_ACCESS_BINDING.to_string(),
-                },
-                "Iceberg execution declaration",
-                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            )?,
-        )
-    }
-}
-
 /// Core application adapter around the provider-owned process-local binding.
 /// Core adds only the writer-specific object-store projection below; access
 /// resolution and file-runtime ownership remain in the provider crate.
@@ -521,18 +474,8 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
                 "Iceberg installer received a declaration for another provider",
             ));
         }
-        let payload: IcebergDeclarationV1 =
-            decode_payload(declaration.payload(), "Iceberg execution declaration")?;
-        if payload.version != ICEBERG_DECLARATION_V1 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                format!(
-                    "unsupported Iceberg execution declaration version {}",
-                    payload.version
-                ),
-            ));
-        }
-        if payload.access_binding != self.binding.access_binding() {
+        let access_binding = decode_access_binding(declaration)?;
+        if access_binding != self.binding.access_binding() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg declaration access binding does not match BE startup binding",
@@ -1108,10 +1051,7 @@ impl IcebergControlProvider {
             incarnation,
             provider.clone(),
             provider.clone(),
-            Arc::new(IcebergInstanceDistribution {
-                descriptor,
-                incarnation,
-            }),
+            Arc::new(IcebergInstanceDistribution::new(descriptor, incarnation)),
             Some(provider.clone()),
             Some(data_mutation),
             Some(metadata_maintenance),
@@ -12513,10 +12453,7 @@ fn planned_table_files_fixture_binding(
         incarnation,
         read.clone(),
         read,
-        Arc::new(IcebergInstanceDistribution {
-            descriptor,
-            incarnation,
-        }),
+        Arc::new(IcebergInstanceDistribution::new(descriptor, incarnation)),
         None,
     )
     .expect("fixture connector control binding")

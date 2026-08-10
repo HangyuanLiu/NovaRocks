@@ -34,6 +34,7 @@ pub mod commit;
 pub mod default_value;
 pub mod delete_file;
 pub mod delta;
+pub mod execution_declaration;
 pub mod file_reader;
 pub mod fs_io;
 pub mod hadoop_catalog;
