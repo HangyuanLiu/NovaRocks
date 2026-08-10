@@ -3926,9 +3926,11 @@ pub(crate) fn alter_table_schema_on_entry(
     build_property_updates(metadata.properties(), change)?;
     if let IcebergSchemaChange::DropColumn { path } = change {
         let equality_delete_columns =
-            crate::connector::iceberg::catalog::registry::current_equality_delete_column_names(
-                &loaded.table,
-            )?;
+            crate::connector::iceberg::catalog::registry::block_on_iceberg(
+                novarocks_connector_iceberg::manifest::current_equality_delete_column_names(
+                    &loaded.table,
+                ),
+            )??;
         reject_drop_dependencies(&path.dotted(), &equality_delete_columns, &[])?;
     }
     if let IcebergSchemaChange::AddColumn {
@@ -4025,10 +4027,9 @@ pub(crate) fn validate_schema_change_application_guard(
     build_updated_schema(metadata.current_schema(), metadata.last_column_id(), change)?;
     build_property_updates(metadata.properties(), change)?;
 
-    let equality_delete_columns =
-        crate::connector::iceberg::catalog::registry::current_equality_delete_column_names(
-            &loaded.table,
-        )?;
+    let equality_delete_columns = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        novarocks_connector_iceberg::manifest::current_equality_delete_column_names(&loaded.table),
+    )??;
 
     let mv_dependencies = starrocks_mv_dependencies_for_target(state, target)?;
     reject_drop_dependencies(&path.dotted(), &equality_delete_columns, &mv_dependencies)

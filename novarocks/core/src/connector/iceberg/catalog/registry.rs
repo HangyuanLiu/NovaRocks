@@ -1327,14 +1327,6 @@ fn reject_unsupported_iceberg_table_semantics(loaded: &IcebergLoadedTable) -> Re
 
 use novarocks_connector_iceberg::manifest::DataFileWithStats;
 
-pub(crate) fn current_equality_delete_column_names(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> Result<Vec<String>, String> {
-    block_on_iceberg(
-        novarocks_connector_iceberg::manifest::current_equality_delete_column_names(table),
-    )?
-}
-
 pub(crate) fn extract_data_files_with_stats_at(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
