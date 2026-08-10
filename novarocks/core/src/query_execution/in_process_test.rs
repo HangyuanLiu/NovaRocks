@@ -121,7 +121,7 @@ fn install_connector_bindings(
             .map_err(|error| failed(format!("build explicit test file runtime: {error}")))?,
     );
     let handle = runtime.handle().clone();
-    let binding = crate::connector::iceberg::provider::IcebergReadBinding::new(
+    let binding = novarocks_connector_iceberg::access_binding::IcebergReadBinding::new(
         None,
         novarocks_fs::FsAccessResolver::new(),
         Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),

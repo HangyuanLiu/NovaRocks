@@ -22,7 +22,8 @@ use novarocks_spi::connector::{
 };
 
 use super::changes::PositionDeleteRef;
-use super::provider::{IcebergReadBinding, IcebergRewritePositionSplitPayloadV1};
+use super::provider::IcebergRewritePositionSplitPayloadV1;
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
 };

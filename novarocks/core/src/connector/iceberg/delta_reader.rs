@@ -28,8 +28,8 @@ use novarocks_spi::connector::{
     ConnectorReaderMetricsSnapshot,
 };
 
-use super::provider::IcebergReadBinding;
 use super::reader::IcebergBatchReader;
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec;
 use novarocks_connector_iceberg::delta::{
     BaseDataFileLineage, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,

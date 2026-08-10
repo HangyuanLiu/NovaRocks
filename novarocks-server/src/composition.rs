@@ -21,9 +21,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use novarocks::common::app_config::NovaRocksConfig;
-use novarocks::connector::iceberg::provider::{IcebergConnectorInstaller, IcebergReadBinding};
+use novarocks::connector::iceberg::provider::IcebergConnectorInstaller;
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};

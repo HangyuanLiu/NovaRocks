@@ -407,10 +407,7 @@ fn statistics_scan_layout(
         .collect()
 }
 
-/// Core application adapter around the provider-owned process-local binding.
-/// Core adds only the writer-specific object-store projection below; access
-/// resolution and file-runtime ownership remain in the provider crate.
-pub use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 
 /// Recreate the Core writer's provider-private storage configuration from a
 /// BE startup binding. Credentials remain local to the exact incarnation.

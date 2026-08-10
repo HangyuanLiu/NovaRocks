@@ -38,12 +38,11 @@ use novarocks_spi::connector::{
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
 use super::iceberg::catalog::{IcebergCatalogRegistry, create_namespace};
-use super::iceberg::provider::{
-    IcebergConnectorInstaller, IcebergControlProvider, IcebergReadBinding,
-};
+use super::iceberg::provider::{IcebergConnectorInstaller, IcebergControlProvider};
 use crate::query_execution::statistics::{StatisticsCollectionFinalizer, ThetaSketchPartial};
 use crate::sql::{Literal, TableColumnDef};
 use novarocks_catalog::schema::SqlType;
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 
 struct NotCancelled;
 
