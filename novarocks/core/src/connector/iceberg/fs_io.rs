@@ -17,9 +17,10 @@
 
 //! Core adapters for the provider-owned Iceberg filesystem boundary.
 //!
-//! Concrete FileIO, storage resolution, and location formatting live in the
-//! connector crate. Core retains only application-owned credential decoding
-//! and its synchronous runtime bridge for the few call sites that need it.
+//! Concrete FileIO, storage resolution, credential normalization, and location
+//! formatting live below Core. Core retains only its synchronous application
+//! bridge for legacy callers that have not yet moved to explicit provider
+//! resources.
 
 use std::ops::Range;
 
@@ -41,12 +42,7 @@ pub(crate) fn object_store_config_from_catalog_properties(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let credentials =
-        crate::fs::object_store_credentials::ObjectStoreCredentials::optional_from_aws_s3_properties(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::AwsS3Properties,
-            &props_map,
-        )?;
-    Ok(credentials.map(|credentials| credentials.to_object_store_config()))
+    novarocks_fs::object_store_config_from_aws_s3_catalog_properties(&props_map)
 }
 
 pub(crate) fn read_exact_range(

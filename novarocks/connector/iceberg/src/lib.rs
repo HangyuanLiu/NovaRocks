@@ -38,6 +38,7 @@ pub mod hadoop_catalog;
 pub mod manifest;
 pub mod metadata_read;
 pub mod planning_facts;
+pub mod position_delete;
 pub mod position_delete_descriptor;
 pub mod read_snapshot;
 pub mod ref_snapshot;

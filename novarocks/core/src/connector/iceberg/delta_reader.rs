@@ -203,7 +203,7 @@ fn plan_jobs(
                 let access = binding.resolve_access(&path)?;
                 let context =
                     binding.file_read_context(cancellation.clone(), request.context.deadline())?;
-                let mut positions = super::position_delete::load_position_deletes_with_context(
+                let mut positions = novarocks_connector_iceberg::position_delete::load_position_deletes_with_context(
                     &specs, &path, &access, &context,
                 )
                 .map_err(corrupt)?;

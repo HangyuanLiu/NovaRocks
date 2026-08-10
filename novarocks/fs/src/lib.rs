@@ -23,6 +23,7 @@
 
 mod access;
 mod cache;
+mod catalog_properties;
 mod error;
 mod physical_reader;
 mod predicate;
@@ -42,6 +43,10 @@ pub use cache::{
     PageCache, PageCacheStats, PageCacheValue, PageHandle, ParquetCacheOptions, get_block_cache,
     init_block_cache, init_parquet_cache, validate_datacache_priority, validate_evict_probability,
     validate_non_negative_i64,
+};
+pub use catalog_properties::{
+    AWS_S3_CATALOG_PROPERTY_KEYS, normalize_aws_s3_catalog_properties,
+    object_store_config_from_aws_s3_catalog_properties,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
 pub use physical_reader::{
