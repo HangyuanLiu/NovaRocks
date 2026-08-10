@@ -3963,6 +3963,46 @@ impl DistributedRewriteOperationRepository {
         self.create_inner(request, None).await
     }
 
+    pub async fn create_admitted(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_create(&request)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let operation_id = request.operation_id;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "admitted create frontend distributed rewrite operation",
+            |transaction| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_rewrite_create(
+                        transaction,
+                        transaction_operation_id,
+                        request,
+                        None,
+                        None,
+                        Some(&admission),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_rewrite_result(
+            result,
+            transaction_operation_id,
+            StoredDistributedRewriteTransactionActionV3::Create,
+            operation_id,
+            "admitted create distributed rewrite operation",
+        )
+        .await
+    }
+
     /// Create the rewrite operation owned by an already-claimed v1 OPTIMIZE
     /// job. The v1 active-target index remains an external fence; this narrow
     /// path merely proves, in the same transaction, that it belongs to the
@@ -4029,6 +4069,7 @@ impl DistributedRewriteOperationRepository {
                         fenced
                             .as_ref()
                             .map(|(authority, validator)| (authority, validator)),
+                        None,
                     )
                     .await
                 })
@@ -4687,9 +4728,17 @@ async fn apply_rewrite_create(
     request: DistributedRewriteOperationCreate,
     claimed_optimize_job_id: Option<i64>,
     fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<DistributedRewriteOperation> {
     if let Err(error) = validate_rewrite_create(&request) {
         return Ok(Err(error));
+    }
+    if let Some(admission) = admission {
+        if let Err(error) = admission.validate_in(transaction).await {
+            return Ok(Err(RepositoryError::authority_lost(format!(
+                "maintenance write admission lost: {error}"
+            ))));
+        }
     }
     let existing = match load_rewrite_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
