@@ -42,3 +42,28 @@ pub(crate) struct JoinRefreshContract {
 pub(crate) struct BranchRefreshContract {
     pub(crate) branch_count: usize,
 }
+
+/// The logical effect an MV refresh has on its target ref.
+///
+/// This is the MV application's own vocabulary. It says *what the refresh does
+/// to the materialized rows*, never how a table format encodes that — choosing
+/// between fast-append, row-delta, deletion vectors or position deletes is the
+/// Provider's decision, made from this effect plus the staged reports it owns.
+///
+/// Keeping the two apart is the point of SPI-5I: before it, every MV refresh
+/// site picked an Iceberg `CommitOpKind` directly, so the same logical effect
+/// could be spelled three ways in three files with nothing to keep them
+/// consistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MvTargetWriteEffect {
+    /// Add rows only. No previously materialized row is retracted.
+    Append,
+    /// Replace everything currently visible on the target ref.
+    Overwrite,
+    /// Add rows and retract others, where the retracted rows are identified by
+    /// the data files the writer already staged.
+    DeltaRetractingStagedFiles,
+    /// Add rows and retract others, where the caller supplied the retracted row
+    /// positions explicitly rather than deriving them from staged files.
+    DeltaRetractingExplicitPositions,
+}

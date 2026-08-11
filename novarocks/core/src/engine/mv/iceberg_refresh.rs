@@ -117,7 +117,7 @@ use crate::mv::refresh::aggregate_first_refresh::{
 };
 use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
-use crate::mv::refresh::contract::ImvRefreshContract;
+use crate::mv::refresh::contract::{ImvRefreshContract, MvTargetWriteEffect};
 use crate::mv::refresh::execution::{
     RefreshExecutionObservation, ValidatedRefreshExecution, dispatch_refresh_decision,
     validate_refresh_execution,
@@ -13773,7 +13773,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     )?,
                 },
                 staging_branch,
-                Some(CommitOpKind::Overwrite),
+                Some(MvTargetWriteEffect::Overwrite),
             )
         },
     )
@@ -16490,13 +16490,33 @@ fn imv_change_stream_writer_abort_result_for_test(
     }
 }
 
+/// A change stream that carries any deletion route retracts previously
+/// materialized rows; otherwise the refresh only adds rows.
+///
+/// Both change-stream entrypoints derived this independently before SPI-5I,
+/// so a future producer route added to one and not the other would have
+/// silently changed only half the refresh paths.
+fn deletion_route_write_effect(
+    refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
+) -> MvTargetWriteEffect {
+    if refresh_plan
+        .producer_branches
+        .iter()
+        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
+    {
+        MvTargetWriteEffect::DeltaRetractingStagedFiles
+    } else {
+        MvTargetWriteEffect::Append
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_imv_change_stream_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     table: novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
 ) -> Result<
@@ -16507,7 +16527,7 @@ fn execute_imv_change_stream_write(
         &table,
         ident,
         target_ref,
-        op_kind,
+        effect,
         || {
             execute_imv_change_stream_writer(
                 state,
@@ -16516,7 +16536,7 @@ fn execute_imv_change_stream_write(
                 ident,
                 refresh_plan,
                 target_ref,
-                Some(op_kind),
+                Some(effect),
             )
         },
     )
@@ -16529,7 +16549,7 @@ fn execute_imv_change_stream_writer(
     ident: &TableIdent,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
-    commit_op_kind: Option<CommitOpKind>,
+    write_effect: Option<MvTargetWriteEffect>,
 ) -> Result<crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite, String> {
     let (refresh_plan, effect_output_ordinal) = ensure_imv_change_stream_effect(refresh_plan)?;
     let entry = state
@@ -16585,19 +16605,9 @@ fn execute_imv_change_stream_writer(
             )?,
         );
     }
-    let op_kind = commit_op_kind.unwrap_or_else(|| {
-        if refresh_plan
-            .producer_branches
-            .iter()
-            .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
-        {
-            CommitOpKind::RowDeltaDvFromFiles
-        } else {
-            CommitOpKind::FastAppend
-        }
-    });
+    let effect = write_effect.unwrap_or_else(|| deletion_route_write_effect(&refresh_plan));
     let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
-        table, ident, target_ref, op_kind,
+        table, ident, target_ref, effect,
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
@@ -16762,17 +16772,9 @@ fn prepare_imv_change_stream_writer(
             None,
             connector_context,
         )?;
-    let op_kind = if refresh_plan
-        .producer_branches
-        .iter()
-        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
-    {
-        CommitOpKind::RowDeltaDvFromFiles
-    } else {
-        CommitOpKind::FastAppend
-    };
+    let effect = deletion_route_write_effect(&refresh_plan);
     let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
-        table, ident, target_ref, op_kind,
+        table, ident, target_ref, effect,
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
@@ -18018,10 +18020,10 @@ fn incremental_refresh_iceberg_mv_with_changes(
     // 6. Build the shared commit collector. The change-stream write DAG routes
     // writer reports back into this collector; the commit driver below consumes
     // the populated collector.
-    let op_kind = if can_emit_delete_rows {
-        CommitOpKind::RowDeltaDvFromFiles
+    let effect = if can_emit_delete_rows {
+        MvTargetWriteEffect::DeltaRetractingStagedFiles
     } else {
-        CommitOpKind::FastAppend
+        MvTargetWriteEffect::Append
     };
     let target_planning_materialization =
         crate::connector::iceberg::provider::load_schema_materialization_with_lease(
@@ -18134,7 +18136,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         &target_backend,
         target_table.clone(),
         &ident,
-        op_kind,
+        effect,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
             table_bindings: planned_query.table_bindings,
