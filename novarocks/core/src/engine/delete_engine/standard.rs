@@ -30,16 +30,12 @@
 //!    which commits the generated position-delete files and drives
 //!    finalization lifecycle.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use chrono::NaiveDateTime;
 use sqlparser::ast as sqlast;
 
-use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::{IcebergCommitCollector, classify_sql_delete_strategy};
-use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::delete_engine::{
@@ -54,8 +50,7 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_connector_iceberg::commit::{CommitOpKind, IcebergSqlDeleteStrategy};
-use novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id;
+use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,
@@ -105,21 +100,19 @@ pub(crate) fn prepare_delete_statement(
         &target.catalog,
     )?;
 
-    // 2. Build iceberg-rust catalog handle + load table.
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
-        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+    // 2. Resolve the target's SQL-owned facts under that exact generation. The
+    //    concrete Iceberg table is never loaded here.
+    let materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+            planning_lease.clone(),
+            connector_context.clone(),
+            &target.namespace,
+            &target.table,
+        )?;
+    // Retain the lease returned beside the provider facts rather than an
+    // independent clone, so there is one explicit generation authority.
+    let planning_lease = materialization.planning_lease.clone();
+
     // Reject a managed materialized view from neutral metadata under an exact
     // generation, the same way INSERT, TRUNCATE and ADD FILES already do. This
     // check cannot move into row-mutation admission: incremental MV refresh
@@ -132,83 +125,50 @@ pub(crate) fn prepare_delete_statement(
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;
 
-    // Branch writes require Iceberg v3 (row-lineage semantics).
-    if target_ref != "main" {
-        let fmt = table.metadata().format_version();
-        if fmt != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
-            return Err(format!(
-                "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
-                table_ident, fmt as u8,
-            ));
-        }
-    }
-
-    // 3. Validation.
-    let delete_strategy = classify_sql_delete_strategy(&table)?;
-    // 4. Reject an unsupported WHERE clause before any external side effect.
+    // 3. Reject an unsupported WHERE clause before any external side effect.
     //    The distributed SELECT planner owns scan pruning and existing delete
-    //    visibility from this point onward. Column types come from the provider
-    //    under the same exact lease, so this check never decodes an Iceberg
-    //    schema itself.
-    let where_columns =
-        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
-            planning_lease.clone(),
-            connector_context.clone(),
-            &target.namespace,
-            &target.table,
-        )?
-        .dml_target_columns;
-    validate_where(&stmt.where_clause, &where_columns)?;
+    //    visibility from this point onward. Column types come from the provider,
+    //    so this check never decodes an Iceberg schema itself.
+    validate_where(&stmt.where_clause, &materialization.dml_target_columns)?;
 
-    let metadata = table.metadata();
-    let base_snapshot_id = if target_ref != "main" {
-        resolve_branch_head_snapshot_id(metadata, &target_ref)?
-    } else {
-        metadata.current_snapshot().map(|s| s.snapshot_id())
-    };
-
-    if matches!(delete_strategy, IcebergSqlDeleteStrategy::DeletionVectors) {
-        return prepare_delete_dv_write(
-            state,
-            &target,
-            catalog,
-            table,
-            entry,
-            base_snapshot_id,
-            &target_ref,
-            &stmt.where_clause,
-            execution.clone(),
-            connector_context,
-            planning_lease,
-        );
-    }
-
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::RowDelta,
-            table_ident,
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
+    // 4. Ask the provider to plan the row mutation. The physical strategy, the
+    //    branch/format admission gates and the base version the frontend
+    //    journals all come back signed; nothing here re-derives them. The
+    //    provider reservation stays where DELETE has always made it, before the
+    //    frontend persists its operation intent -- unlike UPDATE and MERGE,
+    //    which defer activation until after. Aligning the two is a lifecycle
+    //    change and not part of this cutover.
+    let connector_operation_id = ConnectorWriteOperationId::new();
+    let (write_lease, row_mutation) = materialization.prepare_row_mutation(
+        &target_ref,
+        connector_operation_id,
+        novarocks_spi::connector::ConnectorRowMutationIntent::Delete,
+        connector_context.clone(),
+    )?;
+    let strategy = row_mutation.strategy();
+    let base_snapshot_id = row_mutation.base_version_ordinal();
+    let routes = write_lease
+        .activate_row_mutation(
+            novarocks_spi::connector::ConnectorRowMutationActivationRequest::Direct {
+                preparation: row_mutation,
+                context: connector_context.clone(),
+            },
         )
-        .with_table_metadata(metadata.clone()),
-    );
+        .map_err(|error| format!("activate Provider DELETE plan: {error}"))?;
+    let route = routes
+        .routes()
+        .first()
+        .ok_or_else(|| "Provider returned an empty DELETE route set".to_string())?;
+    let preparation = route.preparation().clone();
+
     prepare_delete_write(
         state,
         &target,
-        catalog,
-        table,
-        collector,
-        entry,
+        strategy,
+        preparation,
         base_snapshot_id,
+        connector_operation_id,
+        &write_lease,
         &target_ref,
         &stmt.where_clause,
         execution.clone(),
@@ -226,11 +186,20 @@ struct DistributedDeleteWriteExecutor {
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    /// Deletion vectors are written one per target data file, so the sink output
+    /// is shuffled by its first column. Position deletes have no such
+    /// requirement. Both follow from the provider-signed strategy.
+    shuffle_by_first_output: bool,
 }
 
 impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
     fn run(&self) -> Result<QueryExecutionResult, String> {
-        let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
+        let distribution = if self.shuffle_by_first_output {
+            crate::engine::iceberg_write_shuffle_by_output_index(0)
+        } else {
+            crate::sql::compiler::RootDistributionRequirement::Any
+        };
+        let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -238,7 +207,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
             self.sql_write_input.clone(),
             Arc::clone(&self.table_bindings),
             None,
-            crate::sql::compiler::RootDistributionRequirement::Any,
+            distribution,
             Some(&self.execution),
             &self.connector_context,
             Some(self.connector_write.clone()),
@@ -266,206 +235,45 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
     }
 }
 
-struct DistributedDvDeleteWriteExecutor {
-    state: Arc<StandaloneState>,
-    target: TargetBackend,
-    delete_query: sqlparser::ast::Query,
-    sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<QueryTableBindingStore>,
-    execution: QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-}
-
-impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
-    fn run(&self) -> Result<QueryExecutionResult, String> {
-        let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.delete_query,
-            self.sql_write_input.clone(),
-            Arc::clone(&self.table_bindings),
-            None,
-            crate::engine::iceberg_write_shuffle_by_output_index(0),
-            Some(&self.execution),
-            &self.connector_context,
-            Some(self.connector_write.clone()),
-        )?;
-        Ok(result)
-    }
-
-    fn commit_terminal(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        completion
-            .session()
-            .commit(self.connector_context.clone())
-            .map_err(|error| error.to_string())
-    }
-
-    fn finalize(&self) -> Result<(), String> {
-        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_delete_dv_write(
-    state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
-    table: novarocks_connector_iceberg::iceberg::table::Table,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    base_snapshot_id: Option<i64>,
-    target_ref: &str,
-    where_clause: &sqlast::Expr,
-    execution: QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<PreparedDelete, String> {
-    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let write_lease = planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive deletion-vector write lease: {error}"))?;
-    let preparation = row_delete_preparation(
-        &write_lease,
-        target,
-        target_ref,
-        ConnectorWriteInputRequest::DeletionVector {
-            identity_fields: position_delete_identity_field_requests(),
-            partition_source_fields: Vec::new(),
-        },
-        connector_context.clone(),
-    )?;
-    let target_binding = admit_prepared_connector_write_target(
-        table_bindings.as_ref(),
-        crate::sql::planner::table::SqlTableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
-        preparation.clone(),
-        planning_lease.clone(),
-    )?;
-    let sql_write_input = sql_write_plan_input_for_admitted_target(
-        table_bindings.as_ref(),
-        target_binding,
-        crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::DeletionVectors,
-        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        None,
-    )?;
-    let delete_query = build_delete_position_sink_query(
-        target,
-        where_clause,
-        &write_input_columns(&preparation),
-        target_ref,
-    )?;
-
-    let metadata = table.metadata();
-    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
-        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::RowDeltaDvFromFiles,
-            table_ident,
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table: table.clone(),
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
-    let connector_operation_id = ConnectorWriteOperationId::new();
-    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_connector_write(
-        state,
-        target_ref,
-        preparation,
-        &entry,
-        &table,
-        Arc::clone(&commit_executor),
-        connector_operation_id,
-        connector_context.clone(),
-        &write_lease,
-    )?;
-    let executor = DistributedDvDeleteWriteExecutor {
-        state: Arc::clone(state),
-        target: target.clone(),
-        delete_query,
-        sql_write_input,
-        table_bindings,
-        execution,
-        connector_context: connector_context.clone(),
-        connector_write,
-    };
-    Ok(prepared_delete(
-        DeleteOperation {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            target_ref: target_ref.to_string(),
-            attempt_id: connector_operation_id.to_string(),
-            base_snapshot_id,
-        },
-        Arc::new(executor),
-    ))
-}
-
+/// Plan the distributed write for a DELETE whose physical strategy the provider
+/// has already signed.
+///
+/// Both supported strategies share the same sink query and admission shape; only
+/// the sink mode and the root distribution differ, and both follow from the
+/// signed strategy rather than from anything this engine decides.
 #[allow(clippy::too_many_arguments)]
 fn prepare_delete_write(
     state: &Arc<StandaloneState>,
-    target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
-    table: novarocks_connector_iceberg::iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target: &TargetBackend,
+    strategy: ConnectorRowMutationStrategy,
+    preparation: novarocks_spi::connector::ConnectorWritePreparation,
     base_snapshot_id: Option<i64>,
+    connector_operation_id: ConnectorWriteOperationId,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     target_ref: &str,
     where_clause: &sqlast::Expr,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedDelete, String> {
+    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
+
+    let deletion_vectors = match strategy {
+        ConnectorRowMutationStrategy::DeletionVector => true,
+        ConnectorRowMutationStrategy::PositionDelete => false,
+        other => {
+            return Err(format!(
+                "DELETE cannot be served by row-mutation strategy {other:?}"
+            ));
+        }
+    };
+    let sink_mode = if deletion_vectors {
+        SqlWriteSinkMode::DeletionVectors
+    } else {
+        SqlWriteSinkMode::PositionDeletes
+    };
+
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let write_lease = planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive position-delete write lease: {error}"))?;
-    let preparation = row_delete_preparation(
-        &write_lease,
-        target,
-        target_ref,
-        ConnectorWriteInputRequest::PositionDelete {
-            identity_fields: position_delete_identity_field_requests(),
-            partition_source_fields: Vec::new(),
-        },
-        connector_context.clone(),
-    )?;
     let target_binding = admit_prepared_connector_write_target(
         table_bindings.as_ref(),
         crate::sql::planner::table::SqlTableIdentity {
@@ -479,7 +287,7 @@ fn prepare_delete_write(
     let sql_write_input = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
-        crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::PositionDeletes,
+        sink_mode,
         crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
@@ -489,29 +297,15 @@ fn prepare_delete_write(
         &write_input_columns(&preparation),
         target_ref,
     )?;
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table: table.clone(),
-        collector: Arc::clone(&collector),
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
-    let connector_operation_id = ConnectorWriteOperationId::new();
-    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_connector_write(
+    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_delete_write_service(
         state,
+        target,
         target_ref,
+        strategy,
         preparation,
-        &entry,
-        &table,
-        Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
-        &write_lease,
+        write_lease,
     )?;
     let executor = DistributedDeleteWriteExecutor {
         state: Arc::clone(state),
@@ -522,6 +316,10 @@ fn prepare_delete_write(
         execution,
         connector_context: connector_context.clone(),
         connector_write,
+        // Deletion vectors are written one per target data file, so the sink
+        // output is shuffled by its first column; position deletes have no such
+        // requirement.
+        shuffle_by_first_output: deletion_vectors,
     };
     Ok(prepared_delete(
         DeleteOperation {

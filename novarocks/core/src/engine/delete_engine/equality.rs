@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -28,10 +28,7 @@ use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::{
-    IcebergCommitCollector, ensure_equality_delete_single_partition_spec,
-};
-use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
+use crate::connector::iceberg::commit::ensure_equality_delete_single_partition_spec;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::delete_engine::{
@@ -47,7 +44,6 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
@@ -127,9 +123,6 @@ pub(crate) fn prepare_equality_delete_statement(
     prepare_equality_delete_distributed_write(
         state,
         &target,
-        catalog,
-        table,
-        entry,
         current_snapshot_id,
         &delete_columns,
         values_query,
@@ -198,9 +191,6 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
 fn prepare_equality_delete_distributed_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn Catalog>,
-    table: novarocks_connector_iceberg::iceberg::table::Table,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     current_snapshot_id: Option<i64>,
     delete_columns: &[EqualityDeleteColumn],
     values_query: sqlparser::ast::Query,
@@ -250,49 +240,17 @@ fn prepare_equality_delete_distributed_write(
         None,
     )?;
 
-    let metadata = table.metadata();
-    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
-        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::RowDelta,
-            table_ident,
-            current_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table: table.clone(),
-        collector: Arc::clone(&collector),
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: "main".to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
     let connector_operation_id = ConnectorWriteOperationId::new();
-    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_connector_write(
+    // `ALTER TABLE ... ADD EQUALITY DELETE` names its own physical form, so
+    // there is no strategy for the provider to choose here. The neutral value is
+    // passed through purely so the legacy implementation can derive its own
+    // commit vocabulary instead of this entry point constructing it.
+    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_delete_write_service(
         state,
+        target,
         "main",
+        novarocks_spi::connector::ConnectorRowMutationStrategy::EqualityDelete,
         preparation,
-        &entry,
-        &table,
-        Arc::clone(&commit_executor),
         connector_operation_id,
         connector_context.clone(),
         &write_lease,

@@ -843,6 +843,108 @@ pub(crate) fn prepare_iceberg_connector_write(
     }
 }
 
+/// Reserve the row-delete writer and committer for a Provider-signed route
+/// preparation.
+///
+/// The caller passes the neutral strategy the provider signed and nothing else
+/// about the table. Everything Iceberg-shaped -- the catalog handle, the table,
+/// the commit operation kind, the staging location and the abort cleanup -- is
+/// derived here, so a row-DML entry point never names any of it. This whole
+/// function disappears with the Core Iceberg implementation; until then it is
+/// where the legacy implementation that serves the neutral contract keeps its
+/// own vocabulary.
+pub(crate) fn register_iceberg_row_delete_write_service(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    target_ref: &str,
+    strategy: novarocks_spi::connector::ConnectorRowMutationStrategy,
+    preparation: novarocks_spi::connector::ConnectorWritePreparation,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    use novarocks_connector_iceberg::commit::CommitOpKind;
+    use novarocks_spi::connector::ConnectorRowMutationStrategy;
+
+    let commit_op = match strategy {
+        ConnectorRowMutationStrategy::DeletionVector => CommitOpKind::RowDeltaDvFromFiles,
+        // Position deletes and equality deletes are both plain row-delta
+        // commits; they differ in the delete file each writer produces, not in
+        // how the snapshot is assembled.
+        ConnectorRowMutationStrategy::PositionDelete
+        | ConnectorRowMutationStrategy::EqualityDelete => CommitOpKind::RowDelta,
+        other => {
+            return Err(format!(
+                "Iceberg row-delete writer cannot serve row-mutation strategy {other:?}"
+            ));
+        }
+    };
+
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
+        registry.get(&target.catalog)?
+    };
+    let catalog = build_iceberg_catalog(&entry)?;
+    let table_ident = TableIdent::new(
+        NamespaceIdent::new(target.namespace.clone()),
+        target.table.clone(),
+    );
+    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
+        .map_err(|error| format!("load iceberg table {}: {error}", &table_ident))?;
+
+    let metadata = table.metadata();
+    let base_snapshot_id = if target_ref == "main" {
+        metadata.current_snapshot_id()
+    } else {
+        novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+            metadata, target_ref,
+        )?
+    };
+    let staging_dir = format!(
+        "{}/data/_staging/{}",
+        metadata.location(),
+        uuid::Uuid::new_v4()
+    );
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            commit_op,
+            table_ident,
+            base_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            novarocks_types::UniqueId::new(0, 0),
+        )
+        .with_table_metadata(metadata.clone()),
+    );
+    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
+        catalog,
+        table: table.clone(),
+        collector,
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    });
+    register_iceberg_row_connector_write(
+        state,
+        target_ref,
+        preparation,
+        &entry,
+        &table,
+        commit_executor,
+        operation_id,
+        context,
+        write_lease,
+    )
+}
+
 /// Activate a row-level writer from a Provider-signed preparation.  The
 /// application retains only the exact lease and opaque preparation; the
 /// Iceberg provider derives its private writer handle and service payload.
