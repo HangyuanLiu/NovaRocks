@@ -100,6 +100,7 @@ code-anchors:
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
+- ADR-0053 — MV snapshot change window 为何复用 exact-generation scan planning 并返回 sealed neutral admission（active）
 
 #### 历史
 
