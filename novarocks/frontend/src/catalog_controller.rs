@@ -291,12 +291,16 @@ impl FrontendCatalogController {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use bytes::Bytes;
-    use novarocks::catalog_application::{CatalogAdmission, CatalogApplicationPort};
+    use novarocks::catalog_application::{
+        CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,
+        CatalogApplicationPort, CatalogRuntimeObservation, CatalogRuntimePublisherSink,
+    };
     use novarocks_spi::connector::{
         ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
-        ConnectorError, ConnectorProviderId,
+        ConnectorControlResolver, ConnectorError, ConnectorProviderId,
     };
     use novarocks_spi::state_store::{
         ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction,
@@ -316,8 +320,35 @@ mod tests {
 
     struct ReadyFactory;
 
+    struct RejectingPublisher;
+
+    impl CatalogRuntimePublisherSink for RejectingPublisher {
+        fn publish_catalog_runtime(
+            &self,
+            _observation: CatalogRuntimeObservation,
+        ) -> Result<(), CatalogApplicationError> {
+            Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "injected query runtime publication failure",
+            ))
+        }
+
+        fn unpublish_catalog_runtime(
+            &self,
+            _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+            _generation: u64,
+        ) -> Result<(), CatalogApplicationError> {
+            Ok(())
+        }
+    }
+
     struct PollUnavailableStore {
         inner: Arc<dyn StateStore>,
+    }
+
+    struct ToggleReadStore {
+        inner: Arc<dyn StateStore>,
+        reads_available: AtomicBool,
     }
 
     struct IdentityChangedStore {
@@ -361,6 +392,53 @@ mod tests {
         async fn identity(
             &self,
         ) -> Result<novarocks_spi::state_store::StoreIdentity, StateStoreError> {
+            self.inner.identity().await
+        }
+
+        async fn resolve_commit(
+            &self,
+            transaction_id: &TransactionId,
+        ) -> Result<CommitResolution, StateStoreError> {
+            self.inner.resolve_commit(transaction_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateStore for ToggleReadStore {
+        fn limits(&self) -> &StateStoreLimits {
+            self.inner.limits()
+        }
+
+        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+            self.inner.metrics_snapshot()
+        }
+
+        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+            if !self.reads_available.load(Ordering::Acquire) {
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "injected catalog admission read failure",
+                ));
+            }
+            self.inner.begin_read().await
+        }
+
+        async fn begin_write(
+            &self,
+            transaction_id: TransactionId,
+            purpose: &str,
+        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+            self.inner.begin_write(transaction_id, purpose).await
+        }
+
+        async fn poll_changes(
+            &self,
+            request: &ChangePollRequest,
+        ) -> Result<ChangePage, StateStoreError> {
+            self.inner.poll_changes(request).await
+        }
+
+        async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
             self.inner.identity().await
         }
 
@@ -493,6 +571,7 @@ mod tests {
         let port = Arc::new(FrontendCatalogApplicationPort::new(
             repository,
             Arc::clone(&control),
+            novarocks::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
         ));
         (control, port)
@@ -508,6 +587,107 @@ mod tests {
         assert_eq!(config.retry_max, Duration::from_secs(5));
         assert_eq!(config.worker_count, 8);
         assert_eq!(config.shutdown_deadline, Duration::from_secs(5));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_failure_keeps_durable_attachment_unavailable_and_retires_control() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let created = repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+        let control = Arc::new(
+            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory)])
+                .expect("control host"),
+        );
+        let port = Arc::new(FrontendCatalogApplicationPort::new(
+            repository.clone(),
+            Arc::clone(&control),
+            Arc::new(RejectingPublisher),
+            tokio::runtime::Handle::current(),
+        ));
+        let controller = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("controller");
+
+        controller
+            .bootstrap()
+            .await
+            .expect("one provider failure does not fail the full bootstrap");
+        assert!(matches!(
+            port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Unavailable { .. }
+        ));
+        assert_eq!(port.projection_count(), 0);
+        assert!(
+            control
+                .observe_current_binding(&created.attachment.instance_id)
+                .is_err()
+        );
+
+        drop(controller);
+        drop(port);
+        drop(control);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_admission_uses_only_the_local_projection_when_store_reads_fail() {
+        let (_directory, mut host, store) = open_store().await;
+        let durable_repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open durable repository");
+        let created = durable_repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+        let toggle_store = Arc::new(ToggleReadStore {
+            inner: Arc::clone(&store),
+            reads_available: AtomicBool::new(true),
+        });
+        let repository = CatalogAttachmentRepository::open(toggle_store.clone())
+            .await
+            .expect("open toggle repository");
+        let (_control, port) = projection(repository.clone());
+        let controller = FrontendCatalogController::new(
+            toggle_store.clone(),
+            Arc::clone(&port),
+            CatalogProjectionConfig::default(),
+        )
+        .expect("controller");
+        controller.bootstrap().await.expect("bootstrap projection");
+        toggle_store.reads_available.store(false, Ordering::Release);
+        assert!(
+            repository
+                .get(&created.attachment.instance_id)
+                .await
+                .is_err(),
+            "the injected StateStore read failure must be active"
+        );
+        assert!(matches!(
+            port.admit_catalog(&created.attachment.instance_id),
+            CatalogAdmission::Ready(_)
+        ));
+
+        drop(controller);
+        drop(port);
+        drop(repository);
+        drop(durable_repository);
+        drop(toggle_store);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

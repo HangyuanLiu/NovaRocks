@@ -112,6 +112,7 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
+    catalog_runtime_projection: Arc<novarocks::catalog_application::CatalogRuntimeProjection>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
     dml_recovery_controller: Option<DmlRecoveryController>,
@@ -261,6 +262,8 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
     ) -> Result<Self, FrontendApplicationError> {
+        let catalog_runtime_projection =
+            novarocks::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
             connector_control: Arc::new(
                 ConnectorControlHost::with_factories(connector_factories).map_err(|error| {
@@ -270,6 +273,7 @@ impl FrontendApplicationHost {
                     )
                 })?,
             ),
+            catalog_runtime_projection,
             statistics_service: None,
             dml_service: None,
             dml_recovery_controller: None,
@@ -317,6 +321,7 @@ impl FrontendApplicationHost {
                 Ok(repository) => Some(Arc::new(FrontendCatalogApplicationPort::new(
                     repository,
                     Arc::clone(&host.connector_control),
+                    host.catalog_runtime_projection.publisher(),
                     tokio::runtime::Handle::current(),
                 ))),
                 Err(error) => {
@@ -330,6 +335,7 @@ impl FrontendApplicationHost {
             },
             None => Some(Arc::new(FrontendCatalogApplicationPort::unavailable(
                 Arc::clone(&host.connector_control),
+                host.catalog_runtime_projection.publisher(),
                 tokio::runtime::Handle::current(),
             ))),
         };
@@ -592,11 +598,14 @@ impl FrontendApplicationHost {
     pub fn catalog_application_port(
         &self,
     ) -> Arc<dyn novarocks::catalog_application::CatalogApplicationPort> {
-        Arc::clone(
+        let application = Arc::clone(
             self.catalog_application_port
                 .as_ref()
                 .expect("catalog application port is installed before host open returns"),
-        ) as Arc<dyn novarocks::catalog_application::CatalogApplicationPort>
+        )
+            as Arc<dyn novarocks::catalog_application::CatalogApplicationPort>;
+        self.catalog_runtime_projection
+            .bind_application(application)
     }
 
     pub fn table_maintenance_service(

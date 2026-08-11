@@ -465,17 +465,40 @@ impl<'a> CatalogServiceMaterializer<'a> {
         self
     }
 
-    fn require_catalog_admission(&self, catalog: &str) -> Result<(), String> {
+    fn require_catalog_admission(
+        &self,
+        catalog: &str,
+    ) -> Result<Option<crate::catalog_application::CatalogRuntimeObservation>, String> {
         let Some(application) = self.catalog_application else {
-            return Ok(());
+            return Ok(None);
         };
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
             .map_err(|error| format!("invalid catalog instance `{catalog}`: {error}"))?;
         application
             .admit_catalog(&instance_id)
             .require_ready()
-            .map(|_| ())
+            .map(Some)
             .map_err(|error| error.to_string())
+    }
+
+    fn verify_catalog_admission(
+        &self,
+        catalog: &str,
+        expected: Option<&crate::catalog_application::CatalogRuntimeObservation>,
+    ) -> Result<(), String> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let current = self
+            .require_catalog_admission(catalog)?
+            .ok_or_else(|| "catalog admission unexpectedly became legacy".to_string())?;
+        if &current != expected {
+            return Err(
+                "catalog attachment generation changed while acquiring its planning lease"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Publish one application-resolved table only after its scan has been
@@ -532,12 +555,13 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 Ok(self.bindings.binding(token)?.resolved.clone())
             }
             Some(catalog) => {
-                self.require_catalog_admission(catalog)?;
+                let observation = self.require_catalog_admission(catalog)?;
                 let key = QueryTableBindingKey::analysis_lookup(catalog, database, table);
                 let token = self.bind_for_sql(key, |binding_id| {
                     self.loader
                         .load_strict_base_table(catalog, database, table, binding_id)
                 })?;
+                self.verify_catalog_admission(catalog, observation.as_ref())?;
                 Ok(self.bindings.binding(token)?.resolved.clone())
             }
         }
@@ -571,7 +595,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 .expect("catalog service local read lock")
                 .get(database, table),
             Some(catalog) => {
-                self.require_catalog_admission(catalog)?;
+                let observation = self.require_catalog_admission(catalog)?;
                 let key =
                     QueryTableBindingKey::metadata(catalog, database, table, metadata_table_type);
                 let token = self.bind_for_sql(key, |binding_id| {
@@ -583,6 +607,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
                         binding_id,
                     )
                 })?;
+                self.verify_catalog_admission(catalog, observation.as_ref())?;
                 Ok(self.bindings.binding(token)?.resolved.planner.clone())
             }
         }
@@ -746,6 +771,56 @@ mod tests {
 
     struct UnavailableCatalogApplication;
 
+    struct ChangingCatalogApplication {
+        admissions: AtomicUsize,
+    }
+
+    impl ChangingCatalogApplication {
+        fn observation(generation: u64) -> crate::catalog_application::CatalogRuntimeObservation {
+            crate::catalog_application::CatalogRuntimeObservation {
+                attachment_id: if generation == 1 {
+                    uuid::Uuid::from_u128(1)
+                } else {
+                    uuid::Uuid::from_u128(2)
+                },
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice")
+                    .expect("instance ID"),
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("provider ID"),
+                generation,
+            }
+        }
+    }
+
+    impl crate::catalog_application::CatalogApplicationPort for ChangingCatalogApplication {
+        fn create_catalog(
+            &self,
+            _command: crate::catalog_application::CatalogCreateCommand,
+        ) -> Result<
+            crate::catalog_application::CatalogRuntimeObservation,
+            crate::catalog_application::CatalogApplicationError,
+        > {
+            unreachable!("create is not part of this fixture")
+        }
+
+        fn drop_catalog(
+            &self,
+            _command: crate::catalog_application::CatalogDropCommand,
+        ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+            unreachable!("drop is not part of this fixture")
+        }
+
+        fn admit_catalog(
+            &self,
+            _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        ) -> crate::catalog_application::CatalogAdmission {
+            let attempt = self.admissions.fetch_add(1, Ordering::SeqCst);
+            crate::catalog_application::CatalogAdmission::Ready(Self::observation(
+                if attempt == 0 { 1 } else { 2 },
+            ))
+        }
+    }
+
     impl crate::catalog_application::CatalogApplicationPort for UnavailableCatalogApplication {
         fn create_catalog(
             &self,
@@ -822,6 +897,31 @@ mod tests {
             .expect_err("stale projection must not materialize a table");
 
         assert_eq!(error, "projection is stale");
+    }
+
+    #[test]
+    fn catalog_application_rejects_generation_change_while_acquiring_planning_binding() {
+        let service = crate::engine::query_planning::catalog_runtime::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
+        let application = ChangingCatalogApplication {
+            admissions: AtomicUsize::new(0),
+        };
+        let materializer = CatalogServiceMaterializer::new(
+            Some("ice"),
+            &service,
+            bindings,
+            Box::new(OverlayLoader),
+        )
+        .with_catalog_application(Some(&application));
+
+        let error = materializer
+            .resolve_table_for_analysis(None, "db", "orders")
+            .expect_err("drop and recreate must not switch the request to a new generation");
+
+        assert_eq!(
+            error,
+            "catalog attachment generation changed while acquiring its planning lease"
+        );
     }
 
     #[test]
