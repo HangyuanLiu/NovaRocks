@@ -41,11 +41,17 @@ pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS: usize = 256;
 pub const MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS: usize = 4_096;
 pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES: usize = 16_384;
 pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH: usize = 64;
+/// Upper bounds for one column's write-default value tree. The node budget is
+/// charged per planning-facts value, not per column, so a single table cannot
+/// smuggle an unbounded literal through many shallow columns.
+pub const MAX_CONNECTOR_COLUMN_DEFAULT_NODES: usize = 16_384;
+pub const MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH: usize = 64;
 
 const TABLE_PLANNING_FACT_COLUMN_BYTES: usize = 16;
 const TABLE_PLANNING_FACT_CONSTRAINT_BYTES: usize = 16;
 const TABLE_DEFINITION_COLUMN_BYTES: usize = 24;
 const TABLE_DEFINITION_TYPE_NODE_BYTES: usize = 16;
+const COLUMN_DEFAULT_NODE_BYTES: usize = 24;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConnectorNamespaceIdentity {
@@ -89,6 +95,66 @@ pub enum ConnectorTableColumnRole {
     RowLineageSystem,
 }
 
+/// Provider-neutral value a connector applies to one column when a write omits
+/// it.
+///
+/// This is a sealed literal tree, not a provider payload: it carries no field
+/// id, no table-format encoding, and no handle bytes. Providers that cannot
+/// express a column default return `None` on the owning fact, and generic write
+/// admission then behaves exactly as it does for a column with no default.
+///
+/// Variants and their normalized representation deliberately mirror the neutral
+/// column-default vocabulary owned by the catalog layer. The SPI keeps its own
+/// copy because the SPI production dependency ceiling admits neither that crate
+/// nor any other application value crate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorColumnDefault {
+    Null,
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    /// IEEE-754 bit pattern, so non-finite defaults round-trip exactly.
+    Float32 {
+        bits: u32,
+    },
+    Float64 {
+        bits: u64,
+    },
+    Decimal {
+        unscaled: i128,
+        precision: u8,
+        scale: i8,
+    },
+    String(Arc<str>),
+    Binary(Bytes),
+    Date {
+        days_since_epoch: i32,
+    },
+    TimeMicros {
+        micros_since_midnight: i64,
+    },
+    TimestampMicros {
+        micros_since_epoch: i64,
+    },
+    TimestamptzMicros {
+        micros_since_epoch: i64,
+    },
+    TimestampNanos {
+        nanos_since_epoch: i64,
+    },
+    TimestamptzNanos {
+        nanos_since_epoch: i64,
+    },
+    Uuid([u8; 16]),
+    Fixed {
+        size: u64,
+        bytes: Bytes,
+    },
+    Struct(Vec<(Arc<str>, ConnectorColumnDefault)>),
+    Array(Vec<ConnectorColumnDefault>),
+    Map(Vec<(ConnectorColumnDefault, ConnectorColumnDefault)>),
+}
+
 /// Provider-neutral planning facts for one Arrow schema field. The ordinal is
 /// deliberately explicit so Core can project facts without inspecting a
 /// provider-private table-handle payload.
@@ -98,6 +164,7 @@ pub struct ConnectorTableColumnPlanningFact {
     visibility: ConnectorTableColumnVisibility,
     semantic_kind: ConnectorTableColumnSemanticKind,
     role: ConnectorTableColumnRole,
+    write_default: Option<ConnectorColumnDefault>,
 }
 
 impl ConnectorTableColumnPlanningFact {
@@ -112,7 +179,19 @@ impl ConnectorTableColumnPlanningFact {
             visibility,
             semantic_kind,
             role,
+            write_default: None,
         }
+    }
+
+    /// Attach the value this column receives when a write omits it.
+    ///
+    /// The value is validated together with the owning
+    /// [`ConnectorTablePlanningFacts`], not here, so that bound violations are
+    /// reported against the same request budget as the rest of the facts.
+    #[must_use]
+    pub fn with_write_default(mut self, write_default: Option<ConnectorColumnDefault>) -> Self {
+        self.write_default = write_default;
+        self
     }
 
     pub const fn field_ordinal(&self) -> u32 {
@@ -129,6 +208,10 @@ impl ConnectorTableColumnPlanningFact {
 
     pub const fn role(&self) -> ConnectorTableColumnRole {
         self.role
+    }
+
+    pub const fn write_default(&self) -> Option<&ConnectorColumnDefault> {
+        self.write_default.as_ref()
     }
 }
 
@@ -207,12 +290,13 @@ impl ConnectorTablePlanningFacts {
         mut foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        validate_column_facts(schema, &column_facts)?;
+        let write_default_bytes = validate_column_facts(schema, &column_facts)?;
         validate_unique_constraints(schema, &mut unique_constraints)?;
         validate_foreign_key_constraints(schema, &mut foreign_key_constraints)?;
 
         let bytes =
-            planning_facts_bytes(&column_facts, &unique_constraints, &foreign_key_constraints);
+            planning_facts_bytes(&column_facts, &unique_constraints, &foreign_key_constraints)
+                .saturating_add(write_default_bytes);
         if bytes > context.max_total_payload_bytes() {
             return Err(ConnectorError::new(
                 super::ConnectorErrorKind::ResourceExhausted,
@@ -240,12 +324,14 @@ impl ConnectorTablePlanningFacts {
     }
 }
 
+/// Validate the per-column facts against the frozen schema and return the byte
+/// cost contributed by their write-default trees.
 fn validate_column_facts(
     schema: &SchemaRef,
     column_facts: &[ConnectorTableColumnPlanningFact],
-) -> Result<(), ConnectorError> {
+) -> Result<usize, ConnectorError> {
     if column_facts.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     if column_facts.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS {
         return Err(ConnectorError::new(
@@ -259,6 +345,8 @@ fn validate_column_facts(
             "connector table planning facts do not cover the frozen schema",
         ));
     }
+    let mut write_default_bytes = 0usize;
+    let mut nodes = 0usize;
     for (expected, fact) in column_facts.iter().enumerate() {
         let expected = u32::try_from(expected).map_err(|_| {
             ConnectorError::new(
@@ -272,8 +360,134 @@ fn validate_column_facts(
                 "connector table planning facts contain a duplicate or misaligned schema ordinal",
             ));
         }
+        if let Some(write_default) = fact.write_default.as_ref() {
+            if matches!(write_default, ConnectorColumnDefault::Null) {
+                return Err(ConnectorError::new(
+                    super::ConnectorErrorKind::CorruptData,
+                    "connector column write default cannot be NULL at the top level",
+                ));
+            }
+            write_default_bytes = write_default_bytes.saturating_add(validate_column_default(
+                write_default,
+                0,
+                &mut nodes,
+            )?);
+        }
     }
-    Ok(())
+    Ok(write_default_bytes)
+}
+
+/// Validate one write-default subtree, charging depth, node count and bytes.
+///
+/// The invariants mirror the neutral column-default vocabulary this value is
+/// projected to: a FIXED default must match its declared width, a map key can
+/// be neither NULL nor a duplicate, and every nested value is checked the same
+/// way.
+fn validate_column_default(
+    value: &ConnectorColumnDefault,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<usize, ConnectorError> {
+    if depth > MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::ResourceExhausted,
+            "connector column write default exceeds the value depth limit",
+        ));
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_CONNECTOR_COLUMN_DEFAULT_NODES {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::ResourceExhausted,
+            "connector column write default exceeds the value node limit",
+        ));
+    }
+
+    let mut bytes = COLUMN_DEFAULT_NODE_BYTES;
+    match value {
+        ConnectorColumnDefault::String(text) => {
+            bytes = bytes.saturating_add(text.len());
+        }
+        ConnectorColumnDefault::Binary(payload) => {
+            bytes = bytes.saturating_add(payload.len());
+        }
+        ConnectorColumnDefault::Decimal {
+            precision, scale, ..
+        } => {
+            if !(1..=38).contains(precision)
+                || *scale < 0
+                || i32::from(*scale) > i32::from(*precision)
+            {
+                return Err(corrupt_column_default(
+                    "connector column write default contains an invalid decimal value",
+                ));
+            }
+        }
+        ConnectorColumnDefault::Fixed {
+            size,
+            bytes: fixed_bytes,
+        } => {
+            let byte_len = u64::try_from(fixed_bytes.len()).map_err(|_| {
+                corrupt_column_default(
+                    "connector column write default FIXED byte length does not fit u64",
+                )
+            })?;
+            if *size != byte_len {
+                return Err(corrupt_column_default(
+                    "connector column write default FIXED size does not match its byte length",
+                ));
+            }
+            bytes = bytes.saturating_add(fixed_bytes.len());
+        }
+        ConnectorColumnDefault::Struct(fields) => {
+            for (name, field_value) in fields {
+                bytes = bytes
+                    .saturating_add(name.len())
+                    .saturating_add(validate_column_default(field_value, depth + 1, nodes)?);
+            }
+        }
+        ConnectorColumnDefault::Array(elements) => {
+            for element in elements {
+                bytes = bytes.saturating_add(validate_column_default(element, depth + 1, nodes)?);
+            }
+        }
+        ConnectorColumnDefault::Map(entries) => {
+            let mut keys: Vec<&ConnectorColumnDefault> = Vec::with_capacity(entries.len());
+            for (key, map_value) in entries {
+                if matches!(key, ConnectorColumnDefault::Null) {
+                    return Err(corrupt_column_default(
+                        "connector column write default map key cannot be NULL",
+                    ));
+                }
+                if keys.contains(&key) {
+                    return Err(corrupt_column_default(
+                        "connector column write default contains a duplicate map key",
+                    ));
+                }
+                bytes = bytes
+                    .saturating_add(validate_column_default(key, depth + 1, nodes)?)
+                    .saturating_add(validate_column_default(map_value, depth + 1, nodes)?);
+                keys.push(key);
+            }
+        }
+        ConnectorColumnDefault::Null
+        | ConnectorColumnDefault::Boolean(_)
+        | ConnectorColumnDefault::Int32(_)
+        | ConnectorColumnDefault::Int64(_)
+        | ConnectorColumnDefault::Float32 { .. }
+        | ConnectorColumnDefault::Float64 { .. }
+        | ConnectorColumnDefault::Date { .. }
+        | ConnectorColumnDefault::TimeMicros { .. }
+        | ConnectorColumnDefault::TimestampMicros { .. }
+        | ConnectorColumnDefault::TimestamptzMicros { .. }
+        | ConnectorColumnDefault::TimestampNanos { .. }
+        | ConnectorColumnDefault::TimestamptzNanos { .. }
+        | ConnectorColumnDefault::Uuid(_) => {}
+    }
+    Ok(bytes)
+}
+
+fn corrupt_column_default(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(super::ConnectorErrorKind::CorruptData, message)
 }
 
 fn validate_unique_constraints(
@@ -1078,6 +1292,217 @@ mod tests {
             namespace: Arc::from("analytics"),
             table: Arc::from("customers"),
         }
+    }
+
+    fn ordinary_fact(field_ordinal: u32) -> ConnectorTableColumnPlanningFact {
+        ConnectorTableColumnPlanningFact::new(
+            field_ordinal,
+            ConnectorTableColumnVisibility::Sql,
+            ConnectorTableColumnSemanticKind::None,
+            ConnectorTableColumnRole::Ordinary,
+        )
+    }
+
+    /// Build facts covering `planning_schema` with one write default on the
+    /// first column.
+    fn facts_with_write_default(
+        write_default: ConnectorColumnDefault,
+        total_payload_bytes: usize,
+    ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+        ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            vec![
+                ordinary_fact(0).with_write_default(Some(write_default)),
+                ordinary_fact(1),
+                ordinary_fact(2),
+            ],
+            Vec::new(),
+            Vec::new(),
+            &context(total_payload_bytes),
+        )
+    }
+
+    #[test]
+    fn spi5g_write_default_round_trips_every_variant() {
+        let variants = vec![
+            ConnectorColumnDefault::Boolean(true),
+            ConnectorColumnDefault::Int32(-7),
+            ConnectorColumnDefault::Int64(1 << 40),
+            ConnectorColumnDefault::Float32 {
+                bits: f32::NAN.to_bits(),
+            },
+            ConnectorColumnDefault::Float64 {
+                bits: f64::NEG_INFINITY.to_bits(),
+            },
+            ConnectorColumnDefault::Decimal {
+                unscaled: -12_345,
+                precision: 10,
+                scale: 3,
+            },
+            ConnectorColumnDefault::String(Arc::from("hello")),
+            ConnectorColumnDefault::Binary(Bytes::from_static(b"\x00\xff")),
+            ConnectorColumnDefault::Date {
+                days_since_epoch: -1,
+            },
+            ConnectorColumnDefault::TimeMicros {
+                micros_since_midnight: 1,
+            },
+            ConnectorColumnDefault::TimestampMicros {
+                micros_since_epoch: 2,
+            },
+            ConnectorColumnDefault::TimestamptzMicros {
+                micros_since_epoch: 3,
+            },
+            ConnectorColumnDefault::TimestampNanos {
+                nanos_since_epoch: 4,
+            },
+            ConnectorColumnDefault::TimestamptzNanos {
+                nanos_since_epoch: 5,
+            },
+            ConnectorColumnDefault::Uuid([7u8; 16]),
+            ConnectorColumnDefault::Fixed {
+                size: 3,
+                bytes: Bytes::from_static(b"abc"),
+            },
+            ConnectorColumnDefault::Struct(vec![(
+                Arc::from("inner"),
+                ConnectorColumnDefault::Int32(1),
+            )]),
+            ConnectorColumnDefault::Array(vec![ConnectorColumnDefault::Int32(1)]),
+            ConnectorColumnDefault::Map(vec![(
+                ConnectorColumnDefault::String(Arc::from("k")),
+                ConnectorColumnDefault::Int32(1),
+            )]),
+        ];
+
+        for variant in variants {
+            let facts = facts_with_write_default(variant.clone(), 8_192)
+                .unwrap_or_else(|error| panic!("variant {variant:?} rejected: {error}"));
+            assert_eq!(facts.column_facts()[0].write_default(), Some(&variant));
+            assert_eq!(facts.column_facts()[1].write_default(), None);
+        }
+    }
+
+    #[test]
+    fn spi5g_write_default_rejects_top_level_null() {
+        let error = facts_with_write_default(ConnectorColumnDefault::Null, 4_096)
+            .expect_err("top-level NULL default is rejected");
+        assert_eq!(error.kind(), super::super::ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn spi5g_write_default_rejects_fixed_size_mismatch() {
+        let error = facts_with_write_default(
+            ConnectorColumnDefault::Fixed {
+                size: 4,
+                bytes: Bytes::from_static(b"abc"),
+            },
+            4_096,
+        )
+        .expect_err("FIXED size must match its byte length");
+        assert_eq!(error.kind(), super::super::ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn spi5g_write_default_rejects_invalid_decimal() {
+        let error = facts_with_write_default(
+            ConnectorColumnDefault::Decimal {
+                unscaled: 1,
+                precision: 2,
+                scale: 5,
+            },
+            4_096,
+        )
+        .expect_err("decimal scale cannot exceed its precision");
+        assert_eq!(error.kind(), super::super::ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn spi5g_write_default_rejects_null_and_duplicate_map_keys() {
+        let null_key = facts_with_write_default(
+            ConnectorColumnDefault::Map(vec![(
+                ConnectorColumnDefault::Null,
+                ConnectorColumnDefault::Int32(1),
+            )]),
+            4_096,
+        )
+        .expect_err("map key cannot be NULL");
+        assert_eq!(
+            null_key.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let duplicate_key = facts_with_write_default(
+            ConnectorColumnDefault::Map(vec![
+                (
+                    ConnectorColumnDefault::Int32(1),
+                    ConnectorColumnDefault::Int32(1),
+                ),
+                (
+                    ConnectorColumnDefault::Int32(1),
+                    ConnectorColumnDefault::Int32(2),
+                ),
+            ]),
+            4_096,
+        )
+        .expect_err("duplicate map keys are rejected");
+        assert_eq!(
+            duplicate_key.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn spi5g_write_default_rejects_excessive_depth() {
+        let mut nested = ConnectorColumnDefault::Int32(1);
+        for _ in 0..=MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH {
+            nested = ConnectorColumnDefault::Array(vec![nested]);
+        }
+        let error = facts_with_write_default(nested, 1 << 20)
+            .expect_err("value depth beyond the limit is rejected");
+        assert_eq!(
+            error.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn spi5g_write_default_rejects_excessive_node_count() {
+        let wide = ConnectorColumnDefault::Array(
+            (0..=MAX_CONNECTOR_COLUMN_DEFAULT_NODES)
+                .map(|index| ConnectorColumnDefault::Int32(index as i32))
+                .collect(),
+        );
+        // The budget is deliberately larger than the node tree's byte cost so
+        // the node limit, not the payload budget, is what rejects this value.
+        let error = facts_with_write_default(wide, 1 << 20)
+            .expect_err("value node count beyond the limit is rejected");
+        assert_eq!(
+            error.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn spi5g_write_default_bytes_are_charged_to_the_request_budget() {
+        // The same default is accepted under a generous budget and rejected
+        // once the budget only covers the fixed per-column cost.
+        let long_text = ConnectorColumnDefault::String(Arc::from("x".repeat(4_096).as_str()));
+        facts_with_write_default(long_text.clone(), 1 << 20)
+            .expect("accepted under a large budget");
+
+        let error = facts_with_write_default(long_text, 256)
+            .expect_err("write-default bytes count toward the request budget");
+        assert_eq!(
+            error.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn spi5g_empty_facts_carry_no_write_default() {
+        let facts = ConnectorTablePlanningFacts::empty();
+        assert!(facts.column_facts().is_empty());
     }
 
     #[test]
