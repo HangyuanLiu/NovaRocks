@@ -1257,3 +1257,378 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 fn exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorCleanupFinalizeRequest, ConnectorCleanupOperation,
+        ConnectorCleanupPlanningRequest, ConnectorExecutionBindingKey, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorTableHandle,
+    };
+
+    use super::*;
+    use crate::access_binding::IcebergReadBinding;
+    use crate::catalog_control::IcebergCatalogControlState;
+    use crate::resources::IcebergControlResources;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            64 * 1024,
+            256 * 1024,
+        )
+        .expect("context")
+    }
+
+    fn contract_values() -> (
+        ConnectorInstanceDescriptor,
+        ConnectorExecutionBindingKey,
+        ConnectorCleanupPlan,
+        PreparedBatch,
+    ) {
+        let instance_id = ConnectorInstanceId::parse("cleanup-test").expect("instance");
+        let key = ConnectorExecutionBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([4; 16]),
+        };
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            instance_id: instance_id.clone(),
+        };
+        let request = ConnectorCleanupPlanningRequest::try_new(
+            ConnectorCleanupOperationId::from_bytes([5; 16]),
+            key.clone(),
+            ConnectorCleanupOperation::remove_unreferenced_objects(
+                ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
+                    .expect("table"),
+                1,
+            )
+            .expect("operation"),
+            context(),
+        )
+        .expect("request");
+        let plan = ConnectorCleanupPlan::try_new(
+            &request,
+            [6; 32],
+            [7; 32],
+            ConnectorCleanupPlanSummary::try_new(3, 30, 1, 1).expect("summary"),
+            Bytes::from_static(b"plan"),
+        )
+        .expect("plan");
+        let prepared = PreparedBatch::try_new(
+            key.clone(),
+            plan.operation_id(),
+            plan.plan_digest(),
+            plan.manifest_digest(),
+            0,
+            [8; 32],
+            Bytes::from_static(b"prepared"),
+        )
+        .expect("prepared");
+        (descriptor, key, plan, prepared)
+    }
+
+    fn local_runtime() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        Arc<IcebergControlRuntime>,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "cleanup-test",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let runtime = Arc::new(
+            IcebergControlRuntime::try_new(
+                IcebergCatalogControlState::new(configuration),
+                resources,
+            )
+            .expect("control runtime"),
+        );
+        (executor, warehouse, runtime)
+    }
+
+    fn size_mtime_identity(executor: &tokio::runtime::Runtime, location: &str) -> ObjectIdentity {
+        let access = crate::fs_io::resolve_access_for_location(location, None).expect("access");
+        let path = access.single_relative_path().expect("relative path");
+        let metadata = executor
+            .block_on(access.operator().stat(path))
+            .expect("metadata");
+        ObjectIdentity::SizeMtime {
+            size: metadata.content_length(),
+            mtime_ms: canonical_object_mtime_ms(
+                metadata
+                    .last_modified()
+                    .expect("modification time")
+                    .into_inner()
+                    .as_millisecond(),
+            ),
+        }
+    }
+
+    #[test]
+    fn manifest_and_receipt_codecs_are_canonical_and_bounded() {
+        let records = vec![
+            ManifestRecord {
+                ordinal: 0,
+                location: "file:///tmp/a.parquet".to_string(),
+                identity: ObjectIdentity::SizeMtime {
+                    size: 10,
+                    mtime_ms: 20,
+                },
+            },
+            ManifestRecord {
+                ordinal: 1,
+                location: "file:///tmp/b.parquet".to_string(),
+                identity: ObjectIdentity::Etag {
+                    etag: "etag-b".to_string(),
+                    size: 20,
+                    mtime_ms: 30,
+                },
+            },
+        ];
+        let parts = split_manifest_parts(&records).expect("manifest parts");
+        assert_eq!(parts.len(), 1);
+        let encoded = canonical(&parts[0]).expect("encode manifest part");
+        assert!(encoded.len() <= MAX_PART_BYTES);
+        let decoded: ManifestPart =
+            decode_canonical(&encoded, "manifest part").expect("decode manifest part");
+        assert_eq!(decoded.records.len(), records.len());
+        assert_eq!(batch_digest(&decoded.records), batch_digest(&records));
+
+        let non_canonical = Bytes::from_static(b"{\"version\":1, \"records\":[]}");
+        let error = match decode_canonical::<ManifestPart>(&non_canonical, "manifest part") {
+            Ok(_) => panic!("whitespace must not be accepted as canonical JSON"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+
+        let oversized = ManifestRecord {
+            ordinal: 0,
+            location: "x".repeat(MAX_PART_BYTES + 1),
+            identity: ObjectIdentity::SizeMtime {
+                size: 1,
+                mtime_ms: 1,
+            },
+        };
+        let error = match split_manifest_parts(&[oversized]) {
+            Ok(_) => panic!("one record must not exceed a manifest part"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(
+            MAX_RECORDS,
+            MAX_BATCH_OBJECTS * novarocks_spi::connector::MAX_CONNECTOR_CLEANUP_BATCHES as usize
+        );
+
+        let bounded_reason = receipt(
+            0,
+            ObjectOutcome::Failed,
+            Some("r".repeat(MAX_REASON_CHARS + 100)),
+        )
+        .expect("receipt record");
+        assert_eq!(
+            bounded_reason
+                .reason
+                .as_deref()
+                .expect("reason")
+                .chars()
+                .count(),
+            MAX_REASON_CHARS
+        );
+        let artifact = ReceiptArtifact {
+            version: ARTIFACT_VERSION,
+            batch_digest_hex: hex_encode([9; 32]),
+            records: vec![bounded_reason],
+        };
+        let encoded = canonical(&artifact).expect("encode receipt");
+        assert!(encoded.len() <= MAX_PART_BYTES * 2);
+        let decoded: ReceiptArtifact =
+            decode_canonical(&encoded, "receipt").expect("decode receipt");
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(
+            receipt_summary(&decoded.records).expect("summary").failed(),
+            1
+        );
+
+        let boundary_records = (0..MAX_BATCH_OBJECTS)
+            .map(|ordinal| {
+                receipt(ordinal as u32, ObjectOutcome::AlreadyAbsent, None)
+                    .expect("boundary receipt")
+            })
+            .collect::<Vec<_>>();
+        let boundary_bytes = canonical(&ReceiptArtifact {
+            version: ARTIFACT_VERSION,
+            batch_digest_hex: hex_encode([10; 32]),
+            records: boundary_records,
+        })
+        .expect("encode boundary receipt");
+        assert!(boundary_bytes.len() <= MAX_PART_BYTES * 2);
+        let boundary: ReceiptArtifact =
+            decode_canonical(&boundary_bytes, "boundary receipt").expect("decode boundary receipt");
+        assert_eq!(boundary.records.len(), MAX_BATCH_OBJECTS);
+        assert_eq!(
+            receipt_summary(&boundary.records)
+                .expect("boundary summary")
+                .already_absent(),
+            MAX_BATCH_OBJECTS as u32
+        );
+    }
+
+    #[test]
+    fn receipt_replay_and_terminal_finalization_are_idempotent() {
+        let (descriptor, key, plan, prepared) = contract_values();
+        let records = vec![
+            receipt(0, ObjectOutcome::Deleted, None).expect("deleted"),
+            receipt(
+                1,
+                ObjectOutcome::Failed,
+                Some("identity changed".to_string()),
+            )
+            .expect("failed"),
+            receipt(
+                2,
+                ObjectOutcome::Unknown,
+                Some("response was lost".to_string()),
+            )
+            .expect("unknown"),
+        ];
+        let bytes = canonical(&ReceiptArtifact {
+            version: ARTIFACT_VERSION,
+            batch_digest_hex: hex_encode(prepared.batch_digest()),
+            records: records.clone(),
+        })
+        .expect("receipt artifact");
+        let digest = domain_digest(RECEIPT_DOMAIN, &bytes);
+        let first = receipt_value(
+            &descriptor,
+            &key,
+            &plan,
+            &prepared,
+            "file:///tmp/receipt.json".to_string(),
+            digest,
+            &records,
+        )
+        .expect("first receipt");
+        let replay = receipt_value(
+            &descriptor,
+            &key,
+            &plan,
+            &prepared,
+            "file:///tmp/receipt.json".to_string(),
+            digest,
+            &records,
+        )
+        .expect("replayed receipt");
+        assert_eq!(first, replay);
+        assert_eq!(first.summary().deleted(), 1);
+        assert_eq!(first.summary().failed(), 1);
+        assert_eq!(first.summary().unknown(), 1);
+        first.validate().expect("receipt validates");
+
+        let (_executor, _warehouse, runtime) = local_runtime();
+        let adapter = IcebergCleanupMaintenanceAdapter::new(key, runtime).expect("adapter");
+        adapter
+            .finalize_terminal(
+                ConnectorCleanupFinalizeRequest::try_new(plan.clone(), context())
+                    .expect("first finalization"),
+            )
+            .expect("first terminal finalization");
+        adapter
+            .finalize_terminal(
+                ConnectorCleanupFinalizeRequest::try_new(plan, context())
+                    .expect("replayed finalization"),
+            )
+            .expect("replayed terminal finalization");
+    }
+
+    #[test]
+    fn reconcile_is_stable_and_execute_preserves_failure_outcomes() {
+        let (executor, warehouse, runtime) = local_runtime();
+        let path = warehouse.path().join("candidate.parquet");
+        std::fs::write(&path, b"candidate").expect("write candidate");
+        let location = format!("file://{}", path.display());
+        let identity = size_mtime_identity(&executor, &location);
+        let record = ManifestRecord {
+            ordinal: 0,
+            location: location.clone(),
+            identity: identity.clone(),
+        };
+
+        let remains = reconcile_frozen_batch(&runtime, std::slice::from_ref(&record), None)
+            .expect("reconcile remaining object");
+        let remains_summary = receipt_summary(&remains).expect("remaining summary");
+        assert_eq!(remains_summary.failed(), 1);
+        assert_eq!(remains_summary.deleted(), 0);
+        assert!(path.exists());
+
+        let mismatched = ManifestRecord {
+            ordinal: 0,
+            location: location.clone(),
+            identity: match identity {
+                ObjectIdentity::SizeMtime { size, mtime_ms } => ObjectIdentity::SizeMtime {
+                    size: size + 1,
+                    mtime_ms,
+                },
+                _ => unreachable!("local fixture uses size and mtime"),
+            },
+        };
+        let failed = execute_frozen_batch(&runtime, &[mismatched], None)
+            .expect("execute mismatched identity");
+        let failed_summary = receipt_summary(&failed).expect("failure summary");
+        assert_eq!(failed_summary.failed(), 1);
+        assert_eq!(failed_summary.deleted(), 0);
+        assert!(
+            failed[0]
+                .reason
+                .as_deref()
+                .expect("failure reason")
+                .contains("identity changed")
+        );
+        assert!(path.exists(), "failed cleanup must not delete the object");
+
+        std::fs::remove_file(&path).expect("remove candidate");
+        let absent_once = reconcile_frozen_batch(&runtime, std::slice::from_ref(&record), None)
+            .expect("first absent reconcile");
+        let absent_replay =
+            reconcile_frozen_batch(&runtime, &[record], None).expect("replayed absent reconcile");
+        assert_eq!(
+            receipt_summary(&absent_once).expect("first absent summary"),
+            BatchReceiptSummary::new(1, 0, 0, 0)
+        );
+        assert_eq!(
+            receipt_summary(&absent_replay).expect("replayed absent summary"),
+            BatchReceiptSummary::new(1, 0, 0, 0)
+        );
+    }
+}
