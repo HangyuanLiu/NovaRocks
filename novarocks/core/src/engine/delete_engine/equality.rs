@@ -89,9 +89,15 @@ pub(crate) fn prepare_equality_delete_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
-    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_properties(
+    // Reject a managed materialized view from neutral metadata under an exact
+    // generation, the same way INSERT, TRUNCATE and ADD FILES already do. This
+    // check cannot move into row-mutation admission: incremental MV refresh
+    // drives its own writes through that same admission, so at that level a
+    // user statement is indistinguishable from the MV machinery maintaining its
+    // own target.
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+        state,
         &target,
-        table.metadata().properties(),
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;
 
