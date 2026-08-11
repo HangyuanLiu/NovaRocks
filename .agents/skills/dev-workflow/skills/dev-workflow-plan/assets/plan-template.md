@@ -2,7 +2,7 @@
 title: "<Spec 标题>实现计划"
 date: YYYY-MM-DD
 type: implementation-plan
-status: approved
+status: draft
 spec: "[[<spec-basename>]]"
 tags:
   - dev-workflow/design

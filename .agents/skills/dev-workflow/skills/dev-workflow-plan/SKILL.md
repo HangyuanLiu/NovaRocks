@@ -1,11 +1,12 @@
 ---
 name: dev-workflow-plan
-description: "Turn an accepted spec into an approved, executable implementation plan by using Codex Plan mode, then persist the approved plan in the resolved project documentation root before coding. Use when a design spec is accepted and the user asks to plan implementation, review implementation steps, or prepare parallel execution."
+description: "Turn an accepted spec into a persisted, reviewable, and executable implementation plan in the resolved project documentation root without requiring Codex Plan mode. Use when a design spec is accepted and the user asks to plan implementation, review or revise implementation steps, or prepare parallel execution."
 ---
 
 # 实现计划
 
-使用 Codex 内建 Plan mode 完成调研、决策和计划审阅；不要复制一套独立的 planning 流程。
+在当前可编辑模式中完成调研并直接把实现计划固化到项目文档。不要要求切换 Codex Plan mode，也不要只在对话中输出
+计划。
 
 ## 前置条件
 
@@ -16,17 +17,9 @@ description: "Turn an accepted spec into an approved, executable implementation 
 4. 确认 spec 已被接受，且粒度适合一个 PR。
 5. 检查当前代码、测试入口、依赖关系和相关 ADR；不要只把 spec 改写成任务列表。
 
-若当前不在 Codex Plan mode：
+## 调研与落盘
 
-- 不开始实现；
-- 明确请用户切换到 Plan mode；
-- 给出将要规划的 spec 路径和需要解决的计划问题；
-- 明确提示 Plan mode：尽量把计划产出为依赖清晰、文件范围不冲突、可供多个 sub-agent 并行调度的 task
-  graph；无法安全并行的部分必须明确标成串行。
-
-## 在 Plan mode 中
-
-遵循 Codex Plan mode 的交互与审批机制：
+不要把模式切换作为 plan 阶段的前置条件。完成前置检查后，在同一阶段执行：
 
 1. 研究 spec 点名的代码路径和实际调用链。
 2. 识别需要修改、创建和删除的文件。
@@ -47,30 +40,37 @@ description: "Turn an accepted spec into an approved, executable implementation 
 7. 标出适合创建本地检查点 commit 的边界：完整章节 / 行为切片完成后，以及进入高风险改动前。
 8. 明确 execute 阶段可以本地 commit，但禁止 push 和 PR。
 9. 写明哪些局部选择可由执行者自行决定，哪些变化会使 plan 失效并必须回到设计讨论。
-10. 让用户通过 Plan mode 明确批准最终计划。
+10. 使用 `assets/plan-template.md` 将计划以 `status: draft` 写入 contract 或适用 `AGENTS.md` 规定的 plan 目录。
+11. 在 plan frontmatter 和正文链接目标 spec，并按项目约定在 spec 中增加反向链接；没有既有约定时添加
+    `## 实现计划` 与 plan wikilink。
+12. 项目使用 umbrella 时，将 plan 链接补入对应子任务面板。
+13. 向用户报告 plan 路径、关键任务图和仍需确认的内容，请用户明确批准已落盘版本。
 
-Plan mode 中可使用 sub-agent 并行梳理独立子系统、测试面、文件所有权或风险点。主 agent 负责验证调研结果、
-构造 DAG、消除伪并行和批准最终计划。
+plan 阶段可使用 sub-agent 并行梳理独立子系统、测试面、文件所有权或风险点。主 agent 负责验证调研结果、
+构造 DAG、消除伪并行并维护待用户批准的落盘版本。
 
-## 批准后落盘
+plan 阶段只修改计划文档及其必要的 spec / umbrella 链接，不修改产品代码。计划必须足够完整，让执行阶段无需重新做
+架构决策；但不要规定无关紧要的逐行实现。将模板落盘时，把标题、字段显示名和占位文字转换为当前请求与适用
+`AGENTS.md` 要求的文档语言。
 
-Plan mode 本身不做文件修改。用户批准并回到允许编辑的模式后，在执行任何代码改动前：
+## 批准与修订
 
-1. 使用 `assets/plan-template.md` 把批准版本写入 contract 或适用 `AGENTS.md` 规定的 plan 目录。
-2. 在 plan frontmatter 和正文链接目标 spec。
-3. 按项目文档约定在 spec 中增加指向 plan 的反向链接；没有既有约定时添加 `## 实现计划` 与 plan wikilink。
-4. 项目使用 umbrella 时，将 plan 链接补入对应子任务面板。
-5. 标记 `status: approved`；未批准草案不得用于执行。
+用户明确批准当前落盘版本后：
 
-计划必须足够完整，让执行阶段无需重新做架构决策；但不要规定无关紧要的逐行实现。
-将模板落盘时，把标题、字段显示名和占位文字转换为当前请求与适用 `AGENTS.md` 要求的文档语言。
+1. 最后核对用户批准的内容与磁盘版本一致。
+2. 将 plan frontmatter 更新为 `status: approved`。
+3. 再次检查 spec / plan 双向链接和 umbrella 面板。
+4. 只有完成以上步骤后才进入 `$dev-workflow-execute`。
+
+用户要求修订已经 approved 的计划时，若改动影响任务 DAG、文件所有权、验收边界、关键依赖或风险裁决，先将状态退回
+`draft`，完成落盘修订后重新取得明确批准。纯文字澄清且不改变执行契约时可保留 `approved`。
 
 ## 完成门
 
 只有以下条件同时满足才进入 `$dev-workflow-execute`：
 
-- 用户已批准 Plan mode 的最终计划；
-- approved plan 已落盘；
+- 用户已明确批准当前落盘版本；
+- plan 已落盘且为 `status: approved`；
 - spec 和 plan 相互链接；
 - task DAG、并行 waves、文件所有权、调度标签、验收命令、生产形态验证和完成标准明确；
 - 没有未决重大决策。

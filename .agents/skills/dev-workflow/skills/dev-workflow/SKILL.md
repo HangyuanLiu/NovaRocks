@@ -1,6 +1,6 @@
 ---
 name: dev-workflow
-description: "Route feature, refactor, roadmap, and architecture work through a durable development workflow: discuss the problem, write an accepted spec, plan in Codex Plan mode, execute under a persistent goal, verify, and optionally publish and archive. Use when the user asks to start, continue, or drive a development task end to end, or when the current phase is unclear."
+description: "Route technical explanations, features, refactors, roadmaps, and architecture work through a durable development workflow: explain concepts read-only, discuss the problem, write an accepted spec, persist and approve an implementation plan, execute under a persistent goal, verify, and optionally publish and archive. Use when the user asks to understand, start, continue, or drive a development task, or when the correct workflow phase is unclear."
 ---
 
 # 开发工作流
@@ -24,6 +24,7 @@ description: "Route feature, refactor, roadmap, and architecture work through a 
 
 | 当前状态或用户意图 | 调用 |
 |---|---|
+| 主要目标是从基础理解技术概念、内部机制、代码 / 架构 / plan 变化或数据流 | `$dev-workflow-explain-technical-concept` |
 | 问题、边界或方案尚未讨论清楚 | `$dev-workflow-discuss-design` |
 | 设计已明确接受，但尚无 spec | `$dev-workflow-write-spec` |
 | 已有 accepted spec，但尚无 approved plan | `$dev-workflow-plan` |
@@ -32,12 +33,13 @@ description: "Route feature, refactor, roadmap, and architecture work through a 
 
 如果用户显式指定某个阶段，直接进入该阶段；不要强迫完整重走前序流程，但必须检查该阶段所需输入是否存在。
 “完成了吗”“当前状态如何”等状态询问属于只读状态报告，不进入 finish，也不构成 commit、push、PR 或归档授权。
+技术讲解是可以从任意阶段进入的只读旁路，不改变 spec、plan、goal 或发布状态；讲解完成后返回原阶段。
 
 ## 状态机与阶段门
 
 ```text
-discussion --设计被明确接受--> spec --spec 已确认--> Plan mode
-Plan mode --plan 被明确批准并已落盘--> goal execution
+discussion --设计被明确接受--> spec --spec 已确认--> plan drafting + persistence
+persisted plan --plan 被明确批准--> goal execution
 goal execution --验收证据充分--> verified
 verified --用户另行明确授权发布--> PR + archive
 ```
@@ -45,7 +47,7 @@ verified --用户另行明确授权发布--> PR + archive
 只设置两个常规人工门：
 
 1. **设计接受门**：用户明确接受问题定义、目标、非目标和关键设计决策。
-2. **计划批准门**：用户在 Codex Plan mode 中批准实现计划。
+2. **计划批准门**：用户明确批准已经落盘的实现计划。
 
 进入执行后，不因普通实现困难、测试失败、耗时超预期或局部代码选择而停下。仅在 `$dev-workflow-execute`
 定义的重大决策点暂停。
@@ -55,12 +57,13 @@ verified --用户另行明确授权发布--> PR + archive
 当用户明确要求端到端完成：
 
 1. 在每个阶段完成后自动进入下一阶段。
-2. 需要 Plan mode 时，说明原因并请用户切换；同时提示将计划组织为依赖清晰、尽可能可并行调度的 task graph，
-   以便 execute 阶段使用 sub-agent。
-3. Plan mode 获得批准后，先把批准版本落盘到 `DOC_ROOT`，再开始实现。
-4. 实现开始时创建 goal；在 goal 的终态条件真正满足前持续工作。
-5. 允许在任务本地开发分支创建检查点 commit；execute 阶段始终禁止 push 和 PR。
-6. 只有用户另行明确授权发布后，才进入 finish 阶段执行 push / PR。
+2. plan 阶段直接在当前可编辑模式中把计划写入 `DOC_ROOT`；不要要求用户切换 Codex Plan mode，也不要只在对话中
+   保留计划。
+3. 计划先以 `status: draft` 落盘并在原文档中迭代；用户明确批准该版本后改为 `status: approved`，再开始实现。
+4. 将计划组织为依赖清晰、尽可能可并行调度的 task graph，以便 execute 阶段使用 sub-agent。
+5. 实现开始时创建 goal；在 goal 的终态条件真正满足前持续工作。
+6. 允许在任务本地开发分支创建检查点 commit；execute 阶段始终禁止 push 和 PR。
+7. 只有用户另行明确授权发布后，才进入 finish 阶段执行 push / PR。
 
 ## Sub-agent 使用
 
@@ -73,6 +76,7 @@ verified --用户另行明确授权发布--> PR + archive
 
 ## 范围纪律
 
+- 技术讲解保持只读，先交付用户请求的解释；不得把理解请求当成 spec、plan 或实现授权。
 - 讨论阶段保持只读。
 - spec 阶段只写设计文档，不写 plan 或代码。
 - plan 阶段只规划，不实现。
