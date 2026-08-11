@@ -109,6 +109,11 @@ SQL owner 并只做类型中立化。**
    都超过收益。这是**成本与风险驱动的划线，不是因为 Core 更适合拥有它**。若未来确有 Provider 侧谓词下推
    需求，这条线应重新画。
 
+   裁决 6 还带来第二处用户可见变化：该校验的两条拒绝错误原本把 Iceberg 类型的 Debug 直接嵌进文本
+   （`Decimal { precision: 10, scale: 2 }`、struct/list/map 的 `Type` Debug）。中立化后改用 Arrow 词汇
+   渲染（`Decimal128(10, 2)`）。accept / reject 集合逐项不变，只有类型名的渲染变化。被否决的替代是为
+   "错误文本保真"单独签发一处列级 fact——那会把 table-format 词汇重新引回 Core 的错误路径。
+
 3. **裁决 5 让 SELECT 与 DML 对 variant / binary 列继续给出不同 Arrow 类型。** 这个分歧本身是缺陷。本次
    只把它从"调用方各自解码 Iceberg schema"变成"Provider 显式签发"，没有修复它。选择不修，是为了让本次
    变更的行为面只有裁决 2 一处，便于回归归因。
