@@ -28,9 +28,7 @@ use crate::sql::planner::vocabulary::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 use novarocks_catalog::identifier::TableIdentity;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-};
+use novarocks_connector_iceberg::scan_model::{IcebergDataFileInfo, IcebergTableInfo};
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
@@ -297,7 +295,7 @@ impl IcebergMvTargetRuntimeBinding {
         .map(|files| {
             files
                 .into_iter()
-                .map(data_file_with_stats_to_info)
+                .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
                 .collect()
         })
     }
@@ -312,7 +310,9 @@ impl IcebergMvTargetRuntimeBinding {
             current_snapshot_id: metadata.current_snapshot_id(),
             schema_id: metadata.current_schema_id(),
             location: metadata.location().to_string(),
-            schema: iceberg_schema_def(metadata.current_schema()),
+            schema: novarocks_connector_iceberg::schema_facts::iceberg_schema_def(
+                metadata.current_schema(),
+            ),
             serialized_metadata: Some(
                 serde_json::to_string(metadata).map_err(|err| {
                     format!("serialize iceberg target table metadata failed: {err}")
@@ -500,87 +500,6 @@ fn validate_physical_field_identity(
         ));
     }
     Ok(())
-}
-
-fn data_file_with_stats_to_info(
-    file: novarocks_connector_iceberg::manifest::DataFileWithStats,
-) -> IcebergDataFileInfo {
-    IcebergDataFileInfo {
-        path: file.path,
-        size: file.size,
-        row_count: file.record_count,
-        column_stats: file.column_stats,
-        partition_spec_id: file.partition_spec_id,
-        partition_key: file.partition_key,
-        first_row_id: file.first_row_id,
-        data_sequence_number: file.data_sequence_number,
-        ivm_change_op: None,
-        included_positions: None,
-        delete_files: file.delete_files,
-        manifest_path: file.manifest_path,
-        partition_values: file.partition_field_values,
-    }
-}
-
-fn iceberg_schema_def(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> IcebergSchemaDef {
-    IcebergSchemaDef {
-        fields: schema
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-    }
-}
-
-fn iceberg_field_def(
-    field: &novarocks_connector_iceberg::iceberg::spec::NestedField,
-) -> IcebergSchemaFieldDef {
-    let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    let write_default_json = field.write_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    IcebergSchemaFieldDef {
-        field_id: field.id,
-        name: field.name.clone(),
-        initial_default: field.initial_default.clone(),
-        write_default: field.write_default.clone(),
-        initial_default_json,
-        write_default_json,
-        children: iceberg_type_children(field.field_type.as_ref()),
-    }
-}
-
-fn iceberg_type_children(
-    ty: &novarocks_connector_iceberg::iceberg::spec::Type,
-) -> Vec<IcebergSchemaFieldDef> {
-    match ty {
-        novarocks_connector_iceberg::iceberg::spec::Type::Struct(struct_ty) => struct_ty
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-        novarocks_connector_iceberg::iceberg::spec::Type::List(list_ty) => {
-            vec![iceberg_field_def(list_ty.element_field.as_ref())]
-        }
-        novarocks_connector_iceberg::iceberg::spec::Type::Map(map_ty) => vec![
-            iceberg_field_def(map_ty.key_field.as_ref()),
-            iceberg_field_def(map_ty.value_field.as_ref()),
-        ],
-        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(_) => vec![],
-    }
 }
 
 #[cfg(test)]
