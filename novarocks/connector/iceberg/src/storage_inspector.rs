@@ -31,6 +31,7 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata,
 };
 
+use crate::commit::mv_refresh_ref::{MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP};
 use crate::commit::{MvProvenanceV1, RefreshTechnique};
 use crate::iceberg::spec::{FormatVersion, TableMetadata, Transform};
 use crate::scan_model::IcebergTableInfo;
@@ -273,19 +274,31 @@ fn refresh_target_observation(
         let Some(snapshot) = table.snapshot_by_id(snapshot_id) else {
             continue;
         };
-        if let Some(provenance) =
-            MvProvenanceV1::from_snapshot_summary(snapshot).map_err(corrupt)?
-        {
-            reserve(context, &mut budget, &provenance.token)?;
-            snapshot_markers.insert(
-                snapshot_id,
-                IcebergStorageRefreshMarker {
-                    refresh_id: provenance.refresh_id,
-                    mv_id: provenance.mv_id,
-                    token: provenance.token,
-                },
-            );
-        }
+        // The refresh marker is three discrete snapshot-summary properties, a
+        // different encoding from the MvProvenanceV1 blob that publication facts
+        // use. A staging snapshot carries the marker before it ever carries full
+        // provenance, so decoding the wrong one silently loses the match.
+        let props = &snapshot.summary().additional_properties;
+        let (Some(refresh_id), Some(mv_id), Some(token)) = (
+            props
+                .get(MV_REFRESH_ID_PROP)
+                .and_then(|value| value.parse::<i64>().ok()),
+            props
+                .get(MV_ID_PROP)
+                .and_then(|value| value.parse::<i64>().ok()),
+            props.get(MV_REFRESH_TOKEN_PROP),
+        ) else {
+            continue;
+        };
+        reserve(context, &mut budget, token)?;
+        snapshot_markers.insert(
+            snapshot_id,
+            IcebergStorageRefreshMarker {
+                refresh_id,
+                mv_id,
+                token: token.clone(),
+            },
+        );
     }
 
     let table_uuid = table.uuid().to_string();

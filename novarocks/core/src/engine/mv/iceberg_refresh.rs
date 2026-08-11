@@ -4476,6 +4476,15 @@ fn recover_one_iceberg_mv_refresh(
                 .ok_or_else(|| format!("mv refresh {} missing target table", refresh.refresh_id))?,
         };
     let (entry, catalog, loaded) = load_iceberg_mv_target(state, &target)?;
+    let binding = crate::mv::refresh::target_binding::load_mv_target_binding(
+        state,
+        &novarocks_catalog::identifier::TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        connector_context,
+    )?;
     reconcile_iceberg_mv_refresh(
         state,
         refresh,
@@ -4483,6 +4492,7 @@ fn recover_one_iceberg_mv_refresh(
         &entry,
         &catalog,
         &loaded.table,
+        &binding,
         connector_context,
     )
 }
@@ -9711,20 +9721,6 @@ fn restore_repartition_default_spec_from_recovery_intent(
 /// [`crate::engine::mv::recovery::classify_staging_branch`]: the storage
 /// table's own parent chain is the source of truth for whether a staging
 /// snapshot was ever published, independent of any SQLite ledger state.
-fn main_ancestor_snapshot_ids(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> Vec<i64> {
-    let metadata = table.metadata();
-    let mut ancestors = Vec::new();
-    let mut cursor = metadata.current_snapshot().map(|s| s.snapshot_id());
-    while let Some(snapshot_id) = cursor {
-        ancestors.push(snapshot_id);
-        cursor = metadata
-            .snapshot_by_id(snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id());
-    }
-    ancestors
-}
 
 /// Converge a single unfinished MV refresh against the MV table's lake
 /// state, using the staging-branch snapshot's lineage — NOT the SQLite
@@ -9769,6 +9765,7 @@ fn reconcile_iceberg_mv_refresh(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     _catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
     table: &novarocks_connector_iceberg::iceberg::table::Table,
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     if matches!(
@@ -9782,17 +9779,19 @@ fn reconcile_iceberg_mv_refresh(
         .staging_branch
         .as_deref()
         .ok_or_else(|| format!("mv refresh {} missing staging branch", refresh.refresh_id))?;
-    let staging_snapshot_id = table
-        .metadata()
-        .refs()
+    // Exact parity with the previous `refs().get(..)` lookup: a staging branch
+    // is never `main`, so no fallback applies.
+    let staging_snapshot_id = binding
+        .observation()
+        .ref_snapshot_ids()
         .get(staging_branch)
-        .map(|r| r.snapshot_id);
+        .copied();
 
     match staging_snapshot_id {
         Some(staging_snapshot_id) => {
-            let main_ancestors = main_ancestor_snapshot_ids(table);
+            let main_ancestors = binding.observation().main_ancestor_snapshot_ids().to_vec();
             let marker_matches =
-                snapshot_id_matches_refresh_marker(table, staging_snapshot_id, &refresh)?;
+                observed_snapshot_matches_refresh_marker(binding, staging_snapshot_id, &refresh);
             match classify_staging_branch(&main_ancestors, staging_snapshot_id, marker_matches) {
                 Ok(StagingDisposition::PublishedCurrent | StagingDisposition::Superseded) => {
                     converge_published_iceberg_mv_staging_branch(
@@ -9827,7 +9826,7 @@ fn reconcile_iceberg_mv_refresh(
             }
         }
         None => converge_iceberg_mv_refresh_without_staging_branch(
-            state, &refresh, target, entry, table,
+            state, &refresh, target, entry, table, binding,
         ),
     }
 }
@@ -9919,11 +9918,12 @@ fn converge_iceberg_mv_refresh_without_staging_branch(
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     table: &novarocks_connector_iceberg::iceberg::table::Table,
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
 ) -> Result<(), String> {
-    let main = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let main = binding.current_snapshot_id();
     let main_carries_refresh = match main {
         Some(main_snapshot_id) => {
-            snapshot_id_matches_refresh_marker(table, main_snapshot_id, refresh)?
+            observed_snapshot_matches_refresh_marker(binding, main_snapshot_id, refresh)
         }
         None => false,
     };
@@ -9942,23 +9942,25 @@ fn converge_iceberg_mv_refresh_without_staging_branch(
     }
 }
 
-fn snapshot_id_matches_refresh_marker(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
+/// Does `snapshot_id` carry this refresh's marker?
+///
+/// The Provider decoded the marker identity into the observation; Core only
+/// compares it against its own ledger entry. A refresh with no recorded marker
+/// never matches, exactly as before.
+fn observed_snapshot_matches_refresh_marker(
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
     snapshot_id: i64,
     refresh: &StoredMvRefresh,
-) -> Result<bool, String> {
-    let Some(marker) = refresh.marker.as_ref() else {
-        return Ok(false);
+) -> bool {
+    let Some(expected) = refresh.marker.as_ref() else {
+        return false;
     };
-    let marker = MvRefreshSnapshotMarker {
-        refresh_id: marker.refresh_id,
-        mv_id: marker.mv_id,
-        token: marker.token.clone(),
+    let Some(observed) = binding.observation().snapshot_marker(snapshot_id) else {
+        return false;
     };
-    let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) else {
-        return Ok(false);
-    };
-    Ok(snapshot_matches_refresh_marker(snapshot, &marker))
+    observed.refresh_id == expected.refresh_id
+        && observed.mv_id == expected.mv_id
+        && observed.token == expected.token
 }
 
 fn recovered_published_snapshot_id(refresh: &StoredMvRefresh) -> Option<i64> {
