@@ -37,3 +37,4 @@ pub mod runtime_filter;
 pub mod sketch_hash;
 pub mod spill;
 pub mod statistics;
+pub mod variant_read;

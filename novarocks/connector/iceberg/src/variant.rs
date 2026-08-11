@@ -12,37 +12,8 @@ use arrow::array::{
     StructArray,
 };
 use arrow::datatypes::DataType;
-use novarocks_types::value::variant::VariantValue;
+use novarocks_types::value::variant::{VariantValue, is_variant_struct_data_type};
 use parquet::variant::{VariantArray, unshred_variant};
-
-fn is_binary_like(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-    )
-}
-
-/// Whether an Arrow type is a supported Parquet VARIANT struct layout.
-pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
-    let DataType::Struct(fields) = data_type else {
-        return false;
-    };
-    if fields.is_empty() {
-        return false;
-    }
-    let mut has_metadata = false;
-    let mut has_value = false;
-    let mut has_typed_value = false;
-    for field in fields {
-        match field.name().as_str() {
-            "metadata" if is_binary_like(field.data_type()) => has_metadata = true,
-            "value" if is_binary_like(field.data_type()) => has_value = true,
-            "typed_value" => has_typed_value = true,
-            _ => return false,
-        }
-    }
-    has_metadata && (has_value || has_typed_value)
-}
 
 fn binary_value_at_any(array: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String> {
     if array.is_null(row) {

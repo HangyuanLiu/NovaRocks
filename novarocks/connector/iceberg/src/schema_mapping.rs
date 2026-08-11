@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+pub use novarocks_types::value::variant::is_variant_struct_data_type;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY;
@@ -426,34 +427,6 @@ pub fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Resul
         }
     }
     Ok(found_unidentified_variant)
-}
-
-pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
-    let DataType::Struct(fields) = data_type else {
-        return false;
-    };
-    if fields.is_empty() {
-        return false;
-    }
-    let mut has_metadata = false;
-    let mut has_value = false;
-    let mut has_typed_value = false;
-    for field in fields {
-        match field.name().as_str() {
-            "metadata" if is_binary_like(field.data_type()) => has_metadata = true,
-            "value" if is_binary_like(field.data_type()) => has_value = true,
-            "typed_value" => has_typed_value = true,
-            _ => return false,
-        }
-    }
-    has_metadata && (has_value || has_typed_value)
-}
-
-fn is_binary_like(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-    )
 }
 
 #[cfg(test)]

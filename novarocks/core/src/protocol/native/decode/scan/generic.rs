@@ -32,15 +32,15 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
-use crate::formats::parquet::{
-    ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
-};
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_execution::exec::variant_read::{
+    ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
+};
 use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::plan;
 use novarocks_types::SlotId;

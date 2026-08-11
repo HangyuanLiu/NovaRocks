@@ -20,9 +20,9 @@ use std::collections::{HashMap, HashSet};
 use arrow::datatypes::{DataType, Field};
 
 use super::common::{column_def_data_type, output_column_data_type};
-use crate::formats::parquet::VariantPathSpec;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_execution::exec::variant_read::VariantPathSpec;
 use novarocks_protocol::{common, plan};
 use novarocks_types::SlotId;
 

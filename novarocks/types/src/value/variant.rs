@@ -1452,6 +1452,40 @@ fn format_fraction_fixed(value: u32, width: usize) -> String {
     format!("{:0width$}", value, width = width)
 }
 
+/// Whether an Arrow type can carry raw variant metadata or value bytes.
+pub fn is_variant_binary_like(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    )
+}
+
+/// Whether an Arrow type is a supported Parquet VARIANT struct layout.
+///
+/// Accepts both the unshredded form (`metadata` + `value`) and the shredded
+/// form (`metadata` + `typed_value`, optionally with `value`). Any other field
+/// name disqualifies the struct.
+pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
+    let DataType::Struct(fields) = data_type else {
+        return false;
+    };
+    if fields.is_empty() {
+        return false;
+    }
+    let mut has_metadata = false;
+    let mut has_value = false;
+    let mut has_typed_value = false;
+    for field in fields {
+        match field.name().as_str() {
+            "metadata" if is_variant_binary_like(field.data_type()) => has_metadata = true,
+            "value" if is_variant_binary_like(field.data_type()) => has_value = true,
+            "typed_value" => has_typed_value = true,
+            _ => return false,
+        }
+    }
+    has_metadata && (has_value || has_typed_value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
