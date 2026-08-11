@@ -735,13 +735,10 @@ deployment_owner = "fe-1"
         cluster_id: &str,
         fault_dir: &Path,
     ) -> Self {
-        let debug = format!(
-            r#"
-[debug]
-query_lifecycle_fault_dir = "{}"
-"#,
-            fault_dir.display()
-        );
+        // Fault injection is armed through NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR;
+        // the process config carries no fault-injection key.
+        let _ = fault_dir;
+        let debug = String::new();
         let fe_extra = format!(
             r#"
 [metadata]

@@ -1353,17 +1353,14 @@ fn claim_terminal_ack_drop(
 ) -> Result<bool, String> {
     use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, claim_matching_fault};
 
-    let Some(root) = novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(false);
     };
     let backend_index = session.target.backend_idx();
     let backend_id = u64::try_from(backend_index)
         .map_err(|_| "backend index does not fit terminal ACK fault identity".to_string())?;
     let Some(scope) = claim_matching_fault(
-        root,
+        &root,
         QueryLifecycleFaultKind::TerminalAckDrop,
         snapshot.execution_id(),
         backend_index,
@@ -1394,17 +1391,14 @@ fn claim_terminal_snapshot_conflict(
 ) -> Result<Option<novarocks::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
     use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, claim_matching_fault};
 
-    let Some(root) = novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
     let backend_index = session.target.backend_idx();
     let backend_id = u64::try_from(backend_index)
         .map_err(|_| "backend index does not fit terminal conflict fault identity".to_string())?;
     claim_matching_fault(
-        root,
+        &root,
         QueryLifecycleFaultKind::TerminalSnapshotConflict,
         snapshot.execution_id(),
         backend_index,

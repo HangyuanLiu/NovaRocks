@@ -70,11 +70,10 @@ pub fn claim(root: &Path, kind: CleanupFaultKind) -> Result<bool, String> {
 }
 
 pub fn claim_configured(kind: CleanupFaultKind) -> Result<bool, String> {
-    // Read the runner-owned process environment rather than relying on the
-    // application-config singleton.  FE startup validates that this value and
-    // `debug.cleanup_fault_dir` are identical, while this keeps the hook
-    // usable in the provider's synchronous callback without a second config
-    // initialization path.
+    // Read the runner-owned process environment rather than the
+    // application-config singleton: this hook sits in the provider's
+    // synchronous callback and must not trigger a second config
+    // initialization. Release builds reject the variable at startup.
     let Some(root) = std::env::var_os("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR") else {
         return Ok(false);
     };

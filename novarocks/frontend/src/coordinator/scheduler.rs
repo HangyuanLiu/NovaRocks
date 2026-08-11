@@ -281,10 +281,7 @@ fn bind_query_lifecycle_fault_scopes(
 ) -> Result<(), DistributedQueryError> {
     use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, bind_armed_fault};
 
-    let Some(root) = novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     for &(backend_index, _) in &backends.entries {
@@ -312,7 +309,7 @@ fn bind_query_lifecycle_fault_scopes(
             QueryLifecycleFaultKind::TerminalSnapshotConflict,
         ] {
             if let Some(scope) = bind_armed_fault(
-                root,
+                &root,
                 kind,
                 execution_id,
                 backend_index,
@@ -351,10 +348,7 @@ fn query_control_fragment_backend_limit(
     execution_id: QueryExecutionId,
     live_backend_count: usize,
 ) -> Result<Option<usize>, DistributedQueryError> {
-    let Some(root) = novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
     let path = root.join("fragment-backend-limit.trigger");

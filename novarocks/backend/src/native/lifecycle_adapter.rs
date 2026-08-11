@@ -489,7 +489,7 @@ fn claim_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = novarocks::common::config::sql_test_query_lifecycle_fault_dir() else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
     let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
@@ -520,7 +520,7 @@ fn claim_backend_fault(
 /// write and the parent's kill, which does not prove loss after admission.
 #[cfg(debug_assertions)]
 fn wait_for_runner_owned_restart(scope: &QueryLifecycleFaultScope) {
-    let Some(root) = novarocks::common::config::sql_test_query_lifecycle_fault_dir() else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return;
     };
     let release = trigger_path(
@@ -552,7 +552,7 @@ fn observe_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = novarocks::common::config::sql_test_query_lifecycle_fault_dir() else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
     let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")

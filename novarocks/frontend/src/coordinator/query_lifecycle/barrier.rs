@@ -563,10 +563,7 @@ pub(super) fn record_lifecycle_phase_marker_for_execution(
     phase: &str,
     execution_id: QueryExecutionId,
 ) -> Result<(), DistributedQueryError> {
-    let Some(root) = novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     for (kind, action) in [("kill-query", "kill_query"), ("fe-crash", "kill_fe")] {
@@ -631,11 +628,7 @@ fn record_stage_barrier_marker(batches: &[StageBatch]) -> Result<(), Distributed
     let Some(execution_id) = batches.first().map(|batch| batch.request().execution_id()) else {
         return Ok(());
     };
-    if novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-        .is_some()
-    {
+    if novarocks::common::query_lifecycle_fault::configured_root().is_some() {
         eprintln!(
             "NOVAROCKS_QUERY_STAGE_BARRIER execution_id={}:{}:{} participants={}",
             execution_id.query_id().high(),
@@ -935,10 +928,7 @@ fn attach_one(
 
 #[cfg(debug_assertions)]
 fn record_control_ready_marker(participant: &MaterializedParticipant) -> Result<(), String> {
-    let Some(root) = novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     let execution_id = participant.request.manifest().execution_id();

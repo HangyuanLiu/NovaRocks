@@ -103,14 +103,14 @@ fn runner_stage_prepare_failure(
     Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
     NativeFragmentIngressError,
 > {
-    let Some(root) = app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
-    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(root, available_fragments)
-        .map_err(NativeFragmentIngressError::new)
+    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(
+        &root,
+        available_fragments,
+    )
+    .map_err(NativeFragmentIngressError::new)
 }
 
 #[cfg(not(debug_assertions))]
