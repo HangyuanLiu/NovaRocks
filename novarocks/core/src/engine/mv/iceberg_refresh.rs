@@ -1587,14 +1587,36 @@ impl MvEngine for StandaloneMvEngine {
         };
         #[cfg(test)]
         run_after_create_target_hook();
-        let loaded_target = crate::connector::metadata_load_connector_table_with_planning_lease(
-            &planning_lease,
-            self.connector_context.clone(),
-            &table.namespace,
-            &table.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )
-        .map_err(engine_target_error)?;
+        let loaded_target =
+            match crate::connector::metadata_load_connector_table_with_planning_lease(
+                &planning_lease,
+                self.connector_context.clone(),
+                &table.namespace,
+                &table.table,
+                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            ) {
+                Ok(loaded_target) => loaded_target,
+                Err(error) => {
+                    let cleanup = require_known_committed_target_mutation(
+                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                        &mutation_lease,
+                        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+                        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                            table,
+                            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                            data_disposition:
+                                novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+                        },
+                        self.connector_context.clone(),
+                    ),
+                    "materialized view target metadata-load cleanup",
+                )
+                .map(|_| ());
+                    return Err(engine_target_error(format!(
+                        "{error}; target cleanup={cleanup:?}"
+                    )));
+                }
+            };
         let observation = match self.storage_observer.observe_created_target(
             &planning_lease,
             &loaded_target,
@@ -21285,6 +21307,9 @@ mod tests {
         );
         StandaloneState {
             query_execution,
+            mv_storage_observation: Arc::new(
+                crate::engine::mv::schema_validation_adapter::TestIcebergMvStorageObservationAdapter::default(),
+            ),
             ..defaults
         }
     }

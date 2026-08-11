@@ -18,7 +18,7 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
@@ -26,6 +26,7 @@ use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, arm_path, trigger_path};
 use novarocks_frontend::{FrontendServerConfig, run_frontend_server_until_shutdown};
+use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use tempfile::{NamedTempFile, TempDir};
 
 struct ReservedPort {
@@ -401,6 +402,12 @@ query_lifecycle_fault_dir = "{}"
         .enable_all()
         .build()
         .expect("build frontend runtime");
+    let connector_file_planning_resources = Some(FsAccessResources::new(
+        None,
+        FsAccessResolver::new(),
+        Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+    ));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let _ = fe_mysql.release();
     let _ = fe_http.release();
@@ -411,6 +418,7 @@ query_lifecycle_fault_dir = "{}"
             config_path: Some(config_file.path().to_path_buf()),
             port_override: None,
             connector_control_factories: Vec::new(),
+            connector_file_planning_resources,
             mv_storage_observation: Arc::new(
                 novarocks::mv::storage_observation::UnavailableMvStorageObservationPort,
             ),

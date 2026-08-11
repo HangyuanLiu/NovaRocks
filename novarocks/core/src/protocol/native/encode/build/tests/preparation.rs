@@ -110,7 +110,7 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
             .expect("delta opaque connector read")
             .splits
             .len(),
-        1
+        0
     );
 }
 

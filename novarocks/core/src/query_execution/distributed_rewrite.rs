@@ -651,7 +651,8 @@ mod tests {
         ConnectorDistributedRewritePlanningRequest, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
-        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteBaseVersion,
+        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivationIntent,
+        ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteBaseVersion,
         ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
         ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
         ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
@@ -786,10 +787,28 @@ mod tests {
         }
         fn activate_rewrite(
             &self,
-            _plan: &ConnectorDistributedRewritePlan,
-            _context: ConnectorRequestContext,
+            plan: &ConnectorDistributedRewritePlan,
+            context: ConnectorRequestContext,
         ) -> Result<novarocks_spi::connector::ConnectorWriteActivation, ConnectorError> {
-            unreachable!()
+            let source = plan.cohorts().first().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "test rewrite activation requires a cohort",
+                )
+            })?;
+            novarocks_spi::connector::ConnectorWriteActivation::try_new(
+                self.key.clone(),
+                &ConnectorWriteActivationRequest {
+                    operation_id: plan.operation_id(),
+                    source: ConnectorWriteActivationSource::Prepared(source.preparation().clone()),
+                    intent: ConnectorWriteActivationIntent::Ordinary,
+                    context,
+                },
+                plan.cohorts()
+                    .iter()
+                    .map(|cohort| (cohort.cohort_id(), cohort.preparation().clone()))
+                    .collect(),
+            )
         }
         fn checkpoint_attempt(
             &self,

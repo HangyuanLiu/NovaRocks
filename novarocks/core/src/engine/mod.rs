@@ -353,6 +353,10 @@ pub(crate) struct StandaloneState {
     /// attachment facts here and never constructs a concrete generation.
     pub(crate) connector_control_factory_resolver:
         Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
+    /// Process-local filesystem resources supplied by the composition root.
+    /// During the Phase 1 checkpoint the legacy Core Iceberg control owner
+    /// consumes them without discovering a runtime or credentials globally.
+    pub(crate) connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
     /// Process-local cache of immutable evidence returned by connector
     /// statistics readers. Query compilation still consumes only the pin
     /// captured during table resolution.
@@ -406,6 +410,17 @@ pub(crate) struct StandaloneState {
 }
 
 #[cfg(test)]
+fn test_connector_file_planning_resources() -> Option<novarocks_fs::FsAccessResources> {
+    let runtime = crate::runtime::global_async_runtime::data_runtime_handle().ok()?;
+    Some(novarocks_fs::FsAccessResources::new(
+        None,
+        novarocks_fs::FsAccessResolver::new(),
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime)),
+    ))
+}
+
+#[cfg(test)]
 impl Default for StandaloneState {
     fn default() -> Self {
         Self {
@@ -420,6 +435,7 @@ impl Default for StandaloneState {
             ),
             connector_control: Arc::new(TestConnectorControlRegistry::default()),
             connector_control_factory_resolver: Arc::new(TestConnectorControlRegistry::default()),
+            connector_file_planning_resources: test_connector_file_planning_resources(),
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -1257,6 +1273,9 @@ pub struct StandaloneOpenServices {
     /// durable attachment restore.
     pub connector_control_factory_resolver:
         std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
+    /// Connector-neutral FE filesystem resources. The legacy Core Iceberg
+    /// control owner consumes this only until the follow-up factory cut.
+    pub connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
     /// Bound by the server composition root before engine open. Zero means no
     /// local fragment endpoint is available to this engine instance.
     pub exchange_port: u16,
@@ -1303,6 +1322,16 @@ impl StandaloneOpenServices {
             mv_background_engine_sink: None,
             connector_control,
             connector_control_factory_resolver,
+            connector_file_planning_resources: {
+                #[cfg(test)]
+                {
+                    test_connector_file_planning_resources()
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            },
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -1323,6 +1352,14 @@ impl StandaloneOpenServices {
         observation: std::sync::Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
     ) -> Self {
         self.mv_storage_observation = observation;
+        self
+    }
+
+    pub fn with_connector_file_planning_resources(
+        mut self,
+        resources: Option<novarocks_fs::FsAccessResources>,
+    ) -> Self {
+        self.connector_file_planning_resources = resources;
         self
     }
 
@@ -1458,6 +1495,7 @@ impl StandaloneNovaRocks {
             mv_background_engine_sink,
             connector_control,
             connector_control_factory_resolver,
+            connector_file_planning_resources,
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -1489,6 +1527,7 @@ impl StandaloneNovaRocks {
             statistics_application,
             connector_control,
             connector_control_factory_resolver,
+            connector_file_planning_resources,
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -3796,9 +3835,14 @@ fn register_iceberg_control_binding(
 ) -> Result<(), String> {
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let binding = crate::connector::iceberg::provider::IcebergControlProvider::new_control(
+    let planning_binding = state
+        .connector_file_planning_resources
+        .clone()
+        .map(novarocks_connector_iceberg::access_binding::IcebergReadBinding::from_resources);
+    let binding = crate::connector::iceberg::provider::IcebergControlProvider::new_control_with_planning_binding(
         instance_id,
         Arc::clone(&state.iceberg_catalogs),
+        planning_binding,
     )
     .map_err(|error| format!("create Iceberg connector control binding: {error}"))?;
     state

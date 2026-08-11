@@ -669,6 +669,27 @@ pub fn discover_mv_lake_packages(
                 if let Some(package) =
                     observer.observe_lake_package(&exact_lease, &loaded, context.clone())?
                 {
+                    if package.table != table {
+                        return corrupt(format!(
+                            "MV lake observer returned package metadata for `{}`.`{}`.`{}` while discovering `{}`.`{}`.`{}`",
+                            package.table.instance_id.as_str(),
+                            package.table.namespace,
+                            package.table.table,
+                            table.instance_id.as_str(),
+                            table.namespace,
+                            table.table,
+                        ));
+                    }
+                    let expected_package_id = format!("{}.{}", table.namespace, table.table);
+                    if package.descriptor.package_id != expected_package_id {
+                        return corrupt(format!(
+                            "descriptor package id mismatch for `{}`.`{}`.`{}`: expected `{expected_package_id}`, found `{}`",
+                            table.instance_id.as_str(),
+                            table.namespace,
+                            table.table,
+                            package.descriptor.package_id,
+                        ));
+                    }
                     packages.push(package);
                 }
             }

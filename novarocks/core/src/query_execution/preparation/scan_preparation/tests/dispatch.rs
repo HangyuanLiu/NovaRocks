@@ -76,8 +76,9 @@ impl ScanBindingResolver for JoinRefreshDeltaResolver {
             return Err("join refresh fixture resolver received a non-delta scan".to_string());
         }
         Ok(Some(ResolvedScanExecution::SealedConnectorScan(
-            crate::query_execution::preparation::scan::fixture_sealed_change_scan(
+            crate::query_execution::preparation::scan::fixture_sealed_change_scan_for_table(
                 &source.table.catalog,
+                &source.table.table,
                 match source.kind {
                     crate::sql::planner::table::SqlScanKind::Delta {
                         from_snapshot_id, ..

@@ -1322,7 +1322,7 @@ mod tests {
             .seal()
             .expect_err("router edge without exact route must fail");
         assert!(
-            err.contains("no exact matching router branch route"),
+            err.contains("no exact matching opaque router route"),
             "{err}"
         );
 

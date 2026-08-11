@@ -20,6 +20,7 @@ chrono = "0.4"
 futures = "0.3"
 hex = "0.4"
 novarocks = { path = "../core" }
+novarocks-fs = { path = "../fs" }
 novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
 novarocks-protocol = { path = "../protocol" }

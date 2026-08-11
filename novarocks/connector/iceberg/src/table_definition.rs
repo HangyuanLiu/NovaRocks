@@ -18,13 +18,14 @@
 //! table-definition facts. Core renders SQL from these facts and never reads
 //! an Iceberg table or type.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorRequestContext, ConnectorTableDefinitionColumn,
-    ConnectorTableDefinitionFacts, ConnectorTableDefinitionStructField,
-    ConnectorTableDefinitionType, ConnectorTablePlanningFacts,
+    ConnectorError, ConnectorRequestContext, ConnectorTableColumnVisibility,
+    ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
+    ConnectorTableDefinitionStructField, ConnectorTableDefinitionType, ConnectorTablePlanningFacts,
 };
 
 use crate::iceberg::spec::{PrimitiveType, Schema, Type};
@@ -36,11 +37,24 @@ pub fn table_definition_facts(
     table_comment: Option<&str>,
     context: &ConnectorRequestContext,
 ) -> Result<ConnectorTableDefinitionFacts, ConnectorError> {
+    let sql_ordinals = (!planning_facts.column_facts().is_empty()).then(|| {
+        planning_facts
+            .column_facts()
+            .iter()
+            .filter(|fact| fact.visibility() == ConnectorTableColumnVisibility::Sql)
+            .map(|fact| fact.field_ordinal())
+            .collect::<BTreeSet<_>>()
+    });
     let columns = iceberg_schema
         .as_struct()
         .fields()
         .iter()
         .enumerate()
+        .filter(|(ordinal, _)| {
+            sql_ordinals.as_ref().is_none_or(|ordinals| {
+                u32::try_from(*ordinal).is_ok_and(|ordinal| ordinals.contains(&ordinal))
+            })
+        })
         .map(|(ordinal, field)| {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 ConnectorError::new(
@@ -120,9 +134,36 @@ fn definition_type(data_type: &Type) -> ConnectorTableDefinitionType {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
+        ConnectorTableColumnSemanticKind, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    };
+
     use crate::iceberg::spec::{NestedField, StructType};
 
     use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(10),
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("context")
+    }
 
     #[test]
     fn projects_fixed_nested_uuid_and_timestamp_types() {
@@ -178,5 +219,74 @@ mod tests {
                 ),
             ])
         );
+    }
+
+    #[test]
+    fn definition_facts_exclude_hidden_system_columns() {
+        let iceberg_schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::required(
+                    3,
+                    "_row_id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("schema");
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("name", DataType::Utf8, true),
+            ArrowField::new("_row_id", DataType::Int64, false),
+        ]));
+        let planning_facts = ConnectorTablePlanningFacts::try_new(
+            &arrow_schema,
+            vec![
+                ConnectorTableColumnPlanningFact::new(
+                    0,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    1,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    2,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+            &context(),
+        )
+        .expect("planning facts");
+
+        let facts = table_definition_facts(
+            &iceberg_schema,
+            &arrow_schema,
+            &planning_facts,
+            None,
+            &context(),
+        )
+        .expect("definition facts");
+
+        assert_eq!(facts.columns().len(), 2);
+        assert_eq!(facts.columns()[0].field_ordinal(), 0);
+        assert_eq!(facts.columns()[1].field_ordinal(), 1);
     }
 }

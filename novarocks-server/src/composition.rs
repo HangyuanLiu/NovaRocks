@@ -34,9 +34,8 @@ use novarocks::mv::storage_observation::{
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
-use novarocks_connector_iceberg::resources::{IcebergControlResources, IcebergExecutionResources};
+use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
@@ -288,12 +287,12 @@ pub fn compose_backend_execution_installers(
     Ok(installers)
 }
 
-pub fn compose_frontend_control_factories(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
-    let factory = IcebergControlFactory::new(compose_iceberg_control_resources(config, runtime)?);
-    Ok(vec![std::sync::Arc::new(factory)])
+pub fn compose_frontend_control_factories() -> Vec<std::sync::Arc<dyn ConnectorControlFactory>> {
+    // SPI-5EF Phase 1 keeps the legacy Core Iceberg control binding as the
+    // sole production FE authority. The provider factory remains available
+    // for provider-local conformance tests and will be installed only by the
+    // follow-up atomic factory/owner cut.
+    Vec::new()
 }
 
 pub fn compose_iceberg_execution_resources(
@@ -301,40 +300,27 @@ pub fn compose_iceberg_execution_resources(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<IcebergExecutionResources> {
     Ok(IcebergExecutionResources::new(
-        compose_iceberg_read_binding(config, runtime.clone())?,
+        IcebergReadBinding::from_resources(compose_connector_file_planning_resources(
+            config,
+            runtime.clone(),
+        )?),
         runtime,
     ))
 }
 
-/// Compose the frontend-only resources for one Iceberg control factory.
-///
-/// This deliberately creates a distinct resource bundle from BE execution
-/// composition. All-in-one may share the top-level Tokio handle, but its FE
-/// catalog client and BE installer must never share a provider instance.
-pub fn compose_iceberg_control_resources(
+pub fn compose_connector_file_planning_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
-) -> anyhow::Result<IcebergControlResources> {
-    Ok(IcebergControlResources::new(
-        compose_iceberg_read_binding(config, runtime.clone())?,
-        runtime,
-    ))
-}
-
-fn compose_iceberg_read_binding(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-) -> anyhow::Result<IcebergReadBinding> {
+) -> anyhow::Result<FsAccessResources> {
     let object_store = config.connector.object_store_config().map_err(|error| {
         anyhow::anyhow!("resolve connector startup object-store binding: {error}")
     })?;
-    let resources = FsAccessResources::new(
+    Ok(FsAccessResources::new(
         object_store,
         FsAccessResolver::new(),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
         std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
-    );
-    Ok(IcebergReadBinding::from_resources(resources))
+    ))
 }
 
 pub fn state_store_host_config(
@@ -383,12 +369,17 @@ async fn run_all_in_one_until<F>(
 where
     F: Future<Output = Result<(), String>> + Send,
 {
-    let connector_control_factories = compose_frontend_control_factories(&config, runtime.clone())?;
+    let connector_control_factories = compose_frontend_control_factories();
+    let connector_file_planning_resources = Some(compose_connector_file_planning_resources(
+        &config,
+        runtime.clone(),
+    )?);
     let frontend_config = FrontendServerConfig {
         config: config.clone(),
         config_path: config_path.clone(),
         port_override,
         connector_control_factories,
+        connector_file_planning_resources,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_host_config: state_store_host_config(&config),
     };
@@ -417,6 +408,7 @@ where
     let mut services = novarocks_frontend::standalone_open_services_for_server(
         &frontend,
         std::sync::Arc::clone(&frontend_config.mv_storage_observation),
+        frontend_config.connector_file_planning_resources.clone(),
     );
     services
         .backend_topology
@@ -574,8 +566,7 @@ mod tests {
     fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = novarocks::common::app_config::NovaRocksConfig::default();
-        let factories = compose_frontend_control_factories(&config, runtime.handle().clone())
-            .expect("frontend factories");
+        let factories = compose_frontend_control_factories();
         let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
             .expect("backend installers");
         let iceberg = novarocks_spi::connector::ConnectorProviderId::parse(
@@ -583,8 +574,10 @@ mod tests {
         )
         .expect("provider ID");
 
-        assert_eq!(factories.len(), 1);
-        assert_eq!(factories[0].provider_id(), &iceberg);
+        assert!(
+            factories.is_empty(),
+            "Phase 1 must keep legacy Core control as the sole FE authority"
+        );
         assert_eq!(
             installers
                 .iter()

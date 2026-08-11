@@ -71,41 +71,26 @@ pub(crate) fn fixture_sealed_change_scan(
     from_snapshot_id: i64,
     to_snapshot_id: i64,
 ) -> ConnectorScan {
-    use std::sync::Arc;
-
-    use bytes::Bytes;
-    use novarocks_spi::connector::{
-        ConnectorChangeWindow, ConnectorChangeWindowAdmission,
-        ConnectorChangeWindowPartitionImpact, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorScanHandle,
-    };
-
-    let instance_id = ConnectorInstanceId::parse(instance_id)
-        .expect("fixture connector instance ID must be valid");
-    let context = crate::connector::test_request_context();
-    let admission = if from_snapshot_id == to_snapshot_id {
-        ConnectorChangeWindowAdmission::MetadataOnly
-    } else {
-        ConnectorChangeWindowAdmission::Incremental {
-            has_inserts: true,
-            has_deletes: false,
-            partition_impact: ConnectorChangeWindowPartitionImpact::Unavailable,
-        }
-    };
-    ConnectorScan::try_new_change_window(
-        ConnectorExecutionBindingKey {
-            instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-        },
-        ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id),
-        admission,
-        ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"core-change-fixture"))
-            .expect("fixture scan handle"),
-        Arc::new(arrow::datatypes::Schema::empty()),
-        Vec::new(),
-        &context,
+    crate::connector::iceberg::provider::fixture_change_window_scan(
+        instance_id,
+        from_snapshot_id,
+        to_snapshot_id,
     )
-    .expect("fixture change-window scan")
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_sealed_change_scan_for_table(
+    instance_id: &str,
+    table: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> ConnectorScan {
+    crate::connector::iceberg::provider::fixture_change_window_scan_for_table(
+        instance_id,
+        table,
+        from_snapshot_id,
+        to_snapshot_id,
+    )
 }
 
 /// Provider-neutral result of planning an executable connector read.  Its

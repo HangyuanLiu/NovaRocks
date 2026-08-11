@@ -10416,6 +10416,16 @@ pub(crate) fn fixture_change_window_scan(
     from_snapshot_id: i64,
     to_snapshot_id: i64,
 ) -> novarocks_spi::connector::ConnectorScan {
+    fixture_change_window_scan_for_table(catalog, "orders", from_snapshot_id, to_snapshot_id)
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_change_window_scan_for_table(
+    catalog: &str,
+    table: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> novarocks_spi::connector::ConnectorScan {
     let lease = fixture_planning_lease(catalog);
     let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture connector instance ID");
     let context = crate::connector::test_request_context();
@@ -10426,19 +10436,20 @@ pub(crate) fn fixture_change_window_scan(
             table: novarocks_spi::connector::ConnectorTableIdentity {
                 instance_id,
                 namespace: Arc::from("db"),
-                table: Arc::from("orders"),
+                table: Arc::from(table),
             },
             resolution: ConnectorTableResolution::StrictBaseTable,
             context: context.clone(),
         })
         .expect("fixture table metadata");
+    let projection = (0..metadata.schema.fields().len()).collect();
     lease
         .binding()
         .planning()
         .begin_scan(
             &metadata.table,
             ConnectorBeginScanRequest {
-                projection: Vec::new(),
+                projection,
                 static_predicates: Vec::new(),
                 selection: ConnectorScanSelection::ChangeWindow(
                     novarocks_spi::connector::ConnectorChangeWindow::new(
