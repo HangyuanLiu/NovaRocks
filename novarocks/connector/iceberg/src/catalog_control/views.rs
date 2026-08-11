@@ -210,6 +210,11 @@ pub(crate) fn view_exists(
     namespace: &str,
     view: &str,
 ) -> Result<bool, String> {
+    // Same reasoning as `list_views`: a catalog that cannot create views holds
+    // none, so existence is answerable without a view catalog.
+    if runtime.rest_catalog().is_none() {
+        return Ok(false);
+    }
     ensure_rest(runtime)?;
     let (_, ident) = view_ident(namespace, view)?;
     let catalog = runtime.catalog().clone();
@@ -224,6 +229,14 @@ pub(crate) fn list_views(
     runtime: &IcebergControlRuntime,
     namespace: &str,
 ) -> Result<Vec<String>, String> {
+    // A catalog that cannot create views cannot contain any, so enumerating
+    // them answers "none" rather than failing. Callers that merely need to know
+    // whether a namespace holds views -- DROP DATABASE ... FORCE is the one
+    // that matters -- must not be turned into a hard error by a catalog kind
+    // they never asked about. Mutating view operations still fail loudly.
+    if runtime.rest_catalog().is_none() {
+        return Ok(Vec::new());
+    }
     ensure_rest(runtime)?;
     let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
     let catalog = runtime.catalog().clone();

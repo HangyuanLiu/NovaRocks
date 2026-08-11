@@ -17,9 +17,3 @@
 pub mod orc;
 #[path = "parquet_adapter.rs"]
 pub mod parquet;
-
-#[derive(Clone, Debug)]
-pub enum FileFormatConfig {
-    Parquet(parquet::ParquetScanConfig),
-    Orc(orc::OrcScanConfig),
-}

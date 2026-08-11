@@ -416,6 +416,9 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
 
+// Every argument is a field of the digest this function seals; grouping them
+// into a struct would add a type that exists only to be destructured here.
+#[allow(clippy::too_many_arguments)]
 fn descriptor_digest(
     key: &ConnectorExecutionBindingKey,
     table: &ConnectorTableIdentity,
@@ -470,6 +473,8 @@ fn descriptor_digest(
     h.finalize().into()
 }
 
+// Same reasoning as `descriptor_digest`.
+#[allow(clippy::too_many_arguments)]
 fn observation_digest(
     disposition: ConnectorStagedPublicationDisposition,
     version: Option<&ConnectorCommittedVersion>,

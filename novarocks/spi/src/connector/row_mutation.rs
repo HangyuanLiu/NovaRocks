@@ -609,6 +609,10 @@ impl ConnectorRowMutationPreparationRequest {
     }
 }
 
+// Boxing the prepared variant would only move the cost behind a pointer on a
+// control-plane value that is constructed once per row-mutation admission, and
+// it would change a frozen SPI shape that providers and Core both match on.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ConnectorRowMutationPreparationOutcome {
     Prepared(ConnectorRowMutationPreparation),
@@ -838,7 +842,7 @@ impl ConnectorRowMutationExecutionPlan {
             ConnectorRowMutationExecutionPlanBody::Direct { routes }
             | ConnectorRowMutationExecutionPlanBody::CopyOnWrite { routes, .. } => routes,
         };
-        validate_routes(&routes)?;
+        validate_routes(routes)?;
         if routes.iter().any(|route| {
             route.preparation().owner() != preparation.owner()
                 || route.preparation().table() != preparation.table()
@@ -1011,6 +1015,10 @@ fn digest_owner(hasher: &mut Sha256, owner: &ConnectorExecutionBindingKey) {
     digest_bytes(hasher, owner.instance_id.as_str().as_bytes());
     hasher.update(owner.incarnation.to_bytes());
 }
+// Every argument is a distinct field of the digest this function seals. Folding
+// them into a struct would add a type whose only purpose is to be destructured
+// again here, and would let a caller build a partially-populated digest input.
+#[allow(clippy::too_many_arguments)]
 fn match_digest(
     owner: &ConnectorExecutionBindingKey,
     table: &ConnectorTableHandle,
@@ -1102,6 +1110,9 @@ fn execution_plan_digest(
     }
     hasher.finalize().into()
 }
+// Same reasoning as `match_digest`: these are the sealed digest's fields, not a
+// parameter list that wants grouping.
+#[allow(clippy::too_many_arguments)]
 fn preparation_digest(
     owner: &ConnectorExecutionBindingKey,
     operation: ConnectorWriteOperationId,

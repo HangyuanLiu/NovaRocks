@@ -201,7 +201,8 @@ mod tests {
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    use crate::formats::parquet::{MinMaxPredicate, MinMaxPredicateValue};
+    use crate::formats::parquet::MinMaxPredicate;
+    use novarocks_execution::exec::min_max_predicate::MinMaxPredicateValue;
     use novarocks_types::SlotId;
 
     use super::*;
