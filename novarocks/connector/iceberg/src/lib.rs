@@ -32,6 +32,7 @@ pub mod catalog_cache;
 pub mod catalog_config;
 pub mod catalog_control;
 pub mod catalog_runtime;
+pub mod change_planning;
 pub mod commit;
 pub mod control_factory;
 pub mod control_provider;

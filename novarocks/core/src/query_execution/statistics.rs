@@ -510,7 +510,7 @@ fn admit_statistics_scan_binding(
                     mv_target_read: None,
                     write_target_admission: None,
                     frozen_snapshot_materializations: BTreeMap::new(),
-                    delta_runtime_plans: BTreeMap::new(),
+                    admitted_change_scans: BTreeMap::new(),
                 })
             },
         )

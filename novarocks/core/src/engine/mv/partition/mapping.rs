@@ -18,11 +18,139 @@
 #[cfg(test)]
 use crate::sql::planner::vocabulary::ApplyKeySource;
 
-use crate::connector::iceberg::changes::{ChangePartitionFieldValue, ChangePartitionValue};
 use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 use crate::mv::persistence::schema::{
     ExpressionKind, MvPartitionTransformContract, MvSchemaContract,
 };
+use novarocks_connector_iceberg::delta::{ChangePartitionFieldValue, ChangePartitionValue};
+
+pub(crate) fn map_connector_partition_to_mv_key(
+    contract: &MvSchemaContract,
+    observation: &crate::mv::storage_observation::MvSchemaValidationObservation,
+    connector_partition: &novarocks_spi::connector::ConnectorChangePartition,
+) -> Result<Option<MvPartitionKey>, String> {
+    let Some(partition) = &contract.target.partition else {
+        return Ok(None);
+    };
+    let base_contract = std::iter::once(&contract.base)
+        .chain(contract.bases.iter())
+        .find(|base| base.table_uuid == observation.table_uuid())
+        .ok_or_else(|| {
+            format!(
+                "MV partition mapping has no stable base contract for observed table UUID {}",
+                observation.table_uuid()
+            )
+        })?;
+
+    let mut mapped_fields = Vec::with_capacity(partition.fields.len());
+    for partition_field in &partition.fields {
+        let output_index = contract
+            .target
+            .visible_columns
+            .iter()
+            .position(|column| column.target_field_id == partition_field.source_target_field_id)
+            .ok_or_else(|| {
+                format!(
+                    "MV partition field {} references missing target field {}",
+                    partition_field.partition_field_name, partition_field.source_target_field_id
+                )
+            })?;
+        let output_lineage = contract.output.columns.get(output_index).ok_or_else(|| {
+            format!(
+                "MV partition field {} requires row-evaluation fallback",
+                partition_field.partition_field_name
+            )
+        })?;
+        if output_lineage.expression.kind != ExpressionKind::Column
+            || output_lineage.expression.referenced_base_field_ids.len() != 1
+        {
+            return Err(format!(
+                "MV partition field {} requires row-evaluation fallback",
+                partition_field.partition_field_name
+            ));
+        }
+        let stable_field_id = output_lineage.expression.referenced_base_field_ids[0];
+        if !base_contract
+            .schema_at_create
+            .fields
+            .iter()
+            .any(|field| field.field_id == stable_field_id)
+        {
+            return Err(format!(
+                "MV partition field {} references unknown stable base field {}",
+                partition_field.partition_field_name, stable_field_id
+            ));
+        }
+        let observed_field = observation
+            .fields()
+            .iter()
+            .find(|field| field.field_id() == stable_field_id)
+            .ok_or_else(|| {
+                format!(
+                    "MV partition field {} cannot resolve stable base field {} in the exact schema observation",
+                    partition_field.partition_field_name, stable_field_id
+                )
+            })?;
+        let connector_field = connector_partition
+            .fields()
+            .iter()
+            .find(|field| field.source_column().eq_ignore_ascii_case(observed_field.name()))
+            .ok_or_else(|| {
+                format!(
+                    "MV partition field {} has no connector partition fact for exact source column {}",
+                    partition_field.partition_field_name,
+                    observed_field.name()
+                )
+            })?;
+        if !connector_transform_matches_contract(
+            connector_field.transform(),
+            &partition_field.transform,
+        ) {
+            return Err(format!(
+                "MV partition field {} connector transform does not match its persisted contract",
+                partition_field.partition_field_name
+            ));
+        }
+        let value = match connector_field.value() {
+            novarocks_spi::connector::ConnectorChangePartitionValue::Null => MvPartitionValue::Null,
+            novarocks_spi::connector::ConnectorChangePartitionValue::String(value) => {
+                MvPartitionValue::String(value.to_string())
+            }
+        };
+        mapped_fields.push(MvPartitionKeyField::new(
+            partition_field.partition_field_name.clone(),
+            value,
+        ));
+    }
+
+    Ok(Some(MvPartitionKey::new(
+        partition.target_spec_id,
+        mapped_fields,
+    )))
+}
+
+fn connector_transform_matches_contract(
+    connector: novarocks_spi::connector::ConnectorChangePartitionTransform,
+    contract: &MvPartitionTransformContract,
+) -> bool {
+    use novarocks_spi::connector::ConnectorChangePartitionTransform as Connector;
+
+    match (connector, contract) {
+        (Connector::Identity, MvPartitionTransformContract::Identity)
+        | (Connector::Year, MvPartitionTransformContract::Year)
+        | (Connector::Month, MvPartitionTransformContract::Month)
+        | (Connector::Day, MvPartitionTransformContract::Day)
+        | (Connector::Hour, MvPartitionTransformContract::Hour) => true,
+        (Connector::Bucket { buckets }, MvPartitionTransformContract::Bucket { num_buckets }) => {
+            buckets.get() == *num_buckets
+        }
+        (
+            Connector::Truncate { width },
+            MvPartitionTransformContract::Truncate { width: expected },
+        ) => width.get() == *expected,
+        _ => false,
+    }
+}
 
 pub(crate) fn map_file_partition_to_mv_key(
     contract: &MvSchemaContract,
@@ -146,7 +274,7 @@ pub(crate) fn change_partition_value_to_mv_value(
 }
 
 /// Maps a contract transform to the manifest text produced by
-/// `crate::connector::iceberg::changes::change_partition_transform_name`,
+/// `novarocks_connector_iceberg::delta::change_partition_transform_name`,
 /// which uses `{:?}` (Rust Debug) on `novarocks_connector_iceberg::iceberg::spec::Transform` and lowercases
 /// the result. This gives `bucket(8)` / `truncate(16)` with round parens,
 /// NOT the `bucket[8]` form from Iceberg's `Display` impl. Returns `None` for
@@ -460,7 +588,7 @@ mod tests {
 
     #[test]
     fn change_partition_field_values_is_reachable_for_mv_partition_module() {
-        use crate::connector::iceberg::changes::change_partition_field_values;
+        use novarocks_connector_iceberg::delta::change_partition_field_values;
         // We do not need to drive Iceberg metadata in a unit test — just make
         // sure the symbol is visible at the call site. If this fn ever becomes
         // private again, this test will fail to compile.
@@ -469,8 +597,8 @@ mod tests {
             i32,
             &novarocks_connector_iceberg::iceberg::spec::Struct,
         ) -> Result<
-            Vec<crate::connector::iceberg::changes::ChangePartitionFieldValue>,
-            crate::connector::iceberg::changes::ChangeError,
+            Vec<novarocks_connector_iceberg::delta::ChangePartitionFieldValue>,
+            novarocks_connector_iceberg::delta::ChangeError,
         > = change_partition_field_values;
     }
 }

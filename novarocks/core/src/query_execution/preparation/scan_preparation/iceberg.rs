@@ -183,48 +183,74 @@ fn connector_read_purpose(scan: &PlanScanNode) -> ConnectorReadPurpose {
     }
 }
 
-/// Plans every Iceberg snapshot-delta role through opaque provider-owned
-/// splits.  Core keeps the logical `IcebergDeltaTable` identity for planning,
-/// but it does not retain a delta physical reader or a delete-side decoder.
-pub(super) fn plan_iceberg_delta_connector_read(
+/// Plans a provider-sealed scan through the same opaque split contract used by
+/// ordinary connector reads. The application admitted this scan while it held
+/// the exact lease; preparation must not call `begin_scan` again.
+pub(super) fn plan_sealed_connector_read(
     exact_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &novarocks_spi::connector::ConnectorTableHandle,
     predicates: &[TypedExpr],
-    execution: &ResolvedScanExecution,
+    connector_scan: novarocks_spi::connector::ConnectorScan,
+    expected_selection: novarocks_spi::connector::ConnectorScanSelection,
     target_parallelism: std::num::NonZeroUsize,
     max_split_bytes: Option<std::num::NonZeroU64>,
 ) -> Result<PlannedConnectorRead, String> {
-    let ResolvedScanExecution::IcebergDelta(delta) = execution else {
-        return Err("Iceberg delta connector planning requires IcebergDelta execution".to_string());
-    };
-    let planned = crate::connector::iceberg::provider::plan_native_iceberg_delta_read_with_lease(
-        exact_lease,
-        context,
-        table,
-        &delta.runtime_plan.change_files,
-        delta.runtime_plan.delete_side.as_ref(),
-        target_parallelism,
-        max_split_bytes,
-    )?;
-    let provider_field_ordinals = (0..planned.scan.output_schema().fields().len())
+    let binding = exact_lease.binding();
+    connector_scan
+        .validate(
+            &novarocks_spi::connector::ConnectorExecutionBindingKey {
+                instance_id: binding.descriptor().instance_id.clone(),
+                incarnation: binding.incarnation(),
+            },
+            expected_selection,
+        )
+        .map_err(|error| error.to_string())?;
+    let declaration = binding
+        .execution_declaration(&context)
+        .map_err(|error| error.to_string())?;
+    let split_result = binding
+        .planning()
+        .plan_splits(
+            connector_scan.handle(),
+            ConnectorSplitPlanningRequest {
+                target_parallelism,
+                max_split_bytes,
+                context,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    if split_result
+        .splits
+        .iter()
+        .any(|split| split.owner() != &binding.descriptor().instance_id)
+    {
+        return Err("sealed connector scan planned a split for another instance".to_string());
+    }
+    let provider_field_ordinals = (0..connector_scan.output_schema().fields().len())
         .map(|ordinal| {
             u32::try_from(ordinal)
-                .map_err(|_| "Iceberg delta provider field ordinal does not fit u32".to_string())
+                .map_err(|_| "connector provider field ordinal does not fit u32".to_string())
         })
         .collect::<Result<_, _>>()?;
+    let batch = ConnectorBatchBudget {
+        max_rows: std::num::NonZeroUsize::new(4096).expect("batch rows are nonzero"),
+        max_bytes: std::num::NonZeroUsize::new(
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        )
+        .expect("batch bytes are nonzero"),
+    };
     Ok(PlannedConnectorRead {
-        declaration: planned.declaration,
-        scan: planned.scan,
+        declaration,
+        scan: connector_scan,
         provider_field_ordinals,
-        splits: planned.splits,
-        planning_metrics: planned.planning_metrics,
+        splits: split_result.splits,
+        planning_metrics: split_result.metrics,
         static_predicates: Vec::new(),
         predicate_dispositions: Vec::new(),
         residual_predicates: predicates.to_vec(),
-        batch: planned.batch,
-        planning_lease: planned.planning_lease,
-        read_session: None,
+        batch,
+        planning_lease: exact_lease,
+        read_session: split_result.session,
     })
 }
 

@@ -30,7 +30,7 @@ mod projection;
 mod pruning;
 mod static_predicate;
 
-use iceberg::{plan_connector_read, plan_iceberg_delta_connector_read};
+use iceberg::{plan_connector_read, plan_sealed_connector_read};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
 use static_predicate::lower_static_connector_predicates;
 
@@ -334,43 +334,35 @@ fn prepare_scan_node(
             .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             (Vec::new(), Vec::new(), Some(planned))
         }
-        ResolvedScanExecution::IcebergDelta(_) => {
+        ResolvedScanExecution::SealedConnectorScan(connector_scan) => {
             let ScanSource::Sql(source) = &scan.table.source;
-            if !matches!(
-                source.kind,
-                crate::sql::planner::table::SqlScanKind::Delta { .. }
-            ) {
+            let crate::sql::planner::table::SqlScanKind::Delta {
+                from_snapshot_id,
+                to_snapshot_id,
+            } = source.kind
+            else {
                 return Err(format!(
-                    "scan preparation node_id={node_id}: IcebergDelta execution requires a SQL delta source"
+                    "scan preparation node_id={node_id}: sealed change-window scan requires a SQL delta source"
                 ));
-            }
+            };
             let query_table_bindings = query_table_bindings.ok_or_else(|| {
                 format!(
                     "SQL delta scan node_id={node_id} has binding token but no query-local binding store"
                 )
             })?;
-            let materialization = query_table_bindings
-                .scan_materialization(source.binding)?
-                .ok_or_else(|| {
-                    format!(
-                        "SQL delta scan binding for '{}.{}.{}' has no scan materialization",
-                        source.table.catalog, source.table.namespace, source.table.table
-                    )
-                })?;
-            let QueryScanMaterialization { table, .. } = materialization else {
-                return Err(format!(
-                    "SQL delta scan binding for '{}.{}.{}' is missing its admitted connector read",
-                    source.table.catalog, source.table.namespace, source.table.table
-                ));
-            };
             let exact_lease =
                 exact_query_binding_lease_for_source(query_table_bindings, &scan.table.source)?;
-            let planned = plan_iceberg_delta_connector_read(
+            let planned = plan_sealed_connector_read(
                 exact_lease,
                 context.clone(),
-                &table,
                 &scan.predicates,
-                &execution,
+                connector_scan.clone(),
+                novarocks_spi::connector::ConnectorScanSelection::ChangeWindow(
+                    novarocks_spi::connector::ConnectorChangeWindow::new(
+                        from_snapshot_id,
+                        to_snapshot_id,
+                    ),
+                ),
                 options.connector_target_parallelism,
                 options.connector_max_split_bytes,
             )
@@ -480,7 +472,7 @@ fn validate_resolved_execution_kind(
                 matches!(execution, ResolvedScanExecution::ConnectorRead)
             }
             crate::sql::planner::table::SqlScanKind::Delta { .. } => {
-                matches!(execution, ResolvedScanExecution::IcebergDelta(_))
+                matches!(execution, ResolvedScanExecution::SealedConnectorScan(_))
             }
             crate::sql::planner::table::SqlScanKind::Data { .. }
             | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {

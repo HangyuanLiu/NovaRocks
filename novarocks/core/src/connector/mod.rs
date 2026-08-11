@@ -35,8 +35,6 @@ pub(crate) use iceberg::catalog::{
     IcebergCatalogRegistry, namespace_exists as iceberg_namespace_exists,
 };
 #[cfg(test)]
-pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
-#[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;

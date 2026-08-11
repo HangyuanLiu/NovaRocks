@@ -200,7 +200,7 @@ pub(crate) fn iceberg_query_binding_from_materialization(
     sql_table_name: &str,
     binding: SqlTableBindingId,
 ) -> Result<QueryTableBinding, String> {
-    iceberg_query_binding_from_materialization_with_delta_plans(
+    iceberg_query_binding_from_materialization_with_change_scans(
         materialization,
         catalog,
         namespace,
@@ -289,23 +289,20 @@ pub(crate) fn connector_query_binding_from_materialization(
         mv_target_read: None,
         write_target_admission: None,
         frozen_snapshot_materializations,
-        delta_runtime_plans: BTreeMap::new(),
+        admitted_change_scans: BTreeMap::new(),
     })
 }
 
-/// Equivalent to [`iceberg_query_binding_from_materialization`] with
-/// application-admitted snapshot-window delta facts.  SQL still receives only
-/// the binding token; preparation recovers this map from the same store.
-pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
+/// Equivalent to [`iceberg_query_binding_from_materialization`] with sealed
+/// provider snapshot-window admissions. SQL receives only the binding token;
+/// preparation recovers each opaque scan from the same request-local store.
+pub(crate) fn iceberg_query_binding_from_materialization_with_change_scans(
     materialization: crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
     catalog: &str,
     namespace: &str,
     sql_table_name: &str,
     binding: SqlTableBindingId,
-    delta_runtime_plans: BTreeMap<
-        (i64, i64),
-        crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
-    >,
+    admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
     mut frozen_snapshot_ids: std::collections::BTreeSet<i64>,
 ) -> Result<QueryTableBinding, String> {
     use crate::sql::planner::table::{
@@ -382,8 +379,74 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
         mv_target_read: None,
         write_target_admission: materialization.write_target_admission,
         frozen_snapshot_materializations,
-        delta_runtime_plans,
+        admitted_change_scans,
     })
+}
+
+/// Admit one provider-owned change window while the caller holds the exact
+/// table handle and planning lease. The returned sealed scan is the sole
+/// physical authority retained by Core for later preparation.
+pub(crate) fn admit_connector_change_window(
+    table: &novarocks_spi::connector::ConnectorTableHandle,
+    schema: &arrow::datatypes::SchemaRef,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    window: novarocks_spi::connector::ConnectorChangeWindow,
+) -> Result<novarocks_spi::connector::ConnectorScan, String> {
+    use novarocks_spi::connector::{
+        ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorReadPurpose,
+        ConnectorScanSelection,
+    };
+
+    let binding = planning_lease.binding();
+    if table.owner() != &binding.descriptor().instance_id {
+        return Err(
+            "connector change-window table handle owner does not match its exact planning lease"
+                .to_string(),
+        );
+    }
+    let scan = binding
+        .planning()
+        .begin_scan(
+            table,
+            ConnectorBeginScanRequest {
+                projection: (0..schema.fields().len()).collect(),
+                static_predicates: Vec::new(),
+                selection: ConnectorScanSelection::ChangeWindow(window),
+                purpose: ConnectorReadPurpose::Query,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: std::num::NonZeroUsize::new(4096).expect("batch rows are nonzero"),
+                    max_bytes: std::num::NonZeroUsize::new(
+                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                    )
+                    .expect("batch bytes are nonzero"),
+                },
+                context: context.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    scan.validate(
+        &novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: binding.descriptor().instance_id.clone(),
+            incarnation: binding.incarnation(),
+        },
+        ConnectorScanSelection::ChangeWindow(window),
+    )
+    .map_err(|error| error.to_string())?;
+    if scan.output_schema().fields() != schema.fields() {
+        return Err(
+            "connector change-window scan schema does not match its exact table metadata"
+                .to_string(),
+        );
+    }
+    if !scan.predicate_dispositions().is_empty() {
+        return Err(
+            "connector change-window scan returned dispositions without static predicates"
+                .to_string(),
+        );
+    }
+    Ok(scan)
 }
 
 /// Application materializer for connector-controlled table metadata.  The
@@ -733,7 +796,7 @@ mod tests {
             write_target_admission: None,
             mv_target_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            delta_runtime_plans: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
         }
     }
 

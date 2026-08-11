@@ -21,7 +21,7 @@
 //! `current_snapshot_id` and `uuid` of every base table. The pin is the
 //! single source of truth for snapshot ids during the refresh:
 //!
-//! * `plan_changes` uses pin[base] as its `to_snapshot_id`
+//! * provider change-window planning uses pin[base] as its `to_snapshot_id`
 //! * `begin_mv_refresh_intent` records pin as the refresh target
 //! * `update_starrocks_mv_refresh_summary` writes `last_refresh_snapshots = pin`
 //!

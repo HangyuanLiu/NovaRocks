@@ -932,7 +932,7 @@ fn framework_locator_query_local_overlay(
                         snapshot_id,
                         scan_materialization.clone(),
                     )]),
-                    delta_runtime_plans: std::collections::BTreeMap::new(),
+                    admitted_change_scans: std::collections::BTreeMap::new(),
                 })
             },
         ),
@@ -1328,7 +1328,7 @@ fn locator_data_file_matches_partition_filter(
     let spec_id = file
         .partition_spec_id
         .unwrap_or_else(|| target_metadata.default_partition_spec().spec_id());
-    let values = crate::connector::iceberg::changes::change_partition_field_values(
+    let values = novarocks_connector_iceberg::delta::change_partition_field_values(
         target_metadata,
         spec_id,
         partition_struct,
@@ -1628,7 +1628,7 @@ async fn locate_target_rows_by_apply_key_impl(
                 .as_ref()
                 .map(|spec| spec.spec_id())
                 .unwrap_or_else(|| target_metadata.default_partition_spec().spec_id());
-            let values = crate::connector::iceberg::changes::change_partition_field_values(
+            let values = novarocks_connector_iceberg::delta::change_partition_field_values(
                 &target_metadata,
                 spec_id,
                 partition_struct,

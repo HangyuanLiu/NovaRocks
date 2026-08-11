@@ -794,8 +794,10 @@ fn position_delete_index_storage_config(
     table_location: &str,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, ConnectorError> {
     let Some(bucket) =
-        super::changes::expected_object_store_bucket_from_location(table_location)
-            .map_err(|error| invalid(format!("resolve rewrite position-delete bucket: {error}")))?
+        novarocks_connector_iceberg::delta::expected_object_store_bucket_from_location(
+            table_location,
+        )
+        .map_err(|error| invalid(format!("resolve rewrite position-delete bucket: {error}")))?
     else {
         return Ok(None);
     };

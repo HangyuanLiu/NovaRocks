@@ -179,7 +179,7 @@ pub(crate) fn admit_prepared_connector_write_target(
                 preparation: preparation.clone(),
             }),
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-            delta_runtime_plans: std::collections::BTreeMap::new(),
+            admitted_change_scans: std::collections::BTreeMap::new(),
         })
     })
 }

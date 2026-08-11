@@ -18,7 +18,6 @@
 pub mod catalog;
 pub(crate) mod change_stream_routing;
 pub(crate) mod change_stream_write;
-pub mod changes;
 pub(crate) mod cleanup_maintenance;
 pub mod commit;
 #[cfg_attr(test, allow(dead_code))]

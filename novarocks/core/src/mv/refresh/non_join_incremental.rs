@@ -17,17 +17,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::connector::iceberg::changes::{
-    ChangeError, IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
-};
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::{
+    ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
+    ConnectorChangeWindowReplaceFailure,
+};
 
 pub(crate) struct NonJoinBaseChange<'a> {
     pub base_ref: &'a TableIdentity,
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
-    pub base_table: &'a novarocks_connector_iceberg::iceberg::table::Table,
     pub current_table_uuid: &'a str,
+    pub admission: ConnectorChangeWindowAdmission,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,16 +55,7 @@ struct PlannedFact {
     base_fqn: String,
     current_snapshot_id: i64,
     current_table_uuid: String,
-    result: Result<BatchFact, ChangeError>,
-}
-
-#[derive(Clone, Copy)]
-struct BatchFact {
-    current_snapshot_id: i64,
-    has_inserts: bool,
-    has_position_deletes: bool,
-    has_equality_deletes: bool,
-    has_deleted_data_files: bool,
+    admission: ConnectorChangeWindowAdmission,
 }
 
 pub(crate) fn plan_non_join_incremental_changes(
@@ -85,26 +77,11 @@ pub(crate) fn plan_non_join_incremental_changes(
 
     let facts = changes
         .iter()
-        .map(|change| {
-            let result = plan_changes(
-                change.base_table,
-                change.previous_snapshot_id,
-                Some(change.current_snapshot_id),
-                &[],
-            )
-            .map(|batch| BatchFact {
-                current_snapshot_id: batch.current_snapshot_id,
-                has_inserts: !batch.inserts.is_empty(),
-                has_position_deletes: !batch.deletes.is_empty(),
-                has_equality_deletes: !batch.equality_deletes.is_empty(),
-                has_deleted_data_files: !batch.deleted_data_files.is_empty(),
-            });
-            PlannedFact {
-                base_fqn: change.base_ref.fqn(),
-                current_snapshot_id: change.current_snapshot_id,
-                current_table_uuid: change.current_table_uuid.to_string(),
-                result,
-            }
+        .map(|change| PlannedFact {
+            base_fqn: change.base_ref.fqn(),
+            current_snapshot_id: change.current_snapshot_id,
+            current_table_uuid: change.current_table_uuid.to_string(),
+            admission: change.admission.clone(),
         })
         .collect();
     reduce_non_join_incremental_facts(facts)
@@ -138,51 +115,22 @@ fn reduce_non_join_incremental_facts(
 
     let mut has_insert_changes = false;
     let mut has_delete_changes = false;
-    let mut hard_errors = BTreeMap::new();
     let mut full_rebuild_reasons = BTreeMap::new();
     for fact in facts {
-        let batch = match fact.result {
-            Ok(batch) => batch,
-            Err(err) => match policy_signal_from_change_error(&err) {
-                IcebergChangePolicySignal::FullRefresh { reason } => {
-                    full_rebuild_reasons.insert(fact.base_fqn, reason);
-                    continue;
-                }
-                IcebergChangePolicySignal::Unsupported { reason } => {
-                    hard_errors.insert(
-                        fact.base_fqn,
-                        format!("iceberg-stored materialized view refresh unsupported: {reason}"),
-                    );
-                    continue;
-                }
-                IcebergChangePolicySignal::Incremental => {
-                    hard_errors.insert(
-                        fact.base_fqn,
-                        "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
-                            .to_string(),
-                    );
-                    continue;
-                }
-            },
-        };
-        if batch.current_snapshot_id != fact.current_snapshot_id {
-            hard_errors.insert(
-                fact.base_fqn.clone(),
-                format!(
-                    "iceberg mv incremental refresh: change batch snapshot mismatch for {} (expected {}, got {})",
-                    fact.base_fqn, fact.current_snapshot_id, batch.current_snapshot_id
-                ),
-            );
-            continue;
+        match fact.admission {
+            ConnectorChangeWindowAdmission::MetadataOnly => {}
+            ConnectorChangeWindowAdmission::Incremental {
+                has_inserts,
+                has_deletes,
+                ..
+            } => {
+                has_insert_changes |= has_inserts;
+                has_delete_changes |= has_deletes;
+            }
+            ConnectorChangeWindowAdmission::FullRebuild(reason) => {
+                full_rebuild_reasons.insert(fact.base_fqn, full_rebuild_reason_message(reason));
+            }
         }
-        has_insert_changes |= batch.has_inserts;
-        has_delete_changes |= batch.has_position_deletes
-            || batch.has_equality_deletes
-            || batch.has_deleted_data_files;
-    }
-
-    if let Some((_, err)) = hard_errors.into_iter().next() {
-        return Err(err);
     }
     if !full_rebuild_reasons.is_empty() {
         let reason = if full_rebuild_reasons.len() == 1 {
@@ -210,30 +158,56 @@ fn reduce_non_join_incremental_facts(
     }
 }
 
+pub(crate) fn full_rebuild_reason_message(
+    reason: ConnectorChangeWindowFullRebuildReason,
+) -> String {
+    match reason {
+        ConnectorChangeWindowFullRebuildReason::LineageBroken { from_snapshot_id } => {
+            format!("previous snapshot {from_snapshot_id} is not reachable")
+        }
+        ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
+            snapshot_id,
+            failure,
+        } => {
+            let failure = match failure {
+                ConnectorChangeWindowReplaceFailure::MissingParent => "missing parent",
+                ConnectorChangeWindowReplaceFailure::RecordCountChanged => "record count changed",
+                ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary => {
+                    "missing or invalid summary"
+                }
+                ConnectorChangeWindowReplaceFailure::InvalidDataFileCounts => {
+                    "invalid data-file counts"
+                }
+                ConnectorChangeWindowReplaceFailure::SchemaChanged => "schema changed",
+            };
+            format!("replace snapshot {snapshot_id} is unproven: {failure}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn batch(current_snapshot_id: i64) -> BatchFact {
-        BatchFact {
-            current_snapshot_id,
-            has_inserts: false,
-            has_position_deletes: false,
-            has_equality_deletes: false,
-            has_deleted_data_files: false,
-        }
-    }
-
     fn fact(
         base_fqn: &str,
         current_snapshot_id: i64,
-        result: Result<BatchFact, ChangeError>,
+        admission: ConnectorChangeWindowAdmission,
     ) -> PlannedFact {
         PlannedFact {
             base_fqn: base_fqn.to_string(),
             current_snapshot_id,
             current_table_uuid: format!("uuid-{base_fqn}"),
-            result,
+            admission,
+        }
+    }
+
+    fn incremental(has_inserts: bool, has_deletes: bool) -> ConnectorChangeWindowAdmission {
+        ConnectorChangeWindowAdmission::Incremental {
+            has_inserts,
+            has_deletes,
+            partition_impact:
+                novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unavailable,
         }
     }
 
@@ -246,24 +220,21 @@ mod tests {
     #[test]
     fn duplicate_base_fqn_is_rejected() {
         let err = reduce_non_join_incremental_facts(vec![
-            fact("c.db.t", 2, Ok(batch(2))),
-            fact("c.db.t", 3, Ok(batch(3))),
+            fact("c.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
+            fact("c.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
         ])
         .expect_err("duplicate base");
         assert!(err.contains("duplicate base c.db.t"), "{err}");
     }
 
     #[test]
-    fn exact_endpoint_mismatch_is_rejected() {
-        let err = reduce_non_join_incremental_facts(vec![fact("c.db.t", 3, Ok(batch(2)))])
-            .expect_err("endpoint mismatch");
-        assert!(err.contains("expected 3, got 2"), "{err}");
-    }
-
-    #[test]
     fn all_empty_batches_are_metadata_only() {
-        let plan = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, Ok(batch(2)))])
-            .expect("metadata only");
+        let plan = reduce_non_join_incremental_facts(vec![fact(
+            "c.db.t",
+            2,
+            ConnectorChangeWindowAdmission::MetadataOnly,
+        )])
+        .expect("metadata only");
         assert!(matches!(
             plan,
             NonJoinIncrementalChangePlan::MetadataOnly(_)
@@ -272,10 +243,9 @@ mod tests {
 
     #[test]
     fn insert_only_batch_is_delete_free_change_stream() {
-        let mut planned = batch(2);
-        planned.has_inserts = true;
-        let plan = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, Ok(planned))])
-            .expect("change stream");
+        let plan =
+            reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, incremental(true, false))])
+                .expect("change stream");
         assert!(matches!(
             plan,
             NonJoinIncrementalChangePlan::ChangeStream {
@@ -286,38 +256,35 @@ mod tests {
     }
 
     #[test]
-    fn every_delete_category_marks_change_stream_as_delete_capable() {
-        for mutate in [
-            |fact: &mut BatchFact| fact.has_position_deletes = true,
-            |fact: &mut BatchFact| fact.has_equality_deletes = true,
-            |fact: &mut BatchFact| fact.has_deleted_data_files = true,
-        ] {
-            let mut planned = batch(2);
-            mutate(&mut planned);
-            let plan = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, Ok(planned))])
+    fn delete_admission_marks_change_stream_as_delete_capable() {
+        let plan =
+            reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, incremental(false, true))])
                 .expect("delete change stream");
-            assert!(matches!(
-                plan,
-                NonJoinIncrementalChangePlan::ChangeStream {
-                    has_delete_changes: true,
-                    ..
-                }
-            ));
-        }
+        assert!(matches!(
+            plan,
+            NonJoinIncrementalChangePlan::ChangeStream {
+                has_delete_changes: true,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn lineage_and_unsafe_replace_request_typed_full_rebuild() {
-        for error in [
-            ChangeError::LineageBroken {
-                previous_snapshot: 1,
-            },
-            ChangeError::ReplaceValidationFailed {
-                snapshot_id: 2,
-                reason: "records changed".to_string(),
-            },
+        for admission in [
+            ConnectorChangeWindowAdmission::FullRebuild(
+                ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                    from_snapshot_id: 1,
+                },
+            ),
+            ConnectorChangeWindowAdmission::FullRebuild(
+                ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
+                    snapshot_id: 2,
+                    failure: ConnectorChangeWindowReplaceFailure::RecordCountChanged,
+                },
+            ),
         ] {
-            let plan = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, Err(error))])
+            let plan = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, admission)])
                 .expect("typed full rebuild");
             assert!(matches!(
                 plan,
@@ -331,17 +298,21 @@ mod tests {
         let lineage_broken = fact(
             "z.db.lineage",
             2,
-            Err(ChangeError::LineageBroken {
-                previous_snapshot: 1,
-            }),
+            ConnectorChangeWindowAdmission::FullRebuild(
+                ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                    from_snapshot_id: 1,
+                },
+            ),
         );
         let unsafe_replace = fact(
             "a.db.replace",
             3,
-            Err(ChangeError::ReplaceValidationFailed {
-                snapshot_id: 3,
-                reason: "records changed".to_string(),
-            }),
+            ConnectorChangeWindowAdmission::FullRebuild(
+                ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
+                    snapshot_id: 3,
+                    failure: ConnectorChangeWindowReplaceFailure::RecordCountChanged,
+                },
+            ),
         );
 
         let forward =
@@ -365,69 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_and_unsupported_errors_remain_explicit_errors() {
-        for error in [
-            ChangeError::SchemaEvolutionUnsupported {
-                detail: "column type changed".to_string(),
-            },
-            ChangeError::UnsupportedOperation {
-                snapshot_id: 2,
-                op: "vendor-op".to_string(),
-            },
-        ] {
-            let err = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, Err(error))])
-                .expect_err("unsupported change");
-            assert!(err.contains("refresh unsupported"), "{err}");
-        }
-    }
-
-    #[test]
-    fn hard_errors_are_not_masked_by_full_rebuild_in_either_input_order() {
-        for (label, hard_fact, expected) in [
-            (
-                "unsupported change",
-                fact(
-                    "c.db.unsupported",
-                    3,
-                    Err(ChangeError::SchemaEvolutionUnsupported {
-                        detail: "column type changed".to_string(),
-                    }),
-                ),
-                "refresh unsupported",
-            ),
-            (
-                "endpoint mismatch",
-                fact("c.db.mismatch", 3, Ok(batch(2))),
-                "expected 3, got 2",
-            ),
-        ] {
-            for full_rebuild_first in [true, false] {
-                let full_rebuild_fact = fact(
-                    "c.db.full_rebuild",
-                    4,
-                    Err(ChangeError::LineageBroken {
-                        previous_snapshot: 1,
-                    }),
-                );
-                let facts = if full_rebuild_first {
-                    vec![full_rebuild_fact, hard_fact.clone()]
-                } else {
-                    vec![hard_fact.clone(), full_rebuild_fact]
-                };
-                let err = reduce_non_join_incremental_facts(facts).expect_err(label);
-                assert!(
-                    err.contains(expected),
-                    "{label} must win regardless of input order: {err}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn lineage_maps_are_complete_and_sorted_by_fqn() {
         let plan = reduce_non_join_incremental_facts(vec![
-            fact("z.db.t", 3, Ok(batch(3))),
-            fact("a.db.t", 2, Ok(batch(2))),
+            fact("z.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
+            fact("a.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
         ])
         .expect("metadata only");
         let NonJoinIncrementalChangePlan::MetadataOnly(lineage) = plan else {

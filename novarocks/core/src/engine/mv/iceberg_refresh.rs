@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::common::engine_error::EngineError;
-use crate::connector::iceberg::changes::plan_changes;
 use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitServiceError, IcebergCommitCollector, MvRefreshSnapshotMarker,
     RecoveryEvidence, RunInput, run_iceberg_commit, snapshot_matches_refresh_marker,
@@ -130,7 +129,8 @@ use crate::mv::refresh::join_incremental_refresh::{
     select_join_incremental_refresh_mode,
 };
 use crate::mv::refresh::non_join_incremental::{
-    NonJoinBaseChange, NonJoinIncrementalChangePlan, plan_non_join_incremental_changes,
+    NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
+    plan_non_join_incremental_changes,
 };
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::planning::{
@@ -187,7 +187,7 @@ use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
 use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorChangeWindowAdmission, ConnectorExecutionBindingKey, ConnectorInstanceId,
 };
 
 /// SQL-owned bridge for refresh planning.  It owns only analysis and immutable
@@ -908,20 +908,50 @@ fn prepare_frontend_incremental_write(
                 right_ref.fqn()
             )
         })?;
-        let left_loaded = load_current_iceberg_base_table(state, &left_ref)?;
-        let right_loaded = load_current_iceberg_base_table(state, &right_ref)?;
-        let left_batch = plan_changes(&left_loaded.table, left_from, Some(left_to), &[])
-            .map_err(|error| format!("MV join left change planning failed: {error}"))?;
-        let right_batch = plan_changes(&right_loaded.table, right_from, Some(right_to), &[])
-            .map_err(|error| format!("MV join right change planning failed: {error}"))?;
-        if left_batch.current_snapshot_id != left_to || right_batch.current_snapshot_id != right_to
-        {
-            return Err(
-                "MV join incremental change planning drifted from pinned snapshots".to_string(),
-            );
+        let (left_admission, _) = observe_and_admit_change_window_for_table(
+            state,
+            &left_ref,
+            left_from,
+            left_to,
+            &connector_context,
+        )?;
+        let (right_admission, _) = observe_and_admit_change_window_for_table(
+            state,
+            &right_ref,
+            right_from,
+            right_to,
+            &connector_context,
+        )?;
+        let left_facts = admitted_change_facts(&left_admission);
+        let right_facts = admitted_change_facts(&right_admission);
+        let mut full_rebuild_reasons = Vec::new();
+        if let Err(reason) = &left_facts {
+            full_rebuild_reasons.push(format!("{}: {reason}", left_ref.fqn()));
         }
-        let left_has_delete_changes = iceberg_change_batch_has_row_deletes(&left_batch);
-        let right_has_delete_changes = iceberg_change_batch_has_row_deletes(&right_batch);
+        if let Err(reason) = &right_facts {
+            full_rebuild_reasons.push(format!("{}: {reason}", right_ref.fqn()));
+        }
+        if !full_rebuild_reasons.is_empty() {
+            tracing::info!(
+                target = %context.rewrite.target.fqn(),
+                reasons = %full_rebuild_reasons.join("; "),
+                "MV join refresh admission selected a distributed full-rebuild staging overwrite"
+            );
+            let rebuild = prepare_frontend_first_refresh_write(
+                state,
+                current_catalog,
+                current_database,
+                contract,
+                attempt,
+                &context.rewrite.pin.to_table_uuid_map(),
+                observed_binding,
+                connector_context,
+            )?
+            .into_full_overwrite();
+            return Ok(PreparedIncrementalRefreshWork::FullRebuild(rebuild));
+        }
+        let left_facts = left_facts.expect("full-rebuild admission returned above");
+        let right_facts = right_facts.expect("full-rebuild admission returned above");
         let branches = crate::engine::mv::iceberg_join_branch::plan_join_delta_branches(
             &left_ref,
             &right_ref,
@@ -933,8 +963,8 @@ fn prepare_frontend_incremental_write(
                 from: right_from,
                 to: right_to,
             },
-            !left_batch.inserts.is_empty() || left_has_delete_changes,
-            !right_batch.inserts.is_empty() || right_has_delete_changes,
+            left_facts.has_inserts || left_facts.has_deletes,
+            right_facts.has_inserts || right_facts.has_deletes,
         );
         if branches.is_empty() {
             return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
@@ -942,7 +972,7 @@ fn prepare_frontend_incremental_write(
         let join_mode = if is_aggregate {
             JoinIncrementalRefreshMode::Coalesce
         } else {
-            select_join_incremental_refresh_mode(left_has_delete_changes, right_has_delete_changes)
+            select_join_incremental_refresh_mode(left_facts.has_deletes, right_facts.has_deletes)
         };
         let request = crate::mv::application::MvIncrementalWriteRequest::try_new(
             target.catalog.clone(),
@@ -1035,25 +1065,38 @@ fn prepare_frontend_incremental_write(
                     base.fqn()
                 ));
             }
+            let (admission, _) = observe_and_admit_change_window_for_table(
+                state,
+                base,
+                previous_snapshot_id,
+                current_snapshot_id,
+                &connector_context,
+            )?;
             Ok::<_, String>((
                 base,
                 previous_snapshot_id,
                 current_snapshot_id,
                 current_table_uuid.to_string(),
-                loaded,
+                admission,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let changes = loaded_bases
         .iter()
         .map(
-            |(base_ref, previous_snapshot_id, current_snapshot_id, current_table_uuid, loaded)| {
+            |(
+                base_ref,
+                previous_snapshot_id,
+                current_snapshot_id,
+                current_table_uuid,
+                admission,
+            )| {
                 NonJoinBaseChange {
                     base_ref,
                     previous_snapshot_id: *previous_snapshot_id,
                     current_snapshot_id: *current_snapshot_id,
-                    base_table: &loaded.table,
                     current_table_uuid,
+                    admission: admission.clone(),
                 }
             },
         )
@@ -5613,7 +5656,6 @@ fn refresh_iceberg_mv_with_planned_partitions(
             )
         })?
         .to_string();
-    let loaded = load_current_iceberg_base_table(state, base_ref)?;
     let base_observation =
         observe_schema_validation_for_table(state, base_ref, &execution.connector_context)?;
 
@@ -5779,7 +5821,6 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 base_ref,
                 prev,
                 cur,
-                &loaded.table,
                 &current_table_uuid,
                 FullRebuildSelectPreparation::Projection {
                     select_sql: &ctx.rewrite.mv_definition.select_sql,
@@ -5820,6 +5861,56 @@ fn observe_schema_validation_for_table(
                 table.fqn()
             )
         })
+}
+
+fn observe_and_admit_change_window_for_table(
+    state: &Arc<StandaloneState>,
+    table: &TableIdentity,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    (
+        novarocks_spi::connector::ConnectorChangeWindowAdmission,
+        MvSchemaValidationObservation,
+    ),
+    String,
+> {
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &table.catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &table.namespace,
+        &table.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let window =
+        novarocks_spi::connector::ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id);
+    let scan = crate::engine::query_planning::catalog_materializer::admit_connector_change_window(
+        &metadata.table,
+        &metadata.schema,
+        &exact_lease,
+        connector_context.clone(),
+        window,
+    )?;
+    let novarocks_spi::connector::ConnectorScanAdmission::ChangeWindow(admission) =
+        scan.admission()
+    else {
+        return Err("connector returned a snapshot admission for a change-window scan".to_string());
+    };
+    let observation = state
+        .mv_storage_observation
+        .observe_schema_validation(&exact_lease, &metadata, connector_context.clone())
+        .map_err(|error| {
+            format!(
+                "observe MV schema validation facts for {}: {error}",
+                table.fqn()
+            )
+        })?;
+    Ok((admission.clone(), observation))
 }
 
 fn rebind_mv_definition_before_refresh_derivation(
@@ -6008,31 +6099,14 @@ fn refresh_iceberg_union_projection_mv(
         .iter()
         .any(|(base_ref, _, _, _)| previous_snapshots.contains_key(&base_ref.fqn()))
     {
-        for (base_ref, loaded, current_snapshot_id, _) in &loaded_bases {
+        for (base_ref, _, _, _) in &loaded_bases {
             let fqn = base_ref.fqn();
-            let previous_snapshot_id = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+            previous_snapshots.get(&fqn).copied().ok_or_else(|| {
                 format!(
                     "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
                     target.catalog, target.namespace, target.table
                 )
             })?;
-            if previous_snapshot_id != *current_snapshot_id {
-                crate::connector::iceberg::changes::classify_lineage(
-                    loaded.table.metadata(),
-                    previous_snapshot_id,
-                    *current_snapshot_id,
-                )
-                .map_err(|e| {
-                    format!(
-                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previous base snapshot {previous_snapshot_id} for {} is not reachable from pinned snapshot {}: {e}",
-                        target.catalog,
-                        target.namespace,
-                        target.table,
-                        fqn,
-                        current_snapshot_id
-                    )
-                })?;
-            }
         }
     }
 
@@ -6146,9 +6220,10 @@ fn refresh_iceberg_union_projection_mv(
             Ok(StatementResult::Ok)
         },
         || {
+            let connector_context = refresh_connector_context(&ctx)?;
             let changes = loaded_bases
                 .iter()
-                .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
+                .map(|(base_ref, _loaded, current_snapshot_id, current_table_uuid)| {
                     let previous_snapshot_id =
                         previous_snapshots.get(&base_ref.fqn()).copied().ok_or_else(|| {
                             format!(
@@ -6156,12 +6231,19 @@ fn refresh_iceberg_union_projection_mv(
                                 target.catalog, target.namespace, target.table
                             )
                         })?;
+                    let (admission, _) = observe_and_admit_change_window_for_table(
+                        state,
+                        base_ref,
+                        previous_snapshot_id,
+                        *current_snapshot_id,
+                        connector_context,
+                    )?;
                     Ok(NonJoinBaseChange {
                         base_ref,
                         previous_snapshot_id,
                         current_snapshot_id: *current_snapshot_id,
-                        base_table: &loaded.table,
                         current_table_uuid,
+                        admission,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -6338,7 +6420,6 @@ fn refresh_single_aggregate_iceberg_mv(
     let current = pin
         .get(base_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", base_ref.fqn()))?;
-    let loaded = load_current_iceberg_base_table(state, base_ref)?;
     let base_observation =
         observe_schema_validation_for_table(state, base_ref, &execution.connector_context)?;
     let target_ref = TableIdentity {
@@ -6496,7 +6577,6 @@ fn refresh_single_aggregate_iceberg_mv(
                 base_ref,
                 prev,
                 current,
-                &loaded.table,
                 &current_table_uuid,
                 FullRebuildSelectPreparation::LegacyVisible {
                     select_sql: &mv_definition.select_sql,
@@ -6697,31 +6777,14 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         .iter()
         .any(|(base_ref, _, _, _)| previous_snapshots.contains_key(&base_ref.fqn()))
     {
-        for (base_ref, loaded, current_snapshot_id, _) in &loaded_bases {
+        for (base_ref, _, _, _) in &loaded_bases {
             let fqn = base_ref.fqn();
-            let previous_snapshot_id = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+            previous_snapshots.get(&fqn).copied().ok_or_else(|| {
                 format!(
                     "iceberg {refresh_kind_label} MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
                     target.catalog, target.namespace, target.table
                 )
             })?;
-            if previous_snapshot_id != *current_snapshot_id {
-                crate::connector::iceberg::changes::classify_lineage(
-                    loaded.table.metadata(),
-                    previous_snapshot_id,
-                    *current_snapshot_id,
-                )
-                .map_err(|e| {
-                    format!(
-                        "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previous base snapshot {previous_snapshot_id} for {} is not reachable from pinned snapshot {}: {e}",
-                        target.catalog,
-                        target.namespace,
-                        target.table,
-                        fqn,
-                        current_snapshot_id
-                    )
-                })?;
-            }
         }
     }
 
@@ -6828,9 +6891,10 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             )
         },
         || {
+            let connector_context = refresh_connector_context(&ctx)?;
             let changes = loaded_bases
                 .iter()
-                .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
+                .map(|(base_ref, _loaded, current_snapshot_id, current_table_uuid)| {
                     let previous_snapshot_id =
                         previous_snapshots.get(&base_ref.fqn()).copied().ok_or_else(|| {
                             format!(
@@ -6838,12 +6902,19 @@ fn refresh_fan_in_aggregate_iceberg_mv(
                                 target.catalog, target.namespace, target.table
                             )
                         })?;
+                    let (admission, _) = observe_and_admit_change_window_for_table(
+                        state,
+                        base_ref,
+                        previous_snapshot_id,
+                        *current_snapshot_id,
+                        connector_context,
+                    )?;
                     Ok(NonJoinBaseChange {
                         base_ref,
                         previous_snapshot_id,
                         current_snapshot_id: *current_snapshot_id,
-                        base_table: &loaded.table,
                         current_table_uuid,
+                        admission,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -6914,8 +6985,6 @@ fn refresh_join_aggregate_iceberg_mv(
         )
         .into());
     }
-    let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
-    let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
     let left_observation =
         observe_schema_validation_for_table(state, left_ref, &execution.connector_context)?;
     let right_observation =
@@ -7119,16 +7188,23 @@ fn merge_affected_partition_results(
     }
 }
 
-fn plan_multi_base_affected_partitions<'a>(
+fn plan_multi_base_affected_partitions(
     schema_contract: &mv_schema::MvSchemaContract,
     mode: RefreshMode,
     base_refs: &[TableIdentity],
     previous_snapshots: &BTreeMap<String, i64>,
     current_snapshots: &BTreeMap<String, Option<i64>>,
-    mut table_for_base: impl FnMut(
+    mut admit_for_base: impl FnMut(
         &TableIdentity,
-    )
-        -> Option<&'a novarocks_connector_iceberg::iceberg::table::Table>,
+        i64,
+        i64,
+    ) -> Result<
+        (
+            novarocks_spi::connector::ConnectorChangeWindowAdmission,
+            MvSchemaValidationObservation,
+        ),
+        String,
+    >,
     context: &str,
 ) -> crate::mv::model::AffectedTargetPartitions {
     match mode {
@@ -7158,24 +7234,38 @@ fn plan_multi_base_affected_partitions<'a>(
                             std::iter::empty::<crate::mv::model::MvPartitionKey>(),
                         )
                     }
-                    (Some(previous), Some(current)) => match table_for_base(base_ref) {
-                        Some(table) => match plan_changes(table, previous, Some(current), &[]) {
-                            Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
+                    (Some(previous), Some(current)) => {
+                        match admit_for_base(base_ref, previous, current) {
+                            Ok((
+                                novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                                _,
+                            )) => crate::mv::model::AffectedTargetPartitions::known(
+                                std::iter::empty::<crate::mv::model::MvPartitionKey>(),
+                            ),
+                            Ok((
+                                novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
+                                    partition_impact,
+                                    ..
+                                },
+                                observation,
+                            )) => crate::engine::mv::partition::planner::plan_affected_partitions(
                                 &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
                                     schema_contract,
-                                    change_batch: Some(&batch),
+                                    partition_impact: Some(&partition_impact),
+                                    schema_observation: Some(&observation),
                                 },
                             ),
-                            Err(err) => {
-                                crate::mv::model::AffectedTargetPartitions::not_derived(
-                                    format!("failed to plan Iceberg changes for affected partitions: {err}"),
-                                )
-                            }
-                        },
-                        None => crate::mv::model::AffectedTargetPartitions::not_derived(
-                            "base table was not loaded for affected partition planning",
-                        ),
-                    },
+                            Ok((
+                                novarocks_spi::connector::ConnectorChangeWindowAdmission::FullRebuild(_),
+                                _,
+                            )) => crate::mv::model::AffectedTargetPartitions::not_derived(
+                                "connector change-window admission requires a full rebuild",
+                            ),
+                            Err(err) => crate::mv::model::AffectedTargetPartitions::not_derived(
+                                format!("failed to admit connector changes for affected partitions: {err}"),
+                            ),
+                        }
+                    }
                     (None, _) => crate::mv::model::AffectedTargetPartitions::not_derived(
                         "incremental affected partition planning missing previous snapshot",
                     ),
@@ -7192,11 +7282,13 @@ fn plan_multi_base_affected_partitions<'a>(
 }
 
 fn plan_aggregate_mv_affected_partitions(
+    state: &Arc<StandaloneState>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    base_ref: &TableIdentity,
     schema_contract: &mv_schema::MvSchemaContract,
     mode: RefreshMode,
     previous_snapshot_id: Option<i64>,
     current_snapshot_id: Option<i64>,
-    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> crate::mv::model::AffectedTargetPartitions {
     match mode {
         RefreshMode::Noop => noop_affected_partitions(schema_contract),
@@ -7214,15 +7306,41 @@ fn plan_aggregate_mv_affected_partitions(
                         "incremental aggregate MV affected partition planning missing current snapshot",
                     );
                 };
-                match plan_changes(base_table, previous, Some(current), &[]) {
-                    Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
+                match observe_and_admit_change_window_for_table(
+                    state,
+                    base_ref,
+                    previous,
+                    current,
+                    connector_context,
+                ) {
+                    Ok((
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                        _,
+                    )) => crate::mv::model::AffectedTargetPartitions::known(std::iter::empty::<
+                        crate::mv::model::MvPartitionKey,
+                    >(
+                    )),
+                    Ok((
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
+                            partition_impact,
+                            ..
+                        },
+                        observation,
+                    )) => crate::engine::mv::partition::planner::plan_affected_partitions(
                         &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
                             schema_contract,
-                            change_batch: Some(&batch),
+                            partition_impact: Some(&partition_impact),
+                            schema_observation: Some(&observation),
                         },
                     ),
+                    Ok((
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::FullRebuild(_),
+                        _,
+                    )) => crate::mv::model::AffectedTargetPartitions::not_derived(
+                        "connector change-window admission requires a full rebuild",
+                    ),
                     Err(err) => crate::mv::model::AffectedTargetPartitions::not_derived(format!(
-                        "failed to plan Iceberg changes for affected partitions: {err}"
+                        "failed to admit connector changes for affected partitions: {err}"
                     )),
                 }
             }
@@ -7234,7 +7352,8 @@ fn plan_aggregate_mv_affected_partitions(
                 crate::engine::mv::partition::planner::plan_affected_partitions(
                     &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
                         schema_contract,
-                        change_batch: None,
+                        partition_impact: None,
+                        schema_observation: None,
                     },
                 )
             }
@@ -7574,13 +7693,13 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
             }
             for base_ref in &base_refs {
                 let fqn = base_ref.fqn();
-                let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+                previous_snapshots.get(&fqn).copied().ok_or_else(|| {
                     RefreshError::user(format!(
                         "iceberg join MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
                         iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
                     ))
                 })?;
-                let current = current_snapshots
+                current_snapshots
                     .get(&fqn)
                     .copied()
                     .flatten()
@@ -7590,19 +7709,6 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
                             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
                         ))
                     })?;
-                let loaded =
-                    load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
-                crate::connector::iceberg::changes::classify_lineage(
-                    loaded.table.metadata(),
-                    previous,
-                    current,
-                )
-                .map_err(|e| {
-                    RefreshError::user(format!(
-                        "cannot refresh iceberg join materialized view {}.{}.{}: previous base snapshot {previous} for {} is not reachable from pinned snapshot {current}: {e}",
-                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
-                    ))
-                })?;
             }
         }
         let affected_partitions = unknown_join_affected_partitions();
@@ -7716,7 +7822,6 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
     }
 
     let current_snapshot_id = current_snapshot_id_before_pin;
-    let loaded = pre_pin_loaded;
 
     let refresh_statuses = [base_snapshot_status_for_refresh(
         base_ref,
@@ -7729,63 +7834,18 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
         label: &refresh_label,
     })
     .map_err(RefreshError::user)?;
-    if matches!(decision.mode(), RefreshMode::Incremental) {
-        if let (Some(prev), Some(cur)) = (previous_snapshot_id, current_snapshot_id) {
-            crate::connector::iceberg::changes::classify_lineage(
-                loaded.table.metadata(),
-                prev,
-                cur,
-            )
-            .map_err(|e| {
-                RefreshError::user(format!(
-                    "cannot refresh iceberg materialized view {}.{}.{}: previous base snapshot {prev} for {} is not reachable from pinned snapshot {cur}: {e}",
-                    iceberg_target.catalog,
-                    iceberg_target.namespace,
-                    iceberg_target.table,
-                    base_ref.fqn()
-                ))
-            })?;
-        }
-    }
     let mode = decision.mode();
     let mut snapshot_pins = BTreeMap::new();
     snapshot_pins.insert(base_ref.fqn(), current_snapshot_id);
-    let affected_partitions = match mode {
-        RefreshMode::Noop => noop_affected_partitions(schema_contract),
-        RefreshMode::Incremental => {
-            if is_unpartitioned_mv_contract(schema_contract) {
-                crate::mv::model::AffectedTargetPartitions::Unpartitioned
-            } else {
-                let previous =
-                    previous_snapshot_id.expect("incremental refresh has previous snapshot");
-                let current =
-                    current_snapshot_id.expect("incremental refresh has current snapshot");
-                match plan_changes(&loaded.table, previous, Some(current), &[]) {
-                    Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
-                        &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
-                            schema_contract,
-                            change_batch: Some(&batch),
-                        },
-                    ),
-                    Err(err) => crate::mv::model::AffectedTargetPartitions::not_derived(format!(
-                        "failed to plan Iceberg changes for affected partitions: {err}"
-                    )),
-                }
-            }
-        }
-        RefreshMode::Full | RefreshMode::Rebuild => {
-            if is_unpartitioned_mv_contract(schema_contract) {
-                crate::mv::model::AffectedTargetPartitions::Unpartitioned
-            } else {
-                crate::engine::mv::partition::planner::plan_affected_partitions(
-                    &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
-                        schema_contract,
-                        change_batch: None,
-                    },
-                )
-            }
-        }
-    };
+    let affected_partitions = plan_aggregate_mv_affected_partitions(
+        state,
+        connector_context,
+        base_ref,
+        schema_contract,
+        mode,
+        previous_snapshot_id,
+        current_snapshot_id,
+    );
     log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
     Ok(RefreshPlan {
         contract: RefreshPlanContract {
@@ -7916,37 +7976,18 @@ fn plan_iceberg_union_projection_mv_refresh(
                     )));
                 }
             }
-            let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+            previous_snapshots.get(&fqn).copied().ok_or_else(|| {
                 RefreshError::user(format!(
                     "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
                     iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
                 ))
             })?;
-            let current = current_snapshots.get(&fqn).copied().flatten().ok_or_else(|| {
+            current_snapshots.get(&fqn).copied().flatten().ok_or_else(|| {
                 RefreshError::user(format!(
                     "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
                     iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
                 ))
             })?;
-            if previous != current {
-                let loaded = loaded_bases.get(&fqn).ok_or_else(|| {
-                    RefreshError::user(format!(
-                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: base {} was not loaded",
-                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
-                    ))
-                })?;
-                crate::connector::iceberg::changes::classify_lineage(
-                    loaded.table.metadata(),
-                    previous,
-                    current,
-                )
-                .map_err(|e| {
-                    RefreshError::user(format!(
-                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previous base snapshot {previous} for {} is not reachable from pinned snapshot {current}: {e}",
-                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
-                    ))
-                })?;
-            }
         }
     }
 
@@ -7956,10 +7997,14 @@ fn plan_iceberg_union_projection_mv_refresh(
         base_refs,
         previous_snapshots,
         &current_snapshots,
-        |base_ref| {
-            loaded_bases
-                .get(&base_ref.fqn())
-                .map(|loaded| &loaded.table)
+        |base_ref, previous, current| {
+            observe_and_admit_change_window_for_table(
+                state,
+                base_ref,
+                previous,
+                current,
+                connector_context,
+            )
         },
         "UNION ALL MV affected partition planning",
     );
@@ -8102,37 +8147,18 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     if has_previous {
         for base_ref in base_refs {
             let fqn = base_ref.fqn();
-            let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+            previous_snapshots.get(&fqn).copied().ok_or_else(|| {
                 RefreshError::user(format!(
                     "iceberg {refresh_kind_label} MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
                     iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
                 ))
             })?;
-            let current = current_snapshots.get(&fqn).copied().flatten().ok_or_else(|| {
+            current_snapshots.get(&fqn).copied().flatten().ok_or_else(|| {
                 RefreshError::user(format!(
                     "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
                     iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
                 ))
             })?;
-            if previous != current {
-                let loaded = loaded_bases.get(&fqn).ok_or_else(|| {
-                    RefreshError::user(format!(
-                        "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: base {} was not loaded",
-                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
-                    ))
-                })?;
-                crate::connector::iceberg::changes::classify_lineage(
-                    loaded.table.metadata(),
-                    previous,
-                    current,
-                )
-                .map_err(|e| {
-                    RefreshError::user(format!(
-                        "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previous base snapshot {previous} for {} is not reachable from pinned snapshot {current}: {e}",
-                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
-                    ))
-                })?;
-            }
         }
     }
     let affected_partition_context =
@@ -8143,10 +8169,14 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         base_refs,
         previous_snapshots,
         &current_snapshots,
-        |base_ref| {
-            loaded_bases
-                .get(&base_ref.fqn())
-                .map(|loaded| &loaded.table)
+        |base_ref, previous, current| {
+            observe_and_admit_change_window_for_table(
+                state,
+                base_ref,
+                previous,
+                current,
+                connector_context,
+            )
         },
         &affected_partition_context,
     );
@@ -8259,33 +8289,17 @@ fn plan_iceberg_aggregate_mv_refresh(
                 label: &refresh_label,
             })
             .map_err(RefreshError::user)?;
-            if matches!(decision.mode(), RefreshMode::Incremental) {
-                if let (Some(prev), Some(cur)) = (previous, current) {
-                    crate::connector::iceberg::changes::classify_lineage(
-                        loaded.table.metadata(),
-                        prev,
-                        cur,
-                    )
-                    .map_err(|e| {
-                        RefreshError::user(format!(
-                            "cannot refresh iceberg aggregate materialized view {}.{}.{}: previous base snapshot {prev} for {} is not reachable from pinned snapshot {cur}: {e}",
-                            iceberg_target.catalog,
-                            iceberg_target.namespace,
-                            iceberg_target.table,
-                            base_ref.fqn()
-                        ))
-                    })?;
-                }
-            }
             let mode = decision.mode();
             let mut snapshot_pins = BTreeMap::new();
             snapshot_pins.insert(base_ref.fqn(), current);
             let affected_partitions = plan_aggregate_mv_affected_partitions(
+                state,
+                connector_context,
+                base_ref,
                 schema_contract,
                 mode,
                 previous,
                 current,
-                &loaded.table,
             );
             log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
             Ok(build_iceberg_refresh_plan(
@@ -8395,13 +8409,13 @@ fn plan_iceberg_aggregate_mv_refresh(
             if has_previous {
                 for base_ref in base_refs {
                     let fqn = base_ref.fqn();
-                    let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+                    previous_snapshots.get(&fqn).copied().ok_or_else(|| {
                         RefreshError::user(format!(
                             "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
                             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
                         ))
                     })?;
-                    let current = current_snapshots.get(&fqn).copied().flatten().ok_or_else(
+                    current_snapshots.get(&fqn).copied().flatten().ok_or_else(
                         || {
                             RefreshError::user(format!(
                                 "cannot refresh iceberg join aggregate MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
@@ -8412,25 +8426,6 @@ fn plan_iceberg_aggregate_mv_refresh(
                             ))
                         },
                     )?;
-                    let loaded = if fqn.eq_ignore_ascii_case(&left_ref.fqn()) {
-                        &left_loaded
-                    } else {
-                        &right_loaded
-                    };
-                    crate::connector::iceberg::changes::classify_lineage(
-                        loaded.table.metadata(),
-                        previous,
-                        current,
-                    )
-                    .map_err(|e| {
-                        RefreshError::user(format!(
-                            "cannot refresh iceberg join aggregate MV {}.{}.{}: previous base snapshot {previous} for {} is not reachable from pinned snapshot {current}: {e}",
-                            iceberg_target.catalog,
-                            iceberg_target.namespace,
-                            iceberg_target.table,
-                            fqn
-                        ))
-                    })?;
                 }
             }
             let affected_partitions = unknown_join_affected_partitions();
@@ -13213,8 +13208,6 @@ fn refresh_iceberg_join_mv(
         )
         .into());
     }
-    let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
-    let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
     let left_observation =
         observe_schema_validation_for_table(state, left_ref, &execution.connector_context)?;
     let right_observation =
@@ -13465,12 +13458,29 @@ fn apply_join_schema_contract_decision(
     }
 }
 
-fn iceberg_change_batch_has_row_deletes(
-    batch: &crate::connector::iceberg::changes::IcebergChangeBatch,
-) -> bool {
-    !batch.deletes.is_empty()
-        || !batch.equality_deletes.is_empty()
-        || !batch.deleted_data_files.is_empty()
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AdmittedChangeFacts {
+    has_inserts: bool,
+    has_deletes: bool,
+}
+
+fn admitted_change_facts(
+    admission: &ConnectorChangeWindowAdmission,
+) -> Result<AdmittedChangeFacts, String> {
+    match admission {
+        ConnectorChangeWindowAdmission::MetadataOnly => Ok(AdmittedChangeFacts::default()),
+        ConnectorChangeWindowAdmission::Incremental {
+            has_inserts,
+            has_deletes,
+            ..
+        } => Ok(AdmittedChangeFacts {
+            has_inserts: *has_inserts,
+            has_deletes: *has_deletes,
+        }),
+        ConnectorChangeWindowAdmission::FullRebuild(reason) => {
+            Err(full_rebuild_reason_message(*reason))
+        }
+    }
 }
 
 fn finalize_iceberg_mv_metadata_only_refresh(
@@ -13554,8 +13564,6 @@ fn build_join_projection_repartition_context(
         ));
     }
     let (left_ref, right_ref) = join_base_refs_for_aliases(aliases, base_refs)?;
-    let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
-    let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
     let left_observation = observe_schema_validation_for_table(state, left_ref, connector_context)?;
     let right_observation =
         observe_schema_validation_for_table(state, right_ref, connector_context)?;
@@ -14798,7 +14806,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             mv_target_read: Some(mv_target_read),
             write_target_admission: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            delta_runtime_plans: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
         })
     })?;
     Ok(token)
@@ -14854,7 +14862,7 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
     base_refs: &[TableIdentity],
     pin: &RefreshSnapshotPin,
     previous_snapshot_ids: &BTreeMap<String, i64>,
-    base_catalog_entries: &BTreeMap<
+    _base_catalog_entries: &BTreeMap<
         String,
         crate::connector::iceberg::catalog::IcebergCatalogEntry,
     >,
@@ -14895,29 +14903,22 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                 snapshot_id,
             )?;
         let mut frozen_snapshot_ids = std::collections::BTreeSet::from([snapshot_id]);
-        let mut delta_runtime_plans = BTreeMap::new();
+        let mut admitted_change_scans = BTreeMap::new();
         if let Some(previous_snapshot_id) = previous_snapshot_ids.get(&base.fqn()) {
-            let catalog_key = normalize_identifier(&base.catalog)?;
-            let entry = base_catalog_entries.get(&catalog_key).ok_or_else(|| {
-                format!(
-                    "IMV query binding is missing frozen catalog entry for {}",
-                    base.fqn()
-                )
-            })?;
-            let loaded = crate::connector::iceberg::catalog::load_table(
-                entry,
-                &base.namespace,
-                &base.table,
-            )?;
             frozen_snapshot_ids.insert(*previous_snapshot_id);
-            let runtime_plan = crate::connector::iceberg::provider::freeze_delta_runtime_plan_from_materialization(
-                &materialization,
-                entry,
-                &loaded.table,
+            let window = novarocks_spi::connector::ConnectorChangeWindow::new(
                 *previous_snapshot_id,
                 snapshot_id,
-            )?;
-            delta_runtime_plans.insert((*previous_snapshot_id, snapshot_id), runtime_plan);
+            );
+            let admitted_scan =
+                crate::engine::query_planning::catalog_materializer::admit_connector_change_window(
+                    &materialization.read_table,
+                    &materialization.read_schema,
+                    &materialization.planning_lease,
+                    connector_context.clone(),
+                    window,
+                )?;
+            admitted_change_scans.insert((*previous_snapshot_id, snapshot_id), admitted_scan);
         }
 
         let catalog = base.catalog.clone();
@@ -14930,13 +14931,13 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                 table.clone(),
                 key,
                 move |binding| {
-                    crate::engine::query_planning::catalog_materializer::iceberg_query_binding_from_materialization_with_delta_plans(
+                    crate::engine::query_planning::catalog_materializer::iceberg_query_binding_from_materialization_with_change_scans(
                         materialization.clone(),
                         &catalog,
                         &namespace,
                         &table,
                         binding,
-                        delta_runtime_plans.clone(),
+                        admitted_change_scans.clone(),
                         frozen_snapshot_ids.clone(),
                     )
                 },
@@ -15119,7 +15120,9 @@ mod partition_planning_tests {
             &base_refs,
             &previous_snapshots,
             &current_snapshots,
-            |_base_ref| panic!("unchanged bases should not require loaded table lookup"),
+            |_base_ref, _previous, _current| {
+                panic!("unchanged bases should not require change-window admission")
+            },
             "UNION ALL MV affected partition planning",
         );
 
@@ -15680,30 +15683,35 @@ fn incremental_refresh_iceberg_join_mv(
                 right_ref.fqn()
             )
         })?;
-    let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
-    let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-    let left_batch = plan_changes(&left_loaded.table, left_from, Some(left_to), &[])
-        .map_err(|e| format!("join MV left change planning failed: {e}"))?;
-    let right_batch = plan_changes(&right_loaded.table, right_from, Some(right_to), &[])
-        .map_err(|e| format!("join MV right change planning failed: {e}"))?;
-    if left_batch.current_snapshot_id != left_to {
-        return Err(format!(
-            "join MV left change batch snapshot mismatch: expected {left_to}, got {}",
-            left_batch.current_snapshot_id
+    let connector_context = refresh_connector_context(ctx)?;
+    let (left_admission, _) = observe_and_admit_change_window_for_table(
+        state,
+        left_ref,
+        left_from,
+        left_to,
+        connector_context,
+    )?;
+    let (right_admission, _) = observe_and_admit_change_window_for_table(
+        state,
+        right_ref,
+        right_from,
+        right_to,
+        connector_context,
+    )?;
+    let left_facts = admitted_change_facts(&left_admission).map_err(|reason| {
+        format!(
+            "join MV legacy execution requires frontend full-rebuild preparation for {}: {reason}",
+            left_ref.fqn()
         )
-        .into());
-    }
-    if right_batch.current_snapshot_id != right_to {
-        return Err(format!(
-            "join MV right change batch snapshot mismatch: expected {right_to}, got {}",
-            right_batch.current_snapshot_id
+    })?;
+    let right_facts = admitted_change_facts(&right_admission).map_err(|reason| {
+        format!(
+            "join MV legacy execution requires frontend full-rebuild preparation for {}: {reason}",
+            right_ref.fqn()
         )
-        .into());
-    }
-    let left_has_delete_changes = iceberg_change_batch_has_row_deletes(&left_batch);
-    let right_has_delete_changes = iceberg_change_batch_has_row_deletes(&right_batch);
-    let left_has_changes = !left_batch.inserts.is_empty() || left_has_delete_changes;
-    let right_has_changes = !right_batch.inserts.is_empty() || right_has_delete_changes;
+    })?;
+    let left_has_changes = left_facts.has_inserts || left_facts.has_deletes;
+    let right_has_changes = right_facts.has_inserts || right_facts.has_deletes;
     let branches = crate::engine::mv::iceberg_join_branch::plan_join_delta_branches(
         left_ref,
         right_ref,
@@ -15733,7 +15741,7 @@ fn incremental_refresh_iceberg_join_mv(
     let mode = if ctx.rewrite.schema_contract.aggregate.is_some() {
         JoinIncrementalRefreshMode::Coalesce
     } else {
-        select_join_incremental_refresh_mode(left_has_delete_changes, right_has_delete_changes)
+        select_join_incremental_refresh_mode(left_facts.has_deletes, right_facts.has_deletes)
     };
     execute_join_delta_branches_logical(state, ctx, mode, branches)
 }
@@ -17650,17 +17658,24 @@ fn incremental_refresh_iceberg_mv(
     base_ref: &TableIdentity,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
-    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_table_uuid: &str,
     full_rebuild_select: FullRebuildSelectPreparation<'_>,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
+    let connector_context = refresh_connector_context(ctx)?;
+    let (admission, _) = observe_and_admit_change_window_for_table(
+        state,
+        base_ref,
+        previous_snapshot_id,
+        current_snapshot_id,
+        connector_context,
+    )?;
     let change = NonJoinBaseChange {
         base_ref,
         previous_snapshot_id,
         current_snapshot_id,
-        base_table,
         current_table_uuid,
+        admission,
     };
     incremental_refresh_iceberg_mv_with_changes(
         state,

@@ -17,7 +17,7 @@
 
 //! Position-delete reverse projection for IVM Phase 2.
 //!
-//! Reads `PositionDeleteRef`s produced by `plan_changes` and, for each
+//! Reads `PositionDeleteRef`s produced by provider change-window planning and, for each
 //! deleted `(data_file, pos)` pair, projects the *original* base row
 //! out of the source data file. The output is a `Vec<RecordBatch>` of
 //! the deleted rows in the base table's full schema, ready for WHERE
@@ -38,7 +38,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use roaring::RoaringTreemap;
 
-use crate::connector::iceberg::changes::{ChangeError, PositionDeleteRef};
+use novarocks_connector_iceberg::delta::{ChangeError, PositionDeleteRef};
 
 /// Constants matching the iceberg position-delete file schema (file_path, pos).
 const FILE_PATH_COLUMN: &str = "file_path";
@@ -1168,8 +1168,8 @@ mod tests {
         read_delete_positions_per_data_file, read_dv_positions_per_data_file, scan_deletes,
         scan_deletes_with_base_row_id_lookup, scan_deletes_with_path_normalizer,
     };
-    use crate::connector::iceberg::changes::PositionDeleteRef;
     use crate::connector::iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
+    use novarocks_connector_iceberg::delta::PositionDeleteRef;
 
     fn write_data_parquet(path: &std::path::Path, ids: &[i32], names: &[&str]) {
         let schema = Arc::new(Schema::new(vec![
@@ -1658,7 +1658,7 @@ mod tests {
                 path.strip_prefix("s3://lake/")
                     .map(|relative| relative.to_string())
                     .ok_or_else(|| {
-                        crate::connector::iceberg::changes::ChangeError::InternalInconsistency(
+                        novarocks_connector_iceberg::delta::ChangeError::InternalInconsistency(
                             format!("unexpected object-store path: {path}"),
                         )
                     })

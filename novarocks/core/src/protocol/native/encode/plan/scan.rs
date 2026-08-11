@@ -582,7 +582,10 @@ fn scan_binding_for_source<'a>(
                 matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
             }
             table_model::SqlScanKind::Delta { .. } => {
-                matches!(binding.execution, ResolvedScanExecution::IcebergDelta(_))
+                matches!(
+                    binding.execution,
+                    ResolvedScanExecution::SealedConnectorScan(_)
+                )
             }
             table_model::SqlScanKind::Data { .. }
             | table_model::SqlScanKind::FrozenInputSet { .. }
@@ -629,7 +632,7 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
     match execution {
         ResolvedScanExecution::ConnectorRead => "ConnectorRead",
         ResolvedScanExecution::AdmittedConnectorRead(_) => "AdmittedConnectorRead",
-        ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
+        ResolvedScanExecution::SealedConnectorScan(_) => "SealedConnectorScan",
     }
 }
 

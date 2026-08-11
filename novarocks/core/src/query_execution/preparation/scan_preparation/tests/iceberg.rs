@@ -177,12 +177,16 @@ fn delta_scan_uses_opaque_connector_read() {
         execution: resolved_data_delta(),
     };
 
-    let bindings = prepare_scan_bindings(&plan(root), &registry(Vec::new()), Some(&resolver))
-        .expect("prepare delta scan");
+    let bindings = prepare_scan_bindings(
+        &plan(root),
+        &registry(vec![data_file("s3://bucket/delta.parquet")]),
+        Some(&resolver),
+    )
+    .expect("prepare delta scan");
 
     assert!(matches!(
         bindings.binding(40).expect("binding").execution,
-        ResolvedScanExecution::IcebergDelta(_)
+        ResolvedScanExecution::SealedConnectorScan(_)
     ));
     assert!(
         bindings
@@ -198,7 +202,7 @@ fn delta_scan_uses_opaque_connector_read() {
         "iceberg"
     );
     assert_eq!(planned.splits.len(), 1);
-    assert_eq!(planned.splits[0].split_id(), "delta-0");
+    assert_eq!(planned.splits[0].split_id(), "fixture-0");
 }
 
 #[test]

@@ -312,7 +312,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             mv_target_read: None,
             write_target_admission: None,
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-            delta_runtime_plans: std::collections::BTreeMap::new(),
+            admitted_change_scans: std::collections::BTreeMap::new(),
         })
     }
 }

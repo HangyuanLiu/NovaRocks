@@ -28,10 +28,9 @@ use novarocks_spi::connector::{
 
 use super::*;
 use crate::protocol::native::encode::plan as native_plan;
-use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergDeltaScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
-    ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
+    ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumn,
+    ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
@@ -67,14 +66,9 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
     bindings
         .insert_binding(ResolvedScanBinding {
             node_id: 10,
-            execution: ResolvedScanExecution::IcebergDelta(ResolvedIcebergDeltaScan {
-                runtime_plan: IcebergDeltaScanRuntimePlan {
-                    table_location: "s3://prepared/orders".to_string(),
-                    data_columns: Vec::new(),
-                    change_files: Vec::new(),
-                    delete_side: None,
-                },
-            }),
+            execution: ResolvedScanExecution::SealedConnectorScan(
+                crate::query_execution::preparation::scan::fixture_sealed_change_scan("ice", 6, 7),
+            ),
             physical_columns: vec![ResolvedScanColumn {
                 planner: output_column(1, "bound_order_id", DataType::Int64),
                 source: source_column.clone(),
@@ -649,14 +643,9 @@ fn file_binding_for_test(
 fn delta_binding_for_test(node_id: i32) -> ResolvedScanBinding {
     ResolvedScanBinding {
         node_id,
-        execution: ResolvedScanExecution::IcebergDelta(ResolvedIcebergDeltaScan {
-            runtime_plan: IcebergDeltaScanRuntimePlan {
-                table_location: "s3://prepared/orders".to_string(),
-                data_columns: Vec::new(),
-                change_files: Vec::new(),
-                delete_side: None,
-            },
-        }),
+        execution: ResolvedScanExecution::SealedConnectorScan(
+            crate::query_execution::preparation::scan::fixture_sealed_change_scan("ice", 6, 7),
+        ),
         physical_columns: vec![bound_column_for_test(
             1,
             "order_id",

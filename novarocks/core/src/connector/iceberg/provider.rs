@@ -32,10 +32,11 @@ use novarocks_catalog::schema::SqlType;
 use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, TableMetadata, Type};
 use novarocks_connector_iceberg::iceberg::transaction::{ApplyTransactionAction, Transaction};
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationOperation,
-    ConnectorCatalogMutationReceipt, ConnectorCatalogMutationReconcileRequest,
-    ConnectorCatalogMutationRequest, ConnectorColumnAggregation, ConnectorColumnDefinition,
-    ConnectorCommittedVersion, ConnectorControlBinding, ConnectorDataType, ConnectorDefaultValue,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCatalogMutation,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
+    ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
+    ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorCommittedVersion,
+    ConnectorControlBinding, ConnectorDataType, ConnectorDefaultValue,
     ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
@@ -7864,25 +7865,6 @@ pub(crate) fn freeze_mv_target_reads(
     Ok((full, affected))
 }
 
-/// Freeze a delta snapshot window while the provider still owns the concrete
-/// Iceberg table identity.  The application receives only the resulting
-/// query-local runtime plan and never reads the provider table descriptor.
-pub(crate) fn freeze_delta_runtime_plan_from_materialization(
-    materialization: &IcebergQueryTableMaterialization,
-    entry: &super::catalog::IcebergCatalogEntry,
-    loaded: &novarocks_connector_iceberg::iceberg::table::Table,
-    from_snapshot_id: i64,
-    to_snapshot_id: i64,
-) -> Result<crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan, String> {
-    crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(
-        &materialization.table,
-        entry,
-        loaded,
-        from_snapshot_id,
-        to_snapshot_id,
-    )
-}
-
 pub(crate) fn filter_frozen_mv_target_state_files(
     files: Vec<IcebergDataFileInfo>,
     filter: &crate::mv::model::TargetPartitionFilter,
@@ -8759,99 +8741,6 @@ fn plan_native_iceberg_read_with_bound_lease(
             .expect("batch bytes are nonzero"),
         },
     })
-}
-
-/// Plan snapshot-delta physical reads as ordinary opaque Iceberg connector
-/// splits.  Delta retains its logical planner identity; no native carrier or
-/// core scan operator receives a role-specific file/deletion payload.
-/// Equivalent to [`plan_native_iceberg_delta_read`] but uses the exact
-/// metadata lease already retained by the query binding store.
-pub(crate) fn plan_native_iceberg_delta_read_with_lease(
-    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &ConnectorTableHandle,
-    sources: &[novarocks_connector_iceberg::delta::DeltaSourceFile],
-    delete_side: Option<&novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
-    target_parallelism: NonZeroUsize,
-    max_split_bytes: Option<NonZeroU64>,
-) -> Result<PlannedIcebergConnectorRead, String> {
-    let table_payload: TablePayload = decode_payload(table.payload(), "Iceberg delta table handle")
-        .map_err(|error| error.to_string())?;
-    let table = table_payload
-        .table_info
-        .ok_or_else(|| "Iceberg delta table handle is missing its table descriptor".to_string())?;
-    let mut planned = plan_native_iceberg_read_with_lease(
-        lease,
-        context.clone(),
-        &table,
-        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-        &[],
-        &[],
-        Vec::new(),
-        target_parallelism,
-        max_split_bytes,
-    )?;
-    let owner = planned.declaration.descriptor().instance_id.clone();
-    let incarnation = planned.declaration.incarnation().to_bytes();
-    let mut total_payload_bytes = 0usize;
-    let mut splits = Vec::with_capacity(sources.len());
-    for (index, source) in sources.iter().cloned().enumerate() {
-        let data_file = IcebergDataFileInfo {
-            path: source.path.clone(),
-            size: source.size,
-            row_count: None,
-            column_stats: None,
-            partition_spec_id: source.partition_spec_id,
-            partition_key: source.partition_key.clone(),
-            first_row_id: source.first_row_id,
-            data_sequence_number: source.data_sequence_number,
-            ivm_change_op: None,
-            included_positions: None,
-            delete_files: Vec::new(),
-            manifest_path: None,
-            partition_values: Vec::new(),
-        };
-        let estimated_bytes = u64::try_from(data_file.size)
-            .map_err(|_| "Iceberg delta source has a negative size".to_string())?;
-        let payload = SplitPayload {
-            version: ICEBERG_SPLIT_V5,
-            owner_instance_id: owner.as_str().to_string(),
-            incarnation,
-            namespace: table.namespace.clone(),
-            table: table.table.clone(),
-            snapshot_id: table.current_snapshot_id,
-            table_uuid: table.table_uuid.clone(),
-            schema_id: Some(table.schema_id),
-            units: vec![IcebergFrozenScanUnitPayload {
-                data_file,
-                row_groups: None,
-                estimated_bytes: Some(estimated_bytes),
-            }],
-            projection: Vec::new(),
-            limit: None,
-            physical_predicates: Vec::new(),
-            fact_columns: Vec::new(),
-            name_mapping: None,
-            delta: Some(IcebergDeltaSplitPayload {
-                source,
-                delete_side: delete_side.cloned(),
-            }),
-            distributed_rewrite_position: None,
-            metadata: None,
-        };
-        push_split_with_budget(
-            &mut splits,
-            &mut total_payload_bytes,
-            owner.clone(),
-            format!("delta-{index}"),
-            &payload,
-            Some(estimated_bytes),
-            &context,
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    planned.splits = splits;
-    Ok(planned)
 }
 
 pub(crate) struct PlannedIcebergConnectorRead {
@@ -10521,6 +10410,55 @@ pub(crate) fn fixture_planning_lease(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_change_window_scan(
+    catalog: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> novarocks_spi::connector::ConnectorScan {
+    let lease = fixture_planning_lease(catalog);
+    let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture connector instance ID");
+    let context = crate::connector::test_request_context();
+    let metadata = lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        })
+        .expect("fixture table metadata");
+    lease
+        .binding()
+        .planning()
+        .begin_scan(
+            &metadata.table,
+            ConnectorBeginScanRequest {
+                projection: Vec::new(),
+                static_predicates: Vec::new(),
+                selection: ConnectorScanSelection::ChangeWindow(
+                    novarocks_spi::connector::ConnectorChangeWindow::new(
+                        from_snapshot_id,
+                        to_snapshot_id,
+                    ),
+                ),
+                purpose: ConnectorReadPurpose::Query,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: std::num::NonZeroUsize::new(4096).expect("nonzero rows"),
+                    max_bytes: std::num::NonZeroUsize::new(context.max_handle_payload_bytes())
+                        .expect("nonzero bytes"),
+                },
+                context,
+            },
+        )
+        .expect("fixture change-window scan")
+}
+
 /// A provider-produced neutral admission fixture for Core protocol tests.
 /// Tests may choose a synthetic scan shape, but they must not manufacture an
 /// Iceberg data-file carrier or a provider table handle in Core.
@@ -10712,40 +10650,47 @@ fn planned_table_files_fixture_binding(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let selector = match request.selection {
-                ConnectorScanSelection::Snapshot(selector) => selector,
-                ConnectorScanSelection::ChangeWindow(_) => {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::Unsupported,
-                        "planned-files fixture does not support change-window scans",
-                    ));
-                }
+            let owner = ConnectorExecutionBindingKey {
+                instance_id: self.instance_id.clone(),
+                incarnation: self.incarnation,
             };
-            ConnectorScan::try_new_snapshot(
-                ConnectorExecutionBindingKey {
-                    instance_id: self.instance_id.clone(),
-                    incarnation: self.incarnation,
-                },
-                selector,
-                ConnectorScanHandle::try_new(
-                    self.instance_id.clone(),
-                    encode_payload(
-                        &ScanPayload {
-                            table,
-                            snapshot_id: None,
-                            table_uuid: None,
-                            projection: request.projection,
-                            limit: request.limit,
-                            physical_predicates,
-                            fact_columns: Vec::new(),
-                        },
-                        "fixture scan handle",
-                        request.context.max_handle_payload_bytes(),
-                    )?,
+            let scan_handle = ConnectorScanHandle::try_new(
+                self.instance_id.clone(),
+                encode_payload(
+                    &ScanPayload {
+                        table,
+                        snapshot_id: None,
+                        table_uuid: None,
+                        projection: request.projection,
+                        limit: request.limit,
+                        physical_predicates,
+                        fact_columns: Vec::new(),
+                    },
+                    "fixture scan handle",
+                    request.context.max_handle_payload_bytes(),
                 )?,
-                Arc::new(Schema::new(fields)),
-                predicate_dispositions,
-            )
+            )?;
+            let output_schema = Arc::new(Schema::new(fields));
+            match request.selection {
+                ConnectorScanSelection::Snapshot(selector) => ConnectorScan::try_new_snapshot(
+                    owner,
+                    selector,
+                    scan_handle,
+                    output_schema,
+                    predicate_dispositions,
+                ),
+                ConnectorScanSelection::ChangeWindow(window) => {
+                    ConnectorScan::try_new_change_window(
+                        owner,
+                        window,
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                        scan_handle,
+                        output_schema,
+                        predicate_dispositions,
+                        &request.context,
+                    )
+                }
+            }
         }
 
         fn plan_splits(

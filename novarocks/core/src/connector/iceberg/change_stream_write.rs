@@ -291,7 +291,11 @@ pub(crate) fn position_delete_index_storage_config(
     entry: &IcebergCatalogEntry,
     table_location: &str,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
-    let Some(bucket) = super::changes::expected_object_store_bucket_from_location(table_location)?
+    let Some(bucket) =
+        novarocks_connector_iceberg::delta::expected_object_store_bucket_from_location(
+            table_location,
+        )
+        .map_err(|error| error.to_string())?
     else {
         return Ok(None);
     };
@@ -325,14 +329,18 @@ fn frozen_deletion_vectors_at_snapshot(
         return Ok(HashMap::new());
     };
     let object_store_config = entry.object_store_config();
-    let factory = super::changes::build_factory_for_table(table, object_store_config)?;
-    let expected_bucket = super::changes::expected_object_store_bucket_for_table(table)?;
+    let factory =
+        novarocks_connector_iceberg::delta::build_factory_for_table(table, object_store_config)
+            .map_err(|error| error.to_string())?;
+    let expected_bucket =
+        novarocks_connector_iceberg::delta::expected_object_store_bucket_for_table(table)
+            .map_err(|error| error.to_string())?;
     let positions = super::scan_deletes::previously_deleted_positions_at_snapshot(
         table,
         snapshot_id,
         &factory,
         &|path| {
-            super::changes::normalize_delete_projection_path(
+            novarocks_connector_iceberg::delta::normalize_delete_projection_path(
                 path,
                 object_store_config,
                 expected_bucket.as_deref(),

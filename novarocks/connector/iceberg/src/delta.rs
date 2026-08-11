@@ -315,6 +315,111 @@ impl PositionDeleteRef {
     }
 }
 
+/// Build a filesystem access handle for provider-owned delta files at a table
+/// location. Callers must pass process-local object-store configuration; no
+/// credential is carried by a scan or split payload.
+pub fn build_factory_for_table_location(
+    location: &str,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+) -> Result<novarocks_fs::FsAccessHandle, ChangeError> {
+    crate::fs_io::reader_factory_for_table_location(location, object_store_config).map_err(
+        |error| {
+            ChangeError::InternalInconsistency(format!(
+                "build iceberg table reader factory for {location}: {error}"
+            ))
+        },
+    )
+}
+
+pub fn expected_object_store_bucket_from_location(
+    location: &str,
+) -> Result<Option<String>, ChangeError> {
+    let location = novarocks_fs::FsAccessResolver::new()
+        .parse_location(location)
+        .map_err(|error| {
+            ChangeError::InternalInconsistency(format!(
+                "parse iceberg table location {location}: {error}"
+            ))
+        })?;
+    if location.scheme() == novarocks_fs::FsScheme::ObjectStore {
+        return location
+            .authority()
+            .map(|bucket| Some(bucket.to_string()))
+            .ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "object-store iceberg table location missing bucket: {}",
+                    location.original()
+                ))
+            });
+    }
+    Ok(None)
+}
+
+pub fn expected_object_store_bucket_for_table(
+    table: &crate::iceberg::table::Table,
+) -> Result<Option<String>, ChangeError> {
+    expected_object_store_bucket_from_location(table.metadata().location())
+}
+
+pub fn build_factory_for_table(
+    table: &crate::iceberg::table::Table,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+) -> Result<novarocks_fs::FsAccessHandle, ChangeError> {
+    build_factory_for_table_location(table.metadata().location(), object_store_config)
+}
+
+pub fn normalize_delete_projection_path(
+    path: &str,
+    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+    expected_object_store_bucket: Option<&str>,
+) -> Result<String, ChangeError> {
+    let parsed = novarocks_fs::FsAccessResolver::new()
+        .parse_location(path)
+        .map_err(|error| {
+            ChangeError::InternalInconsistency(format!(
+                "parse iceberg delete reverse projection path {path}: {error}"
+            ))
+        })?;
+    match parsed.scheme() {
+        novarocks_fs::FsScheme::Local => Ok(parsed.path().to_string()),
+        novarocks_fs::FsScheme::ObjectStore => {
+            let access = crate::fs_io::resolve_access_for_location(path, object_store_config)
+                .map_err(|error| {
+                    ChangeError::InternalInconsistency(format!(
+                        "normalize object-store delete reverse projection path {path}: {error}"
+                    ))
+                })?;
+            let bucket = access.handle().authority().ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "object-store delete reverse projection path {path} missing bucket"
+                ))
+            })?;
+            if let Some(expected) = expected_object_store_bucket
+                && bucket != expected
+            {
+                return Err(ChangeError::InternalInconsistency(format!(
+                    "bucket mismatch for object-store delete reverse projection path {path}: path bucket={bucket} expected bucket={expected}"
+                )));
+            }
+            access
+                .single_relative_path()
+                .map(str::to_string)
+                .map_err(|error| {
+                    ChangeError::InternalInconsistency(format!(
+                        "normalize object-store delete reverse projection path {path}: {error}"
+                    ))
+                })
+        }
+        novarocks_fs::FsScheme::Hdfs => {
+            crate::fs_io::normalize_hdfs_path_parse_only(path).map_err(|error| {
+                ChangeError::InternalInconsistency(format!(
+                    "normalize hdfs delete reverse projection path {path}: {error}"
+                ))
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergChangeBatch {
     pub previous_snapshot_id: i64,
@@ -576,6 +681,29 @@ mod tests {
             IcebergChangePolicySignal::FullRefresh {
                 reason: "previous snapshot is not reachable".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn table_location_bucket_projection_is_provider_owned() {
+        assert_eq!(
+            expected_object_store_bucket_from_location("s3://lake/warehouse/db/orders")
+                .expect("object-store location"),
+            Some("lake".to_string())
+        );
+        assert_eq!(
+            expected_object_store_bucket_from_location("hdfs://namenode:9000/warehouse/db/orders")
+                .expect("HDFS location"),
+            None
+        );
+    }
+
+    #[test]
+    fn local_delete_projection_keeps_the_exact_local_path() {
+        assert_eq!(
+            normalize_delete_projection_path("file:///tmp/orders.parquet", None, None)
+                .expect("local path"),
+            "/tmp/orders.parquet"
         );
     }
 }
