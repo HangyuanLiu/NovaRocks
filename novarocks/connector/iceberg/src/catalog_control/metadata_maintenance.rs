@@ -892,6 +892,122 @@ fn resource_exhausted(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceOperation,
+        ConnectorMetadataMaintenancePlanningRequest, ConnectorProviderId, ConnectorTableHandle,
+    };
+
+    use crate::access_binding::IcebergReadBinding;
+    use crate::catalog_control::IcebergCatalogControlState;
+    use crate::resources::IcebergControlResources;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            1024,
+            4096,
+        )
+        .expect("context")
+    }
+
+    fn adapter() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        IcebergMetadataMaintenanceAdapter,
+        ConnectorExecutionBindingKey,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let runtime = Arc::new(
+            IcebergControlRuntime::try_new(
+                IcebergCatalogControlState::new(configuration),
+                IcebergControlResources::new(binding, executor.handle().clone()),
+            )
+            .expect("control runtime"),
+        );
+        let key = ConnectorExecutionBindingKey {
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        };
+        let adapter =
+            IcebergMetadataMaintenanceAdapter::new(key.clone(), runtime).expect("adapter");
+        (executor, warehouse, adapter, key)
+    }
+
+    fn plan(
+        key: ConnectorExecutionBindingKey,
+        operation_id: ConnectorMutationOperationId,
+        table_payload: &'static [u8],
+    ) -> ConnectorMetadataMaintenancePlan {
+        let table = ConnectorTableHandle::try_new(
+            key.instance_id.clone(),
+            Bytes::from_static(table_payload),
+        )
+        .expect("table handle");
+        let request = ConnectorMetadataMaintenancePlanningRequest::try_new(
+            operation_id,
+            key,
+            ConnectorMetadataMaintenanceOperation::rewrite_metadata_layout(table)
+                .expect("operation"),
+            context(),
+        )
+        .expect("planning request");
+        ConnectorMetadataMaintenancePlan::try_new(
+            &request,
+            [3; 32],
+            ConnectorMetadataMaintenancePlanSummary::new(1, 2, 3, 4, 5),
+            Bytes::from_static(b"provider-plan"),
+        )
+        .expect("plan")
+    }
+
+    fn receipt(
+        adapter: &IcebergMetadataMaintenanceAdapter,
+        plan: &ConnectorMetadataMaintenancePlan,
+    ) -> ConnectorMetadataMaintenanceReceipt {
+        ConnectorMetadataMaintenanceReceipt::try_new(
+            adapter.descriptor.clone(),
+            adapter.key.incarnation,
+            plan.operation_id(),
+            plan.operation_kind(),
+            plan.request_digest(),
+            plan.plan_digest(),
+            plan.state_digest(),
+            ConnectorMetadataMaintenanceReceiptSummary::default(),
+            Bytes::from_static(b"receipt"),
+        )
+        .expect("receipt")
+    }
 
     #[test]
     fn maintenance_hex_codec_is_canonical_and_strict() {
@@ -913,5 +1029,135 @@ mod tests {
         .expect("artifact location");
         assert!(location.starts_with("s3://warehouse/db/table/_novarocks/maintenance/v1/"));
         assert!(location.ends_with("/plan.json"));
+    }
+
+    #[test]
+    fn terminal_replay_preserves_failed_finalization() {
+        let (_executor, _warehouse, adapter, key) = adapter();
+        let plan = plan(key, ConnectorMutationOperationId::new(), b"table-a");
+        let expected_receipt = receipt(&adapter, &plan);
+        let expected_failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "cleanup response was lost",
+        );
+        adapter.terminal.lock().expect("terminal").insert(
+            plan.operation_id(),
+            TerminalRecord {
+                plan_digest: plan.plan_digest(),
+                outcome: ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: expected_receipt.clone(),
+                    finalization: ExternalMutationFinalization::Failed(expected_failure.clone()),
+                },
+            },
+        );
+
+        let outcome = adapter
+            .execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
+                    .expect("execute request"),
+            )
+            .expect("terminal replay");
+        let ExternalMutationOutcome::KnownCommitted {
+            receipt,
+            finalization: ExternalMutationFinalization::Failed(failure),
+            ..
+        } = outcome
+        else {
+            panic!("terminal replay must preserve failed finalization")
+        };
+        assert_eq!(receipt, expected_receipt);
+        assert_eq!(failure.kind(), expected_failure.kind());
+        assert_eq!(failure.message(), expected_failure.message());
+    }
+
+    #[test]
+    fn response_loss_terminal_replay_is_idempotent_and_plan_bound() {
+        let (_executor, _warehouse, adapter, key) = adapter();
+        let operation_id = ConnectorMutationOperationId::new();
+        let exact_plan = plan(key.clone(), operation_id, b"table-a");
+        let evidence = ExternalMutationEvidence::try_new(
+            PAYLOAD_VERSION,
+            adapter.descriptor.clone(),
+            adapter.key.incarnation,
+            operation_id,
+            exact_plan.operation_kind(),
+            Bytes::from_static(b"response-loss-evidence"),
+        )
+        .expect("evidence");
+        adapter.terminal.lock().expect("terminal").insert(
+            operation_id,
+            TerminalRecord {
+                plan_digest: exact_plan.plan_digest(),
+                outcome: ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "commit response was lost",
+                    ),
+                    evidence: evidence.clone(),
+                },
+            },
+        );
+
+        for _ in 0..2 {
+            let outcome = adapter
+                .execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                        exact_plan.clone(),
+                        context(),
+                    )
+                    .expect("execute request"),
+                )
+                .expect("unknown replay");
+            let ExternalMutationOutcome::CommitUnknown {
+                evidence: replayed, ..
+            } = outcome
+            else {
+                panic!("response-loss replay must remain unknown")
+            };
+            assert_eq!(replayed.digest(), evidence.digest());
+        }
+
+        let conflicting = plan(key, operation_id, b"table-b");
+        let error = adapter
+            .execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(conflicting, context())
+                    .expect("execute request"),
+            )
+            .expect_err("same operation with a different plan must conflict");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("conflicts with terminal plan"));
+    }
+
+    #[test]
+    fn foreign_generation_is_rejected_before_catalog_access() {
+        let (_executor, _warehouse, adapter, key) = adapter();
+        let foreign_key = ConnectorExecutionBindingKey {
+            instance_id: key.instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes([8; 16]),
+        };
+        let foreign = plan(
+            foreign_key,
+            ConnectorMutationOperationId::new(),
+            b"foreign-table",
+        );
+        let error = adapter
+            .execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(foreign, context())
+                    .expect("execute request"),
+            )
+            .expect_err("foreign generation must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("exact connector generation"));
+    }
+
+    #[test]
+    fn provider_descriptor_remains_exact_for_terminal_receipts() {
+        let (_executor, _warehouse, adapter, key) = adapter();
+        assert_eq!(
+            adapter.descriptor.provider_id,
+            ConnectorProviderId::parse("iceberg").expect("provider")
+        );
+        assert_eq!(adapter.descriptor.instance_id, key.instance_id);
     }
 }

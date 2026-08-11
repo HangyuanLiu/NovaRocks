@@ -2045,6 +2045,76 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
+    };
+
+    use crate::access_binding::IcebergReadBinding;
+    use crate::catalog_control::IcebergCatalogControlState;
+    use crate::resources::IcebergControlResources;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            1024,
+            4096,
+        )
+        .expect("context")
+    }
+
+    fn provider() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        IcebergControlProvider,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let runtime = Arc::new(
+            IcebergControlRuntime::try_new(
+                IcebergCatalogControlState::new(configuration),
+                IcebergControlResources::new(binding, executor.handle().clone()),
+            )
+            .expect("control runtime"),
+        );
+        let provider = IcebergControlProvider::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            },
+            ConnectorInstanceIncarnation::from_bytes([6; 16]),
+            runtime,
+        );
+        (executor, warehouse, provider)
+    }
 
     fn schema() -> Schema {
         Schema::builder()
@@ -2120,5 +2190,71 @@ mod tests {
         assert!(reserved_property("novarocks.table.key_columns").is_some());
         assert_eq!(reserved_property("novarocks.maintenance.enabled"), None);
         assert_eq!(reserved_property("write.parquet.compression-codec"), None);
+    }
+
+    #[test]
+    fn response_loss_classification_is_narrow() {
+        assert!(commit_may_be_unknown(ConnectorErrorKind::Unavailable));
+        assert!(commit_may_be_unknown(ConnectorErrorKind::Internal));
+        for kind in [
+            ConnectorErrorKind::InvalidRequest,
+            ConnectorErrorKind::NotFound,
+            ConnectorErrorKind::PermissionDenied,
+            ConnectorErrorKind::Unsupported,
+            ConnectorErrorKind::Cancelled,
+            ConnectorErrorKind::DeadlineExceeded,
+            ConnectorErrorKind::ResourceExhausted,
+            ConnectorErrorKind::CorruptData,
+        ] {
+            assert!(!commit_may_be_unknown(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn reconcile_rejects_foreign_incarnation_before_decoding_payload() {
+        let (_executor, _warehouse, provider) = provider();
+        let evidence = ExternalMutationEvidence::try_new(
+            ICEBERG_MUTATION_EVIDENCE_VERSION,
+            provider.descriptor().clone(),
+            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            ConnectorMutationOperationId::new(),
+            "create-table",
+            Bytes::from_static(b"intentionally-not-json"),
+        )
+        .expect("foreign evidence");
+        let error = provider
+            .reconcile(ConnectorCatalogMutationReconcileRequest {
+                evidence,
+                context: context(),
+            })
+            .expect_err("foreign evidence must be rejected before decoding or catalog access");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("does not match this generation"));
+    }
+
+    #[test]
+    fn reconcile_rejects_malformed_exact_generation_evidence() {
+        let (_executor, _warehouse, provider) = provider();
+        let evidence = ExternalMutationEvidence::try_new(
+            ICEBERG_MUTATION_EVIDENCE_VERSION,
+            provider.descriptor().clone(),
+            provider.incarnation(),
+            ConnectorMutationOperationId::new(),
+            "create-table",
+            Bytes::from_static(b"intentionally-not-json"),
+        )
+        .expect("evidence envelope");
+        let error = provider
+            .reconcile(ConnectorCatalogMutationReconcileRequest {
+                evidence,
+                context: context(),
+            })
+            .expect_err("malformed evidence must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            error
+                .to_string()
+                .contains("decode Iceberg mutation evidence")
+        );
     }
 }

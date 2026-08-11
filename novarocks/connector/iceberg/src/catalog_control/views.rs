@@ -398,3 +398,90 @@ fn unavailable(error: String) -> ConnectorError {
     };
     ConnectorError::new(kind, error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::access_binding::IcebergReadBinding;
+    use crate::catalog_control::IcebergCatalogControlState;
+    use crate::resources::IcebergControlResources;
+
+    fn hadoop_runtime() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        IcebergControlRuntime,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let runtime = IcebergControlRuntime::try_new(
+            IcebergCatalogControlState::new(configuration),
+            IcebergControlResources::new(binding, executor.handle().clone()),
+        )
+        .expect("control runtime");
+        (executor, warehouse, runtime)
+    }
+
+    #[test]
+    fn every_view_operation_fails_closed_for_hadoop() {
+        let (_executor, _warehouse, runtime) = hadoop_runtime();
+        let assert_gate = |result: Result<(), String>| {
+            let error = result.expect_err("Hadoop must not expose a view operation");
+            assert!(error.contains("require a REST"), "{error}");
+        };
+
+        assert_gate(create_view(
+            &runtime,
+            "db",
+            "v",
+            &[],
+            "select 1",
+            None,
+            false,
+            &[],
+        ));
+        assert_gate(drop_view(&runtime, "db", "v"));
+        assert_gate(load_view(&runtime, "db", "v").map(|_| ()));
+        assert_gate(view_exists(&runtime, "db", "v").map(|_| ()));
+        assert_gate(list_views(&runtime, "db").map(|_| ()));
+    }
+
+    #[test]
+    fn view_error_mapping_keeps_capability_and_lookup_failures_typed() {
+        assert_eq!(
+            unavailable("view operations require a REST iceberg catalog".to_string()).kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        assert_eq!(
+            unavailable("unsupported SQL dialect: spark".to_string()).kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        assert_eq!(
+            unavailable("unknown view: db.v".to_string()).kind(),
+            ConnectorErrorKind::NotFound
+        );
+        assert_eq!(
+            unavailable("REST response lost".to_string()).kind(),
+            ConnectorErrorKind::Unavailable
+        );
+    }
+}

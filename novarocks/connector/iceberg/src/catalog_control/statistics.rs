@@ -914,6 +914,94 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorProviderId,
+        ConnectorRequestContext,
+    };
+
+    use crate::access_binding::IcebergReadBinding;
+    use crate::catalog_control::IcebergCatalogControlState;
+    use crate::control_runtime::IcebergControlRuntime;
+    use crate::resources::IcebergControlResources;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            1024,
+            4096,
+        )
+        .expect("context")
+    }
+
+    fn provider() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        IcebergControlProvider,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let runtime = Arc::new(
+            IcebergControlRuntime::try_new(
+                IcebergCatalogControlState::new(configuration),
+                IcebergControlResources::new(binding, executor.handle().clone()),
+            )
+            .expect("control runtime"),
+        );
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+        };
+        let provider = IcebergControlProvider::new(
+            descriptor,
+            ConnectorInstanceIncarnation::from_bytes([4; 16]),
+            runtime,
+        );
+        (executor, warehouse, provider)
+    }
+
+    fn table_payload() -> IcebergTablePayload {
+        IcebergTablePayload {
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            table_info: None,
+            metadata_columns: Vec::new(),
+            metadata_table_type: None,
+            prepared_files: Vec::new(),
+            explicit_files: None,
+            logical_type_columns: BTreeMap::new(),
+            hidden_columns: Vec::new(),
+        }
+    }
 
     #[test]
     fn rejects_non_canonical_theta_state() {
@@ -951,5 +1039,81 @@ mod tests {
             ),
             StatisticsMetricState::Missing(_)
         ));
+    }
+
+    #[test]
+    fn response_loss_evidence_is_deterministic_and_exact_generation_bound() {
+        let (_executor, _warehouse, provider) = provider();
+        let operation_id = ConnectorMutationOperationId::new();
+        let data_version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("data version");
+        let first = statistics_evidence(
+            &provider,
+            operation_id,
+            &table_payload(),
+            &data_version,
+            "s3://warehouse/db/t/metadata/stats.puffin",
+        )
+        .expect("evidence");
+        let second = statistics_evidence(
+            &provider,
+            operation_id,
+            &table_payload(),
+            &data_version,
+            "s3://warehouse/db/t/metadata/stats.puffin",
+        )
+        .expect("evidence replay");
+        assert_eq!(first, second);
+        let decoded = decode_statistics_evidence(first.provider_payload()).expect("decode");
+        assert_eq!(decoded.namespace, "db");
+        assert_eq!(decoded.table, "t");
+        assert_eq!(
+            decoded.statistics_path,
+            "s3://warehouse/db/t/metadata/stats.puffin"
+        );
+
+        let foreign = ExternalMutationEvidence::try_new(
+            ICEBERG_STATISTICS_EVIDENCE_VERSION,
+            provider.descriptor().clone(),
+            ConnectorInstanceIncarnation::from_bytes([5; 16]),
+            operation_id,
+            STATISTICS_OPERATION_KIND,
+            first.provider_payload().clone(),
+        )
+        .expect("foreign evidence");
+        let error = provider
+            .reconcile_statistics(StatisticsReconcileRequest {
+                evidence: foreign,
+                context: context(),
+            })
+            .expect_err("foreign generation must be rejected before table access");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("exact generation"));
+    }
+
+    #[test]
+    fn malformed_reconcile_evidence_fails_before_catalog_access() {
+        let (_executor, _warehouse, provider) = provider();
+        let evidence = ExternalMutationEvidence::try_new(
+            ICEBERG_STATISTICS_EVIDENCE_VERSION,
+            provider.descriptor().clone(),
+            provider.incarnation(),
+            ConnectorMutationOperationId::new(),
+            STATISTICS_OPERATION_KIND,
+            Bytes::from_static(b"not-json"),
+        )
+        .expect("evidence envelope");
+        let error = provider
+            .reconcile_statistics(StatisticsReconcileRequest {
+                evidence,
+                context: context(),
+            })
+            .expect_err("malformed evidence must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            error
+                .to_string()
+                .contains("decode Iceberg statistics evidence")
+        );
     }
 }
