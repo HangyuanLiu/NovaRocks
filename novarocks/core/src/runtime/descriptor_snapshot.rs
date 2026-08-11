@@ -19,8 +19,6 @@ use std::collections::HashMap;
 
 use arrow::datatypes::Field;
 
-use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
-use novarocks_execution::exec::node::scan::HdfsScanFileFormat;
 use novarocks_execution::exec::row_position::RowPositionDescriptor;
 use novarocks_execution::exec::row_position::RowPositionType;
 use novarocks_types::SlotId;
@@ -258,16 +256,6 @@ impl DescriptorSnapshot {
 
 pub(crate) fn is_iceberg_v3_row_position(row_position_type: RowPositionType) -> bool {
     row_position_type == RowPositionType::Iceberg
-}
-
-pub(crate) fn lookup_file_format_config(
-    file_format: HdfsScanFileFormat,
-    parquet_cfg: ParquetScanConfig,
-) -> Result<FileFormatConfig, String> {
-    match file_format {
-        HdfsScanFileFormat::Parquet => Ok(FileFormatConfig::Parquet(parquet_cfg)),
-        other => Err(format!("lookup only supports PARQUET, got {:?}", other)),
-    }
 }
 
 #[cfg(test)]

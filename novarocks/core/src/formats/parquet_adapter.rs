@@ -31,10 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
-use arrow::array::{Array, ArrayRef, RecordBatch, StructArray};
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::common::runtime_scan_predicate::{
     RuntimeScanPredicateBindings, RuntimeScanPredicateCounters, RuntimeScanPredicateOptions,
@@ -100,7 +98,6 @@ pub struct ParquetScanConfig {
     pub datacache: DataCacheContext,
     pub cache_policy: ParquetReadCachePolicy,
     pub profile_label: Option<String>,
-    pub iceberg_output_schema: Option<SchemaRef>,
     pub variant_path_columns: Vec<VariantPathSpec>,
     pub query_global_dicts: novarocks_execution::exec::dict_encode::QueryGlobalDictEncodeMap,
 }
@@ -361,9 +358,6 @@ pub(crate) fn foundation_scan_predicates(
     cfg: &ParquetScanConfig,
     runtime_filters: Option<&RuntimeFilterContext>,
 ) -> Result<Vec<novarocks_fs::ScanPredicate>, String> {
-    if cfg.iceberg_output_schema.is_some() {
-        return Ok(Vec::new());
-    }
     let mut predicates =
         min_max_predicates_to_scan_predicates(&cfg.min_max_predicates, ScanPredicateSource::Static);
     if let Some(runtime_filters) = runtime_filters {
@@ -555,201 +549,7 @@ impl ParquetReadCachePolicy {
     }
 }
 
-fn parse_parquet_field_id(field: &Field) -> Result<Option<i32>, String> {
-    let Some(raw) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
-        return Ok(None);
-    };
-    raw.parse::<i32>().map(Some).map_err(|error| {
-        format!(
-            "invalid parquet field_id metadata: field={} key={} value={} error={error}",
-            field.name(),
-            PARQUET_FIELD_ID_META_KEY,
-            raw
-        )
-    })
-}
-
-fn find_matching_field_index(
-    fields: &[FieldRef],
-    target: &Field,
-    case_sensitive: bool,
-) -> Result<Option<usize>, String> {
-    let target_field_id = parse_parquet_field_id(target)?;
-    if let Some(target_field_id) = target_field_id {
-        let mut source_has_field_ids = false;
-        for (index, source) in fields.iter().enumerate() {
-            let source_field_id = parse_parquet_field_id(source.as_ref())?;
-            source_has_field_ids |= source_field_id.is_some();
-            if source_field_id == Some(target_field_id) {
-                return Ok(Some(index));
-            }
-        }
-        if source_has_field_ids {
-            return Ok(None);
-        }
-    }
-    Ok(fields.iter().position(|field| {
-        if case_sensitive {
-            field.name() == target.name()
-        } else {
-            field.name().eq_ignore_ascii_case(target.name())
-        }
-    }))
-}
-
-fn align_iceberg_array_to_field(
-    source_field: &Field,
-    source_array: ArrayRef,
-    target_field: &Field,
-    row_count: usize,
-    case_sensitive: bool,
-) -> Result<ArrayRef, String> {
-    if matches!(target_field.data_type(), DataType::LargeBinary)
-        && is_variant_struct_data_type(source_field.data_type())
-    {
-        return collapse_variant_struct_to_largebinary(&source_array, target_field.name());
-    }
-    match (source_field.data_type(), target_field.data_type()) {
-        (DataType::Struct(source_children), DataType::Struct(target_children)) => {
-            let struct_array = source_array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    format!(
-                        "expected StructArray for iceberg schema evolution column {}",
-                        source_field.name()
-                    )
-                })?;
-            let mut columns = Vec::with_capacity(target_children.len());
-            for target_child in target_children {
-                if let Some(source_index) = find_matching_field_index(
-                    source_children,
-                    target_child.as_ref(),
-                    case_sensitive,
-                )? {
-                    columns.push(align_iceberg_array_to_field(
-                        source_children[source_index].as_ref(),
-                        struct_array.column(source_index).clone(),
-                        target_child.as_ref(),
-                        row_count,
-                        case_sensitive,
-                    )?);
-                } else {
-                    columns.push(
-                        novarocks_connector_iceberg::default_value::build_iceberg_default_array(
-                            target_child.as_ref(),
-                            row_count,
-                        )?,
-                    );
-                }
-            }
-            Ok(Arc::new(
-                StructArray::try_new(
-                    target_children.clone(),
-                    columns,
-                    struct_array.nulls().cloned(),
-                )
-                .map_err(|error| error.to_string())?,
-            ))
-        }
-        _ => {
-            if is_dictionary_string_carrier_for_slot(
-                source_array.data_type(),
-                target_field.data_type(),
-            ) || source_array.data_type() == target_field.data_type()
-            {
-                return Ok(source_array);
-            }
-            let casted =
-                cast(source_array.as_ref(), target_field.data_type()).map_err(|error| {
-                    format!(
-                        "iceberg parquet cast failed for column {} from {:?} to {:?}: {error}",
-                        target_field.name(),
-                        source_array.data_type(),
-                        target_field.data_type()
-                    )
-                })?;
-            if casted.null_count() > source_array.null_count() {
-                return Err(format!(
-                    "iceberg parquet cast introduced nulls for column {} from {:?} to {:?}",
-                    target_field.name(),
-                    source_array.data_type(),
-                    target_field.data_type()
-                ));
-            }
-            Ok(casted)
-        }
-    }
-}
-
-fn iceberg_output_field_for_array(target_field: &Field, array: &ArrayRef) -> Field {
-    let mut field =
-        if is_dictionary_string_carrier_for_slot(array.data_type(), target_field.data_type()) {
-            target_field
-                .clone()
-                .with_data_type(array.data_type().clone())
-        } else {
-            target_field.clone()
-        };
-    if array.null_count() > 0 && !field.is_nullable() {
-        field = field.with_nullable(true);
-    }
-    field
-}
-
-fn align_batch_to_iceberg_schema(
-    output_schema: &SchemaRef,
-    batch: RecordBatch,
-    case_sensitive: bool,
-) -> Result<RecordBatch, String> {
-    let row_count = batch.num_rows();
-    let batch_schema = batch.schema();
-    let mut fields = Vec::with_capacity(output_schema.fields().len());
-    let mut columns = Vec::with_capacity(output_schema.fields().len());
-    for target in output_schema.fields() {
-        if target.name() == "___count___" {
-            if target.data_type() != &DataType::Boolean {
-                return Err(format!(
-                    "iceberg virtual count column expects Boolean type, got {:?}",
-                    target.data_type()
-                ));
-            }
-            fields.push(target.as_ref().clone());
-            columns.push(
-                Arc::new(arrow::array::BooleanArray::from(vec![true; row_count])) as ArrayRef,
-            );
-            continue;
-        }
-        if let Some(source_index) =
-            find_matching_field_index(batch_schema.fields(), target.as_ref(), case_sensitive)?
-        {
-            let array = align_iceberg_array_to_field(
-                batch_schema.field(source_index),
-                batch.column(source_index).clone(),
-                target.as_ref(),
-                row_count,
-                case_sensitive,
-            )?;
-            fields.push(iceberg_output_field_for_array(target.as_ref(), &array));
-            columns.push(array);
-        } else {
-            fields.push(target.as_ref().clone());
-            columns.push(
-                novarocks_connector_iceberg::default_value::build_iceberg_default_array(
-                    target.as_ref(),
-                    row_count,
-                )?,
-            );
-        }
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| error.to_string())
-}
-
 fn reorder_batch(cfg: &ParquetScanConfig, batch: RecordBatch) -> Result<RecordBatch, String> {
-    if let Some(output_schema) = cfg.iceberg_output_schema.as_ref() {
-        return align_batch_to_iceberg_schema(output_schema, batch, cfg.case_sensitive)
-            .and_then(|batch| validate_batch_slot_count(cfg, batch));
-    }
     if cfg.columns.is_empty() {
         return validate_batch_slot_count(cfg, batch);
     }
@@ -814,7 +614,7 @@ fn validate_batch_slot_count(
 #[cfg(test)]
 mod file_read_contract_tests {
     use super::*;
-    use arrow::array::{Int32Array, TimestampMicrosecondArray};
+    use arrow::array::TimestampMicrosecondArray;
     use arrow::datatypes::TimeUnit;
     use std::collections::HashMap;
 
@@ -839,7 +639,6 @@ mod file_read_contract_tests {
             ),
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
             profile_label: None,
-            iceberg_output_schema: None,
             variant_path_columns: Vec::new(),
             query_global_dicts: HashMap::new(),
         }
@@ -865,41 +664,7 @@ mod file_read_contract_tests {
     }
 
     #[test]
-    fn file_read_schema_adapter_materializes_defaults_and_retags_timestamps() {
-        let input = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("a", DataType::Int32, true).with_metadata(HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    "1".to_string(),
-                )])),
-            ])),
-            vec![Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef],
-        )
-        .expect("input batch");
-        let output_schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, true).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-            Field::new("b", DataType::Int32, true).with_metadata(HashMap::from([
-                (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
-                (
-                    novarocks_connector_iceberg::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY
-                        .to_string(),
-                    "99".to_string(),
-                ),
-            ])),
-        ]));
-        let output =
-            align_batch_to_iceberg_schema(&output_schema, input, true).expect("align schema");
-        let defaulted = output
-            .column_by_name("b")
-            .expect("defaulted column")
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("int32 default");
-        assert_eq!(defaulted.values(), &[99, 99]);
-
+    fn file_read_schema_adapter_retags_timestamps() {
         let target_type = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
         let target_schema = Schema::new(vec![Field::new("ts", target_type.clone(), true)]);
         let chunk_schema =
