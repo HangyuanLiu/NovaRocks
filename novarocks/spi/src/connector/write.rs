@@ -586,6 +586,10 @@ impl ConnectorWritePreparation {
     }
 }
 
+// Boxing the prepared variant would only hide the cost behind a pointer on a
+// control-plane value built once per write admission, and would change a frozen
+// SPI shape that providers and Core both match on.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ConnectorWritePreparationOutcome {
     Prepared(ConnectorWritePreparation),
@@ -595,6 +599,10 @@ pub enum ConnectorWritePreparationOutcome {
 /// The signed admission evidence consumed by the exact-generation activation
 /// transition.  The tagged form prevents callers from smuggling a row plan
 /// through the ordinary preparation path.
+// The tagged shape is the contract: see the doc comment above. Boxing a variant
+// to equalize sizes would obscure it for no runtime benefit on a per-admission
+// value.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ConnectorWriteActivationSource {
     Prepared(ConnectorWritePreparation),
@@ -2240,21 +2248,20 @@ impl ConnectorWriteLease {
                 ));
             }
         }
-        if let Some((sealed, recipes)) = plan.copy_on_write() {
-            if sealed.operation_id() != preparation.operation_id()
+        if let Some((sealed, recipes)) = plan.copy_on_write()
+            && (sealed.operation_id() != preparation.operation_id()
                 || recipes.len() != sealed.cohorts().len()
                 || plan.routes().iter().any(|route| {
                     !sealed
                         .cohorts()
                         .iter()
                         .any(|cohort| cohort.cohort_id() == route.cohort_id())
-                })
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "copy-on-write activation does not seal exactly its operation cohorts",
-                ));
-            }
+                }))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "copy-on-write activation does not seal exactly its operation cohorts",
+            ));
         }
         Ok(plan)
     }

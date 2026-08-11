@@ -1465,14 +1465,15 @@ mod tests {
         }
     }
 
+    /// Shared operation table a poisoning fake re-enters to simulate a lease
+    /// that observes its own in-flight state.
+    type SharedOperations =
+        Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, LeaseOperationState>>>;
+
     struct PoisoningCapability {
         inner: FakeCapability,
-        poison_on_plan_write: Mutex<
-            Option<Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, LeaseOperationState>>>>,
-        >,
-        poison_on_abort: Mutex<
-            Option<Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, LeaseOperationState>>>>,
-        >,
+        poison_on_plan_write: Mutex<Option<SharedOperations>>,
+        poison_on_abort: Mutex<Option<SharedOperations>>,
     }
 
     impl ConnectorStagedCreate for PoisoningCapability {
