@@ -2805,6 +2805,58 @@ fn validate_fault_injection_jobs(cases: &[SqlCase], jobs: usize) -> Result<()> {
     Ok(())
 }
 
+/// SQL that drives a row-level DML operation through the frontend's coordination
+/// journal.
+///
+/// Detection is deliberately textual and generous: this gates parallelism, so a
+/// false positive costs wall-clock while a false negative costs a flaky suite.
+fn statement_starts_dml_operation(sql: &str) -> bool {
+    let mut head = sql.trim_start();
+    // Skip line comments, which every case in these suites opens with.
+    while let Some(rest) = head.strip_prefix("--") {
+        head = match rest.find('\n') {
+            Some(idx) => rest[idx + 1..].trim_start(),
+            None => "",
+        };
+    }
+    let head = head.to_ascii_uppercase();
+    ["DELETE ", "UPDATE ", "MERGE ", "INSERT ", "ALTER TABLE "]
+        .iter()
+        .any(|prefix| head.starts_with(prefix))
+}
+
+fn cases_start_dml_operations(cases: &[SqlCase]) -> bool {
+    cases
+        .iter()
+        .flat_map(|case| case.steps.iter())
+        .any(|step| statement_starts_dml_operation(&step.sql))
+}
+
+/// Reject parallel jobs for DML suites on a shared cross-process cluster.
+///
+/// One frontend owns one coordination journal. Two DML operations admitted
+/// concurrently contend for the same coordination lease, and the loser surfaces
+/// as `CoordinationUnresolved: OperationNotCommitted` on whichever case happened
+/// to lose. That is indistinguishable from a real failure in the report, and it
+/// moves between cases from run to run, so a suite that is actually stable looks
+/// intermittently broken. Measured on `iceberg-dml` at 1FE+3BE: 4 to 12 failures
+/// per run with the default job count and none of them reproducible, against 6
+/// stable failures with `-j 1`.
+///
+/// This is the same reasoning as the fault-injection guard above: when a suite
+/// mutates shared cluster state, serial execution is a correctness requirement
+/// for the report, not a performance preference.
+fn validate_dml_cluster_jobs(cases: &[SqlCase], jobs: usize, mode: ClusterMode) -> Result<()> {
+    if jobs != 1 && mode == ClusterMode::CrossProcess && cases_start_dml_operations(cases) {
+        bail!(
+            "row-DML suites require -j 1 on a cross-process cluster because concurrent operations \
+             contend for one frontend's coordination lease and report the loser as \
+             CoordinationUnresolved"
+        );
+    }
+    Ok(())
+}
+
 fn restart_frontend_after_step(
     step: &SqlStep,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
@@ -3399,6 +3451,11 @@ fn run() -> Result<i32> {
                 return Ok(1);
             }
 
+            if let Err(exc) = validate_dml_cluster_jobs(&cases, jobs, selected_cluster_mode) {
+                println!("❌ ERROR: {}", exc);
+                return Ok(1);
+            }
+
             if matches!(cli.mode, Mode::Verify | Mode::Record) && result_dir.is_none() {
                 println!(
                     "❌ ERROR: result_dir is required for verify/record mode (suite {})",
@@ -3712,7 +3769,8 @@ mod tests {
         execute_target_session_sql_with,
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
-        validate_fault_injection_jobs, validate_selected_suite_cluster,
+        statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
+        validate_selected_suite_cluster,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3768,6 +3826,72 @@ mod tests {
             case_dbs: vec![],
             sequential: false,
         }
+    }
+
+    fn test_case_with_sql(sql: &str) -> SqlCase {
+        SqlCase {
+            source_file: PathBuf::from("dml.sql"),
+            case_id: "dml_case".to_string(),
+            steps: vec![SqlStep {
+                query_number: 1,
+                sql: sql.to_string(),
+                meta: QueryMeta::default(),
+            }],
+            case_dbs: vec![],
+            sequential: false,
+        }
+    }
+
+    #[test]
+    fn dml_statements_are_recognized_through_leading_comments() {
+        for sql in [
+            "DELETE FROM t WHERE id = 1",
+            "  update t set v = 1",
+            "-- a comment\nMERGE INTO t USING s ON t.id = s.id",
+            "-- one\n-- two\nINSERT INTO t VALUES (1)",
+            "ALTER TABLE t ADD EQUALITY DELETE (id) VALUES (1)",
+        ] {
+            assert!(
+                statement_starts_dml_operation(sql),
+                "should be treated as DML: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT 1",
+            "-- delete is only mentioned here\nSELECT * FROM t",
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE IF EXISTS t",
+        ] {
+            assert!(
+                !statement_starts_dml_operation(sql),
+                "should not be treated as DML: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn dml_suites_require_serial_jobs_on_a_cross_process_cluster() {
+        let dml = vec![test_case_with_sql("DELETE FROM t WHERE id = 1")];
+
+        let err = validate_dml_cluster_jobs(&dml, 4, ClusterMode::CrossProcess)
+            .expect_err("parallel DML on a shared cluster must be rejected");
+        assert!(
+            err.to_string().contains("CoordinationUnresolved"),
+            "the error should name the symptom it prevents: {err}"
+        );
+
+        validate_dml_cluster_jobs(&dml, 1, ClusterMode::CrossProcess)
+            .expect("serial jobs are the supported way to run a DML suite");
+        // Only the shared cross-process cluster has one coordination journal to
+        // contend over; all-in-one runs get their own.
+        validate_dml_cluster_jobs(&dml, 4, ClusterMode::AllInOne)
+            .expect("all-in-one has no shared journal to contend over");
+        validate_dml_cluster_jobs(
+            &[test_case_with_sql("SELECT 1")],
+            8,
+            ClusterMode::CrossProcess,
+        )
+        .expect("read-only suites stay parallel");
     }
 
     #[test]
