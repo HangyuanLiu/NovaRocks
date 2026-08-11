@@ -2823,10 +2823,11 @@ enable_path_style_access = true
 "#
     );
     let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
             &state_store_path,
             &metadata_path,
             cluster_id,
+            &be_object_store,
             &be_object_store,
         );
 
@@ -3184,10 +3185,11 @@ enable_path_style_access = true
 "#
     );
     let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
             &state_store_path,
             &metadata_path,
             cluster_id,
+            &be_object_store,
             &be_object_store,
         );
 
@@ -3317,10 +3319,11 @@ enable_path_style_access = true
 "#
     );
     let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
             &state_store_path,
             &metadata_path,
             cluster_id,
+            &be_object_store,
             &be_object_store,
         );
     let mut conn = connect_mysql(cluster.fe_mysql_port());
