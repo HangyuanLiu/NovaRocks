@@ -18,10 +18,9 @@
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
-use novarocks_fs::ObjectStoreConfig;
+use tracing::warn;
 
-use crate::novarocks_config::config as novarocks_app_config;
-use crate::novarocks_logging::warn;
+use crate::access::ObjectStoreConfig;
 
 /// Runtime retry overrides applied to connector-neutral filesystem resources.
 ///
@@ -67,20 +66,11 @@ impl ObjectStoreRetrySettings {
         settings
     }
 
-    fn from_runtime_config() -> Self {
-        novarocks_app_config()
-            .ok()
-            .map(|cfg| Self {
-                retry_max_times: cfg.runtime.object_storage.retry_max_times,
-                retry_min_delay_ms: cfg.runtime.object_storage.retry_min_delay_ms,
-                retry_max_delay_ms: cfg.runtime.object_storage.retry_max_delay_ms,
-                timeout_ms: cfg.runtime.object_storage.timeout_ms,
-                io_timeout_ms: cfg.runtime.object_storage.io_timeout_ms,
-            })
-            .unwrap_or_default()
-    }
-
-    fn apply_if_absent(&self, cfg: &mut ObjectStoreConfig) {
+    /// Fill in any retry knob the caller left unset.
+    ///
+    /// The values come from the caller's application configuration; this crate
+    /// deliberately owns no configuration source of its own.
+    pub fn apply_if_absent(&self, cfg: &mut ObjectStoreConfig) {
         if cfg.retry_max_times.is_none() {
             cfg.retry_max_times = self.retry_max_times;
         }
@@ -97,10 +87,6 @@ impl ObjectStoreRetrySettings {
             cfg.io_timeout_ms = self.io_timeout_ms;
         }
     }
-}
-
-pub fn apply_object_store_runtime_defaults(cfg: &mut ObjectStoreConfig) {
-    ObjectStoreRetrySettings::from_runtime_config().apply_if_absent(cfg);
 }
 
 fn first_nonempty_property<'a, S>(

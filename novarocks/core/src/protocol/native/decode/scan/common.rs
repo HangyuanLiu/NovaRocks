@@ -325,16 +325,16 @@ pub(super) fn resolve_native_connector_object_store_config(
     cloud_properties: &HashMap<String, String>,
 ) -> Result<Option<ObjectStoreConfig>, NativeFragmentLeafDecodeError> {
     reject_native_connector_cloud_properties(cloud_properties)?;
-    crate::common::app_config::config()
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "connector.object_store",
-                error,
-            )
-        })?
+    let config = crate::common::app_config::config().map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "connector.object_store",
+            error,
+        )
+    })?;
+    config
         .connector
-        .object_store_config()
+        .object_store_config(&config.runtime.object_storage.retry_settings())
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InvalidValue,

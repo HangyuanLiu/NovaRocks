@@ -385,9 +385,12 @@ pub fn compose_connector_file_planning_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FsAccessResources> {
-    let object_store = config.connector.object_store_config().map_err(|error| {
-        anyhow::anyhow!("resolve connector startup object-store binding: {error}")
-    })?;
+    let object_store = config
+        .connector
+        .object_store_config(&config.runtime.object_storage.retry_settings())
+        .map_err(|error| {
+            anyhow::anyhow!("resolve connector startup object-store binding: {error}")
+        })?;
     Ok(FsAccessResources::new(
         object_store,
         FsAccessResolver::new(),

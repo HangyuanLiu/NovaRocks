@@ -32,6 +32,7 @@ opendal = { version = "0.55", features = ["services-oss", "services-fs", "servic
 orc-rust = { version = "0.8.0", default-features = false }
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 url = "2"
 

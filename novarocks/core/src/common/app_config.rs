@@ -454,22 +454,32 @@ pub struct ConnectorConfig {
 }
 
 impl ConnectorConfig {
+    /// Project the `[connector.object_store]` credentials onto a neutral
+    /// filesystem config, filling unset retry knobs from `retry`.
+    ///
+    /// The retry defaults arrive as an argument rather than being read from a
+    /// process-global config, so that `novarocks-fs` owns no configuration
+    /// source of its own.
     pub fn object_store_config(
         &self,
+        retry: &novarocks_fs::ObjectStoreRetrySettings,
     ) -> std::result::Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
         let Some(object_store) = self.object_store.as_ref() else {
             return Ok(None);
         };
-        let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::ConnectorStartupConfig,
+        let credentials = novarocks_fs::ObjectStoreCredentials::from_parts(
+            novarocks_fs::ObjectStoreCredentialsSource::ConnectorStartupConfig,
             object_store.endpoint.as_deref().unwrap_or_default(),
             object_store.access_key_id.as_deref().unwrap_or_default(),
-            object_store.access_key_secret.as_deref().unwrap_or_default(),
+            object_store
+                .access_key_secret
+                .as_deref()
+                .unwrap_or_default(),
             object_store.region.as_deref(),
             object_store.enable_path_style_access,
         )?;
         let mut config = credentials.to_object_store_config();
-        crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
+        retry.apply_if_absent(&mut config);
         Ok(Some(config))
     }
 }
@@ -759,6 +769,19 @@ pub struct ObjectStorageConfig {
     pub retry_log_summary_interval_ms: u64,
     #[serde(default = "default_object_storage_retry_log_first_n")]
     pub retry_log_first_n: u32,
+}
+
+impl ObjectStorageConfig {
+    /// The retry knobs this section contributes to filesystem resources.
+    pub fn retry_settings(&self) -> novarocks_fs::ObjectStoreRetrySettings {
+        novarocks_fs::ObjectStoreRetrySettings {
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]

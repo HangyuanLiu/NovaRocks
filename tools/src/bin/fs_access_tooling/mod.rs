@@ -17,10 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::fs::object_store_credentials::{
-    ObjectStoreCredentials, ObjectStoreCredentialsSource,
+use novarocks_fs::{
+    FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig, ObjectStoreCredentials,
+    ObjectStoreCredentialsSource,
 };
-use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig};
 
 pub fn object_store_config_from_fs_options(
     fs_options: &BTreeMap<String, String>,

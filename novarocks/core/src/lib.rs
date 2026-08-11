@@ -21,7 +21,6 @@ pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;
 pub mod engine;
-pub mod fs;
 pub mod meta;
 pub mod mv;
 pub mod protocol;
