@@ -10437,6 +10437,103 @@ mod tests {
             "unexpected planning error: {error}"
         );
     }
+
+    fn frozen_target_data_file(path: &str) -> IcebergDataFileInfo {
+        IcebergDataFileInfo {
+            path: path.to_string(),
+            size: 128,
+            row_count: Some(10),
+            column_stats: None,
+            partition_spec_id: Some(0),
+            partition_key: Some("Struct([])".to_string()),
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: Vec::new(),
+            manifest_path: None,
+            partition_values: Vec::new(),
+        }
+    }
+
+    fn frozen_target_identity_partition_file(path: &str, id: i32) -> IcebergDataFileInfo {
+        use novarocks_connector_iceberg::scan_model::{
+            IcebergPartitionFieldValue, IcebergPartitionValue,
+        };
+
+        let mut file = frozen_target_data_file(path);
+        file.partition_key = Some(format!("Struct([{id}])"));
+        file.partition_values = vec![IcebergPartitionFieldValue {
+            source_column: "id".to_string(),
+            field_name: "id".to_string(),
+            transform: "identity".to_string(),
+            value: Some(IcebergPartitionValue::Int32(id)),
+        }];
+        file
+    }
+
+    /// Relocated from `scan_preparation/tests/iceberg.rs`, which drove
+    /// [`filter_frozen_mv_target_state_files`] directly without ever entering
+    /// scan preparation. The filter is Iceberg-typed production code, so no
+    /// neutral fact can express these cases; they belong beside it. These two
+    /// remain its only direct coverage.
+    #[test]
+    fn frozen_mv_target_state_reads_only_allow_list_partitions() {
+        use std::collections::BTreeSet;
+
+        use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+        use crate::mv::persistence::schema::{
+            MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+        };
+
+        let mut selected = frozen_target_identity_partition_file("s3://bucket/selected.parquet", 7);
+        selected.partition_spec_id = Some(3);
+        let mut skipped = frozen_target_identity_partition_file("s3://bucket/skipped.parquet", 9);
+        skipped.partition_spec_id = Some(3);
+        let allow_key = MvPartitionKey::new(
+            3,
+            vec![MvPartitionKeyField::new(
+                "id".to_string(),
+                MvPartitionValue::String("7".to_string()),
+            )],
+        );
+        let contract = MvPartitionContract {
+            target_spec_id: 3,
+            fields: vec![MvPartitionFieldContract {
+                partition_field_id: 100,
+                partition_field_name: "id".to_string(),
+                source_target_field_id: 1,
+                source_column_name: "id".to_string(),
+                transform: MvPartitionTransformContract::Identity,
+            }],
+        };
+
+        let files = filter_frozen_mv_target_state_files(
+            vec![selected, skipped],
+            &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::from([allow_key])),
+            Some(&contract),
+            42,
+        )
+        .expect("frozen target-state files should be deterministically pruned");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "s3://bucket/selected.parquet");
+    }
+
+    #[test]
+    fn frozen_mv_target_state_with_empty_allow_list_reads_nothing() {
+        use std::collections::BTreeSet;
+
+        let files = filter_frozen_mv_target_state_files(
+            vec![frozen_target_data_file("s3://bucket/target.parquet")],
+            &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::new()),
+            None,
+            43,
+        )
+        .expect("an empty admitted allow-list is a zero-file scan");
+
+        assert!(files.is_empty());
+    }
 }
 
 #[cfg(test)]

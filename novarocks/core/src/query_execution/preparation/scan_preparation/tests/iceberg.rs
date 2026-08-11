@@ -16,52 +16,33 @@
 // under the License.
 
 use super::*;
+use crate::connector::scan_model::{FixtureColumnStats, FixturePartitionValue};
 
-fn data_file_with_i32_stats(path: &str, min: i32, max: i32) -> IcebergDataFileInfo {
+/// A read unit that carries min/max statistics for `id`. The fixture never
+/// decodes the bounds; they exist so the unit models a statistics-bearing file
+/// whose bytes must survive Core untouched.
+fn data_file_with_i32_stats(path: &str, min: i32, max: i32) -> FixtureScanFile {
     let mut file = data_file(path);
-    file.column_stats = Some(HashMap::from([(
+    file.column_stats = std::collections::BTreeMap::from([(
         "id".to_string(),
-        novarocks_connector_iceberg::scan_model::IcebergColumnStats {
+        FixtureColumnStats {
             null_count: Some(0),
             value_count: Some(10),
-            column_size: None,
             lower_bound: Some(min.to_le_bytes().to_vec()),
             upper_bound: Some(max.to_le_bytes().to_vec()),
         },
-    )]));
+    )]);
     file
 }
 
-fn identity_partition_file(path: &str, id: i32) -> IcebergDataFileInfo {
+fn identity_partition_file(path: &str, id: i32) -> FixtureScanFile {
     let mut file = data_file(path);
-    file.partition_key = Some(format!("Struct([{id}])"));
-    file.partition_values = vec![
-        novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue {
-            source_column: "id".to_string(),
-            field_name: "id".to_string(),
-            transform: "identity".to_string(),
-            value: Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Int32(id)),
-        },
-    ];
+    file.partition_values = vec![FixturePartitionValue {
+        field_name: "id".to_string(),
+        transform: "identity".to_string(),
+        value: Some(id.to_string()),
+    }];
     file
-}
-
-fn position_delete_file(
-    path: &str,
-) -> novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
-    novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
-        path: path.to_string(),
-        file_format: novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
-        file_content: novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position,
-        length: Some(1),
-        content_offset: None,
-        content_size_in_bytes: None,
-        sequence_number: Some(2),
-        partition_spec_id: Some(0),
-        partition_key: Some("Struct([])".to_string()),
-        equality_column_names: Vec::new(),
-        equality_field_ids: Vec::new(),
-    }
 }
 
 fn id_eq(value: i64) -> crate::sql::analysis::TypedExpr {
@@ -108,7 +89,7 @@ fn unsupported_id_predicate() -> crate::sql::analysis::TypedExpr {
 fn planned_data_files(
     bindings: &crate::query_execution::preparation::scan::ScanExecutionBindings,
     node_id: i32,
-) -> Vec<IcebergDataFileInfo> {
+) -> Vec<FixtureScanFile> {
     let planned = bindings
         .connector_read(0, node_id)
         .expect("opaque connector read");
@@ -116,25 +97,33 @@ fn planned_data_files(
         .splits
         .iter()
         .map(|split| {
-            crate::connector::iceberg::provider::planned_split_data_file_for_test(split)
-                .expect("decode test Iceberg split")
+            crate::connector::scan_model::planned_split_file_for_test(split)
+                .expect("decode fixture split")
         })
         .collect()
 }
 
+/// Predicate pushdown must reach the connector while Core keeps the matching
+/// residual and returns the connector's own unit verbatim.
+///
+/// Whether a statistics bound excludes a unit is provider semantics, so the
+/// fixture connector never prunes and this test supplies only the unit a
+/// pruning provider would have selected. The pruning decision itself is
+/// asserted by `connector::iceberg::file_pruning`'s unit tests.
 #[test]
 fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
-    let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
     scan.predicates = vec![id_eq(12)];
     let bindings = prepare_scan_bindings(
         &plan(root),
-        &registry(vec![
-            data_file_with_i32_stats("s3://bucket/id-1-5.parquet", 1, 5),
-            data_file_with_i32_stats("s3://bucket/id-10-20.parquet", 10, 20),
-        ]),
+        &registry(vec![data_file_with_i32_stats(
+            "s3://bucket/id-10-20.parquet",
+            10,
+            20,
+        )]),
         None,
     )
     .expect("prepare pruned scan");
@@ -163,7 +152,7 @@ fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
 
 #[test]
 fn delta_scan_uses_opaque_connector_read() {
-    let mut root = scan_node(40, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(40);
     replace_scan_source(
         &mut root,
         crate::sql::planner::table::test_sql_scan_source(
@@ -199,7 +188,8 @@ fn delta_scan_uses_opaque_connector_read() {
         .expect("delta connector read");
     assert_eq!(
         planned.declaration.descriptor().provider_id.as_str(),
-        "iceberg"
+        "fixture",
+        "the planned read must carry the declaring connector's own provider identity"
     );
     assert_eq!(planned.splits.len(), 1);
     assert_eq!(planned.splits[0].split_id(), "fixture-0");
@@ -207,7 +197,7 @@ fn delta_scan_uses_opaque_connector_read() {
 
 #[test]
 fn explicit_files_plan_opaque_connector_splits() {
-    let plan = plan(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
+    let plan = plan(scan_node(10));
     let bindings = prepare_scan_bindings(
         &plan,
         &registry(vec![data_file("s3://bucket/explicit.parquet")]),
@@ -219,7 +209,7 @@ fn explicit_files_plan_opaque_connector_splits() {
     let planned = bindings.connector_read(0, 10).expect("connector read");
     assert_eq!(
         planned.declaration.descriptor().provider_id.as_str(),
-        "iceberg"
+        "fixture"
     );
     assert_eq!(
         planned.declaration.descriptor().instance_id.as_str(),
@@ -232,7 +222,7 @@ fn explicit_files_plan_opaque_connector_splits() {
 
 #[test]
 fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
-    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("fixture root must be a scan");
     };
@@ -244,11 +234,7 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
     let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
         "s3://bucket/current.parquet",
     )]));
-    let store = fixture_query_table_bindings_with_materialized_files(
-        &plan,
-        &controls,
-        vec![data_file("s3://bucket/snapshot-11.parquet")],
-    );
+    let store = fixture_query_table_bindings(&plan, &controls);
     let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
         panic!("fixture root must remain a scan");
     };
@@ -280,7 +266,7 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
 
 #[test]
 fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
-    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("fixture root must be a scan");
     };
@@ -291,11 +277,7 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
     let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
         "s3://bucket/current.parquet",
     )]));
-    let store = fixture_query_table_bindings_with_materialized_files(
-        &plan(root.clone()),
-        &controls,
-        vec![data_file("s3://bucket/snapshot-11.parquet")],
-    );
+    let store = fixture_query_table_bindings(&plan(root.clone()), &controls);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("fixture root must remain a scan");
     };
@@ -322,19 +304,25 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
     );
 }
 
+/// A partition-valued unit takes the same opaque path as any other: Core keeps
+/// the residual and never reads the partition values.
+///
+/// Identity-partition exclusion is provider semantics, so the fixture does not
+/// prune and this test supplies only the surviving unit; the exclusion itself is
+/// asserted by `connector::iceberg::file_pruning`'s unit tests.
 #[test]
 fn identity_partition_predicate_stays_on_opaque_connector_path() {
-    let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
     scan.predicates = vec![id_eq(12)];
     let bindings = prepare_scan_bindings(
         &plan(root),
-        &registry(vec![
-            identity_partition_file("s3://bucket/id-1.parquet", 1),
-            identity_partition_file("s3://bucket/id-12.parquet", 12),
-        ]),
+        &registry(vec![identity_partition_file(
+            "s3://bucket/id-12.parquet",
+            12,
+        )]),
         None,
     )
     .expect("prepare connector scan");
@@ -354,7 +342,7 @@ fn identity_partition_predicate_stays_on_opaque_connector_path() {
 
 #[test]
 fn large_plain_file_preserves_provider_owned_split_and_byte_estimate() {
-    let plan = plan(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
+    let plan = plan(scan_node(10));
     let mut file = data_file("s3://bucket/large.parquet");
     file.size = 300 * 1024 * 1024;
     let bindings =
@@ -364,35 +352,39 @@ fn large_plain_file_preserves_provider_owned_split_and_byte_estimate() {
 
     assert_eq!(planned.splits.len(), 1);
     assert_eq!(planned.splits[0].estimated_bytes(), Some(300 * 1024 * 1024));
-    let file =
-        crate::connector::iceberg::provider::planned_split_data_file_for_test(&planned.splits[0])
-            .expect("decode test Iceberg split");
+    let file = crate::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
+        .expect("decode fixture split");
     assert_eq!(file.path, "s3://bucket/large.parquet");
     assert_eq!(file.size, 300 * 1024 * 1024);
 }
 
+/// A connector split-planning failure must reach the caller verbatim, carrying
+/// the connector's own error kind and message under the scan node that asked
+/// for it. Core must neither reword nor reclassify a provider refusal.
 #[test]
-fn excessive_delete_apply_cost_preserves_exact_planning_error() {
-    let plan = plan(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
-    let mut file = data_file("s3://bucket/data.parquet");
-    file.delete_files = (0..1025)
-        .map(|idx| position_delete_file(&format!("s3://bucket/delete-{idx}.parquet")))
-        .collect();
+fn connector_planning_error_is_preserved_exactly_with_scan_node_context() {
+    let plan = plan(scan_node(10));
+    // The scan carrier names `test_table`; registering units only for another
+    // table makes the connector refuse to plan with its own NotFound.
+    let registry = registry_for_tables(HashMap::from([(
+        "other_table".to_string(),
+        vec![data_file("s3://bucket/other.parquet")],
+    )]));
 
-    let err = match prepare_scan_bindings(&plan, &registry(vec![file]), None) {
-        Ok(_) => panic!("delete-heavy scan must fail"),
+    let err = match prepare_scan_bindings(&plan, &registry, None) {
+        Ok(_) => panic!("a connector that cannot plan the scan must fail preparation"),
         Err(err) => err,
     };
 
     assert_eq!(
         err,
-        "scan preparation node_id=10: ResourceExhausted: too many Iceberg delete files attached to s3://bucket/data.parquet: count=1025 max=1024"
+        "scan preparation node_id=10: NotFound: no planned files for fixture table test_table"
     );
 }
 
 #[test]
 fn unsupported_predicate_does_not_guess_pruning() {
-    let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -416,62 +408,4 @@ fn unsupported_predicate_does_not_guess_pruning() {
         format!("{:?}", vec![unsupported_id_predicate()])
     );
     assert_eq!(read.splits.len(), 2);
-}
-
-#[test]
-fn sqlx2_mv_target_state_uses_only_frozen_allow_list_files() {
-    use std::collections::BTreeSet;
-
-    use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
-    use crate::mv::persistence::schema::{
-        MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
-    };
-
-    let mut selected = identity_partition_file("s3://bucket/selected.parquet", 7);
-    selected.partition_spec_id = Some(3);
-    let mut skipped = identity_partition_file("s3://bucket/skipped.parquet", 9);
-    skipped.partition_spec_id = Some(3);
-    let allow_key = MvPartitionKey::new(
-        3,
-        vec![MvPartitionKeyField::new(
-            "id".to_string(),
-            MvPartitionValue::String("7".to_string()),
-        )],
-    );
-    let contract = MvPartitionContract {
-        target_spec_id: 3,
-        fields: vec![MvPartitionFieldContract {
-            partition_field_id: 100,
-            partition_field_name: "id".to_string(),
-            source_target_field_id: 1,
-            source_column_name: "id".to_string(),
-            transform: MvPartitionTransformContract::Identity,
-        }],
-    };
-
-    let files = crate::connector::iceberg::provider::filter_frozen_mv_target_state_files(
-        vec![selected, skipped],
-        &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::from([allow_key])),
-        Some(&contract),
-        42,
-    )
-    .expect("frozen target-state files should be deterministically pruned");
-
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].path, "s3://bucket/selected.parquet");
-}
-
-#[test]
-fn sqlx2_mv_target_state_empty_allow_list_reads_no_frozen_files() {
-    use std::collections::BTreeSet;
-
-    let files = crate::connector::iceberg::provider::filter_frozen_mv_target_state_files(
-        vec![data_file("s3://bucket/target.parquet")],
-        &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::new()),
-        None,
-        43,
-    )
-    .expect("an empty admitted allow-list is a zero-file scan");
-
-    assert!(files.is_empty());
 }
