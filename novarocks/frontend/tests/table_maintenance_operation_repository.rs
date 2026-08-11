@@ -795,22 +795,28 @@ async fn fenced_cleanup_plan_rejects_a_stale_attempt() {
         .unwrap();
     let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
     let authority = fenced_authority();
+    let planned = repository
+        .plan_fenced(
+            operation_id,
+            cleanup_plan(),
+            11,
+            authority,
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+    assert_eq!(planned.state, CleanupOperationState::Planned);
     let error = repository
         .plan_fenced(
             operation_id,
             cleanup_plan(),
             11,
             fenced_authority(),
-            Arc::clone(&validator),
+            validator,
         )
         .await
         .unwrap_err();
     assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
-    let planned = repository
-        .plan_fenced(operation_id, cleanup_plan(), 11, authority, validator)
-        .await
-        .unwrap();
-    assert_eq!(planned.state, CleanupOperationState::Planned);
 }
 
 #[tokio::test]
