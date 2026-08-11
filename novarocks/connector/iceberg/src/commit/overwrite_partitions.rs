@@ -30,8 +30,7 @@
 //! * Empty SELECT result is a noop overwrite snapshot — same audit-trail
 //!   behavior as `TruncateCommit` empty-table.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::iceberg::io::FileIO;
@@ -48,7 +47,7 @@ use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::data_file::clone_data_file_with_first_row_id;
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
@@ -126,6 +125,7 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
             row_lineage_first_row_id,
             row_lineage_added_rows,
             target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
         let sketch_sets = ctx.collector.take_sketch_sets();
@@ -184,6 +184,7 @@ struct OverwritePartitionsTxnAction {
     /// Sum of record_count across all written files.
     row_lineage_added_rows: u64,
     target_ref: String,
+    snapshot_properties: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -472,11 +473,15 @@ impl TransactionAction for OverwritePartitionsTxnAction {
             snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let summary = Summary {
             operation: Operation::Overwrite,
-            additional_properties: finalize_snapshot_summary(
-                overwrite_partitions_summary(&self.written, &deleted_data, &deleted_deletes),
-                parent_summary,
-                false,
-            ),
+            additional_properties: merge_snapshot_summary_properties(
+                finalize_snapshot_summary(
+                    overwrite_partitions_summary(&self.written, &deleted_data, &deleted_deletes),
+                    parent_summary,
+                    false,
+                ),
+                &self.snapshot_properties,
+            )
+            .map_err(to_iceberg_unexpected)?,
         };
         let snapshot = if let Some(first_row_id) = self.row_lineage_first_row_id {
             Snapshot::builder()

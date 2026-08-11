@@ -176,11 +176,11 @@ impl TransactionAction for OverwriteTxnAction {
                 .map_err(to_iceberg_unexpected)?;
         let existing = live_data_entries_as_delete_entries(&existing_entries);
 
-        // No-op short circuit: empty input + empty base table → return existing
-        // updates/requirements set as a degenerate ActionCommit. iceberg-rust's
-        // Transaction::do_commit treats an empty action set as a noop, but
-        // returning empty ActionCommit here keeps us consistent with the spec.
-        if self.written.is_empty() && existing.is_empty() {
+        // Ordinary empty input over an empty base is a no-op. Managed
+        // publication and operation-recovery properties require a real empty
+        // overwrite snapshot, so a non-empty provider property set must flow
+        // through the normal snapshot construction below.
+        if self.written.is_empty() && existing.is_empty() && self.snapshot_properties.is_empty() {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 

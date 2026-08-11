@@ -22,7 +22,7 @@
 //! later provider commit slice installs the external commit action behind the
 //! same operation entries.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -69,6 +69,9 @@ use super::{
 
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;
 const ICEBERG_WRITE_OPERATION_KIND: &str = "iceberg.connector_write.v2";
+const ICEBERG_WRITE_OPERATION_MARKER_VERSION: u8 = 1;
+const ICEBERG_WRITE_OPERATION_MARKER_PROPERTY: &str = "novarocks.write.operation.v1";
+const MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES: usize = 16_384;
 
 /// Concrete write capability assembled with every other capability of one
 /// Iceberg control generation.
@@ -79,7 +82,49 @@ pub struct IcebergWriteControl {
     provider: IcebergControlProvider,
     runtime: Arc<IcebergControlRuntime>,
     activations: Arc<IcebergWriteActivationReservations>,
-    operations: Arc<Mutex<HashMap<ConnectorWriteOperationId, OperationState>>>,
+    operations: Arc<Mutex<OperationTable>>,
+}
+
+#[derive(Default)]
+struct OperationTable {
+    entries: HashMap<ConnectorWriteOperationId, OperationState>,
+    terminal_order: VecDeque<ConnectorWriteOperationId>,
+}
+
+impl OperationTable {
+    fn get(&self, operation_id: &ConnectorWriteOperationId) -> Option<&OperationState> {
+        self.entries.get(operation_id)
+    }
+
+    fn get_mut(&mut self, operation_id: &ConnectorWriteOperationId) -> Option<&mut OperationState> {
+        self.entries.get_mut(operation_id)
+    }
+
+    fn insert(
+        &mut self,
+        operation_id: ConnectorWriteOperationId,
+        state: OperationState,
+    ) -> Option<OperationState> {
+        self.terminal_order
+            .retain(|candidate| candidate != &operation_id);
+        if state.is_terminal_tombstone() {
+            self.terminal_order.push_back(operation_id);
+        }
+        let previous = self.entries.insert(operation_id, state);
+        while self.terminal_order.len() > MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES {
+            let Some(expired) = self.terminal_order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&expired)
+                .is_some_and(OperationState::is_terminal_tombstone)
+            {
+                self.entries.remove(&expired);
+            }
+        }
+        previous
+    }
 }
 
 #[derive(Clone)]
@@ -91,9 +136,14 @@ enum OperationState {
     CommitUnknown(CommitUnknownOperation),
 }
 
+impl OperationState {
+    fn is_terminal_tombstone(&self) -> bool {
+        matches!(self, Self::KnownUncommitted(_) | Self::KnownCommitted(_))
+    }
+}
+
 #[derive(Clone)]
 struct CommittingOperation {
-    active: ActiveOperation,
     cohort_set_digest: [u8; 32],
     aggregate_digest: [u8; 32],
 }
@@ -163,6 +213,18 @@ struct CommitUnknownOperation {
     request: ConnectorWriteCommitRequest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IcebergWriteOperationMarkerV1 {
+    version: u8,
+    instance_id: String,
+    incarnation_base64: String,
+    operation_id_base64: String,
+    target_ref: String,
+    cohort_set_digest_base64: String,
+    aggregate_digest_base64: String,
+}
+
 /// Canonical provider payload inside an SPI reconciliation evidence envelope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,7 +279,7 @@ impl IcebergWriteControl {
             provider,
             runtime,
             activations,
-            operations: Arc::new(Mutex::new(HashMap::new())),
+            operations: Arc::new(Mutex::new(OperationTable::default())),
         }
     }
 
@@ -774,15 +836,10 @@ impl IcebergWriteControl {
             let cleanup = self
                 .cleanup_files(&files)
                 .map_err(CommitServiceError::invalid_input)?;
-            return Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::InvalidRequest,
-                    format!(
-                        "managed Iceberg publication produced empty input; cleanup errors={}",
-                        cleanup.error_count
-                    ),
-                ),
-            });
+            return Err(CommitServiceError::known_uncommitted(
+                "managed Iceberg publication produced empty input".to_string(),
+                cleanup,
+            ));
         }
         if decoded.iter().all(|cohort| cohort.files.is_empty())
             && matches!(
@@ -826,8 +883,7 @@ impl IcebergWriteControl {
                 collector.inject_written_files(cohort.files.clone());
             }
         }
-        let snapshot_properties =
-            managed_snapshot_properties(&active.activation_intent, staged_data_rows)?;
+        let snapshot_properties = self.snapshot_properties(request, active, staged_data_rows)?;
         let binding = self.runtime.resources().planning_binding();
         let access = binding
             .resolve_access(metadata.location())
@@ -879,6 +935,60 @@ impl IcebergWriteControl {
             receipt,
             finalization: ExternalMutationFinalization::Complete,
         })
+    }
+
+    fn snapshot_properties(
+        &self,
+        request: &ConnectorWriteCommitRequest,
+        active: &ActiveOperation,
+        rows: u64,
+    ) -> Result<BTreeMap<String, String>, CommitServiceError> {
+        let mut properties = managed_snapshot_properties(&active.activation_intent, rows)?;
+        let marker = self.operation_marker(
+            request.operation_id(),
+            active,
+            request.sealed().digest(),
+            request.aggregate_digest(),
+        );
+        let encoded = serde_json::to_string(&marker).map_err(|error| {
+            CommitServiceError::invalid_input(format!(
+                "encode Iceberg write operation marker: {error}"
+            ))
+        })?;
+        if properties
+            .insert(ICEBERG_WRITE_OPERATION_MARKER_PROPERTY.to_string(), encoded)
+            .is_some()
+        {
+            return Err(CommitServiceError::invalid_input(
+                "Iceberg write operation marker conflicts with managed snapshot properties"
+                    .to_string(),
+            ));
+        }
+        Ok(properties)
+    }
+
+    fn operation_marker(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+        active: &ActiveOperation,
+        cohort_set_digest: [u8; 32],
+        aggregate_digest: [u8; 32],
+    ) -> IcebergWriteOperationMarkerV1 {
+        IcebergWriteOperationMarkerV1 {
+            version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
+            instance_id: self.key.instance_id.as_str().to_string(),
+            incarnation_base64: base64_encode(self.key.incarnation.to_bytes()),
+            operation_id_base64: base64_encode(operation_id.to_bytes()),
+            target_ref: active.target.target_ref.clone(),
+            cohort_set_digest_base64: base64_encode(cohort_set_digest),
+            aggregate_digest_base64: base64_encode(aggregate_digest),
+        }
+    }
+
+    fn invalidate_target_caches(&self, target: &ActiveTarget) {
+        self.runtime
+            .control_state()
+            .invalidate_table_cache(&target.namespace, &target.table);
     }
 
     fn cleanup_files(&self, files: &[WrittenFile]) -> Result<super::CleanupAttempt, String> {
@@ -1127,7 +1237,6 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     operations.insert(
                         operation_id,
                         OperationState::Committing(CommittingOperation {
-                            active: active.clone(),
                             cohort_set_digest: request.sealed().digest(),
                             aggregate_digest: request.aggregate_digest(),
                         }),
@@ -1184,8 +1293,9 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 }
             }
         };
-        let outcome = match self.execute_commit(&request, &active) {
-            Ok(outcome) => outcome,
+        let (outcome, known_uncommitted_finalization) = match self.execute_commit(&request, &active)
+        {
+            Ok(outcome) => (outcome, None),
             Err(CommitServiceError::InvalidInput { message }) => {
                 let mut operations = self.operations.lock().map_err(operation_lock_error)?;
                 if matches!(
@@ -1198,7 +1308,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 }
                 return Err(invalid(message));
             }
-            Err(CommitServiceError::KnownUncommitted { message, cleanup }) => {
+            Err(CommitServiceError::KnownUncommitted { message, cleanup }) => (
                 ExternalMutationOutcome::KnownUncommitted {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Conflict,
@@ -1207,45 +1317,56 @@ impl ConnectorWriteControl for IcebergWriteControl {
                             cleanup.attempted, cleanup.error_count
                         ),
                     ),
-                }
-            }
-            Err(CommitServiceError::Unknown { message, evidence }) => {
+                },
+                Some(cleanup_finalization(&cleanup)),
+            ),
+            Err(CommitServiceError::Unknown { message, evidence }) => (
                 ExternalMutationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
                         message,
                     ),
                     evidence: self.encode_commit_unknown_evidence(&request, evidence)?,
-                }
-            }
+                },
+                None,
+            ),
             Err(CommitServiceError::FinalizeFailedKnownCommitted {
                 outcome: Some(committed),
                 finalize_error,
                 ..
-            }) => ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: crate::write_codec::connector_write_receipt(
-                    committed.new_snapshot_id,
-                    None,
-                )
-                .map_err(internal)?,
-                finalization: ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Internal,
-                    finalize_error,
-                )),
-            },
+            }) => (
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: crate::write_codec::connector_write_receipt(
+                        committed.new_snapshot_id,
+                        None,
+                    )
+                    .map_err(internal)?,
+                    finalization: ExternalMutationFinalization::Failed(
+                        ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Internal,
+                            finalize_error,
+                        ),
+                    ),
+                },
+                None,
+            ),
             Err(CommitServiceError::FinalizeFailedKnownCommitted {
                 outcome: None,
                 finalize_error,
                 evidence,
-            }) => ExternalMutationOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Internal,
-                    finalize_error,
-                ),
-                evidence: self.encode_commit_unknown_evidence(&request, evidence)?,
-            },
+            }) => (
+                ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Internal,
+                        finalize_error,
+                    ),
+                    evidence: self.encode_commit_unknown_evidence(&request, evidence)?,
+                },
+                None,
+            ),
         };
+        self.invalidate_target_caches(&active.target);
         let mut operations = self.operations.lock().map_err(operation_lock_error)?;
         let state = match &outcome {
             ExternalMutationOutcome::KnownCommitted { .. } => {
@@ -1260,7 +1381,11 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     cohort_set_digest: request.sealed().digest(),
                     aggregate_digest: request.aggregate_digest(),
                     outcome: ConnectorWriteAbortOutcome::KnownUncommitted {
-                        cleanup: ExternalMutationFinalization::Complete,
+                        cleanup: known_uncommitted_finalization.clone().ok_or_else(|| {
+                            internal(
+                                "Iceberg known-uncommitted commit is missing cleanup finalization",
+                            )
+                        })?,
                     },
                 })
             }
@@ -1434,19 +1559,9 @@ impl ConnectorWriteControl for IcebergWriteControl {
             self.cleanup_files(&files).map_err(internal)?
         };
         let outcome = ConnectorWriteAbortOutcome::KnownUncommitted {
-            cleanup: if cleanup.error_count == 0 {
-                ExternalMutationFinalization::Complete
-            } else {
-                ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Internal,
-                    format!(
-                        "Iceberg staged cleanup completed with {} error(s): {}",
-                        cleanup.error_count,
-                        cleanup.error_paths.join(", ")
-                    ),
-                ))
-            },
+            cleanup: cleanup_finalization(&cleanup),
         };
+        self.invalidate_target_caches(&active.target);
         let mut operations = self.operations.lock().map_err(operation_lock_error)?;
         operations.insert(
             operation_id,
@@ -1540,14 +1655,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 }
             }
         };
-        let ConnectorWriteActivationIntent::ManagedPublication(expected) =
-            &unknown.active.activation_intent
-        else {
-            // An ordinary operation has no durable marker from which absence
-            // can prove non-commit. Preserve the same bounded evidence until
-            // an operation-specific marker exists.
-            return Ok(unknown.outcome);
-        };
+        self.invalidate_target_caches(&unknown.active.target);
         let ident = crate::iceberg::TableIdent::from_strs([
             unknown.active.target.namespace.as_str(),
             unknown.active.target.table.as_str(),
@@ -1561,34 +1669,52 @@ impl ConnectorWriteControl for IcebergWriteControl {
             .block_on(async move { catalog.load_table(&ident).await })
             .map_err(unavailable)?
             .map_err(|error| unavailable(error.to_string()))?;
-        let mut matched = None;
-        for snapshot in table.metadata().snapshots() {
-            let Some(provenance) =
-                super::MvProvenanceV1::from_snapshot_summary(snapshot).map_err(corrupt)?
-            else {
-                continue;
-            };
-            if managed_provenance_matches(expected, &provenance) {
-                if matched
-                    .replace((snapshot.snapshot_id(), provenance.rows))
-                    .is_some()
-                {
-                    return Err(corrupt(
-                        "Iceberg managed publication marker matches multiple snapshots",
-                    ));
-                }
-            }
+        if table.metadata().uuid().to_string() != unknown.active.target.table_uuid {
+            return Err(corrupt(
+                "Iceberg write reconciliation loaded a different physical table UUID",
+            ));
         }
-        let outcome = if let Some((snapshot_id, rows)) = matched {
-            let row_count = u64::try_from(rows).map_err(|_| {
-                corrupt("Iceberg managed publication snapshot has a negative row count")
-            })?;
-            ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: crate::write_codec::connector_write_receipt(snapshot_id, Some(row_count))
+        let expected_marker = self.operation_marker(
+            operation_id,
+            &unknown.active,
+            request.cohort_set_digest,
+            request.aggregate_digest,
+        );
+        let matched_snapshot = find_operation_marker_snapshot(
+            table.metadata().snapshots().map(Arc::as_ref),
+            &expected_marker,
+        )?;
+        let (outcome, known_uncommitted_finalization) = if let Some(snapshot) = matched_snapshot {
+            let row_count = match &unknown.active.activation_intent {
+                ConnectorWriteActivationIntent::ManagedPublication(expected) => {
+                    let provenance = super::MvProvenanceV1::from_snapshot_summary(snapshot)
+                        .map_err(corrupt)?
+                        .ok_or_else(|| {
+                            corrupt("Iceberg managed publication snapshot is missing provenance")
+                        })?;
+                    if !managed_provenance_matches(expected, &provenance) {
+                        return Err(corrupt(
+                            "Iceberg managed publication snapshot provenance does not match its operation marker",
+                        ));
+                    }
+                    Some(u64::try_from(provenance.rows).map_err(|_| {
+                        corrupt("Iceberg managed publication snapshot has a negative row count")
+                    })?)
+                }
+                ConnectorWriteActivationIntent::Ordinary => None,
+            };
+            (
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: crate::write_codec::connector_write_receipt(
+                        snapshot.snapshot_id(),
+                        row_count,
+                    )
                     .map_err(internal)?,
-                finalization: ExternalMutationFinalization::Complete,
-            }
+                    finalization: ExternalMutationFinalization::Complete,
+                },
+                None,
+            )
         } else {
             let decoded =
                 self.decode_commit_cohorts(&unknown.request, &unknown.active, table.metadata())?;
@@ -1597,15 +1723,18 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 .flat_map(|cohort| cohort.files)
                 .collect::<Vec<_>>();
             let cleanup = self.cleanup_files(&files).map_err(internal)?;
-            ExternalMutationOutcome::KnownUncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Conflict,
-                    format!(
-                        "Iceberg managed publication marker is absent; cleanup errors={}",
-                        cleanup.error_count
+            (
+                ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        format!(
+                            "Iceberg write operation marker is absent; staged cleanup errors={}",
+                            cleanup.error_count
+                        ),
                     ),
-                ),
-            }
+                },
+                Some(cleanup_finalization(&cleanup)),
+            )
         };
         let mut operations = self.operations.lock().map_err(operation_lock_error)?;
         match &outcome {
@@ -1626,7 +1755,11 @@ impl ConnectorWriteControl for IcebergWriteControl {
                         cohort_set_digest: request.cohort_set_digest,
                         aggregate_digest: request.aggregate_digest,
                         outcome: ConnectorWriteAbortOutcome::KnownUncommitted {
-                            cleanup: ExternalMutationFinalization::Complete,
+                            cleanup: known_uncommitted_finalization.clone().ok_or_else(|| {
+                                internal(
+                                    "Iceberg reconciled known-uncommitted operation is missing cleanup finalization",
+                                )
+                            })?,
                         },
                     }),
                 );
@@ -1796,6 +1929,63 @@ fn managed_provenance_matches(
         && actual.technique == technique
         && actual.bases == bases
         && actual.definition_fingerprint == expected.definition_fingerprint()
+}
+
+fn operation_marker_from_snapshot(
+    snapshot: &crate::iceberg::spec::Snapshot,
+) -> Result<Option<IcebergWriteOperationMarkerV1>, ConnectorError> {
+    let Some(raw) = snapshot
+        .summary()
+        .additional_properties
+        .get(ICEBERG_WRITE_OPERATION_MARKER_PROPERTY)
+    else {
+        return Ok(None);
+    };
+    let marker: IcebergWriteOperationMarkerV1 = serde_json::from_str(raw)
+        .map_err(|error| corrupt(format!("decode Iceberg write operation marker: {error}")))?;
+    if marker.version != ICEBERG_WRITE_OPERATION_MARKER_VERSION {
+        return Err(corrupt(format!(
+            "Iceberg write operation marker has unsupported version {}",
+            marker.version
+        )));
+    }
+    novarocks_spi::connector::ConnectorInstanceId::parse(&marker.instance_id)
+        .map_err(|error| corrupt(format!("invalid Iceberg marker instance ID: {error}")))?;
+    if marker.target_ref.trim().is_empty() {
+        return Err(corrupt(
+            "Iceberg write operation marker has an empty target ref",
+        ));
+    }
+    decode_marker_fixed::<16>(&marker.incarnation_base64, "incarnation")?;
+    decode_marker_fixed::<16>(&marker.operation_id_base64, "operation id")?;
+    decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort set digest")?;
+    decode_marker_fixed::<32>(&marker.aggregate_digest_base64, "aggregate digest")?;
+    let canonical = serde_json::to_string(&marker)
+        .map_err(|error| corrupt(format!("encode Iceberg write operation marker: {error}")))?;
+    if canonical != *raw {
+        return Err(corrupt(
+            "Iceberg write operation marker is not canonically encoded",
+        ));
+    }
+    Ok(Some(marker))
+}
+
+fn find_operation_marker_snapshot<'a>(
+    snapshots: impl IntoIterator<Item = &'a crate::iceberg::spec::Snapshot>,
+    expected: &IcebergWriteOperationMarkerV1,
+) -> Result<Option<&'a crate::iceberg::spec::Snapshot>, ConnectorError> {
+    let mut matched = None;
+    for snapshot in snapshots {
+        let Some(marker) = operation_marker_from_snapshot(snapshot)? else {
+            continue;
+        };
+        if marker == *expected && matched.replace(snapshot).is_some() {
+            return Err(corrupt(
+                "Iceberg write operation marker matches multiple snapshots",
+            ));
+        }
+    }
+    Ok(matched)
 }
 
 fn table_snapshot_row_count(
@@ -2066,6 +2256,22 @@ fn data_location(metadata: &crate::iceberg::spec::TableMetadata) -> String {
         .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')))
 }
 
+fn cleanup_finalization(cleanup: &super::CleanupAttempt) -> ExternalMutationFinalization {
+    if cleanup.error_count == 0 {
+        ExternalMutationFinalization::Complete
+    } else {
+        ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            format!(
+                "Iceberg staged cleanup attempted={} and completed with {} error(s): {}",
+                cleanup.attempted,
+                cleanup.error_count,
+                cleanup.error_paths.join(", ")
+            ),
+        ))
+    }
+}
+
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
     if context.cancellation().is_cancelled() {
         return Err(ConnectorError::new(
@@ -2138,6 +2344,17 @@ fn decode_fixed<const N: usize>(value: &str, subject: &str) -> Result<[u8; N], C
         .map_err(|_| invalid(format!("Iceberg write {subject} has invalid length")))
 }
 
+fn decode_marker_fixed<const N: usize>(
+    value: &str,
+    subject: &str,
+) -> Result<[u8; N], ConnectorError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|error| corrupt(format!("decode Iceberg marker {subject}: {error}")))?
+        .try_into()
+        .map_err(|_| corrupt(format!("Iceberg marker {subject} has invalid length")))
+}
+
 fn operation_lock_error<T>(error: std::sync::PoisonError<T>) -> ConnectorError {
     internal(format!("Iceberg write operation table lock: {error}"))
 }
@@ -2174,20 +2391,24 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId,
-        ConnectorSealedWriteCohortSet, ConnectorTableHandle, ConnectorWriteBaseVersion,
-        ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
-        ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWriteTargetRef,
-        ConnectorWriterIdentity,
+        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorInstanceId,
+        ConnectorManagedPublicationIntent, ConnectorProviderId, ConnectorSealedWriteCohortSet,
+        ConnectorStagedPublicationBaseFact, ConnectorStagedReport, ConnectorStagedReportSummary,
+        ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
+        ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteIntent, ConnectorWriteOperationCompletion,
+        ConnectorWritePreparation, ConnectorWriteTargetRef, ConnectorWriterIdentity,
+        ConnectorWriterTerminalState,
     };
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::control_provider::IcebergTablePayload;
     use crate::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
-        TableMetadataBuilder, Type,
+        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
+        SortOrder, Summary, TableMetadataBuilder, Type,
     };
+    use crate::iceberg::{NamespaceIdent, TableCreation};
     use crate::resources::IcebergControlResources;
     use crate::scan_model::IcebergTableInfo;
 
@@ -2249,6 +2470,73 @@ mod tests {
         (executor, control)
     }
 
+    fn control_with_empty_table() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        IcebergWriteControl,
+        crate::iceberg::table::Table,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+        );
+        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let runtime = Arc::new(
+            IcebergControlRuntime::try_new(
+                IcebergCatalogControlState::new(configuration),
+                resources,
+            )
+            .expect("control runtime"),
+        );
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+        };
+        let control = IcebergWriteControl::new(
+            descriptor,
+            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            Arc::clone(&runtime),
+        );
+        let catalog = Arc::clone(runtime.catalog());
+        let table = executor.block_on(async move {
+            let namespace = NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create namespace");
+            let schema = Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .expect("schema");
+            catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("t".to_string())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .expect("create table")
+        });
+        (executor, warehouse, control, table)
+    }
+
     fn preparation(owner: &ConnectorExecutionBindingKey, marker: u8) -> ConnectorWritePreparation {
         let schema = Schema::builder()
             .with_fields(vec![
@@ -2268,15 +2556,27 @@ mod tests {
         .build()
         .expect("metadata")
         .metadata;
+        preparation_for_metadata(owner, &metadata, ConnectorWriteIntent::Append, marker)
+    }
+
+    fn preparation_for_metadata(
+        owner: &ConnectorExecutionBindingKey,
+        metadata: &crate::iceberg::spec::TableMetadata,
+        intent: ConnectorWriteIntent,
+        marker: u8,
+    ) -> ConnectorWritePreparation {
+        let schema = metadata.current_schema();
         let table_info = IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),
-            table_uuid: None,
-            current_snapshot_id: None,
+            table_uuid: Some(metadata.uuid().to_string()),
+            current_snapshot_id: metadata
+                .current_snapshot()
+                .map(|snapshot| snapshot.snapshot_id()),
             schema_id: metadata.current_schema_id(),
             location: metadata.location().to_string(),
-            schema: crate::schema_facts::iceberg_schema_def(&schema),
+            schema: crate::schema_facts::iceberg_schema_def(schema),
             serialized_metadata: Some(serde_json::to_string(&metadata).expect("metadata JSON")),
             serialized_metadata_rows: None,
         };
@@ -2299,7 +2599,7 @@ mod tests {
             )
             .expect("table handle"),
             ConnectorWriteTargetRef::main(),
-            ConnectorWriteIntent::Append,
+            intent,
             ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base"),
             ConnectorWriteInputShape::Data {
                 fields: vec![ConnectorWriteFieldBinding::new(
@@ -2325,6 +2625,25 @@ mod tests {
             intent: ConnectorWriteActivationIntent::Ordinary,
             context: context(),
         }
+    }
+
+    fn snapshot_with_operation_marker(snapshot_id: i64, marker: String) -> Snapshot {
+        Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list(format!("file:/tmp/manifest-list-{snapshot_id}.avro"))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: [(
+                    ICEBERG_WRITE_OPERATION_MARKER_PROPERTY.to_string(),
+                    marker,
+                )]
+                .into_iter()
+                .collect(),
+            })
+            .with_schema_id(0)
+            .build()
     }
 
     #[test]
@@ -2419,6 +2738,268 @@ mod tests {
             .activations
             .activate(&owner, &conflicting)
             .expect("reservation was released");
+        control
+            .activations
+            .release(operation_id)
+            .expect("release probe reservation");
+    }
+
+    #[test]
+    fn operation_marker_is_canonical_and_binds_exact_generation_and_aggregate() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([3; 16]);
+        control
+            .activate_write(activation_request(&owner, operation_id, 1))
+            .expect("activate");
+        let active = {
+            let operations = control.operations.lock().expect("operation table");
+            let OperationState::Active(active) =
+                operations.get(&operation_id).expect("active operation")
+            else {
+                panic!("expected active operation");
+            };
+            active.clone()
+        };
+        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let encoded = serde_json::to_string(&marker).expect("marker JSON");
+        let snapshot = snapshot_with_operation_marker(8, encoded);
+        assert_eq!(
+            operation_marker_from_snapshot(&snapshot).expect("decode marker"),
+            Some(marker)
+        );
+    }
+
+    #[test]
+    fn malformed_operation_marker_is_corrupt_data() {
+        let snapshot = snapshot_with_operation_marker(8, "{\"version\":1}".to_string());
+        let error = operation_marker_from_snapshot(&snapshot).expect_err("corrupt marker");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn duplicate_operation_marker_matches_are_corrupt_data() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([3; 16]);
+        control
+            .activate_write(activation_request(&owner, operation_id, 1))
+            .expect("activate");
+        let active = {
+            let operations = control.operations.lock().expect("operation table");
+            let OperationState::Active(active) =
+                operations.get(&operation_id).expect("active operation")
+            else {
+                panic!("expected active operation");
+            };
+            active.clone()
+        };
+        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let raw = serde_json::to_string(&marker).expect("marker JSON");
+        let first = snapshot_with_operation_marker(8, raw.clone());
+        let second = snapshot_with_operation_marker(9, raw);
+        let error = find_operation_marker_snapshot([&first, &second], &marker)
+            .expect_err("duplicate marker");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn terminal_tombstones_are_bounded_without_evicting_active_operations() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let active_operation_id = ConnectorWriteOperationId::from_bytes([9; 16]);
+        control
+            .activate_write(activation_request(&owner, active_operation_id, 1))
+            .expect("activate");
+        let first_terminal_id = ConnectorWriteOperationId::from_bytes(0_u128.to_be_bytes());
+        let last_terminal_id = ConnectorWriteOperationId::from_bytes(
+            (MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES as u128).to_be_bytes(),
+        );
+        let mut operations = control.operations.lock().expect("operation table");
+        for ordinal in 0..=MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES {
+            operations.insert(
+                ConnectorWriteOperationId::from_bytes((ordinal as u128).to_be_bytes()),
+                OperationState::KnownUncommitted(KnownUncommittedOperation {
+                    cohort_set_digest: [1; 32],
+                    aggregate_digest: [2; 32],
+                    outcome: ConnectorWriteAbortOutcome::KnownUncommitted {
+                        cleanup: ExternalMutationFinalization::Complete,
+                    },
+                }),
+            );
+        }
+        assert!(operations.get(&first_terminal_id).is_none());
+        assert!(operations.get(&last_terminal_id).is_some());
+        assert!(matches!(
+            operations.get(&active_operation_id),
+            Some(OperationState::Active(_))
+        ));
+        assert_eq!(
+            operations.terminal_order.len(),
+            MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_finalization_preserves_error_paths() {
+        let finalization = cleanup_finalization(&crate::commit::CleanupAttempt::completed(vec![
+            "data/staged-a.parquet".to_string(),
+            "metadata/staged-b.avro".to_string(),
+        ]));
+        let ExternalMutationFinalization::Failed(failure) = finalization else {
+            panic!("expected failed cleanup finalization");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+        assert!(failure.message().contains("2 error(s)"));
+        assert!(failure.message().contains("data/staged-a.parquet"));
+        assert!(failure.message().contains("metadata/staged-b.avro"));
+    }
+
+    #[test]
+    fn managed_empty_overwrite_commits_real_snapshot_with_operation_marker() {
+        let (_executor, _warehouse, control, table) = control_with_empty_table();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([12; 16]);
+        let managed = ConnectorManagedPublicationIntent::try_new(
+            41,
+            7,
+            "refresh-41",
+            ConnectorManagedPublicationTechnique::Full,
+            vec![ConnectorStagedPublicationBaseFact {
+                table: Arc::from("ice.db.base"),
+                uuid: Arc::from("base-uuid"),
+                from_version: None,
+                to_version: 1,
+            }],
+            "definition-fingerprint",
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        )
+        .expect("managed intent");
+        let activation = control
+            .activate_write(ConnectorWriteActivationRequest {
+                operation_id,
+                source: ConnectorWriteActivationSource::Prepared(preparation_for_metadata(
+                    &owner,
+                    table.metadata(),
+                    ConnectorWriteIntent::Overwrite,
+                    6,
+                )),
+                intent: ConnectorWriteActivationIntent::ManagedPublication(managed),
+                context: context(),
+            })
+            .expect("activate");
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let execution_id = ConnectorWriteExecutionId::new([13; 16], 1);
+        let writer = ConnectorWriterIdentity::new(
+            operation_id,
+            cohort_id,
+            execution_id,
+            [14; 16],
+            1,
+            2,
+            0,
+            owner.clone(),
+        );
+        let planning = ConnectorWritePlanningRequest {
+            operation_id,
+            cohort_id,
+            execution_id,
+            activation: activation.cohort(cohort_id).expect("cohort"),
+            expected_writers: vec![writer.clone()],
+            context: context(),
+        };
+        let planning_digest = planning.stable_digest(&owner).expect("planning digest");
+        let plan = control.plan_write(planning).expect("plan write");
+        let report = ConnectorStagedReport::try_new(
+            writer,
+            CONNECTOR_WRITE_CONTRACT_VERSION,
+            ConnectorWriterTerminalState::Staged,
+            ConnectorStagedReportSummary::default(),
+            crate::write_codec::encode_writer_reports(&[], table.metadata())
+                .expect("empty report payload"),
+        )
+        .expect("staged report");
+        let accepted = ConnectorWriteAttemptCompletion::try_new(
+            owner.clone(),
+            operation_id,
+            cohort_id,
+            execution_id,
+            [15; 32],
+            vec![report],
+            plan.control_payload().clone(),
+        )
+        .expect("attempt completion");
+        let sealed = ConnectorSealedWriteCohortSet::try_new(
+            operation_id,
+            vec![ConnectorWriteCohortDescriptor::new(
+                cohort_id,
+                ConnectorWriteIntent::Overwrite,
+                planning_digest,
+            )],
+        )
+        .expect("sealed cohorts");
+        let cohort_set_digest = sealed.digest();
+        let completion = ConnectorWriteOperationCompletion::try_new(
+            owner.clone(),
+            sealed,
+            vec![
+                ConnectorWriteCohortCompletion::try_new(cohort_id, Some(accepted), Vec::new())
+                    .expect("cohort completion"),
+            ],
+        )
+        .expect("operation completion");
+        let aggregate_digest = completion.aggregate_digest();
+        let outcome = control
+            .commit(ConnectorWriteCommitRequest {
+                completion,
+                context: context(),
+            })
+            .expect("commit empty overwrite");
+        let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+            panic!("expected known committed outcome");
+        };
+        let snapshot_id = receipt
+            .committed_version()
+            .expect("committed version")
+            .snapshot_id()
+            .expect("snapshot id");
+        let loaded = control
+            .runtime
+            .load_table("db", "t")
+            .expect("reload committed table");
+        let snapshot = loaded
+            .table
+            .metadata()
+            .snapshot_by_id(snapshot_id)
+            .expect("committed snapshot");
+        let marker = operation_marker_from_snapshot(snapshot)
+            .expect("decode operation marker")
+            .expect("operation marker");
+        assert_eq!(
+            decode_marker_fixed::<16>(&marker.operation_id_base64, "operation id")
+                .expect("operation id"),
+            operation_id.to_bytes()
+        );
+        assert_eq!(
+            decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort digest")
+                .expect("cohort digest"),
+            cohort_set_digest
+        );
+        assert_eq!(
+            decode_marker_fixed::<32>(&marker.aggregate_digest_base64, "aggregate digest")
+                .expect("aggregate digest"),
+            aggregate_digest
+        );
+        assert!(
+            crate::commit::MvProvenanceV1::from_snapshot_summary(snapshot)
+                .expect("decode provenance")
+                .is_some()
+        );
+        let conflicting = activation_request(&owner, operation_id, 99);
+        control
+            .activations
+            .activate(&owner, &conflicting)
+            .expect("known terminal released activation reservation");
         control
             .activations
             .release(operation_id)

@@ -50,7 +50,7 @@ use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
     effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
@@ -103,6 +103,7 @@ impl IcebergCommitAction for RowDeltaCommit {
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
             target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
@@ -144,6 +145,7 @@ struct RowDeltaTxnAction {
     /// transaction completes.
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     target_ref: String,
+    snapshot_properties: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -233,11 +235,11 @@ impl TransactionAction for RowDeltaTxnAction {
             snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let snapshot_summary = Summary {
             operation: Operation::Delete,
-            additional_properties: finalize_snapshot_summary(
-                row_delta_summary(&self.written),
-                parent_summary,
-                false,
-            ),
+            additional_properties: merge_snapshot_summary_properties(
+                finalize_snapshot_summary(row_delta_summary(&self.written), parent_summary, false),
+                &self.snapshot_properties,
+            )
+            .map_err(to_iceberg_unexpected)?,
         };
         let snapshot = if let Some(first_row_id) = row_lineage_first_row_id {
             Snapshot::builder()

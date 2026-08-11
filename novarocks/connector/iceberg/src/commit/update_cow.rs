@@ -38,7 +38,7 @@ use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
     debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
@@ -111,6 +111,7 @@ impl IcebergCommitAction for CowUpdateCommit {
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
             target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
         let sketch_sets = ctx.collector.take_sketch_sets();
@@ -160,6 +161,7 @@ struct CowUpdateTxnAction {
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     target_ref: String,
+    snapshot_properties: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -457,7 +459,11 @@ impl TransactionAction for CowUpdateTxnAction {
             snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let summary = Summary {
             operation: Operation::Overwrite,
-            additional_properties: finalize_snapshot_summary(summary_props, parent_summary, false),
+            additional_properties: merge_snapshot_summary_properties(
+                finalize_snapshot_summary(summary_props, parent_summary, false),
+                &self.snapshot_properties,
+            )
+            .map_err(to_iceberg_unexpected)?,
         };
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
