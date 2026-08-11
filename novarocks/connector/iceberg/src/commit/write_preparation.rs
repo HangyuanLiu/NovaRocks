@@ -285,7 +285,8 @@ fn position_delete_partition_field_requests(
                         partition.source_id
                     ))
                 })?;
-            let data_type = iceberg_type_to_arrow_type(source.field_type.as_ref())
+            let data_type =
+                crate::metadata_batch_reader::iceberg_type_to_arrow_type(source.field_type.as_ref())
                 .map_err(invalid_write_activation)?;
             Ok(ConnectorWriteFieldRequest::new(Field::new(
                 &source.name,
@@ -326,43 +327,6 @@ fn bind_write_fields(
 
 /// Arrow type for a partition-source Iceberg field.
 ///
-/// This mirrors the metadata-table reader's mapping deliberately: the
-/// write-preparation path must not import a reader-private helper, and the
-/// signed partition-source layout is frozen against this exact mapping.
-fn iceberg_type_to_arrow_type(ty: &Type) -> Result<DataType, String> {
-    match ty {
-        Type::Primitive(primitive) => Ok(match primitive {
-            PrimitiveType::Boolean => DataType::Boolean,
-            PrimitiveType::Int => DataType::Int32,
-            PrimitiveType::Long => DataType::Int64,
-            PrimitiveType::Float => DataType::Float32,
-            PrimitiveType::Double => DataType::Float64,
-            PrimitiveType::Decimal { precision, scale } => DataType::Decimal128(
-                u8::try_from(*precision)
-                    .map_err(|_| format!("iceberg decimal precision out of range: {precision}"))?,
-                i8::try_from(*scale)
-                    .map_err(|_| format!("iceberg decimal scale out of range: {scale}"))?,
-            ),
-            PrimitiveType::Date => DataType::Date32,
-            PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
-            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
-                DataType::Timestamp(TimeUnit::Microsecond, None)
-            }
-            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
-                DataType::Timestamp(TimeUnit::Nanosecond, None)
-            }
-            PrimitiveType::String | PrimitiveType::Uuid => DataType::Utf8,
-            PrimitiveType::Fixed(width) => DataType::FixedSizeBinary(
-                i32::try_from(*width)
-                    .map_err(|_| format!("iceberg fixed width out of range: {width}"))?,
-            ),
-            PrimitiveType::Binary | PrimitiveType::Variant => DataType::Binary,
-        }),
-        other => Err(format!(
-            "iceberg metadata partition field must be primitive, got {other:?}"
-        )),
-    }
-}
 
 #[cfg(test)]
 mod tests {

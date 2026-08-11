@@ -230,7 +230,9 @@ fn partition_struct_type(metadata: &TableMetadata) -> Result<DataType, String> {
     Ok(DataType::Struct(Fields::from(fields)))
 }
 
-fn iceberg_type_to_arrow_type(ty: &crate::iceberg::spec::Type) -> Result<DataType, String> {
+pub(crate) fn iceberg_type_to_arrow_type(
+    ty: &crate::iceberg::spec::Type,
+) -> Result<DataType, String> {
     use crate::iceberg::spec::{PrimitiveType, Type};
     match ty {
         Type::Primitive(primitive) => Ok(match primitive {
