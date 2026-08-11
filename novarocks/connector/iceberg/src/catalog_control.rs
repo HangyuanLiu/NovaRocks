@@ -39,6 +39,8 @@ pub mod cleanup_maintenance;
 pub mod data_mutation;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub mod metadata_maintenance;
+#[path = "catalog_control/staged_create.rs"]
+pub mod staged_create;
 #[path = "catalog_control/statistics.rs"]
 pub mod statistics;
 #[path = "catalog_control/type_mapping.rs"]

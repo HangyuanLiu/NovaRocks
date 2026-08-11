@@ -153,6 +153,48 @@ impl IcebergControlProvider {
         decode_payload(table.payload(), "table handle")
     }
 
+    pub(crate) fn staged_write_table_handle(
+        &self,
+        table: &crate::iceberg::table::Table,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorTableHandle, ConnectorError> {
+        self.validate_context(context)?;
+        let metadata = table.metadata();
+        let ident = table.identifier();
+        let payload = IcebergTablePayload {
+            namespace: ident.namespace.to_url_string(),
+            table: ident.name.clone(),
+            table_info: Some(IcebergTableInfo {
+                catalog: self.descriptor.instance_id.as_str().to_string(),
+                namespace: ident.namespace.to_url_string(),
+                table: ident.name.clone(),
+                table_uuid: Some(metadata.uuid().to_string()),
+                current_snapshot_id: metadata.current_snapshot_id(),
+                schema_id: metadata.current_schema_id(),
+                location: metadata.location().to_string(),
+                schema: iceberg_schema_def(metadata.current_schema()),
+                serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
+                    corrupt(format!("serialize staged Iceberg table metadata: {error}"))
+                })?),
+                serialized_metadata_rows: None,
+            }),
+            metadata_columns: metadata_column_names(metadata),
+            metadata_table_type: None,
+            prepared_files: Vec::new(),
+            explicit_files: None,
+            logical_type_columns: logical_type_columns(metadata.properties()),
+            hidden_columns: hidden_internal_columns(metadata.properties()),
+        };
+        ConnectorTableHandle::try_new(
+            self.descriptor.instance_id.clone(),
+            encode_payload(
+                &payload,
+                "staged write table handle",
+                context.max_handle_payload_bytes(),
+            )?,
+        )
+    }
+
     fn scan_payload(
         &self,
         scan: &ConnectorScanHandle,

@@ -492,7 +492,7 @@ fn drop_table(
     Ok(ExternalMutationEffect::Applied)
 }
 
-fn table_properties(
+pub(crate) fn table_properties(
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
     input: &[(Arc<str>, Arc<str>)],
@@ -574,7 +574,7 @@ fn logical_type(data_type: &ConnectorDataType) -> Option<String> {
     }
 }
 
-fn initial_partition_spec(
+pub(crate) fn initial_partition_spec(
     schema: &Schema,
     fields: &[ConnectorPartitionTransform],
 ) -> Result<Option<UnboundPartitionSpec>, String> {

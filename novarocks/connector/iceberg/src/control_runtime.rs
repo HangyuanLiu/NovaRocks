@@ -37,6 +37,7 @@ pub struct IcebergControlRuntime {
     control_state: IcebergCatalogControlState,
     resources: IcebergControlResources,
     catalog: Arc<dyn crate::iceberg::Catalog>,
+    rest_catalog: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
     write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
 }
 
@@ -53,12 +54,15 @@ impl IcebergControlRuntime {
         let configuration = control_state.configuration().clone();
         let catalog = resources
             .catalog_runtime()
-            .block_on(async move { crate::catalog_runtime::build_catalog(&configuration).await })?
+            .block_on(
+                async move { crate::catalog_runtime::build_catalog_client(&configuration).await },
+            )?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
         Ok(Self {
             control_state,
             resources,
-            catalog,
+            catalog: Arc::clone(catalog.generic()),
+            rest_catalog: catalog.rest().cloned(),
             write_activations: Arc::new(
                 crate::write_activation::IcebergWriteActivationReservations::default(),
             ),
@@ -71,6 +75,10 @@ impl IcebergControlRuntime {
 
     pub(crate) fn catalog(&self) -> &Arc<dyn crate::iceberg::Catalog> {
         &self.catalog
+    }
+
+    pub(crate) fn rest_catalog(&self) -> Option<&Arc<crate::iceberg_catalog_rest::RestCatalog>> {
+        self.rest_catalog.as_ref()
     }
 
     pub(crate) fn resources(&self) -> &IcebergControlResources {
@@ -184,6 +192,7 @@ impl std::fmt::Debug for IcebergControlRuntime {
             .field("control_state", &"<provider catalog state>")
             .field("resources", &self.resources)
             .field("catalog", &"<provider catalog client>")
+            .field("rest_catalog", &self.rest_catalog.is_some())
             .finish()
     }
 }
