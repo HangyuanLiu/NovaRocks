@@ -91,9 +91,9 @@ pub use service::{
 pub use truncate::TruncateCommit;
 pub use update_cow::{CowUpdateCommit, CowUpdateRewriteSet, CowUpdateTouchedFile};
 pub use validation::{
-    classify_iceberg_write_mode, classify_sql_delete_strategy, ensure_column_id_not_regressed,
+    classify_iceberg_write_mode, ensure_column_id_not_regressed,
     ensure_default_sort_order_resolvable, ensure_equality_delete_single_partition_spec,
     ensure_iceberg_write_supported, ensure_no_equality_deletes,
     ensure_overwrite_single_partition_spec, ensure_partition_id_not_regressed,
-    ensure_single_partition_spec, match_select_schema_to_table, select_iceberg_update_mode,
+    ensure_single_partition_spec, match_select_schema_to_table,
 };

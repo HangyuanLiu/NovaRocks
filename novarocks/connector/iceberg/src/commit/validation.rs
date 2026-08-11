@@ -26,8 +26,7 @@ use crate::iceberg::table::Table;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 
 use crate::commit::{
-    IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
-    NOVAROCKS_UPDATE_MODE_COW,
+    IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
 };
 
 pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
@@ -187,11 +186,6 @@ pub fn ensure_column_id_not_regressed(current: i32, next: i32) -> Result<(), Str
     Ok(())
 }
 
-pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStrategy, String> {
-    let write_mode = ensure_iceberg_write_supported(table)?;
-    Ok(sql_delete_strategy_from_write_mode(write_mode))
-}
-
 /// The physical row-mutation strategy this provider will use for `intent`
 /// against `metadata`.
 ///
@@ -244,26 +238,6 @@ pub fn row_mutation_strategy_from_metadata(
     }
 }
 
-// Consumed by later UPDATE lowering/execution tasks.
-#[allow(dead_code)]
-pub fn ensure_update_requires_v3_row_lineage(table: &Table) -> Result<(), String> {
-    let metadata = table.metadata();
-    ensure_update_properties_require_v3_row_lineage(
-        metadata.format_version(),
-        metadata.properties(),
-    )
-}
-
-// Consumed by later UPDATE lowering/execution tasks.
-#[allow(dead_code)]
-pub fn select_iceberg_update_mode(table: &Table) -> Result<IcebergUpdateMode, String> {
-    ensure_update_requires_v3_row_lineage(table)?;
-    select_update_mode_from_properties(
-        table.metadata().format_version(),
-        table.metadata().properties(),
-    )
-}
-
 fn select_update_mode_from_properties(
     format_version: FormatVersion,
     props: &HashMap<String, String>,
@@ -286,13 +260,6 @@ fn ensure_update_properties_require_v3_row_lineage(
         return Err("UPDATE requires an Iceberg v3 table with write.row-lineage=true".to_string());
     }
     Ok(())
-}
-
-fn sql_delete_strategy_from_write_mode(write_mode: IcebergWriteMode) -> IcebergSqlDeleteStrategy {
-    match write_mode {
-        IcebergWriteMode::LegacyPositionDeletes => IcebergSqlDeleteStrategy::PositionDeleteFiles,
-        IcebergWriteMode::RowLineageV3 => IcebergSqlDeleteStrategy::DeletionVectors,
-    }
 }
 
 /// Phase 1 only handles tables whose data is all under the current default
@@ -498,22 +465,6 @@ mod tests {
         assert_eq!(
             classify_iceberg_write_mode_from_metadata(FormatVersion::V2, &props),
             IcebergWriteMode::LegacyPositionDeletes
-        );
-    }
-
-    #[test]
-    fn sql_delete_strategy_keeps_v2_on_position_delete_files() {
-        assert_eq!(
-            sql_delete_strategy_from_write_mode(IcebergWriteMode::LegacyPositionDeletes),
-            IcebergSqlDeleteStrategy::PositionDeleteFiles
-        );
-    }
-
-    #[test]
-    fn sql_delete_strategy_uses_deletion_vectors_for_row_lineage_v3() {
-        assert_eq!(
-            sql_delete_strategy_from_write_mode(IcebergWriteMode::RowLineageV3),
-            IcebergSqlDeleteStrategy::DeletionVectors
         );
     }
 
