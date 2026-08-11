@@ -25,10 +25,14 @@
 use crate::PROVIDER_ID;
 use crate::catalog_config::parse_catalog_configuration_with_object_store_binding;
 use crate::catalog_control::IcebergCatalogControlState;
+use crate::catalog_control::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
+use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
 use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
+use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
 use crate::commit::IcebergWriteControl;
 use crate::control_provider::IcebergControlProvider;
 use crate::control_runtime::IcebergControlRuntime;
+use crate::distributed_rewrite::IcebergDistributedRewriteControl;
 use crate::execution_declaration::IcebergInstanceDistribution;
 use crate::resources::IcebergControlResources;
 use novarocks_spi::connector::{
@@ -131,7 +135,7 @@ impl ConnectorControlFactory for IcebergControlFactory {
             incarnation,
         };
         let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new(
-            key,
+            key.clone(),
             Arc::clone(&unpublished.runtime),
         )?);
         let write_control = Arc::new(IcebergWriteControl::new(
@@ -139,19 +143,42 @@ impl ConnectorControlFactory for IcebergControlFactory {
             incarnation,
             Arc::clone(&unpublished.runtime),
         ));
-        let binding =
-            ConnectorControlBinding::try_new_with_all_capabilities_and_metadata_maintenance(
+        let data_mutation = Arc::new(IcebergDataMutationAdapter::try_new(Arc::clone(&provider))?);
+        let distributed_rewrite = Arc::new(IcebergDistributedRewriteControl::new(
+            descriptor.clone(),
+            incarnation,
+            Arc::clone(&unpublished.runtime),
+            Arc::clone(&provider),
+            Arc::clone(&write_control),
+        )?);
+        let cleanup_maintenance = Arc::new(IcebergCleanupMaintenanceAdapter::new(
+            key,
+            Arc::clone(&unpublished.runtime),
+        )?);
+        let staged_create = if unpublished.runtime.rest_catalog().is_some() {
+            Some(Arc::new(IcebergStagedCreateAdapter::try_new(
+                Arc::clone(&provider),
+                Arc::clone(&write_control),
+            )?))
+        } else {
+            None
+        };
+        let binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
                 descriptor.clone(),
                 incarnation,
                 provider.clone(),
                 provider.clone(),
                 Arc::new(IcebergInstanceDistribution::new(descriptor, incarnation)),
                 Some(provider.clone()),
-                None,
+                Some(data_mutation),
                 Some(metadata_maintenance),
+                Some(distributed_rewrite),
+                Some(cleanup_maintenance),
+                staged_create.map(|capability| capability as Arc<dyn novarocks_spi::connector::ConnectorStagedCreate>),
                 Some(write_control),
                 Some(provider.clone()),
             )?
+            .try_with_staged_publication_recovery(Some(provider.clone()))?
             .try_with_view_metadata(Some(provider))?;
         ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
     }
@@ -420,6 +447,45 @@ mod tests {
         let mutation = creation.binding().mutation().expect("catalog mutation");
         assert_eq!(mutation.descriptor(), creation.binding().descriptor());
         assert_eq!(mutation.incarnation(), creation.binding().incarnation());
+        let data_mutation = creation.binding().data_mutation().expect("data mutation");
+        assert_eq!(data_mutation.descriptor(), creation.binding().descriptor());
+        assert_eq!(
+            data_mutation.binding_key().incarnation,
+            creation.binding().incarnation()
+        );
+        let distributed_rewrite = creation
+            .binding()
+            .distributed_rewrite()
+            .expect("distributed rewrite");
+        assert_eq!(
+            distributed_rewrite.descriptor(),
+            creation.binding().descriptor()
+        );
+        assert_eq!(
+            distributed_rewrite.binding_key().incarnation,
+            creation.binding().incarnation()
+        );
+        let cleanup = creation
+            .binding()
+            .cleanup_maintenance()
+            .expect("cleanup maintenance");
+        assert_eq!(cleanup.descriptor(), creation.binding().descriptor());
+        assert_eq!(
+            cleanup.binding_key().incarnation,
+            creation.binding().incarnation()
+        );
+        assert!(
+            creation.binding().staged_create().is_none(),
+            "Hadoop generations must not expose REST-only staged create"
+        );
+        let recovery = creation
+            .binding()
+            .staged_publication_recovery()
+            .expect("staged publication recovery");
+        assert_eq!(
+            recovery.binding_key().incarnation,
+            creation.binding().incarnation()
+        );
         let views = creation.binding().view_metadata().expect("view metadata");
         assert_eq!(views.descriptor(), creation.binding().descriptor());
         assert_eq!(views.incarnation(), creation.binding().incarnation());

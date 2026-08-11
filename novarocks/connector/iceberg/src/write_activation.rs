@@ -58,6 +58,25 @@ impl IcebergWriteActivationReservations {
                 .map(|route| (route.cohort_id(), route.preparation().clone()))
                 .collect::<Vec<(ConnectorWriteCohortId, _)>>(),
         };
+        self.activate_cohorts(owner, request, cohorts)
+    }
+
+    /// Reserve an operation whose provider-owned planner froze more than one
+    /// cohort from one signed preparation source.  Distributed rewrite is the
+    /// only caller: generic SPI still exposes only `Prepared` and
+    /// `RowMutation` activation sources, while the provider binds the complete
+    /// cohort set into the resulting activation digest.
+    pub(crate) fn activate_cohorts(
+        &self,
+        owner: &ConnectorExecutionBindingKey,
+        request: &ConnectorWriteActivationRequest,
+        cohorts: Vec<(
+            ConnectorWriteCohortId,
+            novarocks_spi::connector::ConnectorWritePreparation,
+        )>,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
+        request.validate(owner)?;
+        let operation_id = request.operation_id;
         let activation = ConnectorWriteActivation::try_new(owner.clone(), request, cohorts)?;
         let mut reservations = self.reservations.lock().map_err(|error| {
             ConnectorError::new(
@@ -225,5 +244,40 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    #[test]
+    fn provider_frozen_multi_cohort_activation_is_bounded_and_idempotent() {
+        let owner = key();
+        let operation = ConnectorWriteOperationId::new();
+        let request = request(&owner, operation, b"rewrite");
+        let preparation = match &request.source {
+            ConnectorWriteActivationSource::Prepared(preparation) => preparation.clone(),
+            ConnectorWriteActivationSource::RowMutation(_) => unreachable!(),
+        };
+        let first_id = ConnectorWriteCohortId::derive(operation, b"rewrite-test", [1; 32])
+            .expect("first cohort");
+        let second_id = ConnectorWriteCohortId::derive(operation, b"rewrite-test", [2; 32])
+            .expect("second cohort");
+        let cohorts = vec![
+            (first_id, preparation.clone()),
+            (second_id, preparation.clone()),
+        ];
+        let reservations = IcebergWriteActivationReservations::default();
+        let first = reservations
+            .activate_cohorts(&owner, &request, cohorts.clone())
+            .expect("multi-cohort activation");
+        let replay = reservations
+            .activate_cohorts(&owner, &request, cohorts)
+            .expect("multi-cohort replay");
+        assert_eq!(first.digest(), replay.digest());
+        assert_eq!(first.cohorts().len(), 2);
+
+        let conflict =
+            match reservations.activate_cohorts(&owner, &request, vec![(first_id, preparation)]) {
+                Ok(_) => panic!("different cohort set must conflict"),
+                Err(error) => error,
+            };
+        assert_eq!(conflict.kind(), ConnectorErrorKind::InvalidRequest);
     }
 }

@@ -40,10 +40,10 @@ use novarocks_spi::connector::{
     ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
     ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteCohortId,
     ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecutionId,
-    ConnectorWriteInputShape, ConnectorWriteOperationId, ConnectorWritePlan,
-    ConnectorWritePlanningRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
-    ConnectorWriterHandle, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorWriteInputShape, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
+    ConnectorWriteReconcileRequest, ConnectorWriterHandle, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use crate::control_provider::IcebergControlProvider;
@@ -155,6 +155,38 @@ struct ActiveOperation {
     activation_source: ConnectorWriteActivationSource,
     target: ActiveTarget,
     cohorts: HashMap<ConnectorWriteCohortId, CohortService>,
+    distributed_rewrite: Option<DistributedRewriteOperation>,
+}
+
+#[derive(Clone)]
+struct DistributedRewriteOperation {
+    kind: IcebergDistributedRewriteKind,
+    data_paths: BTreeSet<String>,
+    delete_paths: BTreeSet<String>,
+}
+
+/// Provider-private cohort facts frozen by distributed-rewrite planning.
+/// These paths never enter SPI; they are retained only by the exact
+/// generation's write operation table and revalidated at commit time.
+#[derive(Clone)]
+pub(crate) struct IcebergDistributedRewriteCohortActivation {
+    pub cohort_id: ConnectorWriteCohortId,
+    pub preparation: novarocks_spi::connector::ConnectorWritePreparation,
+    pub control_payload: Bytes,
+    pub data_paths: BTreeSet<String>,
+    pub delete_paths: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct IcebergDistributedRewriteActivation {
+    pub kind: IcebergDistributedRewriteKind,
+    pub cohorts: Vec<IcebergDistributedRewriteCohortActivation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IcebergDistributedRewriteKind {
+    Data,
+    PositionDeletes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -405,7 +437,207 @@ impl IcebergWriteControl {
             target: operation_target
                 .ok_or_else(|| corrupt("Iceberg activation has no operation target"))?,
             cohorts,
+            distributed_rewrite: None,
         })
+    }
+
+    /// Activate every cohort frozen by one distributed rewrite through the
+    /// same generation-local reservation and operation tables used by normal
+    /// writes.  No Core service registry or current-generation lookup is
+    /// consulted.
+    pub(crate) fn activate_distributed_rewrite(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+        planned: IcebergDistributedRewriteActivation,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
+        validate_context(&context)?;
+        if planned.cohorts.is_empty() {
+            return Err(invalid(
+                "Iceberg distributed rewrite activation has no frozen cohorts",
+            ));
+        }
+        let source = planned
+            .cohorts
+            .first()
+            .expect("checked non-empty distributed rewrite cohorts")
+            .preparation
+            .clone();
+        let request = ConnectorWriteActivationRequest {
+            operation_id,
+            source: ConnectorWriteActivationSource::Prepared(source),
+            intent: ConnectorWriteActivationIntent::Ordinary,
+            context,
+        };
+        let activation = self.activations.activate_cohorts(
+            &self.key,
+            &request,
+            planned
+                .cohorts
+                .iter()
+                .map(|cohort| (cohort.cohort_id, cohort.preparation.clone()))
+                .collect(),
+        )?;
+        let mut active = match self.build_active_operation(&request, &activation) {
+            Ok(active) => active,
+            Err(error) => {
+                self.activations.release(operation_id)?;
+                return Err(error);
+            }
+        };
+        let mut data_paths = BTreeSet::new();
+        let mut delete_paths = BTreeSet::new();
+        for cohort in &planned.cohorts {
+            if cohort.data_paths.is_empty()
+                || cohort.data_paths.iter().any(|path| path.is_empty())
+                || cohort.delete_paths.iter().any(|path| path.is_empty())
+            {
+                self.activations.release(operation_id)?;
+                return Err(invalid(
+                    "Iceberg distributed rewrite cohort has invalid frozen paths",
+                ));
+            }
+            if planned.kind == IcebergDistributedRewriteKind::PositionDeletes
+                && cohort.delete_paths.is_empty()
+            {
+                self.activations.release(operation_id)?;
+                return Err(invalid(
+                    "Iceberg position-delete rewrite cohort has no frozen Puffin inputs",
+                ));
+            }
+            if !data_paths.is_disjoint(&cohort.data_paths)
+                || !delete_paths.is_disjoint(&cohort.delete_paths)
+            {
+                self.activations.release(operation_id)?;
+                return Err(invalid(
+                    "Iceberg distributed rewrite cohorts overlap frozen file ownership",
+                ));
+            }
+            data_paths.extend(cohort.data_paths.iter().cloned());
+            delete_paths.extend(cohort.delete_paths.iter().cloned());
+            active
+                .cohorts
+                .get_mut(&cohort.cohort_id)
+                .ok_or_else(|| corrupt("Iceberg rewrite activation lost a frozen cohort"))?
+                .control_payload = cohort.control_payload.clone();
+        }
+        active.distributed_rewrite = Some(DistributedRewriteOperation {
+            kind: planned.kind,
+            data_paths,
+            delete_paths,
+        });
+        let mut operations = self.operations.lock().map_err(operation_lock_error)?;
+        match operations.get(&operation_id) {
+            Some(OperationState::Active(existing))
+                if existing.activation_digest == activation.digest() =>
+            {
+                Ok(activation)
+            }
+            Some(_) => {
+                drop(operations);
+                self.activations.release(operation_id)?;
+                Err(invalid(
+                    "Iceberg distributed rewrite conflicts with an existing operation service",
+                ))
+            }
+            None => {
+                operations.insert(operation_id, OperationState::Active(active));
+                Ok(activation)
+            }
+        }
+    }
+
+    /// Validate a staged-create writer aggregate against the exact activated
+    /// operation without dispatching the ordinary table commit.  CTAS owns the
+    /// later atomic create-table publication, but it must not bypass the same
+    /// generation/cohort/control-payload admission used by ordinary writes.
+    pub(crate) fn validate_staged_completion(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+    ) -> Result<(), ConnectorError> {
+        if completion.owner() != &self.key {
+            return Err(invalid(
+                "Iceberg staged-create completion has a foreign write generation",
+            ));
+        }
+        let operation_id = completion.sealed().operation_id();
+        let operations = self.operations.lock().map_err(operation_lock_error)?;
+        let OperationState::Active(active) = operations
+            .get(&operation_id)
+            .ok_or_else(|| not_found("Iceberg staged-create completion has no active write"))?
+        else {
+            return Err(invalid(
+                "Iceberg staged-create completion cannot use a terminal write operation",
+            ));
+        };
+        if active.cohorts.len() != completion.sealed().cohorts().len()
+            || completion.sealed().cohorts().iter().any(|descriptor| {
+                active
+                    .cohorts
+                    .get(&descriptor.cohort_id())
+                    .is_none_or(|cohort| cohort.stable_digest != Some(descriptor.planning_digest()))
+            })
+        {
+            return Err(invalid(
+                "Iceberg staged-create sealed cohorts do not match the active writer service",
+            ));
+        }
+        for cohort in completion.cohorts() {
+            let active_cohort = active.cohorts.get(&cohort.cohort_id()).ok_or_else(|| {
+                invalid("Iceberg staged-create completion contains an unknown cohort")
+            })?;
+            for attempt in cohort
+                .accepted()
+                .into_iter()
+                .chain(cohort.superseded().iter())
+            {
+                if attempt.owner() != &self.key
+                    || attempt.operation_id() != operation_id
+                    || attempt.cohort_id() != cohort.cohort_id()
+                    || attempt.control_payload() != &active_cohort.control_payload
+                {
+                    return Err(invalid(
+                        "Iceberg staged-create attempt does not match its active cohort",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Release the generation-local write reservation only after staged-create
+    /// publication or abort has a known terminal outcome.  Unknown publication
+    /// deliberately retains the operation for exact-generation reconcile.
+    pub(crate) fn finish_staged_terminal(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+    ) -> Result<(), ConnectorError> {
+        let removed = {
+            let mut operations = self.operations.lock().map_err(operation_lock_error)?;
+            let removed = match operations.get(&operation_id) {
+                Some(OperationState::Active(_))
+                | Some(OperationState::KnownCommitted(_))
+                | Some(OperationState::KnownUncommitted(_)) => {
+                    operations.entries.remove(&operation_id)
+                }
+                Some(OperationState::CommitUnknown(_)) | Some(OperationState::Committing(_)) => {
+                    return Err(invalid(
+                        "Iceberg staged-create write reservation is not known terminal",
+                    ));
+                }
+                None => None,
+            };
+            if removed.is_some() {
+                operations
+                    .terminal_order
+                    .retain(|candidate| candidate != &operation_id);
+            }
+            removed
+        };
+        if removed.is_some() {
+            self.activations.release(operation_id)?;
+        }
+        Ok(())
     }
 
     fn writer_payload(
@@ -853,6 +1085,20 @@ impl IcebergWriteControl {
         }
 
         let (op_kind, cow_update_rewrite) = commit_shape(active, &decoded)?;
+        let selected_rewrite = active.distributed_rewrite.as_ref().map(|rewrite| {
+            super::selected_rewrite::SelectedRewriteFiles {
+                kind: match rewrite.kind {
+                    IcebergDistributedRewriteKind::Data => {
+                        super::selected_rewrite::SelectedRewriteKind::Data
+                    }
+                    IcebergDistributedRewriteKind::PositionDeletes => {
+                        super::selected_rewrite::SelectedRewriteKind::PositionDeletes
+                    }
+                },
+                data_paths: rewrite.data_paths.clone(),
+                delete_paths: rewrite.delete_paths.clone(),
+            }
+        });
         let table_ident = crate::iceberg::TableIdent::from_strs([
             active.target.namespace.as_str(),
             active.target.table.as_str(),
@@ -905,7 +1151,7 @@ impl IcebergWriteControl {
             file_io: table.file_io().clone(),
             cleanup_path_mapper,
             cow_update_rewrite,
-            selected_rewrite: None,
+            selected_rewrite,
             target_ref: active.target.target_ref.clone(),
             snapshot_properties,
         };
@@ -1776,6 +2022,9 @@ fn commit_shape(
     active: &ActiveOperation,
     cohorts: &[DecodedCohort],
 ) -> Result<(CommitOpKind, Option<CowUpdateRewriteSet>), CommitServiceError> {
+    if active.distributed_rewrite.is_some() {
+        return Ok((CommitOpKind::SelectedRewrite, None));
+    }
     if let ConnectorWriteActivationSource::RowMutation(plan) = &active.activation_source
         && let Some((_, recipes)) = plan.copy_on_write()
     {
@@ -2696,6 +2945,90 @@ mod tests {
                 .target,
             "ice.db.t"
         );
+    }
+
+    #[test]
+    fn staged_completion_is_exact_and_known_terminal_releases_reservation() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::new();
+        let activation = control
+            .activate_write(activation_request(&owner, operation_id, 1))
+            .expect("activate");
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let execution_id = ConnectorWriteExecutionId::new([3; 16], 1);
+        let writer = ConnectorWriterIdentity::new(
+            operation_id,
+            cohort_id,
+            execution_id,
+            [4; 16],
+            5,
+            6,
+            0,
+            owner.clone(),
+        );
+        let planning = ConnectorWritePlanningRequest {
+            operation_id,
+            cohort_id,
+            execution_id,
+            activation: activation.cohort(cohort_id).expect("cohort"),
+            expected_writers: vec![writer.clone()],
+            context: context(),
+        };
+        let planning_digest = planning.stable_digest(&owner).expect("planning digest");
+        let plan = control.plan_write(planning).expect("plan");
+        let report = ConnectorStagedReport::try_new(
+            writer,
+            CONNECTOR_WRITE_CONTRACT_VERSION,
+            ConnectorWriterTerminalState::Staged,
+            ConnectorStagedReportSummary::default(),
+            Bytes::from_static(b"opaque-staged-create-report"),
+        )
+        .expect("report");
+        let attempt = ConnectorWriteAttemptCompletion::try_new(
+            owner.clone(),
+            operation_id,
+            cohort_id,
+            execution_id,
+            [8; 32],
+            vec![report],
+            plan.control_payload().clone(),
+        )
+        .expect("attempt");
+        let sealed = ConnectorSealedWriteCohortSet::try_new(
+            operation_id,
+            vec![ConnectorWriteCohortDescriptor::new(
+                cohort_id,
+                ConnectorWriteIntent::Append,
+                planning_digest,
+            )],
+        )
+        .expect("sealed");
+        let completion = ConnectorWriteOperationCompletion::try_new(
+            owner.clone(),
+            sealed,
+            vec![
+                ConnectorWriteCohortCompletion::try_new(cohort_id, Some(attempt), Vec::new())
+                    .expect("cohort completion"),
+            ],
+        )
+        .expect("completion");
+        control
+            .validate_staged_completion(&completion)
+            .expect("exact staged completion");
+        control
+            .finish_staged_terminal(operation_id)
+            .expect("known terminal");
+        assert_eq!(
+            control
+                .validate_staged_completion(&completion)
+                .expect_err("released operation")
+                .kind(),
+            ConnectorErrorKind::NotFound
+        );
+        control
+            .activate_write(activation_request(&owner, operation_id, 1))
+            .expect("released reservation can be reused");
     }
 
     #[test]

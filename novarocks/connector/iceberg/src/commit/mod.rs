@@ -102,6 +102,8 @@ pub use validation::{
 };
 pub use write_control::{IcebergWriteControl, IcebergWriteReconcileEvidenceV1};
 
+pub(crate) use action::CommitCtx;
 pub(crate) use collector::IcebergCommitCollector;
+pub(crate) use fast_append::build_staged_fast_append_action;
 pub(crate) use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
 pub(crate) use update_cow::{CowUpdateRewriteSet, CowUpdateTouchedFile};

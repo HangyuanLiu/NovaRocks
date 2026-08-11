@@ -40,6 +40,7 @@ pub mod control_runtime;
 pub mod default_value;
 pub mod delete_file;
 pub mod delta;
+pub mod distributed_rewrite;
 pub mod execution_declaration;
 pub mod file_reader;
 pub mod fs_io;
