@@ -121,9 +121,14 @@ SQL owner 并只做类型中立化。**
 4. **legacy 与 Provider 的重复实现在此之后继续并存。** 本裁决只收敛 consumer 面；FE control factory 仍未
    切换，row-mutation control 仍只有一份 legacy 实现。这是已接受的临时成本，必须在同一 arc 内消除。
 
-5. **新增了三处有界 facts，多于立项时的估计（一处）。** 分区 source 列、写入目标类型、base version
-   ordinal 各一处。三者都挂在既有 capability 上、不新增 capability trait，但确实比预期多。分区 facts
-   一旦开口存在被扩成不受限 property map 的滑坡风险。
+5. **新增了四处有界 facts，远多于立项时的估计（一处）。** 分区 source 列、写入目标类型、base version
+   ordinal、written version ordinal 各一处。四者都挂在既有 capability 上、不新增 capability trait，但数量
+   本身说明立项时"consumer 面只是换调用"的判断偏乐观——第四处是在合并 commit 词汇时才暴露的：
+   merge-on-read writer 必须在 commit 存在之前就知道被重写的行属于哪个版本。
+
+   两处 ordinal 成对（一个向后看、一个向前看）且都 digest-bound，这限制了滑坡；但分区 facts 一旦开口，
+   仍有被扩成不受限 property map 的风险。任何超出"与 Arrow ordinal 对齐的 source column + typed 值"的
+   扩展请求都应重新设计，而不是加字段。
 
 ## 何时重新评估
 
