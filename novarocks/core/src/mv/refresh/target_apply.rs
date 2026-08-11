@@ -150,26 +150,16 @@ pub(crate) fn find_apply_key_field_id_by_column(
 }
 
 pub(crate) fn ensure_base_row_lineage_contract(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    observation: &crate::mv::storage_observation::MvSchemaValidationObservation,
     base_fqn: &str,
 ) -> Result<(), String> {
-    let metadata = table.metadata();
-    if metadata.format_version() != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-        || !row_lineage_property_enabled(metadata.properties())
-    {
+    if !observation.is_format_v3() || !observation.stored_row_lineage_enabled() {
         return Err(format!(
             "iceberg-backed materialized views require base table {base_fqn} to be Iceberg format-version=3 with write.row-lineage=true; \
              upgrade the table or recreate it with TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
         ));
     }
     Ok(())
-}
-
-fn row_lineage_property_enabled(props: &std::collections::HashMap<String, String>) -> bool {
-    props
-        .get("write.row-lineage")
-        .map(|value| value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 pub(crate) fn expose_physical_apply_key_for_locator_registration(
@@ -605,6 +595,9 @@ mod tests {
     use crate::mv::rewrite::context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
+    use crate::mv::storage_observation::{
+        MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
+    };
     use crate::sql::planner::table::{
         SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity,
     };
@@ -612,9 +605,45 @@ mod tests {
     use novarocks_catalog::identifier::TableIdentity;
 
     use super::{
-        BRANCH_ID_COLUMN_NAME, IcebergMvTargetBindings,
+        BRANCH_ID_COLUMN_NAME, IcebergMvTargetBindings, ensure_base_row_lineage_contract,
         expose_physical_apply_key_for_locator_registration, iceberg_mv_physical_select_sql,
     };
+
+    fn schema_observation(
+        format_v3: bool,
+        stored_row_lineage_enabled: bool,
+    ) -> MvSchemaValidationObservation {
+        MvSchemaValidationObservation::try_new_with_maximum_payload(
+            "table-uuid".to_string(),
+            1,
+            format_v3,
+            stored_row_lineage_enabled,
+            vec![MvObservedTargetField::new(
+                1,
+                "k".to_string(),
+                "long".to_string(),
+                false,
+            )],
+            MvSchemaValidationPartitionContract::new(0, Vec::new()),
+        )
+        .expect("schema observation")
+    }
+
+    #[test]
+    fn row_lineage_guard_consumes_neutral_schema_observation() {
+        ensure_base_row_lineage_contract(&schema_observation(true, true), "ice.db.base")
+            .expect("v3 row-lineage observation");
+
+        for observation in [
+            schema_observation(false, true),
+            schema_observation(true, false),
+        ] {
+            let error = ensure_base_row_lineage_contract(&observation, "ice.db.base")
+                .expect_err("incomplete row-lineage contract");
+            assert!(error.contains("format-version=3"), "{error}");
+            assert!(error.contains("write.row-lineage=true"), "{error}");
+        }
+    }
 
     struct TargetFixture {
         _warehouse: tempfile::TempDir,

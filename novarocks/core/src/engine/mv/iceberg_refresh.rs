@@ -3138,7 +3138,12 @@ fn load_base_with_row_lineage(
     String,
 > {
     let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-    ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
+    let context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    let observation = observe_schema_validation_for_table(state, base_ref, &context)?;
+    ensure_base_row_lineage_contract(&observation, &base_ref.fqn())?;
     Ok((base_ref.clone(), loaded_base))
 }
 
@@ -4667,20 +4672,18 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&target.catalog)?
-    };
     // SQLX-2 keeps provider tables out of the process-wide planner catalog.
     // Every subsequent query resolves this target through its own admitted
-    // binding store, so the only durable side effect required after target
-    // creation, publication, recovery, or repartition is invalidating the
-    // provider cache.  Registering a concrete `TableDef` here would leak an
-    // Iceberg descriptor into later requests and bypass their exact lease.
-    entry.invalidate_table_cache(&target.namespace, &target.table);
+    // binding store. Confirm the catalog's exact generation is published;
+    // provider commits own their cache invalidation. Registering or mutating a
+    // concrete Core catalog entry here would create a second runtime owner.
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("parse MV target connector identity: {error}"))?;
+    novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+        state.connector_control.as_ref(),
+        &instance_id,
+    )
+    .map_err(|error| format!("acquire MV target connector generation: {error}"))?;
     Ok(())
 }
 
