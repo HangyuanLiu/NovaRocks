@@ -33,33 +33,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
-};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use chrono::NaiveDateTime;
-#[cfg(test)]
-use novarocks_connector_iceberg::delete_file::{
-    ReferencedDataFilePartition, ReferencedDataFilePartitions,
-    insert_referenced_data_file_partition,
-};
-use novarocks_connector_iceberg::iceberg::expr::{Predicate, Reference};
-use novarocks_connector_iceberg::iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{IcebergCommitCollector, classify_sql_delete_strategy};
-#[cfg(test)]
-use crate::connector::iceberg::delete_visibility::{
-    ExistingDeleteVisibility, load_existing_delete_visibility_by_data_file,
-    load_existing_delete_visibility_by_data_file_at,
-    load_existing_delete_visibility_from_descriptors, load_referenced_data_file_partitions,
-    load_referenced_data_file_partitions_at,
-};
-use crate::connector::iceberg::delete_visibility::{
-    ExistingDeleteVisibilityByDataFile, data_file_row_is_visible,
-};
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
@@ -160,11 +139,20 @@ pub(crate) fn prepare_delete_statement(
 
     // 3. Validation.
     let delete_strategy = classify_sql_delete_strategy(&table)?;
-    // 4. Validate WHERE → novarocks_connector_iceberg::iceberg::Predicate to surface unsupported clauses
-    //    early. The distributed SELECT planner owns scan pruning and existing
-    //    delete visibility from this point onward.
-    let schema = table.metadata().current_schema();
-    let _predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
+    // 4. Reject an unsupported WHERE clause before any external side effect.
+    //    The distributed SELECT planner owns scan pruning and existing delete
+    //    visibility from this point onward. Column types come from the provider
+    //    under the same exact lease, so this check never decodes an Iceberg
+    //    schema itself.
+    let where_columns =
+        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+            planning_lease.clone(),
+            connector_context.clone(),
+            &target.namespace,
+            &target.table,
+        )?
+        .dml_target_columns;
+    validate_where(&stmt.where_clause, &where_columns)?;
 
     let metadata = table.metadata();
     let base_snapshot_id = if target_ref != "main" {
@@ -632,26 +620,21 @@ fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Translate a `sqlparser::ast::Expr` into an [`novarocks_connector_iceberg::iceberg::expr::Predicate`].
+/// Check that a DELETE `WHERE` clause is inside the subset this engine supports.
+///
+/// Nothing is produced: the distributed SELECT planner owns the actual filtering
+/// from here on. This exists only to reject an unsupported clause before the
+/// statement reaches any external side effect.
 ///
 /// Phase 1 supports the following node shapes; everything else is rejected
 /// with an explicit error pointing at the unsupported construct so the caller
 /// can rewrite the WHERE clause.
-fn translate_where(
-    expr: &sqlast::Expr,
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> Result<Predicate, String> {
+fn validate_where(expr: &sqlast::Expr, columns: &[ColumnDef]) -> Result<(), String> {
     match expr {
         sqlast::Expr::BinaryOp { left, op, right } => match op {
-            sqlast::BinaryOperator::And => {
-                let l = translate_where(left, schema)?;
-                let r = translate_where(right, schema)?;
-                Ok(l.and(r))
-            }
-            sqlast::BinaryOperator::Or => {
-                let l = translate_where(left, schema)?;
-                let r = translate_where(right, schema)?;
-                Ok(l.or(r))
+            sqlast::BinaryOperator::And | sqlast::BinaryOperator::Or => {
+                validate_where(left, columns)?;
+                validate_where(right, columns)
             }
             sqlast::BinaryOperator::Eq
             | sqlast::BinaryOperator::NotEq
@@ -667,59 +650,26 @@ fn translate_where(
                 if extract_scalar_fn_comparison(left, right).is_some()
                     || extract_variant_get_comparison(left, right).is_some()
                 {
-                    return Ok(Predicate::AlwaysTrue);
+                    return Ok(());
                 }
-                let (col_name, value_expr, flipped) = extract_comparison(left, right)?;
-                let datum = literal_to_datum(value_expr, schema, &col_name)?;
-                let term = Reference::new(col_name);
-                let pred = match (op, flipped) {
-                    (sqlast::BinaryOperator::Eq, _) => term.equal_to(datum),
-                    (sqlast::BinaryOperator::NotEq, _) => term.not_equal_to(datum),
-                    (sqlast::BinaryOperator::Lt, false) | (sqlast::BinaryOperator::Gt, true) => {
-                        term.less_than(datum)
-                    }
-                    (sqlast::BinaryOperator::LtEq, false)
-                    | (sqlast::BinaryOperator::GtEq, true) => term.less_than_or_equal_to(datum),
-                    (sqlast::BinaryOperator::Gt, false) | (sqlast::BinaryOperator::Lt, true) => {
-                        term.greater_than(datum)
-                    }
-                    (sqlast::BinaryOperator::GtEq, false)
-                    | (sqlast::BinaryOperator::LtEq, true) => term.greater_than_or_equal_to(datum),
-                    _ => unreachable!(),
-                };
-                Ok(pred)
+                let (col_name, value_expr, _flipped) = extract_comparison(left, right)?;
+                validate_literal_for_column(value_expr, columns, &col_name)
             }
             other => Err(format!(
                 "phase 1 DELETE WHERE does not support binary operator `{other:?}`"
             )),
         },
-        sqlast::Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
+        sqlast::Expr::InList { expr, list, .. } => {
             let col_name = expr_to_column_name(expr)?;
-            let datums: Vec<Datum> = list
-                .iter()
-                .map(|lit| literal_to_datum(lit, schema, &col_name))
-                .collect::<Result<_, _>>()?;
-            let term = Reference::new(col_name);
-            let pred = if *negated {
-                term.is_not_in(datums)
-            } else {
-                term.is_in(datums)
-            };
-            Ok(pred)
+            for literal in list {
+                validate_literal_for_column(literal, columns, &col_name)?;
+            }
+            Ok(())
         }
-        sqlast::Expr::IsNull(inner) => {
-            let col = expr_to_column_name(inner)?;
-            Ok(Reference::new(col).is_null())
+        sqlast::Expr::IsNull(inner) | sqlast::Expr::IsNotNull(inner) => {
+            expr_to_column_name(inner).map(|_| ())
         }
-        sqlast::Expr::IsNotNull(inner) => {
-            let col = expr_to_column_name(inner)?;
-            Ok(Reference::new(col).is_not_null())
-        }
-        sqlast::Expr::Nested(inner) => translate_where(inner, schema),
+        sqlast::Expr::Nested(inner) => validate_where(inner, columns),
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
@@ -876,40 +826,6 @@ fn is_literal_expr(expr: &sqlast::Expr) -> bool {
     }
 }
 
-/// Apply a supported scalar function to a `CellValue` and return the resulting
-/// `CellValue`.  Returns an error for unsupported function / type combinations.
-fn apply_scalar_fn_to_cell(fn_name: &str, cell: CellValue) -> Result<CellValue, String> {
-    match fn_name {
-        "lower" => match cell {
-            CellValue::String(s) => Ok(CellValue::String(s.to_lowercase())),
-            other => Err(format!("LOWER() requires a string column, got {other:?}")),
-        },
-        "upper" => match cell {
-            CellValue::String(s) => Ok(CellValue::String(s.to_uppercase())),
-            other => Err(format!("UPPER() requires a string column, got {other:?}")),
-        },
-        "trim" => match cell {
-            CellValue::String(s) => Ok(CellValue::String(s.trim().to_string())),
-            other => Err(format!("TRIM() requires a string column, got {other:?}")),
-        },
-        "ltrim" => match cell {
-            CellValue::String(s) => Ok(CellValue::String(s.trim_start().to_string())),
-            other => Err(format!("LTRIM() requires a string column, got {other:?}")),
-        },
-        "rtrim" => match cell {
-            CellValue::String(s) => Ok(CellValue::String(s.trim_end().to_string())),
-            other => Err(format!("RTRIM() requires a string column, got {other:?}")),
-        },
-        "length" | "char_length" => match cell {
-            CellValue::String(s) => Ok(CellValue::Long(s.chars().count() as i64)),
-            other => Err(format!("LENGTH() requires a string column, got {other:?}")),
-        },
-        other => Err(format!(
-            "phase 1 DELETE WHERE: unsupported scalar function `{other}`"
-        )),
-    }
-}
-
 fn expr_to_column_name(expr: &sqlast::Expr) -> Result<String, String> {
     match expr {
         sqlast::Expr::Identifier(ident) => Ok(ident.value.to_lowercase()),
@@ -928,24 +844,31 @@ fn expr_to_column_name(expr: &sqlast::Expr) -> Result<String, String> {
     }
 }
 
-fn literal_to_datum(
+/// Check that `expr` is a literal this engine can interpret as `column_name`'s
+/// type.
+///
+/// The value itself is not retained: the caller only needs to know whether the
+/// clause is inside the supported subset. Actual filtering belongs to the
+/// distributed SELECT planner.
+fn validate_literal_for_column(
     expr: &sqlast::Expr,
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    columns: &[ColumnDef],
     column_name: &str,
-) -> Result<Datum, String> {
-    let field = schema
-        .as_struct()
-        .fields()
+) -> Result<(), String> {
+    let column = columns
         .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(column_name))
+        .find(|column| column.name.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| format!("column `{column_name}` not found in iceberg table schema"))?;
-    let prim = match &*field.field_type {
-        Type::Primitive(p) => p,
-        other => {
+    let column_type = match &column.data_type {
+        nested @ (DataType::Struct(_)
+        | DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::Map(_, _)) => {
             return Err(format!(
-                "phase 1 DELETE WHERE only supports primitive columns; column `{column_name}` is {other:?}"
+                "phase 1 DELETE WHERE only supports primitive columns; column `{column_name}` is {nested:?}"
             ));
         }
+        other => other,
     };
     let lit_value = match expr {
         sqlast::Expr::Value(v) => v,
@@ -996,349 +919,38 @@ fn literal_to_datum(
     } else {
         lit_str.as_str()
     };
-    match prim {
-        PrimitiveType::Int => lit_str
+    match column_type {
+        DataType::Int32 => lit_str
             .parse::<i32>()
-            .map(Datum::int)
+            .map(|_| ())
             .map_err(|e| format!("parse INT literal `{lit_str}` for column `{column_name}`: {e}")),
-        PrimitiveType::Long => lit_str
+        DataType::Int64 => lit_str
             .parse::<i64>()
-            .map(Datum::long)
+            .map(|_| ())
             .map_err(|e| format!("parse LONG literal `{lit_str}` for column `{column_name}`: {e}")),
-        PrimitiveType::String => Ok(Datum::string(lit_str)),
-        PrimitiveType::Boolean => lit_str
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(()),
+        DataType::Boolean => lit_str
             .parse::<bool>()
-            .map(Datum::bool)
+            .map(|_| ())
             .map_err(|e| format!("parse BOOL literal `{lit_str}` for column `{column_name}`: {e}")),
-        PrimitiveType::Timestamp => {
+        DataType::Timestamp(TimeUnit::Microsecond, zone) => {
             // SQL DATETIME literals arrive as 'YYYY-MM-DD HH:MM:SS[.ffffff]'.
             // Try sub-second precision first, then whole-second form.
-            let micros = NaiveDateTime::parse_from_str(lit_str, "%Y-%m-%d %H:%M:%S%.f")
+            let label = if zone.is_some() {
+                "TIMESTAMPTZ"
+            } else {
+                "DATETIME"
+            };
+            NaiveDateTime::parse_from_str(lit_str, "%Y-%m-%d %H:%M:%S%.f")
                 .or_else(|_| NaiveDateTime::parse_from_str(lit_str, "%Y-%m-%d %H:%M:%S"))
-                .map(|dt| dt.and_utc().timestamp_micros())
+                .map(|_| ())
                 .map_err(|e| {
-                    format!("parse DATETIME literal `{lit_str}` for column `{column_name}`: {e}")
-                })?;
-            Ok(Datum::timestamp_micros(micros))
-        }
-        PrimitiveType::Timestamptz => {
-            let micros = NaiveDateTime::parse_from_str(lit_str, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| NaiveDateTime::parse_from_str(lit_str, "%Y-%m-%d %H:%M:%S"))
-                .map(|dt| dt.and_utc().timestamp_micros())
-                .map_err(|e| {
-                    format!("parse TIMESTAMPTZ literal `{lit_str}` for column `{column_name}`: {e}")
-                })?;
-            Ok(Datum::timestamptz_micros(micros))
+                    format!("parse {label} literal `{lit_str}` for column `{column_name}`: {e}")
+                })
         }
         other => Err(format!(
             "phase 1 DELETE WHERE primitive type {other:?} not yet supported (column `{column_name}`)"
         )),
-    }
-}
-
-fn collect_position_deletes_from_batch(
-    batch: &RecordBatch,
-    where_expr: &sqlast::Expr,
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
-    by_file: &mut BTreeMap<String, Vec<i64>>,
-) -> Result<(), String> {
-    let file_idx = batch
-        .schema()
-        .index_of("_file")
-        .map_err(|_| "scan batch missing `_file` column".to_string())?;
-    let pos_idx = batch
-        .schema()
-        .index_of("_pos")
-        .map_err(|_| "scan batch missing `_pos` column".to_string())?;
-    let file_col = arrow::compute::cast(batch.column(file_idx), &DataType::Utf8)
-        .map_err(|e| format!("cast _file to Utf8 failed: {e}"))?;
-    let pos_col = arrow::compute::cast(batch.column(pos_idx), &DataType::Int64)
-        .map_err(|e| format!("cast _pos to Int64 failed: {e}"))?;
-    let file_arr = file_col
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "_file column not Utf8 after cast".to_string())?;
-    let pos_arr = pos_col
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "_pos column not Int64 after cast".to_string())?;
-
-    for i in 0..batch.num_rows() {
-        if file_arr.is_null(i) || pos_arr.is_null(i) {
-            continue;
-        }
-        let path = file_arr.value(i);
-        if !data_file_row_is_visible(batch, i, path, pos_arr.value(i), existing_deletes_by_file)? {
-            continue;
-        }
-        let matches = evaluate_where_at_row(where_expr, batch, i, schema)?;
-        if !matches {
-            continue;
-        }
-        by_file
-            .entry(path.to_string())
-            .or_default()
-            .push(pos_arr.value(i));
-    }
-    Ok(())
-}
-
-/// Evaluate a Phase-1 supported WHERE expression against a single row of a
-/// scanned [`RecordBatch`]. Mirrors the operator coverage of
-/// [`translate_where`]; any clause this engine cannot map should already have
-/// been rejected upstream during predicate translation.
-fn evaluate_where_at_row(
-    expr: &sqlast::Expr,
-    batch: &RecordBatch,
-    row: usize,
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> Result<bool, String> {
-    match expr {
-        sqlast::Expr::BinaryOp { left, op, right } => match op {
-            sqlast::BinaryOperator::And => Ok(evaluate_where_at_row(left, batch, row, schema)?
-                && evaluate_where_at_row(right, batch, row, schema)?),
-            sqlast::BinaryOperator::Or => Ok(evaluate_where_at_row(left, batch, row, schema)?
-                || evaluate_where_at_row(right, batch, row, schema)?),
-            sqlast::BinaryOperator::Eq
-            | sqlast::BinaryOperator::NotEq
-            | sqlast::BinaryOperator::Lt
-            | sqlast::BinaryOperator::LtEq
-            | sqlast::BinaryOperator::Gt
-            | sqlast::BinaryOperator::GtEq => {
-                // Check for scalar_fn(col) <op> literal first.
-                if let Some((fn_name, col_name, value_expr, flipped)) =
-                    extract_scalar_fn_comparison(left, right)
-                {
-                    let raw_cell = column_value_at_row(&col_name, batch, row, schema)?;
-                    let cell = match raw_cell {
-                        None => return Ok(false),
-                        Some(v) => apply_scalar_fn_to_cell(&fn_name, v)?,
-                    };
-                    // The datum must match the *result* type of the function (e.g.
-                    // LOWER returns STRING, LENGTH returns LONG).  Build a synthetic
-                    // string-typed schema using the transformed cell type so
-                    // literal_to_datum can parse the literal correctly.
-                    let cmp =
-                        compare_cell_to_scalar_fn_literal(&cell, value_expr, &col_name, schema)?;
-                    return Ok(match (op, flipped) {
-                        (sqlast::BinaryOperator::Eq, _) => cmp == std::cmp::Ordering::Equal,
-                        (sqlast::BinaryOperator::NotEq, _) => cmp != std::cmp::Ordering::Equal,
-                        (sqlast::BinaryOperator::Lt, false)
-                        | (sqlast::BinaryOperator::Gt, true) => cmp == std::cmp::Ordering::Less,
-                        (sqlast::BinaryOperator::LtEq, false)
-                        | (sqlast::BinaryOperator::GtEq, true) => {
-                            cmp != std::cmp::Ordering::Greater
-                        }
-                        (sqlast::BinaryOperator::Gt, false)
-                        | (sqlast::BinaryOperator::Lt, true) => cmp == std::cmp::Ordering::Greater,
-                        (sqlast::BinaryOperator::GtEq, false)
-                        | (sqlast::BinaryOperator::LtEq, true) => cmp != std::cmp::Ordering::Less,
-                        _ => unreachable!("unsupported binary operator already rejected upstream"),
-                    });
-                }
-                let (col_name, value_expr, flipped) = extract_comparison(left, right)?;
-                let cell = column_value_at_row(&col_name, batch, row, schema)?;
-                let datum = literal_to_datum(value_expr, schema, &col_name)?;
-                let cmp = match cell {
-                    None => return Ok(false),
-                    Some(v) => compare_cell_to_datum(&v, &datum, &col_name)?,
-                };
-                Ok(match (op, flipped) {
-                    (sqlast::BinaryOperator::Eq, _) => cmp == std::cmp::Ordering::Equal,
-                    (sqlast::BinaryOperator::NotEq, _) => cmp != std::cmp::Ordering::Equal,
-                    (sqlast::BinaryOperator::Lt, false) | (sqlast::BinaryOperator::Gt, true) => {
-                        cmp == std::cmp::Ordering::Less
-                    }
-                    (sqlast::BinaryOperator::LtEq, false)
-                    | (sqlast::BinaryOperator::GtEq, true) => cmp != std::cmp::Ordering::Greater,
-                    (sqlast::BinaryOperator::Gt, false) | (sqlast::BinaryOperator::Lt, true) => {
-                        cmp == std::cmp::Ordering::Greater
-                    }
-                    (sqlast::BinaryOperator::GtEq, false)
-                    | (sqlast::BinaryOperator::LtEq, true) => cmp != std::cmp::Ordering::Less,
-                    _ => unreachable!("unsupported binary operator already rejected upstream"),
-                })
-            }
-            other => Err(format!(
-                "phase 1 DELETE WHERE evaluator does not support binary operator `{other:?}`"
-            )),
-        },
-        sqlast::Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let col_name = expr_to_column_name(expr)?;
-            let cell = column_value_at_row(&col_name, batch, row, schema)?;
-            let cell = match cell {
-                Some(v) => v,
-                None => return Ok(false),
-            };
-            for lit in list {
-                let datum = literal_to_datum(lit, schema, &col_name)?;
-                if compare_cell_to_datum(&cell, &datum, &col_name)? == std::cmp::Ordering::Equal {
-                    return Ok(!*negated);
-                }
-            }
-            Ok(*negated)
-        }
-        sqlast::Expr::IsNull(inner) => {
-            let col = expr_to_column_name(inner)?;
-            Ok(column_value_at_row(&col, batch, row, schema)?.is_none())
-        }
-        sqlast::Expr::IsNotNull(inner) => {
-            let col = expr_to_column_name(inner)?;
-            Ok(column_value_at_row(&col, batch, row, schema)?.is_some())
-        }
-        sqlast::Expr::Nested(inner) => evaluate_where_at_row(inner, batch, row, schema),
-        other => Err(format!(
-            "phase 1 DELETE WHERE evaluator does not support {other:?}"
-        )),
-    }
-}
-
-/// Owned, evaluator-friendly view of a single row's column value.
-#[derive(Debug, Clone)]
-enum CellValue {
-    Int(i64),
-    Long(i64),
-    String(String),
-    Bool(bool),
-    /// Microseconds since Unix epoch (matches Iceberg `Timestamp` and `Timestamptz`).
-    Timestamp(i64),
-}
-
-fn column_value_at_row(
-    col_name: &str,
-    batch: &RecordBatch,
-    row: usize,
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> Result<Option<CellValue>, String> {
-    let field = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(col_name))
-        .ok_or_else(|| format!("column `{col_name}` not found in iceberg schema"))?;
-    let prim = match &*field.field_type {
-        Type::Primitive(p) => p,
-        other => {
-            return Err(format!(
-                "phase 1 DELETE WHERE evaluator only supports primitive columns; column `{col_name}` is {other:?}"
-            ));
-        }
-    };
-    let idx = batch
-        .schema()
-        .index_of(&field.name)
-        .map_err(|_| format!("scan batch missing column `{col_name}`"))?;
-    let column = batch.column(idx);
-    if column.is_null(row) {
-        return Ok(None);
-    }
-    let value = match prim {
-        PrimitiveType::Int => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| format!("column `{col_name}` is not Int32"))?;
-            CellValue::Int(arr.value(row) as i64)
-        }
-        PrimitiveType::Long => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| format!("column `{col_name}` is not Int64"))?;
-            CellValue::Long(arr.value(row))
-        }
-        PrimitiveType::String => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| format!("column `{col_name}` is not Utf8"))?;
-            CellValue::String(arr.value(row).to_string())
-        }
-        PrimitiveType::Boolean => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| format!("column `{col_name}` is not Boolean"))?;
-            CellValue::Bool(arr.value(row))
-        }
-        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| format!("column `{col_name}` is not TimestampMicrosecond"))?;
-            CellValue::Timestamp(arr.value(row))
-        }
-        other => {
-            return Err(format!(
-                "phase 1 DELETE WHERE evaluator does not yet support primitive type {other:?} (column `{col_name}`)"
-            ));
-        }
-    };
-    Ok(Some(value))
-}
-
-fn compare_cell_to_datum(
-    cell: &CellValue,
-    datum: &Datum,
-    col_name: &str,
-) -> Result<std::cmp::Ordering, String> {
-    use novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral;
-    let lit = datum.literal();
-    match (cell, lit) {
-        (CellValue::Int(c), PrimitiveLiteral::Int(d)) => Ok(c.cmp(&(*d as i64))),
-        (CellValue::Long(c), PrimitiveLiteral::Long(d)) => Ok(c.cmp(d)),
-        (CellValue::String(c), PrimitiveLiteral::String(d)) => Ok(c.as_str().cmp(d.as_str())),
-        (CellValue::Bool(c), PrimitiveLiteral::Boolean(d)) => Ok(c.cmp(d)),
-        // Iceberg Timestamp / Timestamptz both store microseconds-since-epoch as PrimitiveLiteral::Long.
-        (CellValue::Timestamp(c), PrimitiveLiteral::Long(d)) => Ok(c.cmp(d)),
-        (cell, lit) => Err(format!(
-            "phase 1 DELETE WHERE evaluator: column `{col_name}` and literal types disagree (cell={cell:?}, lit={lit:?})"
-        )),
-    }
-}
-
-/// Compare a transformed `CellValue` (output of a scalar function) directly
-/// against a SQL literal expression.  The comparison is done at the Rust level
-/// without going through an Iceberg `Datum`, because the scalar-function output
-/// type may differ from the underlying column type (e.g. LENGTH returns Long but
-/// the column is String).
-fn compare_cell_to_scalar_fn_literal(
-    cell: &CellValue,
-    literal_expr: &sqlast::Expr,
-    col_name: &str,
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> Result<std::cmp::Ordering, String> {
-    match cell {
-        CellValue::String(c) => {
-            let s = extract_string_literal(literal_expr).ok_or_else(|| {
-                format!(
-                    "phase 1 DELETE WHERE: scalar function on column `{col_name}` returned STRING; \
-                     expected a string literal on the other side of the comparison"
-                )
-            })?;
-            Ok(c.as_str().cmp(s))
-        }
-        CellValue::Long(c) => {
-            let n = extract_integer_literal(literal_expr).ok_or_else(|| {
-                format!(
-                    "phase 1 DELETE WHERE: scalar function on column `{col_name}` returned LONG; \
-                     expected an integer literal on the other side of the comparison"
-                )
-            })?;
-            Ok(c.cmp(&n))
-        }
-        // For Int/Bool/Timestamp results fall back to building a datum via the
-        // underlying column type (these do not arise from the currently supported
-        // scalar functions but are handled for completeness).
-        _ => {
-            let datum = literal_to_datum(literal_expr, schema, col_name)?;
-            compare_cell_to_datum(cell, &datum, col_name)
-        }
     }
 }
 
@@ -1429,42 +1041,6 @@ mod tests {
         writer.close().expect("close delete file");
     }
 
-    fn iceberg_schema() -> novarocks_connector_iceberg::iceberg::spec::Schema {
-        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )),
-                Arc::new(NestedField::required(
-                    2,
-                    "category",
-                    Type::Primitive(PrimitiveType::String),
-                )),
-            ])
-            .build()
-            .expect("build iceberg schema")
-    }
-
-    fn iceberg_schema_with_variant() -> novarocks_connector_iceberg::iceberg::spec::Schema {
-        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )),
-                Arc::new(NestedField::optional(
-                    2,
-                    "v",
-                    Type::Primitive(PrimitiveType::Variant),
-                )),
-            ])
-            .build()
-            .expect("build iceberg schema with variant")
-    }
-
     fn delete_where_id_in_2_3() -> sqlast::Expr {
         sqlast::Expr::InList {
             expr: Box::new(sqlast::Expr::Identifier(sqlast::Ident::new("id"))),
@@ -1503,12 +1079,41 @@ mod tests {
         select.selection.clone().expect("where clause")
     }
 
+    /// Variant columns reach row DML as LargeBinary, which is what keeps them
+    /// distinguishable from a genuine string column.
+    fn columns_with_variant() -> Vec<novarocks_catalog::schema::ColumnDef> {
+        vec![
+            column("id", DataType::Int32),
+            column("v", DataType::LargeBinary),
+        ]
+    }
+
+    fn columns_with_timestamp() -> Vec<novarocks_catalog::schema::ColumnDef> {
+        vec![
+            column("id", DataType::Int32),
+            column(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            ),
+        ]
+    }
+
     #[test]
-    fn delete_translate_accepts_variant_get_predicate_for_pipeline_filtering() {
+    fn delete_validate_accepts_variant_get_predicate_for_pipeline_filtering() {
         let where_clause =
             where_expr("SELECT 1 FROM orders WHERE try_variant_get(v, '$.a', 'bigint') = 2");
-        super::translate_where(&where_clause, &iceberg_schema_with_variant())
+        super::validate_where(&where_clause, &columns_with_variant())
             .expect("variant_get predicate should be delegated to the query pipeline");
+    }
+
+    #[test]
+    fn delete_validate_rejects_a_direct_comparison_against_a_variant_column() {
+        // Without the write-target type a variant column would look like a
+        // string here and the comparison would be wrongly accepted.
+        let where_clause = where_expr("SELECT 1 FROM orders WHERE v = 'x'");
+        let error = super::validate_where(&where_clause, &columns_with_variant())
+            .expect_err("a bare variant comparison is not supported");
+        assert!(error.contains("LargeBinary"), "{error}");
     }
 
     #[test]
@@ -1573,214 +1178,7 @@ mod tests {
         assert!(rendered.contains("FOR SYSTEM_TIME AS OF '__nr_ref:dev'"));
     }
 
-    #[test]
-    fn referenced_data_file_partition_insert_rejects_conflicting_duplicate_metadata() {
-        let path = "/warehouse/db/t/data.parquet".to_string();
-        let mut partitions = HashMap::new();
-        super::insert_referenced_data_file_partition(
-            &mut partitions,
-            path.clone(),
-            super::ReferencedDataFilePartition {
-                partition_spec_id: 1,
-                partition_values: Struct::from_iter([Some(Literal::int(10))]),
-            },
-        )
-        .expect("insert first partition metadata");
-        super::insert_referenced_data_file_partition(
-            &mut partitions,
-            path.clone(),
-            super::ReferencedDataFilePartition {
-                partition_spec_id: 1,
-                partition_values: Struct::from_iter([Some(Literal::int(10))]),
-            },
-        )
-        .expect("identical duplicate partition metadata");
-
-        let err = super::insert_referenced_data_file_partition(
-            &mut partitions,
-            path.clone(),
-            super::ReferencedDataFilePartition {
-                partition_spec_id: 2,
-                partition_values: Struct::from_iter([Some(Literal::int(10))]),
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains(&path));
-        assert!(err.contains("conflicting partition metadata"));
-        assert!(err.contains("old partition spec id 1"));
-        assert!(err.contains("new partition spec id 2"));
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[&path].partition_spec_id, 1);
-
-        let mut partitions = HashMap::new();
-        super::insert_referenced_data_file_partition(
-            &mut partitions,
-            path.clone(),
-            super::ReferencedDataFilePartition {
-                partition_spec_id: 1,
-                partition_values: Struct::from_iter([Some(Literal::int(10))]),
-            },
-        )
-        .expect("insert first partition metadata");
-        let err = super::insert_referenced_data_file_partition(
-            &mut partitions,
-            path.clone(),
-            super::ReferencedDataFilePartition {
-                partition_spec_id: 1,
-                partition_values: Struct::from_iter([Some(Literal::int(20))]),
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains(&path));
-        assert!(err.contains("conflicting partition metadata"));
-        assert!(err.contains("old partition spec id 1"));
-        assert!(err.contains("new partition spec id 1"));
-    }
-
-    #[test]
-    fn position_delete_collection_skips_rows_hidden_by_equality_deletes() {
-        let dir = temp_dir_for("equality_visibility");
-        let delete_path = dir.join("eq-delete.parquet");
-        write_eq_delete_parquet(&delete_path);
-        let spec = IcebergDeleteFileSpec {
-            path: delete_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string(),
-            file_format: IcebergFileFormat::Parquet,
-            file_content: IcebergFileContent::EqualityDeletes,
-            length: None,
-            content_offset: None,
-            content_size_in_bytes: None,
-        };
-        let equality_deletes =
-            crate::connector::iceberg::equality_delete::load_equality_delete_sets(
-                &[spec],
-                &factory_for_dir(&dir),
-            )
-            .expect("load equality deletes");
-        let mut equality_deletes_by_file = HashMap::new();
-        equality_deletes_by_file.insert(
-            "/warehouse/db/t/data.parquet".to_string(),
-            super::ExistingDeleteVisibility {
-                deleted_positions: roaring::RoaringTreemap::new(),
-                equality_deletes,
-            },
-        );
-        let schema = iceberg_schema();
-        let batch_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-            Field::new("category", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            batch_schema,
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "/warehouse/db/t/data.parquet",
-                    "/warehouse/db/t/data.parquet",
-                    "/warehouse/db/t/data.parquet",
-                ])),
-                Arc::new(Int64Array::from(vec![0, 1, 2])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .expect("scan batch");
-        let mut by_file = BTreeMap::new();
-
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &delete_where_id_in_2_3(),
-            &schema,
-            &equality_deletes_by_file,
-            &mut by_file,
-        )
-        .expect("collect positions");
-
-        assert_eq!(
-            by_file
-                .get("/warehouse/db/t/data.parquet")
-                .map(Vec::as_slice),
-            Some(&[2][..])
-        );
-    }
-
-    #[test]
-    fn position_delete_collection_skips_rows_hidden_by_position_deletes() {
-        let schema = iceberg_schema();
-        let batch_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-            Field::new("category", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            batch_schema,
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "/warehouse/db/t/data.parquet",
-                    "/warehouse/db/t/data.parquet",
-                    "/warehouse/db/t/data.parquet",
-                ])),
-                Arc::new(Int64Array::from(vec![0, 1, 2])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .expect("scan batch");
-        let mut deleted_positions = roaring::RoaringTreemap::new();
-        deleted_positions.insert(1);
-        let mut visibility_by_file = HashMap::new();
-        visibility_by_file.insert(
-            "/warehouse/db/t/data.parquet".to_string(),
-            super::ExistingDeleteVisibility {
-                deleted_positions,
-                equality_deletes: Vec::new(),
-            },
-        );
-        let mut by_file = BTreeMap::new();
-
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &delete_where_id_in_2_3(),
-            &schema,
-            &visibility_by_file,
-            &mut by_file,
-        )
-        .expect("collect positions");
-
-        assert_eq!(
-            by_file
-                .get("/warehouse/db/t/data.parquet")
-                .map(Vec::as_slice),
-            Some(&[2][..])
-        );
-    }
-
     // --------------- Timestamp predicate tests ---------------
-
-    fn iceberg_schema_with_timestamp() -> novarocks_connector_iceberg::iceberg::spec::Schema {
-        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )),
-                Arc::new(NestedField::required(
-                    2,
-                    "ts",
-                    Type::Primitive(PrimitiveType::Timestamp),
-                )),
-            ])
-            .build()
-            .expect("build iceberg schema with timestamp")
-    }
 
     /// Build `WHERE ts = '<literal>'` as a sqlparser Expr.
     fn delete_where_ts_eq(literal: &str) -> sqlast::Expr {
@@ -1795,150 +1193,26 @@ mod tests {
     }
 
     #[test]
-    fn literal_to_datum_parses_datetime_without_subseconds() {
-        let schema = iceberg_schema_with_timestamp();
+    fn delete_validate_accepts_datetime_literals_with_and_without_subseconds() {
+        for literal in ["2020-01-01 00:00:00", "2020-01-01 00:00:00.5"] {
+            let expr = sqlast::Expr::Value(sqlast::ValueWithSpan {
+                value: sqlast::Value::SingleQuotedString(literal.to_string()),
+                span: sqlparser::tokenizer::Span::empty(),
+            });
+            super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
+                .unwrap_or_else(|error| panic!("`{literal}` must be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn delete_validate_rejects_a_malformed_datetime_literal() {
         let expr = sqlast::Expr::Value(sqlast::ValueWithSpan {
-            value: sqlast::Value::SingleQuotedString("2020-01-01 00:00:00".to_string()),
+            value: sqlast::Value::SingleQuotedString("2020-01-01T00:00:00".to_string()),
             span: sqlparser::tokenizer::Span::empty(),
         });
-        let datum = super::literal_to_datum(&expr, &schema, "ts").expect("parse datetime");
-        // 2020-01-01 00:00:00 UTC == 1577836800 seconds == 1577836800_000000 microseconds
-        use novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral;
-        assert!(
-            matches!(datum.literal(), PrimitiveLiteral::Long(us) if *us == 1_577_836_800_000_000),
-            "unexpected datum: {datum:?}"
-        );
-    }
-
-    #[test]
-    fn literal_to_datum_parses_datetime_with_subseconds() {
-        let schema = iceberg_schema_with_timestamp();
-        let expr = sqlast::Expr::Value(sqlast::ValueWithSpan {
-            value: sqlast::Value::SingleQuotedString("2020-01-01 00:00:00.5".to_string()),
-            span: sqlparser::tokenizer::Span::empty(),
-        });
-        let datum = super::literal_to_datum(&expr, &schema, "ts").expect("parse datetime .5");
-        use novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral;
-        // .5 seconds == 500_000 microseconds
-        assert!(
-            matches!(datum.literal(), PrimitiveLiteral::Long(us) if *us == 1_577_836_800_500_000),
-            "unexpected datum: {datum:?}"
-        );
-    }
-
-    #[test]
-    fn collect_position_deletes_finds_rows_matching_timestamp_predicate() {
-        use arrow::array::TimestampMicrosecondArray;
-        use arrow::datatypes::TimeUnit;
-
-        let schema = iceberg_schema_with_timestamp();
-        let batch_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]));
-        // Row 0: ts = 2020-01-01 00:00:00       (1577836800_000000 µs)
-        // Row 1: ts = 2020-01-01 00:00:00.5     (1577836800_500000 µs)
-        // Row 2: ts = 2020-01-02 00:00:00       (1577923200_000000 µs)
-        let ts_values: Vec<i64> = vec![
-            1_577_836_800_000_000,
-            1_577_836_800_500_000,
-            1_577_923_200_000_000,
-        ];
-        let batch = RecordBatch::try_new(
-            batch_schema,
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                ])),
-                Arc::new(Int64Array::from(vec![0, 1, 2])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(TimestampMicrosecondArray::from(ts_values)),
-            ],
-        )
-        .expect("scan batch");
-
-        // DELETE WHERE ts = '2020-01-01 00:00:00' — should match row 0 only.
-        let where_expr = delete_where_ts_eq("2020-01-01 00:00:00");
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions");
-
-        assert_eq!(
-            by_file.get("/wh/t/data.parquet").map(Vec::as_slice),
-            Some(&[0i64][..]),
-            "expected only position 0 (row with ts=2020-01-01 00:00:00)"
-        );
-    }
-
-    #[test]
-    fn collect_position_deletes_finds_rows_matching_timestamp_with_subseconds() {
-        use arrow::array::TimestampMicrosecondArray;
-        use arrow::datatypes::TimeUnit;
-
-        let schema = iceberg_schema_with_timestamp();
-        let batch_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]));
-        let ts_values: Vec<i64> = vec![
-            1_577_836_800_000_000,
-            1_577_836_800_500_000,
-            1_577_923_200_000_000,
-        ];
-        let batch = RecordBatch::try_new(
-            batch_schema,
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                ])),
-                Arc::new(Int64Array::from(vec![0, 1, 2])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(TimestampMicrosecondArray::from(ts_values)),
-            ],
-        )
-        .expect("scan batch");
-
-        // DELETE WHERE ts = '2020-01-01 00:00:00.5' — should match row 1 only.
-        let where_expr = delete_where_ts_eq("2020-01-01 00:00:00.5");
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions");
-
-        assert_eq!(
-            by_file.get("/wh/t/data.parquet").map(Vec::as_slice),
-            Some(&[1i64][..]),
-            "expected only position 1 (row with ts=2020-01-01 00:00:00.5)"
-        );
+        let error = super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
+            .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");
+        assert!(error.contains("DATETIME"), "{error}");
     }
 
     // --------------- Scalar-function predicate tests ---------------
@@ -2037,199 +1311,5 @@ mod tests {
                 span: sqlparser::tokenizer::Span::empty(),
             })),
         }
-    }
-
-    #[test]
-    fn scalar_fn_lower_matches_only_target_row() {
-        // Rows: (id=1,label='X'), (id=2,label='Y'), (id=3,label='Z')
-        // DELETE WHERE LOWER(label) = 'y' — should match position 1 (id=2) only.
-        let schema = iceberg_schema_with_label();
-        let batch = make_label_batch(&["X", "Y", "Z"]);
-        let where_expr = delete_where_lower_label_eq("y");
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions with LOWER predicate");
-
-        assert_eq!(
-            by_file.get("/wh/t/data.parquet").map(Vec::as_slice),
-            Some(&[1i64][..]),
-            "expected only position 1 (label='Y', LOWER='y')"
-        );
-    }
-
-    #[test]
-    fn scalar_fn_upper_matches_only_target_row() {
-        // DELETE WHERE UPPER(label) = 'Y' — should match position 1 (id=2) only.
-        let schema = iceberg_schema_with_label();
-        let batch = make_label_batch(&["X", "Y", "Z"]);
-        let where_expr = delete_where_upper_label_eq("Y");
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions with UPPER predicate");
-
-        assert_eq!(
-            by_file.get("/wh/t/data.parquet").map(Vec::as_slice),
-            Some(&[1i64][..]),
-            "expected only position 1 (label='Y', UPPER='Y')"
-        );
-    }
-
-    #[test]
-    fn scalar_fn_lower_on_already_lowercase_matches_correctly() {
-        // Rows all already lowercase: ('x','y','z').
-        // DELETE WHERE LOWER(label) = 'y' — should match position 1.
-        let schema = iceberg_schema_with_label();
-        let batch = make_label_batch(&["x", "y", "z"]);
-        let where_expr = delete_where_lower_label_eq("y");
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions");
-
-        assert_eq!(
-            by_file.get("/wh/t/data.parquet").map(Vec::as_slice),
-            Some(&[1i64][..]),
-        );
-    }
-
-    #[test]
-    fn scalar_fn_lower_no_match_returns_empty() {
-        // DELETE WHERE LOWER(label) = 'q' — no rows match.
-        let schema = iceberg_schema_with_label();
-        let batch = make_label_batch(&["X", "Y", "Z"]);
-        let where_expr = delete_where_lower_label_eq("q");
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions");
-
-        // No positions → map entry should be absent or empty.
-        assert!(
-            by_file
-                .get("/wh/t/data.parquet")
-                .map_or(true, |v| v.is_empty()),
-            "expected no matching positions"
-        );
-    }
-
-    /// Regression: plain col = literal still works correctly after the change.
-    #[test]
-    fn regression_plain_eq_still_works() {
-        let schema = iceberg_schema();
-        let batch_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-            Field::new("category", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            batch_schema,
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                ])),
-                Arc::new(Int64Array::from(vec![0, 1, 2])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .expect("batch");
-        // DELETE WHERE id = 2
-        let where_expr = sqlast::Expr::BinaryOp {
-            left: Box::new(sqlast::Expr::Identifier(sqlast::Ident::new("id"))),
-            op: sqlast::BinaryOperator::Eq,
-            right: Box::new(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::Number("2".to_string(), false),
-                span: sqlparser::tokenizer::Span::empty(),
-            })),
-        };
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions");
-        assert_eq!(
-            by_file.get("/wh/t/data.parquet").map(Vec::as_slice),
-            Some(&[1i64][..]),
-        );
-    }
-
-    /// Regression: col IN (...) still works correctly after the change.
-    #[test]
-    fn regression_in_list_still_works() {
-        let schema = iceberg_schema();
-        let batch_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-            Field::new("category", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            batch_schema,
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                    "/wh/t/data.parquet",
-                ])),
-                Arc::new(Int64Array::from(vec![0, 1, 2])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .expect("batch");
-        let where_expr = delete_where_id_in_2_3();
-        let empty_visibility = HashMap::new();
-        let mut by_file = BTreeMap::new();
-        super::collect_position_deletes_from_batch(
-            &batch,
-            &where_expr,
-            &schema,
-            &empty_visibility,
-            &mut by_file,
-        )
-        .expect("collect positions");
-        // id IN (2, 3) → positions 1 and 2
-        assert_eq!(
-            by_file.get("/wh/t/data.parquet").map(Vec::as_slice),
-            Some(&[1i64, 2][..]),
-        );
     }
 }
