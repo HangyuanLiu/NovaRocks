@@ -3267,6 +3267,12 @@ impl ConnectorMetadata for IcebergControlProvider {
         let planning_facts = novarocks_connector_iceberg::planning_facts::table_planning_facts(
             novarocks_connector_iceberg::planning_facts::IcebergTablePlanningFactsInput {
                 schema: &schema,
+                // Metadata tables project a synthetic Arrow schema that has no
+                // Iceberg column behind it, so they expose no write defaults.
+                iceberg_schema: table
+                    .metadata_table_type
+                    .is_none()
+                    .then(|| definition_schema.as_ref()),
                 metadata_columns: &table.metadata_columns,
                 hidden_columns: &table.hidden_columns,
                 logical_type_columns: &table.logical_type_columns,

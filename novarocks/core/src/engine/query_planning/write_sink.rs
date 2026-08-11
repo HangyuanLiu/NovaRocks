@@ -323,8 +323,11 @@ mod tests {
             ])
             .build()
             .expect("target schema");
-        let fields = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(&schema)
-            .expect("target columns");
+        let fields = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
+            &schema,
+            &std::collections::HashMap::new(),
+        )
+        .expect("target columns");
 
         assert_eq!(
             fields

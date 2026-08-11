@@ -20,7 +20,7 @@
 //! Frontend DML services own production statement routing and transaction
 //! orchestration over these primitives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{Field, Schema};
@@ -56,6 +56,7 @@ use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
 use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
 use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
@@ -1134,7 +1135,10 @@ pub(crate) fn build_iceberg_write_plan(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
 ) -> Result<(sqlparser::ast::Query, Vec<ColumnDef>), String> {
-    let write_columns = iceberg_insert_columns_from_schema(table.metadata().current_schema())?;
+    let write_columns = iceberg_insert_columns_from_schema(
+        table.metadata().current_schema(),
+        &write_defaults_by_name(&resolved.columns),
+    )?;
     let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
     let query =
         append_source_to_query_for_write(source, insert_columns, &source_columns, &write_columns)?;
@@ -1353,8 +1357,19 @@ fn source_index_for_write_column(
         })
 }
 
+/// Shape the INSERT target columns for one Iceberg table.
+///
+/// The Arrow type still comes from the Iceberg schema because the SQL-facing
+/// Variant and Binary projections below are not the ones the provider publishes
+/// in `ConnectorTableMetadata.schema`; reconciling those two mappings is
+/// SPI-5H's decision, not this function's.
+///
+/// The write default, by contrast, is no longer decoded here: `write_defaults`
+/// carries the already-neutral value keyed by column name, so this function
+/// never interprets an Iceberg literal.
 pub(crate) fn iceberg_insert_columns_from_schema(
     schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    write_defaults: &HashMap<String, ColumnDefault>,
 ) -> Result<Vec<ColumnDef>, String> {
     let arrow_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
         .map_err(|e| format!("convert iceberg insert schema to arrow schema failed: {e}"))?;
@@ -1378,24 +1393,22 @@ pub(crate) fn iceberg_insert_columns_from_schema(
                 name: field.name().clone(),
                 data_type,
                 nullable: field.is_nullable(),
-                write_default: nested
-                    .write_default
-                    .as_ref()
-                    .map(|literal| {
-                        novarocks_connector_iceberg::default_value::iceberg_literal_to_column_default(
-                            literal,
-                            nested.field_type.as_ref(),
-                        )
-                        .map_err(|e| {
-                            format!(
-                                "convert Iceberg insert write-default for column `{}` failed: {e}",
-                                field.name()
-                            )
-                        })
-                    })
-                    .transpose()?,
+                write_default: write_defaults.get(field.name()).cloned(),
                 logical_type: None,
             })
+        })
+        .collect()
+}
+
+/// Index already-neutral write defaults by column name.
+fn write_defaults_by_name(columns: &[ColumnDef]) -> HashMap<String, ColumnDefault> {
+    columns
+        .iter()
+        .filter_map(|column| {
+            column
+                .write_default
+                .as_ref()
+                .map(|value| (column.name.clone(), value.clone()))
         })
         .collect()
 }
@@ -2564,7 +2577,8 @@ mod tests {
             .build()
             .expect("schema");
 
-        let columns = iceberg_insert_columns_from_schema(&schema).expect("columns");
+        let columns =
+            iceberg_insert_columns_from_schema(&schema, &HashMap::new()).expect("columns");
         let names = columns
             .iter()
             .map(|column| column.name.as_str())
