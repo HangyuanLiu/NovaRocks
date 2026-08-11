@@ -283,18 +283,35 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
         cfg,
         cli.mysql_port,
         move |cfg, port| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(
+                    novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
+                )
+                .build()
+                .map_err(|error| anyhow::anyhow!("role=fe: build Tokio runtime: {error}"))?;
             let state_store_host_config = composition::state_store_host_config(&cfg);
-            novarocks_frontend::run_frontend_server(novarocks_frontend::FrontendServerConfig {
-                config: cfg,
-                config_path: frontend_config_path,
-                port_override: port,
-                connector_control_factories: Vec::new(),
-                mv_storage_observation: std::sync::Arc::new(
-                    composition::IcebergMvStorageObservationAdapter::default(),
-                ),
-                state_store_host_config,
-            })
-            .map_err(|error| anyhow::anyhow!("{error}"))
+            let connector_control_factories =
+                composition::compose_frontend_control_factories(&cfg, runtime.handle().clone())?;
+            runtime
+                .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
+                    novarocks_frontend::FrontendServerConfig {
+                        config: cfg,
+                        config_path: frontend_config_path,
+                        port_override: port,
+                        connector_control_factories,
+                        mv_storage_observation: std::sync::Arc::new(
+                            composition::IcebergMvStorageObservationAdapter::default(),
+                        ),
+                        state_store_host_config,
+                    },
+                    async {
+                        tokio::signal::ctrl_c().await.unwrap_or_else(|error| {
+                            tracing::warn!(%error, "frontend Ctrl-C listener failed");
+                        });
+                    },
+                ))
+                .map_err(|error| anyhow::anyhow!("role=fe: {error}"))
         },
         run_standalone_be_role,
         move |cfg, port| composition::run_all_in_one(cfg, resolved_config_path, port),

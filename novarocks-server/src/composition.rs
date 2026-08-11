@@ -34,6 +34,7 @@ use novarocks::mv::storage_observation::{
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
 use novarocks_connector_iceberg::resources::{IcebergControlResources, IcebergExecutionResources};
 use novarocks_connector_iceberg::storage_inspector::{
@@ -44,8 +45,8 @@ use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecuti
 use novarocks_frontend::FrontendServerConfig;
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorExecutionInstaller,
-    ConnectorRequestContext, ConnectorTableMetadata,
+    ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionInstaller, ConnectorRequestContext, ConnectorTableMetadata,
 };
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -287,6 +288,14 @@ pub fn compose_backend_execution_installers(
     Ok(installers)
 }
 
+pub fn compose_frontend_control_factories(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
+    let factory = IcebergControlFactory::new(compose_iceberg_control_resources(config, runtime)?);
+    Ok(vec![std::sync::Arc::new(factory)])
+}
+
 pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
@@ -374,11 +383,12 @@ async fn run_all_in_one_until<F>(
 where
     F: Future<Output = Result<(), String>> + Send,
 {
+    let connector_control_factories = compose_frontend_control_factories(&config, runtime.clone())?;
     let frontend_config = FrontendServerConfig {
         config: config.clone(),
         config_path: config_path.clone(),
         port_override,
-        connector_control_factories: Vec::new(),
+        connector_control_factories,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_host_config: state_store_host_config(&config),
     };
@@ -539,7 +549,10 @@ fn combine_primary_and_cleanup(
 
 #[cfg(test)]
 mod tests {
-    use super::combine_primary_and_cleanup;
+    use super::{
+        combine_primary_and_cleanup, compose_backend_execution_installers,
+        compose_frontend_control_factories,
+    };
 
     #[test]
     fn primary_failure_remains_primary_when_all_cleanup_steps_fail() {
@@ -555,5 +568,29 @@ mod tests {
         assert!(error.contains("server cleanup failed"), "{error}");
         assert!(error.contains("frontend cleanup failed"), "{error}");
         assert!(error.contains("backend cleanup failed"), "{error}");
+    }
+
+    #[test]
+    fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let config = novarocks::common::app_config::NovaRocksConfig::default();
+        let factories = compose_frontend_control_factories(&config, runtime.handle().clone())
+            .expect("frontend factories");
+        let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
+            .expect("backend installers");
+        let iceberg = novarocks_spi::connector::ConnectorProviderId::parse(
+            novarocks_connector_iceberg::PROVIDER_ID,
+        )
+        .expect("provider ID");
+
+        assert_eq!(factories.len(), 1);
+        assert_eq!(factories[0].provider_id(), &iceberg);
+        assert_eq!(
+            installers
+                .iter()
+                .filter(|installer| installer.provider_id() == &iceberg)
+                .count(),
+            1
+        );
     }
 }
