@@ -279,9 +279,6 @@ pub struct NovaRocksConfig {
     pub debug: DebugConfig,
 
     #[serde(default)]
-    pub jdbc: Option<JdbcConfig>,
-
-    #[serde(default)]
     pub metadata: Option<MetadataConfig>,
 
     #[serde(default)]
@@ -300,9 +297,6 @@ pub struct NovaRocksConfig {
     pub spill: SpillStorageConfig,
 
     #[serde(default)]
-    pub starrocks: StarRocksConfig,
-
-    #[serde(default)]
     pub cluster: ClusterConfig,
 }
 
@@ -310,13 +304,8 @@ impl NovaRocksConfig {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("read config file: {}", path.display()))?;
-        let value: toml::Value =
+        let cfg: NovaRocksConfig =
             toml::from_str(&s).with_context(|| format!("parse toml: {}", path.display()))?;
-        reject_removed_plan_wire_format(&value)?;
-        reject_retired_native_table_config(&value)?;
-        let cfg: NovaRocksConfig = value
-            .try_into()
-            .with_context(|| format!("parse toml: {}", path.display()))?;
         validate_state_store_configuration(&cfg)?;
         validate_query_control_config(&cfg.runtime)?;
         validate_query_lifecycle_fault_environment(&cfg)?;
@@ -324,9 +313,6 @@ impl NovaRocksConfig {
         Ok(cfg)
     }
 
-    pub fn jdbc_config(&self) -> Option<&JdbcConfig> {
-        self.jdbc.as_ref()
-    }
 }
 
 fn validate_query_lifecycle_fault_environment(cfg: &NovaRocksConfig) -> Result<()> {
@@ -392,39 +378,6 @@ fn validate_cleanup_fault_environment(cfg: &NovaRocksConfig) -> Result<()> {
     }
 }
 
-fn reject_removed_plan_wire_format(value: &toml::Value) -> Result<()> {
-    let has_removed_key = value
-        .get("runtime")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|runtime| runtime.contains_key("plan_wire_format"));
-    if has_removed_key {
-        bail!(
-            "runtime.plan_wire_format has been removed; NovaRocks-generated plans always use native Proto"
-        );
-    }
-    Ok(())
-}
-
-fn reject_retired_native_table_config(value: &toml::Value) -> Result<()> {
-    let Some(standalone) = value
-        .get("standalone_server")
-        .and_then(toml::Value::as_table)
-    else {
-        return Ok(());
-    };
-    let retired = ["warehouse_uri", "object_store", "mv_default_storage_engine"]
-        .into_iter()
-        .filter(|key| standalone.contains_key(*key))
-        .collect::<Vec<_>>();
-    if retired.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "retired native table configuration under [standalone_server]: {}; native persistent tables must be external Iceberg catalog tables, and shared object-store credentials belong under [connector.object_store]",
-        retired.join(", ")
-    );
-}
-
 impl Default for NovaRocksConfig {
     fn default() -> Self {
         Self {
@@ -436,14 +389,12 @@ impl Default for NovaRocksConfig {
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
             debug: DebugConfig::default(),
-            jdbc: None,
             metadata: None,
             state_store: None,
             foundationdb_client: None,
             standalone_server: None,
             connector: ConnectorConfig::default(),
             spill: SpillStorageConfig::default(),
-            starrocks: StarRocksConfig::default(),
             cluster: ClusterConfig::default(),
         }
     }
@@ -892,53 +843,6 @@ impl Default for SpillStorageConfig {
             dir_max_bytes: default_spill_dir_max_bytes(),
             block_size_bytes: default_spill_block_size_bytes(),
             ipc_compression: default_spill_ipc_compression(),
-        }
-    }
-}
-
-#[derive(Clone, Deserialize)]
-pub struct StarRocksConfig {
-    #[serde(default)]
-    pub fe_http_endpoint: Option<String>,
-    #[serde(default = "default_fe_catalog")]
-    pub fe_catalog: String,
-    #[serde(default)]
-    pub auth_mode: Option<String>,
-    #[serde(default)]
-    pub basic_user: Option<String>,
-    #[serde(default)]
-    pub basic_password: Option<String>,
-    #[serde(default)]
-    pub auth_token: Option<String>,
-    #[serde(default = "default_starrocks_meta_cache_ttl_ms")]
-    pub meta_cache_ttl_ms: u64,
-    #[serde(default = "default_starrocks_lake_data_write_format")]
-    pub lake_data_write_format: String,
-}
-
-fn default_fe_catalog() -> String {
-    "default_catalog".to_string()
-}
-
-fn default_starrocks_meta_cache_ttl_ms() -> u64 {
-    0
-}
-
-fn default_starrocks_lake_data_write_format() -> String {
-    "native".to_string()
-}
-
-impl Default for StarRocksConfig {
-    fn default() -> Self {
-        Self {
-            fe_http_endpoint: None,
-            fe_catalog: default_fe_catalog(),
-            auth_mode: None,
-            basic_user: None,
-            basic_password: None,
-            auth_token: None,
-            meta_cache_ttl_ms: default_starrocks_meta_cache_ttl_ms(),
-            lake_data_write_format: default_starrocks_lake_data_write_format(),
         }
     }
 }
@@ -1846,28 +1750,6 @@ impl DebugConfig {
     }
 }
 
-#[derive(Clone, Deserialize)]
-pub struct JdbcConfig {
-    pub url: String,
-    #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-    #[serde(default)]
-    pub default_db: Option<String>,
-}
-
-impl std::fmt::Debug for JdbcConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JdbcConfig")
-            .field("url", &self.url)
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "***"))
-            .field("default_db", &self.default_db)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2376,71 +2258,6 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         assert_eq!(
             cfg.runtime.olap_sink_max_tablet_write_chunk_bytes,
             67_108_864
-        );
-    }
-
-    fn assert_removed_plan_wire_format_is_rejected(value: &str) {
-        let path = std::env::temp_dir().join(format!(
-            "novarocks-removed-plan-wire-format-{}-{value}.toml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            format!("[runtime]\nplan_wire_format = \"{value}\"\n"),
-        )
-        .expect("write config fixture");
-
-        let result = NovaRocksConfig::load_from_file(&path);
-        std::fs::remove_file(&path).expect("remove config fixture");
-        let err = match result {
-            Ok(_) => panic!("removed runtime.plan_wire_format={value} must be rejected"),
-            Err(err) => err,
-        };
-
-        assert_eq!(
-            err.to_string(),
-            "runtime.plan_wire_format has been removed; NovaRocks-generated plans always use native Proto"
-        );
-    }
-
-    #[test]
-    fn test_load_from_file_rejects_removed_proto_plan_wire_format() {
-        assert_removed_plan_wire_format_is_rejected("proto");
-    }
-
-    #[test]
-    fn test_load_from_file_rejects_removed_thrift_plan_wire_format() {
-        assert_removed_plan_wire_format_is_rejected("thrift");
-    }
-
-    #[test]
-    fn test_load_from_file_rejects_retired_native_table_config() {
-        let path = std::env::temp_dir().join(format!(
-            "novarocks-retired-native-table-config-{}.toml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            r#"
-[standalone_server]
-warehouse_uri = "s3://novarocks/internal"
-mv_default_storage_engine = "starrocks"
-
-[standalone_server.object_store]
-endpoint = "http://127.0.0.1:9000"
-"#,
-        )
-        .expect("write config fixture");
-
-        let result = NovaRocksConfig::load_from_file(&path);
-        std::fs::remove_file(&path).expect("remove config fixture");
-        let err = match result {
-            Ok(_) => panic!("retired native table keys must fail config loading"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.to_string(),
-            "retired native table configuration under [standalone_server]: warehouse_uri, object_store, mv_default_storage_engine; native persistent tables must be external Iceberg catalog tables, and shared object-store credentials belong under [connector.object_store]"
         );
     }
 
