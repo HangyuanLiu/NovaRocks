@@ -98,11 +98,8 @@ mod tests {
 
     use super::super::node::{NativePlanDecodeContext, decode_node};
     use crate::connector::ConnectorRegistry;
-    use crate::connector::iceberg::file_pruning::IcebergFileNullState;
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
-    use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
-    use novarocks_connector_iceberg::delta::DeltaSourceRole;
     use novarocks_execution::exec::expr::{ExprArena, ExprNode};
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::scan::ScanMorsel;
