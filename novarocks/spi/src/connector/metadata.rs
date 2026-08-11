@@ -667,7 +667,7 @@ fn validate_local_constraint_columns(
 /// provider that genuinely has fewer partition columns.
 fn validate_partition_source_columns(
     schema: &SchemaRef,
-    ordinals: &mut Vec<u32>,
+    ordinals: &mut [u32],
 ) -> Result<(), ConnectorError> {
     if ordinals.is_empty() {
         return Ok(());
