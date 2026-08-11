@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -370,6 +370,11 @@ pub(crate) struct StandaloneState {
     pub(crate) mv_storage_observation:
         Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
     pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
+    /// Serializes durable attachment and exact control-generation lifecycle
+    /// transitions. Provider construction is intentionally performed outside
+    /// this lock; only persistence, publication, retirement, and SQL catalog
+    /// projection transitions are fenced here.
+    pub(crate) catalog_attachment_lifecycle: Mutex<()>,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) exchange_port: u16,
@@ -427,6 +432,7 @@ impl Default for StandaloneState {
                 crate::mv::storage_observation::UnavailableMvStorageObservationPort,
             ),
             catalog_attachment_repo: CatalogAttachmentRepository,
+            catalog_attachment_lifecycle: Mutex::new(()),
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
             exchange_port: 0,
@@ -1474,6 +1480,7 @@ impl StandaloneNovaRocks {
             mv_application_service,
             mv_storage_observation,
             catalog_attachment_repo: CatalogAttachmentRepository,
+            catalog_attachment_lifecycle: Mutex::new(()),
             job_repo: JobMetaRepository,
             exchange_port,
             system_catalog,
@@ -2814,6 +2821,11 @@ impl StandaloneSession {
         &self,
         stmt: crate::sql::parser::ast::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
+        let _lifecycle = self
+            .inner
+            .catalog_attachment_lifecycle
+            .lock()
+            .map_err(|error| format!("catalog attachment lifecycle lock: {error}"))?;
         let normalized_catalog = normalize_identifier(&stmt.name)?;
         let mut guard = self
             .inner
@@ -3820,7 +3832,7 @@ pub(crate) fn persist_catalog_attachment_if_needed(
         .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
     state
         .catalog_attachment_repo
-        .upsert(
+        .create(
             txn.as_mut(),
             catalog_name,
             CatalogAttachmentProperties {
@@ -3845,7 +3857,7 @@ pub(crate) fn delete_catalog_attachment_if_needed(
         .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
     state
         .catalog_attachment_repo
-        .delete(txn.as_mut(), catalog_name)
+        .delete_current(txn.as_mut(), catalog_name)
         .map_err(|e| format!("delete catalog attachment metadata failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit catalog attachment metadata failed: {e}"))?;
