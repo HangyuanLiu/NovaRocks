@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cache::CacheOptions;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use novarocks_execution::exec::node::scan::ConnectorRowPositionLookup;
 use novarocks_execution::exec::node::scan::IncrementalScanRange;
@@ -137,7 +136,6 @@ pub(crate) struct QueryContext {
     #[allow(dead_code)]
     pub(crate) query_id: QueryId,
     execution_generation: QueryContextGeneration,
-    pub(crate) cache_options: Option<CacheOptions>,
     pub(crate) desc_snapshot: Option<Arc<DescriptorSnapshot>>,
     pub(crate) num_fragments: usize,
     pub(crate) num_active_fragments: usize,
@@ -192,7 +190,6 @@ impl QueryContext {
         Self {
             query_id,
             execution_generation,
-            cache_options: None,
             desc_snapshot: None,
             num_fragments: 0,
             num_active_fragments: 0,
@@ -394,21 +391,6 @@ impl QueryContext {
 
     pub(crate) fn mem_tracker(&self) -> Arc<MemTracker> {
         Arc::clone(&self.mem_tracker)
-    }
-
-    pub(crate) fn set_cache_options(&mut self, options: CacheOptions) -> Result<(), String> {
-        if let Some(existing) = self.cache_options.as_ref() {
-            if existing != &options {
-                return Err("cache options mismatch for query".to_string());
-            }
-            return Ok(());
-        }
-        self.cache_options = Some(options);
-        Ok(())
-    }
-
-    pub(crate) fn cache_options(&self) -> Option<CacheOptions> {
-        self.cache_options.clone()
     }
 }
 
@@ -789,30 +771,6 @@ impl QueryContextManager {
         f(ctx)
     }
 
-    pub(crate) fn set_cache_options(
-        &self,
-        query_id: QueryId,
-        options: CacheOptions,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| ctx.set_cache_options(options))
-    }
-
-    pub(crate) fn set_cache_options_execution(
-        &self,
-        execution: QueryExecutionKey,
-        options: CacheOptions,
-    ) -> Result<(), String> {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let ctx = guard
-            .active
-            .get_mut(&execution.query_id())
-            .ok_or_else(|| "QueryContext not found".to_string())?;
-        if !ctx.matches_execution(execution) {
-            return Err("query execution generation is not active".to_string());
-        }
-        ctx.set_cache_options(options)
-    }
-
     pub(crate) fn attach_cleanup_lease(
         &self,
         query_id: QueryId,
@@ -822,20 +780,6 @@ impl QueryContextManager {
             ctx.attach_cleanup_lease(lease);
             Ok(())
         })
-    }
-
-    pub(crate) fn cache_options(&self, query_id: QueryId) -> Option<CacheOptions> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .and_then(|ctx| ctx.cache_options())
-            .or_else(|| {
-                guard
-                    .second_chance
-                    .get(&query_id)
-                    .and_then(|ctx| ctx.cache_options())
-            })
     }
 
     #[cfg(test)]

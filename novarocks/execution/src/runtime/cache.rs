@@ -67,7 +67,7 @@ impl ExecutionCacheOptions {
             .unwrap_or(0);
         if ttl_seconds < 0 {
             return Err(format!(
-                "invalid query option: datacache_ttl_seconds must be non-negative, got {ttl_seconds}"
+                "invalid query option: datacache_ttl_seconds must be >= 0, got {ttl_seconds}"
             ));
         }
         Ok(Self {

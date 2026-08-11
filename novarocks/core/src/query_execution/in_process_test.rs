@@ -33,7 +33,6 @@ use novarocks_spi::connector::{
     ConnectorExecutionInstaller, ConnectorExecutionResolver,
 };
 
-use crate::cache::CacheOptions;
 use crate::query_execution::artifact::{
     BackendPlacement, FragmentScheduleDraft, PreparedDistributedQuery,
     RuntimeFilterBoundPreparedDistributedQuery, ValidatedFragmentSchedule,
@@ -262,15 +261,12 @@ pub(crate) fn execute(
         let fragment_instance_id = submission.fragment_instance_id();
         let (delivery_expire, query_expire) =
             query_expire_durations(Some(submission.query_options()));
-        let cache_options =
-            CacheOptions::from_query_options(Some(submission.query_options())).map_err(failed)?;
         let admission = NativeFragmentQueryRuntime::global()
             .prepare_admission(
                 submission.query_id(),
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                cache_options,
                 None,
             )
             .map_err(failed)?;

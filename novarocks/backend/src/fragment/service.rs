@@ -324,9 +324,6 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
-        let cache_options = request
-            .cache_options()
-            .map_err(NativeFragmentIngressError::new)?;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -336,7 +333,6 @@ impl NativeFragmentService {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                cache_options,
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
@@ -479,9 +475,6 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
-        let cache_options = request
-            .cache_options()
-            .map_err(NativeFragmentIngressError::new)?;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -491,7 +484,6 @@ impl NativeFragmentService {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                cache_options,
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
@@ -1009,7 +1001,6 @@ mod tests {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                request.cache_options().expect("valid cache options"),
                 None,
             )
             .expect("native fragment admission");

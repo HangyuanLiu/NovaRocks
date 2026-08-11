@@ -25,7 +25,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks::cache::CacheOptions;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -159,10 +158,6 @@ impl NativeFragmentRequest {
         novarocks_execution::runtime::query_options::query_expire_durations(Some(
             self.query_options(),
         ))
-    }
-    pub(crate) fn cache_options(&self) -> Result<CacheOptions, NativeFragmentIngressError> {
-        CacheOptions::from_query_options(Some(self.query_options()))
-            .map_err(NativeFragmentIngressError::new)
     }
     pub(crate) fn has_runtime_filter_bindings(&self) -> bool {
         self.submission.program().runtime_filters().has_bindings()

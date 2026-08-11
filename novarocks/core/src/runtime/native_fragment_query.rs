@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use novarocks_spi::connector::ConnectorCancellation;
 
-use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::runtime::query_context::{
@@ -123,7 +122,6 @@ impl NativeFragmentQueryRuntime {
         fragment_instance_id: UniqueId,
         delivery_expire: Duration,
         query_expire: Duration,
-        cache_options: CacheOptions,
         runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, String> {
         let execution = execution_key(execution_id);
@@ -133,8 +131,6 @@ impl NativeFragmentQueryRuntime {
             delivery_expire,
             query_expire,
         )?;
-        self.manager
-            .set_cache_options_execution(execution, cache_options)?;
         let query_mem_tracker = self
             .manager
             .query_mem_tracker_execution(execution)
@@ -189,12 +185,10 @@ impl NativeFragmentQueryRuntime {
         fragment_instance_id: UniqueId,
         delivery_expire: Duration,
         query_expire: Duration,
-        cache_options: CacheOptions,
         runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, String> {
         self.manager
             .ensure_native_context(query_id, false, delivery_expire, query_expire)?;
-        self.manager.set_cache_options(query_id, cache_options)?;
         let query_mem_tracker = self
             .manager
             .query_mem_tracker(query_id)

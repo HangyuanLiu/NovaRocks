@@ -17,7 +17,6 @@
 #[cfg(test)]
 mod tests;
 
-pub mod cache;
 pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;
