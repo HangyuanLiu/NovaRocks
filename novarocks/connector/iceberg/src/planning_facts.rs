@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType as ArrowDataType, SchemaRef};
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorColumnDefault, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceId, ConnectorRequestContext, ConnectorTableColumnPlanningFact,
@@ -210,6 +210,8 @@ pub fn table_planning_facts(
                 ConnectorTableColumnRole::Ordinary
             };
             let write_default = iceberg_write_default(input.iceberg_schema, field.name())?;
+            let write_target_type =
+                iceberg_write_target_type(input.iceberg_schema, field.name(), field.data_type());
             Ok(ConnectorTableColumnPlanningFact::new(
                 u32::try_from(ordinal).map_err(|_| {
                     ConnectorError::new(
@@ -221,14 +223,15 @@ pub fn table_planning_facts(
                 semantic_kind,
                 role,
             )
-            .with_write_default(write_default))
+            .with_write_default(write_default)
+            .with_write_target_type(write_target_type))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    let (unique_constraints, foreign_key_constraints) = input
-        .serialized_metadata
-        .and_then(|serialized| {
-            serde_json::from_str::<crate::iceberg::spec::TableMetadata>(serialized).ok()
-        })
+    let metadata = input.serialized_metadata.and_then(|serialized| {
+        serde_json::from_str::<crate::iceberg::spec::TableMetadata>(serialized).ok()
+    });
+    let (unique_constraints, foreign_key_constraints) = metadata
+        .as_ref()
         .map(|metadata| {
             iceberg_constraint_facts(
                 input.schema,
@@ -238,13 +241,94 @@ pub fn table_planning_facts(
             )
         })
         .unwrap_or_default();
+    let partition_source_column_ordinals = match (metadata.as_ref(), input.iceberg_schema) {
+        (Some(metadata), Some(iceberg_schema)) => {
+            iceberg_partition_source_ordinals(metadata, iceberg_schema, input.schema)?
+        }
+        // A metadata table has no Iceberg schema behind its synthetic Arrow
+        // schema, and therefore no partitioning to report.
+        _ => Vec::new(),
+    };
     ConnectorTablePlanningFacts::try_new(
         input.schema,
         column_facts,
         unique_constraints,
         foreign_key_constraints,
+        partition_source_column_ordinals,
         input.context,
     )
+}
+
+/// The Arrow type this column takes as a row-DML write target, when that is not
+/// the same as its read type.
+///
+/// Iceberg `variant` and `binary` are the two types whose write-target encoding
+/// deliberately differs from the read encoding NovaRocks presents to SQL. This
+/// projects that existing divergence as an explicit signed fact instead of
+/// having each write caller re-derive it from an Iceberg schema.
+fn iceberg_write_target_type(
+    iceberg_schema: Option<&crate::iceberg::spec::Schema>,
+    field_name: &str,
+    read_type: &ArrowDataType,
+) -> Option<ArrowDataType> {
+    use crate::iceberg::spec::{PrimitiveType, Type};
+
+    let nested = iceberg_schema?.field_by_name(field_name)?;
+    let write_type = match nested.field_type.as_ref() {
+        Type::Primitive(PrimitiveType::Variant) => ArrowDataType::LargeBinary,
+        Type::Primitive(PrimitiveType::Binary) => ArrowDataType::Binary,
+        _ => return None,
+    };
+    (write_type != *read_type).then_some(write_type)
+}
+
+/// Arrow ordinals of the columns the table's current default partition spec
+/// derives from.
+///
+/// A partition field whose source is absent from either schema is a corrupt
+/// table, not an empty partition set, so it fails the metadata request.
+fn iceberg_partition_source_ordinals(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    iceberg_schema: &crate::iceberg::spec::Schema,
+    arrow_schema: &SchemaRef,
+) -> Result<Vec<u32>, ConnectorError> {
+    let mut ordinals = Vec::new();
+    for partition_field in metadata.default_partition_spec().fields() {
+        let source = iceberg_schema
+            .field_by_id(partition_field.source_id)
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!(
+                        "Iceberg partition field '{}' references missing source id {}",
+                        partition_field.name, partition_field.source_id
+                    ),
+                )
+            })?;
+        let ordinal = arrow_schema
+            .fields()
+            .iter()
+            .position(|field| field.name().eq_ignore_ascii_case(&source.name))
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!(
+                        "Iceberg partition source column '{}' is absent from the frozen schema",
+                        source.name
+                    ),
+                )
+            })?;
+        let ordinal = u32::try_from(ordinal).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg partition source ordinal does not fit connector planning facts",
+            )
+        })?;
+        if !ordinals.contains(&ordinal) {
+            ordinals.push(ordinal);
+        }
+    }
+    Ok(ordinals)
 }
 
 /// Read one column's Iceberg write default and project it onto the sealed SPI
@@ -658,5 +742,211 @@ mod tests {
             write_default_facts(Some(&iceberg_schema), &arrow_schema).expect("planning facts");
 
         assert_eq!(facts.column_facts()[2].write_default(), None);
+    }
+
+    /// Iceberg schema holding one variant, one binary and one plain column.
+    fn write_target_type_schema() -> crate::iceberg::spec::Schema {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "v",
+                    Type::Primitive(PrimitiveType::Variant),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "n",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("valid Iceberg schema")
+    }
+
+    #[test]
+    fn spi5h_write_target_type_is_declared_only_where_it_differs_from_the_read_type() {
+        // The read schema presents the variant column as Utf8, which is exactly
+        // the divergence the write-target fact has to carry. The binary column
+        // is already read as Binary, so it needs no override.
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+
+        let facts = write_default_facts(Some(&write_target_type_schema()), &arrow_schema)
+            .expect("planning facts");
+
+        assert_eq!(
+            facts.column_facts()[0].write_target_type(),
+            Some(&DataType::LargeBinary)
+        );
+        assert_eq!(facts.column_facts()[1].write_target_type(), None);
+        assert_eq!(facts.column_facts()[2].write_target_type(), None);
+    }
+
+    #[test]
+    fn spi5h_columns_without_an_iceberg_field_declare_no_write_target_type() {
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("_row_id", DataType::Int64, true),
+        ]));
+
+        let facts = write_default_facts(Some(&write_target_type_schema()), &arrow_schema)
+            .expect("planning facts");
+
+        assert_eq!(facts.column_facts()[3].write_target_type(), None);
+        // A metadata table has no Iceberg schema at all.
+        let metadata_table = write_default_facts(None, &arrow_schema).expect("planning facts");
+        assert!(
+            metadata_table
+                .column_facts()
+                .iter()
+                .all(|fact| fact.write_target_type().is_none())
+        );
+        assert!(metadata_table.partition_source_column_ordinals().is_empty());
+    }
+
+    #[test]
+    fn spi5h_partition_source_ordinals_map_the_default_spec_onto_arrow_ordinals() {
+        use crate::iceberg::spec::Schema as IcebergSchema;
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, SortOrder,
+            TableMetadataBuilder, Transform, Type,
+        };
+
+        let iceberg_schema = Arc::new(
+            IcebergSchema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    Arc::new(NestedField::optional(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "region",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let partition_spec = PartitionSpec::builder(iceberg_schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("region", "region_part", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("spec");
+        let metadata = TableMetadataBuilder::new(
+            iceberg_schema.as_ref().clone(),
+            partition_spec,
+            SortOrder::builder().build_unbound().expect("sort"),
+            "file:///tmp/x".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let serialized = serde_json::to_string(&metadata).expect("serialize metadata");
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let namespace = Arc::from("db");
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let context = context();
+        let facts = table_planning_facts(IcebergTablePlanningFactsInput {
+            schema: &arrow_schema,
+            iceberg_schema: Some(iceberg_schema.as_ref()),
+            metadata_columns: &[],
+            hidden_columns: &[],
+            logical_type_columns: &BTreeMap::new(),
+            serialized_metadata: Some(&serialized),
+            namespace: &namespace,
+            instance_id: &instance_id,
+            context: &context,
+        })
+        .expect("planning facts");
+
+        assert_eq!(facts.partition_source_column_ordinals(), &[1]);
+    }
+
+    #[test]
+    fn spi5h_partition_source_absent_from_the_frozen_schema_fails_closed() {
+        use crate::iceberg::spec::Schema as IcebergSchema;
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, SortOrder,
+            TableMetadataBuilder, Transform, Type,
+        };
+
+        let iceberg_schema = Arc::new(
+            IcebergSchema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "region",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .expect("schema"),
+        );
+        let partition_spec = PartitionSpec::builder(iceberg_schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("region", "region_part", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("spec");
+        let metadata = TableMetadataBuilder::new(
+            iceberg_schema.as_ref().clone(),
+            partition_spec,
+            SortOrder::builder().build_unbound().expect("sort"),
+            "file:///tmp/x".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let serialized = serde_json::to_string(&metadata).expect("serialize metadata");
+
+        // The frozen Arrow schema is missing the partition source column, which
+        // is an inconsistent table rather than an unpartitioned one.
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "other",
+            DataType::Int64,
+            true,
+        )]));
+        let namespace = Arc::from("db");
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let context = context();
+        let error = table_planning_facts(IcebergTablePlanningFactsInput {
+            schema: &arrow_schema,
+            iceberg_schema: Some(iceberg_schema.as_ref()),
+            metadata_columns: &[],
+            hidden_columns: &[],
+            logical_type_columns: &BTreeMap::new(),
+            serialized_metadata: Some(&serialized),
+            namespace: &namespace,
+            instance_id: &instance_id,
+            context: &context,
+        })
+        .expect_err("missing partition source column must fail closed");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 }

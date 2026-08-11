@@ -272,6 +272,7 @@ mod tests {
             ],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             &context(),
         )
         .expect("planning facts");

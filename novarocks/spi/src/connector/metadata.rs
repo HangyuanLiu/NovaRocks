@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use bytes::Bytes;
 
 use super::{
@@ -38,6 +38,7 @@ pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS: usize = 4_096;
 pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS: usize = 1_024;
 pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS: usize = 1_024;
 pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS: usize = 256;
+pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_PARTITION_SOURCE_COLUMNS: usize = 256;
 pub const MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS: usize = 4_096;
 pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES: usize = 16_384;
 pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH: usize = 64;
@@ -48,6 +49,9 @@ pub const MAX_CONNECTOR_COLUMN_DEFAULT_NODES: usize = 16_384;
 pub const MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH: usize = 64;
 
 const TABLE_PLANNING_FACT_COLUMN_BYTES: usize = 16;
+/// Flat charge for one declared write-target Arrow type. The type is a bounded
+/// enum here, not a nested value tree, so a fixed charge is honest.
+const TABLE_PLANNING_FACT_WRITE_TARGET_TYPE_BYTES: usize = 32;
 const TABLE_PLANNING_FACT_CONSTRAINT_BYTES: usize = 16;
 const TABLE_DEFINITION_COLUMN_BYTES: usize = 24;
 const TABLE_DEFINITION_TYPE_NODE_BYTES: usize = 16;
@@ -165,6 +169,7 @@ pub struct ConnectorTableColumnPlanningFact {
     semantic_kind: ConnectorTableColumnSemanticKind,
     role: ConnectorTableColumnRole,
     write_default: Option<ConnectorColumnDefault>,
+    write_target_type: Option<DataType>,
 }
 
 impl ConnectorTableColumnPlanningFact {
@@ -180,6 +185,7 @@ impl ConnectorTableColumnPlanningFact {
             semantic_kind,
             role,
             write_default: None,
+            write_target_type: None,
         }
     }
 
@@ -210,8 +216,26 @@ impl ConnectorTableColumnPlanningFact {
         self.role
     }
 
+    /// Declare the Arrow type this column takes when it is a row-DML write
+    /// target, for the case where it differs from the frozen read schema.
+    ///
+    /// `None` means "identical to the frozen schema field", which is the only
+    /// shape a provider needs unless its physical write encoding for a type is
+    /// deliberately not the same as its read encoding.
+    #[must_use]
+    pub fn with_write_target_type(mut self, write_target_type: Option<DataType>) -> Self {
+        self.write_target_type = write_target_type;
+        self
+    }
+
     pub const fn write_default(&self) -> Option<&ConnectorColumnDefault> {
         self.write_default.as_ref()
+    }
+
+    /// The write-target Arrow type override, or `None` when the frozen read
+    /// schema field already describes the write target.
+    pub const fn write_target_type(&self) -> Option<&DataType> {
+        self.write_target_type.as_ref()
     }
 }
 
@@ -276,6 +300,7 @@ pub struct ConnectorTablePlanningFacts {
     column_facts: Vec<ConnectorTableColumnPlanningFact>,
     unique_constraints: Vec<ConnectorTableUniqueConstraint>,
     foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+    partition_source_column_ordinals: Vec<u32>,
 }
 
 impl ConnectorTablePlanningFacts {
@@ -288,15 +313,21 @@ impl ConnectorTablePlanningFacts {
         column_facts: Vec<ConnectorTableColumnPlanningFact>,
         mut unique_constraints: Vec<ConnectorTableUniqueConstraint>,
         mut foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+        mut partition_source_column_ordinals: Vec<u32>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         let write_default_bytes = validate_column_facts(schema, &column_facts)?;
         validate_unique_constraints(schema, &mut unique_constraints)?;
         validate_foreign_key_constraints(schema, &mut foreign_key_constraints)?;
+        validate_partition_source_columns(schema, &mut partition_source_column_ordinals)?;
 
-        let bytes =
-            planning_facts_bytes(&column_facts, &unique_constraints, &foreign_key_constraints)
-                .saturating_add(write_default_bytes);
+        let bytes = planning_facts_bytes(
+            &column_facts,
+            &unique_constraints,
+            &foreign_key_constraints,
+            &partition_source_column_ordinals,
+        )
+        .saturating_add(write_default_bytes);
         if bytes > context.max_total_payload_bytes() {
             return Err(ConnectorError::new(
                 super::ConnectorErrorKind::ResourceExhausted,
@@ -308,6 +339,7 @@ impl ConnectorTablePlanningFacts {
             column_facts,
             unique_constraints,
             foreign_key_constraints,
+            partition_source_column_ordinals,
         })
     }
 
@@ -321,6 +353,18 @@ impl ConnectorTablePlanningFacts {
 
     pub fn foreign_key_constraints(&self) -> &[ConnectorTableForeignKeyConstraint] {
         &self.foreign_key_constraints
+    }
+
+    /// Ascending, de-duplicated schema ordinals of the columns the provider
+    /// currently derives its partitioning from.
+    ///
+    /// This is a membership fact only: it says which columns participate, never
+    /// how they are transformed. An empty slice means the provider declares no
+    /// partition source columns, which is not the same as "unknown" — a
+    /// provider that cannot state this fact must fail its metadata request
+    /// rather than return an empty list.
+    pub fn partition_source_column_ordinals(&self) -> &[u32] {
+        &self.partition_source_column_ordinals
     }
 }
 
@@ -617,6 +661,37 @@ fn validate_local_constraint_columns(
     Ok(())
 }
 
+/// Canonicalize and validate the partition source ordinals against the frozen
+/// schema. Duplicates and out-of-range ordinals fail closed rather than being
+/// silently dropped, because a caller cannot tell a pruned list apart from a
+/// provider that genuinely has fewer partition columns.
+fn validate_partition_source_columns(
+    schema: &SchemaRef,
+    ordinals: &mut [u32],
+) -> Result<(), ConnectorError> {
+    if ordinals.is_empty() {
+        return Ok(());
+    }
+    if ordinals.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_PARTITION_SOURCE_COLUMNS {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts exceed the partition source column limit",
+        ));
+    }
+    ordinals.sort_unstable();
+    if ordinals.windows(2).any(|pair| pair[0] == pair[1])
+        || ordinals
+            .iter()
+            .any(|ordinal| *ordinal as usize >= schema.fields().len())
+    {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts reference an unknown or duplicate partition source column",
+        ));
+    }
+    Ok(())
+}
+
 fn compare_foreign_key_constraints(
     left: &ConnectorTableForeignKeyConstraint,
     right: &ConnectorTableForeignKeyConstraint,
@@ -648,10 +723,23 @@ fn planning_facts_bytes(
     column_facts: &[ConnectorTableColumnPlanningFact],
     unique_constraints: &[ConnectorTableUniqueConstraint],
     foreign_key_constraints: &[ConnectorTableForeignKeyConstraint],
+    partition_source_column_ordinals: &[u32],
 ) -> usize {
     column_facts
         .len()
         .saturating_mul(TABLE_PLANNING_FACT_COLUMN_BYTES)
+        .saturating_add(
+            column_facts
+                .iter()
+                .filter(|fact| fact.write_target_type.is_some())
+                .count()
+                .saturating_mul(TABLE_PLANNING_FACT_WRITE_TARGET_TYPE_BYTES),
+        )
+        .saturating_add(
+            partition_source_column_ordinals
+                .len()
+                .saturating_mul(std::mem::size_of::<u32>()),
+        )
         .saturating_add(unique_constraints.iter().fold(0usize, |bytes, constraint| {
             bytes
                 .saturating_add(TABLE_PLANNING_FACT_CONSTRAINT_BYTES)
@@ -1318,6 +1406,7 @@ mod tests {
             ],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             &context(total_payload_bytes),
         )
     }
@@ -1538,6 +1627,7 @@ mod tests {
                 referenced_table(),
                 vec![Arc::from("CUSTOMER_SKETCH"), Arc::from("CUSTOMER_ID")],
             )],
+            Vec::new(),
             &context(4_096),
         )
         .expect("valid facts");
@@ -1584,6 +1674,7 @@ mod tests {
             ],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             &context(4_096),
         )
         .expect_err("duplicate ordinal must be rejected");
@@ -1592,11 +1683,121 @@ mod tests {
     }
 
     #[test]
+    fn spi5h_partition_source_columns_are_canonicalized() {
+        let facts = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![2, 0],
+            &context(4_096),
+        )
+        .expect("partition source ordinals must be accepted");
+
+        assert_eq!(facts.partition_source_column_ordinals(), &[0, 2]);
+    }
+
+    #[test]
+    fn spi5h_partition_source_columns_reject_duplicate_and_unknown_ordinals() {
+        let duplicate = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![1, 1],
+            &context(4_096),
+        )
+        .expect_err("duplicate partition source ordinal must be rejected");
+        assert_eq!(
+            duplicate.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let unknown = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![3],
+            &context(4_096),
+        )
+        .expect_err("out-of-range partition source ordinal must be rejected");
+        assert_eq!(
+            unknown.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let over_limit = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            (0..=MAX_CONNECTOR_TABLE_PLANNING_FACT_PARTITION_SOURCE_COLUMNS as u32).collect(),
+            &context(4_096),
+        )
+        .expect_err("partition source ordinal count must be bounded");
+        assert_eq!(
+            over_limit.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn spi5h_write_target_type_round_trips_and_is_charged_to_the_budget() {
+        let facts = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            vec![
+                ordinary_fact(0),
+                ordinary_fact(1).with_write_target_type(Some(DataType::LargeBinary)),
+                ordinary_fact(2),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &context(4_096),
+        )
+        .expect("write-target type override must be accepted");
+
+        assert_eq!(facts.column_facts()[0].write_target_type(), None);
+        assert_eq!(
+            facts.column_facts()[1].write_target_type(),
+            Some(&DataType::LargeBinary)
+        );
+
+        // Same facts, but a budget that only covers the three plain column
+        // facts: the override must be what pushes the request over.
+        let plain_bytes = planning_facts_bytes(
+            &[ordinary_fact(0), ordinary_fact(1), ordinary_fact(2)],
+            &[],
+            &[],
+            &[],
+        );
+        let budget = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            vec![
+                ordinary_fact(0),
+                ordinary_fact(1).with_write_target_type(Some(DataType::LargeBinary)),
+                ordinary_fact(2),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &context(plain_bytes),
+        )
+        .expect_err("write-target type override must count toward the payload budget");
+        assert_eq!(
+            budget.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
     fn spi5ef_table_planning_facts_reject_unknown_constraint_columns_and_budget_overflow() {
         let unknown_column = ConnectorTablePlanningFacts::try_new(
             &planning_schema(),
             Vec::new(),
             vec![ConnectorTableUniqueConstraint::new(vec![3])],
+            Vec::new(),
             Vec::new(),
             &context(4_096),
         )
@@ -1615,6 +1816,7 @@ mod tests {
                 referenced_table(),
                 vec![Arc::from("customer_id")],
             )],
+            Vec::new(),
             &context(16),
         )
         .expect_err("facts must respect request budget");
@@ -1661,6 +1863,7 @@ mod tests {
                     ConnectorTableColumnRole::RowLineageSystem,
                 ),
             ],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             &context(4_096),

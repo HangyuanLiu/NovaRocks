@@ -43,12 +43,6 @@ pub enum IcebergWriteMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IcebergSqlDeleteStrategy {
-    PositionDeleteFiles,
-    DeletionVectors,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergUpdateMode {
     CopyOnWrite,
     MergeOnRead,

@@ -5444,51 +5444,42 @@ pub(crate) fn prepare_iceberg_row_mutation(
                 format!("decode admitted Iceberg row-mutation metadata: {error}"),
             )
         })?;
-    let strategy = match &request.intent {
-        ConnectorRowMutationIntent::Delete => {
-            if metadata.format_version()
-                == novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-            {
-                ConnectorRowMutationStrategy::DeletionVector
-            } else {
-                ConnectorRowMutationStrategy::PositionDelete
-            }
-        }
-        ConnectorRowMutationIntent::Update | ConnectorRowMutationIntent::Merge { .. } => {
-            let row_lineage = metadata
-                .properties()
-                .get("write.row-lineage")
-                .is_none_or(|value| !value.eq_ignore_ascii_case("false"));
-            if metadata.format_version()
-                != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-                || !row_lineage
-            {
-                return Ok(ConnectorRowMutationPreparationOutcome::Denied(
-                    ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "Iceberg UPDATE/MERGE requires v3 row-lineage metadata",
-                    ),
-                ));
-            }
-            match metadata
-                .properties()
-                .get("novarocks.update.mode")
-                .map(String::as_str)
-                .unwrap_or("copy-on-write")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "copy-on-write" => ConnectorRowMutationStrategy::CopyOnWrite,
-                "merge-on-read" => ConnectorRowMutationStrategy::MergeOnRead,
-                other => {
-                    return Ok(ConnectorRowMutationPreparationOutcome::Denied(
-                        ConnectorError::new(
-                            ConnectorErrorKind::InvalidRequest,
-                            format!("unsupported Iceberg update mode `{other}`"),
-                        ),
-                    ));
-                }
-            }
+    // The managed-materialized-view rejection deliberately does NOT live here.
+    // Incremental MV refresh drives its own change-stream writes through this
+    // same admission, so a check at this level cannot tell a user DML statement
+    // apart from the MV machinery maintaining its own target. That rejection
+    // stays at the SQL entry points, where `reject_if_iceberg_mv_table` already
+    // makes it from neutral metadata under the same exact lease.
+
+    // Writing to a non-main branch needs the v3 row-lineage semantics the
+    // branch writer relies on.
+    if request.target_ref.as_str() != "main"
+        && metadata.format_version()
+            != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
+    {
+        return Ok(ConnectorRowMutationPreparationOutcome::Denied(
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
+                    table.table,
+                    metadata.format_version() as u8,
+                ),
+            ),
+        ));
+    }
+    // The strategy rule, the fail-fast write guards it runs first, and the
+    // merge-on-read override for a MERGE that can delete all live in the
+    // provider. A policy rejection here is a denial, not an internal fault.
+    let strategy = match novarocks_connector_iceberg::commit::row_mutation_strategy_from_metadata(
+        &metadata,
+        &request.intent,
+    ) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            return Ok(ConnectorRowMutationPreparationOutcome::Denied(
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error),
+            ));
         }
     };
     // A MERGE that can append has no target identity or before-image for its
@@ -5650,6 +5641,15 @@ pub(crate) fn prepare_iceberg_row_mutation(
             base_version,
             contract,
             strategy,
+            // The application persists this in its durable DML journal. It is
+            // the same ref-scoped resolution the SQL entry points used to run
+            // against a concrete table handle: the current snapshot for main,
+            // the branch head otherwise.
+            target_snapshot_id,
+            // The sequence number this mutation's rows will belong to. A
+            // merge-on-read writer stamps it on every rewritten row, so it has
+            // to be known before the commit exists.
+            Some(metadata.last_sequence_number() + 1),
             payload,
         )?,
     ))
@@ -7663,6 +7663,13 @@ pub(crate) struct IcebergQueryTableMaterialization {
     pub(crate) table_name: String,
     pub(crate) schema_id: Option<i32>,
     pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    /// SQL-visible columns as row DML must write them, which differs from
+    /// `columns` only where the provider declared a write-target Arrow type.
+    pub(crate) dml_target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    /// Names of the columns the provider's current default partition spec
+    /// derives from. Row DML uses this as a membership set to reject assigning
+    /// a partition column; it carries no transform.
+    pub(crate) partition_source_columns: Vec<String>,
     pub(crate) iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     /// The sole read authority handed back to the application boundary.  The
     /// provider may still inspect its payload while deriving SQL-owned facts,
@@ -7818,6 +7825,8 @@ impl IcebergQueryTableMaterialization {
             table_name: self.table_name.clone(),
             schema_id: self.schema_id,
             columns: self.columns.clone(),
+            dml_target_columns: self.dml_target_columns.clone(),
+            partition_source_columns: self.partition_source_columns.clone(),
             iceberg_row_lineage_metadata_columns: self.iceberg_row_lineage_metadata_columns.clone(),
             read_table: table,
             read_schema: self.read_schema.clone(),
@@ -8422,10 +8431,26 @@ fn materialization_from_metadata(
         );
     let (columns, iceberg_row_lineage_metadata_columns) =
         columns_from_planning_facts(&metadata.schema, &metadata.planning_facts);
+    let dml_target_columns =
+        dml_target_columns_from_planning_facts(&metadata.schema, &metadata.planning_facts);
+    let partition_source_columns = metadata
+        .planning_facts
+        .partition_source_column_ordinals()
+        .iter()
+        .filter_map(|ordinal| {
+            metadata
+                .schema
+                .fields()
+                .get(*ordinal as usize)
+                .map(|field| field.name().to_string())
+        })
+        .collect();
     Ok(IcebergQueryTableMaterialization {
         table_name: payload.table,
         schema_id,
         columns,
+        dml_target_columns,
+        partition_source_columns,
         iceberg_row_lineage_metadata_columns,
         read_table: metadata.table,
         read_schema: metadata.schema,
@@ -8490,6 +8515,47 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
         compression: IcebergWriteFileCompression::Snappy,
         position_delete_output_descriptor: None,
     })
+}
+
+/// Row-DML target columns, which are the SQL-visible columns with each
+/// provider-declared write-target Arrow type applied.
+///
+/// The read schema and the write target disagree for Iceberg variant and binary
+/// columns. That divergence is a known defect; this keeps it byte-identical to
+/// what row DML produced when it decoded the Iceberg schema itself, while making
+/// the provider the one that states it.
+fn dml_target_columns_from_planning_facts(
+    schema: &Schema,
+    facts: &ConnectorTablePlanningFacts,
+) -> Vec<novarocks_catalog::schema::ColumnDef> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, field)| {
+            let fact = facts.column_facts().get(ordinal);
+            if matches!(
+                fact.map(|fact| fact.visibility()),
+                Some(ConnectorTableColumnVisibility::Hidden)
+            ) || matches!(
+                fact.map(|fact| fact.role()),
+                Some(ConnectorTableColumnRole::RowLineageSystem)
+            ) {
+                return None;
+            }
+            let data_type = fact
+                .and_then(|fact| fact.write_target_type())
+                .cloned()
+                .unwrap_or_else(|| field.data_type().clone());
+            Some(novarocks_catalog::schema::ColumnDef {
+                name: field.name().to_string(),
+                data_type,
+                nullable: field.is_nullable(),
+                write_default: None,
+                logical_type: None,
+            })
+        })
+        .collect()
 }
 
 fn columns_from_planning_facts(
@@ -9171,6 +9237,8 @@ mod tests {
             table_name: "orders".to_string(),
             schema_id: Some(1),
             columns: Vec::new(),
+            dml_target_columns: Vec::new(),
+            partition_source_columns: Vec::new(),
             iceberg_row_lineage_metadata_columns: Vec::new(),
             read_table,
             read_schema: Arc::new(Schema::empty()),

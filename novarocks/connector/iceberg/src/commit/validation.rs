@@ -21,13 +21,12 @@
 
 use std::collections::HashMap;
 
-use crate::iceberg::spec::FormatVersion;
+use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::iceberg::table::Table;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 
 use crate::commit::{
-    IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
-    NOVAROCKS_UPDATE_MODE_COW,
+    IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
 };
 
 pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
@@ -58,17 +57,34 @@ fn classify_iceberg_write_mode_from_metadata(
 /// Returns the write mode selected from Iceberg table metadata after rejecting
 /// table schemas that the current writer cannot encode.
 pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode, String> {
-    ensure_default_sort_order_resolvable(table)?;
-    ensure_no_variant_in_partition_spec(table)?;
-    ensure_no_variant_in_sort_order(table)?;
-    Ok(classify_iceberg_write_mode(table))
+    ensure_iceberg_write_supported_from_metadata(table.metadata())
+}
+
+/// [`ensure_iceberg_write_supported`] for callers that hold frozen metadata
+/// rather than a live catalog table, such as row-mutation admission working
+/// from an already-admitted table payload.
+pub fn ensure_iceberg_write_supported_from_metadata(
+    metadata: &TableMetadata,
+) -> Result<IcebergWriteMode, String> {
+    ensure_default_sort_order_resolvable_from_metadata(metadata)?;
+    ensure_no_variant_in_partition_spec_from_metadata(metadata)?;
+    ensure_no_variant_in_sort_order_from_metadata(metadata)?;
+    Ok(classify_iceberg_write_mode_from_metadata(
+        metadata.format_version(),
+        metadata.properties(),
+    ))
 }
 
 // Wired in by later tasks (insert/overwrite/update/delete planning).
 #[allow(dead_code)]
 pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> {
+    ensure_no_variant_in_partition_spec_from_metadata(table.metadata())
+}
+
+pub fn ensure_no_variant_in_partition_spec_from_metadata(
+    metadata: &TableMetadata,
+) -> Result<(), String> {
     use crate::iceberg::spec::{PrimitiveType, Type};
-    let metadata = table.metadata();
     let schema = metadata.current_schema();
     for f in metadata.default_partition_spec().fields() {
         let source = schema.field_by_id(f.source_id).ok_or_else(|| {
@@ -95,8 +111,13 @@ pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> 
 // Wired in by later tasks (insert/overwrite/update/delete planning).
 #[allow(dead_code)]
 pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
+    ensure_no_variant_in_sort_order_from_metadata(table.metadata())
+}
+
+pub fn ensure_no_variant_in_sort_order_from_metadata(
+    metadata: &TableMetadata,
+) -> Result<(), String> {
     use crate::iceberg::spec::{PrimitiveType, Type};
-    let metadata = table.metadata();
     let schema = metadata.current_schema();
     for f in metadata.default_sort_order().fields.iter() {
         let source = schema.field_by_id(f.source_id).ok_or_else(|| {
@@ -123,7 +144,12 @@ pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
 /// existing sort order. iceberg-rust's `TableMetadata::default_sort_order()`
 /// panics if the id is dangling; this surfaces a clean error instead.
 pub fn ensure_default_sort_order_resolvable(table: &Table) -> Result<(), String> {
-    let metadata = table.metadata();
+    ensure_default_sort_order_resolvable_from_metadata(table.metadata())
+}
+
+pub fn ensure_default_sort_order_resolvable_from_metadata(
+    metadata: &TableMetadata,
+) -> Result<(), String> {
     let id = metadata.default_sort_order_id();
     if metadata.sort_order_by_id(id).is_none() {
         return Err(format!(
@@ -160,29 +186,56 @@ pub fn ensure_column_id_not_regressed(current: i32, next: i32) -> Result<(), Str
     Ok(())
 }
 
-pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStrategy, String> {
-    let write_mode = ensure_iceberg_write_supported(table)?;
-    Ok(sql_delete_strategy_from_write_mode(write_mode))
-}
+/// The physical row-mutation strategy this provider will use for `intent`
+/// against `metadata`.
+///
+/// This is the single place the Iceberg strategy is decided. It runs the same
+/// fail-fast write guards as ordinary write admission first, so an unsupported
+/// table shape is rejected before a strategy is named.
+///
+/// Two rules deserve calling out:
+///
+/// - Deletion vectors are a format-v3 feature, and the DV commit path rejects
+///   any other format version outright. The DELETE strategy is therefore keyed
+///   on the format version alone. A v2 table that declares
+///   `write.row-lineage=true` gets position deletes, not a deletion vector it
+///   could never commit.
+/// - A MERGE that can delete matched rows is served merge-on-read even when the
+///   table asks for copy-on-write, because the copy-on-write rewrite has no way
+///   to express a matched delete.
+// Design: ADR-0055 (docs/adr/ADR-0055-row-dml-strategy-consumer-closeout.md)
+pub fn row_mutation_strategy_from_metadata(
+    metadata: &TableMetadata,
+    intent: &novarocks_spi::connector::ConnectorRowMutationIntent,
+) -> Result<novarocks_spi::connector::ConnectorRowMutationStrategy, String> {
+    use novarocks_spi::connector::{
+        ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationStrategy,
+    };
 
-// Consumed by later UPDATE lowering/execution tasks.
-#[allow(dead_code)]
-pub fn ensure_update_requires_v3_row_lineage(table: &Table) -> Result<(), String> {
-    let metadata = table.metadata();
-    ensure_update_properties_require_v3_row_lineage(
-        metadata.format_version(),
-        metadata.properties(),
-    )
-}
+    ensure_iceberg_write_supported_from_metadata(metadata)?;
 
-// Consumed by later UPDATE lowering/execution tasks.
-#[allow(dead_code)]
-pub fn select_iceberg_update_mode(table: &Table) -> Result<IcebergUpdateMode, String> {
-    ensure_update_requires_v3_row_lineage(table)?;
-    select_update_mode_from_properties(
-        table.metadata().format_version(),
-        table.metadata().properties(),
-    )
+    match intent {
+        ConnectorRowMutationIntent::Delete => {
+            if metadata.format_version() == FormatVersion::V3 {
+                Ok(ConnectorRowMutationStrategy::DeletionVector)
+            } else {
+                Ok(ConnectorRowMutationStrategy::PositionDelete)
+            }
+        }
+        ConnectorRowMutationIntent::Update | ConnectorRowMutationIntent::Merge { .. } => {
+            let mode = select_update_mode_from_properties(
+                metadata.format_version(),
+                metadata.properties(),
+            )?;
+            if intent.accepts(ConnectorRowMutationEffect::Delete) {
+                return Ok(ConnectorRowMutationStrategy::MergeOnRead);
+            }
+            Ok(match mode {
+                IcebergUpdateMode::CopyOnWrite => ConnectorRowMutationStrategy::CopyOnWrite,
+                IcebergUpdateMode::MergeOnRead => ConnectorRowMutationStrategy::MergeOnRead,
+            })
+        }
+    }
 }
 
 fn select_update_mode_from_properties(
@@ -207,13 +260,6 @@ fn ensure_update_properties_require_v3_row_lineage(
         return Err("UPDATE requires an Iceberg v3 table with write.row-lineage=true".to_string());
     }
     Ok(())
-}
-
-fn sql_delete_strategy_from_write_mode(write_mode: IcebergWriteMode) -> IcebergSqlDeleteStrategy {
-    match write_mode {
-        IcebergWriteMode::LegacyPositionDeletes => IcebergSqlDeleteStrategy::PositionDeleteFiles,
-        IcebergWriteMode::RowLineageV3 => IcebergSqlDeleteStrategy::DeletionVectors,
-    }
 }
 
 /// Phase 1 only handles tables whose data is all under the current default
@@ -423,22 +469,6 @@ mod tests {
     }
 
     #[test]
-    fn sql_delete_strategy_keeps_v2_on_position_delete_files() {
-        assert_eq!(
-            sql_delete_strategy_from_write_mode(IcebergWriteMode::LegacyPositionDeletes),
-            IcebergSqlDeleteStrategy::PositionDeleteFiles
-        );
-    }
-
-    #[test]
-    fn sql_delete_strategy_uses_deletion_vectors_for_row_lineage_v3() {
-        assert_eq!(
-            sql_delete_strategy_from_write_mode(IcebergWriteMode::RowLineageV3),
-            IcebergSqlDeleteStrategy::DeletionVectors
-        );
-    }
-
-    #[test]
     fn update_mode_defaults_to_copy_on_write() {
         let props = HashMap::from([("write.row-lineage".to_string(), "true".to_string())]);
         assert_eq!(
@@ -601,6 +631,218 @@ mod tests {
         let err = ensure_no_variant_in_sort_order(&table).expect_err("must reject");
         assert!(err.contains("'v'"), "{err}");
         assert!(err.contains("sort"), "{err}");
+    }
+
+    /// UPDATE and MERGE additionally require the row-lineage property, not just
+    /// format v3, so every non-DELETE strategy fixture carries it.
+    const ROW_LINEAGE_ON: (&str, &str) = ("write.row-lineage", "true");
+
+    /// Plain single-column table metadata at a chosen format version and
+    /// property set, which is all the strategy rule reads.
+    fn strategy_metadata(
+        format_version: crate::iceberg::spec::FormatVersion,
+        props: &[(&str, &str)],
+    ) -> TableMetadata {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, SortOrder, Type};
+        use std::sync::Arc;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let partition_spec = crate::iceberg::spec::PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .expect("spec");
+        let sort_order = SortOrder::builder().build_unbound().expect("sort");
+        crate::iceberg::spec::TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            partition_spec,
+            sort_order,
+            "file:///tmp/x".to_string(),
+            format_version,
+            props
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata
+    }
+
+    #[test]
+    fn spi5h_delete_strategy_is_keyed_on_format_version_alone() {
+        use crate::iceberg::spec::FormatVersion;
+        use novarocks_spi::connector::{ConnectorRowMutationIntent, ConnectorRowMutationStrategy};
+
+        assert_eq!(
+            row_mutation_strategy_from_metadata(
+                &strategy_metadata(FormatVersion::V3, &[]),
+                &ConnectorRowMutationIntent::Delete,
+            )
+            .expect("v3 delete"),
+            ConnectorRowMutationStrategy::DeletionVector
+        );
+
+        assert_eq!(
+            row_mutation_strategy_from_metadata(
+                &strategy_metadata(FormatVersion::V2, &[]),
+                &ConnectorRowMutationIntent::Delete,
+            )
+            .expect("v2 delete"),
+            ConnectorRowMutationStrategy::PositionDelete
+        );
+
+        // A v2 table that declares row lineage must still get position deletes.
+        // Deletion vectors are v3-only and the DV commit path rejects v2, so
+        // the looser write-mode classification would only pick a strategy that
+        // is guaranteed to fail at commit time.
+        assert_eq!(
+            row_mutation_strategy_from_metadata(
+                &strategy_metadata(FormatVersion::V2, &[("write.row-lineage", "true")]),
+                &ConnectorRowMutationIntent::Delete,
+            )
+            .expect("v2 row-lineage delete"),
+            ConnectorRowMutationStrategy::PositionDelete
+        );
+    }
+
+    #[test]
+    fn spi5h_update_strategy_follows_the_table_mode_and_requires_v3_row_lineage() {
+        use crate::iceberg::spec::FormatVersion;
+        use novarocks_spi::connector::{ConnectorRowMutationIntent, ConnectorRowMutationStrategy};
+
+        assert_eq!(
+            row_mutation_strategy_from_metadata(
+                &strategy_metadata(FormatVersion::V3, &[ROW_LINEAGE_ON]),
+                &ConnectorRowMutationIntent::Update,
+            )
+            .expect("default is copy-on-write"),
+            ConnectorRowMutationStrategy::CopyOnWrite
+        );
+
+        assert_eq!(
+            row_mutation_strategy_from_metadata(
+                &strategy_metadata(
+                    FormatVersion::V3,
+                    &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "merge-on-read")]
+                ),
+                &ConnectorRowMutationIntent::Update,
+            )
+            .expect("declared merge-on-read"),
+            ConnectorRowMutationStrategy::MergeOnRead
+        );
+
+        let v2 = row_mutation_strategy_from_metadata(
+            &strategy_metadata(FormatVersion::V2, &[ROW_LINEAGE_ON]),
+            &ConnectorRowMutationIntent::Update,
+        )
+        .expect_err("UPDATE needs v3 row lineage");
+        assert!(v2.contains("row-lineage"), "{v2}");
+
+        let v3_without_row_lineage = row_mutation_strategy_from_metadata(
+            &strategy_metadata(FormatVersion::V3, &[]),
+            &ConnectorRowMutationIntent::Update,
+        )
+        .expect_err("UPDATE needs the row-lineage property, not just v3");
+        assert!(
+            v3_without_row_lineage.contains("row-lineage"),
+            "{v3_without_row_lineage}"
+        );
+
+        let unsupported = row_mutation_strategy_from_metadata(
+            &strategy_metadata(
+                FormatVersion::V3,
+                &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "sideways")],
+            ),
+            &ConnectorRowMutationIntent::Update,
+        )
+        .expect_err("unknown update mode must fail");
+        assert!(unsupported.contains("sideways"), "{unsupported}");
+    }
+
+    #[test]
+    fn spi5h_merge_that_can_delete_is_served_merge_on_read() {
+        use crate::iceberg::spec::FormatVersion;
+        use novarocks_spi::connector::{
+            ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationStrategy,
+        };
+
+        // Copy-on-write table, but the MERGE can delete matched rows: the
+        // rewrite cannot express that, so merge-on-read wins.
+        assert_eq!(
+            row_mutation_strategy_from_metadata(
+                &strategy_metadata(
+                    FormatVersion::V3,
+                    &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "copy-on-write")]
+                ),
+                &ConnectorRowMutationIntent::Merge {
+                    effects: vec![
+                        ConnectorRowMutationEffect::Delete,
+                        ConnectorRowMutationEffect::Insert,
+                    ],
+                },
+            )
+            .expect("merge with delete"),
+            ConnectorRowMutationStrategy::MergeOnRead
+        );
+
+        // Same table, a MERGE that only replaces and inserts, stays on the
+        // table's declared copy-on-write mode.
+        assert_eq!(
+            row_mutation_strategy_from_metadata(
+                &strategy_metadata(
+                    FormatVersion::V3,
+                    &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "copy-on-write")]
+                ),
+                &ConnectorRowMutationIntent::Merge {
+                    effects: vec![
+                        ConnectorRowMutationEffect::Replace,
+                        ConnectorRowMutationEffect::Insert,
+                    ],
+                },
+            )
+            .expect("merge without delete"),
+            ConnectorRowMutationStrategy::CopyOnWrite
+        );
+    }
+
+    #[test]
+    fn spi5h_strategy_runs_the_write_support_guards_first() {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionField, PrimitiveType, Transform, Type,
+        };
+        use novarocks_spi::connector::ConnectorRowMutationIntent;
+
+        // Reuse the variant-partition table, which the write guards reject.
+        let table = make_table_with(
+            vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+            ],
+            vec![PartitionField {
+                source_id: 2,
+                field_id: 1000,
+                name: "v_part".to_string(),
+                transform: Transform::Identity,
+            }],
+            vec![],
+        );
+        assert_eq!(table.metadata().format_version(), FormatVersion::V3);
+
+        let err = row_mutation_strategy_from_metadata(
+            table.metadata(),
+            &ConnectorRowMutationIntent::Delete,
+        )
+        .expect_err("variant partition column must be rejected before a strategy is named");
+        assert!(err.contains("variant"), "{err}");
     }
 
     #[test]

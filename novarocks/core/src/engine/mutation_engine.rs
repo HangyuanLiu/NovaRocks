@@ -245,18 +245,10 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
                     &request.execution,
                     &connector_context,
                 )?;
-                let base_snapshot_id = if prepared.target_ref == "main" {
-                    prepared
-                        .table
-                        .metadata()
-                        .current_snapshot()
-                        .map(|snapshot| snapshot.snapshot_id())
-                } else {
-                    novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
-                        prepared.table.metadata(),
-                        &prepared.target_ref,
-                    )?
-                };
+                // The provider signed this during admission for the exact
+                // target ref; the journal records that value rather than
+                // re-reading a table handle here.
+                let base_snapshot_id = prepared.admitted_base_snapshot_id;
                 (
                     PreparedKernel::Update(prepared),
                     stmt.table,
@@ -273,11 +265,7 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
                     &request.execution,
                     &connector_context,
                 )?;
-                let base_snapshot_id = prepared
-                    .table
-                    .metadata()
-                    .current_snapshot()
-                    .map(|snapshot| snapshot.snapshot_id());
+                let base_snapshot_id = prepared.admitted_base_snapshot_id;
                 (
                     PreparedKernel::Merge(prepared),
                     stmt.table,

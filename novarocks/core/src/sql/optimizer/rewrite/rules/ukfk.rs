@@ -966,6 +966,7 @@ mod tests {
                 },
                 vec![Arc::from("id")],
             )],
+            vec![],
             &context,
         )
         .expect("valid typed planning facts");
