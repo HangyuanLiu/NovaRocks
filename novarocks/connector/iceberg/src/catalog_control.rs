@@ -27,12 +27,16 @@ use crate::catalog_config::IcebergCatalogConfiguration;
 use crate::loaded_table::IcebergPhysicalTableCache;
 use crate::manifest::DataFileWithStats;
 
+#[path = "catalog_control/add_files.rs"]
+pub(crate) mod add_files;
 #[path = "catalog_control/catalog_mutation.rs"]
 pub mod catalog_mutation;
 #[path = "catalog_control/cleanup_candidates.rs"]
 mod cleanup_candidates;
 #[path = "catalog_control/cleanup_maintenance.rs"]
 pub mod cleanup_maintenance;
+#[path = "catalog_control/data_mutation.rs"]
+pub mod data_mutation;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub mod metadata_maintenance;
 #[path = "catalog_control/statistics.rs"]
