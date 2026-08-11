@@ -43,8 +43,8 @@ use novarocks_spi::connector::{
     BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupPlan,
     ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteReceipt,
     ConnectorMetadataMaintenancePlan, ConnectorMutationOperationId, ConnectorWriteAbortOutcome,
-    ConnectorWriteCohortId, ConnectorWriteReceipt, ExternalMutationEvidence,
-    ExternalMutationOutcome, PreparedBatch,
+    ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
+    ExternalMutationEvidence, ExternalMutationOutcome, PreparedBatch,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -725,7 +725,7 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         cohort_id: ConnectorWriteCohortId,
     ) -> Result<ConnectorWriteCompletion, String> {
         let state = self.shared_for_table_maintenance()?;
-        crate::connector::iceberg::distributed_rewrite_execution::stage_frozen_rewrite_cohort(
+        stage_frozen_rewrite_cohort(
             &state,
             session.session(),
             cohort_id,
@@ -786,6 +786,108 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
             .session()
             .finalize_committed(receipt)
             .map_err(|error| format!("finalize distributed rewrite operation: {error}"))
+    }
+}
+
+/// Stage one provider-frozen rewrite cohort through the ordinary connector
+/// read and write contracts retained by its exact composite lease.
+fn stage_frozen_rewrite_cohort(
+    state: &Arc<crate::engine::StandaloneState>,
+    session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+    cohort_id: ConnectorWriteCohortId,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    (
+        ConnectorWriteCompletion,
+        crate::query_execution::outcome::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    let cohort = session
+        .plan()
+        .cohorts()
+        .iter()
+        .find(|candidate| candidate.cohort_id() == cohort_id)
+        .ok_or_else(|| "distributed rewrite execution names an unknown cohort".to_string())?;
+    let read = crate::query_execution::distributed_rewrite::plan_frozen_rewrite_connector_read(
+        session.lease(),
+        execution.topology(),
+        cohort.source(),
+        (0..cohort.scan_schema().fields().len()).collect(),
+        context.clone(),
+    )
+    .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
+    let table_bindings =
+        Arc::new(crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()?);
+    let source_binding =
+        crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
+            table_bindings.as_ref(),
+            cohort.scan_schema(),
+        )?;
+    let resolver =
+        crate::query_execution::distributed_rewrite::FrozenRewriteReadResolver::new(read);
+    let physical_plan =
+        crate::query_execution::distributed_rewrite::frozen_rewrite_scan_physical_plan(
+            cohort.scan_schema(),
+            source_binding,
+        );
+    let target_binding =
+        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+            table_bindings.as_ref(),
+            rewrite_target_identity(session, cohort_id),
+            cohort.preparation().clone(),
+            session.lease().planning_lease(),
+        )?;
+    let sink = crate::engine::query_planning::write_sink::sql_write_plan_input_for_admitted_target(
+        table_bindings.as_ref(),
+        target_binding,
+        rewrite_sink_mode(cohort.preparation().input())?,
+        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        None,
+    )?;
+    let registration = session
+        .execution_registration(cohort_id)
+        .map_err(|error| format!("register frozen rewrite cohort: {error}"))?;
+    crate::engine::execute_frozen_rewrite_physical_plan_as_iceberg_staging(
+        state,
+        physical_plan,
+        sink,
+        Some(execution),
+        context,
+        table_bindings.as_ref(),
+        &resolver,
+        registration,
+    )
+}
+
+fn rewrite_target_identity(
+    session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+    cohort_id: ConnectorWriteCohortId,
+) -> crate::sql::planner::table::SqlTableIdentity {
+    crate::sql::planner::table::SqlTableIdentity {
+        catalog: session
+            .lease()
+            .binding_key()
+            .instance_id
+            .as_str()
+            .to_string(),
+        namespace: "__connector_rewrite".to_string(),
+        table: format!("cohort_{}", hex::encode(cohort_id.to_bytes())),
+    }
+}
+
+fn rewrite_sink_mode(
+    input: &ConnectorWriteInputShape,
+) -> Result<crate::sql::planner::distributed::write::contract::SqlWriteSinkMode, String> {
+    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
+
+    match input {
+        ConnectorWriteInputShape::Data { .. } => Ok(SqlWriteSinkMode::Data),
+        ConnectorWriteInputShape::RowLineage { .. } => Ok(SqlWriteSinkMode::RowLineageData),
+        ConnectorWriteInputShape::PositionDelete { .. } => Ok(SqlWriteSinkMode::PositionDeletes),
+        ConnectorWriteInputShape::DeletionVector { .. } => Ok(SqlWriteSinkMode::DeletionVectors),
+        ConnectorWriteInputShape::EqualityDelete { .. } => Ok(SqlWriteSinkMode::EqualityDeletes),
     }
 }
 

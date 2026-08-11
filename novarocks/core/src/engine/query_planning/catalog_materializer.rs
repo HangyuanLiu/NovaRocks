@@ -39,6 +39,156 @@ use crate::sql::catalog::{
 };
 use crate::sql::planner::table::TableDef;
 
+/// Provider-neutral table facts admitted for one request.  Core projects the
+/// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
+/// never decodes a provider table handle or metadata payload.
+#[derive(Clone)]
+pub(crate) struct ConnectorQueryTableMaterialization {
+    pub(crate) schema_version: Option<Vec<u8>>,
+    pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) read_table: novarocks_spi::connector::ConnectorTableHandle,
+    pub(crate) read_schema: arrow::datatypes::SchemaRef,
+    pub(crate) read_selector: novarocks_spi::connector::ConnectorReadSelector,
+    pub(crate) sql_ukfk_facts: crate::sql::planner::table::SqlUkFkTableFacts,
+    pub(crate) statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+}
+
+pub(crate) fn load_connector_table_materialization_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    load_connector_table_materialization_with_resolution(
+        controls,
+        context,
+        catalog,
+        namespace,
+        table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )
+}
+
+/// Load one provider-defined read alias through the same opaque metadata
+/// contract used for base tables. The alias syntax is application-owned, but
+/// Core neither decodes the returned table handle nor names a provider type.
+pub(crate) fn load_connector_table_alias_materialization_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    alias: &str,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    load_connector_table_materialization_with_resolution(
+        controls,
+        context,
+        catalog,
+        namespace,
+        alias,
+        novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+    )
+}
+
+fn load_connector_table_materialization_with_resolution(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    resolution: novarocks_spi::connector::ConnectorTableResolution,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
+    };
+
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let planning_lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    let metadata = planning_lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    connector_table_materialization_from_metadata(metadata, planning_lease)
+}
+
+pub(crate) fn connector_table_materialization_from_metadata(
+    metadata: novarocks_spi::connector::ConnectorTableMetadata,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    use novarocks_spi::connector::{
+        ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+    };
+
+    let mut columns = Vec::new();
+    let mut row_lineage_metadata_columns = Vec::new();
+    for (ordinal, field) in metadata.schema.fields().iter().enumerate() {
+        let fact = metadata.planning_facts.column_facts().get(ordinal);
+        let logical_type = match fact.map(|fact| fact.semantic_kind()) {
+            Some(ConnectorTableColumnSemanticKind::Bitmap) => {
+                Some(novarocks_catalog::schema::SqlType::Bitmap)
+            }
+            Some(ConnectorTableColumnSemanticKind::Hll) => {
+                Some(novarocks_catalog::schema::SqlType::Hll)
+            }
+            _ => None,
+        };
+        let column = novarocks_catalog::schema::ColumnDef {
+            name: field.name().to_string(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type,
+        };
+        match fact.map(|fact| fact.role()) {
+            Some(ConnectorTableColumnRole::RowLineageSystem) => {
+                row_lineage_metadata_columns.push(column)
+            }
+            _ if matches!(
+                fact.map(|fact| fact.visibility()),
+                Some(ConnectorTableColumnVisibility::Hidden)
+            ) => {}
+            _ => columns.push(column),
+        }
+    }
+    let statistics_pin = metadata
+        .statistics_data_version
+        .clone()
+        .map(
+            |data_version| crate::connector::backend::ResolvedTableStatisticsPin {
+                table: metadata.table.clone(),
+                data_version,
+            },
+        );
+    Ok(ConnectorQueryTableMaterialization {
+        schema_version: metadata.version.map(|version| version.to_vec()),
+        columns,
+        row_lineage_metadata_columns,
+        read_table: metadata.table,
+        read_schema: metadata.schema.clone(),
+        read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+        sql_ukfk_facts:
+            crate::sql::planner::table::SqlUkFkTableFacts::from_connector_planning_facts(
+                &metadata.schema,
+                &metadata.planning_facts,
+            ),
+        statistics_pin,
+        planning_lease,
+    })
+}
+
 /// Convert an admitted Iceberg provider envelope into the one SQL-facing
 /// table shape.  The caller supplies the token allocated by
 /// `QueryTableBindingStore`; every concrete descriptor remains paired with
@@ -50,7 +200,7 @@ pub(crate) fn iceberg_query_binding_from_materialization(
     sql_table_name: &str,
     binding: SqlTableBindingId,
 ) -> Result<QueryTableBinding, String> {
-    iceberg_query_binding_from_materialization_with_delta_plans(
+    iceberg_query_binding_from_materialization_with_change_scans(
         materialization,
         catalog,
         namespace,
@@ -61,19 +211,98 @@ pub(crate) fn iceberg_query_binding_from_materialization(
     )
 }
 
-/// Equivalent to [`iceberg_query_binding_from_materialization`] with
-/// application-admitted snapshot-window delta facts.  SQL still receives only
-/// the binding token; preparation recovers this map from the same store.
-pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
+/// Project a provider-neutral SPI metadata materialization into the
+/// request-local SQL binding. Provider aliases retain their separately frozen
+/// provider-owned facts until their dedicated adapters run.
+pub(crate) fn connector_query_binding_from_materialization(
+    materialization: ConnectorQueryTableMaterialization,
+    catalog: &str,
+    namespace: &str,
+    sql_table_name: &str,
+    binding: SqlTableBindingId,
+) -> Result<QueryTableBinding, String> {
+    use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity};
+
+    let (scan_kind, frozen_snapshot_id) = match materialization.read_selector {
+        novarocks_spi::connector::ConnectorReadSelector::Current => (
+            SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+            None,
+        ),
+        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id) => {
+            let version =
+                crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id);
+            (SqlScanKind::FrozenInputSet { version }, Some(snapshot_id))
+        }
+        novarocks_spi::connector::ConnectorReadSelector::TimestampMicros(timestamp_micros) => {
+            return Err(format!(
+                "connector read selector timestamp {timestamp_micros} must resolve to a snapshot before SQL materialization"
+            ));
+        }
+    };
+    let planner = TableDef {
+        name: sql_table_name.to_string(),
+        columns: materialization.columns,
+        iceberg_row_lineage_metadata_columns: materialization.row_lineage_metadata_columns,
+        source: ScanSource::Sql(
+            SqlScanSource::new(
+                binding,
+                SqlTableIdentity {
+                    catalog: catalog.to_string(),
+                    namespace: namespace.to_string(),
+                    table: sql_table_name.to_string(),
+                },
+                scan_kind,
+            )
+            .with_ukfk_facts(materialization.sql_ukfk_facts),
+        ),
+    };
+    let frozen_snapshot_materializations = frozen_snapshot_id
+        .into_iter()
+        .map(|snapshot_id| {
+            (
+                snapshot_id,
+                QueryScanMaterialization {
+                    table: materialization.read_table.clone(),
+                    schema: materialization.read_schema.clone(),
+                    selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
+                        snapshot_id,
+                    ),
+                    statistics_pin: materialization.statistics_pin.clone(),
+                    planning_lease: materialization.planning_lease.clone(),
+                },
+            )
+        })
+        .collect();
+    Ok(QueryTableBinding {
+        resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+        statistics_pin: materialization.statistics_pin.clone(),
+        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+        scan_materialization: Some(QueryScanMaterialization {
+            table: materialization.read_table,
+            schema: materialization.read_schema,
+            selector: materialization.read_selector,
+            statistics_pin: materialization.statistics_pin,
+            planning_lease: materialization.planning_lease,
+        }),
+        mv_target_read: None,
+        write_target_admission: None,
+        frozen_snapshot_materializations,
+        admitted_change_scans: BTreeMap::new(),
+    })
+}
+
+/// Equivalent to [`iceberg_query_binding_from_materialization`] with sealed
+/// provider snapshot-window admissions. SQL receives only the binding token;
+/// preparation recovers each opaque scan from the same request-local store.
+pub(crate) fn iceberg_query_binding_from_materialization_with_change_scans(
     materialization: crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
     catalog: &str,
     namespace: &str,
     sql_table_name: &str,
     binding: SqlTableBindingId,
-    delta_runtime_plans: BTreeMap<
-        (i64, i64),
-        crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
-    >,
+    admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
     mut frozen_snapshot_ids: std::collections::BTreeSet<i64>,
 ) -> Result<QueryTableBinding, String> {
     use crate::sql::planner::table::{
@@ -150,8 +379,74 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
         mv_target_read: None,
         write_target_admission: materialization.write_target_admission,
         frozen_snapshot_materializations,
-        delta_runtime_plans,
+        admitted_change_scans,
     })
+}
+
+/// Admit one provider-owned change window while the caller holds the exact
+/// table handle and planning lease. The returned sealed scan is the sole
+/// physical authority retained by Core for later preparation.
+pub(crate) fn admit_connector_change_window(
+    table: &novarocks_spi::connector::ConnectorTableHandle,
+    schema: &arrow::datatypes::SchemaRef,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    window: novarocks_spi::connector::ConnectorChangeWindow,
+) -> Result<novarocks_spi::connector::ConnectorScan, String> {
+    use novarocks_spi::connector::{
+        ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorReadPurpose,
+        ConnectorScanSelection,
+    };
+
+    let binding = planning_lease.binding();
+    if table.owner() != &binding.descriptor().instance_id {
+        return Err(
+            "connector change-window table handle owner does not match its exact planning lease"
+                .to_string(),
+        );
+    }
+    let scan = binding
+        .planning()
+        .begin_scan(
+            table,
+            ConnectorBeginScanRequest {
+                projection: (0..schema.fields().len()).collect(),
+                static_predicates: Vec::new(),
+                selection: ConnectorScanSelection::ChangeWindow(window),
+                purpose: ConnectorReadPurpose::Query,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: std::num::NonZeroUsize::new(4096).expect("batch rows are nonzero"),
+                    max_bytes: std::num::NonZeroUsize::new(
+                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                    )
+                    .expect("batch bytes are nonzero"),
+                },
+                context: context.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    scan.validate(
+        &novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: binding.descriptor().instance_id.clone(),
+            incarnation: binding.incarnation(),
+        },
+        ConnectorScanSelection::ChangeWindow(window),
+    )
+    .map_err(|error| error.to_string())?;
+    if scan.output_schema().fields() != schema.fields() {
+        return Err(
+            "connector change-window scan schema does not match its exact table metadata"
+                .to_string(),
+        );
+    }
+    if !scan.predicate_dispositions().is_empty() {
+        return Err(
+            "connector change-window scan returned dispositions without static predicates"
+                .to_string(),
+        );
+    }
+    Ok(scan)
 }
 
 /// Application materializer for connector-controlled table metadata.  The
@@ -501,7 +796,7 @@ mod tests {
             write_target_admission: None,
             mv_target_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            delta_runtime_plans: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
         }
     }
 

@@ -89,35 +89,6 @@ fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table:
             logical_type: None,
         })
         .collect::<Vec<_>>();
-    let schema = novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
-        fields: names
-            .iter()
-            .enumerate()
-            .map(
-                |(idx, name)| novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                    field_id: i32::try_from(idx + 1).expect("field id"),
-                    name: (*name).to_string(),
-                    initial_default: None,
-                    write_default: None,
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: Vec::new(),
-                },
-            )
-            .collect(),
-    };
-    let _iceberg_table = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
-        catalog: "ice".to_string(),
-        namespace: "db".to_string(),
-        table: "sc2".to_string(),
-        table_uuid: Some("uuid-sc2".to_string()),
-        current_snapshot_id: Some(10),
-        schema_id: 1,
-        location: "s3://warehouse/db/sc2".to_string(),
-        schema,
-        serialized_metadata: None,
-        serialized_metadata_rows: None,
-    };
     crate::sql::planner::table::TableDef {
         name: "sc2".to_string(),
         columns,
@@ -185,32 +156,39 @@ fn prepared_connector_scan_bindings(
         Bytes::from_static(b"integration-binding"),
     )
     .expect("fixture connector declaration");
+    let scan = novarocks_spi::connector::ConnectorScan::try_new_snapshot(
+        novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: declaration.incarnation(),
+        },
+        novarocks_spi::connector::ConnectorReadSelector::Current,
+        novarocks_spi::connector::ConnectorScanHandle::try_new(
+            instance_id,
+            Bytes::from_static(b"integration-scan"),
+        )
+        .expect("fixture connector scan handle"),
+        Arc::new(arrow::datatypes::Schema::new(
+            columns
+                .iter()
+                .map(|column| {
+                    arrow::datatypes::Field::new(
+                        &column.name,
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
+        Vec::new(),
+    )
+    .expect("sealed fixture connector scan");
     bindings
         .insert_connector_read(
             fragment_id,
             node_id,
             crate::query_execution::preparation::scan::PlannedConnectorRead {
                 declaration,
-                scan: novarocks_spi::connector::ConnectorScan {
-                    handle: novarocks_spi::connector::ConnectorScanHandle::try_new(
-                        instance_id,
-                        Bytes::from_static(b"integration-scan"),
-                    )
-                    .expect("fixture connector scan handle"),
-                    output_schema: Arc::new(arrow::datatypes::Schema::new(
-                        columns
-                            .iter()
-                            .map(|column| {
-                                arrow::datatypes::Field::new(
-                                    &column.name,
-                                    column.data_type.clone(),
-                                    column.nullable,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )),
-                    predicate_dispositions: Vec::new(),
-                },
+                scan,
                 splits: Vec::new(),
                 provider_field_ordinals: (0..columns.len() as u32).collect(),
                 planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(

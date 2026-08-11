@@ -44,9 +44,11 @@ use super::catalog::registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg, build_iceberg_catalog,
     load_table,
 };
-use super::commit::expire_snapshots::{ExpireParams, run_expire_snapshots_once_with_marker};
 use super::commit::rewrite_manifests::run_rewrite_manifests_once_with_marker;
 use super::provider::decode_data_mutation_table_target;
+use novarocks_connector_iceberg::commit::snapshot_lifecycle_helpers::expire_snapshots::{
+    ExpireParams, run_expire_snapshots_once_with_marker,
+};
 
 const PAYLOAD_VERSION: u16 = 1;
 const MARKER_VERSION: u16 = 1;
@@ -185,7 +187,7 @@ impl IcebergMetadataMaintenanceAdapter {
         entry.invalidate_table_cache(&namespace, &table_name);
         let loaded = load_table(&entry, &namespace, &table_name)
             .map_err(|error| unavailable(format!("load Iceberg table for maintenance: {error}")))?;
-        let table = loaded.table;
+        let table = loaded.into_table();
         let metadata = table.metadata();
         let (older_than_ms, retain_last) = match request.operation() {
             ConnectorMetadataMaintenanceOperation::RewriteMetadataLayout { .. } => (None, None),

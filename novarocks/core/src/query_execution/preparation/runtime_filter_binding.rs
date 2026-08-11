@@ -376,7 +376,7 @@ fn materialize_scan_domain_target(
     }
     let output_matches = read
         .scan
-        .output_schema
+        .output_schema()
         .fields()
         .iter()
         .enumerate()

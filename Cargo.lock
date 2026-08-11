@@ -3240,7 +3240,9 @@ dependencies = [
  "anyhow",
  "arrow",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
+ "chrono",
  "crc32fast",
  "datasketches",
  "iceberg",
@@ -3249,9 +3251,11 @@ dependencies = [
  "novarocks-catalog",
  "novarocks-fs",
  "novarocks-spi",
+ "novarocks-types",
  "opendal",
  "ordered-float 4.6.0",
  "parquet",
+ "rand 0.8.5",
  "roaring 0.10.12",
  "serde",
  "serde_json",
@@ -3260,6 +3264,7 @@ dependencies = [
  "tokio",
  "tracing",
  "typetag",
+ "url",
  "uuid",
 ]
 
@@ -3348,6 +3353,7 @@ dependencies = [
  "novarocks-catalog",
  "novarocks-connector-starrocks",
  "novarocks-execution",
+ "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-state-store",
@@ -3458,9 +3464,12 @@ name = "novarocks-types"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "base64 0.22.1",
  "chrono",
+ "num-traits",
  "roaring 0.10.12",
+ "ryu",
  "serde_json",
 ]
 

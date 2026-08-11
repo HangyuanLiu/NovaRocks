@@ -426,15 +426,14 @@ fn validate_decoded_primitive_literal(
         PrimitiveLiteral::Int128(value),
         crate::iceberg::spec::PrimitiveType::Decimal { precision, .. },
     ) = (literal, primitive_type)
+        && !decimal_unscaled_fits_precision(*value, *precision)
     {
-        if !decimal_unscaled_fits_precision(*value, *precision) {
-            return Err(IcebergWriteDescriptorError::DecodeFailed {
-                index,
-                message: format!(
-                    "partition decimal literal {value} exceeds decimal precision {precision}"
-                ),
-            });
-        }
+        return Err(IcebergWriteDescriptorError::DecodeFailed {
+            index,
+            message: format!(
+                "partition decimal literal {value} exceeds decimal precision {precision}"
+            ),
+        });
     }
     Ok(())
 }

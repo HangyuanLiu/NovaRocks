@@ -62,18 +62,25 @@ fn planned_connector_read_for_test(
         Bytes::from_static(b"binding"),
     )
     .expect("declaration");
+    let scan = ConnectorScan::try_new_snapshot(
+        novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: declaration.incarnation(),
+        },
+        novarocks_spi::connector::ConnectorReadSelector::Current,
+        ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"scan"))
+            .expect("scan handle"),
+        Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            column_name,
+            data_type.clone(),
+            nullable,
+        )])),
+        Vec::new(),
+    )
+    .expect("sealed scan");
     crate::query_execution::preparation::scan::PlannedConnectorRead {
         declaration,
-        scan: ConnectorScan {
-            handle: ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"scan"))
-                .expect("scan handle"),
-            output_schema: Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
-                column_name,
-                data_type.clone(),
-                nullable,
-            )])),
-            predicate_dispositions: Vec::new(),
-        },
+        scan,
         splits: Vec::new(),
         provider_field_ordinals: vec![0],
         planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(),

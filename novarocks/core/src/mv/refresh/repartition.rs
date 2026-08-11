@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 use novarocks_connector_iceberg::iceberg::TableIdent;
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 use crate::mv::refresh::aggregate_first_refresh::{
     AggregateStateRead, prepare_aggregate_first_refresh_chunks,
@@ -30,6 +29,7 @@ use crate::mv::refresh::projection_first_refresh::{
 use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_execution::exec::chunk::Chunk;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,7 +148,7 @@ pub(crate) async fn write_repartition_chunk_payload(
     let data_files = if total_rows == 0 {
         Vec::new()
     } else {
-        crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+        novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files(
             table,
             chunks.into_iter().map(|chunk| chunk.batch),
         )
@@ -526,7 +526,7 @@ mod tests {
 
         assert_eq!(
             join_repartition_commit_kind(),
-            crate::connector::iceberg::commit::CommitOpKind::Overwrite
+            novarocks_connector_iceberg::commit::CommitOpKind::Overwrite
         );
         assert_eq!(calls.get(), 1);
         assert_eq!(

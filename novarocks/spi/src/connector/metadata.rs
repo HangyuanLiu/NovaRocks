@@ -31,6 +31,22 @@ use super::{
 /// admission omits it from SQL-owned write shaping.
 pub const CONNECTOR_FIELD_HIDDEN_FROM_SQL: &str = "novarocks.connector.hidden_from_sql";
 
+/// Upper bounds for the provider-neutral facts returned together with one
+/// connector table schema. These facts are request-local metadata, not a
+/// durable connector contract or a table-handle payload.
+pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS: usize = 4_096;
+pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS: usize = 1_024;
+pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS: usize = 1_024;
+pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS: usize = 256;
+pub const MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS: usize = 4_096;
+pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES: usize = 16_384;
+pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH: usize = 64;
+
+const TABLE_PLANNING_FACT_COLUMN_BYTES: usize = 16;
+const TABLE_PLANNING_FACT_CONSTRAINT_BYTES: usize = 16;
+const TABLE_DEFINITION_COLUMN_BYTES: usize = 24;
+const TABLE_DEFINITION_TYPE_NODE_BYTES: usize = 16;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConnectorNamespaceIdentity {
     pub instance_id: ConnectorInstanceId,
@@ -44,10 +60,688 @@ pub struct ConnectorTableIdentity {
     pub table: Arc<str>,
 }
 
+/// SQL exposure of one field in the frozen Arrow schema.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectorTableColumnVisibility {
+    #[default]
+    Sql,
+    Hidden,
+}
+
+/// SQL semantic kind whose meaning cannot be recovered from the Arrow storage
+/// type alone.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectorTableColumnSemanticKind {
+    #[default]
+    None,
+    Bitmap,
+    Hll,
+}
+
+/// Connector-owned role of one field in the frozen Arrow schema.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectorTableColumnRole {
+    #[default]
+    Ordinary,
+    RowLineageSystem,
+}
+
+/// Provider-neutral planning facts for one Arrow schema field. The ordinal is
+/// deliberately explicit so Core can project facts without inspecting a
+/// provider-private table-handle payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorTableColumnPlanningFact {
+    field_ordinal: u32,
+    visibility: ConnectorTableColumnVisibility,
+    semantic_kind: ConnectorTableColumnSemanticKind,
+    role: ConnectorTableColumnRole,
+}
+
+impl ConnectorTableColumnPlanningFact {
+    pub const fn new(
+        field_ordinal: u32,
+        visibility: ConnectorTableColumnVisibility,
+        semantic_kind: ConnectorTableColumnSemanticKind,
+        role: ConnectorTableColumnRole,
+    ) -> Self {
+        Self {
+            field_ordinal,
+            visibility,
+            semantic_kind,
+            role,
+        }
+    }
+
+    pub const fn field_ordinal(&self) -> u32 {
+        self.field_ordinal
+    }
+
+    pub const fn visibility(&self) -> ConnectorTableColumnVisibility {
+        self.visibility
+    }
+
+    pub const fn semantic_kind(&self) -> ConnectorTableColumnSemanticKind {
+        self.semantic_kind
+    }
+
+    pub const fn role(&self) -> ConnectorTableColumnRole {
+        self.role
+    }
+}
+
+/// A canonical unique-key declaration expressed using fields of the frozen
+/// Arrow schema.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorTableUniqueConstraint {
+    column_ordinals: Vec<u32>,
+}
+
+impl ConnectorTableUniqueConstraint {
+    pub fn new(column_ordinals: Vec<u32>) -> Self {
+        Self { column_ordinals }
+    }
+
+    pub fn column_ordinals(&self) -> &[u32] {
+        &self.column_ordinals
+    }
+}
+
+/// A canonical foreign-key declaration. Local columns are schema ordinals;
+/// the referenced table is a connector identity and its column names are
+/// canonical SQL names. Provider-private IDs never cross this boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorTableForeignKeyConstraint {
+    local_column_ordinals: Vec<u32>,
+    referenced_table: ConnectorTableIdentity,
+    referenced_column_names: Vec<Arc<str>>,
+}
+
+impl ConnectorTableForeignKeyConstraint {
+    pub fn new(
+        local_column_ordinals: Vec<u32>,
+        referenced_table: ConnectorTableIdentity,
+        referenced_column_names: Vec<Arc<str>>,
+    ) -> Self {
+        Self {
+            local_column_ordinals,
+            referenced_table,
+            referenced_column_names,
+        }
+    }
+
+    pub fn local_column_ordinals(&self) -> &[u32] {
+        &self.local_column_ordinals
+    }
+
+    pub fn referenced_table(&self) -> &ConnectorTableIdentity {
+        &self.referenced_table
+    }
+
+    pub fn referenced_column_names(&self) -> &[Arc<str>] {
+        &self.referenced_column_names
+    }
+}
+
+/// Bounded provider-neutral facts needed by Core to materialize SQL table
+/// columns and optimizer UK/FK facts. Providers that have no additional facts
+/// return [`Self::empty`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorTablePlanningFacts {
+    column_facts: Vec<ConnectorTableColumnPlanningFact>,
+    unique_constraints: Vec<ConnectorTableUniqueConstraint>,
+    foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+}
+
+impl ConnectorTablePlanningFacts {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn try_new(
+        schema: &SchemaRef,
+        column_facts: Vec<ConnectorTableColumnPlanningFact>,
+        mut unique_constraints: Vec<ConnectorTableUniqueConstraint>,
+        mut foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        validate_column_facts(schema, &column_facts)?;
+        validate_unique_constraints(schema, &mut unique_constraints)?;
+        validate_foreign_key_constraints(schema, &mut foreign_key_constraints)?;
+
+        let bytes =
+            planning_facts_bytes(&column_facts, &unique_constraints, &foreign_key_constraints);
+        if bytes > context.max_total_payload_bytes() {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::ResourceExhausted,
+                "connector table planning facts exceed request total payload budget",
+            ));
+        }
+
+        Ok(Self {
+            column_facts,
+            unique_constraints,
+            foreign_key_constraints,
+        })
+    }
+
+    pub fn column_facts(&self) -> &[ConnectorTableColumnPlanningFact] {
+        &self.column_facts
+    }
+
+    pub fn unique_constraints(&self) -> &[ConnectorTableUniqueConstraint] {
+        &self.unique_constraints
+    }
+
+    pub fn foreign_key_constraints(&self) -> &[ConnectorTableForeignKeyConstraint] {
+        &self.foreign_key_constraints
+    }
+}
+
+fn validate_column_facts(
+    schema: &SchemaRef,
+    column_facts: &[ConnectorTableColumnPlanningFact],
+) -> Result<(), ConnectorError> {
+    if column_facts.is_empty() {
+        return Ok(());
+    }
+    if column_facts.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts exceed the column fact limit",
+        ));
+    }
+    if column_facts.len() != schema.fields().len() {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts do not cover the frozen schema",
+        ));
+    }
+    for (expected, fact) in column_facts.iter().enumerate() {
+        let expected = u32::try_from(expected).map_err(|_| {
+            ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector table schema ordinal does not fit u32",
+            )
+        })?;
+        if fact.field_ordinal != expected {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector table planning facts contain a duplicate or misaligned schema ordinal",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_constraints(
+    schema: &SchemaRef,
+    constraints: &mut [ConnectorTableUniqueConstraint],
+) -> Result<(), ConnectorError> {
+    if constraints.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts exceed the unique constraint limit",
+        ));
+    }
+    for constraint in constraints.iter_mut() {
+        validate_local_constraint_columns(schema, &mut constraint.column_ordinals)?;
+    }
+    constraints.sort_by(|left, right| left.column_ordinals.cmp(&right.column_ordinals));
+    if constraints.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts contain duplicate unique constraints",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_foreign_key_constraints(
+    schema: &SchemaRef,
+    constraints: &mut [ConnectorTableForeignKeyConstraint],
+) -> Result<(), ConnectorError> {
+    if constraints.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts exceed the foreign key constraint limit",
+        ));
+    }
+    for constraint in constraints.iter_mut() {
+        if constraint.referenced_table.namespace.is_empty()
+            || constraint.referenced_table.table.is_empty()
+            || constraint.local_column_ordinals.len() != constraint.referenced_column_names.len()
+        {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector table planning facts contain an invalid foreign key constraint",
+            ));
+        }
+        if constraint.local_column_ordinals.len()
+            > MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS
+        {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector table planning facts foreign key exceeds the column limit",
+            ));
+        }
+
+        let mut pairs = constraint
+            .local_column_ordinals
+            .iter()
+            .copied()
+            .zip(constraint.referenced_column_names.iter().cloned())
+            .collect::<Vec<_>>();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        if pairs.iter().any(|(_, column)| column.trim().is_empty())
+            || pairs.windows(2).any(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector table planning facts contain duplicate or empty foreign key columns",
+            ));
+        }
+        if pairs
+            .iter()
+            .any(|(ordinal, _)| *ordinal as usize >= schema.fields().len())
+        {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector table planning facts foreign key references an unknown local column",
+            ));
+        }
+        let mut referenced_names = pairs
+            .iter()
+            .map(|(_, name)| Arc::<str>::from(name.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
+        referenced_names.sort();
+        if referenced_names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector table planning facts foreign key repeats a referenced column",
+            ));
+        }
+        constraint.local_column_ordinals = pairs.iter().map(|(ordinal, _)| *ordinal).collect();
+        constraint.referenced_column_names = pairs
+            .into_iter()
+            .map(|(_, name)| Arc::<str>::from(name.to_ascii_lowercase()))
+            .collect();
+    }
+    constraints.sort_by(compare_foreign_key_constraints);
+    if constraints.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts contain duplicate foreign key constraints",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_local_constraint_columns(
+    schema: &SchemaRef,
+    columns: &mut [u32],
+) -> Result<(), ConnectorError> {
+    if columns.is_empty() || columns.len() > MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts contain an invalid constraint column count",
+        ));
+    }
+    columns.sort_unstable();
+    if columns.windows(2).any(|pair| pair[0] == pair[1])
+        || columns
+            .iter()
+            .any(|ordinal| *ordinal as usize >= schema.fields().len())
+    {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::CorruptData,
+            "connector table planning facts reference an unknown or duplicate schema column",
+        ));
+    }
+    Ok(())
+}
+
+fn compare_foreign_key_constraints(
+    left: &ConnectorTableForeignKeyConstraint,
+    right: &ConnectorTableForeignKeyConstraint,
+) -> std::cmp::Ordering {
+    left.local_column_ordinals
+        .cmp(&right.local_column_ordinals)
+        .then_with(|| {
+            left.referenced_table
+                .instance_id
+                .cmp(&right.referenced_table.instance_id)
+        })
+        .then_with(|| {
+            left.referenced_table
+                .namespace
+                .cmp(&right.referenced_table.namespace)
+        })
+        .then_with(|| {
+            left.referenced_table
+                .table
+                .cmp(&right.referenced_table.table)
+        })
+        .then_with(|| {
+            left.referenced_column_names
+                .cmp(&right.referenced_column_names)
+        })
+}
+
+fn planning_facts_bytes(
+    column_facts: &[ConnectorTableColumnPlanningFact],
+    unique_constraints: &[ConnectorTableUniqueConstraint],
+    foreign_key_constraints: &[ConnectorTableForeignKeyConstraint],
+) -> usize {
+    column_facts
+        .len()
+        .saturating_mul(TABLE_PLANNING_FACT_COLUMN_BYTES)
+        .saturating_add(unique_constraints.iter().fold(0usize, |bytes, constraint| {
+            bytes
+                .saturating_add(TABLE_PLANNING_FACT_CONSTRAINT_BYTES)
+                .saturating_add(
+                    constraint
+                        .column_ordinals
+                        .len()
+                        .saturating_mul(std::mem::size_of::<u32>()),
+                )
+        }))
+        .saturating_add(
+            foreign_key_constraints
+                .iter()
+                .fold(0usize, |bytes, constraint| {
+                    bytes
+                        .saturating_add(TABLE_PLANNING_FACT_CONSTRAINT_BYTES)
+                        .saturating_add(
+                            constraint
+                                .local_column_ordinals
+                                .len()
+                                .saturating_mul(std::mem::size_of::<u32>()),
+                        )
+                        .saturating_add(constraint.referenced_table.instance_id.as_str().len())
+                        .saturating_add(constraint.referenced_table.namespace.len())
+                        .saturating_add(constraint.referenced_table.table.len())
+                        .saturating_add(
+                            constraint
+                                .referenced_column_names
+                                .iter()
+                                .map(|name| name.len())
+                                .sum::<usize>(),
+                        )
+                }),
+        )
+}
+
+/// Provider-neutral SQL type facts used only to render a table definition.
+///
+/// This deliberately does not reuse the catalog-mutation type vocabulary:
+/// display metadata must retain fixed-binary width, while mutation inputs own
+/// defaults, aggregation semantics, and provider admission rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorTableDefinitionType {
+    Boolean,
+    Int,
+    BigInt,
+    Float,
+    Double,
+    Decimal {
+        precision: u32,
+        scale: u32,
+    },
+    Date,
+    Time,
+    DateTime,
+    DateTimeNs,
+    String,
+    Binary {
+        fixed_length: Option<u64>,
+    },
+    Variant,
+    Array(Box<ConnectorTableDefinitionType>),
+    Map(
+        Box<ConnectorTableDefinitionType>,
+        Box<ConnectorTableDefinitionType>,
+    ),
+    Struct(Vec<ConnectorTableDefinitionStructField>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorTableDefinitionStructField {
+    name: Arc<str>,
+    data_type: ConnectorTableDefinitionType,
+}
+
+impl ConnectorTableDefinitionStructField {
+    pub fn new(name: impl Into<Arc<str>>, data_type: ConnectorTableDefinitionType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn data_type(&self) -> &ConnectorTableDefinitionType {
+        &self.data_type
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorTableDefinitionColumn {
+    field_ordinal: u32,
+    data_type: ConnectorTableDefinitionType,
+    nullable: bool,
+    comment: Option<Arc<str>>,
+}
+
+impl ConnectorTableDefinitionColumn {
+    pub fn new(
+        field_ordinal: u32,
+        data_type: ConnectorTableDefinitionType,
+        nullable: bool,
+        comment: Option<Arc<str>>,
+    ) -> Self {
+        Self {
+            field_ordinal,
+            data_type,
+            nullable,
+            comment,
+        }
+    }
+
+    pub const fn field_ordinal(&self) -> u32 {
+        self.field_ordinal
+    }
+
+    pub const fn data_type(&self) -> &ConnectorTableDefinitionType {
+        &self.data_type
+    }
+
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+
+    pub fn comment(&self) -> Option<&str> {
+        self.comment.as_deref()
+    }
+}
+
+/// Bounded definition metadata returned with one exact table load.
+///
+/// Empty facts mean the provider does not expose definition metadata. A
+/// populated value is sealed against the same Arrow schema and planning facts
+/// returned by [`ConnectorTableMetadata`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorTableDefinitionFacts {
+    columns: Vec<ConnectorTableDefinitionColumn>,
+    table_comment: Option<Arc<str>>,
+}
+
+impl ConnectorTableDefinitionFacts {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn try_new(
+        schema: &SchemaRef,
+        planning_facts: &ConnectorTablePlanningFacts,
+        columns: Vec<ConnectorTableDefinitionColumn>,
+        table_comment: Option<Arc<str>>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        if columns.len() > MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::ResourceExhausted,
+                "connector table definition exceeds the column limit",
+            ));
+        }
+
+        let expected_ordinals = if planning_facts.column_facts().is_empty() {
+            (0..schema.fields().len()).collect::<Vec<_>>()
+        } else {
+            planning_facts
+                .column_facts()
+                .iter()
+                .filter(|fact| fact.visibility() == ConnectorTableColumnVisibility::Sql)
+                .map(|fact| fact.field_ordinal() as usize)
+                .collect::<Vec<_>>()
+        };
+        if columns.len() != expected_ordinals.len() {
+            return Err(corrupt_definition(
+                "connector table definition does not cover the SQL-visible schema",
+            ));
+        }
+
+        let mut bytes = columns
+            .len()
+            .saturating_mul(TABLE_DEFINITION_COLUMN_BYTES)
+            .saturating_add(table_comment.as_ref().map_or(0, |value| value.len()));
+        let mut nodes = 0_usize;
+        for (column, expected_ordinal) in columns.iter().zip(expected_ordinals) {
+            let expected_ordinal = u32::try_from(expected_ordinal).map_err(|_| {
+                corrupt_definition("connector table definition schema ordinal does not fit u32")
+            })?;
+            if column.field_ordinal != expected_ordinal {
+                return Err(corrupt_definition(
+                    "connector table definition contains a duplicate or misaligned schema ordinal",
+                ));
+            }
+            let field = schema.field(column.field_ordinal as usize);
+            if column.nullable != field.is_nullable() {
+                return Err(corrupt_definition(
+                    "connector table definition nullability does not match the frozen schema",
+                ));
+            }
+            bytes = bytes.saturating_add(column.comment.as_ref().map_or(0, |value| value.len()));
+            bytes =
+                bytes.saturating_add(validate_definition_type(&column.data_type, 1, &mut nodes)?);
+        }
+        if bytes > context.max_total_payload_bytes() {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::ResourceExhausted,
+                "connector table definition exceeds the request total payload budget",
+            ));
+        }
+
+        Ok(Self {
+            columns,
+            table_comment,
+        })
+    }
+
+    pub fn columns(&self) -> &[ConnectorTableDefinitionColumn] {
+        &self.columns
+    }
+
+    pub fn table_comment(&self) -> Option<&str> {
+        self.table_comment.as_deref()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty() && self.table_comment.is_none()
+    }
+}
+
+fn validate_definition_type(
+    data_type: &ConnectorTableDefinitionType,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<usize, ConnectorError> {
+    if depth > MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::ResourceExhausted,
+            "connector table definition exceeds the type depth limit",
+        ));
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::ResourceExhausted,
+            "connector table definition exceeds the type node limit",
+        ));
+    }
+
+    let mut bytes = TABLE_DEFINITION_TYPE_NODE_BYTES;
+    match data_type {
+        ConnectorTableDefinitionType::Decimal { precision, scale } => {
+            if !(1..=38).contains(precision) || scale > precision {
+                return Err(corrupt_definition(
+                    "connector table definition contains an invalid decimal type",
+                ));
+            }
+        }
+        ConnectorTableDefinitionType::Binary {
+            fixed_length: Some(length),
+        } if *length == 0 => {
+            return Err(corrupt_definition(
+                "connector table definition contains a zero fixed-binary length",
+            ));
+        }
+        ConnectorTableDefinitionType::Array(element) => {
+            bytes = bytes.saturating_add(validate_definition_type(element, depth + 1, nodes)?);
+        }
+        ConnectorTableDefinitionType::Map(key, value) => {
+            bytes = bytes
+                .saturating_add(validate_definition_type(key, depth + 1, nodes)?)
+                .saturating_add(validate_definition_type(value, depth + 1, nodes)?);
+        }
+        ConnectorTableDefinitionType::Struct(fields) => {
+            let mut names = std::collections::BTreeSet::new();
+            for field in fields {
+                let normalized = field.name.trim().to_ascii_lowercase();
+                if normalized.is_empty() || !names.insert(normalized) {
+                    return Err(corrupt_definition(
+                        "connector table definition contains an empty or duplicate struct field",
+                    ));
+                }
+                bytes = bytes.saturating_add(field.name.len()).saturating_add(
+                    validate_definition_type(&field.data_type, depth + 1, nodes)?,
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(bytes)
+}
+
+fn corrupt_definition(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(super::ConnectorErrorKind::CorruptData, message)
+}
+
 #[derive(Clone)]
 pub struct ConnectorTableMetadata {
     pub identity: ConnectorTableIdentity,
     pub schema: SchemaRef,
+    /// Bounded provider-neutral facts aligned to `schema`. Empty facts retain
+    /// the historical provider-neutral defaults.
+    pub planning_facts: ConnectorTablePlanningFacts,
+    /// Bounded SQL definition facts loaded from this exact provider
+    /// generation. Empty facts mean SHOW CREATE is unsupported.
+    pub definition_facts: ConnectorTableDefinitionFacts,
     /// Provider-owned schema identity. This remains deliberately distinct
     /// from the data-version pin used by statistics and scan planning.
     pub version: Option<Bytes>,
@@ -272,6 +966,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use super::*;
 
     struct NeverCancelled;
@@ -364,6 +1060,434 @@ mod tests {
 
         assert_eq!(
             error.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    fn planning_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("sketch", DataType::Binary, true),
+            Field::new("_row_id", DataType::Int64, false),
+        ]))
+    }
+
+    fn referenced_table() -> ConnectorTableIdentity {
+        ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance ID"),
+            namespace: Arc::from("analytics"),
+            table: Arc::from("customers"),
+        }
+    }
+
+    #[test]
+    fn spi5ef_table_planning_facts_canonicalize_constraints() {
+        let facts = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            vec![
+                ConnectorTableColumnPlanningFact::new(
+                    0,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    1,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::Hll,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    2,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+            ],
+            vec![
+                ConnectorTableUniqueConstraint::new(vec![1, 0]),
+                ConnectorTableUniqueConstraint::new(vec![2]),
+            ],
+            vec![ConnectorTableForeignKeyConstraint::new(
+                vec![1, 0],
+                referenced_table(),
+                vec![Arc::from("CUSTOMER_SKETCH"), Arc::from("CUSTOMER_ID")],
+            )],
+            &context(4_096),
+        )
+        .expect("valid facts");
+
+        assert_eq!(
+            facts.column_facts()[1].semantic_kind(),
+            ConnectorTableColumnSemanticKind::Hll
+        );
+        assert_eq!(facts.unique_constraints()[0].column_ordinals(), &[0, 1]);
+        let foreign_key = &facts.foreign_key_constraints()[0];
+        assert_eq!(foreign_key.local_column_ordinals(), &[0, 1]);
+        assert_eq!(
+            foreign_key.referenced_column_names(),
+            &[
+                Arc::<str>::from("customer_id"),
+                Arc::<str>::from("customer_sketch")
+            ]
+        );
+    }
+
+    #[test]
+    fn spi5ef_table_planning_facts_reject_misaligned_or_duplicate_ordinals() {
+        let error = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            vec![
+                ConnectorTableColumnPlanningFact::new(
+                    0,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    0,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::Bitmap,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    2,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+            &context(4_096),
+        )
+        .expect_err("duplicate ordinal must be rejected");
+
+        assert_eq!(error.kind(), super::super::ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn spi5ef_table_planning_facts_reject_unknown_constraint_columns_and_budget_overflow() {
+        let unknown_column = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            Vec::new(),
+            vec![ConnectorTableUniqueConstraint::new(vec![3])],
+            Vec::new(),
+            &context(4_096),
+        )
+        .expect_err("unique constraint must reference a schema field");
+        assert_eq!(
+            unknown_column.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let budget = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            Vec::new(),
+            Vec::new(),
+            vec![ConnectorTableForeignKeyConstraint::new(
+                vec![0],
+                referenced_table(),
+                vec![Arc::from("customer_id")],
+            )],
+            &context(16),
+        )
+        .expect_err("facts must respect request budget");
+        assert_eq!(
+            budget.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn spi5ef_table_planning_facts_default_to_empty() {
+        assert!(
+            ConnectorTablePlanningFacts::empty()
+                .column_facts()
+                .is_empty()
+        );
+        assert!(
+            ConnectorTablePlanningFacts::default()
+                .foreign_key_constraints()
+                .is_empty()
+        );
+    }
+
+    fn definition_planning_facts() -> ConnectorTablePlanningFacts {
+        ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            vec![
+                ConnectorTableColumnPlanningFact::new(
+                    0,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    1,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::Hll,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                ConnectorTableColumnPlanningFact::new(
+                    2,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+            &context(4_096),
+        )
+        .expect("planning facts")
+    }
+
+    #[test]
+    fn spi5ef_table_definition_facts_align_to_sql_visible_ordinals() {
+        let facts = ConnectorTableDefinitionFacts::try_new(
+            &planning_schema(),
+            &definition_planning_facts(),
+            vec![
+                ConnectorTableDefinitionColumn::new(
+                    0,
+                    ConnectorTableDefinitionType::BigInt,
+                    false,
+                    Some(Arc::from("identifier")),
+                ),
+                ConnectorTableDefinitionColumn::new(
+                    1,
+                    ConnectorTableDefinitionType::Struct(vec![
+                        ConnectorTableDefinitionStructField::new(
+                            "payload",
+                            ConnectorTableDefinitionType::Array(Box::new(
+                                ConnectorTableDefinitionType::Binary {
+                                    fixed_length: Some(16),
+                                },
+                            )),
+                        ),
+                    ]),
+                    true,
+                    None,
+                ),
+            ],
+            Some(Arc::from("table comment")),
+            &context(4_096),
+        )
+        .expect("valid definition facts");
+
+        assert_eq!(facts.columns()[0].field_ordinal(), 0);
+        assert_eq!(facts.columns()[0].comment(), Some("identifier"));
+        assert_eq!(facts.table_comment(), Some("table comment"));
+        assert!(!facts.is_empty());
+    }
+
+    #[test]
+    fn spi5ef_table_definition_facts_reject_misaligned_or_invalid_types() {
+        let misaligned = ConnectorTableDefinitionFacts::try_new(
+            &planning_schema(),
+            &definition_planning_facts(),
+            vec![
+                ConnectorTableDefinitionColumn::new(
+                    0,
+                    ConnectorTableDefinitionType::Int,
+                    false,
+                    None,
+                ),
+                ConnectorTableDefinitionColumn::new(
+                    2,
+                    ConnectorTableDefinitionType::Binary { fixed_length: None },
+                    false,
+                    None,
+                ),
+            ],
+            None,
+            &context(4_096),
+        )
+        .expect_err("hidden or misaligned ordinal must fail");
+        assert_eq!(
+            misaligned.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let invalid_decimal = ConnectorTableDefinitionFacts::try_new(
+            &Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)])),
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                ConnectorTableDefinitionType::Decimal {
+                    precision: 4,
+                    scale: 5,
+                },
+                true,
+                None,
+            )],
+            None,
+            &context(4_096),
+        )
+        .expect_err("invalid decimal must fail");
+        assert_eq!(
+            invalid_decimal.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn spi5ef_table_definition_facts_enforce_depth_and_payload_budget() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let mut nested = ConnectorTableDefinitionType::String;
+        for _ in 0..MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH {
+            nested = ConnectorTableDefinitionType::Array(Box::new(nested));
+        }
+        let depth = ConnectorTableDefinitionFacts::try_new(
+            &schema,
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(0, nested, true, None)],
+            None,
+            &context(4_096),
+        )
+        .expect_err("excessive type depth must fail");
+        assert_eq!(
+            depth.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+
+        let budget = ConnectorTableDefinitionFacts::try_new(
+            &schema,
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                ConnectorTableDefinitionType::String,
+                true,
+                Some(Arc::from("a comment larger than the budget")),
+            )],
+            None,
+            &context(32),
+        )
+        .expect_err("definition facts must respect the request budget");
+        assert_eq!(
+            budget.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn spi5ef_table_definition_facts_reject_missing_nullable_and_struct_contracts() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, false),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        let missing = ConnectorTableDefinitionFacts::try_new(
+            &schema,
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                ConnectorTableDefinitionType::String,
+                false,
+                None,
+            )],
+            None,
+            &context(4_096),
+        )
+        .expect_err("missing ordinal must fail");
+        assert_eq!(
+            missing.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let nullable = ConnectorTableDefinitionFacts::try_new(
+            &Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                ConnectorTableDefinitionType::String,
+                true,
+                None,
+            )],
+            None,
+            &context(4_096),
+        )
+        .expect_err("nullability mismatch must fail");
+        assert_eq!(
+            nullable.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let duplicate_struct = ConnectorTableDefinitionFacts::try_new(
+            &Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)])),
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                ConnectorTableDefinitionType::Struct(vec![
+                    ConnectorTableDefinitionStructField::new(
+                        "Child",
+                        ConnectorTableDefinitionType::String,
+                    ),
+                    ConnectorTableDefinitionStructField::new(
+                        "child",
+                        ConnectorTableDefinitionType::Int,
+                    ),
+                ]),
+                true,
+                None,
+            )],
+            None,
+            &context(4_096),
+        )
+        .expect_err("case-insensitive duplicate struct fields must fail");
+        assert_eq!(
+            duplicate_struct.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn spi5ef_table_definition_facts_enforce_fixed_and_node_limits() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let fixed = ConnectorTableDefinitionFacts::try_new(
+            &schema,
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                ConnectorTableDefinitionType::Binary {
+                    fixed_length: Some(0),
+                },
+                true,
+                None,
+            )],
+            None,
+            &context(4_096),
+        )
+        .expect_err("zero fixed-binary length must fail");
+        assert_eq!(fixed.kind(), super::super::ConnectorErrorKind::CorruptData);
+
+        let fields = (0..MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES)
+            .map(|ordinal| {
+                ConnectorTableDefinitionStructField::new(
+                    format!("field_{ordinal}"),
+                    ConnectorTableDefinitionType::String,
+                )
+            })
+            .collect();
+        let nodes = ConnectorTableDefinitionFacts::try_new(
+            &schema,
+            &ConnectorTablePlanningFacts::empty(),
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                ConnectorTableDefinitionType::Struct(fields),
+                true,
+                None,
+            )],
+            None,
+            &context(4_096),
+        )
+        .expect_err("type node limit must fail");
+        assert_eq!(
+            nodes.kind(),
             super::super::ConnectorErrorKind::ResourceExhausted
         );
     }

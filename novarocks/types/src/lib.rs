@@ -17,6 +17,7 @@
 
 pub mod aggregate;
 mod arithmetic;
+pub mod arrow_cast;
 pub mod arrow_primitive;
 pub mod coercion;
 pub mod decimal;

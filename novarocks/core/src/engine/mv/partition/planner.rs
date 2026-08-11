@@ -18,14 +18,16 @@
 #[cfg(test)]
 use crate::sql::planner::vocabulary::ApplyKeySource;
 
-use crate::connector::iceberg::changes::IcebergChangeBatch;
-use crate::engine::mv::partition::mapping::map_file_partition_to_mv_key;
+use crate::engine::mv::partition::mapping::map_connector_partition_to_mv_key;
 use crate::mv::model::{AffectedTargetPartitions, MvPartitionKey};
 use crate::mv::persistence::schema::MvSchemaContract;
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
     pub schema_contract: &'a MvSchemaContract,
-    pub change_batch: Option<&'a IcebergChangeBatch>,
+    pub partition_impact:
+        Option<&'a novarocks_spi::connector::ConnectorChangeWindowPartitionImpact>,
+    pub schema_observation:
+        Option<&'a crate::mv::storage_observation::MvSchemaValidationObservation>,
 }
 
 pub(crate) fn plan_affected_partitions(
@@ -34,57 +36,55 @@ pub(crate) fn plan_affected_partitions(
     if input.schema_contract.target.partition.is_none() {
         return AffectedTargetPartitions::Unpartitioned;
     }
-    let Some(batch) = input.change_batch else {
+    let Some(impact) = input.partition_impact else {
         return AffectedTargetPartitions::not_derived(
             "full refresh affected partition planning is not implemented",
         );
     };
-    if !batch.deletes.is_empty() || !batch.equality_deletes.is_empty() {
-        return AffectedTargetPartitions::not_derived(
-            "row-level delete affected partitions require row-evaluation fallback",
-        );
-    }
-
-    let mut new_partitions = Vec::<MvPartitionKey>::new();
-    for file in &batch.inserts {
-        let Some(spec_id) = file.partition_spec_id else {
-            return AffectedTargetPartitions::not_derived(format!(
-                "inserted data file {} is missing partition spec id",
-                file.path
-            ));
-        };
-        match map_file_partition_to_mv_key(input.schema_contract, spec_id, &file.partition_values) {
-            Ok(Some(key)) => new_partitions.push(key),
-            Ok(None) => return AffectedTargetPartitions::Unpartitioned,
-            Err(reason) => return AffectedTargetPartitions::not_derived(reason),
+    match impact {
+        novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unavailable => {
+            AffectedTargetPartitions::not_derived(
+                "connector change-window partition impact is unavailable",
+            )
+        }
+        novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unpartitioned => {
+            AffectedTargetPartitions::Unpartitioned
+        }
+        novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Exact {
+            has_row_deletes,
+            added,
+            removed,
+        } => {
+            if *has_row_deletes {
+                return AffectedTargetPartitions::not_derived(
+                    "row-level delete affected partitions require row-evaluation fallback",
+                );
+            }
+            let Some(observation) = input.schema_observation else {
+                return AffectedTargetPartitions::not_derived(
+                    "connector partition impact is missing its exact schema observation",
+                );
+            };
+            let mut partitions = Vec::<MvPartitionKey>::with_capacity(added.len() + removed.len());
+            for partition in added.iter().chain(removed) {
+                match map_connector_partition_to_mv_key(
+                    input.schema_contract,
+                    observation,
+                    partition,
+                ) {
+                    Ok(Some(key)) => partitions.push(key),
+                    Ok(None) => return AffectedTargetPartitions::Unpartitioned,
+                    Err(reason) => return AffectedTargetPartitions::not_derived(reason),
+                }
+            }
+            AffectedTargetPartitions::known(partitions)
         }
     }
-
-    let mut old_partitions = Vec::<MvPartitionKey>::new();
-    for file in &batch.deleted_data_files {
-        let Some(spec_id) = file.partition_spec_id else {
-            return AffectedTargetPartitions::not_derived(format!(
-                "deleted data file {} is missing partition spec id",
-                file.path
-            ));
-        };
-        match map_file_partition_to_mv_key(input.schema_contract, spec_id, &file.partition_values) {
-            Ok(Some(key)) => old_partitions.push(key),
-            Ok(None) => return AffectedTargetPartitions::Unpartitioned,
-            Err(reason) => return AffectedTargetPartitions::not_derived(reason),
-        }
-    }
-
-    AffectedTargetPartitions::known(new_partitions.into_iter().chain(old_partitions))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AffectedPartitionPlanInput, plan_affected_partitions};
-    use crate::connector::iceberg::changes::{
-        ChangePartitionFieldValue, ChangePartitionValue, DataFileRef, DeletedDataFileRef,
-        IcebergChangeBatch, PositionDeleteRef,
-    };
     use crate::mv::model::{
         AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
     };
@@ -94,7 +94,15 @@ mod tests {
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
+    use crate::mv::storage_observation::{
+        MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
+        MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
+    };
     use crate::sql::planner::vocabulary::ApplyKeySource;
+    use novarocks_spi::connector::{
+        ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
+        ConnectorChangePartitionValue, ConnectorChangeWindowPartitionImpact,
+    };
 
     fn contract_with_identity_partition() -> MvSchemaContract {
         MvSchemaContract {
@@ -156,56 +164,56 @@ mod tests {
         }
     }
 
-    fn change_batch() -> IcebergChangeBatch {
-        IcebergChangeBatch {
-            previous_snapshot_id: 1,
-            current_snapshot_id: 2,
-            inserts: Vec::new(),
-            deletes: Vec::new(),
-            equality_deletes: Vec::new(),
-            deleted_data_files: Vec::new(),
-        }
+    fn observation() -> MvSchemaValidationObservation {
+        MvSchemaValidationObservation::try_new_with_maximum_payload(
+            "base-uuid".to_string(),
+            0,
+            true,
+            true,
+            vec![MvObservedTargetField::new(
+                1,
+                "id".to_string(),
+                "int".to_string(),
+                false,
+            )],
+            MvSchemaValidationPartitionContract::new(
+                7,
+                vec![MvSchemaValidationPartitionField::new(
+                    100,
+                    "id".to_string(),
+                    1,
+                    "id".to_string(),
+                    MvSchemaValidationPartitionTransform::Identity,
+                )],
+            ),
+        )
+        .expect("schema observation")
     }
 
-    fn partition_value(value: &str) -> ChangePartitionFieldValue {
-        ChangePartitionFieldValue {
-            source_field_id: 1,
-            source_column: Some("id".to_string()),
-            field_name: "id".to_string(),
-            transform: "identity".to_string(),
-            value: ChangePartitionValue::Primitive(value.to_string()),
-        }
+    fn partition(value: &str) -> ConnectorChangePartition {
+        ConnectorChangePartition::try_new(vec![
+            ConnectorChangePartitionField::try_new(
+                "id",
+                ConnectorChangePartitionTransform::Identity,
+                ConnectorChangePartitionValue::String(value.into()),
+            )
+            .expect("partition field"),
+        ])
+        .expect("partition")
     }
 
-    fn data_file(path: &str, partition_spec_id: Option<i32>, value: &str) -> DataFileRef {
-        DataFileRef {
-            path: path.to_string(),
-            size: 128,
-            record_count: Some(1),
-            partition_spec_id,
-            partition_key: Some(format!("id={value}")),
-            partition_values: vec![partition_value(value)],
-            first_row_id: None,
-            data_sequence_number: None,
-            row_id_allow_list: None,
-        }
-    }
-
-    fn deleted_data_file(
-        path: &str,
-        partition_spec_id: Option<i32>,
-        value: &str,
-    ) -> DeletedDataFileRef {
-        DeletedDataFileRef {
-            path: path.to_string(),
-            size: 128,
-            record_count: Some(1),
-            partition_spec_id,
-            partition_key: Some(format!("id={value}")),
-            partition_values: vec![partition_value(value)],
-            first_row_id: None,
-            data_sequence_number: None,
-        }
+    fn exact_impact(
+        has_row_deletes: bool,
+        added: Vec<ConnectorChangePartition>,
+        removed: Vec<ConnectorChangePartition>,
+    ) -> ConnectorChangeWindowPartitionImpact {
+        ConnectorChangeWindowPartitionImpact::try_exact(
+            has_row_deletes,
+            added,
+            removed,
+            &crate::connector::test_request_context(),
+        )
+        .expect("partition impact")
     }
 
     fn mv_key(value: &str) -> MvPartitionKey {
@@ -221,14 +229,13 @@ mod tests {
     #[test]
     fn append_only_insert_returns_new_partitions() {
         let contract = contract_with_identity_partition();
-        let mut batch = change_batch();
-        batch
-            .inserts
-            .push(data_file("s3://bucket/new.parquet", Some(7), "42"));
+        let impact = exact_impact(false, vec![partition("42")], Vec::new());
+        let observation = observation();
 
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             schema_contract: &contract,
-            change_batch: Some(&batch),
+            partition_impact: Some(&impact),
+            schema_observation: Some(&observation),
         });
 
         let AffectedTargetPartitions::Known { partitions } = result else {
@@ -243,17 +250,13 @@ mod tests {
     #[test]
     fn overwrite_diff_returns_merged_partitions() {
         let contract = contract_with_identity_partition();
-        let mut batch = change_batch();
-        batch
-            .inserts
-            .push(data_file("s3://bucket/new.parquet", Some(7), "42"));
-        batch
-            .deleted_data_files
-            .push(deleted_data_file("s3://bucket/old.parquet", Some(7), "24"));
+        let impact = exact_impact(false, vec![partition("42")], vec![partition("24")]);
+        let observation = observation();
 
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             schema_contract: &contract,
-            change_batch: Some(&batch),
+            partition_impact: Some(&impact),
+            schema_observation: Some(&observation),
         });
 
         let AffectedTargetPartitions::Known { partitions } = result else {
@@ -268,21 +271,13 @@ mod tests {
     #[test]
     fn position_delete_returns_unknown() {
         let contract = contract_with_identity_partition();
-        let mut batch = change_batch();
-        batch.deletes.push(PositionDeleteRef {
-            delete_file_path: "s3://bucket/delete.parquet".to_string(),
-            delete_file_size: 128,
-            record_count: Some(1),
-            referenced_data_file: None,
-            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
-            content_offset: None,
-            content_size_in_bytes: None,
-            partition_values: Vec::new(),
-        });
+        let impact = exact_impact(true, Vec::new(), Vec::new());
+        let observation = observation();
 
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             schema_contract: &contract,
-            change_batch: Some(&batch),
+            partition_impact: Some(&impact),
+            schema_observation: Some(&observation),
         });
 
         assert_eq!(
@@ -292,22 +287,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_insert_partition_spec_id_returns_unknown() {
+    fn unavailable_connector_evidence_returns_unknown() {
         let contract = contract_with_identity_partition();
-        let mut batch = change_batch();
-        batch
-            .inserts
-            .push(data_file("s3://bucket/new.parquet", None, "42"));
+        let impact = ConnectorChangeWindowPartitionImpact::Unavailable;
 
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             schema_contract: &contract,
-            change_batch: Some(&batch),
+            partition_impact: Some(&impact),
+            schema_observation: None,
         });
 
-        assert!(
-            result
-                .not_derived_reason()
-                .is_some_and(|reason| reason.contains("missing partition spec id"))
+        assert_eq!(
+            result.not_derived_reason(),
+            Some("connector change-window partition impact is unavailable")
         );
     }
 
@@ -315,11 +307,12 @@ mod tests {
     fn unpartitioned_contract_returns_unpartitioned() {
         let mut contract = contract_with_identity_partition();
         contract.target.partition = None;
-        let batch = change_batch();
+        let impact = ConnectorChangeWindowPartitionImpact::Unpartitioned;
 
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             schema_contract: &contract,
-            change_batch: Some(&batch),
+            partition_impact: Some(&impact),
+            schema_observation: None,
         });
 
         assert_eq!(result, AffectedTargetPartitions::Unpartitioned);

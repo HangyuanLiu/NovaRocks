@@ -28,8 +28,6 @@ use std::sync::Arc;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::commit::CommitServiceError;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::statistics::StatisticsEngine;
 use crate::engine::{StandaloneState, iceberg_writer};
@@ -206,12 +204,6 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
         prepared: &dyn IcebergPreparedInsert,
     ) -> Result<IcebergWriteReport, String>;
 
-    fn commit_iceberg_write(
-        &self,
-        prepared: &dyn IcebergPreparedInsert,
-        commit: &dyn IcebergInsertCommit,
-    ) -> Result<CommitOutcome, CommitServiceError>;
-
     fn commit_iceberg_write_terminal(
         &self,
         _prepared: &dyn IcebergPreparedInsert,
@@ -351,7 +343,7 @@ impl InsertEngine for Arc<StandaloneState> {
             table: prepared.target().table.clone(),
             target_ref: request.target_ref,
             attempt_id: prepared.attempt_id().to_string(),
-            is_overwrite: !matches!(prepared.commit_op_kind(), CommitOpKind::FastAppend),
+            is_overwrite: prepared.is_overwrite(),
             base_snapshot_id: prepared.base_snapshot_id(),
         };
         Ok(PreparedIcebergInsert {
@@ -367,31 +359,7 @@ impl InsertEngine for Arc<StandaloneState> {
         let prepared = downcast_prepared(prepared)?;
         Ok(iceberg_write_report_from_result(
             prepared.prepared.run_coordinated_write()?,
-            prepared.prepared.commit_op_kind(),
         ))
-    }
-
-    fn commit_iceberg_write(
-        &self,
-        prepared: &dyn IcebergPreparedInsert,
-        commit: &dyn IcebergInsertCommit,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let prepared = downcast_prepared(prepared).map_err(|message| {
-            CommitServiceError::known_uncommitted(
-                message,
-                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-            )
-        })?;
-        let commit = commit
-            .as_any()
-            .downcast_ref::<CoreIcebergInsertCommit>()
-            .ok_or_else(|| {
-                CommitServiceError::known_uncommitted(
-                    "foreign Iceberg INSERT commit handle".to_string(),
-                    crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-                )
-            })?;
-        prepared.prepared.commit(&commit.completion)
     }
 
     fn commit_iceberg_write_terminal(
@@ -428,7 +396,6 @@ fn downcast_prepared(
 
 fn iceberg_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
-    _commit_op_kind: CommitOpKind,
 ) -> IcebergWriteReport {
     if let Some(abort) = result.write_abort {
         let has_staged_files = abort
@@ -593,54 +560,45 @@ mod tests {
 
     #[test]
     fn query_execution_result_ignores_legacy_fileless_overwrite_carrier() {
-        let report = iceberg_write_report_from_result(
-            QueryExecutionResult {
-                query_result: QueryResult::empty(),
-                write_commit: Some(WriteCommitInput {
-                    write_id: UniqueId::new(1, 2),
-                    writers: Vec::new(),
-                }),
-                write_abort: None,
-                connector_completion: None,
-                fragment_profiles: Vec::new(),
-            },
-            CommitOpKind::Overwrite,
-        );
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_commit: Some(WriteCommitInput {
+                write_id: UniqueId::new(1, 2),
+                writers: Vec::new(),
+            }),
+            write_abort: None,
+            connector_completion: None,
+            fragment_profiles: Vec::new(),
+        });
 
         assert!(matches!(report, IcebergWriteReport::NoOp));
     }
 
     #[test]
     fn query_execution_result_maps_absent_commit_to_noop() {
-        let report = iceberg_write_report_from_result(
-            QueryExecutionResult {
-                query_result: QueryResult::empty(),
-                write_commit: None,
-                write_abort: None,
-                connector_completion: None,
-                fragment_profiles: Vec::new(),
-            },
-            CommitOpKind::Overwrite,
-        );
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_commit: None,
+            write_abort: None,
+            connector_completion: None,
+            fragment_profiles: Vec::new(),
+        });
 
         assert!(matches!(report, IcebergWriteReport::NoOp));
     }
 
     #[test]
     fn query_execution_result_maps_fileless_fast_append_to_noop() {
-        let report = iceberg_write_report_from_result(
-            QueryExecutionResult {
-                query_result: QueryResult::empty(),
-                write_commit: Some(WriteCommitInput {
-                    write_id: UniqueId::new(1, 2),
-                    writers: Vec::new(),
-                }),
-                write_abort: None,
-                connector_completion: None,
-                fragment_profiles: Vec::new(),
-            },
-            CommitOpKind::FastAppend,
-        );
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_commit: Some(WriteCommitInput {
+                write_id: UniqueId::new(1, 2),
+                writers: Vec::new(),
+            }),
+            write_abort: None,
+            connector_completion: None,
+            fragment_profiles: Vec::new(),
+        });
 
         assert!(matches!(report, IcebergWriteReport::NoOp));
     }
@@ -656,7 +614,7 @@ mod tests {
             ),
             connector_completion: None,
             fragment_profiles: Vec::new(),
-        }, CommitOpKind::FastAppend);
+        });
 
         let IcebergWriteReport::Aborted {
             reason,
@@ -676,16 +634,13 @@ mod tests {
         abort.completed_writer_outputs[0]
             .connector_staged_report_frames
             .clear();
-        let report = iceberg_write_report_from_result(
-            QueryExecutionResult {
-                query_result: QueryResult::empty(),
-                write_commit: None,
-                write_abort: Some(abort),
-                connector_completion: None,
-                fragment_profiles: Vec::new(),
-            },
-            CommitOpKind::FastAppend,
-        );
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_commit: None,
+            write_abort: Some(abort),
+            connector_completion: None,
+            fragment_profiles: Vec::new(),
+        });
 
         let IcebergWriteReport::Aborted {
             has_staged_files, ..

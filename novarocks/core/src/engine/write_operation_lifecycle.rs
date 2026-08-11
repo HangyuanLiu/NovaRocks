@@ -20,7 +20,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::StandaloneState;
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCleanupOutcomeRecord, IcebergOperationFactUpdate,
@@ -28,13 +27,11 @@ use crate::meta::repository::iceberg_operation::{
     IcebergOperationNextAction, IcebergOperationState, IcebergOperationTarget,
 };
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput, WriterCommitInput};
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WriteOperationContext {
     pub(crate) operation_kind: IcebergOperationKind,
     pub(crate) target: IcebergOperationTarget,
     pub(crate) attempt_id: String,
-    pub(crate) commit_op_kind: CommitOpKind,
     pub(crate) base_snapshot_id: Option<i64>,
     pub(crate) base_snapshot_map: BTreeMap<String, i64>,
     pub(crate) created_at_ms: i64,
@@ -46,13 +43,6 @@ pub(crate) fn operation_request_from_write_commit(
 ) -> Result<CreateIcebergOperationRequest, String> {
     if ctx.attempt_id.trim().is_empty() {
         return Err("write operation attempt_id is empty".to_string());
-    }
-    let expected_operation_kind = operation_kind_for_commit_op_kind(ctx.commit_op_kind);
-    if ctx.operation_kind != expected_operation_kind {
-        return Err(format!(
-            "write operation kind {:?} does not match commit op {:?}; expected {:?}",
-            ctx.operation_kind, ctx.commit_op_kind, expected_operation_kind
-        ));
     }
     let staged_artifacts = staged_artifacts_from_writer_outputs(&commit.writers)?;
     Ok(CreateIcebergOperationRequest {
@@ -119,22 +109,6 @@ fn staged_artifacts_from_writer_outputs(
 
 fn format_unique_id(id: &crate::common::types::UniqueId) -> String {
     format!("{}/{}", id.high(), id.low())
-}
-
-fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind {
-    match kind {
-        CommitOpKind::FastAppend => IcebergOperationKind::InsertAppend,
-        CommitOpKind::Overwrite | CommitOpKind::OverwritePartitions | CommitOpKind::Truncate => {
-            IcebergOperationKind::InsertOverwrite
-        }
-        CommitOpKind::RowDelta
-        | CommitOpKind::RowDeltaDv
-        | CommitOpKind::RowDeltaDvFromFiles
-        | CommitOpKind::CowUpdate => IcebergOperationKind::RowDelta,
-        CommitOpKind::RewriteDataFiles
-        | CommitOpKind::SelectedRewrite
-        | CommitOpKind::RewriteManifests => IcebergOperationKind::Maintenance,
-    }
 }
 
 pub(crate) fn create_writer_operation_from_commit(
@@ -243,7 +217,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::common::types::UniqueId;
-    use crate::connector::iceberg::commit::CommitOpKind;
     use crate::meta::repository::iceberg_operation::{
         IcebergOperationFailureKind, IcebergOperationKind, IcebergOperationNextAction,
         IcebergOperationState, IcebergOperationTarget,
@@ -322,7 +295,6 @@ mod tests {
                 ref_name: None,
             },
             attempt_id: "insert-10-20".to_string(),
-            commit_op_kind: CommitOpKind::FastAppend,
             base_snapshot_id: Some(42),
             base_snapshot_map: BTreeMap::from([("ice.sales.orders".to_string(), 42)]),
             created_at_ms: 1234,
@@ -347,26 +319,6 @@ mod tests {
         assert_eq!(request.base_snapshot_id, Some(42));
         assert_eq!(request.created_at_ms, 1234);
         assert!(request.staged_artifacts.is_empty());
-    }
-
-    #[test]
-    fn write_commit_rejects_operation_kind_commit_op_mismatch() {
-        let mut ctx = append_operation_context();
-        ctx.operation_kind = IcebergOperationKind::RowDelta;
-        let commit = WriteCommitInput {
-            write_id: id(11, 21),
-            writers: vec![writer_output(
-                0,
-                key(11, 21, 111, 211, 0),
-                "s3://w/a.parquet",
-            )],
-        };
-
-        let err = operation_request_from_write_commit(ctx, &commit)
-            .expect_err("mismatched operation kind must fail");
-
-        assert!(err.contains("does not match commit op"), "{err}");
-        assert!(err.contains("FastAppend"), "{err}");
     }
 
     #[test]

@@ -46,7 +46,7 @@ use novarocks_connector_iceberg::commit::{
     FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
 };
 
-use crate::connector::iceberg::fs_io;
+use novarocks_connector_iceberg::fs_io;
 use novarocks_fs::ObjectStoreConfig;
 use novarocks_fs::{FsLocation, FsScheme};
 
@@ -554,7 +554,7 @@ mod tests {
         use crate::connector::iceberg::commit::action::{CommitCtx, IcebergCommitAction};
         use crate::connector::iceberg::commit::collector::IcebergCommitCollector;
         use crate::connector::iceberg::commit::fast_append::FastAppendCommit;
-        use crate::connector::iceberg::commit::types::{CommitOpKind, WrittenFile};
+        use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
         use novarocks_connector_iceberg::iceberg::spec::{
             DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema,
             Struct, Type,
@@ -567,9 +567,9 @@ mod tests {
         let warehouse_uri = format!("file://{warehouse_path}");
 
         let file_io =
-            crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
+            novarocks_connector_iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
         let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
-            crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
                 warehouse_uri.clone(),
             ),
@@ -939,9 +939,9 @@ mod tests {
         let warehouse_uri = format!("file://{warehouse_path}");
 
         let file_io =
-            crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
+            novarocks_connector_iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
         let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
-            crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
                 warehouse_uri,
             ),

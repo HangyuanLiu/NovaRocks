@@ -8,7 +8,6 @@
 use arrow::datatypes::DataType;
 use novarocks_connector_iceberg::iceberg::TableIdent;
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::refresh::change_stream_write::{
     ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
@@ -21,6 +20,7 @@ use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::logical::LogicalPlanNode;
 use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_connector_iceberg::commit::CommitOpKind;
 
 pub(crate) struct JoinFirstRefreshLogicalInput {
     pub(crate) plan: LogicalPlanNode,

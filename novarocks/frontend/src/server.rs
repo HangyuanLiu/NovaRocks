@@ -24,6 +24,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use novarocks::common::app_config::NovaRocksConfig;
+use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
@@ -43,6 +44,12 @@ pub struct FrontendServerConfig {
     pub port_override: Option<u16>,
     /// Provider-owned FE control factories composed by the server root.
     pub connector_control_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+    /// Process-local, connector-neutral filesystem resources used by the
+    /// Phase 1 legacy Core control binding for FE scan planning.
+    pub connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
+    /// Application-owned storage observation composed by the server role.
+    /// Frontend and Core never decode provider table handles directly.
+    pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     /// Typed StateStore host input. The FE remains the owner of opening and
     /// shutting down this host; the server only supplies the composition data.
     pub state_store_host_config: Option<StateStoreHostConfig>,
@@ -51,6 +58,8 @@ pub struct FrontendServerConfig {
 fn standalone_open_services(
     system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog>,
     host: &FrontendApplicationHost,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
 ) -> novarocks::engine::StandaloneOpenServices {
     novarocks::engine::StandaloneOpenServices::new(
         host.execution_role(),
@@ -66,6 +75,7 @@ fn standalone_open_services(
         host.coordinator_report_endpoint_sink(),
         host.query_control_service(),
         host.connector_control_registry(),
+        host.connector_control_factory_resolver(),
         0,
     )
     .with_statistics_application(host.statistics_application_port())
@@ -74,6 +84,8 @@ fn standalone_open_services(
     .with_statistics_attempt_executor_sink(host.statistics_application_port())
     .with_mv_refresh_provider_activation_sink(host.mv_refresh_provider_activation_sink())
     .with_mv_background_engine_sink(host.mv_background_engine_sink())
+    .with_mv_storage_observation(mv_storage_observation)
+    .with_connector_file_planning_resources(connector_file_planning_resources)
 }
 
 /// Opens the frontend services once for an externally composed server. The
@@ -96,10 +108,14 @@ pub async fn open_frontend_application_for_server(
 /// Builds standalone services from a previously opened frontend host.
 pub fn standalone_open_services_for_server(
     host: &FrontendApplicationHost,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
 ) -> novarocks::engine::StandaloneOpenServices {
     standalone_open_services(
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
         host,
+        mv_storage_observation,
+        connector_file_planning_resources,
     )
 }
 
@@ -132,6 +148,8 @@ where
     let execution = resolve_frontend_execution_config(&config)?;
     let backend = cluster_backend_open_config(&config.config)?;
     let connector_factories = config.connector_control_factories.clone();
+    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
+    let connector_file_planning_resources = config.connector_file_planning_resources.clone();
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
@@ -149,7 +167,12 @@ where
         },
         move |host| {
             (
-                standalone_open_services(system_catalog, host),
+                standalone_open_services(
+                    system_catalog,
+                    host,
+                    Arc::clone(&mv_storage_observation),
+                    connector_file_planning_resources.clone(),
+                ),
                 host.dml_service(),
                 host.terminal_ingress(),
             )
@@ -220,6 +243,8 @@ where
     let execution = resolve_frontend_execution_config(&config)?;
     let backend = cluster_backend_open_config(&config.config)?;
     let connector_factories = config.connector_control_factories.clone();
+    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
+    let connector_file_planning_resources = config.connector_file_planning_resources.clone();
     run_frontend_server_with_signal_and_ports(
         config,
         signal,
@@ -237,7 +262,12 @@ where
         },
         move |host| {
             (
-                standalone_open_services(system_catalog, host),
+                standalone_open_services(
+                    system_catalog,
+                    host,
+                    Arc::clone(&mv_storage_observation),
+                    connector_file_planning_resources.clone(),
+                ),
                 host.dml_service(),
                 host.terminal_ingress(),
             )
@@ -589,6 +619,10 @@ mod tests {
             config_path: None,
             port_override: None,
             connector_control_factories: Vec::new(),
+            connector_file_planning_resources: None,
+            mv_storage_observation: Arc::new(
+                novarocks::mv::storage_observation::UnavailableMvStorageObservationPort,
+            ),
             state_store_host_config: None,
         }
     }
@@ -652,6 +686,8 @@ mod tests {
             standalone_open_services(
                 Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
                 &host,
+                Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+                None,
             ),
         )
         .expect("open engine with frontend-owned application services");

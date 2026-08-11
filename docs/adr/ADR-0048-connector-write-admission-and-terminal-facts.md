@@ -2,9 +2,9 @@
 id: ADR-0048
 title: "Connector write admission and durable terminal facts"
 domain: [provider-spi, frontend-dml]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0051
 date: 2026-08-09
 provenance:
   - "discussion: 2026-08-09 Connector write admission and terminal-write neutralization"

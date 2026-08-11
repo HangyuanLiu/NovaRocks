@@ -8,7 +8,7 @@ pub(crate) mod runtime_filter;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-    BackendServerConfig, run_backend_server, run_backend_server_until_shutdown,
+    BackendServerConfig, run_backend_server_until_shutdown, run_backend_server_until_signal,
 };
 pub use connector::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,

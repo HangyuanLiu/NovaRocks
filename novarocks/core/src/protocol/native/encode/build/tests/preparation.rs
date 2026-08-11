@@ -42,26 +42,12 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver for Sentinel
             })
         ));
         Ok(Some(
-            crate::query_execution::preparation::scan::ResolvedScanExecution::IcebergDelta(
-                crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
-                    runtime_plan:
-                        crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
-                            table_location: "s3://bucket/test_table".to_string(),
-                            data_columns: Vec::new(),
-                            change_files:
-                                vec![novarocks_connector_iceberg::delta::DeltaSourceFile {
-                                path: "s3://bucket/delta-added.parquet".to_string(),
-                                size: 128,
-                                role: novarocks_connector_iceberg::delta::DeltaSourceRole::DataFile,
-                                partition_spec_id: Some(0),
-                                partition_key: Some("Struct([])".to_string()),
-                                first_row_id: Some(100),
-                                data_sequence_number: Some(7),
-                                row_id_allow_list: None,
-                            }],
-                            delete_side: None,
-                        },
-                },
+            crate::query_execution::preparation::scan::ResolvedScanExecution::SealedConnectorScan(
+                crate::query_execution::preparation::scan::fixture_sealed_change_scan(
+                    "test_catalog",
+                    6,
+                    7,
+                ),
             ),
         ))
     }
@@ -124,7 +110,7 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
             .expect("delta opaque connector read")
             .splits
             .len(),
-        1
+        0
     );
 }
 

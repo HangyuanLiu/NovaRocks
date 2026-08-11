@@ -22,10 +22,10 @@ use super::commit::{
     CleanupAttempt, CleanupPathMapper, CommitServiceError, CowUpdateRewriteSet,
     IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
-use super::report::IcebergWriterReport;
-use super::write_contract::decode_write_receipt;
-use crate::connector::iceberg::commit::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::AbortLog;
+use novarocks_connector_iceberg::commit::report::IcebergWriterReport;
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::write_codec::decode_write_receipt;
 
 /// Convert a sealed provider commit decision into the application-neutral
 /// durable outcome consumed by the frontend lifecycle runner.
@@ -305,7 +305,7 @@ impl IcebergWriteCommitExecutor {
                     "validate change-stream connector staged report: {error}"
                 ))
             })?;
-            let reports = super::write_contract::decode_writer_reports(
+            let reports = novarocks_connector_iceberg::write_codec::decode_writer_reports(
                 staged.payload(),
                 self.table.metadata(),
             )

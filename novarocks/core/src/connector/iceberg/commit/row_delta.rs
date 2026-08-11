@@ -57,8 +57,8 @@ use super::helpers::{
     read_snapshot_manifest_list, required_target_ref_snapshot_id, snapshot_summary,
     target_ref_snapshot_id, write_manifest_list,
 };
-use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
 
 pub struct RowDeltaCommit;
 
@@ -341,7 +341,7 @@ async fn write_delete_manifest(
         let df = written_file_to_iceberg_data_file_minimal(f)?;
         // Newly-introduced position-delete files must be recorded with
         // `ManifestStatus::Added` so downstream readers (e.g., the
-        // `plan_changes` / `collect_files` lineage walk) include them in
+        // provider change-window planning / `collect_files` lineage walk) include them in
         // the delete-bearing change set.  iceberg-rust's `add_delete_file`
         // helper sets `status=Deleted` — that variant is reserved for
         // marking files REMOVED in compaction-style snapshots, not for

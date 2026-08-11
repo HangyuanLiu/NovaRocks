@@ -21,31 +21,251 @@ use std::time::Duration;
 
 use anyhow::Context;
 use novarocks::common::app_config::NovaRocksConfig;
-use novarocks::connector::iceberg::provider::{IcebergConnectorInstaller, IcebergReadBinding};
+use novarocks::mv::persistence::descriptor::MvDescriptorV1;
+use novarocks::mv::persistence::schema::{
+    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+};
+use novarocks::mv::storage_observation::{
+    MvLakePackageObservation, MvLakePublication, MvObservedTargetField, MvPublishedBaseFact,
+    MvPublishedLakeFacts, MvPublishedRefreshTechnique, MvSchemaValidationObservation,
+    MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
+    MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
+};
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
+use novarocks_connector_iceberg::resources::IcebergExecutionResources;
+use novarocks_connector_iceberg::storage_inspector::{
+    IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionTransform,
+    IcebergStorageRefreshTechnique,
+};
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
-use novarocks_fs::{TokioFileIoRuntime, TokioFileTaskSpawner};
-use novarocks_spi::connector::ConnectorExecutionInstaller;
+use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
+use novarocks_spi::connector::{
+    ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionInstaller, ConnectorRequestContext, ConnectorTableMetadata,
+};
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct IcebergMvStorageObservationAdapter {
+    inspector: IcebergStorageInspector,
+}
+
+impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
+    fn observe_created_target(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvTargetCreationObservation, ConnectorError> {
+        let observed = self
+            .inspector
+            .observe_created_target(exact_lease, metadata, context)?;
+        let fields = observed
+            .fields
+            .into_iter()
+            .map(|field| MvObservedTargetField {
+                field_id: field.field_id,
+                name: field.name,
+                type_signature: field.type_signature,
+                nullable: field.nullable,
+            })
+            .collect();
+        let partition = MvPartitionContract {
+            target_spec_id: observed.partition.target_spec_id,
+            fields: observed
+                .partition
+                .fields
+                .into_iter()
+                .map(|field| MvPartitionFieldContract {
+                    partition_field_id: field.partition_field_id,
+                    partition_field_name: field.partition_field_name,
+                    source_target_field_id: field.source_target_field_id,
+                    source_column_name: field.source_column_name,
+                    transform: match field.transform {
+                        IcebergStoragePartitionTransform::Identity => {
+                            MvPartitionTransformContract::Identity
+                        }
+                        IcebergStoragePartitionTransform::Year => {
+                            MvPartitionTransformContract::Year
+                        }
+                        IcebergStoragePartitionTransform::Month => {
+                            MvPartitionTransformContract::Month
+                        }
+                        IcebergStoragePartitionTransform::Day => MvPartitionTransformContract::Day,
+                        IcebergStoragePartitionTransform::Hour => {
+                            MvPartitionTransformContract::Hour
+                        }
+                        IcebergStoragePartitionTransform::Bucket { num_buckets } => {
+                            MvPartitionTransformContract::Bucket { num_buckets }
+                        }
+                        IcebergStoragePartitionTransform::Truncate { width } => {
+                            MvPartitionTransformContract::Truncate { width }
+                        }
+                        IcebergStoragePartitionTransform::Void => {
+                            MvPartitionTransformContract::Void
+                        }
+                    },
+                })
+                .collect(),
+        };
+        MvTargetCreationObservation::try_new(
+            metadata.identity.clone(),
+            observed.table_uuid,
+            observed.schema_id,
+            fields,
+            partition,
+        )
+    }
+
+    fn observe_schema_validation(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvSchemaValidationObservation, ConnectorError> {
+        let observed =
+            self.inspector
+                .observe_created_target(exact_lease, metadata, context.clone())?;
+        let fields = observed
+            .fields
+            .into_iter()
+            .map(|field| MvObservedTargetField {
+                field_id: field.field_id,
+                name: field.name,
+                type_signature: field.type_signature,
+                nullable: field.nullable,
+            })
+            .collect();
+        let partition = MvSchemaValidationPartitionContract::new(
+            observed.partition.target_spec_id,
+            observed
+                .partition
+                .fields
+                .into_iter()
+                .map(|field| {
+                    MvSchemaValidationPartitionField::new(
+                        field.partition_field_id,
+                        field.partition_field_name,
+                        field.source_target_field_id,
+                        field.source_column_name,
+                        match field.transform {
+                            IcebergStoragePartitionTransform::Identity => {
+                                MvSchemaValidationPartitionTransform::Identity
+                            }
+                            IcebergStoragePartitionTransform::Year => {
+                                MvSchemaValidationPartitionTransform::Year
+                            }
+                            IcebergStoragePartitionTransform::Month => {
+                                MvSchemaValidationPartitionTransform::Month
+                            }
+                            IcebergStoragePartitionTransform::Day => {
+                                MvSchemaValidationPartitionTransform::Day
+                            }
+                            IcebergStoragePartitionTransform::Hour => {
+                                MvSchemaValidationPartitionTransform::Hour
+                            }
+                            IcebergStoragePartitionTransform::Bucket { num_buckets } => {
+                                MvSchemaValidationPartitionTransform::Bucket { num_buckets }
+                            }
+                            IcebergStoragePartitionTransform::Truncate { width } => {
+                                MvSchemaValidationPartitionTransform::Truncate { width }
+                            }
+                            IcebergStoragePartitionTransform::Void => {
+                                MvSchemaValidationPartitionTransform::Void
+                            }
+                        },
+                    )
+                })
+                .collect(),
+        );
+        MvSchemaValidationObservation::try_new(
+            observed.table_uuid,
+            observed.schema_id,
+            observed.format_v3,
+            observed.explicit_row_lineage_enabled,
+            fields,
+            partition,
+            &context,
+        )
+    }
+
+    fn observe_lake_package(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
+        let Some(observed) = self
+            .inspector
+            .observe_lake_package(exact_lease, metadata, context)?
+        else {
+            return Ok(None);
+        };
+        let properties = observed
+            .descriptor_properties
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let descriptor = MvDescriptorV1::from_storage_properties(&properties).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode Iceberg MV storage descriptor: {error}"),
+            )
+        })?;
+        let publication = match observed.publication {
+            IcebergStorageLakePublication::NeverPublished => MvLakePublication::NeverPublished,
+            IcebergStorageLakePublication::Published(facts) => {
+                let technique = match facts.technique {
+                    IcebergStorageRefreshTechnique::Incremental => {
+                        MvPublishedRefreshTechnique::Incremental
+                    }
+                    IcebergStorageRefreshTechnique::Full => MvPublishedRefreshTechnique::Full,
+                    IcebergStorageRefreshTechnique::MetadataOnly => {
+                        MvPublishedRefreshTechnique::MetadataOnly
+                    }
+                };
+                let bases = facts
+                    .bases
+                    .into_iter()
+                    .map(|base| MvPublishedBaseFact {
+                        table_fqn: base.table_fqn,
+                        table_uuid: base.table_uuid,
+                        from_snapshot: base.from_snapshot,
+                        to_snapshot: base.to_snapshot,
+                    })
+                    .collect();
+                MvLakePublication::Published(MvPublishedLakeFacts::try_new(
+                    facts.target_snapshot_id,
+                    facts.refresh_id,
+                    facts.mv_id,
+                    facts.token,
+                    technique,
+                    bases,
+                    facts.definition_fingerprint,
+                    facts.rows,
+                    facts.provenance_hash,
+                    facts.waterline_hash,
+                )?)
+            }
+        };
+        MvLakePackageObservation::try_new(metadata.identity.clone(), descriptor, publication)
+            .map(Some)
+    }
+}
+
 pub fn compose_backend_execution_installers(
     config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>>> {
-    let object_store = config.connector.object_store_config().map_err(|error| {
-        anyhow::anyhow!("resolve connector startup object-store binding: {error}")
-    })?;
-    let runtime = novarocks::runtime::global_async_runtime::data_runtime_handle()
-        .map_err(|error| anyhow::anyhow!("resolve data runtime for Iceberg installer: {error}"))?;
-    let binding = IcebergReadBinding::new(
-        object_store,
-        std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
-    );
+    let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
     let iceberg_installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
-        vec![std::sync::Arc::new(IcebergConnectorInstaller::new(binding))];
+        vec![std::sync::Arc::new(IcebergConnectorInstaller::new(
+            iceberg_resources,
+        ))];
     let expected = novarocks_spi::connector::ConnectorProviderId::parse(
         novarocks_connector_iceberg::PROVIDER_ID,
     )
@@ -65,6 +285,42 @@ pub fn compose_backend_execution_installers(
     }
     installers.extend(iceberg_installers);
     Ok(installers)
+}
+
+pub fn compose_frontend_control_factories() -> Vec<std::sync::Arc<dyn ConnectorControlFactory>> {
+    // SPI-5EF Phase 1 keeps the legacy Core Iceberg control binding as the
+    // sole production FE authority. The provider factory remains available
+    // for provider-local conformance tests and will be installed only by the
+    // follow-up atomic factory/owner cut.
+    Vec::new()
+}
+
+pub fn compose_iceberg_execution_resources(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<IcebergExecutionResources> {
+    Ok(IcebergExecutionResources::new(
+        IcebergReadBinding::from_resources(compose_connector_file_planning_resources(
+            config,
+            runtime.clone(),
+        )?),
+        runtime,
+    ))
+}
+
+pub fn compose_connector_file_planning_resources(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<FsAccessResources> {
+    let object_store = config.connector.object_store_config().map_err(|error| {
+        anyhow::anyhow!("resolve connector startup object-store binding: {error}")
+    })?;
+    Ok(FsAccessResources::new(
+        object_store,
+        FsAccessResolver::new(),
+        std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
+    ))
 }
 
 pub fn state_store_host_config(
@@ -94,6 +350,7 @@ pub fn run_all_in_one(
         config,
         config_path,
         port_override,
+        runtime.handle().clone(),
         async {
             tokio::signal::ctrl_c()
                 .await
@@ -106,22 +363,30 @@ async fn run_all_in_one_until<F>(
     config: NovaRocksConfig,
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
+    runtime: tokio::runtime::Handle,
     shutdown: F,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = Result<(), String>> + Send,
 {
+    let connector_control_factories = compose_frontend_control_factories();
+    let connector_file_planning_resources = Some(compose_connector_file_planning_resources(
+        &config,
+        runtime.clone(),
+    )?);
     let frontend_config = FrontendServerConfig {
         config: config.clone(),
         config_path: config_path.clone(),
         port_override,
-        connector_control_factories: Vec::new(),
+        connector_control_factories,
+        connector_file_planning_resources,
+        mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_host_config: state_store_host_config(&config),
     };
     let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
         .await
         .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
-    let execution_installers = compose_backend_execution_installers(&config)?;
+    let execution_installers = compose_backend_execution_installers(&config, runtime)?;
     let mut backend = match BackendApplicationHost::open_with_terminal_ingress(
         BackendServerConfig {
             config: config.clone(),
@@ -140,7 +405,11 @@ where
     };
     let endpoint = backend.connectable_native_endpoint();
     let dml = frontend.dml_service();
-    let mut services = novarocks_frontend::standalone_open_services_for_server(&frontend);
+    let mut services = novarocks_frontend::standalone_open_services_for_server(
+        &frontend,
+        std::sync::Arc::clone(&frontend_config.mv_storage_observation),
+        frontend_config.connector_file_planning_resources.clone(),
+    );
     services
         .backend_topology
         .add_backend(endpoint)
@@ -272,7 +541,10 @@ fn combine_primary_and_cleanup(
 
 #[cfg(test)]
 mod tests {
-    use super::combine_primary_and_cleanup;
+    use super::{
+        combine_primary_and_cleanup, compose_backend_execution_installers,
+        compose_frontend_control_factories,
+    };
 
     #[test]
     fn primary_failure_remains_primary_when_all_cleanup_steps_fail() {
@@ -288,5 +560,30 @@ mod tests {
         assert!(error.contains("server cleanup failed"), "{error}");
         assert!(error.contains("frontend cleanup failed"), "{error}");
         assert!(error.contains("backend cleanup failed"), "{error}");
+    }
+
+    #[test]
+    fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let config = novarocks::common::app_config::NovaRocksConfig::default();
+        let factories = compose_frontend_control_factories();
+        let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
+            .expect("backend installers");
+        let iceberg = novarocks_spi::connector::ConnectorProviderId::parse(
+            novarocks_connector_iceberg::PROVIDER_ID,
+        )
+        .expect("provider ID");
+
+        assert!(
+            factories.is_empty(),
+            "Phase 1 must keep legacy Core control as the sole FE authority"
+        );
+        assert_eq!(
+            installers
+                .iter()
+                .filter(|installer| installer.provider_id() == &iceberg)
+                .count(),
+            1
+        );
     }
 }

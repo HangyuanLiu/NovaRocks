@@ -68,8 +68,8 @@ pub(crate) struct BaseTableDescriptor {
 pub(crate) fn validate_ivm_primary_key(
     pk_columns: &[String],
     base: &BaseTableDescriptor,
-) -> Result<(), crate::connector::iceberg::changes::ChangeError> {
-    use crate::connector::iceberg::changes::ChangeError;
+) -> Result<(), novarocks_connector_iceberg::delta::ChangeError> {
+    use novarocks_connector_iceberg::delta::ChangeError;
 
     if base.format_version != 2 && base.format_version != 3 {
         return Err(ChangeError::IcebergFormatUnsupported {

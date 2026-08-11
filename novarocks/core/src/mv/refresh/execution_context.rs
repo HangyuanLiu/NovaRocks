@@ -687,7 +687,7 @@ pub(crate) fn collect_base_catalog_entries(
 
 #[cfg(test)]
 fn data_file_with_stats_to_info(
-    file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    file: novarocks_connector_iceberg::manifest::DataFileWithStats,
 ) -> IcebergDataFileInfo {
     IcebergDataFileInfo {
         path: file.path,
@@ -805,7 +805,7 @@ pub(crate) mod tests_support {
             _warehouse: warehouse,
             target_entry,
             iceberg_catalog,
-            target_table: loaded.table,
+            target_table: loaded.into_table(),
             target_snapshot_id,
         }
     }
@@ -1261,9 +1261,12 @@ pub(crate) mod tests_support {
 
         let mut base_catalog_entries = BTreeMap::new();
         base_catalog_entries.insert("ice".to_string(), base_entry);
-        let target_bindings =
-            IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, loaded.table)
-                .expect("join projection target bindings");
+        let target_bindings = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            target_entry,
+            loaded.into_table(),
+        )
+        .expect("join projection target bindings");
 
         (
             warehouse,

@@ -81,22 +81,22 @@ impl From<CatalogAttachmentPropertiesAvro> for CatalogAttachmentProperties {
 }
 
 impl CatalogAttachmentRepository {
+    pub(crate) fn create(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        catalog: &str,
+        properties: CatalogAttachmentProperties,
+    ) -> RepositoryResult<()> {
+        put_attachment(txn, catalog, properties, ExpectedRevision::NotExists)
+    }
+
     pub(crate) fn upsert(
         &self,
         txn: &mut dyn MetaWriteTxn,
         catalog: &str,
         properties: CatalogAttachmentProperties,
     ) -> RepositoryResult<()> {
-        txn.put(MetaRecordPut::new(
-            attachment_key(catalog)?,
-            MetaRecordKind::new(ATTACHMENT_KIND)?,
-            ExpectedRevision::Any,
-            encode_record_payload(
-                ATTACHMENT_KIND,
-                &CatalogAttachmentPropertiesAvro::from(&properties),
-            )?,
-        ))?;
-        Ok(())
+        put_attachment(txn, catalog, properties, ExpectedRevision::Any)
     }
 
     pub(crate) fn exists(&self, txn: &dyn MetaReadTxn, catalog: &str) -> RepositoryResult<bool> {
@@ -125,6 +125,38 @@ impl CatalogAttachmentRepository {
         txn.delete(&attachment_key(catalog)?, ExpectedRevision::Any)?;
         Ok(())
     }
+
+    pub(crate) fn delete_current(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        catalog: &str,
+    ) -> RepositoryResult<bool> {
+        let key = attachment_key(catalog)?;
+        let Some(record) = txn.get(&key)? else {
+            return Ok(false);
+        };
+        decode_attachment_properties(&record)?;
+        txn.delete(&key, ExpectedRevision::Exact(record.revision))?;
+        Ok(true)
+    }
+}
+
+fn put_attachment(
+    txn: &mut dyn MetaWriteTxn,
+    catalog: &str,
+    properties: CatalogAttachmentProperties,
+    expected: ExpectedRevision,
+) -> RepositoryResult<()> {
+    txn.put(MetaRecordPut::new(
+        attachment_key(catalog)?,
+        MetaRecordKind::new(ATTACHMENT_KIND)?,
+        expected,
+        encode_record_payload(
+            ATTACHMENT_KIND,
+            &CatalogAttachmentPropertiesAvro::from(&properties),
+        )?,
+    ))?;
+    Ok(())
 }
 
 fn decode_attachment_properties(
@@ -249,6 +281,62 @@ mod tests {
                 .exists(read.as_ref(), "WAREHOUSE")
                 .expect("second exists")
         );
+    }
+
+    #[test]
+    fn attachment_create_is_absent_cas_and_delete_is_exact_revision() {
+        let dir = tempfile::tempdir().expect("metadata dir");
+        let provider =
+            SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite")).expect("open provider");
+        let repository = CatalogAttachmentRepository;
+
+        let mut write = provider
+            .begin_write("create attachment")
+            .expect("write txn");
+        repository
+            .create(
+                write.as_mut(),
+                "ice",
+                CatalogAttachmentProperties {
+                    properties: vec![("type".into(), "iceberg".into())],
+                },
+            )
+            .expect("create attachment");
+        write.commit().expect("commit attachment");
+
+        let mut duplicate = provider
+            .begin_write("duplicate attachment")
+            .expect("write txn");
+        repository
+            .create(
+                duplicate.as_mut(),
+                "ICE",
+                CatalogAttachmentProperties {
+                    properties: vec![("type".into(), "iceberg".into())],
+                },
+            )
+            .expect_err("absent CAS must reject an existing attachment");
+        duplicate.abort().expect("abort duplicate create");
+
+        let mut delete = provider
+            .begin_write("delete current attachment")
+            .expect("write txn");
+        assert!(
+            repository
+                .delete_current(delete.as_mut(), "ICE")
+                .expect("delete current")
+        );
+        delete.commit().expect("commit delete");
+
+        let mut delete = provider
+            .begin_write("delete missing attachment")
+            .expect("write txn");
+        assert!(
+            !repository
+                .delete_current(delete.as_mut(), "ice")
+                .expect("delete missing")
+        );
+        delete.commit().expect("commit no-op delete");
     }
 
     #[test]

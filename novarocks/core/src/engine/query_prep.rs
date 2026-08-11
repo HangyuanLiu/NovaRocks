@@ -33,6 +33,7 @@ use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergFileForQuery {
     pub(crate) path: String,
@@ -46,6 +47,7 @@ pub(crate) struct IcebergFileForQuery {
     pub(crate) row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
+#[cfg(test)]
 pub(crate) fn delete_temp_iceberg_file_for_query(
     path: String,
     size: i64,
@@ -396,7 +398,7 @@ pub(crate) fn external_schema_columns_for_statement(
     }
 
     let materialization =
-        crate::connector::iceberg::provider::load_schema_materialization_with_lease(
+        crate::engine::query_planning::catalog_materializer::load_connector_table_materialization_with_lease(
             state.connector_control.as_ref(),
             crate::connector::connector_request_context(
                 None,
@@ -468,7 +470,7 @@ pub(crate) fn build_iceberg_delta_table_def_with_files(
     let mut frozen_files = data_files
         .iter()
         .cloned()
-        .map(crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+        .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
         .collect::<Vec<_>>();
     let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         entry,
@@ -485,11 +487,11 @@ pub(crate) fn build_iceberg_delta_table_def_with_files(
 #[cfg(test)]
 fn iceberg_files_for_query_to_stats(
     data_files: Vec<IcebergFileForQuery>,
-) -> Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats> {
+) -> Vec<novarocks_connector_iceberg::manifest::DataFileWithStats> {
     data_files
         .into_iter()
         .map(
-            |file| crate::connector::iceberg::catalog::registry::DataFileWithStats {
+            |file| novarocks_connector_iceberg::manifest::DataFileWithStats {
                 path: file.path,
                 size: file.size,
                 record_count: file.record_count,
@@ -635,7 +637,7 @@ mod tests {
             .split("/// Returns true if `table_name`")
             .next()
             .expect("statement schema lookup boundary");
-        assert!(lookup.contains("load_schema_materialization_with_lease"));
+        assert!(lookup.contains("load_connector_table_materialization_with_lease"));
         assert!(!lookup.contains("register("));
         assert!(!lookup.contains("drop_local_table_registration_if_exists"));
     }

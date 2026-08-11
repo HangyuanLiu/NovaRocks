@@ -39,7 +39,7 @@ use novarocks_connector_iceberg::iceberg::transaction::{
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use novarocks_execution::exec::row_position::{
+use novarocks_connector_iceberg::row_lineage_synth::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
@@ -50,8 +50,8 @@ use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
 use super::overwrite::{build_minimal_data_file, write_added_data_manifest};
-use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
 
 pub struct RewriteDataFilesCommit;
 

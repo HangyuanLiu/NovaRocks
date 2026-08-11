@@ -17,6 +17,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use novarocks_spi::connector::{
+    ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
+};
 
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
@@ -79,20 +84,45 @@ pub(crate) fn reject_if_iceberg_mv_table(
         return Ok(());
     }
 
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&target.catalog)?
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
+    let exact_lease =
+        ConnectorControlResolver::acquire_current(state.connector_control.as_ref(), &instance_id)
+            .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
+    let context =
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+    let identity = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
     };
-    entry.invalidate_table_cache(&target.namespace, &target.table);
-    let loaded = crate::connector::iceberg::catalog::registry::load_table(
-        &entry,
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        context.clone(),
         &target.namespace,
         &target.table,
+        ConnectorTableResolution::StrictBaseTable,
     )?;
-    reject_if_iceberg_mv_properties(target, loaded.table.metadata().properties(), mutation)
+    if metadata.identity != identity {
+        return Err(
+            "connector loaded a different table while checking the MV mutation guard".to_string(),
+        );
+    }
+    if state
+        .mv_storage_observation
+        .observe_lake_package(&exact_lease, &metadata, context)
+        .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
+        .is_some()
+    {
+        return Err(format!(
+            "table {}.{}.{} is a materialized view; {}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            mutation.guidance()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

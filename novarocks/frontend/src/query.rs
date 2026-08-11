@@ -1306,8 +1306,6 @@ mod tests {
     use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_catalog::schema::ColumnDef;
 
-    use novarocks::connector::iceberg::commit::{CommitOutcome, CommitServiceError};
-
     #[derive(Default)]
     struct RecordingCoreCommand {
         calls: AtomicUsize,
@@ -1334,22 +1332,6 @@ mod tests {
             _prepared: &dyn MutationPrepared,
         ) -> Result<MutationStageOutcome, String> {
             unreachable!("rejected mutation must not stage")
-        }
-
-        fn abort_mutation(
-            &self,
-            _prepared: &dyn MutationPrepared,
-            _abort: &dyn MutationAbort,
-        ) -> Result<CommitOutcome, CommitServiceError> {
-            unreachable!("rejected mutation must not abort")
-        }
-
-        fn commit_mutation(
-            &self,
-            _prepared: &dyn MutationPrepared,
-            _commit: &dyn MutationCommit,
-        ) -> Result<CommitOutcome, CommitServiceError> {
-            unreachable!("rejected mutation must not commit")
         }
 
         fn finalize_mutation(&self, _prepared: &dyn MutationPrepared) -> Result<(), String> {
@@ -1381,7 +1363,6 @@ mod tests {
                     table: "t".to_string(),
                     target_ref: "main".to_string(),
                     attempt_id: "test-delete".to_string(),
-                    commit_op_kind: novarocks::connector::iceberg::commit::CommitOpKind::RowDelta,
                     base_snapshot_id: None,
                 },
                 handle: Arc::new(TestDeletePrepared),
@@ -1390,14 +1371,6 @@ mod tests {
 
         fn run_delete(&self, _prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
             Ok(DeleteWriteReport::NoOp)
-        }
-
-        fn commit_delete(
-            &self,
-            _prepared: &dyn DeletePrepared,
-            _commit: &dyn DeleteCommit,
-        ) -> Result<CommitOutcome, CommitServiceError> {
-            unreachable!("no-op DELETE must not commit")
         }
 
         fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
@@ -1492,16 +1465,6 @@ mod tests {
             _prepared: &dyn IcebergPreparedInsert,
         ) -> Result<IcebergWriteReport, String> {
             Err("unexpected Iceberg INSERT".to_string())
-        }
-
-        fn commit_iceberg_write(
-            &self,
-            _prepared: &dyn IcebergPreparedInsert,
-            _commit: &dyn IcebergInsertCommit,
-        ) -> Result<CommitOutcome, CommitServiceError> {
-            Err(CommitServiceError::invalid_input(
-                "unexpected Iceberg INSERT".to_string(),
-            ))
         }
 
         fn finalize_iceberg_write(

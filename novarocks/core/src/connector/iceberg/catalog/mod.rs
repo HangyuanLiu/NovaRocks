@@ -20,7 +20,6 @@
 
 pub(crate) mod add_files;
 pub(crate) mod backend;
-pub(crate) mod hadoop_catalog;
 pub(crate) mod registry;
 pub(crate) mod schema_update;
 pub(crate) mod views;
@@ -28,11 +27,11 @@ pub(crate) mod views;
 // Re-export the same surface the previous `standalone::iceberg::*` module
 // offered, so callers only need to update the module prefix, not each
 // imported symbol.
+pub(crate) use backend::hidden_internal_column_names_from_metadata;
 #[cfg(test)]
 pub(crate) use backend::{
     build_iceberg_table_def_for_delta_scan, build_iceberg_table_def_with_files,
 };
-pub(crate) use backend::{hidden_internal_column_names_from_metadata, row_lineage_enabled};
 pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace,
     list_namespaces, load_table, namespace_exists, register_existing_table,

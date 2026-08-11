@@ -54,10 +54,9 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::mv::iceberg_storage_observation::IcebergMvStorageObservationAdapter;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvStorageObservation,
+    MvLakePackageObservation, MvLakePublication, MvStorageObservationPort,
 };
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::procedure::CallProcedureStmt;
@@ -195,12 +194,17 @@ fn execute_request_with_context(
         namespace: Arc::from(req.namespace.as_str()),
         table: Arc::from(req.mv.as_str()),
     };
-    let observer = IcebergMvStorageObservationAdapter::new(
-        Arc::clone(&state.iceberg_catalogs),
-        Arc::clone(&state.connector_control),
-    );
-    let package = observer
-        .observe_lake_package(&exact_lease, &table, connector_context)
+    let loaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &table.namespace,
+        &table.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )
+    .map_err(|error| format!("load stateless rebuild table metadata: {error}"))?;
+    let package = state
+        .mv_storage_observation
+        .observe_lake_package(&exact_lease, &loaded_table, connector_context)
         .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
         .ok_or_else(|| {
             format!(

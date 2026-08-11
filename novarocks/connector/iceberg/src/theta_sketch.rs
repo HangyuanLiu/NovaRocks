@@ -34,7 +34,10 @@
 use std::collections::BTreeSet;
 use std::hash::Hash;
 
+use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::datatypes::DataType;
 use datasketches::theta::ThetaSketch;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 // -- Compact binary format constants ------------------------------------------
 
@@ -379,9 +382,186 @@ impl ThetaSketchHandle {
     }
 }
 
+/// Compute one Theta sketch for every primitive Arrow column carrying an
+/// Iceberg parquet field id.
+///
+/// The value-to-hash mapping is part of the persisted Puffin NDV format:
+/// integers, dates, timestamps, and decimals use their native values;
+/// booleans use `0`/`1`; strings use their UTF-8 bytes; and all NaN values use
+/// one canonical IEEE representation. Keep this mapping in the provider with
+/// the Theta/Puffin implementation rather than in an execution owner.
+pub fn compute_theta_sketches_for_batch(
+    batch: &RecordBatch,
+) -> Option<std::collections::HashMap<i32, ThetaSketchHandle>> {
+    collect_theta_sketches(batch)
+}
+
+/// Build per-field Theta sketches from a batch that has no parquet field-id
+/// metadata, using a lower-cased column-name to field-id map.
+pub fn collect_theta_sketches_by_name(
+    batch: &RecordBatch,
+    name_to_field_id: &std::collections::HashMap<String, i32>,
+) -> std::collections::HashMap<i32, ThetaSketchHandle> {
+    const LG_K: u8 = 12;
+    let schema = batch.schema();
+    let mut sketches = std::collections::HashMap::new();
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let Some(&field_id) = name_to_field_id.get(&field.name().to_lowercase()) else {
+            continue;
+        };
+        let mut sketch = ThetaSketchHandle::new(LG_K);
+        if feed_array_into_sketch(&mut sketch, field.data_type(), batch.column(col_idx)) {
+            sketches.insert(field_id, sketch);
+        }
+    }
+    sketches
+}
+
+fn collect_theta_sketches(
+    batch: &RecordBatch,
+) -> Option<std::collections::HashMap<i32, ThetaSketchHandle>> {
+    // Apache DataSketches Java/Spark default lg_k = 12 (k = 4096, ~1.5% error).
+    const LG_K: u8 = 12;
+
+    let schema = batch.schema();
+    let mut sketches = std::collections::HashMap::new();
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let Some(field_id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
+            continue;
+        };
+        let Ok(field_id) = field_id_str.parse::<i32>() else {
+            continue;
+        };
+        let mut sketch = ThetaSketchHandle::new(LG_K);
+        if feed_array_into_sketch(&mut sketch, field.data_type(), batch.column(col_idx)) {
+            sketches.insert(field_id, sketch);
+        }
+    }
+    (!sketches.is_empty()).then_some(sketches)
+}
+
+fn feed_array_into_sketch(
+    sketch: &mut ThetaSketchHandle,
+    data_type: &DataType,
+    array: &ArrayRef,
+) -> bool {
+    use arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use arrow::datatypes::TimeUnit;
+
+    let mut updated = false;
+    macro_rules! feed_int {
+        ($ty:ty) => {{
+            if let Some(values) = array.as_any().downcast_ref::<$ty>() {
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        sketch.update(values.value(row));
+                        updated = true;
+                    }
+                }
+            }
+        }};
+    }
+
+    match data_type {
+        DataType::Boolean => {
+            if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        sketch.update(u8::from(values.value(row)));
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Int8 => feed_int!(Int8Array),
+        DataType::Int16 => feed_int!(Int16Array),
+        DataType::Int32 => feed_int!(Int32Array),
+        DataType::Int64 => feed_int!(Int64Array),
+        DataType::Date32 => feed_int!(Date32Array),
+        DataType::Date64 => feed_int!(Date64Array),
+        DataType::Float32 => {
+            if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        let value = values.value(row);
+                        sketch.update(if value.is_nan() {
+                            f32::NAN.to_bits()
+                        } else {
+                            value.to_bits()
+                        });
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Float64 => {
+            if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        let value = values.value(row);
+                        sketch.update(if value.is_nan() {
+                            f64::NAN.to_bits()
+                        } else {
+                            value.to_bits()
+                        });
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Decimal128(_, _) => {
+            if let Some(values) = array.as_any().downcast_ref::<Decimal128Array>() {
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        sketch.update(values.value(row));
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Utf8 => {
+            if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        sketch.update(values.value(row));
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::LargeUtf8 => {
+            if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+                for row in 0..values.len() {
+                    if !values.is_null(row) {
+                        sketch.update(values.value(row));
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => feed_int!(TimestampSecondArray),
+            TimeUnit::Millisecond => feed_int!(TimestampMillisecondArray),
+            TimeUnit::Microsecond => feed_int!(TimestampMicrosecondArray),
+            TimeUnit::Nanosecond => feed_int!(TimestampNanosecondArray),
+        },
+        _ => {}
+    }
+    updated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int32Array};
+    use arrow::datatypes::{Field, Schema};
 
     #[test]
     fn empty_sketch_estimate_is_zero() {
@@ -401,6 +581,68 @@ mod tests {
             (9_500.0..10_500.0).contains(&est),
             "estimate {est} out of expected range for 10k distinct values"
         );
+    }
+
+    #[test]
+    fn batch_collection_uses_field_ids_and_canonicalizes_nan() {
+        let mut id_metadata = HashMap::new();
+        id_metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "7".to_string());
+        let mut invalid_metadata = HashMap::new();
+        invalid_metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "invalid".to_string());
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("measure", DataType::Float64, true).with_metadata(id_metadata),
+            Field::new("ignored_binary", DataType::Binary, true),
+            Field::new("ignored_bad_id", DataType::Int32, true).with_metadata(invalid_metadata),
+        ]));
+        let first_nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        let second_nan = f64::from_bits(0x7fff_ffff_ffff_ffff);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(Float64Array::from(vec![
+                    Some(first_nan),
+                    Some(second_nan),
+                    None,
+                    Some(1.0),
+                ])) as ArrayRef,
+                std::sync::Arc::new(BinaryArray::from(vec![Some(b"ignored".as_slice()); 4]))
+                    as ArrayRef,
+                std::sync::Arc::new(Int32Array::from(vec![Some(1); 4])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        let sketches = compute_theta_sketches_for_batch(&batch).expect("field-id sketch");
+        assert_eq!(sketches.len(), 1);
+        let mut expected = ThetaSketchHandle::new(12);
+        expected.update(f64::NAN.to_bits());
+        expected.update(f64::NAN.to_bits());
+        expected.update(1.0_f64.to_bits());
+        assert_eq!(
+            sketches.get(&7).expect("id 7").serialize(),
+            expected.serialize()
+        );
+    }
+
+    #[test]
+    fn batch_collection_by_name_lowercases_names() {
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![Field::new(
+                "MiXeD",
+                DataType::Int32,
+                true,
+            )])),
+            vec![std::sync::Arc::new(Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(2),
+            ]))],
+        )
+        .expect("batch");
+        let sketches =
+            collect_theta_sketches_by_name(&batch, &HashMap::from([("mixed".to_string(), 9)]));
+        assert_eq!(sketches.len(), 1);
+        assert!(sketches.contains_key(&9));
     }
 
     #[test]

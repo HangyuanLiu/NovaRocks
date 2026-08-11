@@ -18,9 +18,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use bytes::Bytes;
 use novarocks_connector_iceberg::commit::AbortLog;
+use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_connector_iceberg::iceberg::{
     Catalog, ErrorKind, TableCommit, TableRequirement, TableUpdate,
 };
@@ -39,7 +39,6 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization,
 };
 
-use super::catalog::backend::iceberg_schema_def_for_codegen;
 use super::catalog::registry::{
     IcebergCatalogEntry, RestStagedPrepareFailure, RestStagedTableCreate, block_on_iceberg,
     prepare_rest_staged_table,
@@ -48,6 +47,7 @@ use super::write_contract::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 use super::write_service::IcebergWriteServiceRegistry;
+use novarocks_connector_iceberg::schema_facts::iceberg_schema_def;
 
 const EVIDENCE_VERSION: u16 = 1;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
@@ -68,7 +68,7 @@ fn staged_data_sink_spec(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: metadata.current_schema_id(),
         location: metadata.location().to_string(),
-        schema: iceberg_schema_def_for_codegen(metadata.current_schema()),
+        schema: iceberg_schema_def(metadata.current_schema()),
         serialized_metadata: Some(
             serde_json::to_string(metadata)
                 .map_err(|error| internal(format!("serialize staged table metadata: {error}")))?,
@@ -390,7 +390,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let entry = &self.entry;
         if !matches!(
             entry.kind,
-            super::catalog::registry::IcebergCatalogKind::Rest
+            novarocks_connector_iceberg::catalog_config::IcebergCatalogKind::Rest
         ) {
             self.operations
                 .lock()
@@ -647,16 +647,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 target_ref: "main".to_string(),
                 snapshot_properties: Default::default(),
             });
-            let plan_payload = super::write_control::IcebergWritePlanPayloadV1 {
-                version: 1,
-                target: format!(
-                    "{}.{}.{}",
-                    self.descriptor.instance_id.as_str(),
-                    ident.namespace,
-                    ident.name
-                ),
-                target_ref: "main".to_string(),
-            };
+            let plan_payload =
+                novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1 {
+                    version: 1,
+                    target: format!(
+                        "{}.{}.{}",
+                        self.descriptor.instance_id.as_str(),
+                        ident.namespace,
+                        ident.name
+                    ),
+                    target_ref: "main".to_string(),
+                };
             let provider_payload = plan_payload.encode()?;
             let committer: Arc<dyn super::write_service::IcebergWriteReportCommitter> =
                 commit_executor;

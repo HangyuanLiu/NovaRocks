@@ -23,21 +23,22 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorStagedReport,
-    ConnectorStagedReportSummary, ConnectorWriteAdmissionPurpose, ConnectorWriteAttemptCompletion,
-    ConnectorWriteCohortId, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriterIdentity,
-    ConnectorWriterTerminalState,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorRequestContext,
+    ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorWriteActivation,
+    ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorWriteActivationSource, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteFieldRequest,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
+    ConnectorWriterIdentity, ConnectorWriterTerminalState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info;
 use super::catalog::registry::{
-    DataFileWithStats, IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg,
-    build_iceberg_catalog, extract_data_files_with_stats, load_table,
+    IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg, build_iceberg_catalog,
+    extract_data_files_with_stats, load_table,
 };
 use super::commit::{IcebergCommitCollector, SelectedRewriteKind};
 use super::sink::build_position_delete_data_file_partition_index;
@@ -52,8 +53,13 @@ use super::write_service::{
     IcebergWriteReportCommitter, IcebergWriteServiceRegistry,
 };
 use crate::common::types::UniqueId;
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
+use novarocks_connector_iceberg::commit::CommitOpKind;
+use novarocks_connector_iceberg::manifest::DataFileWithStats;
+use novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info;
+use novarocks_connector_iceberg::row_lineage_synth::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
+};
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
 };
@@ -219,7 +225,7 @@ impl IcebergDistributedRewritePlanner {
         let loaded = load_table(&entry, &namespace, &table_name).map_err(|error| {
             ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
         })?;
-        let table = loaded.table;
+        let table = loaded.into_table();
         let metadata = table.metadata();
         let base_snapshot_id = metadata
             .current_snapshot()
@@ -290,7 +296,7 @@ impl IcebergDistributedRewritePlanner {
         let input_schema = rewrite_input_schema(
             request.operation(),
             physical_schema,
-            super::catalog::backend::row_lineage_enabled(metadata),
+            novarocks_connector_iceberg::schema_facts::row_lineage_enabled(metadata),
         );
         let cohorts = cohort_plans_from_artifact(
             request,
@@ -298,7 +304,7 @@ impl IcebergDistributedRewritePlanner {
             &artifact_location,
             &artifact.groups,
             input_schema,
-            super::catalog::backend::row_lineage_enabled(metadata),
+            novarocks_connector_iceberg::schema_facts::row_lineage_enabled(metadata),
         )?;
         let state_digest = rewrite_state_digest(
             metadata.uuid().to_string().as_bytes(),
@@ -399,7 +405,7 @@ impl IcebergDistributedRewriteAdapter {
         entry.invalidate_table_cache(&artifact.namespace, &artifact.table);
         let table = load_table(&entry, &artifact.namespace, &artifact.table)
             .map_err(|error| unavailable(format!("reload frozen Iceberg rewrite table: {error}")))?
-            .table;
+            .into_table();
         validate_frozen_rewrite_table(&artifact, table.metadata())?;
         let catalog = build_iceberg_catalog(&entry)
             .map_err(|error| unavailable(format!("build Iceberg rewrite catalog: {error}")))?;
@@ -485,7 +491,9 @@ impl IcebergDistributedRewriteAdapter {
                     encode_frozen_data_rewrite_handle_payload(
                         table.metadata(),
                         artifact.base_snapshot_id,
-                        super::catalog::backend::row_lineage_enabled(table.metadata()),
+                        novarocks_connector_iceberg::schema_facts::row_lineage_enabled(
+                            table.metadata(),
+                        ),
                     )
                     .map_err(|error| {
                         invalid(format!("encode data rewrite writer handle: {error}"))
@@ -554,7 +562,7 @@ impl IcebergDistributedRewriteAdapter {
             .map_err(|error| {
                 unavailable(format!("load Iceberg rewrite checkpoint table: {error}"))
             })?
-            .table;
+            .into_table();
         Ok(table.file_io().clone())
     }
 }
@@ -578,7 +586,8 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteAdapter {
     fn activate_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
-    ) -> Result<(), ConnectorError> {
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
         plan.validate()?;
         if plan.owner() != self.binding_key() {
             return Err(invalid(
@@ -590,21 +599,38 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteAdapter {
             .lock()
             .map_err(|_| internal("Iceberg rewrite activation cache lock poisoned"))?;
         match activated.get(&plan.operation_id()) {
-            Some(existing) if existing == &plan.plan_digest() => return Ok(()),
-            Some(_) => {
+            Some(existing) if existing != &plan.plan_digest() => {
                 return Err(invalid(
                     "Iceberg rewrite activation conflicts with frozen plan",
                 ));
             }
+            Some(_) => {}
             None => {}
         }
-        let service = self.build_service(plan)?;
-        let operation_id = plan.operation_id();
-        let digest = plan.plan_digest();
-        self.services
-            .register_lazy(operation_id, digest, move || Ok(Arc::clone(&service)))?;
-        activated.insert(operation_id, digest);
-        Ok(())
+        if !activated.contains_key(&plan.operation_id()) {
+            let service = self.build_service(plan)?;
+            let operation_id = plan.operation_id();
+            let digest = plan.plan_digest();
+            self.services
+                .register_lazy(operation_id, digest, move || Ok(Arc::clone(&service)))?;
+            activated.insert(operation_id, digest);
+        }
+        let source = plan.cohorts().first().ok_or_else(|| {
+            invalid("Iceberg rewrite activation requires at least one provider cohort")
+        })?;
+        ConnectorWriteActivation::try_new(
+            self.binding_key().clone(),
+            &ConnectorWriteActivationRequest {
+                operation_id: plan.operation_id(),
+                source: ConnectorWriteActivationSource::Prepared(source.preparation().clone()),
+                intent: ConnectorWriteActivationIntent::Ordinary,
+                context,
+            },
+            plan.cohorts()
+                .iter()
+                .map(|cohort| (cohort.cohort_id(), cohort.preparation().clone()))
+                .collect(),
+        )
     }
 
     fn checkpoint_attempt(
@@ -768,8 +794,10 @@ fn position_delete_index_storage_config(
     table_location: &str,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, ConnectorError> {
     let Some(bucket) =
-        super::changes::expected_object_store_bucket_from_location(table_location)
-            .map_err(|error| invalid(format!("resolve rewrite position-delete bucket: {error}")))?
+        novarocks_connector_iceberg::delta::expected_object_store_bucket_from_location(
+            table_location,
+        )
+        .map_err(|error| invalid(format!("resolve rewrite position-delete bucket: {error}")))?
     else {
         return Ok(None);
     };
@@ -1842,8 +1870,7 @@ fn rewrite_cohort_preparation(
                 .filter(|field| {
                     matches!(
                         field.field().name().as_str(),
-                        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
-                            | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                        ICEBERG_ROW_ID_COL | ICEBERG_LAST_UPDATED_SEQ_COL
                     )
                 })
                 .cloned()
@@ -1853,8 +1880,7 @@ fn rewrite_cohort_preparation(
                 .filter(|field| {
                     !matches!(
                         field.field().name().as_str(),
-                        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
-                            | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                        ICEBERG_ROW_ID_COL | ICEBERG_LAST_UPDATED_SEQ_COL
                     )
                 })
                 .collect();
@@ -1911,13 +1937,9 @@ pub(crate) fn rewrite_input_schema(
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } if row_lineage_data => {
             let mut fields = physical_schema.fields().to_vec();
             fields.extend([
+                Arc::new(Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false)),
                 Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                    DataType::Int64,
-                    false,
-                )),
-                Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    ICEBERG_LAST_UPDATED_SEQ_COL,
                     DataType::Int64,
                     true,
                 )),

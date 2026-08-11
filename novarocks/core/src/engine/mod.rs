@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -349,6 +349,14 @@ pub(crate) struct StandaloneState {
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+    /// Frontend-owned provider factory resolver. Core submits durable
+    /// attachment facts here and never constructs a concrete generation.
+    pub(crate) connector_control_factory_resolver:
+        Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
+    /// Process-local filesystem resources supplied by the composition root.
+    /// During the Phase 1 checkpoint the legacy Core Iceberg control owner
+    /// consumes them without discovering a runtime or credentials globally.
+    pub(crate) connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
     /// Process-local cache of immutable evidence returned by connector
     /// statistics readers. Query compilation still consumes only the pin
     /// captured during table resolution.
@@ -362,7 +370,15 @@ pub(crate) struct StandaloneState {
     pub(crate) mv_repository: Arc<dyn MvRepository>,
     /// Frontend-owned MV statement application boundary.
     pub(crate) mv_application_service: Arc<dyn MvApplicationService>,
+    /// Server-composed exact-generation storage observation boundary.
+    pub(crate) mv_storage_observation:
+        Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
     pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
+    /// Serializes durable attachment and exact control-generation lifecycle
+    /// transitions. Provider construction is intentionally performed outside
+    /// this lock; only persistence, publication, retirement, and SQL catalog
+    /// projection transitions are fenced here.
+    pub(crate) catalog_attachment_lifecycle: Mutex<()>,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) exchange_port: u16,
@@ -394,6 +410,17 @@ pub(crate) struct StandaloneState {
 }
 
 #[cfg(test)]
+fn test_connector_file_planning_resources() -> Option<novarocks_fs::FsAccessResources> {
+    let runtime = crate::runtime::global_async_runtime::data_runtime_handle().ok()?;
+    Some(novarocks_fs::FsAccessResources::new(
+        None,
+        novarocks_fs::FsAccessResolver::new(),
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime)),
+    ))
+}
+
+#[cfg(test)]
 impl Default for StandaloneState {
     fn default() -> Self {
         Self {
@@ -407,6 +434,8 @@ impl Default for StandaloneState {
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
             connector_control: Arc::new(TestConnectorControlRegistry::default()),
+            connector_control_factory_resolver: Arc::new(TestConnectorControlRegistry::default()),
+            connector_file_planning_resources: test_connector_file_planning_resources(),
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -415,7 +444,11 @@ impl Default for StandaloneState {
             metadata_provider: None,
             mv_repository: Arc::new(UnavailableMvRepository),
             mv_application_service: Arc::new(UnavailableMvApplicationService),
+            mv_storage_observation: Arc::new(
+                crate::mv::storage_observation::UnavailableMvStorageObservationPort,
+            ),
             catalog_attachment_repo: CatalogAttachmentRepository,
+            catalog_attachment_lifecycle: Mutex::new(()),
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
             exchange_port: 0,
@@ -1024,6 +1057,22 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorControlFactoryResolver for TestConnectorControlRegistry {
+    fn create_control(
+        &self,
+        _request: novarocks_spi::connector::ConnectorControlFactoryRequest,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlCreation,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control registry has no provider factories",
+        ))
+    }
+}
+
+#[cfg(test)]
 struct TestDistributedQueryCoordinator {
     connector_control:
         Option<std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>>,
@@ -1207,6 +1256,10 @@ pub struct StandaloneOpenServices {
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
     pub mv_application_service: std::sync::Arc<dyn MvApplicationService>,
+    /// Server-composed provider storage inspector adapter. The default is
+    /// intentionally unavailable so missing composition fails closed.
+    pub mv_storage_observation:
+        std::sync::Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
     pub query_execution: crate::query_execution::service::QueryExecutionService,
     pub backend_query_events:
         std::sync::Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
@@ -1216,6 +1269,13 @@ pub struct StandaloneOpenServices {
     pub query_control: crate::query_execution::control::QueryControlService,
     /// Frontend-owned lifecycle port for logical connector control bindings.
     pub connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+    /// Frontend-owned provider factory resolver used by catalog create and
+    /// durable attachment restore.
+    pub connector_control_factory_resolver:
+        std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
+    /// Connector-neutral FE filesystem resources. The legacy Core Iceberg
+    /// control owner consumes this only until the follow-up factory cut.
+    pub connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
     /// Bound by the server composition root before engine open. Zero means no
     /// local fragment endpoint is available to this engine instance.
     pub exchange_port: u16,
@@ -1242,6 +1302,9 @@ impl StandaloneOpenServices {
         >,
         query_control: crate::query_execution::control::QueryControlService,
         connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+        connector_control_factory_resolver: std::sync::Arc<
+            dyn novarocks_spi::connector::ConnectorControlFactoryResolver,
+        >,
         exchange_port: u16,
     ) -> Self {
         Self {
@@ -1258,9 +1321,23 @@ impl StandaloneOpenServices {
             mv_refresh_provider_activation_sink: None,
             mv_background_engine_sink: None,
             connector_control,
+            connector_control_factory_resolver,
+            connector_file_planning_resources: {
+                #[cfg(test)]
+                {
+                    test_connector_file_planning_resources()
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            },
             table_maintenance_service,
             mv_repository,
             mv_application_service,
+            mv_storage_observation: std::sync::Arc::new(
+                crate::mv::storage_observation::UnavailableMvStorageObservationPort,
+            ),
             query_execution,
             backend_query_events,
             backend_topology,
@@ -1268,6 +1345,22 @@ impl StandaloneOpenServices {
             query_control,
             exchange_port,
         }
+    }
+
+    pub fn with_mv_storage_observation(
+        mut self,
+        observation: std::sync::Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
+    ) -> Self {
+        self.mv_storage_observation = observation;
+        self
+    }
+
+    pub fn with_connector_file_planning_resources(
+        mut self,
+        resources: Option<novarocks_fs::FsAccessResources>,
+    ) -> Self {
+        self.connector_file_planning_resources = resources;
+        self
     }
 
     pub fn with_statistics_application(
@@ -1401,9 +1494,12 @@ impl StandaloneNovaRocks {
             mv_refresh_provider_activation_sink,
             mv_background_engine_sink,
             connector_control,
+            connector_control_factory_resolver,
+            connector_file_planning_resources,
             table_maintenance_service,
             mv_repository,
             mv_application_service,
+            mv_storage_observation,
             query_execution,
             backend_query_events,
             backend_topology,
@@ -1420,7 +1516,9 @@ impl StandaloneNovaRocks {
             metadata_provider: metadata_provider.clone(),
             mv_repository,
             mv_application_service,
+            mv_storage_observation,
             catalog_attachment_repo: CatalogAttachmentRepository,
+            catalog_attachment_lifecycle: Mutex::new(()),
             job_repo: JobMetaRepository,
             exchange_port,
             system_catalog,
@@ -1428,6 +1526,8 @@ impl StandaloneNovaRocks {
             statistics_service,
             statistics_application,
             connector_control,
+            connector_control_factory_resolver,
+            connector_file_planning_resources,
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -2293,7 +2393,12 @@ impl StandaloneSession {
 
         // SHOW CREATE TABLE ...
         if looks_like_show_create_table(&normalized) {
-            return self.handle_show_create_table(&normalized, current_catalog, current_database);
+            return self.handle_show_create_table(
+                &normalized,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
@@ -2355,6 +2460,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let table_name = parse_show_create_table(sql)?;
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
@@ -2369,20 +2475,33 @@ impl StandaloneSession {
                 target.backend_name
             ));
         }
-        let entry = {
-            let registry = self
-                .inner
-                .iceberg_catalogs
-                .read()
-                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-            registry.get(&target.catalog)?
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        let lease = self
+            .inner
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|error| error.to_string())?;
+        let identity = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(target.namespace.as_str()),
+            table: Arc::from(target.table.as_str()),
         };
-        entry.invalidate_table_cache(&target.namespace, &target.table);
-        let loaded = crate::connector::iceberg::catalog::registry::load_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )?;
+        let loaded = lease
+            .binding()
+            .metadata()
+            .load_table(novarocks_spi::connector::ConnectorTableRequest {
+                table: identity.clone(),
+                resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                context: connector_context.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+        if loaded.identity != identity || loaded.table.owner() != &identity.instance_id {
+            return Err(
+                "SHOW CREATE TABLE received corrupt metadata for a different connector table"
+                    .to_string(),
+            );
+        }
         let ddl = build_iceberg_create_table_ddl(
             &target.catalog,
             &target.namespace,
@@ -2741,6 +2860,11 @@ impl StandaloneSession {
         &self,
         stmt: crate::sql::parser::ast::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
+        let _lifecycle = self
+            .inner
+            .catalog_attachment_lifecycle
+            .lock()
+            .map_err(|error| format!("catalog attachment lifecycle lock: {error}"))?;
         let normalized_catalog = normalize_identifier(&stmt.name)?;
         let mut guard = self
             .inner
@@ -3120,62 +3244,70 @@ fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::Obje
     Ok(crate::sql::parser::ast::ObjectName { parts })
 }
 
-/// Generate a `CREATE TABLE` DDL string from a loaded Iceberg table's current
-/// schema.  Column doc strings are emitted as `COMMENT '...'` clauses.
+/// Generate a `CREATE TABLE` DDL string from exact-generation connector facts.
 fn build_iceberg_create_table_ddl(
     catalog: &str,
     namespace: &str,
     table: &str,
-    loaded: &crate::connector::iceberg::catalog::registry::IcebergLoadedTable,
+    loaded: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<String, String> {
-    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
+    use novarocks_spi::connector::ConnectorTableDefinitionType;
 
-    fn iceberg_type_to_sql(ty: &Type) -> String {
+    fn definition_type_to_sql(ty: &ConnectorTableDefinitionType) -> String {
         match ty {
-            Type::Primitive(PrimitiveType::Boolean) => "BOOLEAN".to_string(),
-            Type::Primitive(PrimitiveType::Int) => "INT".to_string(),
-            Type::Primitive(PrimitiveType::Long) => "BIGINT".to_string(),
-            Type::Primitive(PrimitiveType::Float) => "FLOAT".to_string(),
-            Type::Primitive(PrimitiveType::Double) => "DOUBLE".to_string(),
-            Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
+            ConnectorTableDefinitionType::Boolean => "BOOLEAN".to_string(),
+            ConnectorTableDefinitionType::Int => "INT".to_string(),
+            ConnectorTableDefinitionType::BigInt => "BIGINT".to_string(),
+            ConnectorTableDefinitionType::Float => "FLOAT".to_string(),
+            ConnectorTableDefinitionType::Double => "DOUBLE".to_string(),
+            ConnectorTableDefinitionType::Decimal { precision, scale } => {
                 format!("DECIMAL({precision},{scale})")
             }
-            Type::Primitive(PrimitiveType::Date) => "DATE".to_string(),
-            Type::Primitive(PrimitiveType::Time) => "TIME".to_string(),
-            Type::Primitive(PrimitiveType::Timestamp)
-            | Type::Primitive(PrimitiveType::Timestamptz) => "DATETIME".to_string(),
-            Type::Primitive(PrimitiveType::TimestampNs)
-            | Type::Primitive(PrimitiveType::TimestamptzNs) => "TIMESTAMP_NS".to_string(),
-            Type::Primitive(PrimitiveType::String) => "STRING".to_string(),
-            Type::Primitive(PrimitiveType::Uuid) => "STRING".to_string(),
-            Type::Primitive(PrimitiveType::Fixed(n)) => format!("BINARY({n})"),
-            Type::Primitive(PrimitiveType::Binary) => "BINARY".to_string(),
-            Type::Primitive(PrimitiveType::Variant) => "VARIANT".to_string(),
-            Type::List(l) => format!(
-                "ARRAY<{}>",
-                iceberg_type_to_sql(&l.element_field.field_type)
-            ),
-            Type::Map(m) => format!(
+            ConnectorTableDefinitionType::Date => "DATE".to_string(),
+            ConnectorTableDefinitionType::Time => "TIME".to_string(),
+            ConnectorTableDefinitionType::DateTime => "DATETIME".to_string(),
+            ConnectorTableDefinitionType::DateTimeNs => "TIMESTAMP_NS".to_string(),
+            ConnectorTableDefinitionType::String => "STRING".to_string(),
+            ConnectorTableDefinitionType::Binary {
+                fixed_length: Some(length),
+            } => format!("BINARY({length})"),
+            ConnectorTableDefinitionType::Binary { fixed_length: None } => "BINARY".to_string(),
+            ConnectorTableDefinitionType::Variant => "VARIANT".to_string(),
+            ConnectorTableDefinitionType::Array(element) => {
+                format!("ARRAY<{}>", definition_type_to_sql(element))
+            }
+            ConnectorTableDefinitionType::Map(key, value) => format!(
                 "MAP<{},{}>",
-                iceberg_type_to_sql(&m.key_field.field_type),
-                iceberg_type_to_sql(&m.value_field.field_type)
+                definition_type_to_sql(key),
+                definition_type_to_sql(value)
             ),
-            Type::Struct(s) => {
-                let fields: Vec<String> = s
-                    .fields()
+            ConnectorTableDefinitionType::Struct(fields) => {
+                let fields = fields
                     .iter()
-                    .map(|f| format!("{} {}", f.name, iceberg_type_to_sql(&f.field_type)))
-                    .collect();
+                    .map(|field| {
+                        format!(
+                            "{} {}",
+                            field.name(),
+                            definition_type_to_sql(field.data_type())
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 format!("STRUCT<{}>", fields.join(", "))
             }
         }
     }
 
-    let schema = loaded.table.metadata().current_schema();
-    let mut col_defs: Vec<String> = Vec::new();
-    for field in schema.as_struct().fields() {
-        let nullable = if field.required { " NOT NULL" } else { "" };
-        let comment = if let Some(doc) = &field.doc {
+    if loaded.definition_facts.is_empty() {
+        return Err(
+            "SHOW CREATE TABLE is unsupported because the connector returned no table definition facts"
+                .to_string(),
+        );
+    }
+    let mut col_defs = Vec::with_capacity(loaded.definition_facts.columns().len());
+    for column in loaded.definition_facts.columns() {
+        let field = loaded.schema.field(column.field_ordinal() as usize);
+        let nullable = if column.nullable() { "" } else { " NOT NULL" };
+        let comment = if let Some(doc) = column.comment() {
             let escaped = doc.replace('\'', "\\'");
             format!(" COMMENT '{escaped}'")
         } else {
@@ -3183,19 +3315,16 @@ fn build_iceberg_create_table_ddl(
         };
         col_defs.push(format!(
             "  `{}` {}{}{}",
-            field.name,
-            iceberg_type_to_sql(&field.field_type),
+            field.name(),
+            definition_type_to_sql(column.data_type()),
             nullable,
             comment
         ));
     }
 
-    // Emit table-level COMMENT if the "comment" property is set and non-empty.
     let table_comment = loaded
-        .table
-        .metadata()
-        .properties()
-        .get("comment")
+        .definition_facts
+        .table_comment()
         .filter(|v| !v.is_empty())
         .map(|v| {
             let escaped = v.replace('\'', "\\'");
@@ -3706,9 +3835,14 @@ fn register_iceberg_control_binding(
 ) -> Result<(), String> {
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let binding = crate::connector::iceberg::provider::IcebergControlProvider::new_control(
+    let planning_binding = state
+        .connector_file_planning_resources
+        .clone()
+        .map(novarocks_connector_iceberg::access_binding::IcebergReadBinding::from_resources);
+    let binding = crate::connector::iceberg::provider::IcebergControlProvider::new_control_with_planning_binding(
         instance_id,
         Arc::clone(&state.iceberg_catalogs),
+        planning_binding,
     )
     .map_err(|error| format!("create Iceberg connector control binding: {error}"))?;
     state
@@ -3742,7 +3876,7 @@ pub(crate) fn persist_catalog_attachment_if_needed(
         .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
     state
         .catalog_attachment_repo
-        .upsert(
+        .create(
             txn.as_mut(),
             catalog_name,
             CatalogAttachmentProperties {
@@ -3767,7 +3901,7 @@ pub(crate) fn delete_catalog_attachment_if_needed(
         .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
     state
         .catalog_attachment_repo
-        .delete(txn.as_mut(), catalog_name)
+        .delete_current(txn.as_mut(), catalog_name)
         .map_err(|e| format!("delete catalog attachment metadata failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit catalog attachment metadata failed: {e}"))?;
@@ -5951,96 +6085,126 @@ fn parse_explain_refresh_materialized_view(
 #[cfg(test)]
 mod build_iceberg_create_table_ddl_tests {
     use super::build_iceberg_create_table_ddl;
-    use crate::connector::iceberg::catalog::registry::IcebergLoadedTable;
-    use novarocks_connector_iceberg::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type,
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
+        ConnectorTableDefinitionStructField, ConnectorTableDefinitionType, ConnectorTableHandle,
+        ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
     };
-    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    fn loaded_table_with_props(props: HashMap<String, String>) -> IcebergLoadedTable {
-        let schema = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::optional(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-            ))])
-            .build()
-            .expect("build schema");
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec(),
-            SortOrder::unsorted_order(),
-            "/tmp/test".to_string(),
-            FormatVersion::V2,
-            props,
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(60),
+            Arc::new(NeverCancelled),
+            1_024,
+            64 * 1_024,
         )
-        .expect("builder")
-        .build()
-        .expect("metadata")
-        .metadata;
-        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(
-                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
-            )
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("table");
-        IcebergLoadedTable {
-            table,
-            columns: vec![],
-            logical_types: HashMap::new(),
-            key_desc: None,
-            column_aggregations: HashMap::new(),
-            object_store_config: None,
+        .expect("request context")
+    }
+
+    fn loaded_table(
+        table_comment: Option<&str>,
+        column_comment: Option<&str>,
+        data_type: ConnectorTableDefinitionType,
+        nullable: bool,
+    ) -> ConnectorTableMetadata {
+        let instance_id = ConnectorInstanceId::parse("cat").expect("instance ID");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            nullable,
+        )]));
+        let planning_facts = ConnectorTablePlanningFacts::empty();
+        let definition_facts = ConnectorTableDefinitionFacts::try_new(
+            &schema,
+            &planning_facts,
+            vec![ConnectorTableDefinitionColumn::new(
+                0,
+                data_type,
+                nullable,
+                column_comment.map(Arc::from),
+            )],
+            table_comment.map(Arc::from),
+            &request_context(),
+        )
+        .expect("definition facts");
+        ConnectorTableMetadata {
+            identity: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from("ns"),
+                table: Arc::from("tbl"),
+            },
+            schema,
+            planning_facts,
+            definition_facts,
+            version: None,
+            statistics_data_version: None,
+            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
+                .expect("table handle"),
         }
     }
 
     #[test]
-    fn emits_comment_when_property_is_set() {
-        let mut props = HashMap::new();
-        props.insert("comment".to_string(), "my table comment".to_string());
-        let loaded = loaded_table_with_props(props);
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            ddl.contains("COMMENT 'my table comment'"),
-            "expected COMMENT clause in DDL, got: {ddl}"
+    fn emits_table_and_column_comments_with_escaping() {
+        let loaded = loaded_table(
+            Some("it's great"),
+            Some("owner's id"),
+            ConnectorTableDefinitionType::Int,
+            false,
         );
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(ddl.contains("`id` INT NOT NULL COMMENT 'owner\\'s id'"));
+        assert!(ddl.contains("COMMENT 'it\\'s great'"));
     }
 
     #[test]
-    fn no_comment_clause_when_property_absent() {
-        let loaded = loaded_table_with_props(HashMap::new());
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            !ddl.contains("COMMENT"),
-            "expected no COMMENT clause when property absent, got: {ddl}"
+    fn renders_fixed_and_nested_definition_types() {
+        let loaded = loaded_table(
+            None,
+            None,
+            ConnectorTableDefinitionType::Array(Box::new(ConnectorTableDefinitionType::Struct(
+                vec![ConnectorTableDefinitionStructField::new(
+                    "payload",
+                    ConnectorTableDefinitionType::Map(
+                        Box::new(ConnectorTableDefinitionType::String),
+                        Box::new(ConnectorTableDefinitionType::Binary {
+                            fixed_length: Some(16),
+                        }),
+                    ),
+                )],
+            ))),
+            true,
         );
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(ddl.contains("ARRAY<STRUCT<payload MAP<STRING,BINARY(16)>>>"));
     }
 
     #[test]
-    fn no_comment_clause_when_property_empty() {
-        let mut props = HashMap::new();
-        props.insert("comment".to_string(), String::new());
-        let loaded = loaded_table_with_props(props);
+    fn no_comment_clause_when_comment_is_empty() {
+        let loaded = loaded_table(Some(""), None, ConnectorTableDefinitionType::Int, true);
         let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            !ddl.contains("COMMENT"),
-            "expected no COMMENT clause when property is empty string, got: {ddl}"
-        );
+        assert!(!ddl.contains("COMMENT"));
     }
 
     #[test]
-    fn comment_with_single_quote_is_escaped() {
-        let mut props = HashMap::new();
-        props.insert("comment".to_string(), "it's great".to_string());
-        let loaded = loaded_table_with_props(props);
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(
-            ddl.contains("COMMENT 'it\\'s great'"),
-            "expected escaped single quote in COMMENT, got: {ddl}"
-        );
+    fn empty_definition_facts_fail_closed() {
+        let mut loaded = loaded_table(None, None, ConnectorTableDefinitionType::Int, true);
+        loaded.definition_facts = ConnectorTableDefinitionFacts::empty();
+        let error = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded)
+            .expect_err("empty definition facts must fail");
+        assert!(error.contains("unsupported"));
     }
 }
 
@@ -6610,6 +6774,7 @@ mod tests {
             backend_topology,
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             crate::query_execution::control::QueryControlService::for_test(),
+            Arc::new(super::TestConnectorControlRegistry::default()),
             Arc::new(super::TestConnectorControlRegistry::default()),
             1,
         )

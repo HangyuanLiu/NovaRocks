@@ -582,7 +582,10 @@ fn scan_binding_for_source<'a>(
                 matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
             }
             table_model::SqlScanKind::Delta { .. } => {
-                matches!(binding.execution, ResolvedScanExecution::IcebergDelta(_))
+                matches!(
+                    binding.execution,
+                    ResolvedScanExecution::SealedConnectorScan(_)
+                )
             }
             table_model::SqlScanKind::Data { .. }
             | table_model::SqlScanKind::FrozenInputSet { .. }
@@ -629,7 +632,7 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
     match execution {
         ResolvedScanExecution::ConnectorRead => "ConnectorRead",
         ResolvedScanExecution::AdmittedConnectorRead(_) => "AdmittedConnectorRead",
-        ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
+        ResolvedScanExecution::SealedConnectorScan(_) => "SealedConnectorScan",
     }
 }
 
@@ -658,7 +661,7 @@ fn encode_scan_source(
                     .as_str()
                     .to_string(),
                 instance_incarnation: planned.declaration.incarnation().to_bytes().to_vec(),
-                scan_payload: planned.scan.handle.payload().to_vec(),
+                scan_payload: planned.scan.handle().payload().to_vec(),
                 splits: Vec::new(),
                 max_batch_rows: u64::try_from(planned.batch.max_rows.get())
                     .map_err(|_| "connector batch row budget does not fit u64".to_string())?,
@@ -679,7 +682,7 @@ fn encode_scan_source(
                     None,
                     scan_variant_columns,
                     binding,
-                    Some(&planned.scan.output_schema),
+                    Some(planned.scan.output_schema()),
                 )?,
             })),
         });

@@ -679,6 +679,16 @@ fn rewrite_eliminated_aggregate_expr(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use arrow::datatypes::{Field, Schema};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTablePlanningFacts,
+        ConnectorTableUniqueConstraint,
+    };
+
     use super::*;
 
     use crate::sql::analysis::{LiteralValue, OutputColumn};
@@ -922,19 +932,44 @@ mod tests {
     }
 
     #[test]
-    fn sqlx2_ukfk_facts_match_frozen_sql_constraints_without_provider_metadata() {
-        let properties = std::collections::BTreeMap::from([
-            (
-                "UNIQUE_CONSTRAINTS".to_string(),
-                "`customer_id`".to_string(),
-            ),
-            (
-                "foreign_key_constraints".to_string(),
-                "`customer_id` REFERENCES sales.customers (`id`)".to_string(),
-            ),
-        ]);
+    fn sqlx2_ukfk_facts_match_typed_connector_constraints() {
+        struct NeverCancelled;
 
-        let facts = SqlUkFkTableFacts::from_frozen_properties(&properties);
+        impl ConnectorCancellation for NeverCancelled {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "customer_id",
+            DataType::Int64,
+            false,
+        )]));
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            4_096,
+            4_096,
+        )
+        .expect("valid connector context");
+        let planning_facts = ConnectorTablePlanningFacts::try_new(
+            &schema,
+            vec![],
+            vec![ConnectorTableUniqueConstraint::new(vec![0])],
+            vec![ConnectorTableForeignKeyConstraint::new(
+                vec![0],
+                ConnectorTableIdentity {
+                    instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance ID"),
+                    namespace: Arc::from("sales"),
+                    table: Arc::from("customers"),
+                },
+                vec![Arc::from("id")],
+            )],
+            &context,
+        )
+        .expect("valid typed planning facts");
+        let facts = SqlUkFkTableFacts::from_connector_planning_facts(&schema, &planning_facts);
 
         assert!(facts.has_unique_key(&["CUSTOMER_ID".to_string()]));
         assert!(facts.has_matching_foreign_key(

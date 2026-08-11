@@ -31,56 +31,49 @@ use bytes::Bytes;
 use novarocks_catalog::schema::SqlType;
 use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, TableMetadata, Type};
 use novarocks_connector_iceberg::iceberg::transaction::{ApplyTransactionAction, Transaction};
-use novarocks_fs::{
-    FileCancellation, FileError, FileErrorKind, FileIdentity, ParquetMetadataInspection,
-    ParquetStatisticsSortOrder, ParquetStatisticsValue, inspect_parquet_metadata,
-};
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCatalogMutation,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCatalogMutation,
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorCommittedVersion,
     ConnectorControlBinding, ConnectorDataType, ConnectorDefaultValue,
     ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
     ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
     ConnectorMutationEffectField, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationMatchContract, ConnectorMutationOperationId, ConnectorMutationRouteInput,
     ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorNamespaceRequest,
-    ConnectorOpenReaderRequest, ConnectorPartitionTransform, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReadNamedReference, ConnectorReadPurpose,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
-    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
-    ConnectorRefreshPublicationGuard, ConnectorRequestContext,
-    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
-    ConnectorRowMutationEffect, ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
-    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
-    ConnectorRowMutationPreparationRequest, ConnectorRowMutationRoute,
-    ConnectorRowMutationStrategy, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanUnitColumn,
-    ConnectorScanUnitColumnDomain, ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsEvidence, ConnectorScanUnitFactsMissingReason,
-    ConnectorSealedWriteCohortSet, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorPrepareSplitRequest, ConnectorProviderId, ConnectorReadNamedReference,
+    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
+    ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
+    ConnectorRequestContext, ConnectorRowMutationActivationRequest,
+    ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
+    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorRowMutationRoute, ConnectorRowMutationStrategy, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanSelection, ConnectorSealedWriteCohortSet, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
     ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
     ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
     ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
-    ConnectorStatistics, ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
-    ConnectorTableResolution, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
-    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor,
-    ConnectorWriteCohortId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
-    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    ConnectorWriteRouteId, ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy,
-    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorStatistics, ConnectorTableColumnRole, ConnectorTableColumnSemanticKind,
+    ConnectorTableColumnVisibility, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata,
+    ConnectorViewMetadataValue, ConnectorViewRequest, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteRouteId,
+    ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     ExternalMutationOutcome, StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
     StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
     StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
@@ -93,7 +86,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::catalog::IcebergCatalogEntry;
-use super::catalog::backend::iceberg_schema_def_for_codegen;
 use super::catalog::registry::{
     IcebergCatalogRegistry, create_namespace, create_table, drop_namespace, drop_table,
     extract_data_files_with_stats_at, list_namespaces, list_tables, load_table, namespace_exists,
@@ -102,19 +94,15 @@ use super::catalog::views;
 use super::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
 use super::data_mutation::IcebergDataMutationAdapter;
 use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
-use super::reader::IcebergBatchReader;
 use super::write_contract::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
-    encode_data_sink_spec_handle_payload, encode_deletion_vector_sink_handle_payload,
-    encode_equality_delete_sink_spec_handle_payload, encode_position_delete_sink_handle_payload,
-    iceberg_write_sink_mode,
+    encode_data_sink_spec_handle_payload, encode_equality_delete_sink_spec_handle_payload,
+    encode_position_delete_sink_handle_payload,
 };
 use super::write_control::{
-    IcebergFirstRefreshWritePlanPayloadV2, IcebergRowMutationActivationFactory,
-    IcebergRowMutationPreparationFactory, IcebergWriteControlAdapter, IcebergWritePlanPayloadV1,
-    IcebergWritePreparationFactory,
+    IcebergRowMutationActivationFactory, IcebergRowMutationPreparationFactory,
+    IcebergWriteControlAdapter, IcebergWritePreparationFactory,
 };
-use super::write_execution::IcebergDataWriteExecution;
 use super::write_service::{
     IcebergFirstRefreshWriteReportCommitter, IcebergMvPrimaryEmptyInputPolicy,
     IcebergWriteCohortContext, IcebergWriteControlService, IcebergWriteControlServiceContext,
@@ -122,213 +110,46 @@ use super::write_service::{
 };
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
+use novarocks_connector_iceberg::delta::IcebergDeltaSplitPayload;
+use novarocks_connector_iceberg::execution_declaration::IcebergInstanceDistribution;
+use novarocks_connector_iceberg::file_reader::distributed_rewrite_reader::{
+    ICEBERG_REWRITE_POSITION_SPLIT_V1, IcebergRewritePositionSplitPayloadV1,
+};
+use novarocks_connector_iceberg::file_reader::execution_payload::{
+    ICEBERG_SPLIT_V5, IcebergFrozenScanUnitPayload, IcebergMetadataSplitPayloadV1,
+    IcebergScanFactColumnV1, SplitPayload, canonical_split_name_mapping,
+    materialize_local_scan_units, scan_fact_scalar_type,
+};
+use novarocks_connector_iceberg::reconcile_payload::{
+    ICEBERG_MUTATION_EVIDENCE_VERSION, ICEBERG_STAGED_PUBLICATION_PROOF_VERSION,
+    ICEBERG_STATISTICS_EVIDENCE_VERSION, IcebergMutationEvidenceTarget, IcebergMutationEvidenceV1,
+    IcebergStagedPublicationProofV1, IcebergStatisticsEvidenceV1, decode_mutation_evidence,
+    decode_staged_publication_proof, decode_statistics_evidence, encode_mutation_evidence,
+    encode_staged_publication_proof, encode_statistics_evidence,
+};
+use novarocks_connector_iceberg::row_lineage_synth as iceberg_row_lineage;
+use novarocks_connector_iceberg::row_mutation_payload::{
+    IcebergCowRecipePayloadV1, decode_cow_recipe, encode_cow_recipe,
+};
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
-    IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
-    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue, IcebergTableInfo,
+    IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
+    IcebergPhysicalPredicateValue, IcebergTableInfo,
 };
 #[cfg(test)]
 use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
-
-#[derive(Clone, Deserialize, Serialize)]
-struct IcebergDeltaSplitPayload {
-    source: novarocks_connector_iceberg::delta::DeltaSourceFile,
-    #[serde(default)]
-    delete_side: Option<novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
-}
+use novarocks_connector_iceberg::schema_facts::{iceberg_schema_def, row_lineage_enabled};
+use novarocks_connector_iceberg::statistics_codec::{
+    decode_provider_statistics, encode_provider_statistics, statistics_data_version,
+    statistics_metric_column,
+};
+use novarocks_connector_iceberg::write_payload::{
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
+};
 
 const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
-const ICEBERG_DECLARATION_V1: u16 = 1;
-const DEFAULT_ACCESS_BINDING: &str = "default";
-const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
-const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
-const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_OPERATION_KIND: &str = "statistics-publish";
-const ICEBERG_STAGED_PUBLICATION_PROOF_VERSION: u16 = 1;
-fn statistics_data_version(
-    table_uuid: &str,
-    snapshot_id: Option<i64>,
-) -> Result<StatisticsDataVersion, ConnectorError> {
-    StatisticsDataVersion::try_new(Bytes::from(format!(
-        "iceberg/v1/{table_uuid}/{}",
-        snapshot_id
-            .map(|snapshot| snapshot.to_string())
-            .unwrap_or_else(|| "empty".to_string())
-    )))
-}
-
-fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
-    match metric {
-        StatisticsMetric::RowCount => None,
-        StatisticsMetric::NullCount { column }
-        | StatisticsMetric::Minimum { column }
-        | StatisticsMetric::Maximum { column }
-        | StatisticsMetric::AverageSize { column }
-        | StatisticsMetric::ThetaNdv { column } => Some(column),
-    }
-}
-
-fn encode_provider_statistics(evidence: &StatisticsEvidence) -> Result<Vec<u8>, ConnectorError> {
-    if evidence.coverage != StatisticsCoverage::Full
-        || evidence.accuracy != StatisticsAccuracy::Exact
-        || evidence.provenance != StatisticsProvenance::VisibleRows
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "Iceberg provider statistics require Full Exact visible-row evidence",
-        ));
-    }
-    let metrics = evidence
-        .metrics
-        .iter()
-        .map(|(metric, state)| {
-            let StatisticsMetricState::Available(value) = state else {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg provider statistics cannot persist unavailable metrics",
-                ));
-            };
-            let value = match value {
-                StatisticsMetricValue::U64(value) => IcebergStatisticValueV1::U64(*value),
-                StatisticsMetricValue::I64(value) => IcebergStatisticValueV1::I64(*value),
-                StatisticsMetricValue::F64(value) => IcebergStatisticValueV1::F64(*value),
-                StatisticsMetricValue::Bytes(value) => {
-                    IcebergStatisticValueV1::Bytes(value.to_vec())
-                }
-            };
-            Ok(match metric {
-                StatisticsMetric::RowCount => IcebergProviderStatisticV1::RowCount { value },
-                StatisticsMetric::NullCount { column } => IcebergProviderStatisticV1::NullCount {
-                    column: column.to_string(),
-                    value,
-                },
-                StatisticsMetric::Minimum { column } => IcebergProviderStatisticV1::Minimum {
-                    column: column.to_string(),
-                    value,
-                },
-                StatisticsMetric::Maximum { column } => IcebergProviderStatisticV1::Maximum {
-                    column: column.to_string(),
-                    value,
-                },
-                StatisticsMetric::AverageSize { column } => {
-                    IcebergProviderStatisticV1::AverageSize {
-                        column: column.to_string(),
-                        value,
-                    }
-                }
-                StatisticsMetric::ThetaNdv { column } => IcebergProviderStatisticV1::ThetaNdv {
-                    column: column.to_string(),
-                    value,
-                },
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    serde_json::to_vec(&IcebergProviderStatisticsV1 {
-        version: ICEBERG_PROVIDER_STATISTICS_VERSION,
-        data_version: evidence.data_version.as_bytes().to_vec(),
-        metrics,
-    })
-    .map_err(|error| internal(format!("encode Iceberg provider statistics: {error}")))
-}
-
-fn decode_provider_statistics(
-    payload: &[u8],
-    expected_data_version: &StatisticsDataVersion,
-    requested: &novarocks_spi::connector::StatisticsMetricRequest,
-) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricState>, ConnectorError> {
-    let artifact: IcebergProviderStatisticsV1 =
-        serde_json::from_slice(payload).map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("decode Iceberg provider statistics: {error}"),
-            )
-        })?;
-    if artifact.version != ICEBERG_PROVIDER_STATISTICS_VERSION
-        || artifact.data_version.as_slice() != expected_data_version.as_bytes().as_ref()
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg provider statistics do not match the pinned table version",
-        ));
-    }
-    let mut available = BTreeMap::new();
-    for metric in artifact.metrics {
-        let (metric, value) = match metric {
-            IcebergProviderStatisticV1::RowCount { value } => (StatisticsMetric::RowCount, value),
-            IcebergProviderStatisticV1::NullCount { column, value } => (
-                StatisticsMetric::NullCount {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::Minimum { column, value } => (
-                StatisticsMetric::Minimum {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::Maximum { column, value } => (
-                StatisticsMetric::Maximum {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::AverageSize { column, value } => (
-                StatisticsMetric::AverageSize {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::ThetaNdv { column, value } => (
-                StatisticsMetric::ThetaNdv {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-        };
-        let value = match value {
-            IcebergStatisticValueV1::U64(value) => StatisticsMetricValue::U64(value),
-            IcebergStatisticValueV1::I64(value) => StatisticsMetricValue::I64(value),
-            IcebergStatisticValueV1::F64(value) if value.is_finite() => {
-                StatisticsMetricValue::F64(value)
-            }
-            IcebergStatisticValueV1::F64(_) => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg provider statistics contain a non-finite value",
-                ));
-            }
-            IcebergStatisticValueV1::Bytes(value) => {
-                StatisticsMetricValue::try_bytes(Bytes::from(value))?
-            }
-        };
-        if available
-            .insert(metric, StatisticsMetricState::Available(value))
-            .is_some()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg provider statistics contain a duplicate metric",
-            ));
-        }
-    }
-    Ok(requested
-        .metrics()
-        .iter()
-        .map(|metric| {
-            let state = available.get(metric).cloned().unwrap_or_else(|| {
-                StatisticsMetricState::Missing(StatisticsMissing {
-                    kind: StatisticsMissingKind::NotCollected,
-                    message: Arc::from(
-                        "metric was not present in the published statistics artifact",
-                    ),
-                })
-            });
-            (metric.clone(), state)
-        })
-        .collect())
-}
 
 /// Build the physical layout from the metadata serialized into the resolved
 /// table handle.  In particular, this must not call `load_table`: durable
@@ -404,446 +225,7 @@ fn statistics_scan_layout(
         .collect()
 }
 
-/// Provider-owned, secret-free declaration used to install an Iceberg read
-/// instance into a BE.  Catalog clients and credentials deliberately do not
-/// cross this boundary: the installer resolves the named binding from process
-/// startup composition.
-#[derive(Deserialize, Serialize)]
-struct IcebergDeclarationV1 {
-    version: u16,
-    access_binding: String,
-}
-
-#[derive(Clone)]
-struct IcebergInstanceDistribution {
-    descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
-}
-
-impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
-    fn declaration(
-        &self,
-        context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        if context.cancellation().is_cancelled() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Cancelled,
-                "connector request was cancelled",
-            ));
-        }
-        if Instant::now() >= context.deadline() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::DeadlineExceeded,
-                "connector request deadline elapsed",
-            ));
-        }
-        ConnectorExecutionDeclaration::try_new(
-            self.descriptor.clone(),
-            self.incarnation,
-            encode_payload(
-                &IcebergDeclarationV1 {
-                    version: ICEBERG_DECLARATION_V1,
-                    access_binding: DEFAULT_ACCESS_BINDING.to_string(),
-                },
-                "Iceberg execution declaration",
-                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            )?,
-        )
-    }
-}
-
-/// Core application adapter around the provider-owned process-local binding.
-/// Core adds only the writer-specific object-store projection below; access
-/// resolution and file-runtime ownership remain in the provider crate.
-pub use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-
-/// Recreate the Core writer's provider-private storage configuration from a
-/// BE startup binding. Credentials remain local to the exact incarnation.
-pub(crate) fn write_object_store_config(
-    binding: &IcebergReadBinding,
-    data_location: &str,
-) -> Result<Option<super::sink_plan::IcebergSinkObjectStoreConfig>, String> {
-    let Some(bucket) = super::changes::expected_object_store_bucket_from_location(data_location)?
-    else {
-        return Ok(None);
-    };
-    let config = binding.object_store_config().ok_or_else(|| {
-        format!("Iceberg connector writer needs a startup object-store binding for bucket {bucket}")
-    })?;
-    Ok(Some(super::sink_plan::IcebergSinkObjectStoreConfig {
-        endpoint: config.endpoint.clone(),
-        bucket,
-        access_key_id: config.access_key_id.clone(),
-        access_key_secret: config.access_key_secret.clone(),
-        session_token: config.session_token.clone(),
-        region: config.region.clone(),
-        enable_path_style_access: config.enable_path_style_access,
-        retry_max_times: config.retry_max_times,
-        retry_min_delay_ms: config.retry_min_delay_ms,
-        retry_max_delay_ms: config.retry_max_delay_ms,
-        timeout_ms: config.timeout_ms,
-        io_timeout_ms: config.io_timeout_ms,
-    }))
-}
-
-/// Startup-composed installer for Iceberg read-only instances.  The payload
-/// identifies the binding but cannot override it with cloud properties.
-pub struct IcebergConnectorInstaller {
-    provider_id: ConnectorProviderId,
-    binding: IcebergReadBinding,
-}
-
-impl IcebergConnectorInstaller {
-    pub fn new(binding: IcebergReadBinding) -> Self {
-        Self {
-            provider_id: ConnectorProviderId::parse(PROVIDER_ID)
-                .expect("static Iceberg provider ID is valid"),
-            binding,
-        }
-    }
-}
-
-impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
-    fn provider_id(&self) -> &ConnectorProviderId {
-        &self.provider_id
-    }
-
-    fn install(
-        &self,
-        declaration: &ConnectorExecutionDeclaration,
-        _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        if declaration.descriptor().provider_id != self.provider_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg installer received a declaration for another provider",
-            ));
-        }
-        let payload: IcebergDeclarationV1 =
-            decode_payload(declaration.payload(), "Iceberg execution declaration")?;
-        if payload.version != ICEBERG_DECLARATION_V1 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                format!(
-                    "unsupported Iceberg execution declaration version {}",
-                    payload.version
-                ),
-            ));
-        }
-        if payload.access_binding != self.binding.access_binding() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg declaration access binding does not match BE startup binding",
-            ));
-        }
-        let key = declaration.binding_key();
-        ConnectorExecutionBinding::try_new_capabilities(
-            self.provider_id.clone(),
-            key.clone(),
-            Some(Arc::new(IcebergReadOnlyConnectorInstance {
-                key: key.clone(),
-                binding: self.binding.clone(),
-            })),
-            Some(Arc::new(IcebergDataWriteExecution::new(
-                key,
-                self.binding.clone(),
-            ))),
-        )
-    }
-}
-
-/// BE-only instance installed through the binding control plane. Metadata and
-/// planning are deliberately unsupported: it materializes only the frozen
-/// membership carried by one FE split into sealed local units.
-struct IcebergReadOnlyConnectorInstance {
-    key: ConnectorExecutionBindingKey,
-    binding: IcebergReadBinding,
-}
-
-impl IcebergReadOnlyConnectorInstance {
-    fn validate_context(
-        &self,
-        context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<(), ConnectorError> {
-        if context.cancellation().is_cancelled() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Cancelled,
-                "connector request was cancelled",
-            ));
-        }
-        if Instant::now() >= context.deadline() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::DeadlineExceeded,
-                "connector request deadline elapsed",
-            ));
-        }
-        Ok(())
-    }
-
-    fn prepare_split(
-        &self,
-        split: &ConnectorSplit,
-        request: ConnectorPrepareSplitRequest,
-    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
-        request.check_active()?;
-        ensure_owner(split.owner(), &self.key.instance_id)?;
-        let payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
-        validate_split_payload(&payload)?;
-        if payload.owner_instance_id != self.key.instance_id.as_str()
-            || payload.incarnation != self.key.incarnation.to_bytes()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg split does not belong to this installed instance incarnation",
-            ));
-        }
-        if let Some(metadata) = payload.metadata {
-            let shared_payload = encode_payload(
-                &IcebergPreparedSplitSharedPayload {
-                    version: ICEBERG_PREPARED_SPLIT_SHARED_V2,
-                    owner_instance_id: payload.owner_instance_id,
-                    incarnation: payload.incarnation,
-                    namespace: payload.namespace,
-                    table: payload.table,
-                    snapshot_id: payload.snapshot_id,
-                    table_uuid: payload.table_uuid,
-                    schema_id: payload.schema_id,
-                    projection: payload.projection,
-                    limit: payload.limit,
-                    physical_predicates: payload.physical_predicates,
-                    fact_columns: payload.fact_columns,
-                    name_mapping: payload.name_mapping,
-                    delta: payload.delta,
-                    distributed_rewrite_position: payload.distributed_rewrite_position,
-                    metadata: Some(metadata),
-                },
-                "prepared metadata split shared payload",
-                request.context.max_handle_payload_bytes(),
-            )?;
-            let descriptor = ConnectorPreparedScanUnitDescriptor::try_new(
-                encode_payload(
-                    &IcebergPreparedMetadataUnitPayloadV1 { version: 1 },
-                    "prepared metadata scan unit payload",
-                    request.context.max_handle_payload_bytes(),
-                )?,
-                None,
-                ConnectorScanUnitDomainFacts::missing(
-                    novarocks_spi::connector::ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
-                ),
-            )?;
-            return ConnectorPreparedScanUnitSet::try_new_with_preparation_evidence(
-                self.key.clone(),
-                split,
-                shared_payload,
-                vec![descriptor],
-                Some("metadata"),
-                &request,
-            );
-        }
-        if payload.units.is_empty() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg split has no frozen scan units",
-            ));
-        }
-        if (payload.delta.is_some() || payload.distributed_rewrite_position.is_some())
-            && payload.units.len() != 1
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg special scan split must carry exactly one frozen unit",
-            ));
-        }
-        let special_unit =
-            payload.delta.is_some() || payload.distributed_rewrite_position.is_some();
-        let fact_columns = payload.fact_columns.clone();
-        let facts_are_conservative =
-            payload.limit.is_some() || !payload.physical_predicates.is_empty() || special_unit;
-        let shared_payload = encode_payload(
-            &IcebergPreparedSplitSharedPayload {
-                version: ICEBERG_PREPARED_SPLIT_SHARED_V2,
-                owner_instance_id: payload.owner_instance_id,
-                incarnation: payload.incarnation,
-                namespace: payload.namespace,
-                table: payload.table,
-                snapshot_id: payload.snapshot_id,
-                table_uuid: payload.table_uuid,
-                schema_id: payload.schema_id,
-                projection: payload.projection,
-                limit: payload.limit,
-                physical_predicates: payload.physical_predicates,
-                fact_columns: payload.fact_columns,
-                name_mapping: payload.name_mapping,
-                delta: payload.delta,
-                distributed_rewrite_position: payload.distributed_rewrite_position,
-                metadata: None,
-            },
-            "prepared split shared payload",
-            request.context.max_handle_payload_bytes(),
-        )?;
-        let units =
-            materialize_local_scan_units(&self.binding, payload.units, special_unit, &request)?;
-        let leaf_kind = if units.iter().any(|unit| unit.row_groups.is_some()) {
-            "row_group"
-        } else {
-            "file"
-        };
-        let mut inspections = HashMap::<String, ParquetMetadataInspection>::new();
-        let descriptors = units
-            .into_iter()
-            .map(|unit| {
-                request.check_active()?;
-                let facts = iceberg_unit_domain_facts(
-                    &self.binding,
-                    &mut inspections,
-                    &unit,
-                    &fact_columns,
-                    facts_are_conservative
-                        || !unit.data_file.delete_files.is_empty()
-                        || unit.data_file.included_positions.is_some(),
-                    special_unit,
-                    &request,
-                )?;
-                ConnectorPreparedScanUnitDescriptor::try_new(
-                    encode_payload(
-                        &IcebergPreparedUnitPayload {
-                            version: ICEBERG_PREPARED_SCAN_UNIT_V1,
-                            data_file: unit.data_file,
-                            row_groups: unit.row_groups,
-                        },
-                        "prepared scan unit payload",
-                        request.context.max_handle_payload_bytes(),
-                    )?,
-                    unit.estimated_bytes,
-                    facts,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let prepared = ConnectorPreparedScanUnitSet::try_new_with_preparation_evidence(
-            self.key.clone(),
-            split,
-            shared_payload,
-            descriptors,
-            Some(leaf_kind),
-            &request,
-        )?;
-        Ok(prepared)
-    }
-
-    fn open_unit_reader(
-        &self,
-        unit: &ConnectorPreparedScanUnit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        self.validate_context(&request.context)?;
-        if unit.binding_key() != &self.key {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg prepared scan unit belongs to another installed instance incarnation",
-            ));
-        }
-        let shared: IcebergPreparedSplitSharedPayload = decode_payload(
-            unit.shared_payload(),
-            "Iceberg prepared split shared payload",
-        )?;
-        if let Some(metadata) = shared.metadata {
-            if shared.owner_instance_id != self.key.instance_id.as_str()
-                || shared.incarnation != self.key.incarnation.to_bytes()
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg metadata prepared unit does not belong to this installed instance incarnation",
-                ));
-            }
-            return super::metadata::open_metadata_connector_reader(
-                metadata.metadata_table_type,
-                metadata.serialized_table,
-                metadata.serialized_payload,
-                request.expected_schema.clone(),
-                request.batch,
-                request.context,
-            );
-        }
-        let prepared: IcebergPreparedUnitPayload =
-            decode_payload(unit.payload(), "Iceberg prepared scan unit")?;
-        validate_prepared_payload(&shared, &prepared)?;
-        if shared.owner_instance_id != self.key.instance_id.as_str()
-            || shared.incarnation != self.key.incarnation.to_bytes()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg prepared scan unit does not belong to this installed instance incarnation",
-            ));
-        }
-        if let Some(delta) = shared.delta {
-            return super::delta_reader::IcebergDeltaBatchReader::try_new(
-                delta.source,
-                delta.delete_side,
-                self.binding.clone(),
-                request,
-            )
-            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
-        }
-        if let Some(rewrite_position) = shared.distributed_rewrite_position {
-            return super::distributed_rewrite_reader::IcebergRewritePositionBatchReader::try_new(
-                prepared.data_file,
-                rewrite_position,
-                self.binding.clone(),
-                request,
-            )
-            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
-        }
-        let file_context = self.binding.file_read_context(
-            novarocks_fs::FileCancellation::new(),
-            request.context.deadline(),
-        )?;
-        // A split is the authorization unit for its data file and every
-        // provider-planned delete side file. Resolve one least-common access
-        // root up front so partitioned data and sibling delete staging paths
-        // remain inside the same explicit capability.
-        let access = self.binding.resolve_access_for_locations(
-            std::iter::once(prepared.data_file.path.as_str()).chain(
-                prepared
-                    .data_file
-                    .delete_files
-                    .iter()
-                    .map(|delete| delete.path.as_str()),
-            ),
-        )?;
-        IcebergBatchReader::try_new_with_name_mapping_and_row_groups(
-            &prepared.data_file,
-            &shared.physical_predicates,
-            shared.name_mapping.as_deref(),
-            prepared.row_groups.as_deref(),
-            access,
-            request,
-            file_context,
-        )
-        .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
-    }
-}
-
-impl ConnectorReadExecution for IcebergReadOnlyConnectorInstance {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.key
-    }
-
-    fn prepare_split(
-        &self,
-        split: &ConnectorSplit,
-        request: ConnectorPrepareSplitRequest,
-    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
-        self.prepare_split(split, request)
-    }
-
-    fn open_unit_reader(
-        &self,
-        unit: &ConnectorPreparedScanUnit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        self.open_unit_reader(unit, request)
-    }
-}
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 
 #[derive(Clone)]
 pub(crate) struct IcebergControlProvider {
@@ -852,6 +234,11 @@ pub(crate) struct IcebergControlProvider {
     incarnation: ConnectorInstanceIncarnation,
     binding_key: ConnectorExecutionBindingKey,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
+    /// FE-local filesystem capability used only to refine already-authorized
+    /// files into frozen row-group units. It is injected by composition;
+    /// absent legacy construction fails closed rather than discovering a
+    /// process-global Tokio runtime or credentials.
+    planning_binding: Option<IcebergReadBinding>,
     snapshot_memberships: Arc<SnapshotMembershipCache>,
     recovery_cleanup_outcomes:
         Arc<Mutex<HashMap<ConnectorMutationOperationId, IcebergRecoveryCleanupRecord>>>,
@@ -865,143 +252,6 @@ struct IcebergRecoveryCleanupRecord {
     observation_digest: [u8; 32],
 }
 
-/// Provider-private, bounded description of exactly the ref that an
-/// inspection proved safe to clean up. It is only carried back as opaque SPI
-/// proof; the frontend never interprets these fields.
-#[derive(Clone, Deserialize, Serialize)]
-struct IcebergStagedPublicationProofV1 {
-    version: u16,
-    descriptor_digest: Vec<u8>,
-    namespace: String,
-    table: String,
-    table_uuid: String,
-    staging_ref: String,
-    staging_snapshot_id: Option<i64>,
-    target_ref: String,
-    target_snapshot_id: Option<i64>,
-    refresh_id: i64,
-    mv_id: i64,
-    marker_token: String,
-}
-
-/// Provider-private, bounded evidence used only to decide an ambiguous
-/// external catalog commit. It intentionally contains no catalog handle,
-/// credentials, parser AST, or runtime object.
-#[derive(Deserialize, Serialize)]
-struct IcebergMutationEvidenceV1 {
-    version: u16,
-    target: IcebergMutationEvidenceTarget,
-}
-
-/// Minimal, secret-free proof needed to determine whether an uncertain Puffin
-/// publication reached the catalog.  The operation-specific path is both the
-/// idempotency key and the orphan-cleanup target; it is never a replacement
-/// statistics authority.
-#[derive(Deserialize, Serialize)]
-struct IcebergStatisticsEvidenceV1 {
-    version: u16,
-    namespace: String,
-    table: String,
-    data_version: Vec<u8>,
-    statistics_path: String,
-}
-
-/// Exact scalar evidence collected from visible rows and stored alongside the
-/// standard Theta blobs.  This is provider-private persisted data: Core sees
-/// only the typed `StatisticsEvidence` reconstructed from it.
-#[derive(Deserialize, Serialize)]
-struct IcebergProviderStatisticsV1 {
-    version: u16,
-    data_version: Vec<u8>,
-    metrics: Vec<IcebergProviderStatisticV1>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "metric", rename_all = "snake_case")]
-enum IcebergProviderStatisticV1 {
-    RowCount {
-        value: IcebergStatisticValueV1,
-    },
-    NullCount {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    Minimum {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    Maximum {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    AverageSize {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-    ThetaNdv {
-        column: String,
-        value: IcebergStatisticValueV1,
-    },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
-enum IcebergStatisticValueV1 {
-    U64(u64),
-    I64(i64),
-    F64(f64),
-    Bytes(Vec<u8>),
-}
-
-#[derive(Deserialize, Serialize)]
-enum IcebergMutationEvidenceTarget {
-    Namespace {
-        namespace: String,
-        should_exist: bool,
-    },
-    Table {
-        namespace: String,
-        table: String,
-        should_exist: bool,
-        before_uuid: Option<String>,
-    },
-    View {
-        namespace: String,
-        view: String,
-        should_exist: bool,
-    },
-    TableVersion {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        before_metadata_location: Option<String>,
-    },
-    BootstrapEmptyTableSnapshot {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        operation_marker: String,
-    },
-    Ref {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        ref_name: String,
-        expected_snapshot_id: Option<i64>,
-    },
-    GuardedFastForward {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        before_metadata_location: Option<String>,
-        source_branch: String,
-        target_branch: String,
-        source_snapshot_id: i64,
-        expected_target_snapshot_id: Option<i64>,
-        guard_digest: [u8; 32],
-    },
-}
-
 impl IcebergControlProvider {
     /// Creates the FE-only control binding for a logical Iceberg catalog. The
     /// implementation remains in core until SPI-5, but its runtime capability
@@ -1009,6 +259,14 @@ impl IcebergControlProvider {
     pub(crate) fn new_control(
         instance_id: ConnectorInstanceId,
         registry: Arc<RwLock<IcebergCatalogRegistry>>,
+    ) -> Result<ConnectorControlBinding, ConnectorError> {
+        Self::new_control_with_planning_binding(instance_id, registry, None)
+    }
+
+    pub(crate) fn new_control_with_planning_binding(
+        instance_id: ConnectorInstanceId,
+        registry: Arc<RwLock<IcebergCatalogRegistry>>,
+        planning_binding: Option<IcebergReadBinding>,
     ) -> Result<ConnectorControlBinding, ConnectorError> {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)?,
@@ -1026,7 +284,7 @@ impl IcebergControlProvider {
         };
         let staged_create_supported = matches!(
             control_entry.kind,
-            super::catalog::registry::IcebergCatalogKind::Rest
+            novarocks_connector_iceberg::catalog_config::IcebergCatalogKind::Rest
         );
         let write_key = ConnectorExecutionBindingKey {
             instance_id: descriptor.instance_id.clone(),
@@ -1038,6 +296,7 @@ impl IcebergControlProvider {
             incarnation,
             binding_key: write_key.clone(),
             registry: Arc::clone(&registry),
+            planning_binding,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
@@ -1092,10 +351,7 @@ impl IcebergControlProvider {
             incarnation,
             provider.clone(),
             provider.clone(),
-            Arc::new(IcebergInstanceDistribution {
-                descriptor,
-                incarnation,
-            }),
+            Arc::new(IcebergInstanceDistribution::new(descriptor, incarnation)),
             Some(provider.clone()),
             Some(data_mutation),
             Some(metadata_maintenance),
@@ -1264,11 +520,11 @@ impl IcebergControlProvider {
                 }
             }
         };
-        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+        let payload = encode_mutation_evidence(&IcebergMutationEvidenceV1 {
             version: ICEBERG_MUTATION_EVIDENCE_VERSION,
             target,
         })
-        .map_err(|error| internal(format!("encode Iceberg mutation evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_MUTATION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1301,11 +557,11 @@ impl IcebergControlProvider {
             expected_target_snapshot_id,
             guard_digest: guard.digest(),
         };
-        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+        let payload = encode_mutation_evidence(&IcebergMutationEvidenceV1 {
             version: ICEBERG_MUTATION_EVIDENCE_VERSION,
             target,
         })
-        .map_err(|error| internal(format!("encode Iceberg mutation evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_MUTATION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1329,11 +585,11 @@ impl IcebergControlProvider {
             table_uuid: loaded.table.metadata().uuid().to_string(),
             operation_marker: operation_marker.to_string(),
         };
-        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+        let payload = encode_mutation_evidence(&IcebergMutationEvidenceV1 {
             version: ICEBERG_MUTATION_EVIDENCE_VERSION,
             target,
         })
-        .map_err(|error| internal(format!("encode Iceberg bootstrap evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_MUTATION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1701,14 +957,14 @@ impl IcebergControlProvider {
         data_version: &StatisticsDataVersion,
         statistics_path: &str,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
-        let payload = serde_json::to_vec(&IcebergStatisticsEvidenceV1 {
+        let payload = encode_statistics_evidence(&IcebergStatisticsEvidenceV1 {
             version: ICEBERG_STATISTICS_EVIDENCE_VERSION,
             namespace: table.namespace.clone(),
             table: table.table.clone(),
             data_version: data_version.as_bytes().to_vec(),
             statistics_path: statistics_path.to_string(),
         })
-        .map_err(|error| internal(format!("encode Iceberg statistics evidence: {error}")))?;
+        .map_err(internal)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_STATISTICS_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1844,7 +1100,7 @@ impl IcebergControlProvider {
             })
             .collect::<Vec<_>>();
         let schema = super::schema::build_projected_output_schema_from_scan_model(
-            &iceberg_schema_def_for_codegen(loaded.table.metadata().current_schema()),
+            &iceberg_schema_def(loaded.table.metadata().current_schema()),
             &columns,
         )
         .map_err(|error| internal(format!("build Iceberg projected schema: {error}")))?;
@@ -1864,15 +1120,15 @@ impl IcebergControlProvider {
         )
         .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
         let mut storage_fields = storage_schema.fields().to_vec();
-        if super::catalog::backend::row_lineage_enabled(loaded.table.metadata()) {
+        if row_lineage_enabled(loaded.table.metadata()) {
             storage_fields.extend([
                 Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+                    iceberg_row_lineage::ICEBERG_ROW_ID_COL,
                     DataType::Int64,
                     false,
                 )),
                 Arc::new(Field::new(
-                    novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL,
                     DataType::Int64,
                     true,
                 )),
@@ -1892,8 +1148,8 @@ impl IcebergControlProvider {
                         format!("Iceberg rewrite projection index {index} is outside the table schema"),
                     )
                 })?;
-                if novarocks_execution::exec::row_position::is_iceberg_row_id(storage_field.name())
-                    || novarocks_execution::exec::row_position::is_iceberg_last_updated_sequence_number(
+                if iceberg_row_lineage::is_iceberg_row_id(storage_field.name())
+                    || iceberg_row_lineage::is_iceberg_last_updated_sequence_number(
                         storage_field.name(),
                     )
                 {
@@ -2464,8 +1720,8 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 evidence: request.evidence,
             });
         }
-        let decoded: IcebergMutationEvidenceV1 =
-            serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
+        let decoded =
+            decode_mutation_evidence(request.evidence.provider_payload()).map_err(|error| {
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     format!("decode Iceberg mutation evidence: {error}"),
@@ -2673,7 +1929,7 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
             mv_id: descriptor.mv_id,
             marker_token: descriptor.marker_token.to_string(),
         };
-        let proof = serde_json::to_vec(&proof)
+        let proof = encode_staged_publication_proof(&proof)
             .map(Bytes::from)
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
@@ -2712,13 +1968,14 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
         {
             return Ok(outcome);
         }
-        let proof: IcebergStagedPublicationProofV1 =
-            serde_json::from_slice(request.observation.proof.payload()).map_err(|error| {
+        let proof = decode_staged_publication_proof(request.observation.proof.payload()).map_err(
+            |error| {
                 ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
                     format!("invalid Iceberg staged publication cleanup proof: {error}"),
                 )
-            })?;
+            },
+        )?;
         if proof.version != ICEBERG_STAGED_PUBLICATION_PROOF_VERSION
             || proof.descriptor_digest.as_slice() != request.descriptor_digest
             || proof.staging_snapshot_id != request.observation.staging_snapshot_id
@@ -3052,13 +2309,14 @@ fn source_snapshot_id_from_committed_version(
             "Iceberg guarded publication requires a snapshot-bearing committed version",
         )
     })?;
-    let decoded = super::write_contract::decode_write_receipt(committed_version.payload())
-        .map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("decode Iceberg committed version for guarded publication: {error}"),
-            )
-        })?;
+    let decoded =
+        novarocks_connector_iceberg::write_codec::decode_write_receipt(committed_version.payload())
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!("decode Iceberg committed version for guarded publication: {error}"),
+                )
+            })?;
     if decoded != snapshot_id {
         return Err(ConnectorError::new(
             ConnectorErrorKind::CorruptData,
@@ -3986,6 +3244,8 @@ impl ConnectorMetadata for IcebergControlProvider {
             &loaded.table.metadata().uuid().to_string(),
             loaded.table.metadata().current_snapshot_id(),
         )?;
+        let definition_schema = loaded.table.metadata().current_schema().clone();
+        let table_comment = loaded.table.metadata().properties().get("comment").cloned();
         let table = build_table_payload(
             self.instance_id.as_str(),
             &request.table.namespace,
@@ -4004,6 +3264,32 @@ impl ConnectorMetadata for IcebergControlProvider {
                 &[],
             )?
         };
+        let planning_facts = novarocks_connector_iceberg::planning_facts::table_planning_facts(
+            novarocks_connector_iceberg::planning_facts::IcebergTablePlanningFactsInput {
+                schema: &schema,
+                metadata_columns: &table.metadata_columns,
+                hidden_columns: &table.hidden_columns,
+                logical_type_columns: &table.logical_type_columns,
+                serialized_metadata: table
+                    .table_info
+                    .as_ref()
+                    .and_then(|info| info.serialized_metadata.as_deref()),
+                namespace: &request.table.namespace,
+                instance_id: &self.instance_id,
+                context: &request.context,
+            },
+        )?;
+        let definition_facts = if table.metadata_table_type.is_some() {
+            novarocks_spi::connector::ConnectorTableDefinitionFacts::empty()
+        } else {
+            novarocks_connector_iceberg::table_definition::table_definition_facts(
+                &definition_schema,
+                &schema,
+                &planning_facts,
+                table_comment.as_deref(),
+                &request.context,
+            )?
+        };
         Ok(ConnectorTableMetadata {
             identity: novarocks_spi::connector::ConnectorTableIdentity {
                 instance_id: self.instance_id.clone(),
@@ -4011,6 +3297,8 @@ impl ConnectorMetadata for IcebergControlProvider {
                 table: Arc::from(table_name),
             },
             schema,
+            planning_facts,
+            definition_facts,
             version,
             statistics_data_version: Some(statistics_data_version),
             table: ConnectorTableHandle::try_new(
@@ -4229,7 +3517,7 @@ impl StatisticsReader for IcebergControlProvider {
         )))?;
         if let Some(statistics_path) = statistics_path {
             let artifact = super::catalog::registry::block_on_iceberg(
-                super::stats_assembler::read_provider_statistics_blob(
+                novarocks_connector_iceberg::stats_assembler::read_provider_statistics_blob(
                     loaded.table.file_io(),
                     statistics_path,
                 ),
@@ -4462,11 +3750,12 @@ impl StatisticsCollection for IcebergControlProvider {
                 "cannot publish Iceberg statistics for a table without a snapshot",
             )
         })?;
-        let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
-            metadata,
-            snapshot_id,
-            request.operation_id.to_bytes(),
-        );
+        let statistics_path =
+            novarocks_connector_iceberg::stats_assembler::puffin_path_for_statistics_operation(
+                metadata,
+                snapshot_id,
+                request.operation_id.to_bytes(),
+            );
         self.statistics_evidence(
             request.operation_id,
             &table,
@@ -4579,11 +3868,12 @@ impl StatisticsCollection for IcebergControlProvider {
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
             sketches.insert(*field_id, sketch);
         }
-        let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
-            metadata,
-            snapshot_id,
-            request.operation_id.to_bytes(),
-        );
+        let statistics_path =
+            novarocks_connector_iceberg::stats_assembler::puffin_path_for_statistics_operation(
+                metadata,
+                snapshot_id,
+                request.operation_id.to_bytes(),
+            );
         let expected_evidence = self.statistics_evidence(
             request.operation_id,
             &table,
@@ -4597,7 +3887,7 @@ impl StatisticsCollection for IcebergControlProvider {
             )));
         }
         let written = super::catalog::registry::block_on_iceberg(
-            super::stats_assembler::write_puffin_with_provider_statistics(
+            novarocks_connector_iceberg::stats_assembler::write_puffin_with_provider_statistics(
                 loaded.table.file_io(),
                 &statistics_path,
                 snapshot_id,
@@ -4667,8 +3957,8 @@ impl StatisticsCollection for IcebergControlProvider {
         request: StatisticsReconcileRequest,
     ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
         self.validate_context(&request.context)?;
-        let evidence: IcebergStatisticsEvidenceV1 =
-            serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
+        let evidence =
+            decode_statistics_evidence(request.evidence.provider_payload()).map_err(|error| {
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     format!("decode Iceberg statistics evidence: {error}"),
@@ -4753,7 +4043,7 @@ fn metric_state_f64(value: &StatValue<f64>) -> StatisticsMetricState {
 /// the manifest fast path exact without reconstructing a count from a lossy
 /// floating-point null fraction.
 fn manifest_null_count(
-    files: &[super::catalog::registry::DataFileWithStats],
+    files: &[novarocks_connector_iceberg::manifest::DataFileWithStats],
     column: &str,
 ) -> StatisticsMetricState {
     let total = files.iter().try_fold(0_u64, |total, file| {
@@ -4780,7 +4070,7 @@ fn manifest_null_count(
 
 fn manifest_evidence_is_complete(
     row_count: &StatValue<u64>,
-    files: &[super::catalog::registry::DataFileWithStats],
+    files: &[novarocks_connector_iceberg::manifest::DataFileWithStats],
 ) -> bool {
     matches!(row_count, StatValue::Known { .. })
         && files.iter().all(|file| file.delete_files.is_empty())
@@ -4884,9 +4174,18 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 &request.projection,
             )?,
         };
+        let selector = match request.selection {
+            ConnectorScanSelection::Snapshot(selector) => selector,
+            ConnectorScanSelection::ChangeWindow(_) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "legacy Core Iceberg control does not admit change-window scans",
+                ));
+            }
+        };
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
             (None, None)
-        } else if matches!(request.selector, ConnectorReadSelector::Current) {
+        } else if matches!(selector, ConnectorReadSelector::Current) {
             let table_info = table.table_info.as_ref().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
@@ -4898,8 +4197,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 table_info.table_uuid.clone(),
             )
         } else {
-            let (snapshot_id, table_uuid) =
-                self.select_snapshot(&entry, &table, request.selector)?;
+            let (snapshot_id, table_uuid) = self.select_snapshot(&entry, &table, selector)?;
             (snapshot_id, Some(table_uuid))
         };
         let (physical_predicates, predicate_dispositions) =
@@ -4914,8 +4212,10 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             physical_predicates,
             fact_columns,
         };
-        Ok(ConnectorScan {
-            handle: ConnectorScanHandle::try_new(
+        ConnectorScan::try_new_snapshot(
+            self.binding_key.clone(),
+            selector,
+            ConnectorScanHandle::try_new(
                 self.instance_id.clone(),
                 encode_payload(
                     &payload,
@@ -4925,7 +4225,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             )?,
             output_schema,
             predicate_dispositions,
-        })
+        )
     }
 
     fn plan_splits(
@@ -4960,7 +4260,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 extract_data_files_with_stats_at(&loaded.table, snapshot_id)
                     .map_err(map_iceberg_error)?
                     .into_iter()
-                    .map(super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+                    .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
                     .collect()
             }
         };
@@ -5034,11 +4334,12 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         // Freeze row-group membership at the FE while the catalog snapshot and
         // object-store capability are still pinned. BE preparation preserves a
         // non-empty `row_groups` selection verbatim and never re-plans it.
-        let planning_binding = IcebergReadBinding::default_binding(
-            self.entry(self.instance_id.as_str())?
-                .object_store_config()
-                .cloned(),
-        )?;
+        let planning_binding = self.planning_binding.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "Iceberg control generation has no composed filesystem planning resources",
+            )
+        })?;
         let leaves = materialize_local_scan_units(
             &planning_binding,
             leaves,
@@ -5299,7 +4600,9 @@ impl IcebergControlProvider {
             delta: None,
             distributed_rewrite_position: None,
             metadata: Some(IcebergMetadataSplitPayloadV1 {
-                metadata_table_type,
+                metadata_table_type: super::metadata::provider_metadata_table_type(
+                    metadata_table_type,
+                ),
                 serialized_table,
                 serialized_payload,
             }),
@@ -5682,7 +4985,7 @@ fn build_table_payload(
         prepared_files = data_files
             .iter()
             .cloned()
-            .map(super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+            .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
             .collect();
     }
     let mut table_info = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
@@ -5693,9 +4996,7 @@ fn build_table_payload(
         current_snapshot_id: metadata_table.metadata().current_snapshot_id(),
         schema_id: metadata_table.metadata().current_schema_id(),
         location: metadata_table.metadata().location().to_string(),
-        schema: super::catalog::backend::iceberg_schema_def_for_codegen(
-            metadata_table.metadata().current_schema(),
-        ),
+        schema: iceberg_schema_def(metadata_table.metadata().current_schema()),
         serialized_metadata: Some(
             serde_json::to_string(metadata_table.metadata())
                 .map_err(|error| internal(format!("serialize Iceberg table metadata: {error}")))?,
@@ -5711,12 +5012,14 @@ fn build_table_payload(
         )
     ) {
         let rows = super::catalog::registry::block_on_iceberg(async {
-            crate::connector::iceberg::metadata_read::read_metadata_table_rows(
+            novarocks_connector_iceberg::metadata_read::read_metadata_table_rows(
                 &metadata_table,
                 &metadata_file_io,
-                metadata_table_type
-                    .clone()
-                    .expect("metadata table type is present"),
+                provider_metadata_table_type(
+                    metadata_table_type
+                        .as_ref()
+                        .expect("metadata table type is present"),
+                )?,
             )
             .await
         })
@@ -5740,6 +5043,23 @@ fn build_table_payload(
         hidden_columns,
         frozen_rewrite: None,
     })
+}
+
+fn provider_metadata_table_type(
+    ty: &super::IcebergMetadataTableType,
+) -> Result<novarocks_connector_iceberg::metadata_read::MetadataTableType, String> {
+    match ty {
+        super::IcebergMetadataTableType::Files => {
+            Ok(novarocks_connector_iceberg::metadata_read::MetadataTableType::Files)
+        }
+        super::IcebergMetadataTableType::Manifests => {
+            Ok(novarocks_connector_iceberg::metadata_read::MetadataTableType::Manifests)
+        }
+        super::IcebergMetadataTableType::LogicalIcebergMetadata => Ok(
+            novarocks_connector_iceberg::metadata_read::MetadataTableType::LogicalIcebergMetadata,
+        ),
+        other => Err(format!("provider metadata walk does not support {other:?}")),
+    }
 }
 
 /// Project only the SQL-visible Iceberg pseudo-column names into the provider
@@ -6476,7 +5796,7 @@ fn activate_iceberg_direct_row_mutation(
             ));
         }
     }
-    ConnectorRowMutationExecutionPlan::try_direct(routes)
+    ConnectorRowMutationExecutionPlan::try_direct(preparation.clone(), routes)
 }
 
 fn activate_iceberg_cow_row_mutation(
@@ -6579,7 +5899,12 @@ fn activate_iceberg_cow_row_mutation(
         routes.push(route);
     }
     let sealed = ConnectorSealedWriteCohortSet::try_new(preparation.operation_id(), descriptors)?;
-    ConnectorRowMutationExecutionPlan::try_copy_on_write(routes, sealed, recipes)
+    ConnectorRowMutationExecutionPlan::try_copy_on_write(
+        preparation.clone(),
+        routes,
+        sealed,
+        recipes,
+    )
 }
 
 fn iceberg_row_mutation_snapshot(
@@ -6724,65 +6049,18 @@ fn iceberg_row_mutation_route_payload(
     ))
 }
 
-/// Provider-private COW recipe. SQL/Core can retain, compare and pass its
-/// bytes, but only this module decodes the old-file identity or matched-row
-/// membership used to configure an Iceberg writer service.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IcebergCowRecipePayloadV1 {
-    version: u8,
-    role: String,
-    old_file: String,
-    matched_row_ids: Vec<i64>,
-}
-
 fn iceberg_cow_recipe_payload(
     role: &[u8],
     old_file: &str,
     row_ids: &[i64],
 ) -> Result<Bytes, ConnectorError> {
-    let role = std::str::from_utf8(role).map_err(|_| {
-        invalid_iceberg_row_mutation_activation("Iceberg COW recipe role is not UTF-8")
-    })?;
-    serde_json::to_vec(&IcebergCowRecipePayloadV1 {
-        version: 2,
-        role: role.to_string(),
-        old_file: old_file.to_string(),
-        matched_row_ids: row_ids.to_vec(),
-    })
-    .map(Bytes::from)
-    .map_err(|error| {
-        invalid_iceberg_row_mutation_activation(format!("encode Iceberg COW recipe: {error}"))
-    })
+    encode_cow_recipe(role, old_file, row_ids).map_err(invalid_iceberg_row_mutation_activation)
 }
 
 fn decode_iceberg_cow_recipe_payload(
     payload: &Bytes,
 ) -> Result<IcebergCowRecipePayloadV1, ConnectorError> {
-    let recipe = serde_json::from_slice::<IcebergCowRecipePayloadV1>(payload).map_err(|error| {
-        invalid_iceberg_row_mutation_activation(format!("decode Iceberg COW recipe: {error}"))
-    })?;
-    if recipe.version != 2
-        || !matches!(recipe.role.as_str(), "rewrite" | "append")
-        || (recipe.role == "rewrite"
-            && (recipe.old_file.is_empty() || recipe.matched_row_ids.is_empty()))
-        || (recipe.role == "append"
-            && (!recipe.old_file.is_empty() || !recipe.matched_row_ids.is_empty()))
-    {
-        return Err(invalid_iceberg_row_mutation_activation(
-            "Iceberg COW recipe has an invalid role or payload shape",
-        ));
-    }
-    if recipe
-        .matched_row_ids
-        .windows(2)
-        .any(|pair| pair[0] >= pair[1])
-    {
-        return Err(invalid_iceberg_row_mutation_activation(
-            "Iceberg COW recipe row identities are not strictly ordered",
-        ));
-    }
-    Ok(recipe)
+    decode_cow_recipe(payload).map_err(invalid_iceberg_row_mutation_activation)
 }
 
 /// Resolve the physical COW base solely inside the Iceberg adapter.  The
@@ -6856,8 +6134,8 @@ fn iceberg_cow_rewrite_input(
 ) -> Result<ConnectorWriteInputShape, ConnectorError> {
     let contract = preparation.match_contract();
     let lineage = [
-        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        iceberg_row_lineage::ICEBERG_ROW_ID_COL,
+        iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL,
     ]
     .into_iter()
     .map(|name| {
@@ -7526,7 +6804,7 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
                     format!("reload Iceberg row-mutation target at activation: {error}"),
                 )
             })?
-            .table;
+            .into_table();
     let actual_snapshot_id = iceberg_ref_snapshot_from_metadata(table.metadata(), target_ref)?;
     if actual_snapshot_id != expected_snapshot_id {
         return Err(ConnectorError::new(
@@ -7982,8 +7260,8 @@ pub(crate) fn iceberg_data_sink_spec_from_preparation(
     if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
         iceberg.schema.fields.extend([
             novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                name: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                field_id: iceberg_row_lineage::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: iceberg_row_lineage::ICEBERG_ROW_ID_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -7991,8 +7269,9 @@ pub(crate) fn iceberg_data_sink_spec_from_preparation(
                 children: Vec::new(),
             },
             novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
-                field_id: novarocks_execution::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                name: novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                field_id:
+                    iceberg_row_lineage::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 initial_default: None,
                 write_default: None,
                 initial_default_json: None,
@@ -8044,7 +7323,7 @@ pub(crate) fn iceberg_row_write_sink_spec_from_preparation(
 ) -> Result<
     (
         IcebergWriteSinkSpec,
-        Option<Vec<super::commit::EqualityDeleteColumn>>,
+        Option<Vec<novarocks_connector_iceberg::commit::EqualityDeleteColumn>>,
     ),
     ConnectorError,
 > {
@@ -8206,11 +7485,11 @@ fn position_delete_columns_and_descriptor(
 ) -> Result<
     (
         Vec<novarocks_catalog::schema::ColumnDef>,
-        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
+        novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
     ),
     ConnectorError,
 > {
-    use crate::connector::iceberg::position_delete_descriptor::{
+    use novarocks_connector_iceberg::position_delete_descriptor::{
         ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
         ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         PositionDeleteOutputField, PositionDeletePartitionSourceField,
@@ -8225,12 +7504,12 @@ fn position_delete_columns_and_descriptor(
     let pos = identity_fields[1].field();
     if !file
         .name()
-        .eq_ignore_ascii_case(novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL)
+        .eq_ignore_ascii_case(iceberg_row_lineage::ICEBERG_FILE_PATH_COL)
         || file.data_type() != &DataType::Utf8
         || file.is_nullable()
         || !pos
             .name()
-            .eq_ignore_ascii_case(novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL)
+            .eq_ignore_ascii_case(iceberg_row_lineage::ICEBERG_ROW_POS_COL)
         || pos.data_type() != &DataType::Int64
         || pos.is_nullable()
     {
@@ -8283,7 +7562,7 @@ fn position_delete_columns_and_descriptor(
     }
     Ok((
         target_columns,
-        crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
+        novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput {
             file_path: PositionDeleteOutputField {
                 output_expr_index: 0,
                 name: ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
@@ -8308,7 +7587,7 @@ fn equality_delete_columns_from_preparation(
 ) -> Result<
     (
         Vec<novarocks_catalog::schema::ColumnDef>,
-        Vec<super::commit::EqualityDeleteColumn>,
+        Vec<novarocks_connector_iceberg::commit::EqualityDeleteColumn>,
     ),
     ConnectorError,
 > {
@@ -8339,7 +7618,7 @@ fn equality_delete_columns_from_preparation(
                 ))
             })?;
         columns.push(column_def_from_binding(binding));
-        equality_columns.push(super::commit::EqualityDeleteColumn {
+        equality_columns.push(novarocks_connector_iceberg::commit::EqualityDeleteColumn {
             name: field.name().to_string(),
             field_id: iceberg_field.id,
             data_type: field.data_type().clone(),
@@ -8586,25 +7865,6 @@ pub(crate) fn freeze_mv_target_reads(
     Ok((full, affected))
 }
 
-/// Freeze a delta snapshot window while the provider still owns the concrete
-/// Iceberg table identity.  The application receives only the resulting
-/// query-local runtime plan and never reads the provider table descriptor.
-pub(crate) fn freeze_delta_runtime_plan_from_materialization(
-    materialization: &IcebergQueryTableMaterialization,
-    entry: &super::catalog::IcebergCatalogEntry,
-    loaded: &novarocks_connector_iceberg::iceberg::table::Table,
-    from_snapshot_id: i64,
-    to_snapshot_id: i64,
-) -> Result<crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan, String> {
-    crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(
-        &materialization.table,
-        entry,
-        loaded,
-        from_snapshot_id,
-        to_snapshot_id,
-    )
-}
-
 pub(crate) fn filter_frozen_mv_target_state_files(
     files: Vec<IcebergDataFileInfo>,
     filter: &crate::mv::model::TargetPartitionFilter,
@@ -8799,7 +8059,7 @@ pub(crate) fn staged_iceberg_write_table_handle(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: metadata.current_schema_id(),
         location: metadata.location().to_string(),
-        schema: super::catalog::backend::iceberg_schema_def_for_codegen(metadata.current_schema()),
+        schema: iceberg_schema_def(metadata.current_schema()),
         serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
             internal(format!("serialize staged Iceberg write metadata: {error}"))
         })?),
@@ -8856,131 +8116,6 @@ struct ScanPayload {
     fact_columns: Vec<IcebergScanFactColumnV1>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct SplitPayload {
-    version: u16,
-    owner_instance_id: String,
-    incarnation: [u8; 16],
-    namespace: String,
-    table: String,
-    snapshot_id: Option<i64>,
-    #[serde(default)]
-    table_uuid: Option<String>,
-    #[serde(default)]
-    schema_id: Option<i32>,
-    units: Vec<IcebergFrozenScanUnitPayload>,
-    projection: Vec<usize>,
-    limit: Option<u64>,
-    #[serde(default)]
-    physical_predicates: Vec<IcebergPhysicalPredicate>,
-    #[serde(default)]
-    fact_columns: Vec<IcebergScanFactColumnV1>,
-    #[serde(default)]
-    name_mapping: Option<String>,
-    #[serde(default)]
-    delta: Option<IcebergDeltaSplitPayload>,
-    #[serde(default)]
-    distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
-    #[serde(default)]
-    metadata: Option<IcebergMetadataSplitPayloadV1>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct IcebergMetadataSplitPayloadV1 {
-    metadata_table_type: super::metadata::IcebergMetadataTableType,
-    serialized_table: String,
-    serialized_payload: String,
-}
-
-/// FE-frozen physical leaf. The outer split is intentionally a composite
-/// carrier; only this provider interprets the leaf membership.
-#[derive(Deserialize, Serialize)]
-struct IcebergFrozenScanUnitPayload {
-    data_file: IcebergDataFileInfo,
-    /// `Some` selects exactly those Parquet row groups. `None` denotes one
-    /// whole-file leaf (ORC and special Iceberg roles).
-    row_groups: Option<Vec<usize>>,
-    estimated_bytes: Option<u64>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct IcebergPreparedSplitSharedPayload {
-    version: u16,
-    owner_instance_id: String,
-    incarnation: [u8; 16],
-    namespace: String,
-    table: String,
-    snapshot_id: Option<i64>,
-    table_uuid: Option<String>,
-    schema_id: Option<i32>,
-    projection: Vec<usize>,
-    limit: Option<u64>,
-    physical_predicates: Vec<IcebergPhysicalPredicate>,
-    #[serde(default)]
-    fact_columns: Vec<IcebergScanFactColumnV1>,
-    name_mapping: Option<String>,
-    delta: Option<IcebergDeltaSplitPayload>,
-    distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
-    metadata: Option<IcebergMetadataSplitPayloadV1>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct IcebergPreparedUnitPayload {
-    version: u16,
-    data_file: IcebergDataFileInfo,
-    row_groups: Option<Vec<usize>>,
-}
-
-/// Metadata readers receive their frozen descriptor in the shared split
-/// payload. This marker keeps every generic prepared unit explicitly opaque
-/// and non-empty for protocol validation.
-#[derive(Deserialize, Serialize)]
-struct IcebergPreparedMetadataUnitPayloadV1 {
-    version: u16,
-}
-
-/// Provider-private description of one projected top-level Iceberg field.
-/// It binds the table-schema ordinal to the field ID, canonical name, and
-/// scalar vocabulary before a split crosses the FE/BE boundary.
-#[derive(Clone, Deserialize, Serialize)]
-struct IcebergScanFactColumnV1 {
-    field_ordinal: u32,
-    field_id: i32,
-    canonical_name: String,
-    scalar_type: IcebergScanFactScalarTypeV1,
-    nullable: bool,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-enum IcebergScanFactScalarTypeV1 {
-    Boolean,
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    Date32,
-    TimestampMicros,
-    TimestampNanos,
-    Utf8,
-    Binary,
-    Unsupported,
-}
-
-/// Provider-private maintenance split.  The C1 carrier only transports this
-/// opaque payload; it never learns Puffin metadata or deletion-vector rows.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IcebergRewritePositionSplitPayloadV1 {
-    pub(crate) version: u16,
-    pub(crate) selected_delete_files: Vec<IcebergDeleteFileInfo>,
-}
-
-const ICEBERG_REWRITE_POSITION_SPLIT_V1: u16 = 1;
-
-const ICEBERG_SPLIT_V5: u16 = 5;
-const ICEBERG_PREPARED_SPLIT_SHARED_V2: u16 = 2;
-const ICEBERG_PREPARED_SCAN_UNIT_V1: u16 = 1;
-
 fn scan_fact_columns(
     output_schema: &SchemaRef,
     projection: &[usize],
@@ -9034,7 +8169,7 @@ fn scan_fact_columns(
                 field_ordinal,
                 field_id: table_field.field_id,
                 canonical_name: table_field.name.to_ascii_lowercase(),
-                scalar_type: iceberg_scan_fact_scalar_type(field.data_type()),
+                scalar_type: scan_fact_scalar_type(field.data_type()),
                 nullable: field.is_nullable(),
             }))
         })
@@ -9047,26 +8182,6 @@ fn scan_fact_columns(
     // order so their constructor can reject duplicate or reordered entries.
     columns.sort_by_key(|column| column.field_ordinal);
     Ok(columns)
-}
-
-fn iceberg_scan_fact_scalar_type(data_type: &DataType) -> IcebergScanFactScalarTypeV1 {
-    match data_type {
-        DataType::Boolean => IcebergScanFactScalarTypeV1::Boolean,
-        DataType::Int8 => IcebergScanFactScalarTypeV1::Int8,
-        DataType::Int16 => IcebergScanFactScalarTypeV1::Int16,
-        DataType::Int32 => IcebergScanFactScalarTypeV1::Int32,
-        DataType::Int64 => IcebergScanFactScalarTypeV1::Int64,
-        DataType::Date32 => IcebergScanFactScalarTypeV1::Date32,
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
-            IcebergScanFactScalarTypeV1::TimestampMicros
-        }
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
-            IcebergScanFactScalarTypeV1::TimestampNanos
-        }
-        DataType::Utf8 => IcebergScanFactScalarTypeV1::Utf8,
-        DataType::Binary => IcebergScanFactScalarTypeV1::Binary,
-        _ => IcebergScanFactScalarTypeV1::Unsupported,
-    }
 }
 
 fn split_name_mapping(table: &TablePayload) -> Result<Option<String>, ConnectorError> {
@@ -9091,573 +8206,6 @@ fn split_name_mapping(table: &TablePayload) -> Result<Option<String>, ConnectorE
         return Ok(None);
     };
     canonical_split_name_mapping(mapping).map(Some)
-}
-
-fn canonical_split_name_mapping(mapping: &str) -> Result<String, ConnectorError> {
-    if mapping.len() > novarocks_spi::connector::MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "Iceberg name mapping exceeds the provider-private split bound",
-        ));
-    }
-    super::catalog::add_files::canonical_name_mapping(mapping)
-        .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
-}
-
-fn validate_split_name_mapping(mapping: Option<&str>) -> Result<(), ConnectorError> {
-    let Some(mapping) = mapping else {
-        return Ok(());
-    };
-    let canonical = canonical_split_name_mapping(mapping)?;
-    if canonical != mapping {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg split name mapping is not canonical",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_split_payload(payload: &SplitPayload) -> Result<(), ConnectorError> {
-    if payload.version != ICEBERG_SPLIT_V5 {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            format!(
-                "unsupported Iceberg composite split version {}",
-                payload.version
-            ),
-        ));
-    }
-    validate_split_name_mapping(payload.name_mapping.as_deref())?;
-    if let Some(rewrite_position) = payload.distributed_rewrite_position.as_ref() {
-        if rewrite_position.version != ICEBERG_REWRITE_POSITION_SPLIT_V1
-            || rewrite_position.selected_delete_files.is_empty()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg rewrite-position split is invalid",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_prepared_payload(
-    shared: &IcebergPreparedSplitSharedPayload,
-    unit: &IcebergPreparedUnitPayload,
-) -> Result<(), ConnectorError> {
-    if shared.version != ICEBERG_PREPARED_SPLIT_SHARED_V2
-        || unit.version != ICEBERG_PREPARED_SCAN_UNIT_V1
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "unsupported Iceberg prepared scan unit payload version",
-        ));
-    }
-    validate_split_name_mapping(shared.name_mapping.as_deref())?;
-    if let Some(row_groups) = unit.row_groups.as_ref() {
-        if row_groups.is_empty() || row_groups.windows(2).any(|window| window[0] >= window[1]) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg prepared scan unit row groups must be non-empty and strictly ordered",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Materialize Parquet leaves locally from the exact FE-frozen file list.
-/// This never consults catalog metadata: footer reads only refine the physical
-/// membership of an already-authorized file, and all resulting unit costs add
-/// back to the frozen file cost exactly.
-fn materialize_local_scan_units(
-    binding: &IcebergReadBinding,
-    frozen_units: Vec<IcebergFrozenScanUnitPayload>,
-    special_unit: bool,
-    request: &ConnectorPrepareSplitRequest,
-) -> Result<Vec<IcebergFrozenScanUnitPayload>, ConnectorError> {
-    if special_unit {
-        return Ok(frozen_units);
-    }
-    let mut materialized = Vec::with_capacity(frozen_units.len());
-    for unit in frozen_units {
-        request.check_active()?;
-        if unit.row_groups.is_some() || !is_parquet_path(&unit.data_file.path) {
-            materialized.push(unit);
-            continue;
-        }
-        let file_size = u64::try_from(unit.data_file.size).map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!(
-                    "Iceberg data file {} has a negative size",
-                    unit.data_file.path
-                ),
-            )
-        })?;
-        let access = binding.resolve_access(&unit.data_file.path)?;
-        let file = access
-            .bind_location(
-                &unit.data_file.path,
-                FileIdentity::new(&unit.data_file.path, file_size, None),
-            )
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })?;
-        let context =
-            binding.file_read_context(FileCancellation::new(), request.context.deadline())?;
-        let metadata =
-            inspect_parquet_metadata(file, None, context).map_err(map_iceberg_footer_error)?;
-        let layout = metadata.row_groups();
-        request.check_active()?;
-        if layout.is_empty() {
-            materialized.push(unit);
-            continue;
-        }
-        // A one-row-group Parquet file is already exactly one local unit.
-        // Retain it as a whole-file unit so small-file packing remains visible
-        // and the reader does not need a redundant row-group selector.
-        if layout.len() == 1 {
-            materialized.push(unit);
-            continue;
-        }
-        let file_cost = unit.estimated_bytes.ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg Parquet split unit must carry a known frozen cost",
-            )
-        })?;
-        let costs = distribute_unit_cost(file_cost, &layout)?;
-        for (row_group, estimated_bytes) in layout.into_iter().zip(costs) {
-            materialized.push(IcebergFrozenScanUnitPayload {
-                data_file: unit.data_file.clone(),
-                row_groups: Some(vec![row_group.ordinal as usize]),
-                estimated_bytes: Some(estimated_bytes),
-            });
-        }
-    }
-    Ok(materialized)
-}
-
-fn iceberg_unit_domain_facts(
-    binding: &IcebergReadBinding,
-    inspections: &mut HashMap<String, ParquetMetadataInspection>,
-    unit: &IcebergFrozenScanUnitPayload,
-    fact_columns: &[IcebergScanFactColumnV1],
-    conservative: bool,
-    special_unit: bool,
-    request: &ConnectorPrepareSplitRequest,
-) -> Result<ConnectorScanUnitDomainFacts, ConnectorError> {
-    if special_unit || !is_parquet_path(&unit.data_file.path) {
-        return Ok(ConnectorScanUnitDomainFacts::missing(
-            ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
-        ));
-    }
-    if fact_columns.is_empty()
-        || fact_columns
-            .iter()
-            .any(|column| matches!(column.scalar_type, IcebergScanFactScalarTypeV1::Unsupported))
-    {
-        return Ok(ConnectorScanUnitDomainFacts::missing(
-            ConnectorScanUnitFactsMissingReason::DataTypeUnsupported,
-        ));
-    }
-    if !inspections.contains_key(&unit.data_file.path) {
-        let file_size = u64::try_from(unit.data_file.size).map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!(
-                    "Iceberg data file {} has a negative size",
-                    unit.data_file.path
-                ),
-            )
-        })?;
-        let access = binding.resolve_access(&unit.data_file.path)?;
-        let file = access
-            .bind_location(
-                &unit.data_file.path,
-                FileIdentity::new(&unit.data_file.path, file_size, None),
-            )
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })?;
-        let context =
-            binding.file_read_context(FileCancellation::new(), request.context.deadline())?;
-        let inspection =
-            inspect_parquet_metadata(file, None, context).map_err(map_iceberg_footer_error)?;
-        inspections.insert(unit.data_file.path.clone(), inspection);
-    }
-    let inspection = inspections
-        .get(&unit.data_file.path)
-        .expect("inserted authorized Parquet inspection");
-    request.check_active()?;
-    let selected = selected_parquet_row_groups(inspection, unit.row_groups.as_deref())?;
-    let physical = map_iceberg_fact_columns(inspection, fact_columns)?;
-    let physical_row_count = selected.iter().try_fold(0_u64, |total, row_group| {
-        total.checked_add(row_group.row_count).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg selected Parquet row count overflows facts accounting",
-            )
-        })
-    })?;
-    let evidence = if conservative {
-        ConnectorScanUnitFactsEvidence::Conservative
-    } else {
-        ConnectorScanUnitFactsEvidence::Exact
-    };
-    let columns = physical
-        .iter()
-        .map(|(column, physical_ordinal)| {
-            iceberg_column_domain_facts(
-                inspection,
-                selected.as_slice(),
-                *physical_ordinal,
-                column,
-                physical_row_count,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ConnectorScanUnitDomainFacts::available(physical_row_count, evidence, columns)
-}
-
-fn selected_parquet_row_groups<'a>(
-    inspection: &'a ParquetMetadataInspection,
-    selected: Option<&[usize]>,
-) -> Result<Vec<&'a novarocks_fs::ParquetRowGroupLayout>, ConnectorError> {
-    match selected {
-        None => Ok(inspection.row_groups().iter().collect()),
-        Some(selected) => selected
-            .iter()
-            .map(|ordinal| {
-                inspection.row_groups().get(*ordinal).ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::CorruptData,
-                        "Iceberg prepared scan unit selects a Parquet row group outside the frozen footer",
-                    )
-                })
-            })
-            .collect(),
-    }
-}
-
-fn map_iceberg_footer_error(error: FileError) -> ConnectorError {
-    let kind = match error.kind() {
-        FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
-        FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
-        // A file that disappeared after the FE froze it contradicts the
-        // sealed membership; do not turn that contradiction into fail-open.
-        FileErrorKind::NotFound | FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
-        FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
-        FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
-        FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
-        FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
-        FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        FileErrorKind::Internal => ConnectorErrorKind::Internal,
-    };
-    ConnectorError::new(kind, error.to_string())
-}
-
-fn map_iceberg_fact_columns<'a>(
-    inspection: &ParquetMetadataInspection,
-    columns: &'a [IcebergScanFactColumnV1],
-) -> Result<Vec<(&'a IcebergScanFactColumnV1, Option<u32>)>, ConnectorError> {
-    let physical = inspection.physical_columns();
-    // Iceberg VARIANT is one logical table field but is encoded as an opaque
-    // Parquet group whose `metadata`/`value` leaves intentionally do not carry
-    // table field IDs. Exclude those leaves from the ordinary field-ID
-    // coverage check; they cannot provide scalar fact-column statistics and
-    // must not make a valid file look like a mixed-identity footer.
-    let identity_physical = physical
-        .iter()
-        .filter(|column| {
-            let Some(root) = column.path().first() else {
-                return true;
-            };
-            !inspection.schema().fields().iter().any(|field| {
-                field.name().eq_ignore_ascii_case(root)
-                    && crate::formats::parquet::is_variant_struct_data_type(field.data_type())
-            })
-        })
-        .collect::<Vec<_>>();
-    let physical_columns_len = identity_physical.len();
-    let with_ids = identity_physical
-        .iter()
-        .filter(|column| column.field_id().is_some())
-        .count();
-    if with_ids != 0 && with_ids != physical_columns_len {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg Parquet footer has mixed field-ID coverage",
-        ));
-    }
-    columns
-        .iter()
-        .map(|column| {
-            let matches = physical
-                .iter()
-                .filter(|physical| {
-                    if with_ids == physical_columns_len {
-                        physical.field_id() == Some(column.field_id)
-                    } else {
-                        physical.path().len() == 1
-                            && physical.path()[0].eq_ignore_ascii_case(&column.canonical_name)
-                    }
-                })
-                .collect::<Vec<_>>();
-            if matches.len() > 1 {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg Parquet footer maps a frozen field to multiple physical leaves",
-                ));
-            }
-            Ok((column, matches.first().map(|physical| physical.ordinal())))
-        })
-        .collect()
-}
-
-fn iceberg_column_domain_facts(
-    inspection: &ParquetMetadataInspection,
-    selected: &[&novarocks_fs::ParquetRowGroupLayout],
-    physical_ordinal: Option<u32>,
-    frozen: &IcebergScanFactColumnV1,
-    physical_row_count: u64,
-) -> Result<ConnectorScanUnitColumnFacts, ConnectorError> {
-    let scalar_type = iceberg_fact_scalar_type(frozen.scalar_type).ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "unsupported Iceberg facts scalar reached the Parquet mapper",
-        )
-    })?;
-    let column = ConnectorScanUnitColumn::new(frozen.field_ordinal, scalar_type, frozen.nullable);
-    let Some(physical_ordinal) = physical_ordinal else {
-        return Ok(ConnectorScanUnitColumnFacts::missing(
-            column,
-            ConnectorScanUnitFactsMissingReason::ValueUnavailable,
-        ));
-    };
-    if physical_row_count == 0 {
-        return Ok(ConnectorScanUnitColumnFacts::missing(
-            column,
-            ConnectorScanUnitFactsMissingReason::ValueUnavailable,
-        ));
-    }
-    let mut null_count = 0_u64;
-    let mut min: Option<ConnectorScalarValue> = None;
-    let mut max: Option<ConnectorScalarValue> = None;
-    for row_group in selected {
-        let Some(statistics) = inspection.column_statistics(row_group.ordinal, physical_ordinal)
-        else {
-            return Ok(ConnectorScanUnitColumnFacts::missing(
-                column,
-                ConnectorScanUnitFactsMissingReason::PhysicalStatisticsAbsent,
-            ));
-        };
-        let Some(row_group_nulls) = statistics.null_count() else {
-            return Ok(ConnectorScanUnitColumnFacts::missing(
-                column,
-                ConnectorScanUnitFactsMissingReason::PhysicalStatisticsAbsent,
-            ));
-        };
-        null_count = null_count.checked_add(row_group_nulls).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg Parquet null count overflows facts accounting",
-            )
-        })?;
-        if row_group_nulls == row_group.row_count {
-            continue;
-        }
-        if !statistics.min_is_exact()
-            || !statistics.max_is_exact()
-            || statistics.min_max_deprecated()
-            || !matches!(
-                statistics.sort_order(),
-                ParquetStatisticsSortOrder::Signed | ParquetStatisticsSortOrder::Unsigned
-            )
-        {
-            return Ok(ConnectorScanUnitColumnFacts::missing(
-                column,
-                ConnectorScanUnitFactsMissingReason::PhysicalStatisticsAbsent,
-            ));
-        }
-        let (Some(row_min), Some(row_max)) = (statistics.min(), statistics.max()) else {
-            return Ok(ConnectorScanUnitColumnFacts::missing(
-                column,
-                ConnectorScanUnitFactsMissingReason::PhysicalStatisticsAbsent,
-            ));
-        };
-        let Some(row_min) = parquet_statistic_scalar(row_min, frozen.scalar_type) else {
-            return Ok(ConnectorScanUnitColumnFacts::missing(
-                column,
-                ConnectorScanUnitFactsMissingReason::DataTypeUnsupported,
-            ));
-        };
-        let Some(row_max) = parquet_statistic_scalar(row_max, frozen.scalar_type) else {
-            return Ok(ConnectorScanUnitColumnFacts::missing(
-                column,
-                ConnectorScanUnitFactsMissingReason::DataTypeUnsupported,
-            ));
-        };
-        min = match min {
-            Some(current)
-                if current
-                    .compare_same_type(&row_min)
-                    .is_some_and(|order| order.is_gt()) =>
-            {
-                Some(row_min)
-            }
-            Some(current) => Some(current),
-            None => Some(row_min),
-        };
-        max = match max {
-            Some(current)
-                if current
-                    .compare_same_type(&row_max)
-                    .is_some_and(|order| order.is_lt()) =>
-            {
-                Some(row_max)
-            }
-            Some(current) => Some(current),
-            None => Some(row_max),
-        };
-    }
-    if null_count > physical_row_count {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg Parquet null count exceeds selected physical rows",
-        ));
-    }
-    if null_count == physical_row_count {
-        return ConnectorScanUnitColumnDomain::try_all_null(column, null_count, physical_row_count);
-    }
-    match (min, max) {
-        (Some(min), Some(max)) => ConnectorScanUnitColumnDomain::try_range(
-            column,
-            min,
-            max,
-            null_count,
-            physical_row_count,
-        ),
-        _ => Ok(ConnectorScanUnitColumnFacts::missing(
-            column,
-            ConnectorScanUnitFactsMissingReason::PhysicalStatisticsAbsent,
-        )),
-    }
-}
-
-fn iceberg_fact_scalar_type(
-    scalar_type: IcebergScanFactScalarTypeV1,
-) -> Option<ConnectorScalarType> {
-    Some(match scalar_type {
-        IcebergScanFactScalarTypeV1::Boolean => ConnectorScalarType::Boolean,
-        IcebergScanFactScalarTypeV1::Int8 => ConnectorScalarType::Int8,
-        IcebergScanFactScalarTypeV1::Int16 => ConnectorScalarType::Int16,
-        IcebergScanFactScalarTypeV1::Int32 => ConnectorScalarType::Int32,
-        IcebergScanFactScalarTypeV1::Int64 => ConnectorScalarType::Int64,
-        IcebergScanFactScalarTypeV1::Date32 => ConnectorScalarType::Date32,
-        IcebergScanFactScalarTypeV1::TimestampMicros => ConnectorScalarType::TimestampMicros,
-        IcebergScanFactScalarTypeV1::TimestampNanos => ConnectorScalarType::TimestampNanos,
-        IcebergScanFactScalarTypeV1::Utf8 => ConnectorScalarType::Utf8,
-        IcebergScanFactScalarTypeV1::Binary => ConnectorScalarType::Binary,
-        IcebergScanFactScalarTypeV1::Unsupported => return None,
-    })
-}
-
-fn parquet_statistic_scalar(
-    value: &ParquetStatisticsValue,
-    scalar_type: IcebergScanFactScalarTypeV1,
-) -> Option<ConnectorScalarValue> {
-    match (scalar_type, value) {
-        (IcebergScanFactScalarTypeV1::Boolean, ParquetStatisticsValue::Boolean(value)) => {
-            Some(ConnectorScalarValue::Boolean(*value))
-        }
-        (IcebergScanFactScalarTypeV1::Int32, ParquetStatisticsValue::Int32(value)) => {
-            Some(ConnectorScalarValue::Int32(*value))
-        }
-        (IcebergScanFactScalarTypeV1::Date32, ParquetStatisticsValue::Int32(value)) => {
-            Some(ConnectorScalarValue::Date32(*value))
-        }
-        (IcebergScanFactScalarTypeV1::Int64, ParquetStatisticsValue::Int64(value)) => {
-            Some(ConnectorScalarValue::Int64(*value))
-        }
-        (IcebergScanFactScalarTypeV1::TimestampMicros, ParquetStatisticsValue::Int64(value)) => {
-            Some(ConnectorScalarValue::TimestampMicros(*value))
-        }
-        (IcebergScanFactScalarTypeV1::TimestampNanos, ParquetStatisticsValue::Int64(value)) => {
-            Some(ConnectorScalarValue::TimestampNanos(*value))
-        }
-        (IcebergScanFactScalarTypeV1::Utf8, ParquetStatisticsValue::ByteArray(value)) => {
-            std::str::from_utf8(value)
-                .ok()
-                .map(|value| ConnectorScalarValue::Utf8(value.to_string()))
-        }
-        (IcebergScanFactScalarTypeV1::Binary, ParquetStatisticsValue::ByteArray(value)) => {
-            Some(ConnectorScalarValue::Binary(value.clone()))
-        }
-        _ => None,
-    }
-}
-
-fn distribute_unit_cost(
-    total: u64,
-    layout: &[novarocks_fs::ParquetRowGroupLayout],
-) -> Result<Vec<u64>, ConnectorError> {
-    let weight_total = layout.iter().try_fold(0_u64, |sum, row_group| {
-        sum.checked_add(row_group.compressed_bytes)
-    });
-    let mut costs = Vec::with_capacity(layout.len());
-    if let Some(weight_total) = weight_total.filter(|total| *total > 0) {
-        let mut assigned = 0_u64;
-        for (index, row_group) in layout.iter().enumerate() {
-            let cost = if index + 1 == layout.len() {
-                total.checked_sub(assigned).ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "Iceberg row-group cost accounting underflowed",
-                    )
-                })?
-            } else {
-                total
-                    .checked_mul(row_group.compressed_bytes)
-                    .and_then(|value| value.checked_div(weight_total))
-                    .ok_or_else(|| {
-                        ConnectorError::new(
-                            ConnectorErrorKind::ResourceExhausted,
-                            "Iceberg row-group cost accounting overflowed",
-                        )
-                    })?
-            };
-            assigned = assigned.checked_add(cost).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "Iceberg row-group cost accounting overflowed",
-                )
-            })?;
-            costs.push(cost);
-        }
-    } else {
-        let count = u64::try_from(layout.len()).map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg row-group count overflows u64",
-            )
-        })?;
-        let base = total / count;
-        let mut remainder = total % count;
-        for _ in layout {
-            let extra = u64::from(remainder > 0);
-            remainder = remainder.saturating_sub(extra);
-            costs.push(base + extra);
-        }
-    }
-    Ok(costs)
-}
-
-fn is_parquet_path(path: &str) -> bool {
-    let path = path.split('?').next().unwrap_or(path).to_ascii_lowercase();
-    path.ends_with(".parquet") || path.ends_with(".parq")
 }
 
 fn rewrite_position_output_schema() -> SchemaRef {
@@ -9852,44 +8400,27 @@ fn materialization_from_metadata(
             table: metadata.table.clone(),
             data_version,
         });
-    let read_selector = match binding {
-        IcebergDataFileBinding::CurrentSnapshot => ConnectorReadSelector::Current,
-        IcebergDataFileBinding::ExplicitFiles => ConnectorReadSelector::SnapshotId(
-            decode_payload::<TablePayload>(metadata.table.payload(), "table handle")
-                .map_err(|error| error.to_string())?
-                .table_info
-                .as_ref()
-                .and_then(|table| table.current_snapshot_id)
-                .ok_or_else(|| {
-                    "frozen Iceberg table materialization is missing its snapshot identity"
-                        .to_string()
-                })?,
-        ),
-    };
+    // Snapshot selection is an application fact supplied by the caller which
+    // froze it.  Base materialization is always current and never decodes the
+    // opaque table handle to rediscover a provider-private snapshot id.
+    let read_selector = ConnectorReadSelector::Current;
     let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
         .map_err(|error| error.to_string())?;
     let table = payload
         .table_info
         .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
-    let sql_ukfk_facts = sql_ukfk_facts_from_frozen_table(&table);
-    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
-        .into_iter()
-        .filter(|column| {
-            !payload
-                .hidden_columns
-                .iter()
-                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
-                && !payload
-                    .metadata_columns
-                    .iter()
-                    .any(|metadata| column.name.eq_ignore_ascii_case(metadata))
-        })
-        .collect();
+    let sql_ukfk_facts =
+        crate::sql::planner::table::SqlUkFkTableFacts::from_connector_planning_facts(
+            &metadata.schema,
+            &metadata.planning_facts,
+        );
+    let (columns, iceberg_row_lineage_metadata_columns) =
+        columns_from_planning_facts(&metadata.schema, &metadata.planning_facts);
     Ok(IcebergQueryTableMaterialization {
         table_name: payload.table,
         schema_id,
         columns,
-        iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
+        iceberg_row_lineage_metadata_columns,
         read_table: metadata.table,
         read_schema: metadata.schema,
         read_selector,
@@ -9901,25 +8432,6 @@ fn materialization_from_metadata(
         statistics_pin,
         planning_lease,
     })
-}
-
-fn sql_ukfk_facts_from_frozen_table(
-    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
-) -> crate::sql::planner::table::SqlUkFkTableFacts {
-    let Some(serialized) = table.serialized_metadata.as_deref() else {
-        return crate::sql::planner::table::SqlUkFkTableFacts::default();
-    };
-    let Ok(metadata) = serde_json::from_str::<
-        novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    >(serialized) else {
-        return crate::sql::planner::table::SqlUkFkTableFacts::default();
-    };
-    let properties = metadata
-        .properties()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    crate::sql::planner::table::SqlUkFkTableFacts::from_frozen_properties(&properties)
 }
 
 pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
@@ -9940,14 +8452,14 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
     let mut target_columns = materialization.columns.clone();
     target_columns.extend([
         novarocks_catalog::schema::ColumnDef {
-            name: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            name: iceberg_row_lineage::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         novarocks_catalog::schema::ColumnDef {
-            name: novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            name: iceberg_row_lineage::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
             data_type: DataType::Int64,
             nullable: true,
             write_default: None,
@@ -9974,55 +8486,39 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
     })
 }
 
-fn columns_from_metadata(
+fn columns_from_planning_facts(
     schema: &Schema,
-    logical_type_columns: &BTreeMap<String, String>,
-) -> Vec<novarocks_catalog::schema::ColumnDef> {
-    schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let logical_type = match logical_type_columns
-                .get(&field.name().to_lowercase())
-                .map(String::as_str)
-            {
-                Some("bitmap") => Some(SqlType::Bitmap),
-                Some("hll") => Some(SqlType::Hll),
-                _ => None,
-            };
-            novarocks_catalog::schema::ColumnDef {
-                name: field.name().to_string(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                write_default: None,
-                logical_type,
-            }
-        })
-        .collect()
-}
-
-fn iceberg_metadata_columns(
-    names: &[String],
-) -> Result<Vec<novarocks_catalog::schema::ColumnDef>, String> {
-    names
-        .iter()
-        .map(|name| {
-            let (data_type, nullable) = match name.as_str() {
-                "_file" => (arrow::datatypes::DataType::Utf8, false),
-                "_pos" | "_row_id" | "_last_updated_sequence_number" => {
-                    (arrow::datatypes::DataType::Int64, false)
-                }
-                other => return Err(format!("unknown Iceberg metadata column `{other}`")),
-            };
-            Ok(novarocks_catalog::schema::ColumnDef {
-                name: name.clone(),
-                data_type,
-                nullable,
-                write_default: None,
-                logical_type: None,
-            })
-        })
-        .collect()
+    facts: &ConnectorTablePlanningFacts,
+) -> (
+    Vec<novarocks_catalog::schema::ColumnDef>,
+    Vec<novarocks_catalog::schema::ColumnDef>,
+) {
+    let mut columns = Vec::new();
+    let mut system_columns = Vec::new();
+    for (ordinal, field) in schema.fields().iter().enumerate() {
+        let fact = facts.column_facts().get(ordinal);
+        let logical_type = match fact.map(|fact| fact.semantic_kind()) {
+            Some(ConnectorTableColumnSemanticKind::Bitmap) => Some(SqlType::Bitmap),
+            Some(ConnectorTableColumnSemanticKind::Hll) => Some(SqlType::Hll),
+            _ => None,
+        };
+        let column = novarocks_catalog::schema::ColumnDef {
+            name: field.name().to_string(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type,
+        };
+        match fact.map(|fact| fact.role()) {
+            Some(ConnectorTableColumnRole::RowLineageSystem) => system_columns.push(column),
+            _ if matches!(
+                fact.map(|fact| fact.visibility()),
+                Some(ConnectorTableColumnVisibility::Hidden)
+            ) => {}
+            _ => columns.push(column),
+        }
+    }
+    (columns, system_columns)
 }
 
 fn metadata_table_name(metadata_type: &super::IcebergMetadataTableType) -> &'static str {
@@ -10170,6 +8666,18 @@ fn plan_native_iceberg_read_with_bound_lease(
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    let selection = ConnectorScanSelection::Snapshot(
+        table
+            .current_snapshot_id
+            .filter(|_| {
+                matches!(
+                    binding,
+                    novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
+                )
+            })
+            .map(ConnectorReadSelector::SnapshotId)
+            .unwrap_or(ConnectorReadSelector::Current),
+    );
     let scan = control_binding
         .planning()
         .begin_scan(
@@ -10177,16 +8685,7 @@ fn plan_native_iceberg_read_with_bound_lease(
             novarocks_spi::connector::ConnectorBeginScanRequest {
                 projection: projection.to_vec(),
                 static_predicates: static_predicates.clone(),
-                selector: table
-                    .current_snapshot_id
-                    .filter(|_| {
-                        matches!(
-                            binding,
-                            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-                        )
-                    })
-                    .map(ConnectorReadSelector::SnapshotId)
-                    .unwrap_or(ConnectorReadSelector::Current),
+                selection,
                 purpose: ConnectorReadPurpose::Query,
                 limit: None,
                 batch: novarocks_spi::connector::ConnectorBatchBudget {
@@ -10200,12 +8699,20 @@ fn plan_native_iceberg_read_with_bound_lease(
             },
         )
         .map_err(|error| error.to_string())?;
-    normalize_predicate_dispositions(&static_predicates, &scan.predicate_dispositions)
+    scan.validate(
+        &ConnectorExecutionBindingKey {
+            instance_id: control_binding.descriptor().instance_id.clone(),
+            incarnation: control_binding.incarnation(),
+        },
+        selection,
+    )
+    .map_err(|error| error.to_string())?;
+    normalize_predicate_dispositions(&static_predicates, scan.predicate_dispositions())
         .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
     let split_result = control_binding
         .planning()
         .plan_splits(
-            &scan.handle,
+            scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism,
                 max_split_bytes,
@@ -10234,99 +8741,6 @@ fn plan_native_iceberg_read_with_bound_lease(
             .expect("batch bytes are nonzero"),
         },
     })
-}
-
-/// Plan snapshot-delta physical reads as ordinary opaque Iceberg connector
-/// splits.  Delta retains its logical planner identity; no native carrier or
-/// core scan operator receives a role-specific file/deletion payload.
-/// Equivalent to [`plan_native_iceberg_delta_read`] but uses the exact
-/// metadata lease already retained by the query binding store.
-pub(crate) fn plan_native_iceberg_delta_read_with_lease(
-    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &ConnectorTableHandle,
-    sources: &[novarocks_connector_iceberg::delta::DeltaSourceFile],
-    delete_side: Option<&novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
-    target_parallelism: NonZeroUsize,
-    max_split_bytes: Option<NonZeroU64>,
-) -> Result<PlannedIcebergConnectorRead, String> {
-    let table_payload: TablePayload = decode_payload(table.payload(), "Iceberg delta table handle")
-        .map_err(|error| error.to_string())?;
-    let table = table_payload
-        .table_info
-        .ok_or_else(|| "Iceberg delta table handle is missing its table descriptor".to_string())?;
-    let mut planned = plan_native_iceberg_read_with_lease(
-        lease,
-        context.clone(),
-        &table,
-        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-        &[],
-        &[],
-        Vec::new(),
-        target_parallelism,
-        max_split_bytes,
-    )?;
-    let owner = planned.declaration.descriptor().instance_id.clone();
-    let incarnation = planned.declaration.incarnation().to_bytes();
-    let mut total_payload_bytes = 0usize;
-    let mut splits = Vec::with_capacity(sources.len());
-    for (index, source) in sources.iter().cloned().enumerate() {
-        let data_file = IcebergDataFileInfo {
-            path: source.path.clone(),
-            size: source.size,
-            row_count: None,
-            column_stats: None,
-            partition_spec_id: source.partition_spec_id,
-            partition_key: source.partition_key.clone(),
-            first_row_id: source.first_row_id,
-            data_sequence_number: source.data_sequence_number,
-            ivm_change_op: None,
-            included_positions: None,
-            delete_files: Vec::new(),
-            manifest_path: None,
-            partition_values: Vec::new(),
-        };
-        let estimated_bytes = u64::try_from(data_file.size)
-            .map_err(|_| "Iceberg delta source has a negative size".to_string())?;
-        let payload = SplitPayload {
-            version: ICEBERG_SPLIT_V5,
-            owner_instance_id: owner.as_str().to_string(),
-            incarnation,
-            namespace: table.namespace.clone(),
-            table: table.table.clone(),
-            snapshot_id: table.current_snapshot_id,
-            table_uuid: table.table_uuid.clone(),
-            schema_id: Some(table.schema_id),
-            units: vec![IcebergFrozenScanUnitPayload {
-                data_file,
-                row_groups: None,
-                estimated_bytes: Some(estimated_bytes),
-            }],
-            projection: Vec::new(),
-            limit: None,
-            physical_predicates: Vec::new(),
-            fact_columns: Vec::new(),
-            name_mapping: None,
-            delta: Some(IcebergDeltaSplitPayload {
-                source,
-                delete_side: delete_side.cloned(),
-            }),
-            distributed_rewrite_position: None,
-            metadata: None,
-        };
-        push_split_with_budget(
-            &mut splits,
-            &mut total_payload_bytes,
-            owner.clone(),
-            format!("delta-{index}"),
-            &payload,
-            Some(estimated_bytes),
-            &context,
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    planned.splits = splits;
-    Ok(planned)
 }
 
 pub(crate) struct PlannedIcebergConnectorRead {
@@ -10472,23 +8886,24 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
+    use novarocks_connector_iceberg::file_reader::execution_payload::{
+        IcebergScanFactScalarTypeV1, iceberg_unit_domain_facts, validate_split_payload,
+    };
     use novarocks_connector_iceberg::scan_model::{
         IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     };
+    use novarocks_spi::connector::{
+        ConnectorScanUnitColumnDomain, ConnectorScanUnitColumnFacts, ConnectorScanUnitFactsEvidence,
+    };
 
-    #[test]
-    fn cow_recipe_keeps_provider_identity_private_and_round_trips() {
-        let payload = iceberg_cow_recipe_payload(
-            b"rewrite",
-            "s3://warehouse/orders/data-00042.parquet",
-            &[9, 3, 17],
+    fn explicit_test_read_binding(runtime: &tokio::runtime::Runtime) -> IcebergReadBinding {
+        let handle = runtime.handle().clone();
+        IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
         )
-        .expect("encode COW recipe");
-        let decoded = decode_iceberg_cow_recipe_payload(&payload).expect("decode COW recipe");
-
-        assert_eq!(decoded.role, "rewrite");
-        assert_eq!(decoded.old_file, "s3://warehouse/orders/data-00042.parquet");
-        assert_eq!(decoded.matched_row_ids, vec![9, 3, 17]);
     }
 
     #[test]
@@ -11039,7 +9454,10 @@ mod tests {
             .expect("Parquet size fits i64")
     }
 
-    fn local_planning_provider(warehouse: &Path) -> IcebergControlProvider {
+    fn local_planning_provider(
+        warehouse: &Path,
+    ) -> (tokio::runtime::Runtime, IcebergControlProvider) {
+        let runtime = tokio::runtime::Runtime::new().expect("build explicit test runtime");
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let mut catalog_registry = IcebergCatalogRegistry::default();
         catalog_registry
@@ -11052,7 +9470,7 @@ mod tests {
             )
             .expect("local catalog registration");
         let incarnation = ConnectorInstanceIncarnation::from_bytes([9; 16]);
-        IcebergControlProvider {
+        let provider = IcebergControlProvider {
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider ID"),
                 instance_id: instance_id.clone(),
@@ -11064,11 +9482,13 @@ mod tests {
             instance_id,
             incarnation,
             registry: Arc::new(RwLock::new(catalog_registry)),
+            planning_binding: Some(explicit_test_read_binding(&runtime)),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
             recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        (runtime, provider)
     }
 
     fn explicit_file_scan_handle(
@@ -11134,7 +9554,7 @@ mod tests {
             "the large third leaf must exceed the derived soft target"
         );
         let expected_total = files.iter().map(|file| file.size as u64).sum::<u64>();
-        let provider = local_planning_provider(directory.path());
+        let (_runtime, provider) = local_planning_provider(directory.path());
         let scan = explicit_file_scan_handle(provider.instance_id.clone(), files.clone());
 
         let first = ConnectorScanPlanning::plan_splits(&provider, &scan, local_planning_request())
@@ -11212,8 +9632,10 @@ mod tests {
         let request = ConnectorPrepareSplitRequest {
             context: context_with_payload_budgets(64 * 1024, 256 * 1024),
         };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = explicit_test_read_binding(&runtime);
         let materialized = materialize_local_scan_units(
-            &IcebergReadBinding::default_binding(None).expect("local binding"),
+            &binding,
             vec![IcebergFrozenScanUnitPayload {
                 data_file: IcebergDataFileInfo::for_test(
                     path.to_string_lossy().as_ref(),
@@ -11266,7 +9688,8 @@ mod tests {
             scalar_type: IcebergScanFactScalarTypeV1::Int32,
             nullable: false,
         }];
-        let binding = IcebergReadBinding::default_binding(None).expect("local binding");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = explicit_test_read_binding(&runtime);
         let mut inspections = HashMap::new();
         let exact = iceberg_unit_domain_facts(
             &binding,
@@ -11317,58 +9740,6 @@ mod tests {
     }
 
     #[test]
-    fn row_group_cost_distribution_is_deterministic_for_weighted_and_zero_weight_layouts() {
-        let weighted = vec![
-            novarocks_fs::ParquetRowGroupLayout {
-                ordinal: 0,
-                compressed_bytes: 1,
-                row_count: 1,
-            },
-            novarocks_fs::ParquetRowGroupLayout {
-                ordinal: 1,
-                compressed_bytes: 3,
-                row_count: 1,
-            },
-            novarocks_fs::ParquetRowGroupLayout {
-                ordinal: 2,
-                compressed_bytes: 6,
-                row_count: 1,
-            },
-        ];
-        assert_eq!(
-            distribute_unit_cost(101, &weighted).expect("weighted costs"),
-            [10, 30, 61]
-        );
-        assert_eq!(
-            distribute_unit_cost(101, &weighted).expect("repeated weighted costs"),
-            [10, 30, 61],
-            "weighted distribution must be repeatable"
-        );
-
-        let zero_weight = vec![
-            novarocks_fs::ParquetRowGroupLayout {
-                ordinal: 0,
-                compressed_bytes: 0,
-                row_count: 1,
-            },
-            novarocks_fs::ParquetRowGroupLayout {
-                ordinal: 1,
-                compressed_bytes: 0,
-                row_count: 1,
-            },
-            novarocks_fs::ParquetRowGroupLayout {
-                ordinal: 2,
-                compressed_bytes: 0,
-                row_count: 1,
-            },
-        ];
-        assert_eq!(
-            distribute_unit_cost(8, &zero_weight).expect("zero-weight costs"),
-            [3, 3, 2]
-        );
-    }
-
-    #[test]
     fn local_unknown_table_error_is_not_found() {
         let error = map_iceberg_error("unknown table: analytics.orders".to_string());
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -11393,8 +9764,8 @@ mod tests {
     fn data_file_with_column_null_count(
         column: &str,
         null_count: Option<i64>,
-    ) -> crate::connector::iceberg::catalog::registry::DataFileWithStats {
-        crate::connector::iceberg::catalog::registry::DataFileWithStats {
+    ) -> novarocks_connector_iceberg::manifest::DataFileWithStats {
+        novarocks_connector_iceberg::manifest::DataFileWithStats {
             path: "file:///tmp/table/data.parquet".to_string(),
             size: 12,
             record_count: Some(4),
@@ -11487,67 +9858,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn provider_statistics_artifact_round_trips_requested_metrics() {
-        let data_version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
-        let theta_metric = StatisticsMetric::ThetaNdv {
-            column: Arc::from("k"),
-        };
-        let evidence = StatisticsEvidence {
-            data_version: data_version.clone(),
-            evidence_revision: StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1"))
-                .expect("revision"),
-            coverage: StatisticsCoverage::Full,
-            accuracy: StatisticsAccuracy::Exact,
-            interval: None,
-            provenance: StatisticsProvenance::VisibleRows,
-            metrics: BTreeMap::from([
-                (
-                    StatisticsMetric::RowCount,
-                    StatisticsMetricState::Available(StatisticsMetricValue::U64(3)),
-                ),
-                (
-                    theta_metric.clone(),
-                    StatisticsMetricState::Available(StatisticsMetricValue::F64(3.0)),
-                ),
-            ]),
-        };
-        let payload = encode_provider_statistics(&evidence).expect("encode artifact");
-        let requested = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::RowCount,
-            theta_metric.clone(),
-            StatisticsMetric::NullCount {
-                column: Arc::from("k"),
-            },
-        ])
-        .expect("metric request");
-
-        let decoded = decode_provider_statistics(&payload, &data_version, &requested)
-            .expect("decode artifact");
-        assert_eq!(
-            decoded.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(3)
-            ))
-        );
-        assert_eq!(
-            decoded.get(&theta_metric),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(3.0)
-            ))
-        );
-        assert!(matches!(
-            decoded.get(&StatisticsMetric::NullCount {
-                column: Arc::from("k")
-            }),
-            Some(StatisticsMetricState::Missing(StatisticsMissing {
-                kind: StatisticsMissingKind::NotCollected,
-                ..
-            }))
-        ));
-    }
-
     fn mutation_provider_without_catalog() -> IcebergControlProvider {
         let instance_id = ConnectorInstanceId::parse("ice.test").expect("instance ID");
         let incarnation = ConnectorInstanceIncarnation::from_bytes([7; 16]);
@@ -11563,6 +9873,7 @@ mod tests {
             instance_id,
             incarnation,
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+            planning_binding: None,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
@@ -12004,6 +10315,7 @@ mod tests {
         )
         .expect("scan handle");
         let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let mut catalog_registry = IcebergCatalogRegistry::default();
         catalog_registry
@@ -12027,6 +10339,7 @@ mod tests {
             instance_id,
             incarnation,
             registry: Arc::new(RwLock::new(catalog_registry)),
+            planning_binding: Some(explicit_test_read_binding(&runtime)),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
@@ -12095,6 +10408,66 @@ pub(crate) fn fixture_planning_lease(
         )),
         || {},
     )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_change_window_scan(
+    catalog: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> novarocks_spi::connector::ConnectorScan {
+    fixture_change_window_scan_for_table(catalog, "orders", from_snapshot_id, to_snapshot_id)
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_change_window_scan_for_table(
+    catalog: &str,
+    table: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> novarocks_spi::connector::ConnectorScan {
+    let lease = fixture_planning_lease(catalog);
+    let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture connector instance ID");
+    let context = crate::connector::test_request_context();
+    let metadata = lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        })
+        .expect("fixture table metadata");
+    let projection = (0..metadata.schema.fields().len()).collect();
+    lease
+        .binding()
+        .planning()
+        .begin_scan(
+            &metadata.table,
+            ConnectorBeginScanRequest {
+                projection,
+                static_predicates: Vec::new(),
+                selection: ConnectorScanSelection::ChangeWindow(
+                    novarocks_spi::connector::ConnectorChangeWindow::new(
+                        from_snapshot_id,
+                        to_snapshot_id,
+                    ),
+                ),
+                purpose: ConnectorReadPurpose::Query,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: std::num::NonZeroUsize::new(4096).expect("nonzero rows"),
+                    max_bytes: std::num::NonZeroUsize::new(context.max_handle_payload_bytes())
+                        .expect("nonzero bytes"),
+                },
+                context,
+            },
+        )
+        .expect("fixture change-window scan")
 }
 
 /// A provider-produced neutral admission fixture for Core protocol tests.
@@ -12222,6 +10595,7 @@ fn planned_table_files_fixture_binding(
 
     struct Fixture {
         instance_id: ConnectorInstanceId,
+        incarnation: ConnectorInstanceIncarnation,
         files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
         seen_projections: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
     }
@@ -12287,26 +10661,47 @@ fn planned_table_files_fixture_binding(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(ConnectorScan {
-                handle: ConnectorScanHandle::try_new(
-                    self.instance_id.clone(),
-                    encode_payload(
-                        &ScanPayload {
-                            table,
-                            snapshot_id: None,
-                            table_uuid: None,
-                            projection: request.projection,
-                            limit: request.limit,
-                            physical_predicates,
-                            fact_columns: Vec::new(),
-                        },
-                        "fixture scan handle",
-                        request.context.max_handle_payload_bytes(),
-                    )?,
+            let owner = ConnectorExecutionBindingKey {
+                instance_id: self.instance_id.clone(),
+                incarnation: self.incarnation,
+            };
+            let scan_handle = ConnectorScanHandle::try_new(
+                self.instance_id.clone(),
+                encode_payload(
+                    &ScanPayload {
+                        table,
+                        snapshot_id: None,
+                        table_uuid: None,
+                        projection: request.projection,
+                        limit: request.limit,
+                        physical_predicates,
+                        fact_columns: Vec::new(),
+                    },
+                    "fixture scan handle",
+                    request.context.max_handle_payload_bytes(),
                 )?,
-                output_schema: Arc::new(Schema::new(fields)),
-                predicate_dispositions,
-            })
+            )?;
+            let output_schema = Arc::new(Schema::new(fields));
+            match request.selection {
+                ConnectorScanSelection::Snapshot(selector) => ConnectorScan::try_new_snapshot(
+                    owner,
+                    selector,
+                    scan_handle,
+                    output_schema,
+                    predicate_dispositions,
+                ),
+                ConnectorScanSelection::ChangeWindow(window) => {
+                    ConnectorScan::try_new_change_window(
+                        owner,
+                        window,
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                        scan_handle,
+                        output_schema,
+                        predicate_dispositions,
+                        &request.context,
+                    )
+                }
+            }
         }
 
         fn plan_splits(
@@ -12459,6 +10854,8 @@ fn planned_table_files_fixture_binding(
             Ok(ConnectorTableMetadata {
                 identity: request.table.clone(),
                 schema: fixture_read_schema_for_table(request.table.table.as_ref()),
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
                 version: None,
                 statistics_data_version: None,
                 table: ConnectorTableHandle::try_new(
@@ -12474,8 +10871,10 @@ fn planned_table_files_fixture_binding(
     }
 
     let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture instance ID");
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
     let read = Arc::new(Fixture {
         instance_id: instance_id.clone(),
+        incarnation,
         files_by_table,
         seen_projections,
     });
@@ -12484,16 +10883,12 @@ fn planned_table_files_fixture_binding(
             .expect("fixture provider ID"),
         instance_id,
     };
-    let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
     ConnectorControlBinding::try_new(
         descriptor.clone(),
         incarnation,
         read.clone(),
         read,
-        Arc::new(IcebergInstanceDistribution {
-            descriptor,
-            incarnation,
-        }),
+        Arc::new(IcebergInstanceDistribution::new(descriptor, incarnation)),
         None,
     )
     .expect("fixture connector control binding")

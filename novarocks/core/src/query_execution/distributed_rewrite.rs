@@ -19,7 +19,7 @@ use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteLease,
     ConnectorDistributedRewritePlan, ConnectorDistributedRewriteReceipt, ConnectorError,
-    ConnectorErrorKind, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorErrorKind, ConnectorReadSelector, ConnectorRequestContext, ConnectorScanSelection,
     ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorWriteAbortOutcome,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteExecutionId,
     ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationEvidence,
@@ -74,15 +74,19 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
         ConnectorBeginScanRequest {
             projection,
             static_predicates: Vec::new(),
-            selector: ConnectorReadSelector::Current,
+            selection: ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
             purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
             limit: None,
             batch,
             context: context.clone(),
         },
     )?;
+    scan.validate(
+        lease.binding_key(),
+        ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
+    )?;
     let split_result = lease.planning().plan_splits(
-        &scan.handle,
+        scan.handle(),
         ConnectorSplitPlanningRequest {
             target_parallelism,
             max_split_bytes: None,
@@ -100,7 +104,7 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
     }
     Ok(PlannedConnectorRead {
         declaration: lease.execution_declaration(&context)?,
-        provider_field_ordinals: (0..scan.output_schema.fields().len())
+        provider_field_ordinals: (0..scan.output_schema().fields().len())
             .map(|ordinal| u32::try_from(ordinal).expect("connector output ordinal fits u32"))
             .collect(),
         scan,
@@ -175,7 +179,7 @@ pub(crate) fn admit_frozen_rewrite_scan_binding(
                 mv_target_read: None,
                 write_target_admission: None,
                 frozen_snapshot_materializations: BTreeMap::new(),
-                delta_runtime_plans: BTreeMap::new(),
+                admitted_change_scans: BTreeMap::new(),
             })
         },
     )
@@ -331,21 +335,22 @@ impl ConnectorDistributedRewriteSession {
         let write_session = if plan.cohorts().is_empty() {
             None
         } else {
-            lease.activate_rewrite(&plan)?;
+            let activation = lease.activate_rewrite(&plan, context.clone())?;
             let write_lease = lease.derive_write_lease()?;
             let templates = plan
                 .cohorts()
                 .iter()
                 .map(|cohort| {
-                    ConnectorWritePlanningTemplate::new_in_cohort(
-                        plan.operation_id(),
-                        cohort.cohort_id(),
-                        cohort.preparation().clone(),
+                    let activated = activation.cohort(cohort.cohort_id()).ok_or_else(|| {
+                        invalid("distributed rewrite activation omitted a sealed cohort")
+                    })?;
+                    ConnectorWritePlanningTemplate::from_activated_cohort(
+                        activated,
                         context.clone(),
                         write_lease.clone(),
                     )
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             let registration = ConnectorWriteOperationRegistration::try_new(templates)
                 .map_err(|error| invalid(format!("register rewrite cohorts: {error}")))?;
             Some(ConnectorWriteOperationSession::try_begin(
@@ -646,7 +651,8 @@ mod tests {
         ConnectorDistributedRewritePlanningRequest, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
-        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteBaseVersion,
+        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivationIntent,
+        ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteBaseVersion,
         ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
         ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
         ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
@@ -781,9 +787,28 @@ mod tests {
         }
         fn activate_rewrite(
             &self,
-            _plan: &ConnectorDistributedRewritePlan,
-        ) -> Result<(), ConnectorError> {
-            Ok(())
+            plan: &ConnectorDistributedRewritePlan,
+            context: ConnectorRequestContext,
+        ) -> Result<novarocks_spi::connector::ConnectorWriteActivation, ConnectorError> {
+            let source = plan.cohorts().first().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "test rewrite activation requires a cohort",
+                )
+            })?;
+            novarocks_spi::connector::ConnectorWriteActivation::try_new(
+                self.key.clone(),
+                &ConnectorWriteActivationRequest {
+                    operation_id: plan.operation_id(),
+                    source: ConnectorWriteActivationSource::Prepared(source.preparation().clone()),
+                    intent: ConnectorWriteActivationIntent::Ordinary,
+                    context,
+                },
+                plan.cohorts()
+                    .iter()
+                    .map(|cohort| (cohort.cohort_id(), cohort.preparation().clone()))
+                    .collect(),
+            )
         }
         fn checkpoint_attempt(
             &self,

@@ -26,8 +26,8 @@ use crate::iceberg::spec::{
 use crate::iceberg::table::Table;
 use crate::read_model::{IcebergReadDeleteFormat, IcebergReadDeleteKind};
 use crate::scan_model::{
-    IcebergColumnStats, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
-    IcebergPartitionFieldValue, IcebergPartitionValue,
+    IcebergColumnStats, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+    IcebergDeleteFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue,
 };
 
 /// Data-file facts extracted from one pinned Iceberg manifest walk.
@@ -47,6 +47,26 @@ pub struct DataFileWithStats {
     /// Iceberg v3 row-lineage: data sequence number of the manifest entry.
     pub data_sequence_number: Option<i64>,
     pub delete_files: Vec<IcebergDeleteFileInfo>,
+}
+
+pub fn data_file_with_stats_to_iceberg_data_file_info(
+    file: DataFileWithStats,
+) -> IcebergDataFileInfo {
+    IcebergDataFileInfo {
+        path: file.path,
+        size: file.size,
+        row_count: file.record_count,
+        column_stats: file.column_stats,
+        partition_spec_id: file.partition_spec_id,
+        partition_key: file.partition_key,
+        first_row_id: file.first_row_id,
+        data_sequence_number: file.data_sequence_number,
+        ivm_change_op: None,
+        included_positions: None,
+        delete_files: file.delete_files,
+        manifest_path: file.manifest_path,
+        partition_values: file.partition_field_values,
+    }
 }
 
 fn partition_field_values(

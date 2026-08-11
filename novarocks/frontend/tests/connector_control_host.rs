@@ -41,15 +41,15 @@ use novarocks_spi::connector::{
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
     ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
-    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
+    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
     ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest, ConnectorWriteControl,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
-    ConnectorWriteReconcileRequest, ExternalMutationOutcome, StatisticsAccuracy,
-    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
-    StatisticsProvenance, StatisticsReadRequest, StatisticsReader,
+    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWritePlan, ConnectorWritePlanningRequest,
+    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ExternalMutationOutcome,
+    StatisticsAccuracy, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsProvenance, StatisticsReadRequest, StatisticsReader,
 };
 
 struct TestControl {
@@ -430,7 +430,8 @@ impl ConnectorDistributedRewrite for TestDistributedRewrite {
     fn activate_rewrite(
         &self,
         _plan: &ConnectorDistributedRewritePlan,
-    ) -> Result<(), ConnectorError> {
+        _context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
         Err(unsupported())
     }
 

@@ -32,8 +32,6 @@ use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
 use novarocks_catalog::schema::ColumnDef;
 
-pub(crate) use super::iceberg_delta::IcebergDeltaScanRuntimePlan;
-
 pub(crate) trait ScanBindingResolver: Send + Sync {
     fn resolve_scan(
         &self,
@@ -61,12 +59,38 @@ pub(crate) enum ResolvedScanExecution {
     /// A query-local opaque read admission.  Core may inspect only its SPI
     /// schema and selector while preparation asks the exact lease to plan it.
     AdmittedConnectorRead(QueryScanMaterialization),
-    IcebergDelta(ResolvedIcebergDeltaScan),
+    /// A provider-sealed scan admitted earlier by the application. Preparation
+    /// validates its exact generation and selection, then plans opaque splits
+    /// without decoding or recreating provider physical facts.
+    SealedConnectorScan(ConnectorScan),
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedIcebergDeltaScan {
-    pub runtime_plan: IcebergDeltaScanRuntimePlan,
+#[cfg(test)]
+pub(crate) fn fixture_sealed_change_scan(
+    instance_id: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> ConnectorScan {
+    crate::connector::iceberg::provider::fixture_change_window_scan(
+        instance_id,
+        from_snapshot_id,
+        to_snapshot_id,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_sealed_change_scan_for_table(
+    instance_id: &str,
+    table: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> ConnectorScan {
+    crate::connector::iceberg::provider::fixture_change_window_scan_for_table(
+        instance_id,
+        table,
+        from_snapshot_id,
+        to_snapshot_id,
+    )
 }
 
 /// Provider-neutral result of planning an executable connector read.  Its
@@ -274,16 +298,16 @@ impl ScanExecutionBindings {
                 "duplicate connector read fragment_id={fragment_id} node_id={node_id}"
             ));
         }
-        if read.scan.handle.owner() != &read.declaration.descriptor().instance_id {
+        if read.scan.handle().owner() != &read.declaration.descriptor().instance_id {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"
             ));
         }
-        if read.provider_field_ordinals.len() != read.scan.output_schema.fields().len() {
+        if read.provider_field_ordinals.len() != read.scan.output_schema().fields().len() {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} provider ordinal count {} does not match output schema field count {}",
                 read.provider_field_ordinals.len(),
-                read.scan.output_schema.fields().len(),
+                read.scan.output_schema().fields().len(),
             ));
         }
         let mut provider_ordinals = BTreeSet::new();
@@ -376,14 +400,7 @@ mod tests {
     }
 
     fn delta_execution() -> ResolvedScanExecution {
-        ResolvedScanExecution::IcebergDelta(ResolvedIcebergDeltaScan {
-            runtime_plan: IcebergDeltaScanRuntimePlan {
-                table_location: "s3://warehouse/db/table".to_string(),
-                data_columns: Vec::new(),
-                change_files: Vec::new(),
-                delete_side: None,
-            },
-        })
+        ResolvedScanExecution::SealedConnectorScan(fixture_sealed_change_scan("ice", 6, 7))
     }
 
     fn binding(

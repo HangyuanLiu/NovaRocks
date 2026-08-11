@@ -31,11 +31,11 @@ use novarocks_connector_iceberg::iceberg::{
 };
 
 use super::registry::{
-    IcebergCatalogEntry, IcebergCatalogKind, block_on_iceberg, build_iceberg_catalog,
-    iceberg_type_for_sql_type,
+    IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog, iceberg_type_for_sql_type,
 };
 use crate::sql::parser::ast::TableColumnDef;
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_connector_iceberg::catalog_config::IcebergCatalogKind;
 
 /// Dialect tag NovaRocks writes into view representations. NovaRocks parses
 /// StarRocks-flavoured SQL, so it shares StarRocks' dialect tag for

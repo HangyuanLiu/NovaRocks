@@ -21,7 +21,7 @@ use std::sync::RwLock;
 use crate::identifier::TableIdentity;
 
 struct CachedEntry<M> {
-    schema_id: Option<i32>,
+    schema_version: Option<Vec<u8>>,
     metadata: M,
 }
 
@@ -45,7 +45,7 @@ impl<M: Clone> SchemaCache<M> {
     pub fn get_or_build_validated<F>(
         &self,
         id: &TableIdentity,
-        current_schema_id: Option<i32>,
+        current_schema_version: Option<Vec<u8>>,
         builder: F,
     ) -> Result<M, String>
     where
@@ -54,7 +54,7 @@ impl<M: Clone> SchemaCache<M> {
         {
             let entries = self.entries.read().expect("schema cache read lock");
             if let Some(entry) = entries.get(id)
-                && entry.schema_id == current_schema_id
+                && entry.schema_version == current_schema_version
             {
                 return Ok(entry.metadata.clone());
             }
@@ -67,7 +67,7 @@ impl<M: Clone> SchemaCache<M> {
             .insert(
                 id.clone(),
                 CachedEntry {
-                    schema_id: current_schema_id,
+                    schema_version: current_schema_version,
                     metadata: metadata.clone(),
                 },
             );
@@ -115,13 +115,13 @@ mod tests {
 
         assert_eq!(
             cache
-                .get_or_build_validated(&id, Some(7), builder)
+                .get_or_build_validated(&id, Some(vec![7]), builder)
                 .expect("build"),
             TestMetadata { revision: 1 }
         );
         assert_eq!(
             cache
-                .get_or_build_validated(&id, Some(7), builder)
+                .get_or_build_validated(&id, Some(vec![7]), builder)
                 .expect("cache hit"),
             TestMetadata { revision: 1 }
         );
@@ -140,11 +140,11 @@ mod tests {
         };
 
         cache
-            .get_or_build_validated(&versioned, Some(1), builder)
+            .get_or_build_validated(&versioned, Some(vec![1]), builder)
             .expect("build schema 1");
         assert_eq!(
             cache
-                .get_or_build_validated(&versioned, Some(2), builder)
+                .get_or_build_validated(&versioned, Some(vec![2]), builder)
                 .expect("rebuild schema 2"),
             TestMetadata { revision: 2 }
         );
@@ -172,21 +172,21 @@ mod tests {
         };
 
         cache
-            .get_or_build_validated(&first, Some(1), builder)
+            .get_or_build_validated(&first, Some(vec![1]), builder)
             .expect("build first");
         cache
-            .get_or_build_validated(&second, Some(1), builder)
+            .get_or_build_validated(&second, Some(vec![1]), builder)
             .expect("build second");
         cache.invalidate(&first);
         assert_eq!(
             cache
-                .get_or_build_validated(&first, Some(1), builder)
+                .get_or_build_validated(&first, Some(vec![1]), builder)
                 .expect("rebuild invalidated table"),
             TestMetadata { revision: 3 }
         );
         assert_eq!(
             cache
-                .get_or_build_validated(&second, Some(1), builder)
+                .get_or_build_validated(&second, Some(vec![1]), builder)
                 .expect("other table remains cached"),
             TestMetadata { revision: 2 }
         );
@@ -194,7 +194,7 @@ mod tests {
         cache.invalidate_all();
         assert_eq!(
             cache
-                .get_or_build_validated(&second, Some(1), builder)
+                .get_or_build_validated(&second, Some(vec![1]), builder)
                 .expect("rebuild after invalidate all"),
             TestMetadata { revision: 4 }
         );
@@ -206,7 +206,7 @@ mod tests {
         let slow = TableIdentity::new("c", "ns", "slow");
         let ready = TableIdentity::new("c", "ns", "ready");
         cache
-            .get_or_build_validated(&ready, Some(1), || Ok(TestMetadata { revision: 9 }))
+            .get_or_build_validated(&ready, Some(vec![1]), || Ok(TestMetadata { revision: 9 }))
             .expect("preload ready entry");
 
         let builder_started = Arc::new(Barrier::new(2));
@@ -216,7 +216,7 @@ mod tests {
             let started = Arc::clone(&builder_started);
             let release = Arc::clone(&release_builder);
             std::thread::spawn(move || {
-                cache.get_or_build_validated(&slow, Some(1), || {
+                cache.get_or_build_validated(&slow, Some(vec![1]), || {
                     started.wait();
                     release.wait();
                     Ok(TestMetadata { revision: 1 })
@@ -229,7 +229,7 @@ mod tests {
         let ready_handle = {
             let cache = Arc::clone(&cache);
             std::thread::spawn(move || {
-                let result = cache.get_or_build_validated(&ready, Some(1), || {
+                let result = cache.get_or_build_validated(&ready, Some(vec![1]), || {
                     panic!("ready entry should hit cache")
                 });
                 sender.send(result).expect("send ready result");
@@ -262,7 +262,7 @@ mod tests {
             let id = id.clone();
             handles.push(std::thread::spawn(move || {
                 cache
-                    .get_or_build_validated(&id, Some(1), || Ok(TestMetadata { revision: 1 }))
+                    .get_or_build_validated(&id, Some(vec![1]), || Ok(TestMetadata { revision: 1 }))
                     .expect("concurrent lookup")
             }));
         }
@@ -275,7 +275,7 @@ mod tests {
         }
         assert_eq!(
             cache
-                .get_or_build_validated(&id, Some(1), || {
+                .get_or_build_validated(&id, Some(vec![1]), || {
                     panic!("settled entry should hit cache")
                 })
                 .expect("settled lookup"),

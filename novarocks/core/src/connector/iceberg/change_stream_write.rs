@@ -38,7 +38,6 @@ use super::write_contract::{
     encode_data_sink_spec_handle_payload, encode_deletion_vector_sink_handle_payload,
     encode_position_delete_sink_handle_payload,
 };
-use super::write_control::IcebergWritePlanPayloadV1;
 use super::write_service::{
     IcebergChangeStreamWriteReportCommitter, IcebergWriteControlService,
     IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
@@ -46,6 +45,7 @@ use super::write_service::{
 use crate::connector::iceberg::write_contract::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
+use novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1;
 use novarocks_spi::connector::{ConnectorError, ConnectorWriteOperationId};
 
 /// Frozen application input accepted by the Iceberg provider binding. It has
@@ -291,7 +291,11 @@ pub(crate) fn position_delete_index_storage_config(
     entry: &IcebergCatalogEntry,
     table_location: &str,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
-    let Some(bucket) = super::changes::expected_object_store_bucket_from_location(table_location)?
+    let Some(bucket) =
+        novarocks_connector_iceberg::delta::expected_object_store_bucket_from_location(
+            table_location,
+        )
+        .map_err(|error| error.to_string())?
     else {
         return Ok(None);
     };
@@ -325,14 +329,18 @@ fn frozen_deletion_vectors_at_snapshot(
         return Ok(HashMap::new());
     };
     let object_store_config = entry.object_store_config();
-    let factory = super::changes::build_factory_for_table(table, object_store_config)?;
-    let expected_bucket = super::changes::expected_object_store_bucket_for_table(table)?;
+    let factory =
+        novarocks_connector_iceberg::delta::build_factory_for_table(table, object_store_config)
+            .map_err(|error| error.to_string())?;
+    let expected_bucket =
+        novarocks_connector_iceberg::delta::expected_object_store_bucket_for_table(table)
+            .map_err(|error| error.to_string())?;
     let positions = super::scan_deletes::previously_deleted_positions_at_snapshot(
         table,
         snapshot_id,
         &factory,
         &|path| {
-            super::changes::normalize_delete_projection_path(
+            novarocks_connector_iceberg::delta::normalize_delete_projection_path(
                 path,
                 object_store_config,
                 expected_bucket.as_deref(),

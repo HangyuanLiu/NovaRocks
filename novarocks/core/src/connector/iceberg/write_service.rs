@@ -85,18 +85,19 @@ use super::commit::{
     CleanupAttempt, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
     RecoveryEvidence, RunInput, SelectedRewriteFiles, SelectedRewriteKind, run_iceberg_commit,
 };
-use super::report::IcebergWriterReport;
 use super::sink_plan::IcebergSinkPlan;
 use super::write_commit::IcebergWriteCommitExecutor;
-use super::write_contract::{
-    decode_sink_plan_handle_payload, decode_writer_reports, encode_sink_plan_handle_payload,
-};
+use super::write_contract::encode_sink_plan_handle_payload;
 use super::write_control::{
-    IcebergFirstRefreshWritePlanPayloadV2, IcebergWriteControlBackend, IcebergWriteControlPlan,
-    IcebergWritePlanPayloadV1, IcebergWriteReconcileEvidenceV1,
+    IcebergWriteControlBackend, IcebergWriteControlPlan, IcebergWriteReconcileEvidenceV1,
 };
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::AbortLog;
+use novarocks_connector_iceberg::commit::report::IcebergWriterReport;
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::write_codec::{decode_write_handle, decode_writer_reports};
+use novarocks_connector_iceberg::write_payload::{
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
+};
 
 /// A staged-action build can create manifest artifacts before it discovers a
 /// definite failure.  Keep the exact abort register with the typed error so
@@ -1790,7 +1791,7 @@ impl IcebergWriteControlServiceContext {
     ) -> Result<(), ConnectorError> {
         if self
             .preparation_digest
-            .is_some_and(|expected| expected != request.preparation.digest())
+            .is_some_and(|expected| expected != request.activation.preparation().digest())
         {
             return Err(invalid(
                 "Iceberg write service was activated for a different provider preparation",
@@ -1800,7 +1801,7 @@ impl IcebergWriteControlServiceContext {
             .cohort_preparation_digests
             .as_ref()
             .and_then(|digests| digests.get(&request.cohort_id))
-            .is_some_and(|expected| *expected != request.preparation.digest())
+            .is_some_and(|expected| *expected != request.activation.preparation().digest())
         {
             return Err(invalid(
                 "Iceberg write cohort was activated for a different provider preparation",
@@ -1863,13 +1864,13 @@ fn validate_writer_handle_payloads(
 ) -> Result<(), ConnectorError> {
     match payloads {
         IcebergWriterHandlePayloads::Uniform(payload) => {
-            decode_sink_plan_handle_payload(payload).map_err(|error| {
+            decode_write_handle(payload).map_err(|error| {
                 invalid(format!("decode Iceberg writer handle template: {error}"))
             })?;
         }
         IcebergWriterHandlePayloads::ByFragment(payloads) => {
             for (fragment_id, payload) in payloads {
-                decode_sink_plan_handle_payload(payload).map_err(|error| {
+                decode_write_handle(payload).map_err(|error| {
                     invalid(format!(
                         "decode Iceberg writer handle template for fragment {fragment_id}: {error}"
                     ))
@@ -1962,7 +1963,7 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
                 novarocks_spi::connector::ConnectorWriterHandle::try_new(
                     owner.clone(),
                     writer,
-                    super::write_contract::ICEBERG_WRITE_PAYLOAD_VERSION,
+                    novarocks_connector_iceberg::write_codec::ICEBERG_WRITE_PAYLOAD_VERSION,
                     payload,
                 )
                 .map_err(|error| internal(format!("encode Iceberg writer handle: {error}")))
@@ -2131,10 +2132,12 @@ mod tests {
     use parquet::basic::Compression;
 
     use super::*;
-    use crate::connector::iceberg::report::{IcebergPartitionReport, IcebergWrittenFileReport};
     use crate::connector::iceberg::sink_plan::IcebergSinkPlan;
-    use crate::connector::iceberg::write_contract::staged_report_from_iceberg_reports;
+    use novarocks_connector_iceberg::commit::report::{
+        IcebergPartitionReport, IcebergWrittenFileReport,
+    };
     use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
+    use novarocks_connector_iceberg::write_codec::staged_report_from_iceberg_reports;
 
     struct NeverCancelled;
     impl ConnectorCancellation for NeverCancelled {
@@ -2329,27 +2332,41 @@ mod tests {
         let operation_id = ConnectorWriteOperationId::from_bytes([1; 16]);
         let cohort_id = ConnectorWriteCohortId::primary(operation_id);
         let execution_id = ConnectorWriteExecutionId::new([2; 16], 3);
+        let preparation = ConnectorWritePreparation::try_new(
+            owner.clone(),
+            ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::from_static(b"t"))
+                .expect("table"),
+            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+            ConnectorWriteIntent::Append,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base version"),
+            ConnectorWriteInputShape::Data {
+                fields: vec![ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("id", DataType::Int32, false),
+                )],
+            },
+            Bytes::from_static(b"provider-signed-preparation"),
+        )
+        .expect("preparation");
+        let context = context();
+        let activation = novarocks_spi::connector::ConnectorWriteActivation::try_new(
+            owner.clone(),
+            &novarocks_spi::connector::ConnectorWriteActivationRequest {
+                operation_id,
+                source: novarocks_spi::connector::ConnectorWriteActivationSource::Prepared(
+                    preparation.clone(),
+                ),
+                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+                context: context.clone(),
+            },
+            vec![(cohort_id, preparation)],
+        )
+        .expect("activation");
         ConnectorWritePlanningRequest {
             operation_id,
             cohort_id,
             execution_id,
-            preparation: ConnectorWritePreparation::try_new(
-                owner.clone(),
-                ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::from_static(b"t"))
-                    .expect("table"),
-                novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                ConnectorWriteIntent::Append,
-                ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base"))
-                    .expect("base version"),
-                ConnectorWriteInputShape::Data {
-                    fields: vec![ConnectorWriteFieldBinding::new(
-                        ConnectorWriteFieldToken::from_bytes([1; 32]),
-                        Field::new("id", DataType::Int32, false),
-                    )],
-                },
-                Bytes::from_static(b"provider-signed-preparation"),
-            )
-            .expect("preparation"),
+            activation: activation.cohort(cohort_id).expect("cohort"),
             expected_writers: vec![ConnectorWriterIdentity::new(
                 operation_id,
                 cohort_id,
@@ -2360,7 +2377,7 @@ mod tests {
                 0,
                 owner,
             )],
-            context: context(),
+            context,
         }
     }
 
@@ -2372,7 +2389,7 @@ mod tests {
     ) -> (ConnectorWriteCommitRequest, ConnectorWriteAbortRequest) {
         let descriptor = ConnectorWriteCohortDescriptor::new(
             request.cohort_id,
-            request.preparation.intent(),
+            request.activation.preparation().intent(),
             request.stable_digest(&owner).expect("planning digest"),
         );
         let sealed = ConnectorSealedWriteCohortSet::try_new(request.operation_id, vec![descriptor])

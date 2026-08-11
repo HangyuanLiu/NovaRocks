@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-
 use crate::sql::binding::SqlTableBindingId;
 #[cfg(test)]
 use crate::sql::binding::SqlTableBindingScopeId;
+use arrow::datatypes::Schema;
 use novarocks_catalog::schema::ColumnDef;
 
 /// Immutable version selector attached to a query-local table binding.
@@ -119,30 +118,52 @@ struct SqlUkFkForeignKey {
 }
 
 impl SqlUkFkTableFacts {
-    /// Decode only the SQL constraint properties from an already-frozen value
-    /// map.  The input deliberately is not provider metadata or a catalog
-    /// handle: application materialization owns that conversion.
-    pub(crate) fn from_frozen_properties(properties: &BTreeMap<String, String>) -> Self {
-        let unique_constraints = properties
+    /// Project provider-neutral, schema-ordinal constraints into the SQL
+    /// optimizer's name-based facts.  The materializer never inspects a
+    /// connector table handle to recover these values.
+    pub(crate) fn from_connector_planning_facts(
+        schema: &Schema,
+        facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
+    ) -> Self {
+        let column_name = |ordinal: u32| {
+            schema
+                .fields()
+                .get(ordinal as usize)
+                .map(|field| field.name().to_ascii_lowercase())
+        };
+        let unique_constraints = facts
+            .unique_constraints()
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("unique_constraints"))
-            .map(|(_, value)| {
-                value
-                    .split(';')
-                    .filter_map(parse_constraint_columns)
-                    .collect()
+            .filter_map(|constraint| {
+                constraint
+                    .column_ordinals()
+                    .iter()
+                    .map(|ordinal| column_name(*ordinal))
+                    .collect::<Option<Vec<_>>>()
             })
-            .unwrap_or_default();
-        let foreign_key_constraints = properties
+            .collect();
+        let foreign_key_constraints = facts
+            .foreign_key_constraints()
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("foreign_key_constraints"))
-            .map(|(_, value)| {
-                value
-                    .split(';')
-                    .filter_map(parse_foreign_key_constraint)
-                    .collect()
+            .filter_map(|constraint| {
+                let local_columns = constraint
+                    .local_column_ordinals()
+                    .iter()
+                    .map(|ordinal| column_name(*ordinal))
+                    .collect::<Option<Vec<_>>>()?;
+                let referenced = constraint.referenced_table();
+                let referenced_table = format!("{}.{}", referenced.namespace, referenced.table,);
+                Some(SqlUkFkForeignKey {
+                    local_columns,
+                    referenced_table,
+                    referenced_columns: constraint
+                        .referenced_column_names()
+                        .iter()
+                        .map(|column| column.to_ascii_lowercase())
+                        .collect(),
+                })
             })
-            .unwrap_or_default();
+            .collect();
         Self {
             unique_constraints,
             foreign_key_constraints,
@@ -172,40 +193,6 @@ impl SqlUkFkTableFacts {
                 && same_constraint_columns(&foreign_key.referenced_columns, referenced_columns)
         })
     }
-}
-
-fn parse_constraint_columns(raw: &str) -> Option<Vec<String>> {
-    let segment = if let Some(open) = raw.find('(') {
-        let close = raw[open + 1..].find(')')? + open + 1;
-        &raw[open + 1..close]
-    } else {
-        raw
-    };
-    let columns = segment
-        .split(',')
-        .map(normalize_constraint_identifier)
-        .filter(|column| !column.is_empty())
-        .collect::<Vec<_>>();
-    (!columns.is_empty()).then_some(columns)
-}
-
-fn parse_foreign_key_constraint(raw: &str) -> Option<SqlUkFkForeignKey> {
-    let raw = raw.trim().trim_end_matches(';').trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let references_idx = raw.to_ascii_lowercase().find("references")?;
-    let local_columns = parse_constraint_columns(raw[..references_idx].trim())?;
-    let right = raw[references_idx + "references".len()..].trim();
-    let open = right.find('(')?;
-    let referenced_table = normalize_constraint_table_name(&right[..open]);
-    let referenced_columns = parse_constraint_columns(right)?;
-    (!referenced_table.is_empty() && !local_columns.is_empty() && !referenced_columns.is_empty())
-        .then_some(SqlUkFkForeignKey {
-            local_columns,
-            referenced_table,
-            referenced_columns,
-        })
 }
 
 fn normalize_constraint_identifier(value: &str) -> String {
@@ -457,10 +444,57 @@ pub struct TableDef {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::num::{NonZeroU32, NonZeroU64};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTablePlanningFacts,
+        ConnectorTableUniqueConstraint,
+    };
 
     use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn typed_ukfk_facts() -> SqlUkFkTableFacts {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int64, false),
+        ]));
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            4_096,
+            4_096,
+        )
+        .expect("valid connector context");
+        let facts = ConnectorTablePlanningFacts::try_new(
+            &schema,
+            vec![],
+            vec![ConnectorTableUniqueConstraint::new(vec![0])],
+            vec![ConnectorTableForeignKeyConstraint::new(
+                vec![1],
+                ConnectorTableIdentity {
+                    instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance ID"),
+                    namespace: Arc::from("sales"),
+                    table: Arc::from("dim_customer"),
+                },
+                vec![Arc::from("id")],
+            )],
+            &context,
+        )
+        .expect("valid typed planning facts");
+        SqlUkFkTableFacts::from_connector_planning_facts(&schema, &facts)
+    }
 
     #[test]
     fn sqlx2_scan_source_contains_only_binding_and_sql_facts() {
@@ -495,13 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlx2_scan_source_keeps_frozen_ukfk_facts_on_its_binding() {
-        let mut properties = BTreeMap::new();
-        properties.insert("unique_constraints".to_string(), "(id)".to_string());
-        properties.insert(
-            "foreign_key_constraints".to_string(),
-            "(customer_id) REFERENCES dim_customer(id)".to_string(),
-        );
+    fn sqlx2_scan_source_keeps_typed_ukfk_facts_on_its_binding() {
         let binding = SqlTableBindingId::new(
             crate::sql::binding::SqlTableBindingScopeId::new(NonZeroU64::new(5).expect("scope")),
             NonZeroU32::new(2).expect("ordinal"),
@@ -517,7 +545,7 @@ mod tests {
                 version: SqlTableVersionSelector::Current,
             },
         )
-        .with_ukfk_facts(SqlUkFkTableFacts::from_frozen_properties(&properties));
+        .with_ukfk_facts(typed_ukfk_facts());
 
         assert!(scan.ukfk_facts().has_unique_key(&["ID".to_string()]));
         assert!(scan.ukfk_facts().has_matching_foreign_key(

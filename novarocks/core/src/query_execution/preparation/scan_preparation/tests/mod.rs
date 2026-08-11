@@ -251,7 +251,7 @@ fn fixture_query_table_bindings_with_materialized_files(
                     },
                     write_target_admission: None,
                     frozen_snapshot_materializations,
-                    delta_runtime_plans: std::collections::BTreeMap::new(),
+                    admitted_change_scans: std::collections::BTreeMap::new(),
                 })
             },
         )
@@ -480,35 +480,13 @@ fn recording_registry(
 }
 
 fn resolved_delta() -> ResolvedScanExecution {
-    ResolvedScanExecution::IcebergDelta(
-        crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
-            runtime_plan: crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
-                table_location: "s3://bucket/test_table".to_string(),
-                data_columns: Vec::new(),
-                change_files: Vec::new(),
-                delete_side: None,
-            },
-        },
+    ResolvedScanExecution::SealedConnectorScan(
+        crate::query_execution::preparation::scan::fixture_sealed_change_scan("test_catalog", 6, 7),
     )
 }
 
 fn resolved_data_delta() -> ResolvedScanExecution {
-    let mut delta = match resolved_delta() {
-        ResolvedScanExecution::IcebergDelta(delta) => delta,
-        ResolvedScanExecution::ConnectorRead => unreachable!("fixture is delta"),
-        ResolvedScanExecution::AdmittedConnectorRead(_) => unreachable!("fixture is delta"),
-    };
-    delta.runtime_plan.change_files = vec![novarocks_connector_iceberg::delta::DeltaSourceFile {
-        path: "s3://bucket/delta-added.parquet".to_string(),
-        size: 128,
-        role: novarocks_connector_iceberg::delta::DeltaSourceRole::DataFile,
-        partition_spec_id: Some(0),
-        partition_key: Some("Struct([])".to_string()),
-        first_row_id: Some(100),
-        data_sequence_number: Some(7),
-        row_id_allow_list: None,
-    }];
-    ResolvedScanExecution::IcebergDelta(delta)
+    resolved_delta()
 }
 
 fn replace_scan_source(root: &mut DistributedNode, source: ScanSource) {

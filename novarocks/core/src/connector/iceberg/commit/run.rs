@@ -48,7 +48,7 @@ use super::service::{
 use super::truncate::TruncateCommit;
 use super::update_cow::CowUpdateCommit;
 use super::update_cow::CowUpdateRewriteSet;
-use crate::connector::iceberg::commit::types::{CommitOpKind, CommitOutcome};
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 
 pub type CleanupPathMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
 

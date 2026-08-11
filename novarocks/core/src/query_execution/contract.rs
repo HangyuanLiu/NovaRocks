@@ -34,9 +34,11 @@ pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorWriteCohortId,
-    ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationId,
-    ConnectorWritePlanningRequest, ConnectorWritePreparation,
+    ConnectorActivatedWriteCohort, ConnectorError, ConnectorExecutionBindingKey,
+    ConnectorRequestContext, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteExecutionId,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlanningRequest,
+    ConnectorWritePreparation,
 };
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
@@ -145,7 +147,7 @@ pub enum DistributedQueryIntent {
 pub struct ConnectorWritePlanningTemplate {
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
-    preparation: ConnectorWritePreparation,
+    activation: ConnectorActivatedWriteCohort,
     context: ConnectorRequestContext,
     // This lease is derived from the planning generation that accepted the
     // preparation.  Keeping it with the inert planning template prevents an
@@ -154,16 +156,80 @@ pub struct ConnectorWritePlanningTemplate {
 }
 
 impl ConnectorWritePlanningTemplate {
-    pub fn new(
+    pub fn from_activated_cohort(
+        activation: ConnectorActivatedWriteCohort,
+        context: ConnectorRequestContext,
+        lease: ConnectorWriteLease,
+    ) -> Result<Self, ConnectorError> {
+        activation.validate()?;
+        if activation.owner() != lease.binding_key() {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "activated connector write cohort does not match its exact write lease",
+            ));
+        }
+        Ok(Self::new(
+            activation.operation_id(),
+            activation,
+            context,
+            lease,
+        ))
+    }
+
+    /// Activate an ordinary Provider-signed preparation on its retained exact
+    /// lease and construct the only legal planning template for it.
+    pub fn activate_prepared(
         operation_id: ConnectorWriteOperationId,
         preparation: ConnectorWritePreparation,
+        context: ConnectorRequestContext,
+        lease: ConnectorWriteLease,
+    ) -> Result<Self, ConnectorError> {
+        Self::activate_prepared_with_intent(
+            operation_id,
+            preparation,
+            ConnectorWriteActivationIntent::Ordinary,
+            context,
+            lease,
+        )
+    }
+
+    /// Activate a prepared write with an application-owned, provider-neutral
+    /// intent.  Only the exact lease may turn the preparation into planning
+    /// authority; the intent is bound into the activation digest at that
+    /// transition.
+    pub fn activate_prepared_with_intent(
+        operation_id: ConnectorWriteOperationId,
+        preparation: ConnectorWritePreparation,
+        intent: ConnectorWriteActivationIntent,
+        context: ConnectorRequestContext,
+        lease: ConnectorWriteLease,
+    ) -> Result<Self, ConnectorError> {
+        let activation = lease.activate_write(ConnectorWriteActivationRequest {
+            operation_id,
+            source: ConnectorWriteActivationSource::Prepared(preparation),
+            intent,
+            context: context.clone(),
+        })?;
+        let cohort = activation
+            .cohort(ConnectorWriteCohortId::primary(operation_id))
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                    "ordinary connector write activation omitted its primary cohort",
+                )
+            })?;
+        Ok(Self::new(operation_id, cohort, context, lease))
+    }
+    pub fn new(
+        operation_id: ConnectorWriteOperationId,
+        activation: ConnectorActivatedWriteCohort,
         context: ConnectorRequestContext,
         lease: ConnectorWriteLease,
     ) -> Self {
         Self::new_in_cohort(
             operation_id,
-            ConnectorWriteCohortId::primary(operation_id),
-            preparation,
+            activation.cohort_id(),
+            activation,
             context,
             lease,
         )
@@ -172,14 +238,14 @@ impl ConnectorWritePlanningTemplate {
     pub fn new_in_cohort(
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
-        preparation: ConnectorWritePreparation,
+        activation: ConnectorActivatedWriteCohort,
         context: ConnectorRequestContext,
         lease: ConnectorWriteLease,
     ) -> Self {
         Self {
             operation_id,
             cohort_id,
-            preparation,
+            activation,
             context,
             lease,
         }
@@ -194,15 +260,19 @@ impl ConnectorWritePlanningTemplate {
     }
 
     pub fn connector_instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
-        self.preparation.table().owner()
+        self.activation.preparation().table().owner()
     }
 
     pub fn preparation(&self) -> &ConnectorWritePreparation {
-        &self.preparation
+        self.activation.preparation()
+    }
+
+    pub fn request_context(&self) -> &ConnectorRequestContext {
+        &self.context
     }
 
     pub fn intent(&self) -> novarocks_spi::connector::ConnectorWriteIntent {
-        self.preparation.intent()
+        self.activation.preparation().intent()
     }
 
     pub fn context(&self) -> &ConnectorRequestContext {
@@ -237,7 +307,7 @@ impl ConnectorWritePlanningTemplate {
             operation_id: self.operation_id,
             cohort_id: self.cohort_id,
             execution_id,
-            preparation: self.preparation,
+            activation: self.activation,
             expected_writers: Vec::new(),
             context: self.context,
         }

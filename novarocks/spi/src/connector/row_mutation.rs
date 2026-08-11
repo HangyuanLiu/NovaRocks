@@ -779,8 +779,20 @@ impl ConnectorRowMutationActivationRequest {
     }
 }
 
+/// Provider-sealed physical execution result for one row-mutation operation.
+///
+/// The application can route its opaque cohorts but cannot assemble an
+/// unbound set of routes.  In particular, the plan always retains the exact
+/// row-mutation preparation that authenticated its operation and generation.
 #[derive(Clone)]
-pub enum ConnectorRowMutationExecutionPlan {
+pub struct ConnectorRowMutationExecutionPlan {
+    preparation: ConnectorRowMutationPreparation,
+    body: ConnectorRowMutationExecutionPlanBody,
+    digest: [u8; 32],
+}
+
+#[derive(Clone)]
+enum ConnectorRowMutationExecutionPlanBody {
     Direct {
         routes: Vec<ConnectorRowMutationRoute>,
     },
@@ -792,48 +804,132 @@ pub enum ConnectorRowMutationExecutionPlan {
 }
 
 impl ConnectorRowMutationExecutionPlan {
-    pub fn try_direct(routes: Vec<ConnectorRowMutationRoute>) -> Result<Self, ConnectorError> {
-        validate_routes(&routes)?;
-        Ok(Self::Direct { routes })
+    pub fn try_direct(
+        preparation: ConnectorRowMutationPreparation,
+        routes: Vec<ConnectorRowMutationRoute>,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new(
+            preparation,
+            ConnectorRowMutationExecutionPlanBody::Direct { routes },
+        )
     }
     pub fn try_copy_on_write(
+        preparation: ConnectorRowMutationPreparation,
         routes: Vec<ConnectorRowMutationRoute>,
         sealed_cohorts: ConnectorSealedWriteCohortSet,
         cohort_recipes: Vec<ConnectorRowMutationCohortRecipe>,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new(
+            preparation,
+            ConnectorRowMutationExecutionPlanBody::CopyOnWrite {
+                routes,
+                sealed_cohorts,
+                cohort_recipes,
+            },
+        )
+    }
+
+    fn try_new(
+        preparation: ConnectorRowMutationPreparation,
+        body: ConnectorRowMutationExecutionPlanBody,
+    ) -> Result<Self, ConnectorError> {
+        preparation.validate()?;
+        let routes = match &body {
+            ConnectorRowMutationExecutionPlanBody::Direct { routes }
+            | ConnectorRowMutationExecutionPlanBody::CopyOnWrite { routes, .. } => routes,
+        };
         validate_routes(&routes)?;
-        if cohort_recipes.is_empty() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "copy-on-write requires sealed cohort recipes",
-            ));
-        }
-        let ids: HashSet<_> = routes.iter().map(|route| route.route_id()).collect();
-        let cohorts: HashSet<_> = sealed_cohorts
-            .cohorts()
-            .iter()
-            .map(|cohort| cohort.cohort_id())
-            .collect();
-        let mut seen = HashSet::new();
-        if cohort_recipes.iter().any(|recipe| {
-            !ids.contains(&recipe.route_id)
-                || !cohorts.contains(&recipe.cohort_id)
-                || !seen.insert(recipe.cohort_id)
+        if routes.iter().any(|route| {
+            route.preparation().owner() != preparation.owner()
+                || route.preparation().table() != preparation.table()
+                || route.preparation().base_version() != preparation.base_version()
         }) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "copy-on-write recipe is foreign or duplicate",
+                "row-mutation execution route is foreign to its preparation",
             ));
         }
-        Ok(Self::CopyOnWrite {
-            routes,
+        if let ConnectorRowMutationExecutionPlanBody::CopyOnWrite {
             sealed_cohorts,
             cohort_recipes,
+            ..
+        } = &body
+        {
+            if preparation.strategy() != ConnectorRowMutationStrategy::CopyOnWrite
+                || cohort_recipes.is_empty()
+                || sealed_cohorts.operation_id() != preparation.operation_id()
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "copy-on-write execution plan does not match its preparation",
+                ));
+            }
+            let ids: HashSet<_> = routes.iter().map(|route| route.route_id()).collect();
+            let cohorts: HashSet<_> = sealed_cohorts
+                .cohorts()
+                .iter()
+                .map(|cohort| cohort.cohort_id())
+                .collect();
+            let mut seen = HashSet::new();
+            if cohort_recipes.iter().any(|recipe| {
+                !ids.contains(&recipe.route_id)
+                    || !cohorts.contains(&recipe.cohort_id)
+                    || !seen.insert(recipe.cohort_id)
+            }) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "copy-on-write recipe is foreign or duplicate",
+                ));
+            }
+        } else if preparation.strategy() == ConnectorRowMutationStrategy::CopyOnWrite {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "copy-on-write preparation requires a copy-on-write execution plan",
+            ));
+        }
+        let digest = execution_plan_digest(&preparation, &body);
+        Ok(Self {
+            preparation,
+            body,
+            digest,
         })
     }
+
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        let expected = Self::try_new(self.preparation.clone(), self.body.clone())?;
+        if expected.digest != self.digest {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "row-mutation execution plan digest does not match contents",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn preparation(&self) -> &ConnectorRowMutationPreparation {
+        &self.preparation
+    }
+
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        self.preparation.owner()
+    }
+
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.preparation.operation_id()
+    }
+
+    pub const fn source_digest(&self) -> [u8; 32] {
+        self.preparation.digest()
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
     pub fn routes(&self) -> &[ConnectorRowMutationRoute] {
-        match self {
-            Self::Direct { routes } | Self::CopyOnWrite { routes, .. } => routes,
+        match &self.body {
+            ConnectorRowMutationExecutionPlanBody::Direct { routes }
+            | ConnectorRowMutationExecutionPlanBody::CopyOnWrite { routes, .. } => routes,
         }
     }
 
@@ -846,13 +942,13 @@ impl ConnectorRowMutationExecutionPlan {
         &ConnectorSealedWriteCohortSet,
         &[ConnectorRowMutationCohortRecipe],
     )> {
-        match self {
-            Self::CopyOnWrite {
+        match &self.body {
+            ConnectorRowMutationExecutionPlanBody::CopyOnWrite {
                 sealed_cohorts,
                 cohort_recipes,
                 ..
             } => Some((sealed_cohorts, cohort_recipes)),
-            Self::Direct { .. } => None,
+            ConnectorRowMutationExecutionPlanBody::Direct { .. } => None,
         }
     }
 }
@@ -971,6 +1067,39 @@ fn route_digest(
         hasher.update(token.to_bytes());
     }
     hasher.update(preparation.digest());
+    hasher.finalize().into()
+}
+fn execution_plan_digest(
+    preparation: &ConnectorRowMutationPreparation,
+    body: &ConnectorRowMutationExecutionPlanBody,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.connector-row-mutation-execution-plan.v1\0");
+    hasher.update(preparation.digest());
+    match body {
+        ConnectorRowMutationExecutionPlanBody::Direct { routes } => {
+            hasher.update([1]);
+            for route in routes {
+                hasher.update(route.digest());
+            }
+        }
+        ConnectorRowMutationExecutionPlanBody::CopyOnWrite {
+            routes,
+            sealed_cohorts,
+            cohort_recipes,
+        } => {
+            hasher.update([2]);
+            for route in routes {
+                hasher.update(route.digest());
+            }
+            hasher.update(sealed_cohorts.digest());
+            for recipe in cohort_recipes {
+                hasher.update(recipe.cohort_id().to_bytes());
+                hasher.update(recipe.route_id().to_bytes());
+                digest_bytes(&mut hasher, recipe.payload());
+            }
+        }
+    }
     hasher.finalize().into()
 }
 fn preparation_digest(

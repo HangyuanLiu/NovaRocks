@@ -26,7 +26,7 @@ use std::sync::Arc;
 use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::catalog::registry::build_iceberg_catalog;
 use crate::engine::StandaloneState;
 use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
@@ -68,26 +68,26 @@ pub(crate) fn current_snapshot_id(
     state: &Arc<StandaloneState>,
     target: &MaintenanceTarget,
 ) -> Result<i64, String> {
-    let (catalog, table_ident, _) =
-        resolve_maintenance_catalog(state, &target.catalog, &target.namespace, &target.table)?;
-    let table = block_on_iceberg(async move { catalog.load_table(&table_ident).await })?.map_err(
-        |error| {
-            format!(
-                "load iceberg table {} for maintenance failed: {error}",
-                action_target(target)
-            )
-        },
+    let context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
-    table
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id())
-        .ok_or_else(|| {
-            format!(
-                "iceberg table {} has no current snapshot",
-                action_target(target)
-            )
-        })
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
+        exact_lease,
+        context,
+        &target.namespace,
+        &target.table,
+    )?;
+    facts.current_snapshot_id().ok_or_else(|| {
+        format!(
+            "iceberg table {} has no current snapshot",
+            action_target(target)
+        )
+    })
 }
 
 fn run_rewrite_manifests_action(

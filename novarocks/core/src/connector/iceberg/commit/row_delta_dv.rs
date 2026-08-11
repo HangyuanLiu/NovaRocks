@@ -67,16 +67,17 @@ use super::helpers::{
     required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
     target_ref_snapshot_id, write_manifest_list,
 };
-use super::position_delete_writer::PositionDeleteGroup;
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_with_dv_merge, dv_summary, dv_total_records,
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
-use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
-use crate::connector::iceberg::stats_assembler::CommitType;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
-use novarocks_connector_iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::{
+    DeletionVector, PositionDeleteGroup, write_single_deletion_vector_puffin,
+};
+use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 pub struct RowDeltaDvCommit;
 

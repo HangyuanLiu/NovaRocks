@@ -17,10 +17,10 @@ use super::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorRequestContext,
-    ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteAttemptCompletion,
-    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWriteReceipt,
+    ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivation,
+    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteControl,
+    ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWriteReceipt,
 };
 
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
@@ -551,7 +551,8 @@ pub trait ConnectorDistributedRewrite: Send + Sync {
     fn activate_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
-    ) -> Result<(), ConnectorError>;
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteActivation, ConnectorError>;
     fn checkpoint_attempt(
         &self,
         plan: &ConnectorDistributedRewritePlan,
@@ -699,9 +700,17 @@ impl ConnectorDistributedRewriteLease {
     pub fn activate_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
-    ) -> Result<(), ConnectorError> {
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
         self.validate_plan(plan)?;
-        self.rewrite.activate_rewrite(plan)
+        let activation = self.rewrite.activate_rewrite(plan, context)?;
+        activation.validate()?;
+        if activation.owner() != &self.key || activation.operation_id() != plan.operation_id() {
+            return Err(invalid(
+                "distributed rewrite activation does not match exact lease generation",
+            ));
+        }
+        Ok(activation)
     }
     pub fn checkpoint_attempt(
         &self,

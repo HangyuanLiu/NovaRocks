@@ -27,10 +27,8 @@ use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergUpdateMode};
 use crate::connector::iceberg::commit::{
-    CommitServiceError, IcebergCommitCollector, ensure_iceberg_write_supported,
-    select_iceberg_update_mode,
+    IcebergCommitCollector, ensure_iceberg_write_supported, select_iceberg_update_mode,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::engine::StandaloneState;
@@ -45,6 +43,7 @@ use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
     MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
+use novarocks_connector_iceberg::commit::{CommitOpKind, IcebergUpdateMode};
 
 fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
     write_commit
@@ -406,14 +405,10 @@ pub(crate) trait MutationExecution: Send + Sync {
     fn needs_abort_on_stage_error(&self) -> bool {
         false
     }
-    fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError>;
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String>;
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError>;
+    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext;
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -423,11 +418,10 @@ pub(crate) trait MutationExecution: Send + Sync {
         >,
         String,
     > {
-        crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
-            completion.session().owner(),
-            completion.session().operation_id(),
-            self.commit(completion),
-        )
+        completion
+            .session()
+            .commit(self.terminal_context())
+            .map_err(|error| error.to_string())
     }
     fn finalize(&self) -> Result<(), String>;
 }
@@ -1979,21 +1973,6 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
             .is_some()
     }
 
-    fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError> {
-        let session = self
-            .operation_session
-            .lock()
-            .expect("MOR UPDATE operation session lock poisoned")
-            .clone()
-            .expect("MOR UPDATE abort requires a retained operation session");
-        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
-            &self.commit_executor,
-            &session,
-            self.connector_context.clone(),
-            reason,
-        )
-    }
-
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
@@ -2008,14 +1987,8 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
             .map_err(|error| format!("abort MOR UPDATE connector operation: {error}"))
     }
 
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        )
+    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -2101,21 +2074,6 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
             .is_some()
     }
 
-    fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError> {
-        let session = self
-            .operation_session
-            .lock()
-            .expect("MOR MERGE operation session lock poisoned")
-            .clone()
-            .expect("MOR MERGE abort requires a retained operation session");
-        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
-            &self.commit_executor,
-            &session,
-            self.connector_context.clone(),
-            reason,
-        )
-    }
-
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
@@ -2130,14 +2088,8 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
             .map_err(|error| format!("abort MOR MERGE connector operation: {error}"))
     }
 
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        )
+    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -2267,7 +2219,7 @@ fn build_cow_update_distributed_write(
 fn build_cow_rewrite_query_local_overlay(
     target: &crate::engine::backend_resolver::TargetBackend,
     synthetic_table_name: &str,
-    data_file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
+    data_file: novarocks_connector_iceberg::manifest::DataFileWithStats,
     base_snapshot_id: i64,
     target_ref: &str,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -2303,7 +2255,7 @@ fn build_cow_rewrite_query_local_overlay(
     // because its default snapshot is main.
     let materialization = materialization.with_frozen_files_at_snapshot(
         vec![
-            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
+            novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info(
                 data_file,
             ),
         ],
@@ -2542,15 +2494,6 @@ impl MutationExecution for DistributedCowUpdateExecutor {
         true
     }
 
-    fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
-            &self.commit_executor,
-            &self.operation_session,
-            self.connector_context.clone(),
-            reason,
-        )
-    }
-
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
@@ -2559,14 +2502,8 @@ impl MutationExecution for DistributedCowUpdateExecutor {
             .map_err(|error| format!("abort COW UPDATE connector operation: {error}"))
     }
 
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        )
+    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -2736,6 +2673,16 @@ fn build_cow_update_distributed_execution(
         .0
         .operation_id();
     let write_lease = write.write_lease.clone();
+    let activation = write_lease
+        .activate_write(novarocks_spi::connector::ConnectorWriteActivationRequest {
+            operation_id,
+            source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
+                write.provider_plan.clone(),
+            ),
+            intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| format!("activate exact COW UPDATE generation: {error}"))?;
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
@@ -2746,14 +2693,16 @@ fn build_cow_update_distributed_execution(
             .provider_binding
             .rewrite_cohort_for_file(&file_plan.old_file)
             .map_err(|error| format!("resolve Provider COW rewrite cohort: {error}"))?;
+        let cohort = activation.cohort(cohort_id).ok_or_else(|| {
+            "exact COW UPDATE activation omitted a provider-sealed rewrite cohort".to_string()
+        })?;
         cohort_templates.push(
-            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
-                operation_id,
-                cohort_id,
-                write.rewrite_preparation.clone(),
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+                cohort,
                 connector_context.clone(),
                 write_lease.clone(),
-            ),
+            )
+            .map_err(|error| format!("build activated COW UPDATE template: {error}"))?,
         );
         if cohort_by_old_file
             .insert(file_plan.old_file.clone(), cohort_id)
@@ -3812,6 +3761,16 @@ fn prepare_cow_merge_operation(
         .0
         .operation_id();
     let write_lease = write.write_lease.clone();
+    let activation = write_lease
+        .activate_write(novarocks_spi::connector::ConnectorWriteActivationRequest {
+            operation_id,
+            source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
+                write.provider_plan.clone(),
+            ),
+            intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| format!("activate exact COW MERGE generation: {error}"))?;
     write
         .file_plans
         .sort_by(|left, right| left.old_file.cmp(&right.old_file));
@@ -3822,14 +3781,16 @@ fn prepare_cow_merge_operation(
             .provider_binding
             .rewrite_cohort_for_file(&file_plan.old_file)
             .map_err(|error| format!("resolve Provider COW MERGE rewrite cohort: {error}"))?;
+        let cohort = activation.cohort(cohort_id).ok_or_else(|| {
+            "exact COW MERGE activation omitted a provider-sealed rewrite cohort".to_string()
+        })?;
         templates.push(
-            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
-                operation_id,
-                cohort_id,
-                write.rewrite_preparation.clone(),
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+                cohort,
                 connector_context.clone(),
                 write_lease.clone(),
-            ),
+            )
+            .map_err(|error| format!("build activated COW MERGE template: {error}"))?,
         );
         cohort_by_old_file.insert(file_plan.old_file.clone(), cohort_id);
     }
@@ -3844,14 +3805,16 @@ fn prepare_cow_merge_operation(
             .find(|route| route.cohort_id() == cohort_id)
             .map(|route| route.preparation().clone())
             .ok_or_else(|| "Provider COW append cohort has no route preparation".to_string())?;
+        let cohort = activation.cohort(cohort_id).ok_or_else(|| {
+            "exact COW MERGE activation omitted a provider-sealed append cohort".to_string()
+        })?;
         templates.push(
-            crate::query_execution::contract::ConnectorWritePlanningTemplate::new_in_cohort(
-                operation_id,
-                cohort_id,
-                preparation.clone(),
+            crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+                cohort,
                 connector_context.clone(),
                 write_lease.clone(),
-            ),
+            )
+            .map_err(|error| format!("build activated COW MERGE template: {error}"))?,
         );
         (Some(cohort_id), Some(preparation))
     } else {
@@ -4833,19 +4796,6 @@ impl MutationExecution for DistributedMergeExecutor {
         self.cow_operation.is_some()
     }
 
-    fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError> {
-        let cow = self
-            .cow_operation
-            .as_ref()
-            .expect("MERGE typed abort requires a sealed connector operation");
-        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
-            &self.commit_executor,
-            &cow.session,
-            self.connector_context.clone(),
-            reason,
-        )
-    }
-
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
@@ -4858,14 +4808,8 @@ impl MutationExecution for DistributedMergeExecutor {
             .map_err(|error| format!("abort COW MERGE connector operation: {error}"))
     }
 
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        )
+    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {

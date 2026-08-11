@@ -17,7 +17,6 @@
 
 mod boundary;
 mod cte;
-mod iceberg_delta;
 mod projection;
 pub(crate) mod runtime_filter_binding;
 pub(crate) mod runtime_filter_view;

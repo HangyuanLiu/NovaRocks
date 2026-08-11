@@ -17,12 +17,12 @@ use novarocks_connector_iceberg::commit::{
 };
 use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
-    ConnectorRequestContext, ConnectorWriteInputRequest, ConnectorWriteLease,
-    ConnectorWriteOperationId,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
+    ConnectorManagedPublicationTechnique, ConnectorRequestContext,
+    ConnectorStagedPublicationBaseFact, ConnectorWriteActivationIntent, ConnectorWriteInputRequest,
+    ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::connector::iceberg::commit::CommitOpKind;
-use crate::connector::iceberg::write_control::IcebergFirstRefreshWritePlanPayloadV2;
 use crate::engine::StandaloneState;
 use crate::mv::application::{
     MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
@@ -30,6 +30,8 @@ use crate::mv::application::{
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
+use novarocks_connector_iceberg::commit::CommitOpKind;
+use novarocks_connector_iceberg::write_payload::IcebergFirstRefreshWritePlanPayloadV2;
 
 /// Core-side provider adapter installed into the frontend composition. It
 /// retains only a weak engine reference, preventing a direct all-in-one
@@ -153,7 +155,7 @@ pub(crate) fn activate_first_refresh_connector_write(
     let target_table =
         crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)
             .map_err(|error| format!("reload MV first-refresh staging target: {error}"))?
-            .table;
+            .into_table();
     validate_first_refresh_target_contract(&target_table, prepared.target_contract())?;
     let ident = TableIdent::new(
         NamespaceIdent::new(target.namespace.clone()),
@@ -245,14 +247,46 @@ pub(crate) fn activate_first_refresh_connector_write(
         empty_input_policy,
     )
     .map_err(|error| format!("activate Iceberg first-refresh writer from preparation: {error}"))?;
-    Ok(
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::new(
-            operation_id,
-            preparation,
-            connector_context,
-            exact_lease.clone(),
-        ),
+    let managed_publication = ConnectorManagedPublicationIntent::try_new(
+        prepared.publication_intent().refresh_id(),
+        prepared.publication_intent().mv_id(),
+        prepared.publication_intent().marker_token(),
+        match prepared.publication_intent().technique() {
+            MvRefreshPublicationTechnique::Full => ConnectorManagedPublicationTechnique::Full,
+            MvRefreshPublicationTechnique::Incremental => {
+                ConnectorManagedPublicationTechnique::Incremental
+            }
+        },
+        prepared
+            .publication_intent()
+            .bases()
+            .iter()
+            .map(|base| ConnectorStagedPublicationBaseFact {
+                table: base.table_fqn().into(),
+                uuid: base.table_uuid().into(),
+                from_version: base.from_snapshot(),
+                to_version: base.to_snapshot(),
+            })
+            .collect(),
+        prepared.publication_intent().definition_fingerprint(),
+        match empty_input_policy {
+            crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot => {
+                ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit
+            }
+            crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite => {
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
+            }
+        },
     )
+    .map_err(|error| format!("build managed MV publication activation intent: {error}"))?;
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared_with_intent(
+        operation_id,
+        preparation,
+        ConnectorWriteActivationIntent::ManagedPublication(managed_publication),
+        connector_context,
+        exact_lease.clone(),
+    )
+    .map_err(|error| format!("activate exact Iceberg MV write generation: {error}"))
 }
 
 fn validate_first_refresh_target_contract(

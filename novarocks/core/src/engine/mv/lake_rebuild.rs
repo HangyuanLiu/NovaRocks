@@ -30,7 +30,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::engine::StandaloneState;
-use crate::engine::mv::iceberg_storage_observation::IcebergMvStorageObservationAdapter;
 use crate::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -39,7 +38,7 @@ use crate::mv::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::persistence::descriptor::DescriptorDependency;
 use crate::mv::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvStorageObservation,
+    MvLakePackageObservation, MvLakePublication, discover_mv_lake_packages,
 };
 
 /// Output of [`rebuild_mv_definition_from_lake`]: the definition-create
@@ -133,13 +132,40 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
 
     let context =
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
-    let observer = IcebergMvStorageObservationAdapter::new(
-        Arc::clone(&state.iceberg_catalogs),
-        Arc::clone(&state.connector_control),
-    );
-    let packages = observer
-        .discover_lake_packages(context)
-        .map_err(|error| format!("discover lake MV packages failed: {error}"))?;
+    let read = state
+        .metadata_provider
+        .as_ref()
+        .expect("metadata provider checked above")
+        .begin_read()
+        .map_err(|error| format!("open catalog attachment read transaction failed: {error}"))?;
+    let instance_ids = state
+        .catalog_attachment_repo
+        .list(read.as_ref())
+        .map_err(|error| format!("list catalog attachments for MV rebuild failed: {error}"))?
+        .into_iter()
+        .filter(|attachment| {
+            attachment.properties.properties.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("type") && value.eq_ignore_ascii_case("iceberg")
+            })
+        })
+        .map(|attachment| {
+            novarocks_spi::connector::ConnectorInstanceId::parse(&attachment.catalog).map_err(
+                |error| {
+                    format!(
+                        "parse Iceberg catalog attachment `{}` for MV rebuild: {error}",
+                        attachment.catalog
+                    )
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let packages = discover_mv_lake_packages(
+        state.connector_control.as_ref(),
+        instance_ids,
+        state.mv_storage_observation.as_ref(),
+        context,
+    )
+    .map_err(|error| format!("discover lake MV packages failed: {error}"))?;
     for package in packages {
         rebuild_one_lake_package_if_missing(state, &package)?;
     }

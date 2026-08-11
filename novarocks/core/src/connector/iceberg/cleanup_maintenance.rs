@@ -35,9 +35,9 @@ use super::catalog::registry::{
 use super::commit::remove_orphan_files::{
     ScannedFile, canonical_object_mtime_ms, collect_orphan_candidates,
 };
-use super::fs_io;
 use super::provider::decode_data_mutation_table_target;
 use crate::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
+use novarocks_connector_iceberg::fs_io;
 
 const ARTIFACT_VERSION: u16 = 1;
 const MAX_ARTIFACT_PARTS: usize = 64;
@@ -424,7 +424,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         entry.invalidate_table_cache(&namespace, &table_name);
         let loaded = load_table(&entry, &namespace, &table_name)
             .map_err(|error| unavailable(format!("load Iceberg cleanup table: {error}")))?;
-        let table = loaded.table;
+        let table = loaded.into_table();
         let metadata = table.metadata();
         let collected = block_on_iceberg(collect_orphan_candidates(
             build_catalog(&entry)?,

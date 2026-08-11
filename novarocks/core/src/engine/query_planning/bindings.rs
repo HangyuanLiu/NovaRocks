@@ -245,13 +245,11 @@ pub(crate) struct QueryTableBinding {
     /// The map is query-local and shares the binding's planning lease; it is
     /// never populated by a later catalog lookup.
     pub(crate) frozen_snapshot_materializations: BTreeMap<i64, QueryScanMaterialization>,
-    /// Exact snapshot-window physical facts admitted for a SQL delta scan.
-    /// They remain application-owned and are retrieved only through this
-    /// binding's request-local token during preparation.
-    pub(crate) delta_runtime_plans: BTreeMap<
-        (i64, i64),
-        crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
-    >,
+    /// Provider-sealed snapshot-window admissions retained for SQL delta
+    /// scans. Core never decodes their handles or reconstructs provider
+    /// physical facts; preparation reuses the exact sealed scan through this
+    /// binding's request-local token.
+    pub(crate) admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
 }
 
 /// One Provider-signed terminal write preparation retained beside the SQL
@@ -317,7 +315,7 @@ impl QueryTableBinding {
             mv_target_read: None,
             write_target_admission: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            delta_runtime_plans: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
         }
     }
 

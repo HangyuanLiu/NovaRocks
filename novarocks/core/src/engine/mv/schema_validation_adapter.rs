@@ -15,80 +15,330 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::persistence::schema::MvSchemaContract;
-use crate::mv::schema_validation::{
-    ContractDecision, CurrentIcebergTableView, JoinContractDecision, JoinSchemaValidationError,
-    validate_join_schema_contract, validate_schema_contract,
+use crate::mv::persistence::descriptor::MvDescriptorV1;
+use crate::mv::persistence::schema::{
+    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
-use novarocks_catalog::identifier::TableIdentity;
+use crate::mv::storage_observation::{
+    MvLakePackageObservation, MvLakePublication, MvObservedTargetField, MvPublishedBaseFact,
+    MvPublishedLakeFacts, MvPublishedRefreshTechnique, MvSchemaValidationObservation,
+    MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
+    MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
+};
+use novarocks_connector_iceberg::storage_inspector::{
+    IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionTransform,
+    IcebergStorageRefreshTechnique, IcebergStorageTargetObservation,
+};
+use novarocks_spi::connector::{
+    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+    ConnectorTableMetadata,
+};
 
 const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
 
-pub(crate) fn current_iceberg_table_view(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> CurrentIcebergTableView<'_> {
-    current_iceberg_table_view_with_schema(table, table.metadata().current_schema())
+/// Test-only equivalent of the Server composition adapter.
+///
+/// Core production keeps this module disabled. Iceberg MV integration fixtures
+/// still construct the legacy Core control binding directly in Phase 1, so
+/// they must explicitly install the same exact-lease storage observation
+/// boundary that Server production installs.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TestIcebergMvStorageObservationAdapter {
+    inspector: IcebergStorageInspector,
 }
 
-pub(crate) fn current_iceberg_table_view_with_schema<'a>(
-    table: &'a novarocks_connector_iceberg::iceberg::table::Table,
-    schema: &'a novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> CurrentIcebergTableView<'a> {
-    let metadata = table.metadata();
-    CurrentIcebergTableView {
-        table_uuid: metadata.uuid().to_string(),
-        format_version: metadata.format_version(),
-        row_lineage_enabled: row_lineage_enabled(metadata.properties()),
-        schema,
-        default_partition_spec: metadata.default_partition_spec(),
+impl MvStorageObservationPort for TestIcebergMvStorageObservationAdapter {
+    fn observe_created_target(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvTargetCreationObservation, ConnectorError> {
+        let observed = self
+            .inspector
+            .observe_created_target(exact_lease, metadata, context)?;
+        let fields = observed_fields(&observed);
+        let partition = created_partition_contract(&observed);
+        MvTargetCreationObservation::try_new(
+            metadata.identity.clone(),
+            observed.table_uuid,
+            observed.schema_id,
+            fields,
+            partition,
+        )
+    }
+
+    fn observe_schema_validation(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvSchemaValidationObservation, ConnectorError> {
+        let observed =
+            self.inspector
+                .observe_created_target(exact_lease, metadata, context.clone())?;
+        MvSchemaValidationObservation::try_new(
+            observed.table_uuid.clone(),
+            observed.schema_id,
+            observed.format_v3,
+            observed.explicit_row_lineage_enabled,
+            observed_fields(&observed),
+            validation_partition_contract(&observed),
+            &context,
+        )
+    }
+
+    fn observe_lake_package(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
+        let Some(observed) = self
+            .inspector
+            .observe_lake_package(exact_lease, metadata, context)?
+        else {
+            return Ok(None);
+        };
+        let properties = observed
+            .descriptor_properties
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let descriptor = MvDescriptorV1::from_storage_properties(&properties).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode Iceberg MV storage descriptor: {error}"),
+            )
+        })?;
+        let publication = match observed.publication {
+            IcebergStorageLakePublication::NeverPublished => MvLakePublication::NeverPublished,
+            IcebergStorageLakePublication::Published(facts) => {
+                let technique = match facts.technique {
+                    IcebergStorageRefreshTechnique::Incremental => {
+                        MvPublishedRefreshTechnique::Incremental
+                    }
+                    IcebergStorageRefreshTechnique::Full => MvPublishedRefreshTechnique::Full,
+                    IcebergStorageRefreshTechnique::MetadataOnly => {
+                        MvPublishedRefreshTechnique::MetadataOnly
+                    }
+                };
+                let bases = facts
+                    .bases
+                    .into_iter()
+                    .map(|base| MvPublishedBaseFact {
+                        table_fqn: base.table_fqn,
+                        table_uuid: base.table_uuid,
+                        from_snapshot: base.from_snapshot,
+                        to_snapshot: base.to_snapshot,
+                    })
+                    .collect();
+                MvLakePublication::Published(MvPublishedLakeFacts::try_new(
+                    facts.target_snapshot_id,
+                    facts.refresh_id,
+                    facts.mv_id,
+                    facts.token,
+                    technique,
+                    bases,
+                    facts.definition_fingerprint,
+                    facts.rows,
+                    facts.provenance_hash,
+                    facts.waterline_hash,
+                )?)
+            }
+        };
+        MvLakePackageObservation::try_new(metadata.identity.clone(), descriptor, publication)
+            .map(Some)
     }
 }
 
-pub(crate) fn validate_current_schema_contract(
-    contract: &MvSchemaContract,
-    current_base_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> ContractDecision {
-    validate_current_schema_contract_with_base_schema(
-        contract,
-        current_base_table,
-        current_base_table.metadata().current_schema(),
-        current_target_table,
+fn observed_fields(observed: &IcebergStorageTargetObservation) -> Vec<MvObservedTargetField> {
+    observed
+        .fields
+        .iter()
+        .map(|field| MvObservedTargetField {
+            field_id: field.field_id,
+            name: field.name.clone(),
+            type_signature: field.type_signature.clone(),
+            nullable: field.nullable,
+        })
+        .collect()
+}
+
+fn created_partition_contract(observed: &IcebergStorageTargetObservation) -> MvPartitionContract {
+    MvPartitionContract {
+        target_spec_id: observed.partition.target_spec_id,
+        fields: observed
+            .partition
+            .fields
+            .iter()
+            .map(|field| MvPartitionFieldContract {
+                partition_field_id: field.partition_field_id,
+                partition_field_name: field.partition_field_name.clone(),
+                source_target_field_id: field.source_target_field_id,
+                source_column_name: field.source_column_name.clone(),
+                transform: created_partition_transform(field.transform.clone()),
+            })
+            .collect(),
+    }
+}
+
+fn validation_partition_contract(
+    observed: &IcebergStorageTargetObservation,
+) -> MvSchemaValidationPartitionContract {
+    MvSchemaValidationPartitionContract::new(
+        observed.partition.target_spec_id,
+        observed
+            .partition
+            .fields
+            .iter()
+            .map(|field| {
+                MvSchemaValidationPartitionField::new(
+                    field.partition_field_id,
+                    field.partition_field_name.clone(),
+                    field.source_target_field_id,
+                    field.source_column_name.clone(),
+                    validation_partition_transform(field.transform.clone()),
+                )
+            })
+            .collect(),
     )
 }
 
-pub(crate) fn validate_current_schema_contract_with_base_schema(
-    contract: &MvSchemaContract,
-    current_base_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> ContractDecision {
-    let base_view = current_iceberg_table_view_with_schema(current_base_table, base_schema);
-    let target_view = current_iceberg_table_view(current_target_table);
-    validate_schema_contract(contract, &base_view, &target_view)
+fn created_partition_transform(
+    transform: IcebergStoragePartitionTransform,
+) -> MvPartitionTransformContract {
+    match transform {
+        IcebergStoragePartitionTransform::Identity => MvPartitionTransformContract::Identity,
+        IcebergStoragePartitionTransform::Year => MvPartitionTransformContract::Year,
+        IcebergStoragePartitionTransform::Month => MvPartitionTransformContract::Month,
+        IcebergStoragePartitionTransform::Day => MvPartitionTransformContract::Day,
+        IcebergStoragePartitionTransform::Hour => MvPartitionTransformContract::Hour,
+        IcebergStoragePartitionTransform::Bucket { num_buckets } => {
+            MvPartitionTransformContract::Bucket { num_buckets }
+        }
+        IcebergStoragePartitionTransform::Truncate { width } => {
+            MvPartitionTransformContract::Truncate { width }
+        }
+        IcebergStoragePartitionTransform::Void => MvPartitionTransformContract::Void,
+    }
 }
 
-pub(crate) fn validate_current_join_schema_contract(
-    contract: &MvSchemaContract,
-    bases: &[(
-        &TableIdentity,
-        &novarocks_connector_iceberg::iceberg::table::Table,
-    ); 2],
-    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> Result<JoinContractDecision, JoinSchemaValidationError> {
-    let base_fqns = [bases[0].0.fqn(), bases[1].0.fqn()];
-    let base_views = [
-        (
-            base_fqns[0].as_str(),
-            current_iceberg_table_view(bases[0].1),
-        ),
-        (
-            base_fqns[1].as_str(),
-            current_iceberg_table_view(bases[1].1),
-        ),
-    ];
-    let target_view = current_iceberg_table_view(current_target_table);
-    validate_join_schema_contract(contract, &base_views, &target_view)
+fn validation_partition_transform(
+    transform: IcebergStoragePartitionTransform,
+) -> MvSchemaValidationPartitionTransform {
+    match transform {
+        IcebergStoragePartitionTransform::Identity => {
+            MvSchemaValidationPartitionTransform::Identity
+        }
+        IcebergStoragePartitionTransform::Year => MvSchemaValidationPartitionTransform::Year,
+        IcebergStoragePartitionTransform::Month => MvSchemaValidationPartitionTransform::Month,
+        IcebergStoragePartitionTransform::Day => MvSchemaValidationPartitionTransform::Day,
+        IcebergStoragePartitionTransform::Hour => MvSchemaValidationPartitionTransform::Hour,
+        IcebergStoragePartitionTransform::Bucket { num_buckets } => {
+            MvSchemaValidationPartitionTransform::Bucket { num_buckets }
+        }
+        IcebergStoragePartitionTransform::Truncate { width } => {
+            MvSchemaValidationPartitionTransform::Truncate { width }
+        }
+        IcebergStoragePartitionTransform::Void => MvSchemaValidationPartitionTransform::Void,
+    }
+}
+
+pub(crate) fn current_iceberg_table_observation(
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Result<MvSchemaValidationObservation, String> {
+    current_iceberg_table_observation_with_schema(table, table.metadata().current_schema())
+}
+
+fn current_iceberg_table_observation_with_schema(
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> Result<MvSchemaValidationObservation, String> {
+    let metadata = table.metadata();
+    MvSchemaValidationObservation::try_new_with_maximum_payload(
+        metadata.uuid().to_string(),
+        schema.schema_id(),
+        metadata.format_version() == novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+        row_lineage_enabled(metadata.properties()),
+        schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| {
+                MvObservedTargetField::new(
+                    field.id,
+                    field.name.clone(),
+                    field.field_type.to_string(),
+                    !field.required,
+                )
+            })
+            .collect(),
+        partition_contract(metadata.default_partition_spec(), schema)?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn partition_contract(
+    spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> Result<MvSchemaValidationPartitionContract, String> {
+    let fields = spec
+        .fields()
+        .iter()
+        .map(|field| {
+            let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+                format!(
+                    "partition field {} references missing source field ID {}",
+                    field.name, field.source_id
+                )
+            })?;
+            let transform = match &field.transform {
+                novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+                    MvSchemaValidationPartitionTransform::Identity
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+                    MvSchemaValidationPartitionTransform::Year
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+                    MvSchemaValidationPartitionTransform::Month
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+                    MvSchemaValidationPartitionTransform::Day
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+                    MvSchemaValidationPartitionTransform::Hour
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
+                    MvSchemaValidationPartitionTransform::Bucket {
+                        num_buckets: *num_buckets,
+                    }
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
+                    MvSchemaValidationPartitionTransform::Truncate { width: *width }
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+                    MvSchemaValidationPartitionTransform::Void
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => {
+                    MvSchemaValidationPartitionTransform::Unsupported(format!(
+                        "{:?}",
+                        field.transform
+                    ))
+                }
+            };
+            Ok(MvSchemaValidationPartitionField::new(
+                field.field_id,
+                field.name.clone(),
+                field.source_id,
+                source.name.clone(),
+                transform,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(MvSchemaValidationPartitionContract::new(
+        spec.spec_id(),
+        fields,
+    ))
 }
 
 fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> bool {

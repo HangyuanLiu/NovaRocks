@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use novarocks_connector_iceberg::iceberg::TableIdent;
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::mv::refresh::change_stream_write::{
     ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
     execute_and_collect_change_stream_write,
@@ -20,6 +19,7 @@ use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::logical::LogicalPlanNode;
+use novarocks_connector_iceberg::commit::CommitOpKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinIncrementalRefreshMode {

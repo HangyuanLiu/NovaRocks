@@ -23,10 +23,12 @@
 
 mod access;
 mod cache;
+mod catalog_properties;
 mod error;
 mod physical_reader;
 mod predicate;
 mod read;
+mod resources;
 mod runtime;
 
 pub use access::{
@@ -41,6 +43,11 @@ pub use cache::{
     PageCache, PageCacheStats, PageCacheValue, PageHandle, ParquetCacheOptions, get_block_cache,
     init_block_cache, init_parquet_cache, validate_datacache_priority, validate_evict_probability,
     validate_non_negative_i64,
+};
+pub use catalog_properties::{
+    AWS_S3_CATALOG_PROPERTY_KEYS, normalize_aws_s3_catalog_properties,
+    object_store_config_from_aws_s3_catalog_properties,
+    object_store_config_from_aws_s3_catalog_property_pairs,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
 pub use physical_reader::{
@@ -58,6 +65,7 @@ pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
     FileReadContext, FileReadRange, FileReadRequest,
 };
+pub use resources::FsAccessResources;
 pub use runtime::{
     FileBytesFuture, FileCancellation, FileIoRuntime, FileTask, FileTaskFuture, FileTaskSpawner,
     FileU64Future, TokioFileIoRuntime, TokioFileTaskSpawner,

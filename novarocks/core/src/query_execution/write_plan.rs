@@ -148,7 +148,7 @@ impl ConnectorWriteManifest {
                 "connector write lease does not match the frozen writer manifest generation",
             ));
         }
-        if request.preparation.owner() != &self.owner
+        if request.activation.preparation().owner() != &self.owner
             || request.operation_id != self.operation_id
             || request.cohort_id != self.cohort_id
             || request.execution_id != self.execution_id
@@ -161,7 +161,7 @@ impl ConnectorWriteManifest {
         request.expected_writers = self.writers.clone();
         let descriptor = ConnectorWriteCohortDescriptor::new(
             self.cohort_id,
-            request.preparation.intent(),
+            request.activation.preparation().intent(),
             request.stable_digest(&self.owner)?,
         );
         // The same bounded/cancellable request context must accompany the

@@ -1479,7 +1479,7 @@ mod tests {
         let manifest = dir.path().join("manifest.avro");
         fs::write(&puffin, b"dv").unwrap();
         fs::write(&manifest, b"manifest").unwrap();
-        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+        let file_io = novarocks_connector_iceberg::fs_io::build_file_io_for_location(
             &path_string(&puffin),
             None,
         );
@@ -1505,7 +1505,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let table_location = path_string(dir.path());
         let file_io =
-            crate::connector::iceberg::fs_io::build_file_io_for_location(&table_location, None);
+            novarocks_connector_iceberg::fs_io::build_file_io_for_location(&table_location, None);
         let commit_uuid = Uuid::new_v4();
         fs::create_dir_all(
             dir.path()

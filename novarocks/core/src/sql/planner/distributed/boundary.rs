@@ -895,7 +895,7 @@ mod tests {
             .iter()
             .map(|column| column.name.as_str())
             .collect();
-        assert_eq!(names, vec!["op", "route", "delete_id"]);
+        assert_eq!(names, vec!["effect", "route", "delete_id"]);
     }
 
     #[test]

@@ -28,10 +28,9 @@ use novarocks_spi::connector::{
 
 use super::*;
 use crate::protocol::native::encode::plan as native_plan;
-use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;
 use crate::query_execution::preparation::scan::{
-    ResolvedIcebergDeltaScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
-    ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
+    ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumn,
+    ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
@@ -67,14 +66,9 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
     bindings
         .insert_binding(ResolvedScanBinding {
             node_id: 10,
-            execution: ResolvedScanExecution::IcebergDelta(ResolvedIcebergDeltaScan {
-                runtime_plan: IcebergDeltaScanRuntimePlan {
-                    table_location: "s3://prepared/orders".to_string(),
-                    data_columns: Vec::new(),
-                    change_files: Vec::new(),
-                    delete_side: None,
-                },
-            }),
+            execution: ResolvedScanExecution::SealedConnectorScan(
+                crate::query_execution::preparation::scan::fixture_sealed_change_scan("ice", 6, 7),
+            ),
             physical_columns: vec![ResolvedScanColumn {
                 planner: output_column(1, "bound_order_id", DataType::Int64),
                 source: source_column.clone(),
@@ -157,17 +151,24 @@ fn planned_connector_read_for_test()
         Bytes::from_static(b"binding"),
     )
     .expect("declaration");
+    let scan = ConnectorScan::try_new_snapshot(
+        novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: declaration.incarnation(),
+        },
+        novarocks_spi::connector::ConnectorReadSelector::Current,
+        ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"delta-scan"))
+            .expect("scan handle"),
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("physical_order_id", DataType::Int64, false),
+            arrow::datatypes::Field::new("tenant_id", DataType::Int64, false),
+        ])),
+        Vec::new(),
+    )
+    .expect("sealed scan");
     crate::query_execution::preparation::scan::PlannedConnectorRead {
         declaration,
-        scan: ConnectorScan {
-            handle: ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"delta-scan"))
-                .expect("scan handle"),
-            output_schema: Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("physical_order_id", DataType::Int64, false),
-                arrow::datatypes::Field::new("tenant_id", DataType::Int64, false),
-            ])),
-            predicate_dispositions: Vec::new(),
-        },
+        scan,
         splits: Vec::new(),
         provider_field_ordinals: vec![0, 1],
         planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(),
@@ -642,14 +643,9 @@ fn file_binding_for_test(
 fn delta_binding_for_test(node_id: i32) -> ResolvedScanBinding {
     ResolvedScanBinding {
         node_id,
-        execution: ResolvedScanExecution::IcebergDelta(ResolvedIcebergDeltaScan {
-            runtime_plan: IcebergDeltaScanRuntimePlan {
-                table_location: "s3://prepared/orders".to_string(),
-                data_columns: Vec::new(),
-                change_files: Vec::new(),
-                delete_side: None,
-            },
-        }),
+        execution: ResolvedScanExecution::SealedConnectorScan(
+            crate::query_execution::preparation::scan::fixture_sealed_change_scan("ice", 6, 7),
+        ),
         physical_columns: vec![bound_column_for_test(
             1,
             "order_id",

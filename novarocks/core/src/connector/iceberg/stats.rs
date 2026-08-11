@@ -22,9 +22,6 @@ use std::sync::{Arc, RwLock};
 use arrow::datatypes::DataType;
 
 use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
-use crate::connector::iceberg::catalog::backend::{
-    data_file_with_stats_to_iceberg_data_file_info, iceberg_schema_def_for_codegen,
-};
 use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats_at, load_table};
 use crate::connector::stats::StatsProviderError;
 use crate::sql::optimizer::statistics::Confidence;
@@ -32,7 +29,9 @@ use crate::sql::optimizer::stats_input::{
     BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
 };
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info;
 use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
+use novarocks_connector_iceberg::schema_facts::iceberg_schema_def;
 
 /// Provider-owned conversion of Iceberg manifest/Puffin artifacts into the
 /// neutral, immutable SQL statistics value.  SQL consumes only the returned
@@ -321,7 +320,7 @@ fn iceberg_table_info_for_stats(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: schema.schema_id(),
         location: metadata.location().to_string(),
-        schema: iceberg_schema_def_for_codegen(schema),
+        schema: iceberg_schema_def(schema),
         serialized_metadata: Some(serde_json::to_string(metadata).map_err(|err| {
             StatsProviderError::Metadata(format!("serialize iceberg table metadata failed: {err}"))
         })?),
@@ -439,8 +438,8 @@ fn load_iceberg_puffin_ndv_from_metadata(
     metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     snapshot_id: i64,
 ) -> (HashMap<String, f64>, HashMap<String, i32>) {
-    use crate::connector::iceberg::stats_loader::StatsLoader;
     use crate::runtime::global_async_runtime::data_block_on;
+    use novarocks_connector_iceberg::stats_loader::StatsLoader;
 
     let empty = (HashMap::new(), HashMap::new());
     if metadata.statistics_for_snapshot(snapshot_id).is_none() {
@@ -473,8 +472,8 @@ fn load_iceberg_puffin_ndv_from_metadata_with_file_io(
     snapshot_id: i64,
     file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
 ) -> (HashMap<String, f64>, HashMap<String, i32>) {
-    use crate::connector::iceberg::stats_loader::StatsLoader;
     use crate::runtime::global_async_runtime::data_block_on;
+    use novarocks_connector_iceberg::stats_loader::StatsLoader;
 
     let empty = (HashMap::new(), HashMap::new());
     if metadata.statistics_for_snapshot(snapshot_id).is_none() {
@@ -522,21 +521,22 @@ fn build_stats_file_io(
     let scheme = location.split("://").next().unwrap_or("");
     let is_s3 = matches!(scheme, "s3" | "s3a" | "oss");
     if !is_s3 {
-        return Ok(crate::connector::iceberg::fs_io::build_file_io_for_location(location, None));
+        return Ok(novarocks_connector_iceberg::fs_io::build_file_io_for_location(location, None));
     }
 
-    let props = cloud_properties
+    let properties = cloud_properties
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
-    let object_store_config =
-        crate::connector::iceberg::fs_io::object_store_config_from_catalog_properties(&props)?
-            .ok_or_else(|| {
-                "object-store stats FileIO requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                    .to_string()
-            })?;
+    let object_store_config = novarocks_fs::object_store_config_from_aws_s3_catalog_property_pairs(
+        &properties,
+    )?
+    .ok_or_else(|| {
+        "object-store stats FileIO requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+            .to_string()
+    })?;
     Ok(
-        crate::connector::iceberg::fs_io::build_file_io_for_location(
+        novarocks_connector_iceberg::fs_io::build_file_io_for_location(
             location,
             Some(&object_store_config),
         ),

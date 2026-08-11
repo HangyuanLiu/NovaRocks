@@ -178,7 +178,7 @@ pub(super) fn fixture_query_table_bindings(
                     write_target_admission: None,
                     mv_target_read: None,
                     frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-                    delta_runtime_plans: std::collections::BTreeMap::new(),
+                    admitted_change_scans: std::collections::BTreeMap::new(),
                 })
             },
         )

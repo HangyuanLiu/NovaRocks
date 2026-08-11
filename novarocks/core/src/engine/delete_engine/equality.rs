@@ -28,17 +28,14 @@ use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::connector::iceberg::commit::{
-    CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
-    ensure_equality_delete_single_partition_spec,
+    IcebergCommitCollector, ensure_equality_delete_single_partition_spec,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::delete_engine::{
-    DeleteOperation, PreparedDelete, PreparedDeleteExecution, has_iceberg_staged_output,
-    prepared_delete,
+    DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
@@ -50,6 +47,8 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::commit::CommitOpKind;
+use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,
@@ -140,7 +139,6 @@ struct DistributedEqualityDeleteWriteExecutor {
     delete_query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
@@ -170,23 +168,6 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         Ok(result)
     }
 
-    fn has_staged_output(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<bool, String> {
-        has_iceberg_staged_output(completion, &self.commit_executor)
-    }
-
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        )
-    }
-
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -196,11 +177,10 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         >,
         String,
     > {
-        crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
-            self.connector_write.preparation().owner(),
-            self.connector_write.operation_id(),
-            self.commit(completion),
-        )
+        completion
+            .session()
+            .commit(self.connector_context.clone())
+            .map_err(|error| error.to_string())
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -317,7 +297,6 @@ fn prepare_equality_delete_distributed_write(
         delete_query: values_query,
         sql_write_input,
         table_bindings,
-        commit_executor,
         execution: execution.clone(),
         connector_context: connector_context.clone(),
         connector_write,
@@ -329,7 +308,6 @@ fn prepare_equality_delete_distributed_write(
             table: target.table.clone(),
             target_ref: "main".to_string(),
             attempt_id: connector_operation_id.to_string(),
-            commit_op_kind: CommitOpKind::RowDelta,
             base_snapshot_id: current_snapshot_id,
         },
         Arc::new(executor),

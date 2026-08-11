@@ -39,11 +39,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::common::types::UniqueId;
 
-use super::position_delete_writer::PositionDeleteGroup;
-use crate::connector::iceberg::commit::types::{CommitOpKind, WrittenFile};
-use crate::connector::iceberg::report::IcebergWriterReport;
-use crate::connector::iceberg::stats_assembler::FileSketchSet;
+use novarocks_connector_iceberg::commit::PositionDeleteGroup;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::report::{self as iceberg_report, IcebergWriterReport};
+use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
+use novarocks_connector_iceberg::stats_assembler::FileSketchSet;
 
 #[derive(Default)]
 struct StagedEffectCounters {
@@ -1048,26 +1048,25 @@ mod parity_tests {
         df: &novarocks_connector_iceberg::iceberg::spec::DataFile,
         partition_spec_id: i32,
         metadata: &TableMetadata,
-    ) -> crate::connector::iceberg::report::IcebergWriterReport {
+    ) -> iceberg_report::IcebergWriterReport {
         let written =
             crate::engine::iceberg_writer::data_file_to_written_file(df, partition_spec_id)
                 .expect("written file");
-        crate::connector::iceberg::report::writer_report_from_written_file(&written, metadata)
-            .expect("writer report")
+        iceberg_report::writer_report_from_written_file(&written, metadata).expect("writer report")
     }
 
     #[test]
     fn convert_writer_report_uses_partition_values_not_partition_path() {
         let (collector, _metadata, spec_id) = string_partition_collector();
         let values = Struct::from_iter([Some(Literal::string("west"))]);
-        let report = crate::connector::iceberg::report::IcebergWriterReport {
-            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+        let report = iceberg_report::IcebergWriterReport {
+            file: iceberg_report::IcebergWrittenFileReport {
                 path: "file:///warehouse/t/data/a.parquet".to_string(),
                 format: "PARQUET".to_string(),
                 content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 12,
-                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                partition: iceberg_report::IcebergPartitionReport {
                     partition_path: "region=east".to_string(),
                     null_fingerprint: "0".to_string(),
                     partition_spec_id: spec_id,
@@ -1287,21 +1286,21 @@ mod parity_tests {
     fn convert_skips_bounds_for_variant_field_ids() {
         let metadata = unpartitioned_metadata(int_variant_schema());
         let partition_spec_id = metadata.default_partition_spec_id();
-        let report = crate::connector::iceberg::report::IcebergWriterReport {
-            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+        let report = iceberg_report::IcebergWriterReport {
+            file: iceberg_report::IcebergWrittenFileReport {
                 path: "file:///t/data-variant.parquet".to_string(),
                 format: "PARQUET".to_string(),
                 content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 10,
-                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                partition: iceberg_report::IcebergPartitionReport {
                     partition_path: String::new(),
                     null_fingerprint: String::new(),
                     partition_spec_id,
                     partition_values: Struct::empty(),
                 },
                 split_offsets: None,
-                column_stats: Some(crate::connector::iceberg::report::IcebergColumnStats {
+                column_stats: Some(iceberg_report::IcebergColumnStats {
                     column_sizes: BTreeMap::from([(2, 8)]),
                     value_counts: BTreeMap::from([(2, 1)]),
                     null_value_counts: BTreeMap::from([(2, 0)]),
@@ -1393,15 +1392,15 @@ mod tests {
     fn unpartitioned_writer_report(
         path: &str,
         spec_id: i32,
-    ) -> crate::connector::iceberg::report::IcebergWriterReport {
-        crate::connector::iceberg::report::IcebergWriterReport {
-            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+    ) -> iceberg_report::IcebergWriterReport {
+        iceberg_report::IcebergWriterReport {
+            file: iceberg_report::IcebergWrittenFileReport {
                 path: path.to_string(),
                 format: "parquet".to_string(),
                 content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 3,
                 file_size_in_bytes: 40,
-                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                partition: iceberg_report::IcebergPartitionReport {
                     partition_path: String::new(),
                     null_fingerprint: String::new(),
                     partition_spec_id: spec_id,
@@ -1532,7 +1531,7 @@ mod tests {
         );
     }
 
-    fn valid_puffin_dv_report() -> crate::connector::iceberg::report::IcebergWriterReport {
+    fn valid_puffin_dv_report() -> iceberg_report::IcebergWriterReport {
         let mut report = unpartitioned_writer_report("s3://b/data/dv-00000000.puffin", 0);
         report.file.format = "puffin".to_string();
         report.file.content =
@@ -1699,18 +1698,15 @@ mod tests {
         .with_table_metadata(metadata)
     }
 
-    fn test_writer_report(
-        path: &str,
-        spec_id: i32,
-    ) -> crate::connector::iceberg::report::IcebergWriterReport {
-        crate::connector::iceberg::report::IcebergWriterReport {
-            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+    fn test_writer_report(path: &str, spec_id: i32) -> iceberg_report::IcebergWriterReport {
+        iceberg_report::IcebergWriterReport {
+            file: iceberg_report::IcebergWrittenFileReport {
                 path: path.to_string(),
                 format: "parquet".to_string(),
                 content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 12,
-                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                partition: iceberg_report::IcebergPartitionReport {
                     partition_path: "region=west".to_string(),
                     null_fingerprint: "0".to_string(),
                     partition_spec_id: spec_id,
@@ -1738,14 +1734,14 @@ mod tests {
         let metadata = test_string_partition_metadata(7);
         let spec_id = metadata.default_partition_spec_id();
         let collector = test_collector_with_metadata(metadata.clone());
-        let report = crate::connector::iceberg::report::IcebergWriterReport {
-            file: crate::connector::iceberg::report::IcebergWrittenFileReport {
+        let report = iceberg_report::IcebergWriterReport {
+            file: iceberg_report::IcebergWrittenFileReport {
                 path: "file:///warehouse/t/data/a.parquet".to_string(),
                 format: "parquet".to_string(),
                 content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 12,
-                partition: crate::connector::iceberg::report::IcebergPartitionReport {
+                partition: iceberg_report::IcebergPartitionReport {
                     partition_path: "region=west".to_string(),
                     null_fingerprint: "0".to_string(),
                     partition_spec_id: spec_id,

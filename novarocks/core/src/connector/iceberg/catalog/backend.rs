@@ -25,8 +25,13 @@ use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_P
 use crate::sql::planner::table::{ScanSource, TableDef};
 #[cfg(test)]
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::manifest::DataFileWithStats;
 use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
+};
+#[cfg(test)]
+use novarocks_connector_iceberg::schema_facts::{
+    iceberg_schema_def, row_lineage_enabled, stored_row_lineage_enabled,
 };
 
 #[cfg(test)]
@@ -43,7 +48,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
-    data_files: Vec<super::registry::DataFileWithStats>,
+    data_files: Vec<DataFileWithStats>,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files(
         entry,
@@ -147,7 +152,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     table_name: &str,
     loaded: IcebergLoadedTable,
 ) -> Result<TableDef, String> {
-    if !is_v3_row_lineage(loaded.table.metadata()) {
+    if !stored_row_lineage_enabled(loaded.table.metadata()) {
         return Err(format!(
             "iceberg table {namespace}.{table_name} cannot back an IVM-A1 delta scan because its \
              metadata does not declare Iceberg v3 row-lineage; rebuild the base table with \
@@ -223,7 +228,7 @@ fn build_iceberg_table_def_with_data_files(
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
-    data_files: Vec<super::registry::DataFileWithStats>,
+    data_files: Vec<DataFileWithStats>,
     binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files_impl(
@@ -247,7 +252,7 @@ fn build_iceberg_table_def_with_data_files_impl(
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
-    data_files: Vec<super::registry::DataFileWithStats>,
+    data_files: Vec<DataFileWithStats>,
     options: IcebergTableDefOptions,
 ) -> Result<TableDef, String> {
     let has_data_files = !data_files.is_empty();
@@ -293,13 +298,13 @@ fn build_iceberg_table_def_with_data_files_impl(
         IcebergTableDefMode::ScanBinding => {
             let mut metadata_columns = iceberg_row_identity_metadata_columns();
             if has_data_files
-                && is_v3_row_lineage(loaded.table.metadata())
+                && stored_row_lineage_enabled(loaded.table.metadata())
                 && all_files_have_first_row_id
             {
                 metadata_columns.extend(iceberg_v3_row_lineage_metadata_columns());
             } else {
                 if has_data_files
-                    && is_v3_row_lineage(loaded.table.metadata())
+                    && stored_row_lineage_enabled(loaded.table.metadata())
                     && !all_files_have_first_row_id
                 {
                     tracing::warn!(
@@ -428,26 +433,6 @@ fn hidden_internal_column_names(
     out
 }
 
-pub(crate) fn data_file_with_stats_to_iceberg_data_file_info(
-    file: super::registry::DataFileWithStats,
-) -> IcebergDataFileInfo {
-    IcebergDataFileInfo {
-        path: file.path,
-        size: file.size,
-        row_count: file.record_count,
-        column_stats: file.column_stats,
-        partition_spec_id: file.partition_spec_id,
-        partition_key: file.partition_key,
-        first_row_id: file.first_row_id,
-        data_sequence_number: file.data_sequence_number,
-        ivm_change_op: None,
-        included_positions: None,
-        delete_files: file.delete_files,
-        manifest_path: file.manifest_path,
-        partition_values: file.partition_field_values,
-    }
-}
-
 fn build_iceberg_table_info(
     catalog_name: &str,
     namespace_name: &str,
@@ -471,119 +456,6 @@ fn build_iceberg_table_info(
         ),
         serialized_metadata_rows: None,
     })
-}
-
-pub(crate) fn iceberg_schema_def_for_codegen(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> IcebergSchemaDef {
-    iceberg_schema_def(schema)
-}
-
-fn iceberg_schema_def(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> IcebergSchemaDef {
-    IcebergSchemaDef {
-        fields: schema
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-    }
-}
-
-fn iceberg_field_def(
-    field: &novarocks_connector_iceberg::iceberg::spec::NestedField,
-) -> IcebergSchemaFieldDef {
-    let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    let write_default_json = field.write_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    IcebergSchemaFieldDef {
-        field_id: field.id,
-        name: field.name.clone(),
-        initial_default: field.initial_default.clone(),
-        write_default: field.write_default.clone(),
-        initial_default_json,
-        write_default_json,
-        children: iceberg_type_children(field.field_type.as_ref()),
-    }
-}
-
-fn iceberg_type_children(
-    ty: &novarocks_connector_iceberg::iceberg::spec::Type,
-) -> Vec<IcebergSchemaFieldDef> {
-    match ty {
-        novarocks_connector_iceberg::iceberg::spec::Type::Struct(struct_ty) => struct_ty
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-        novarocks_connector_iceberg::iceberg::spec::Type::List(list_ty) => {
-            vec![iceberg_field_def(list_ty.element_field.as_ref())]
-        }
-        novarocks_connector_iceberg::iceberg::spec::Type::Map(map_ty) => vec![
-            iceberg_field_def(map_ty.key_field.as_ref()),
-            iceberg_field_def(map_ty.value_field.as_ref()),
-        ],
-        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(_) => vec![],
-    }
-}
-
-/// Returns true when the table is Iceberg format-version=3 with
-/// `write.row-lineage=true`, meaning per-row `_row_id` and
-/// `_last_updated_sequence_number` metadata columns are available.
-#[cfg(test)]
-fn is_v3_row_lineage(metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata) -> bool {
-    let v3 = matches!(
-        metadata.format_version(),
-        novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-    );
-    let lineage = metadata
-        .properties()
-        .get("write.row-lineage")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    v3 && lineage
-}
-
-/// True iff the table can carry row-lineage metadata under the Iceberg V3
-/// spec rules: format-version is V3 AND `write.row-lineage` is not
-/// explicitly disabled. Per the Iceberg V3 spec, row-lineage is enabled
-/// by default on V3 tables; writers may opt out with
-/// `write.row-lineage=false`.
-///
-/// This is intentionally more permissive than `is_v3_row_lineage`. Schema-only
-/// table definitions use this to expose row-lineage metadata columns for
-/// catalog registration before scan files are bound, following V3-default
-/// semantics. Scan-binding table definitions remain stricter and use
-/// `is_v3_row_lineage` plus per-file `first_row_id` because ordinary scans can
-/// only synthesize row-lineage metadata when every bound file carries row IDs.
-/// OPTIMIZE preserves row-lineage whenever the writer would emit it on a fresh
-/// INSERT, which follows the V3-default semantics modelled here.
-pub(crate) fn row_lineage_enabled(
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-) -> bool {
-    if !matches!(
-        metadata.format_version(),
-        novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-    ) {
-        return false;
-    }
-    match metadata.properties().get("write.row-lineage") {
-        Some(v) => !v.eq_ignore_ascii_case("false"),
-        None => true,
-    }
 }
 
 /// Storage marker for an Iceberg table that has no data files yet.
@@ -628,7 +500,6 @@ mod tests {
     use novarocks_connector_iceberg::iceberg::table::Table;
     use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
-    use crate::connector::iceberg::catalog::registry::DataFileWithStats;
     use crate::sql::parser::ast::TableColumnDef;
     use novarocks_catalog::schema::SqlType;
 
@@ -723,7 +594,9 @@ mod tests {
         .expect("metadata")
         .metadata;
         let table = Table::builder()
-            .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
+            .file_io(
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
+            )
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),
@@ -732,20 +605,20 @@ mod tests {
             .build()
             .expect("table");
 
-        IcebergLoadedTable {
+        IcebergLoadedTable::new(
             table,
-            columns: vec![ColumnDef {
+            None,
+            vec![ColumnDef {
                 name: "id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
                 write_default: None,
                 logical_type: None,
             }],
-            logical_types: HashMap::new(),
-            key_desc: None,
-            column_aggregations: HashMap::new(),
-            object_store_config: None,
-        }
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        )
     }
 
     fn v3_row_lineage_loaded_table() -> IcebergLoadedTable {
@@ -1134,7 +1007,7 @@ mod tests {
 
     #[test]
     fn data_file_with_stats_to_iceberg_data_file_info_preserves_read_metadata() {
-        let file = crate::connector::iceberg::catalog::registry::DataFileWithStats {
+        let file = DataFileWithStats {
             path: "s3://bucket/table/data.parquet".to_string(),
             size: 12,
             record_count: Some(3),
@@ -1149,7 +1022,10 @@ mod tests {
             delete_files: vec![],
         };
 
-        let data_file = data_file_with_stats_to_iceberg_data_file_info(file);
+        let data_file =
+            novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info(
+                file,
+            );
 
         assert_eq!(data_file.partition_spec_id, Some(7));
         assert_eq!(data_file.partition_key.as_deref(), Some("city=A"));

@@ -61,7 +61,7 @@ use super::helpers::{
 use super::overwrite::{
     enumerate_live_all_files, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
 };
-use crate::connector::iceberg::commit::types::CommitOutcome;
+use novarocks_connector_iceberg::commit::CommitOutcome;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct TruncateCommit;
@@ -419,7 +419,7 @@ mod tests {
         empty_v3_iceberg_table, run_commit_with, run_commit_with_properties,
         v3_table_with_n_data_files,
     };
-    use crate::connector::iceberg::commit::types::CommitOpKind;
+    use novarocks_connector_iceberg::commit::CommitOpKind;
     use novarocks_connector_iceberg::iceberg::spec::{
         DataFileBuilder, DataFileFormat, Operation, Struct,
     };
@@ -574,7 +574,7 @@ mod tests {
             ManifestContentType, NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Type,
         };
         use std::sync::Arc;
-        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(
+        let file_io = novarocks_connector_iceberg::fs_io::build_file_io_for_location(
             "file:///tmp/novarocks-truncate-test",
             None,
         );

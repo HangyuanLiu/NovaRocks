@@ -521,7 +521,6 @@ pub fn run_backend_server(config: BackendServerConfig) -> Result<(), BackendAppl
         })?;
     runtime.block_on(run_backend_server_until_signal(config))
 }
-
 pub async fn run_backend_server_until_shutdown<F>(
     config: BackendServerConfig,
     shutdown: F,
@@ -536,7 +535,7 @@ where
     .await
 }
 
-async fn run_backend_server_until_signal(
+pub async fn run_backend_server_until_signal(
     config: BackendServerConfig,
 ) -> Result<(), BackendApplicationError> {
     #[cfg(unix)]

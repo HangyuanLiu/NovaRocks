@@ -30,7 +30,7 @@
 use novarocks_connector_iceberg::iceberg::spec::{DataFile, DataFileBuilder};
 
 use super::collector::IcebergCommitCollector;
-use crate::connector::iceberg::commit::types::WrittenFile;
+use novarocks_connector_iceberg::commit::WrittenFile;
 
 pub fn written_file_to_iceberg_data_file(
     f: &WrittenFile,

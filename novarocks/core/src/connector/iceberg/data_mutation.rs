@@ -48,9 +48,9 @@ use super::commit::{
     CleanupAttempt, CleanupPathMapper, CommitServiceError, IcebergCommitCollector,
     RecoveryEvidence, RunInput, run_iceberg_commit,
 };
-use super::fs_io;
 use super::provider::decode_data_mutation_table_target;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
+use novarocks_connector_iceberg::fs_io;
 
 const PLAN_PAYLOAD_VERSION: u16 = 1;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;
@@ -233,7 +233,7 @@ impl RegisteredIcebergDataMutationBackend {
         let entry = self.entry()?;
         entry.invalidate_table_cache(namespace, table);
         let loaded = load_table(&entry, namespace, table).map_err(map_provider_error)?;
-        Ok((entry, loaded.table))
+        Ok((entry, loaded.into_table()))
     }
 }
 
@@ -265,9 +265,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 let manifest = plan_manifest_for_table(
                     &table,
                     source_location,
-                    fs_io::object_store_config_from_catalog_properties(&entry.properties)
-                        .map_err(map_provider_error)?
-                        .as_ref(),
+                    novarocks_fs::object_store_config_from_aws_s3_catalog_property_pairs(
+                        &entry.properties,
+                    )
+                    .map_err(map_provider_error)?
+                    .as_ref(),
                 )
                 .map_err(map_provider_error)?;
                 let mapping_digest = manifest
@@ -378,10 +380,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         );
         let op_kind = match planned {
             PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } => {
-                let object_store = fs_io::object_store_config_from_catalog_properties(
-                    &entry.properties,
-                )
-                .map_err(|error| connector_error_as_pre_dispatch(map_provider_error(error)))?;
+                let object_store =
+                    novarocks_fs::object_store_config_from_aws_s3_catalog_property_pairs(
+                        &entry.properties,
+                    )
+                    .map_err(|error| connector_error_as_pre_dispatch(map_provider_error(error)))?;
                 revalidate_manifest_for_table(
                     &table,
                     payload
@@ -475,7 +478,9 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 .metadata()
                 .properties()
                 .get(novarocks_connector_iceberg::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
-                .map(|mapping| super::catalog::add_files::canonical_name_mapping(mapping))
+                .map(|mapping| {
+                    novarocks_connector_iceberg::schema_mapping::canonical_name_mapping(mapping)
+                })
                 .transpose()
                 .map_err(|error| {
                     CommitServiceError::finalize_failed_known_committed(

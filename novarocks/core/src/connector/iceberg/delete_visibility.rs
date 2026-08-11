@@ -18,15 +18,12 @@
 use std::collections::HashMap;
 
 use arrow::array::RecordBatch;
+use novarocks_connector_iceberg::delete_file::{
+    ReferencedDataFilePartition, ReferencedDataFilePartitions,
+    insert_referenced_data_file_partition,
+};
 
 use super::catalog::registry;
-
-pub(crate) struct ReferencedDataFilePartition {
-    pub(crate) partition_spec_id: i32,
-    pub(crate) partition_values: novarocks_connector_iceberg::iceberg::spec::Struct,
-}
-
-pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
 
 /// Snapshot-aware version of [`load_referenced_data_file_partitions`].
 ///
@@ -68,37 +65,11 @@ pub(crate) fn load_referenced_data_file_partitions(
     load_referenced_data_file_partitions_at(table, None)
 }
 
-pub(crate) fn insert_referenced_data_file_partition(
-    partitions: &mut ReferencedDataFilePartitions,
-    path: String,
-    partition: ReferencedDataFilePartition,
-) -> Result<(), String> {
-    match partitions.entry(path) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(partition);
-        }
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            let existing = entry.get();
-            if existing.partition_spec_id == partition.partition_spec_id
-                && existing.partition_values == partition.partition_values
-            {
-                return Ok(());
-            }
-            return Err(format!(
-                "iceberg data file `{}` has conflicting partition metadata: old partition spec id {}, new partition spec id {}",
-                entry.key(),
-                existing.partition_spec_id,
-                partition.partition_spec_id
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExistingDeleteVisibility {
     pub(crate) deleted_positions: roaring::RoaringTreemap,
-    pub(crate) equality_deletes: Vec<super::equality_delete::EqualityDeleteSet>,
+    pub(crate) equality_deletes:
+        Vec<novarocks_connector_iceberg::file_reader::equality_delete::EqualityDeleteSet>,
 }
 
 pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDeleteVisibility>;
@@ -169,7 +140,7 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
 }
 
 fn load_delete_visibility_from_data_files(
-    data_files: Vec<registry::DataFileWithStats>,
+    data_files: Vec<novarocks_connector_iceberg::manifest::DataFileWithStats>,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     let mut out = ExistingDeleteVisibilityByDataFile::new();
@@ -323,7 +294,11 @@ pub(crate) fn data_file_row_is_visible(
     let equality_deletes = visibility
         .map(|state| state.equality_deletes.as_slice())
         .unwrap_or(&[]);
-    if super::equality_delete::equality_delete_row_is_deleted(batch, row, equality_deletes)? {
+    if novarocks_connector_iceberg::file_reader::equality_delete::equality_delete_row_is_deleted(
+        batch,
+        row,
+        equality_deletes,
+    )? {
         return Ok(false);
     }
     Ok(true)

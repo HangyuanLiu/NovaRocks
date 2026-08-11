@@ -23,8 +23,6 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::connector::iceberg::commit::CommitServiceError;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::engine::StandaloneState;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -87,7 +85,6 @@ pub struct DeleteOperation {
     pub table: String,
     pub target_ref: String,
     pub attempt_id: String,
-    pub commit_op_kind: CommitOpKind,
     pub base_snapshot_id: Option<i64>,
 }
 
@@ -107,14 +104,6 @@ pub enum DeleteWriteReport {
 
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
     fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
-    fn has_staged_output(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<bool, String>;
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError>;
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -132,11 +121,6 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
 pub trait DeleteEngine: Send + Sync {
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String>;
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String>;
-    fn commit_delete(
-        &self,
-        prepared: &dyn DeletePrepared,
-        commit: &dyn DeleteCommit,
-    ) -> Result<CommitOutcome, CommitServiceError>;
     fn commit_delete_terminal(
         &self,
         _prepared: &dyn DeletePrepared,
@@ -205,35 +189,21 @@ impl DeleteEngine for Arc<StandaloneState> {
         let Some(completion) = result.connector_completion else {
             return Ok(DeleteWriteReport::NoOp);
         };
-        if !prepared.execution.has_staged_output(&completion)? {
+        let has_staged_output = completion
+            .input()
+            .reports()
+            .iter()
+            .any(|report| report.summary().artifact_count > 0);
+        if !has_staged_output {
+            completion
+                .session()
+                .finish_known_empty_noop()
+                .map_err(|error| error.to_string())?;
             return Ok(DeleteWriteReport::NoOp);
         }
         Ok(DeleteWriteReport::CommitRequired(Arc::new(
             CoreDeleteCommit { completion },
         )))
-    }
-
-    fn commit_delete(
-        &self,
-        prepared: &dyn DeletePrepared,
-        commit: &dyn DeleteCommit,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let prepared = downcast_prepared(prepared).map_err(|message| {
-            CommitServiceError::known_uncommitted(
-                message,
-                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-            )
-        })?;
-        let commit = commit
-            .as_any()
-            .downcast_ref::<CoreDeleteCommit>()
-            .ok_or_else(|| {
-                CommitServiceError::known_uncommitted(
-                    "foreign DELETE commit handle".to_string(),
-                    crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-                )
-            })?;
-        prepared.execution.commit(&commit.completion)
     }
 
     fn commit_delete_terminal(
@@ -257,23 +227,6 @@ impl DeleteEngine for Arc<StandaloneState> {
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {
         downcast_prepared(prepared)?.execution.finalize()
     }
-}
-
-pub(crate) fn has_iceberg_staged_output(
-    completion: &crate::query_execution::ConnectorWriteCompletion,
-    commit_executor: &crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor,
-) -> Result<bool, String> {
-    completion
-        .input()
-        .reports()
-        .iter()
-        .try_fold(false, |has_staged_output, staged| {
-            let reports = crate::connector::iceberg::write_contract::decode_writer_reports(
-                staged.payload(),
-                commit_executor.table.metadata(),
-            )?;
-            Ok(has_staged_output || !reports.is_empty())
-        })
 }
 
 struct CorePreparedDelete {

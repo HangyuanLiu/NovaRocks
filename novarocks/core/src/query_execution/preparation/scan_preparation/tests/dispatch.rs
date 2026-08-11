@@ -75,19 +75,23 @@ impl ScanBindingResolver for JoinRefreshDeltaResolver {
         ) {
             return Err("join refresh fixture resolver received a non-delta scan".to_string());
         }
-        Ok(Some(ResolvedScanExecution::IcebergDelta(
-            crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
-                runtime_plan:
-                    crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
-                        table_location: format!(
-                            "s3://sqlx2-coalesce/{}/{}/{}",
-                            source.table.catalog, source.table.namespace, source.table.table
-                        ),
-                        data_columns: Vec::new(),
-                        change_files: Vec::new(),
-                        delete_side: None,
-                    },
-            },
+        Ok(Some(ResolvedScanExecution::SealedConnectorScan(
+            crate::query_execution::preparation::scan::fixture_sealed_change_scan_for_table(
+                &source.table.catalog,
+                &source.table.table,
+                match source.kind {
+                    crate::sql::planner::table::SqlScanKind::Delta {
+                        from_snapshot_id, ..
+                    } => from_snapshot_id,
+                    _ => unreachable!("validated delta source"),
+                },
+                match source.kind {
+                    crate::sql::planner::table::SqlScanKind::Delta { to_snapshot_id, .. } => {
+                        to_snapshot_id
+                    }
+                    _ => unreachable!("validated delta source"),
+                },
+            ),
         )))
     }
 }
@@ -206,7 +210,7 @@ fn coalesce_binding(
         write_target_admission: None,
         mv_target_read,
         frozen_snapshot_materializations,
-        delta_runtime_plans: std::collections::BTreeMap::new(),
+        admitted_change_scans: std::collections::BTreeMap::new(),
     }
 }
 
@@ -463,7 +467,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                     write_target_admission: None,
                     mv_target_read: None,
                     frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-                    delta_runtime_plans: std::collections::BTreeMap::new(),
+                    admitted_change_scans: std::collections::BTreeMap::new(),
                 };
                 Ok(binding)
             },

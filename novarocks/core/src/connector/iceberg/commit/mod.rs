@@ -25,7 +25,6 @@
 mod action;
 mod collector;
 mod data_file;
-mod equality_delete_writer;
 pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
@@ -33,7 +32,6 @@ mod helpers;
 mod mv_provenance_tests;
 mod overwrite;
 mod overwrite_partitions;
-mod position_delete_writer;
 pub mod remove_orphan_files;
 mod rewrite_data_files;
 pub mod rewrite_manifests;
@@ -50,14 +48,12 @@ pub(crate) mod snapshot_lifecycle_helpers_tests;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod truncate;
-mod types;
 mod update_cow;
 mod validation;
 
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use data_file::written_file_to_iceberg_data_file;
-pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use fast_append::FastAppendCommit;
 pub(crate) use fast_append::{StagedFastAppendAction, build_staged_fast_append_action};
 pub use novarocks_connector_iceberg::commit::{
@@ -77,7 +73,6 @@ pub use novarocks_connector_iceberg::commit::{
 };
 pub use overwrite::OverwriteCommit;
 pub use overwrite_partitions::OverwritePartitionsCommit;
-pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
 pub use rewrite_data_files::RewriteDataFilesCommit;
 #[allow(unused_imports)]
 pub(crate) use rewrite_data_files::count_current_live_files;
@@ -94,10 +89,6 @@ pub use service::{
     classify_commit_error,
 };
 pub use truncate::TruncateCommit;
-pub use types::{
-    CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode,
-    NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
-};
 pub use update_cow::{CowUpdateCommit, CowUpdateRewriteSet, CowUpdateTouchedFile};
 pub use validation::{
     classify_iceberg_write_mode, classify_sql_delete_strategy, ensure_column_id_not_regressed,

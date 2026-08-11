@@ -91,6 +91,9 @@ pub(crate) fn bind_empty_runtime_filter_tables_for_test(
 #[derive(Default)]
 struct TestExecutionResolver {
     bindings: BTreeMap<ConnectorExecutionBindingKey, Arc<ConnectorExecutionBinding>>,
+    /// Keeps the explicitly composed test runtime alive for every installed
+    /// filesystem binding. Production uses server-owned role-local resources.
+    _file_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl ConnectorExecutionResolver for TestExecutionResolver {
@@ -113,13 +116,30 @@ impl ConnectorExecutionResolver for TestExecutionResolver {
 fn install_connector_bindings(
     declarations: &[ConnectorExecutionDeclaration],
 ) -> Result<Arc<dyn ConnectorExecutionResolver>, DistributedQueryError> {
-    let binding = crate::connector::iceberg::provider::IcebergReadBinding::default_binding(None)
-        .map_err(|error| failed(error.to_string()))?;
+    let runtime = Arc::new(
+        tokio::runtime::Runtime::new()
+            .map_err(|error| failed(format!("build explicit test file runtime: {error}")))?,
+    );
+    let handle = runtime.handle().clone();
+    let binding = novarocks_connector_iceberg::access_binding::IcebergReadBinding::new(
+        None,
+        novarocks_fs::FsAccessResolver::new(),
+        Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+    );
     let installers: Vec<Arc<dyn ConnectorExecutionInstaller>> = vec![Arc::new(
-        crate::connector::iceberg::provider::IcebergConnectorInstaller::new(binding),
+        novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller::new(
+            novarocks_connector_iceberg::resources::IcebergExecutionResources::new(
+                binding,
+                runtime.handle().clone(),
+            ),
+        ),
     )];
     let context = crate::connector::test_request_context();
-    let mut resolver = TestExecutionResolver::default();
+    let mut resolver = TestExecutionResolver {
+        bindings: BTreeMap::new(),
+        _file_runtime: Some(runtime),
+    };
     for declaration in declarations {
         let installer = installers
             .iter()

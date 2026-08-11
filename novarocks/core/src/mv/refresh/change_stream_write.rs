@@ -13,8 +13,8 @@ use crate::connector::iceberg::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterRoutingError,
 };
 use crate::connector::iceberg::commit::IcebergCommitCollector;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::query_execution::write::WriteCommitInput;
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 
 pub(crate) struct ExecutedChangeStreamWrite {
     pub(crate) write_commit: Option<WriteCommitInput>,
@@ -149,10 +149,10 @@ mod tests {
     use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::common::types::UniqueId;
-    use crate::connector::iceberg::report::{
+    use crate::query_execution::write::{WriterCommitInput, WriterKey};
+    use novarocks_connector_iceberg::commit::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
-    use crate::query_execution::write::{WriterCommitInput, WriterKey};
     use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
     fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {

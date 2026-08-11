@@ -59,9 +59,9 @@ use super::helpers::{
     effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
     required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
-use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
-use crate::connector::iceberg::stats_assembler::CommitType;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 pub struct OverwriteCommit;
 
@@ -769,7 +769,8 @@ mod enumerate_tests {
         .unwrap()
         .metadata;
 
-        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None);
+        let file_io =
+            novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None);
         let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
         Table::builder()
             .file_io(file_io)

@@ -47,6 +47,8 @@ pub const MAX_CONNECTOR_WRITE_RECEIPT_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDE
 pub const MAX_CONNECTOR_WRITE_COHORTS: usize = 4096;
 pub const MAX_CONNECTOR_WRITE_OPERATION_WRITERS: usize = 16_384;
 pub const MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_CONNECTOR_WRITE_ACTIVATIONS: usize = 16_384;
+pub const MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES: usize = 64 * 1024;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
 const CONNECTOR_WRITE_COHORT_SET_DOMAIN: &[u8] = b"novarocks.connector-write-cohort-set.v1\0";
@@ -590,20 +592,376 @@ pub enum ConnectorWritePreparationOutcome {
     Denied(ConnectorError),
 }
 
+/// The signed admission evidence consumed by the exact-generation activation
+/// transition.  The tagged form prevents callers from smuggling a row plan
+/// through the ordinary preparation path.
+#[derive(Clone)]
+pub enum ConnectorWriteActivationSource {
+    Prepared(ConnectorWritePreparation),
+    RowMutation(super::ConnectorRowMutationExecutionPlan),
+}
+
+impl ConnectorWriteActivationSource {
+    fn validate(
+        &self,
+        owner: &ConnectorExecutionBindingKey,
+        operation_id: ConnectorWriteOperationId,
+    ) -> Result<[u8; 32], ConnectorError> {
+        match self {
+            Self::Prepared(preparation) => {
+                preparation.validate()?;
+                if preparation.owner() != owner {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "connector write activation preparation does not match the exact control owner",
+                    ));
+                }
+                Ok(preparation.digest())
+            }
+            Self::RowMutation(plan) => {
+                plan.validate()?;
+                if plan.owner() != owner || plan.operation_id() != operation_id {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "connector row-mutation activation does not match the exact operation owner",
+                    ));
+                }
+                Ok(plan.digest())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorManagedPublicationTechnique {
+    Full,
+    Incremental,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorManagedPublicationEmptyInputDisposition {
+    AbortWithoutExternalCommit,
+    CommitEmptyWrite,
+}
+
+/// Bounded application facts that a provider may encode as its own managed
+/// publication provenance. Target identity and target ref deliberately stay
+/// in the signed preparation and cannot be duplicated here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorManagedPublicationIntent {
+    refresh_id: i64,
+    materialization_id: i64,
+    marker: Arc<str>,
+    technique: ConnectorManagedPublicationTechnique,
+    bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+    definition_fingerprint: Arc<str>,
+    empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+}
+
+impl ConnectorManagedPublicationIntent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        refresh_id: i64,
+        materialization_id: i64,
+        marker: impl Into<Arc<str>>,
+        technique: ConnectorManagedPublicationTechnique,
+        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        definition_fingerprint: impl Into<Arc<str>>,
+        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+    ) -> Result<Self, ConnectorError> {
+        let marker = marker.into();
+        let definition_fingerprint = definition_fingerprint.into();
+        if refresh_id <= 0
+            || materialization_id <= 0
+            || marker.is_empty()
+            || definition_fingerprint.is_empty()
+            || bases.is_empty()
+            || bases.len() > super::MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS
+            || marker.len() + definition_fingerprint.len()
+                > MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES
+            || bases.iter().any(|base| {
+                base.table.is_empty()
+                    || base.uuid.is_empty()
+                    || base.to_version < 0
+                    || base.from_version.is_some_and(|version| version < 0)
+            })
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed publication intent is invalid or exceeds its bounds",
+            ));
+        }
+        let mut tables = BTreeSet::new();
+        let mut uuids = BTreeSet::new();
+        if bases
+            .iter()
+            .any(|base| !tables.insert(base.table.as_ref()) || !uuids.insert(base.uuid.as_ref()))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed publication intent has duplicate base identities",
+            ));
+        }
+        Ok(Self {
+            refresh_id,
+            materialization_id,
+            marker,
+            technique,
+            bases,
+            definition_fingerprint,
+            empty_input,
+        })
+    }
+
+    pub const fn refresh_id(&self) -> i64 {
+        self.refresh_id
+    }
+    pub const fn materialization_id(&self) -> i64 {
+        self.materialization_id
+    }
+    pub fn marker(&self) -> &str {
+        self.marker.as_ref()
+    }
+    pub const fn technique(&self) -> ConnectorManagedPublicationTechnique {
+        self.technique
+    }
+    pub fn bases(&self) -> &[super::ConnectorStagedPublicationBaseFact] {
+        &self.bases
+    }
+    pub fn definition_fingerprint(&self) -> &str {
+        self.definition_fingerprint.as_ref()
+    }
+    pub const fn empty_input(&self) -> ConnectorManagedPublicationEmptyInputDisposition {
+        self.empty_input
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"novarocks.connector-managed-publication-intent.v1\0");
+        hasher.update(self.refresh_id.to_be_bytes());
+        hasher.update(self.materialization_id.to_be_bytes());
+        digest_bytes(&mut hasher, self.marker.as_bytes());
+        hasher.update([match self.technique {
+            ConnectorManagedPublicationTechnique::Full => 1,
+            ConnectorManagedPublicationTechnique::Incremental => 2,
+        }]);
+        for base in &self.bases {
+            digest_bytes(&mut hasher, base.table.as_bytes());
+            digest_bytes(&mut hasher, base.uuid.as_bytes());
+            hasher.update(base.from_version.unwrap_or(-1).to_be_bytes());
+            hasher.update(base.to_version.to_be_bytes());
+        }
+        digest_bytes(&mut hasher, self.definition_fingerprint.as_bytes());
+        hasher.update([match self.empty_input {
+            ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit => 1,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite => 2,
+        }]);
+        hasher.finalize().into()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteActivationIntent {
+    Ordinary,
+    ManagedPublication(ConnectorManagedPublicationIntent),
+}
+
+impl ConnectorWriteActivationIntent {
+    fn digest(&self) -> [u8; 32] {
+        match self {
+            Self::Ordinary => {
+                Sha256::digest(b"novarocks.connector-write-activation-ordinary.v1\0").into()
+            }
+            Self::ManagedPublication(intent) => intent.digest(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectorWriteActivationRequest {
+    pub operation_id: ConnectorWriteOperationId,
+    pub source: ConnectorWriteActivationSource,
+    pub intent: ConnectorWriteActivationIntent,
+    pub context: ConnectorRequestContext,
+}
+
+impl ConnectorWriteActivationRequest {
+    pub fn validate(
+        &self,
+        owner: &ConnectorExecutionBindingKey,
+    ) -> Result<[u8; 32], ConnectorError> {
+        self.source.validate(owner, self.operation_id)
+    }
+}
+
+/// One provider-signed activated cohort. Only this value may enter planning.
+#[derive(Clone)]
+pub struct ConnectorActivatedWriteCohort {
+    owner: ConnectorExecutionBindingKey,
+    operation_id: ConnectorWriteOperationId,
+    cohort_id: ConnectorWriteCohortId,
+    preparation: ConnectorWritePreparation,
+    activation_digest: [u8; 32],
+}
+
+impl ConnectorActivatedWriteCohort {
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
+    }
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+    pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
+        self.cohort_id
+    }
+    pub fn preparation(&self) -> &ConnectorWritePreparation {
+        &self.preparation
+    }
+    pub const fn activation_digest(&self) -> [u8; 32] {
+        self.activation_digest
+    }
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        self.preparation.validate()?;
+        if self.preparation.owner() != &self.owner {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "activated write cohort owner does not match preparation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Operation-scoped result of exact-generation service reservation.
+#[derive(Clone)]
+pub struct ConnectorWriteActivation {
+    owner: ConnectorExecutionBindingKey,
+    operation_id: ConnectorWriteOperationId,
+    source_digest: [u8; 32],
+    activation_digest: [u8; 32],
+    cohorts: Vec<ConnectorActivatedWriteCohort>,
+}
+
+impl ConnectorWriteActivation {
+    pub fn try_new(
+        owner: ConnectorExecutionBindingKey,
+        request: &ConnectorWriteActivationRequest,
+        mut cohorts: Vec<(ConnectorWriteCohortId, ConnectorWritePreparation)>,
+    ) -> Result<Self, ConnectorError> {
+        let source_digest = request.validate(&owner)?;
+        if cohorts.is_empty() || cohorts.len() > MAX_CONNECTOR_WRITE_COHORTS {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector activation has an invalid cohort count",
+            ));
+        }
+        cohorts.sort_by_key(|(cohort_id, _)| *cohort_id);
+        let mut ids = BTreeSet::new();
+        if cohorts.iter().any(|(cohort_id, preparation)| {
+            preparation.validate().is_err()
+                || preparation.owner() != &owner
+                || !ids.insert(*cohort_id)
+        }) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector activation contains a foreign or duplicate cohort",
+            ));
+        }
+        let intent_digest = request.intent.digest();
+        let mut hasher = Sha256::new();
+        hasher.update(b"novarocks.connector-write-activation.v1\0");
+        digest_owner(&mut hasher, &owner);
+        hasher.update(request.operation_id.to_bytes());
+        hasher.update(source_digest);
+        hasher.update(intent_digest);
+        for (cohort_id, preparation) in &cohorts {
+            hasher.update(cohort_id.to_bytes());
+            hasher.update(preparation.digest());
+        }
+        let activation_digest = hasher.finalize().into();
+        let cohorts = cohorts
+            .into_iter()
+            .map(|(cohort_id, preparation)| ConnectorActivatedWriteCohort {
+                owner: owner.clone(),
+                operation_id: request.operation_id,
+                cohort_id,
+                preparation,
+                activation_digest,
+            })
+            .collect();
+        Ok(Self {
+            owner,
+            operation_id: request.operation_id,
+            source_digest,
+            activation_digest,
+            cohorts,
+        })
+    }
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
+    }
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+    pub const fn source_digest(&self) -> [u8; 32] {
+        self.source_digest
+    }
+    pub const fn digest(&self) -> [u8; 32] {
+        self.activation_digest
+    }
+    pub fn cohorts(&self) -> &[ConnectorActivatedWriteCohort] {
+        &self.cohorts
+    }
+    pub fn cohort(
+        &self,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> Option<ConnectorActivatedWriteCohort> {
+        self.cohorts
+            .iter()
+            .find(|cohort| cohort.cohort_id == cohort_id)
+            .cloned()
+    }
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        if self.cohorts.is_empty() || self.cohorts.len() > MAX_CONNECTOR_WRITE_COHORTS {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector activation cohort count is invalid",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        if self.cohorts.iter().any(|cohort| {
+            cohort.validate().is_err()
+                || cohort.owner() != &self.owner
+                || cohort.operation_id() != self.operation_id
+                || cohort.activation_digest() != self.activation_digest
+                || !ids.insert(cohort.cohort_id())
+        }) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector activation contains invalid cohorts",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectorWritePlanningRequest {
     pub operation_id: ConnectorWriteOperationId,
     pub cohort_id: ConnectorWriteCohortId,
     pub execution_id: ConnectorWriteExecutionId,
-    pub preparation: ConnectorWritePreparation,
+    pub activation: ConnectorActivatedWriteCohort,
     pub expected_writers: Vec<ConnectorWriterIdentity>,
     pub context: ConnectorRequestContext,
 }
 
 impl ConnectorWritePlanningRequest {
     pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
-        self.preparation.validate()?;
-        if self.preparation.owner() != owner {
+        self.activation.validate()?;
+        if self.activation.owner() != owner
+            || self.activation.operation_id() != self.operation_id
+            || self.activation.cohort_id() != self.cohort_id
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector write planning preparation does not match the exact control owner",
@@ -645,8 +1003,11 @@ impl ConnectorWritePlanningRequest {
         // placement-frozen writer set exists. Writer validation remains
         // mandatory in `validate`, which every provider planning request
         // invokes after `ConnectorWriteManifest::plan` fills that set.
-        self.preparation.validate()?;
-        if self.preparation.owner() != owner {
+        self.activation.validate()?;
+        if self.activation.owner() != owner
+            || self.activation.operation_id() != self.operation_id
+            || self.activation.cohort_id() != self.cohort_id
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector write planning preparation does not match the exact control owner",
@@ -657,7 +1018,7 @@ impl ConnectorWritePlanningRequest {
         digest_owner(&mut hasher, owner);
         hasher.update(self.operation_id.to_bytes());
         hasher.update(self.cohort_id.to_bytes());
-        hasher.update(self.preparation.digest());
+        hasher.update(self.activation.activation_digest());
         Ok(hasher.finalize().into())
     }
 }
@@ -1720,6 +2081,19 @@ pub trait ConnectorWriteControl: Send + Sync {
         ))
     }
 
+    /// Reserve the exact-generation writer/committer service after admission
+    /// and before placement planning. Implementations must make identical
+    /// requests idempotent and reject a conflicting request for one operation.
+    fn activate_write(
+        &self,
+        _request: ConnectorWriteActivationRequest,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement write activation",
+        ))
+    }
+
     fn plan_write(
         &self,
         request: ConnectorWritePlanningRequest,
@@ -1883,6 +2257,26 @@ impl ConnectorWriteLease {
             }
         }
         Ok(plan)
+    }
+
+    pub fn activate_write(
+        &self,
+        request: ConnectorWriteActivationRequest,
+    ) -> Result<ConnectorWriteActivation, ConnectorError> {
+        let source_digest = request.validate(&self.binding_key)?;
+        let operation_id = request.operation_id;
+        let activation = self.control.activate_write(request)?;
+        activation.validate()?;
+        if activation.owner() != &self.binding_key
+            || activation.operation_id() != operation_id
+            || activation.source_digest() != source_digest
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write activation does not retain the exact lease generation",
+            ));
+        }
+        Ok(activation)
     }
 
     /// Return whether two leases retain the same provider control generation.
@@ -2471,19 +2865,32 @@ mod tests {
             Bytes::new(),
         )
         .expect("preparation");
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NotCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("context");
+        let activation_request = ConnectorWriteActivationRequest {
+            operation_id: writer.operation_id(),
+            source: ConnectorWriteActivationSource::Prepared(preparation.clone()),
+            intent: ConnectorWriteActivationIntent::Ordinary,
+            context: context.clone(),
+        };
+        let activation = ConnectorWriteActivation::try_new(
+            owner.clone(),
+            &activation_request,
+            vec![(writer.cohort_id(), preparation)],
+        )
+        .expect("activation");
         let request = ConnectorWritePlanningRequest {
             operation_id: writer.operation_id(),
             cohort_id: writer.cohort_id(),
             execution_id: writer.execution_id(),
-            preparation,
+            activation: activation.cohort(writer.cohort_id()).expect("cohort"),
             expected_writers: vec![writer],
-            context: ConnectorRequestContext::try_new(
-                Instant::now() + Duration::from_secs(1),
-                Arc::new(NotCancelled),
-                MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-            )
-            .expect("context"),
+            context,
         };
         request.validate(&owner).expect("exact writer owner");
     }
