@@ -4553,42 +4553,42 @@ fn iceberg_mv_table_ident(target: &IcebergMvTarget) -> Result<TableIdent, String
         .map_err(|e| format!("build mv iceberg ident failed: {e}"))
 }
 
+/// Resolve the MV target's neutral binding for a validation-only read.
+///
+/// Callers that already hold a binding should pass it through instead; this is
+/// for sites that still load the target the legacy way and only need facts.
+fn target_binding_for(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::mv::refresh::target_binding::MvTargetBinding, String> {
+    crate::mv::refresh::target_binding::load_mv_target_binding(
+        state,
+        &novarocks_catalog::identifier::TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        connector_context,
+    )
+}
+
 fn validate_target_snapshot(
     target: &IcebergMvTarget,
     mv_definition: &StoredMvDefinition,
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
 ) -> Result<(), String> {
-    let actual = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let actual = binding.current_snapshot_id();
     let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
-    if actual != expected && !(expected.is_none() && is_empty_target_bootstrap_snapshot(table)) {
+    if actual != expected
+        && !(expected.is_none() && binding.observation().current_snapshot_is_empty_bootstrap())
+    {
         return Err(format!(
             "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
             target.catalog, target.namespace, target.table, expected, actual
         ));
     }
     Ok(())
-}
-
-/// CREATE MV establishes this provider-owned initial snapshot before any MV
-/// definition is durable. It is a staging-branch base, not a completed MV
-/// refresh, so the definition deliberately continues to record no refreshed
-/// target snapshot until first refresh publishes data.
-fn is_empty_target_bootstrap_snapshot(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> bool {
-    table.metadata().current_snapshot().is_some_and(|snapshot| {
-        snapshot.parent_snapshot_id().is_none()
-            && snapshot
-                .summary()
-                .additional_properties
-                .get("novarocks.mv.bootstrap")
-                .map(String::as_str)
-                == Some("true")
-            && snapshot
-                .summary()
-                .additional_properties
-                .contains_key("novarocks.bootstrap.empty.operation-id")
-    })
 }
 
 fn recorded_target_snapshot_id(
@@ -4703,7 +4703,11 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
     })?;
 
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
+    validate_target_snapshot(
+        &target,
+        &mv_definition,
+        &target_binding_for(state, &target, connector_context)?,
+    )?;
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     validate_repartition_schema_contract(
         state,
@@ -7222,8 +7226,13 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
         namespace: iceberg_target.namespace.clone(),
         table: iceberg_target.table.clone(),
     };
-    validate_target_snapshot(&iceberg_target, &mv_definition, &target_loaded.table)
-        .map_err(RefreshError::user)?;
+    validate_target_snapshot(
+        &iceberg_target,
+        &mv_definition,
+        &target_binding_for(state, &iceberg_target, connector_context)
+            .map_err(RefreshError::user)?,
+    )
+    .map_err(RefreshError::user)?;
 
     let base_refs =
         parse_iceberg_table_refs(&mv_definition.base_table_refs).map_err(RefreshError::user)?;
@@ -8712,8 +8721,13 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
         .map_err(RefreshError::pre_commit)?;
     let (target_entry, iceberg_catalog, target_loaded) =
         load_iceberg_mv_target(state, &contract_target).map_err(RefreshError::pre_commit)?;
-    validate_target_snapshot(&contract_target, &mv_definition, &target_loaded.table)
-        .map_err(RefreshError::pre_commit)?;
+    validate_target_snapshot(
+        &contract_target,
+        &mv_definition,
+        &target_binding_for(state, &contract_target, connector_context)
+            .map_err(RefreshError::user)?,
+    )
+    .map_err(RefreshError::pre_commit)?;
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)
         .map_err(RefreshError::pre_commit)?;
     let observed_baseline = build_refresh_state_baseline(
@@ -15184,7 +15198,11 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
+    validate_target_snapshot(
+        &target,
+        &mv_definition,
+        &target_binding_for(state, &target, connector_context)?,
+    )?;
 
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(

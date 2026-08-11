@@ -537,6 +537,7 @@ pub struct MvRefreshTargetObservation {
     current_snapshot_id: Option<i64>,
     ref_snapshot_ids: BTreeMap<String, i64>,
     main_ancestor_snapshot_ids: Vec<i64>,
+    current_snapshot_is_empty_bootstrap: bool,
     snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
 }
 
@@ -560,6 +561,7 @@ impl MvRefreshTargetObservation {
         current_snapshot_id: Option<i64>,
         ref_snapshot_ids: BTreeMap<String, i64>,
         main_ancestor_snapshot_ids: Vec<i64>,
+        current_snapshot_is_empty_bootstrap: bool,
         snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
@@ -610,8 +612,15 @@ impl MvRefreshTargetObservation {
             current_snapshot_id,
             ref_snapshot_ids,
             main_ancestor_snapshot_ids,
+            current_snapshot_is_empty_bootstrap,
             snapshot_markers,
         })
+    }
+
+    /// Is the current snapshot the empty bootstrap snapshot CREATE MV
+    /// establishes before the first refresh publishes data?
+    pub const fn current_snapshot_is_empty_bootstrap(&self) -> bool {
+        self.current_snapshot_is_empty_bootstrap
     }
 
     /// `main`'s snapshot chain, newest first.
@@ -1403,6 +1412,7 @@ mod tests {
             current_snapshot_id,
             refs,
             Vec::new(),
+            false,
             BTreeMap::new(),
             &context(4096),
         )
@@ -1420,6 +1430,7 @@ mod tests {
             None,
             BTreeMap::new(),
             Vec::new(),
+            false,
             BTreeMap::new(),
             &context(4096),
         )
@@ -1437,6 +1448,7 @@ mod tests {
             None,
             BTreeMap::new(),
             Vec::new(),
+            false,
             BTreeMap::new(),
             &context(4096),
         )

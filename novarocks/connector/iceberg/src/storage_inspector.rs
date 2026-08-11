@@ -43,6 +43,8 @@ const MAX_TARGET_FIELDS: usize = 4_096;
 const MAX_PARTITION_FIELDS: usize = 4_096;
 const MAX_TARGET_REFS: usize = 1_024;
 const MAX_MAIN_ANCESTORS: usize = 100_000;
+const MV_BOOTSTRAP_PROP: &str = "novarocks.mv.bootstrap";
+const MV_BOOTSTRAP_OPERATION_ID_PROP: &str = "novarocks.bootstrap.empty.operation-id";
 const MAX_PROVENANCE_BASES: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +108,9 @@ pub struct IcebergStorageRefreshTargetObservation {
     /// `main`'s snapshot chain, newest first. MV reconciliation classifies a
     /// staging snapshot by asking whether it is on this chain.
     pub main_ancestor_snapshot_ids: Vec<i64>,
+    /// Is the current snapshot the empty bootstrap snapshot CREATE MV
+    /// establishes before any refresh publishes data?
+    pub current_snapshot_is_empty_bootstrap: bool,
     /// MV refresh marker carried by the current snapshot and by each ref tip,
     /// decoded from provider-private provenance. Snapshots without a marker are
     /// absent rather than present-and-empty.
@@ -301,6 +306,13 @@ fn refresh_target_observation(
         );
     }
 
+    let current_snapshot_is_empty_bootstrap = table.current_snapshot().is_some_and(|snapshot| {
+        let props = &snapshot.summary().additional_properties;
+        snapshot.parent_snapshot_id().is_none()
+            && props.get(MV_BOOTSTRAP_PROP).map(String::as_str) == Some("true")
+            && props.contains_key(MV_BOOTSTRAP_OPERATION_ID_PROP)
+    });
+
     let table_uuid = table.uuid().to_string();
     reserve(context, &mut budget, &table_uuid)?;
     validate_context(context)?;
@@ -314,6 +326,7 @@ fn refresh_target_observation(
         current_snapshot_id,
         ref_snapshot_ids,
         main_ancestor_snapshot_ids,
+        current_snapshot_is_empty_bootstrap,
         snapshot_markers,
     })
 }
