@@ -325,9 +325,6 @@ fn bind_write_fields(
         .collect()
 }
 
-/// Arrow type for a partition-source Iceberg field.
-///
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
