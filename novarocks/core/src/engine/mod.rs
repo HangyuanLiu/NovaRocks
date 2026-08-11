@@ -6778,6 +6778,15 @@ mod tests {
             Arc::new(super::TestConnectorControlRegistry::default()),
             1,
         )
+        // Production installs the provider-specific inspector from the Server
+        // composition root; `new` leaves a fail-closed port so a composition
+        // that forgets it cannot silently observe nothing. Tests need the same
+        // observation the Server would provide, otherwise any statement that
+        // consults the MV guard fails on the port rather than on its own
+        // behaviour.
+        .with_mv_storage_observation(Arc::new(
+            crate::engine::mv::schema_validation_adapter::TestIcebergMvStorageObservationAdapter::default(),
+        ))
     }
 
     struct RecordingQueryExecutionCoordinator {
