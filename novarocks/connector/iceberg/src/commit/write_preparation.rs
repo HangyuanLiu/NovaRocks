@@ -22,7 +22,7 @@
 //! substitute a catalog field ID, or recreate a preparation for another
 //! connector incarnation.
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorTableHandle,
@@ -39,7 +39,7 @@ use crate::commit::write_shared::{
 };
 use crate::control_provider::IcebergTablePayload;
 use crate::file_reader::execution_payload::decode_payload;
-use crate::iceberg::spec::{PrimitiveType, TableMetadata, Type};
+use crate::iceberg::spec::TableMetadata;
 use crate::storage_inspector::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 
 /// Sign the SQL-proposed Arrow input while the Iceberg provider still owns the
@@ -340,7 +340,8 @@ mod tests {
     };
 
     use crate::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, Schema, SortOrder, TableMetadataBuilder,
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
     };
     use crate::metadata_batch_reader::MetadataTableType;
     use crate::scan_model::IcebergTableInfo;
