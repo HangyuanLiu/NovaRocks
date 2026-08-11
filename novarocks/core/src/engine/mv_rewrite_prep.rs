@@ -83,24 +83,33 @@ fn freeze_base_table_state(
         .into_iter()
         .next()
         .expect("one table reference produces one parsed identity");
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg catalogs read lock");
-        registry.get(&table_ref.catalog)?
-    };
-    let loaded = crate::connector::iceberg::catalog::load_table(
-        &entry,
+    let connector_context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &table_ref.catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &table_ref.namespace,
+        &table_ref.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let schema_observation = state
+        .mv_storage_observation
+        .observe_schema_validation(&exact_lease, &metadata, connector_context.clone())
+        .map_err(|error| format!("observe MV rewrite storage facts for {fqn}: {error}"))?;
+    let reference_facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
+        exact_lease,
+        connector_context,
         &table_ref.namespace,
         &table_ref.table,
     )?;
     Ok(MvRewriteBaseTableState::Resolved {
-        snapshot_id: loaded
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| snapshot.snapshot_id()),
-        table_uuid: Some(loaded.table.metadata().uuid().to_string()),
+        snapshot_id: reference_facts.current_snapshot_id(),
+        table_uuid: Some(schema_observation.table_uuid().to_string()),
     })
 }

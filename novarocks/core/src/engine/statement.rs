@@ -941,6 +941,22 @@ pub(crate) fn execute_drop_catalog_statement(
     catalog_name: &str,
     if_exists: bool,
 ) -> Result<StatementResult, String> {
+    let normalized_catalog = normalize_identifier(catalog_name)?;
+    let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
+        .map_err(|error| format!("invalid connector instance ID: {error}"))?;
+    match state
+        .connector_control
+        .observe_current_binding(&instance_id)
+    {
+        Ok(_) => {}
+        Err(error)
+            if if_exists
+                && error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
+        {
+            return Ok(StatementResult::Ok);
+        }
+        Err(error) => return Err(format!("resolve catalog `{normalized_catalog}`: {error}")),
+    }
     // The catalog name passed in by the user may carry quoting/case the
     // dependency graph normalizes away; the MV drop-scope guards already do
     // case-insensitive matching, so pass the user-typed value straight through.
@@ -954,24 +970,18 @@ pub(crate) fn execute_drop_catalog_statement(
         catalog_name,
         None,
     )?;
-    let mut guard = state
+    #[cfg(test)]
+    state
         .iceberg_catalogs
         .write()
-        .expect("standalone iceberg catalog write lock");
-    match guard.drop_catalog(catalog_name) {
-        Ok(()) => {
-            drop(guard);
-            let normalized_catalog = normalize_identifier(catalog_name)?;
-            retire_iceberg_control_binding(state, &normalized_catalog)?;
-            delete_catalog_attachment_if_needed(state, &normalized_catalog)?;
-            state
-                .catalog_service
-                .unregister_catalog(&normalized_catalog);
-            Ok(StatementResult::Ok)
-        }
-        Err(err) if if_exists && err.contains("unknown catalog") => Ok(StatementResult::Ok),
-        Err(err) => Err(err),
-    }
+        .expect("test iceberg catalog write lock")
+        .drop_catalog(&normalized_catalog)?;
+    retire_iceberg_control_binding(state, &normalized_catalog)?;
+    delete_catalog_attachment_if_needed(state, &normalized_catalog)?;
+    state
+        .catalog_service
+        .unregister_catalog(&normalized_catalog);
+    Ok(StatementResult::Ok)
 }
 
 pub(crate) fn execute_drop_database_statement(
