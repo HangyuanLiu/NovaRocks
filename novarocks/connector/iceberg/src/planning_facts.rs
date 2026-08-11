@@ -243,6 +243,7 @@ pub fn table_planning_facts(
         column_facts,
         unique_constraints,
         foreign_key_constraints,
+        Vec::new(),
         input.context,
     )
 }

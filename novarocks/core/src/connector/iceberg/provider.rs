@@ -5650,6 +5650,10 @@ pub(crate) fn prepare_iceberg_row_mutation(
             base_version,
             contract,
             strategy,
+            // Populated by the strategy/facts closeout below; until then the
+            // application still derives its journal base version from the
+            // concrete table handle it holds.
+            None,
             payload,
         )?,
     ))
