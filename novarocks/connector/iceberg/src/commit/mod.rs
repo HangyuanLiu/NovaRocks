@@ -44,6 +44,8 @@ mod row_delta_dv;
 mod row_delta_dv_from_files;
 pub mod row_delta_dv_metadata;
 mod row_mutation_activation;
+#[cfg(test)]
+mod row_mutation_parity_tests;
 mod row_mutation_preparation;
 mod run;
 mod selected_rewrite;
