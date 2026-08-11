@@ -209,6 +209,7 @@ pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStr
 /// - A MERGE that can delete matched rows is served merge-on-read even when the
 ///   table asks for copy-on-write, because the copy-on-write rewrite has no way
 ///   to express a matched delete.
+// Design: ADR-0055 (docs/adr/ADR-0055-row-dml-strategy-consumer-closeout.md)
 pub fn row_mutation_strategy_from_metadata(
     metadata: &TableMetadata,
     intent: &novarocks_spi::connector::ConnectorRowMutationIntent,
