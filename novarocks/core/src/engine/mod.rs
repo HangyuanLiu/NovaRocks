@@ -8151,6 +8151,7 @@ mysql_port = 47892
         let service = Arc::new(RefreshRouteRecordingMvApplicationService::default());
         let state = Arc::new(StandaloneState {
             mv_application_service: service.clone(),
+            mv_repository: super::test_mv_repository(),
             ..Default::default()
         });
         let request_context = super::test_request_context(Some("ice"), "analytics");
@@ -8176,10 +8177,13 @@ mysql_port = 47892
         let refreshes = service.refreshes.lock().expect("refresh route calls");
         assert_eq!(refreshes.len(), 1);
         let (statement, target, execution) = &refreshes[0];
+        // Dispatch resolves each dependency step to a fully qualified
+        // `database.name` before routing, so the frontend never has to
+        // re-derive the current database from an abbreviated statement.
         assert!(matches!(
             statement,
             MvApplicationStatement::Refresh(refresh)
-                if refresh.name_parts == ["orders_mv"] && !refresh.full
+                if refresh.name_parts == ["analytics", "orders_mv"] && !refresh.full
         ));
         assert_eq!(target.catalog.as_deref(), Some("ice"));
         assert_eq!(target.database, "analytics");
