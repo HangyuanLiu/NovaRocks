@@ -35,7 +35,7 @@ use crate::commit::{MvProvenanceV1, RefreshTechnique};
 use crate::iceberg::spec::{FormatVersion, TableMetadata, Transform};
 use crate::scan_model::IcebergTableInfo;
 
-const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
+pub(crate) const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
 const MV_DESCRIPTOR_HASH_PROP: &str = "novarocks.mv.descriptor.hash";
 const MV_DESCRIPTOR_INLINE_PROP: &str = "novarocks.mv.descriptor.inline";
 const MAX_TARGET_FIELDS: usize = 4_096;

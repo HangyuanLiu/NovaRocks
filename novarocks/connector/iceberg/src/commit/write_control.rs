@@ -36,14 +36,17 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
     ConnectorInstanceIncarnation, ConnectorManagedPublicationEmptyInputDisposition,
     ConnectorManagedPublicationTechnique, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorWriteAbortOutcome,
-    ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
-    ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteCohortId,
-    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecutionId,
-    ConnectorWriteInputShape, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
-    ConnectorWriteReconcileRequest, ConnectorWriterHandle, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
+    ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteInputShape,
+    ConnectorWriteOperationCompletion, ConnectorWriteOperationId, ConnectorWritePlan,
+    ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
+    ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
+    ConnectorWriterHandle, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use crate::control_provider::IcebergControlProvider;
@@ -1341,6 +1344,27 @@ impl IcebergWriteControl {
 impl ConnectorWriteControl for IcebergWriteControl {
     fn binding_key(&self) -> &ConnectorExecutionBindingKey {
         &self.key
+    }
+
+    fn prepare_write(
+        &self,
+        request: ConnectorWritePreparationRequest,
+    ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+        super::write_preparation::prepare_write(request, &self.key)
+    }
+
+    fn prepare_row_mutation(
+        &self,
+        request: ConnectorRowMutationPreparationRequest,
+    ) -> Result<ConnectorRowMutationPreparationOutcome, ConnectorError> {
+        super::row_mutation_preparation::prepare_row_mutation(request, &self.key)
+    }
+
+    fn activate_row_mutation(
+        &self,
+        request: ConnectorRowMutationActivationRequest,
+    ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
+        super::row_mutation_activation::activate_row_mutation(request, &self.key)
     }
 
     fn activate_write(
