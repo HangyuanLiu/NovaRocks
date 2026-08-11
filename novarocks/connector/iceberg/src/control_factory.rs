@@ -25,11 +25,19 @@
 use crate::PROVIDER_ID;
 use crate::catalog_config::parse_catalog_configuration_with_object_store_binding;
 use crate::catalog_control::IcebergCatalogControlState;
+use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
+use crate::commit::IcebergWriteControl;
+use crate::control_provider::IcebergControlProvider;
 use crate::control_runtime::IcebergControlRuntime;
+use crate::execution_declaration::IcebergInstanceDistribution;
 use crate::resources::IcebergControlResources;
 use novarocks_spi::connector::{
-    ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind, ConnectorProviderId,
+    ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
+    ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
+    ConnectorProviderId,
 };
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct IcebergControlFactory {
@@ -84,11 +92,13 @@ impl IcebergControlFactory {
             ));
         }
         let durable_properties = sanitize_durable_properties(&configuration.properties);
-        let runtime = IcebergControlRuntime::try_new(
-            IcebergCatalogControlState::new(configuration),
-            self.control_resources.clone(),
-        )
-        .map_err(unavailable)?;
+        let runtime = Arc::new(
+            IcebergControlRuntime::try_new(
+                IcebergCatalogControlState::new(configuration),
+                self.control_resources.clone(),
+            )
+            .map_err(unavailable)?,
+        );
         Ok(IcebergUnpublishedControl {
             runtime,
             durable_properties,
@@ -96,16 +106,67 @@ impl IcebergControlFactory {
     }
 }
 
+impl ConnectorControlFactory for IcebergControlFactory {
+    fn provider_id(&self) -> &ConnectorProviderId {
+        self.provider_id()
+    }
+
+    fn create_control(
+        &self,
+        request: ConnectorControlFactoryRequest,
+    ) -> Result<ConnectorControlCreation, ConnectorError> {
+        let unpublished = self.prepare_unpublished(&request)?;
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: self.provider_id.clone(),
+            instance_id: request.instance_id().clone(),
+        };
+        let incarnation = ConnectorInstanceIncarnation::new();
+        let provider = Arc::new(IcebergControlProvider::new(
+            descriptor.clone(),
+            incarnation,
+            Arc::clone(&unpublished.runtime),
+        ));
+        let key = ConnectorExecutionBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation,
+        };
+        let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new(
+            key,
+            Arc::clone(&unpublished.runtime),
+        )?);
+        let write_control = Arc::new(IcebergWriteControl::new(
+            descriptor.clone(),
+            incarnation,
+            Arc::clone(&unpublished.runtime),
+        ));
+        let binding =
+            ConnectorControlBinding::try_new_with_all_capabilities_and_metadata_maintenance(
+                descriptor.clone(),
+                incarnation,
+                provider.clone(),
+                provider.clone(),
+                Arc::new(IcebergInstanceDistribution::new(descriptor, incarnation)),
+                Some(provider.clone()),
+                None,
+                Some(metadata_maintenance),
+                Some(write_control),
+                Some(provider.clone()),
+            )?
+            .try_with_view_metadata(Some(provider))?;
+        ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
+    }
+}
+
 #[allow(dead_code)] // Held until the provider has assembled every capability.
 #[derive(Debug)]
 pub struct IcebergUnpublishedControl {
-    runtime: IcebergControlRuntime,
+    runtime: Arc<IcebergControlRuntime>,
     durable_properties: Vec<(String, String)>,
 }
 
 #[allow(dead_code)]
 impl IcebergUnpublishedControl {
-    pub(crate) fn runtime(&self) -> &IcebergControlRuntime {
+    pub(crate) fn runtime(&self) -> &Arc<IcebergControlRuntime> {
         &self.runtime
     }
 
@@ -310,5 +371,61 @@ mod tests {
         factory
             .prepare_unpublished(&restored)
             .expect("restore with server credentials");
+    }
+
+    #[test]
+    fn created_binding_installs_exact_generation_control_capabilities() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+            binding,
+            runtime.handle().clone(),
+        ));
+        let request = ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            vec![(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("request");
+
+        let creation = factory.create_control(request).expect("control creation");
+        let maintenance = creation
+            .binding()
+            .metadata_maintenance()
+            .expect("metadata maintenance");
+
+        assert_eq!(maintenance.descriptor(), creation.binding().descriptor());
+        assert_eq!(
+            maintenance.binding_key().incarnation,
+            creation.binding().incarnation()
+        );
+        let write = creation.binding().write().expect("write control");
+        assert_eq!(
+            write.binding_key().instance_id,
+            creation.binding().descriptor().instance_id
+        );
+        assert_eq!(
+            write.binding_key().incarnation,
+            creation.binding().incarnation()
+        );
+        let mutation = creation.binding().mutation().expect("catalog mutation");
+        assert_eq!(mutation.descriptor(), creation.binding().descriptor());
+        assert_eq!(mutation.incarnation(), creation.binding().incarnation());
+        let views = creation.binding().view_metadata().expect("view metadata");
+        assert_eq!(views.descriptor(), creation.binding().descriptor());
+        assert_eq!(views.incarnation(), creation.binding().incarnation());
+        let statistics = creation.binding().statistics().expect("statistics");
+        assert_eq!(statistics.descriptor(), creation.binding().descriptor());
+        assert_eq!(statistics.incarnation(), creation.binding().incarnation());
+        assert!(statistics.collection().is_some());
     }
 }

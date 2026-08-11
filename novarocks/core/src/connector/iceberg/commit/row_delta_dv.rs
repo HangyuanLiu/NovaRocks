@@ -72,8 +72,8 @@ use super::row_delta_dv_metadata::{
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
-use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::{
     DeletionVector, PositionDeleteGroup, write_single_deletion_vector_puffin,
 };

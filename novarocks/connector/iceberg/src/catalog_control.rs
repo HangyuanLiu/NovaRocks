@@ -27,6 +27,21 @@ use crate::catalog_config::IcebergCatalogConfiguration;
 use crate::loaded_table::IcebergPhysicalTableCache;
 use crate::manifest::DataFileWithStats;
 
+#[path = "catalog_control/catalog_mutation.rs"]
+pub mod catalog_mutation;
+#[path = "catalog_control/cleanup_candidates.rs"]
+mod cleanup_candidates;
+#[path = "catalog_control/cleanup_maintenance.rs"]
+pub mod cleanup_maintenance;
+#[path = "catalog_control/metadata_maintenance.rs"]
+pub mod metadata_maintenance;
+#[path = "catalog_control/statistics.rs"]
+pub mod statistics;
+#[path = "catalog_control/type_mapping.rs"]
+pub(crate) mod type_mapping;
+#[path = "catalog_control/views.rs"]
+pub(crate) mod views;
+
 /// State that is private to one Iceberg control generation.
 ///
 /// It carries provider configuration plus physical catalog caches. SQL table

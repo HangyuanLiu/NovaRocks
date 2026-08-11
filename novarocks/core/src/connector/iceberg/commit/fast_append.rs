@@ -44,7 +44,7 @@ use super::helpers::{
     snapshot_total_records, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
-use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use novarocks_connector_iceberg::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use novarocks_connector_iceberg::stats_assembler::{CommitType, FileSketchSet, StatsAssembler};
 
 pub struct FastAppendCommit;
@@ -703,8 +703,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::connector::iceberg::commit::CommitOpKind;
     use crate::connector::iceberg::commit::IcebergCommitCollector;
+    use novarocks_connector_iceberg::commit::CommitOpKind;
 
     #[test]
     fn type_compiles() {

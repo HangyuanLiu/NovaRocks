@@ -62,9 +62,46 @@ pub(crate) fn load_connector_table_materialization_with_lease(
     namespace: &str,
     table: &str,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
+    load_connector_table_materialization_with_resolution(
+        controls,
+        context,
+        catalog,
+        namespace,
+        table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )
+}
+
+/// Load one provider-defined read alias through the same opaque metadata
+/// contract used for base tables. The alias syntax is application-owned, but
+/// Core neither decodes the returned table handle nor names a provider type.
+pub(crate) fn load_connector_table_alias_materialization_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    alias: &str,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    load_connector_table_materialization_with_resolution(
+        controls,
+        context,
+        catalog,
+        namespace,
+        alias,
+        novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+    )
+}
+
+fn load_connector_table_materialization_with_resolution(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    resolution: novarocks_spi::connector::ConnectorTableResolution,
+) -> Result<ConnectorQueryTableMaterialization, String> {
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
-        ConnectorTableResolution,
     };
 
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
@@ -80,7 +117,7 @@ pub(crate) fn load_connector_table_materialization_with_lease(
                 namespace: Arc::from(namespace),
                 table: Arc::from(table),
             },
-            resolution: ConnectorTableResolution::StrictBaseTable,
+            resolution,
             context,
         })
         .map_err(|error| error.to_string())?;

@@ -488,10 +488,10 @@ mod tests {
         MutationStatementKind, STAGED, parse_merge_statement, parse_update_statement,
     };
     use crate::connector::iceberg::commit::CommitServiceError;
-    use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
     use crate::engine::mutation_flow::MutationExecution;
     use crate::query_execution::ConnectorWriteCompletion;
     use crate::query_execution::outcome::QueryExecutionResult;
+    use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
     use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
 
     struct TestExecution {

@@ -28,7 +28,6 @@ use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::connector::iceberg::commit::{
     CommitServiceError, IcebergCommitCollector, ensure_equality_delete_single_partition_spec,
 };
@@ -50,6 +49,7 @@ use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_mi
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,

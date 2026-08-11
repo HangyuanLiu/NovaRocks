@@ -23,7 +23,6 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::StandaloneState;
 use crate::mv::application::{
     MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
@@ -31,6 +30,7 @@ use crate::mv::application::{
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
+use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_connector_iceberg::write_payload::IcebergFirstRefreshWritePlanPayloadV2;
 
 /// Core-side provider adapter installed into the frontend composition. It

@@ -48,7 +48,6 @@ pub(crate) mod snapshot_lifecycle_helpers_tests;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod truncate;
-mod types;
 mod update_cow;
 mod validation;
 
@@ -90,10 +89,6 @@ pub use service::{
     classify_commit_error,
 };
 pub use truncate::TruncateCommit;
-pub(crate) use types::{
-    CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode,
-    WrittenFile,
-};
 pub use update_cow::{CowUpdateCommit, CowUpdateRewriteSet, CowUpdateTouchedFile};
 pub use validation::{
     classify_iceberg_write_mode, classify_sql_delete_strategy, ensure_column_id_not_regressed,

@@ -17,16 +17,6 @@
 
 use crate::mv::analysis::rebind::RebindColumn;
 
-#[derive(Clone, Debug)]
-pub(crate) struct CurrentIcebergTableView<'a> {
-    pub(crate) table_uuid: String,
-    pub(crate) format_version: novarocks_connector_iceberg::iceberg::spec::FormatVersion,
-    pub(crate) row_lineage_enabled: bool,
-    pub(crate) schema: &'a novarocks_connector_iceberg::iceberg::spec::Schema,
-    pub(crate) default_partition_spec:
-        &'a novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ContractDecision {
     CompatibleSafe,

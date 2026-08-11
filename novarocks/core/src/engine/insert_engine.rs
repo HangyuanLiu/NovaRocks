@@ -28,12 +28,12 @@ use std::sync::Arc;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::statistics::StatisticsEngine;
 use crate::engine::{StandaloneState, iceberg_writer};
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
 use crate::sql::parser::ast::{Literal, ObjectName};
+use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 /// Parse one statement through NovaRocks' StarRocks normalizer and return its

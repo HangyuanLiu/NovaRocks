@@ -39,10 +39,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::common::types::UniqueId;
 
-use crate::connector::iceberg::commit::types::{CommitOpKind, WrittenFile};
 use novarocks_connector_iceberg::commit::PositionDeleteGroup;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
 use novarocks_connector_iceberg::commit::report::{self as iceberg_report, IcebergWriterReport};
+use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
 use novarocks_connector_iceberg::stats_assembler::FileSketchSet;
 
 #[derive(Default)]

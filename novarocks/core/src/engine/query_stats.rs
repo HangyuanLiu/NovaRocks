@@ -33,6 +33,7 @@ use crate::engine::query_planning::bindings::{
 };
 use crate::engine::query_planning::catalog_materializer::{
     QueryTableBindingLoader, connector_query_binding_from_materialization,
+    load_connector_table_alias_materialization_with_lease,
     load_connector_table_materialization_with_lease,
 };
 use crate::sql::catalog::ResolvedAnalyzerTable;
@@ -269,20 +270,21 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
         binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
-        let materialization =
-            crate::connector::iceberg::provider::load_metadata_materialization_with_lease(
-                self.controls,
-                self.connector_context.clone(),
-                catalog,
-                namespace,
-                table,
-                metadata_table_type,
-            )?;
+        let alias = format!(
+            "{table}${}",
+            metadata_table_alias_suffix(metadata_table_type)
+        );
+        let materialization = load_connector_table_alias_materialization_with_lease(
+            self.controls,
+            self.connector_context.clone(),
+            catalog,
+            namespace,
+            &alias,
+        )?;
         let planner = crate::sql::planner::table::TableDef {
-            name: materialization.table_name,
+            name: table.to_string(),
             columns: materialization.columns,
-            iceberg_row_lineage_metadata_columns: materialization
-                .iceberg_row_lineage_metadata_columns,
+            iceberg_row_lineage_metadata_columns: materialization.row_lineage_metadata_columns,
             source: ScanSource::Sql(SqlScanSource::new(
                 binding_id,
                 SqlTableIdentity {
@@ -312,6 +314,22 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
+    }
+}
+
+fn metadata_table_alias_suffix(
+    kind: crate::sql::planner::table::SqlMetadataTableKind,
+) -> &'static str {
+    use crate::sql::planner::table::SqlMetadataTableKind;
+
+    match kind {
+        SqlMetadataTableKind::Snapshots => "SNAPSHOTS",
+        SqlMetadataTableKind::History => "HISTORY",
+        SqlMetadataTableKind::Refs => "REFS",
+        SqlMetadataTableKind::Files => "FILES",
+        SqlMetadataTableKind::Manifests => "MANIFESTS",
+        SqlMetadataTableKind::Partitions => "PARTITIONS",
+        SqlMetadataTableKind::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
     }
 }
 
@@ -727,5 +745,25 @@ mod unified_tests {
         assert!(strict_base.contains("load_connector_table_materialization_with_lease"));
         assert!(!strict_base.contains("load_schema_materialization_with_lease"));
         assert!(!strict_base.contains("connector::iceberg::provider"));
+    }
+
+    #[test]
+    fn metadata_alias_admission_uses_the_spi_materialization_path() {
+        let source = include_str!("query_stats.rs");
+        let metadata = source
+            .split("fn load_metadata_table")
+            .nth(1)
+            .expect("metadata table loader")
+            .split("fn metadata_table_alias_suffix")
+            .next()
+            .expect("metadata alias suffix boundary");
+        assert!(metadata.contains("load_connector_table_alias_materialization_with_lease"));
+        assert!(!metadata.contains("connector::iceberg::provider"));
+        assert_eq!(
+            metadata_table_alias_suffix(
+                crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata,
+            ),
+            "LOGICAL_ICEBERG_METADATA"
+        );
     }
 }

@@ -13,8 +13,8 @@ use crate::connector::iceberg::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterRoutingError,
 };
 use crate::connector::iceberg::commit::IcebergCommitCollector;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::query_execution::write::WriteCommitInput;
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 
 pub(crate) struct ExecutedChangeStreamWrite {
     pub(crate) write_commit: Option<WriteCommitInput>,

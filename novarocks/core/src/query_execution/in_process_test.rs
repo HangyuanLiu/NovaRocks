@@ -128,7 +128,7 @@ fn install_connector_bindings(
         Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
     );
     let installers: Vec<Arc<dyn ConnectorExecutionInstaller>> = vec![Arc::new(
-        crate::connector::iceberg::provider::IcebergConnectorInstaller::new(
+        novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller::new(
             novarocks_connector_iceberg::resources::IcebergExecutionResources::new(
                 binding,
                 runtime.handle().clone(),

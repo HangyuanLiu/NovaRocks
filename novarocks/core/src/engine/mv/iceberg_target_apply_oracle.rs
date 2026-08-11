@@ -2720,7 +2720,7 @@ mod tests {
         );
         let collector = std::sync::Arc::new(
             crate::connector::iceberg::commit::IcebergCommitCollector::new(
-                crate::connector::iceberg::commit::CommitOpKind::RowDelta,
+                novarocks_connector_iceberg::commit::CommitOpKind::RowDelta,
                 table_ident.clone(),
                 metadata
                     .current_snapshot()

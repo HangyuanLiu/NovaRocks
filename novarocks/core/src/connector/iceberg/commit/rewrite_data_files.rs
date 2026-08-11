@@ -50,8 +50,8 @@ use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
 use super::overwrite::{build_minimal_data_file, write_added_data_manifest};
-use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
 
 pub struct RewriteDataFilesCommit;
 

@@ -32,6 +32,10 @@ pub mod equality_delete;
 
 #[path = "distributed_rewrite_reader.rs"]
 pub mod distributed_rewrite_reader;
+#[path = "execution_installer.rs"]
+pub mod execution_installer;
+#[path = "execution_payload.rs"]
+pub mod execution_payload;
 #[path = "variant.rs"]
 pub mod variant;
 

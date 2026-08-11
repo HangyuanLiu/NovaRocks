@@ -411,6 +411,9 @@ query_lifecycle_fault_dir = "{}"
             config_path: Some(config_file.path().to_path_buf()),
             port_override: None,
             connector_control_factories: Vec::new(),
+            mv_storage_observation: Arc::new(
+                novarocks::mv::storage_observation::UnavailableMvStorageObservationPort,
+            ),
             state_store_host_config: None,
         },
         async move {

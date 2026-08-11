@@ -1020,16 +1020,13 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
             current_database,
         )
         .map_err(internal_failure)?;
-        let entry = self
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| {
-                internal_failure(format!("iceberg catalog registry read lock: {error}"))
-            })?
-            .get(&target.catalog)
-            .map_err(internal_failure)?;
-        match crate::connector::iceberg::catalog::registry::table_exists_typed(
-            &entry,
+        let context =
+            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
+                .map_err(internal_failure)?;
+        match crate::connector::metadata_table_exists(
+            self.connector_control.as_ref(),
+            context,
+            &target.catalog,
             &target.namespace,
             &target.table,
         ) {

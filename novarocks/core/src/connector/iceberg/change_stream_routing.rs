@@ -15,10 +15,10 @@ use std::collections::BTreeMap;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
 use crate::connector::iceberg::commit::IcebergCommitCollector;
-use crate::connector::iceberg::commit::WrittenFile;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
 use novarocks_connector_iceberg::commit::report::IcebergWriterReport;
+use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ChangeStreamWriterCommitPlan {
@@ -159,8 +159,7 @@ impl ChangeStreamRoutedWriterFiles {
     pub(crate) fn inject(self, collector: &IcebergCommitCollector) {
         if matches!(
             collector.op_kind,
-            crate::connector::iceberg::commit::CommitOpKind::FastAppend
-                | crate::connector::iceberg::commit::CommitOpKind::Overwrite
+            CommitOpKind::FastAppend | CommitOpKind::Overwrite
         ) {
             let mut files = self.reuse_or_dv;
             files.extend(self.fresh);
@@ -252,7 +251,7 @@ mod tests {
     use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::common::types::UniqueId;
-    use crate::connector::iceberg::commit::CommitOpKind;
+    use novarocks_connector_iceberg::commit::CommitOpKind;
     use novarocks_connector_iceberg::commit::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };

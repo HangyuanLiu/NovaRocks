@@ -554,7 +554,7 @@ mod tests {
         use crate::connector::iceberg::commit::action::{CommitCtx, IcebergCommitAction};
         use crate::connector::iceberg::commit::collector::IcebergCommitCollector;
         use crate::connector::iceberg::commit::fast_append::FastAppendCommit;
-        use crate::connector::iceberg::commit::types::{CommitOpKind, WrittenFile};
+        use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
         use novarocks_connector_iceberg::iceberg::spec::{
             DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema,
             Struct, Type,

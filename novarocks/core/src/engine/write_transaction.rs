@@ -7,8 +7,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use novarocks_connector_iceberg::commit::CommitOpKind;
 
 pub(crate) struct IcebergWriteCommitPolicy {
     pub(crate) commit_op_kind: CommitOpKind,

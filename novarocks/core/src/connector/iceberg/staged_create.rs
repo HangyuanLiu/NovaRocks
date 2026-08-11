@@ -18,9 +18,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use bytes::Bytes;
 use novarocks_connector_iceberg::commit::AbortLog;
+use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_connector_iceberg::iceberg::{
     Catalog, ErrorKind, TableCommit, TableRequirement, TableUpdate,
 };

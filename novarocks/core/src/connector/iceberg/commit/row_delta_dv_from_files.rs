@@ -52,8 +52,8 @@ use super::row_delta_dv_metadata::{
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
-use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::{
     DeletionVector, read_deletion_vector_puffin, write_single_deletion_vector_puffin,
 };
@@ -744,7 +744,7 @@ mod tests {
     use super::super::test_helpers::empty_v3_iceberg_table;
     use super::*;
     use crate::common::types::UniqueId;
-    use crate::connector::iceberg::commit::types::CommitOpKind;
+    use novarocks_connector_iceberg::commit::CommitOpKind;
     use novarocks_connector_iceberg::commit::PositionDeleteGroup;
 
     /// M3a Part B: a RowDeltaDvFromFiles commit may carry, in one snapshot,

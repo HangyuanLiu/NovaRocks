@@ -49,7 +49,6 @@ use crate::connector::iceberg::commit::{
     CommitCtx, FastAppendCommit, IcebergCommitAction, IcebergCommitCollector,
     classify_iceberg_write_mode,
 };
-use crate::connector::iceberg::commit::{CommitOpKind, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::write_service::IcebergWriteServiceRegistry;
 use crate::sql::literal::{literal_to_i128_for_integer, parse_datetime_string_to_nanos};
 use crate::sql::{ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind};
@@ -58,6 +57,7 @@ use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::{ColumnDefault, SqlType};
 use novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files;
 use novarocks_connector_iceberg::commit::variant_write::parse_variant_shredding_properties;
+use novarocks_connector_iceberg::commit::{CommitOpKind, IcebergWriteMode, WrittenFile};
 use novarocks_connector_iceberg::fs_io;
 
 #[derive(Default)]

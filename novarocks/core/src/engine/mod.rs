@@ -366,6 +366,9 @@ pub(crate) struct StandaloneState {
     pub(crate) mv_repository: Arc<dyn MvRepository>,
     /// Frontend-owned MV statement application boundary.
     pub(crate) mv_application_service: Arc<dyn MvApplicationService>,
+    /// Server-composed exact-generation storage observation boundary.
+    pub(crate) mv_storage_observation:
+        Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
     pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
@@ -420,6 +423,9 @@ impl Default for StandaloneState {
             metadata_provider: None,
             mv_repository: Arc::new(UnavailableMvRepository),
             mv_application_service: Arc::new(UnavailableMvApplicationService),
+            mv_storage_observation: Arc::new(
+                crate::mv::storage_observation::UnavailableMvStorageObservationPort,
+            ),
             catalog_attachment_repo: CatalogAttachmentRepository,
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
@@ -1228,6 +1234,10 @@ pub struct StandaloneOpenServices {
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
     pub mv_application_service: std::sync::Arc<dyn MvApplicationService>,
+    /// Server-composed provider storage inspector adapter. The default is
+    /// intentionally unavailable so missing composition fails closed.
+    pub mv_storage_observation:
+        std::sync::Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
     pub query_execution: crate::query_execution::service::QueryExecutionService,
     pub backend_query_events:
         std::sync::Arc<dyn crate::query_execution::backend::BackendQueryEventSink>,
@@ -1290,6 +1300,9 @@ impl StandaloneOpenServices {
             table_maintenance_service,
             mv_repository,
             mv_application_service,
+            mv_storage_observation: std::sync::Arc::new(
+                crate::mv::storage_observation::UnavailableMvStorageObservationPort,
+            ),
             query_execution,
             backend_query_events,
             backend_topology,
@@ -1297,6 +1310,14 @@ impl StandaloneOpenServices {
             query_control,
             exchange_port,
         }
+    }
+
+    pub fn with_mv_storage_observation(
+        mut self,
+        observation: std::sync::Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
+    ) -> Self {
+        self.mv_storage_observation = observation;
+        self
     }
 
     pub fn with_statistics_application(
@@ -1434,6 +1455,7 @@ impl StandaloneNovaRocks {
             table_maintenance_service,
             mv_repository,
             mv_application_service,
+            mv_storage_observation,
             query_execution,
             backend_query_events,
             backend_topology,
@@ -1450,6 +1472,7 @@ impl StandaloneNovaRocks {
             metadata_provider: metadata_provider.clone(),
             mv_repository,
             mv_application_service,
+            mv_storage_observation,
             catalog_attachment_repo: CatalogAttachmentRepository,
             job_repo: JobMetaRepository,
             exchange_port,

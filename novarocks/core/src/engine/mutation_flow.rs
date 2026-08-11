@@ -27,7 +27,6 @@ use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergUpdateMode};
 use crate::connector::iceberg::commit::{
     CommitServiceError, IcebergCommitCollector, ensure_iceberg_write_supported,
     select_iceberg_update_mode,
@@ -45,6 +44,7 @@ use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
     MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome, IcebergUpdateMode};
 
 fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
     write_commit

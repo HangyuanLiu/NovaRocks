@@ -1,0 +1,1381 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with this
+// work for additional information regarding copyright ownership.
+
+//! Generation-local Iceberg control capabilities.
+//!
+//! This module is the provider implementation behind one frontend control
+//! binding. It owns opaque table payloads and uses only the catalog client and
+//! runtime injected into that exact generation.
+
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::time::Instant;
+
+use arrow::datatypes::{Field, Schema, SchemaRef};
+use bytes::Bytes;
+use novarocks_spi::connector::{
+    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
+    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorReadNamedReference, ConnectorReadPurpose, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind, ConnectorReadSelector,
+    ConnectorReadSnapshotLogEntry, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+    validate_static_predicates,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::control_runtime::IcebergControlRuntime;
+use crate::file_reader::execution_payload::{
+    ICEBERG_SPLIT_V5, IcebergFrozenScanUnitPayload, IcebergMetadataSplitPayloadV1,
+    IcebergScanFactColumnV1, SplitPayload, canonical_split_name_mapping,
+    materialize_local_scan_units, scan_fact_scalar_type,
+};
+use crate::manifest::{
+    data_file_with_stats_to_iceberg_data_file_info, extract_data_files_with_stats_at,
+};
+use crate::metadata_batch_reader::{
+    MetadataTableType, metadata_output_schema, metadata_table_output_columns,
+};
+use crate::planning_facts::{IcebergTablePlanningFactsInput, table_planning_facts};
+use crate::scan_model::{
+    IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
+    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue, IcebergTableInfo,
+};
+use crate::schema_facts::{iceberg_schema_def, row_lineage_enabled};
+
+const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
+const APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key-column";
+const HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
+
+#[derive(Clone)]
+pub struct IcebergControlProvider {
+    descriptor: ConnectorInstanceDescriptor,
+    incarnation: ConnectorInstanceIncarnation,
+    runtime: Arc<IcebergControlRuntime>,
+}
+
+impl IcebergControlProvider {
+    pub(crate) fn new(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        runtime: Arc<IcebergControlRuntime>,
+    ) -> Self {
+        Self {
+            descriptor,
+            incarnation,
+            runtime,
+        }
+    }
+
+    pub(crate) fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    pub(crate) fn runtime(&self) -> &Arc<IcebergControlRuntime> {
+        &self.runtime
+    }
+
+    fn validate_context(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), ConnectorError> {
+        if context.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector request was cancelled",
+            ));
+        }
+        if Instant::now() >= context.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector request deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_owner(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError> {
+        if instance_id != &self.descriptor.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg control request belongs to another connector instance",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn table_payload(
+        &self,
+        table: &ConnectorTableHandle,
+    ) -> Result<IcebergTablePayload, ConnectorError> {
+        self.ensure_owner(table.owner())?;
+        decode_payload(table.payload(), "table handle")
+    }
+
+    fn scan_payload(
+        &self,
+        scan: &ConnectorScanHandle,
+    ) -> Result<IcebergScanPayload, ConnectorError> {
+        self.ensure_owner(scan.owner())?;
+        decode_payload(scan.payload(), "scan handle")
+    }
+}
+
+impl ConnectorMetadata for IcebergControlProvider {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.descriptor.instance_id
+    }
+
+    fn list_namespaces(
+        &self,
+        request: ConnectorListNamespacesRequest,
+    ) -> Result<Vec<ConnectorNamespaceIdentity>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.instance_id)?;
+        self.runtime
+            .list_namespaces()
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|namespace| {
+                Ok(ConnectorNamespaceIdentity {
+                    instance_id: self.descriptor.instance_id.clone(),
+                    namespace: Arc::from(namespace),
+                })
+            })
+            .collect()
+    }
+
+    fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.namespace.instance_id)?;
+        self.runtime
+            .namespace_exists(&request.namespace.namespace)
+            .map_err(unavailable)
+    }
+
+    fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.table.instance_id)?;
+        let (table, metadata_type) =
+            resolve_table_request(&request.table.table, request.resolution)?;
+        if metadata_type.is_some() {
+            return self
+                .runtime
+                .table_exists(&request.table.namespace, &table)
+                .map_err(unavailable);
+        }
+        self.runtime
+            .table_exists(&request.table.namespace, &table)
+            .map_err(unavailable)
+    }
+
+    fn list_tables(
+        &self,
+        request: ConnectorListTablesRequest,
+    ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.namespace.instance_id)?;
+        self.runtime
+            .list_tables(&request.namespace.namespace)
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|table| {
+                Ok(ConnectorTableIdentity {
+                    instance_id: self.descriptor.instance_id.clone(),
+                    namespace: request.namespace.namespace.clone(),
+                    table: Arc::from(table),
+                })
+            })
+            .collect()
+    }
+
+    fn read_reference_facts(
+        &self,
+        request: ConnectorReadReferenceFactsRequest,
+    ) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.table.instance_id)?;
+        let loaded = self
+            .runtime
+            .load_table(&request.table.namespace, &request.table.table)
+            .map_err(unavailable)?;
+        read_reference_facts(loaded.table.metadata(), &request.context)
+    }
+
+    fn load_table(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.table.instance_id)?;
+        let (table_name, metadata_table_type) =
+            resolve_table_request(&request.table.table, request.resolution)?;
+        let loaded = self
+            .runtime
+            .load_table(&request.table.namespace, &table_name)
+            .map_err(unavailable)?;
+        let metadata = loaded.table.metadata();
+        let definition_schema = metadata.current_schema().clone();
+        let table_comment = metadata.properties().get("comment").cloned();
+        let mut base_schema = Arc::new(
+            crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
+                .map_err(|error| corrupt(format!("convert Iceberg schema to Arrow: {error}")))?,
+        );
+        let hidden_columns = hidden_internal_columns(metadata.properties());
+        base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
+        let logical_type_columns = logical_type_columns(metadata.properties());
+        let metadata_columns = metadata_column_names(metadata);
+        let mut table_info =
+            IcebergTableInfo {
+                catalog: self.descriptor.instance_id.as_str().to_string(),
+                namespace: request.table.namespace.to_string(),
+                table: table_name.clone(),
+                table_uuid: Some(metadata.uuid().to_string()),
+                current_snapshot_id: metadata.current_snapshot_id(),
+                schema_id: metadata.current_schema_id(),
+                location: metadata.location().to_string(),
+                schema: iceberg_schema_def(metadata.current_schema()),
+                serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
+                    corrupt(format!("serialize Iceberg table metadata: {error}"))
+                })?),
+                serialized_metadata_rows: None,
+            };
+        let mut prepared_files = Vec::new();
+        if matches!(metadata_table_type, Some(MetadataTableType::Partitions)) {
+            if let Some(snapshot_id) = metadata.current_snapshot_id() {
+                let table = loaded.table.clone();
+                prepared_files = self
+                    .runtime
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(
+                        async move { extract_data_files_with_stats_at(&table, snapshot_id).await },
+                    )
+                    .map_err(unavailable)?
+                    .map_err(unavailable)?
+                    .into_iter()
+                    .map(data_file_with_stats_to_iceberg_data_file_info)
+                    .collect();
+            }
+        }
+        if matches!(
+            metadata_table_type,
+            Some(
+                MetadataTableType::Files
+                    | MetadataTableType::Manifests
+                    | MetadataTableType::LogicalIcebergMetadata
+            )
+        ) {
+            let table = loaded.table.clone();
+            let file_io = table.file_io().clone();
+            let metadata_read_type =
+                metadata_read_type(metadata_table_type.expect("metadata table type is present"))?;
+            table_info.serialized_metadata_rows = Some(
+                self.runtime
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move {
+                        crate::metadata_read::read_metadata_table_rows(
+                            &table,
+                            &file_io,
+                            metadata_read_type,
+                        )
+                        .await
+                    })
+                    .map_err(unavailable)?
+                    .map_err(unavailable)?,
+            );
+        }
+        let payload = IcebergTablePayload {
+            namespace: request.table.namespace.to_string(),
+            table: table_name.clone(),
+            table_info: Some(table_info),
+            metadata_columns,
+            metadata_table_type,
+            prepared_files,
+            explicit_files: None,
+            logical_type_columns,
+            hidden_columns,
+        };
+        let schema = if let Some(metadata_table_type) = payload.metadata_table_type {
+            let columns =
+                metadata_table_output_columns(metadata_table_type, metadata).map_err(corrupt)?;
+            metadata_output_schema(&columns).map_err(corrupt)?
+        } else {
+            base_schema
+        };
+        let planning_facts = if payload.metadata_table_type.is_some() {
+            ConnectorTablePlanningFacts::empty()
+        } else {
+            table_planning_facts(IcebergTablePlanningFactsInput {
+                schema: &schema,
+                metadata_columns: &payload.metadata_columns,
+                hidden_columns: &payload.hidden_columns,
+                logical_type_columns: &payload.logical_type_columns,
+                serialized_metadata: payload
+                    .table_info
+                    .as_ref()
+                    .and_then(|table| table.serialized_metadata.as_deref()),
+                namespace: &request.table.namespace,
+                instance_id: &self.descriptor.instance_id,
+                context: &request.context,
+            })?
+        };
+        let definition_facts = if payload.metadata_table_type.is_some() {
+            ConnectorTableDefinitionFacts::empty()
+        } else {
+            crate::table_definition::table_definition_facts(
+                &definition_schema,
+                &schema,
+                &planning_facts,
+                table_comment.as_deref(),
+                &request.context,
+            )?
+        };
+        let statistics_data_version = crate::statistics_codec::statistics_data_version(
+            &metadata.uuid().to_string(),
+            metadata.current_snapshot_id(),
+        )?;
+        Ok(ConnectorTableMetadata {
+            identity: ConnectorTableIdentity {
+                instance_id: self.descriptor.instance_id.clone(),
+                namespace: request.table.namespace,
+                table: Arc::from(table_name),
+            },
+            schema,
+            planning_facts,
+            definition_facts,
+            version: Some(Bytes::copy_from_slice(
+                &metadata.current_schema_id().to_le_bytes(),
+            )),
+            statistics_data_version: Some(statistics_data_version),
+            table: ConnectorTableHandle::try_new(
+                self.descriptor.instance_id.clone(),
+                encode_payload(
+                    &payload,
+                    "table handle",
+                    request.context.max_handle_payload_bytes(),
+                )?,
+            )?,
+        })
+    }
+}
+
+impl ConnectorScanPlanning for IcebergControlProvider {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.descriptor.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        table: &ConnectorTableHandle,
+        request: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        self.validate_context(&request.context)?;
+        validate_static_predicates(&request.static_predicates)?;
+        let table = self.table_payload(table)?;
+        let output_schema = if table.metadata_table_type.is_some() {
+            projected_metadata_schema(&table, &request.projection)?
+        } else {
+            projected_schema(&table, &request.projection)?
+        };
+        let (snapshot_id, table_uuid) = match request.selector {
+            ConnectorReadSelector::Current => {
+                let table_info = table.table_info.as_ref().ok_or_else(|| {
+                    corrupt("Iceberg current scan is missing its resolved table pin")
+                })?;
+                (
+                    table_info.current_snapshot_id,
+                    table_info.table_uuid.clone(),
+                )
+            }
+            selector => {
+                let physical = self
+                    .runtime
+                    .load_table(&table.namespace, &table.table)
+                    .map_err(unavailable)?;
+                (
+                    select_snapshot(physical.table.metadata(), selector)?,
+                    Some(physical.table.metadata().uuid().to_string()),
+                )
+            }
+        };
+        let (physical_predicates, predicate_dispositions) =
+            negotiate_static_predicates(&table, &request.static_predicates);
+        let fact_columns = if table.metadata_table_type.is_some() {
+            Vec::new()
+        } else {
+            scan_fact_columns(&output_schema, &request.projection, &table)?
+        };
+        let payload = IcebergScanPayload {
+            table,
+            snapshot_id,
+            table_uuid,
+            projection: request.projection,
+            limit: request.limit,
+            purpose: request.purpose.into(),
+            fact_columns,
+            physical_predicates,
+        };
+        Ok(ConnectorScan {
+            handle: ConnectorScanHandle::try_new(
+                self.descriptor.instance_id.clone(),
+                encode_payload(
+                    &payload,
+                    "scan handle",
+                    request.context.max_handle_payload_bytes(),
+                )?,
+            )?,
+            output_schema,
+            predicate_dispositions,
+        })
+    }
+
+    fn plan_splits(
+        &self,
+        scan: &ConnectorScanHandle,
+        request: ConnectorSplitPlanningRequest,
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let scan = self.scan_payload(scan)?;
+        if scan.table.metadata_table_type.is_some() {
+            return self.plan_metadata_splits(scan, request);
+        }
+        let files = self.scan_files(&scan)?;
+        if !matches!(scan.purpose, IcebergReadPurposeV1::Query)
+            && files.iter().any(|file| {
+                file.delete_files.iter().any(|delete| {
+                    delete.file_content == crate::scan_model::IcebergDeleteFileContent::Equality
+                })
+            })
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg MV target scan does not support equality deletes yet",
+            ));
+        }
+        crate::planning_facts::validate_planned_files(scan.table.table_info.as_ref(), &files)?;
+        let candidate_units_considered = u64::try_from(files.len()).unwrap_or(u64::MAX);
+        let name_mapping = split_name_mapping(&scan.table)?;
+        let mut remaining = scan.limit;
+        let mut leaves = Vec::new();
+        for file in files {
+            if let Some(rows) = remaining.as_mut() {
+                if *rows == 0 {
+                    break;
+                }
+                if let Some(row_count) = file.row_count.and_then(|value| u64::try_from(value).ok())
+                {
+                    *rows = rows.saturating_sub(row_count);
+                }
+            }
+            let estimated_bytes = u64::try_from(file.size).map_err(|_| {
+                corrupt(format!(
+                    "Iceberg data file {} has a negative size",
+                    file.path
+                ))
+            })?;
+            leaves.push(IcebergFrozenScanUnitPayload {
+                data_file: file,
+                row_groups: None,
+                estimated_bytes: Some(estimated_bytes),
+            });
+        }
+        let leaves = materialize_local_scan_units(
+            self.runtime.resources().planning_binding(),
+            leaves,
+            false,
+            &novarocks_spi::connector::ConnectorPrepareSplitRequest {
+                context: request.context.clone(),
+            },
+        )?;
+        let scan_units_planned = u64::try_from(leaves.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg scan unit count overflows u64",
+            )
+        })?;
+        let total_leaf_bytes = leaves
+            .iter()
+            .try_fold(0_u64, |total, leaf| {
+                total.checked_add(leaf.estimated_bytes.unwrap_or(0))
+            })
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg split cost overflowed",
+                )
+            })?;
+        let target_bytes = request
+            .max_split_bytes
+            .map(NonZeroU64::get)
+            .unwrap_or_else(|| {
+                total_leaf_bytes
+                    .checked_add(request.target_parallelism.get() as u64 - 1)
+                    .and_then(|bytes| bytes.checked_div(request.target_parallelism.get() as u64))
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+            });
+        let hard_limit = request.max_split_bytes.map(NonZeroU64::get);
+        let mut splits = Vec::new();
+        let mut total_payload_bytes = 0_usize;
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0_u64;
+        for leaf in leaves {
+            let leaf_bytes = leaf.estimated_bytes.unwrap_or(0);
+            if hard_limit.is_some_and(|limit| leaf_bytes > limit) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    format!(
+                        "Iceberg physical leaf {} exceeds split byte limit",
+                        leaf.data_file.path
+                    ),
+                ));
+            }
+            let full = pending.len()
+                >= novarocks_spi::connector::MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT;
+            let over_bytes = !pending.is_empty()
+                && pending_bytes
+                    .checked_add(leaf_bytes)
+                    .is_none_or(|value| value > target_bytes);
+            if full || over_bytes {
+                push_data_split(
+                    self,
+                    &scan,
+                    &name_mapping,
+                    &mut splits,
+                    &mut total_payload_bytes,
+                    std::mem::take(&mut pending),
+                    pending_bytes,
+                    &request.context,
+                )?;
+                pending_bytes = 0;
+            }
+            pending_bytes = pending_bytes.checked_add(leaf_bytes).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg split cost overflowed",
+                )
+            })?;
+            pending.push(leaf);
+        }
+        if !pending.is_empty() {
+            push_data_split(
+                self,
+                &scan,
+                &name_mapping,
+                &mut splits,
+                &mut total_payload_bytes,
+                pending,
+                pending_bytes,
+                &request.context,
+            )?;
+        }
+        let composite_splits_planned = u64::try_from(splits.len()).unwrap_or(u64::MAX);
+        ConnectorSplitPlanningResult::try_new(
+            splits,
+            ConnectorSplitPlanningMetrics {
+                candidate_units_considered,
+                candidate_units_pruned: 0,
+                composite_splits_planned,
+                scan_units_planned,
+            },
+        )
+    }
+}
+
+impl IcebergControlProvider {
+    fn plan_metadata_splits(
+        &self,
+        scan: IcebergScanPayload,
+        request: ConnectorSplitPlanningRequest,
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+        let metadata_table_type = scan.table.metadata_table_type.ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata split planning requires a metadata table type",
+            )
+        })?;
+        let table =
+            scan.table.table_info.as_ref().ok_or_else(|| {
+                corrupt("Iceberg metadata split is missing frozen table information")
+            })?;
+        let serialized_table = table.serialized_metadata.clone().ok_or_else(|| {
+            corrupt("Iceberg metadata split is missing serialized table metadata")
+        })?;
+        let serialized_payload = match metadata_table_type {
+            MetadataTableType::Files
+            | MetadataTableType::Manifests
+            | MetadataTableType::LogicalIcebergMetadata => {
+                table.serialized_metadata_rows.clone().ok_or_else(|| {
+                    corrupt("Iceberg metadata split is missing frozen metadata rows")
+                })?
+            }
+            MetadataTableType::Snapshots | MetadataTableType::History | MetadataTableType::Refs => {
+                String::new()
+            }
+            MetadataTableType::Partitions => {
+                partition_metadata_payload(&scan.table.prepared_files).map_err(corrupt)?
+            }
+        };
+        let payload = SplitPayload {
+            version: ICEBERG_SPLIT_V5,
+            owner_instance_id: self.descriptor.instance_id.as_str().to_string(),
+            incarnation: self.incarnation.to_bytes(),
+            namespace: scan.table.namespace,
+            table: scan.table.table,
+            snapshot_id: scan.snapshot_id,
+            table_uuid: scan.table_uuid,
+            schema_id: Some(table.schema_id),
+            units: Vec::new(),
+            projection: scan.projection,
+            limit: scan.limit,
+            physical_predicates: Vec::new(),
+            fact_columns: Vec::new(),
+            name_mapping: None,
+            delta: None,
+            distributed_rewrite_position: None,
+            metadata: Some(IcebergMetadataSplitPayloadV1 {
+                metadata_table_type,
+                serialized_table,
+                serialized_payload,
+            }),
+        };
+        let encoded = encode_payload(
+            &payload,
+            "metadata split",
+            request.context.max_handle_payload_bytes(),
+        )?;
+        if encoded.len() > request.context.max_total_payload_bytes() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg metadata split payload exceeds the request budget",
+            ));
+        }
+        let split = ConnectorSplit::try_new(
+            self.descriptor.instance_id.clone(),
+            "iceberg-metadata-0".to_string(),
+            encoded,
+            None,
+        )?;
+        ConnectorSplitPlanningResult::try_new(
+            vec![split],
+            ConnectorSplitPlanningMetrics {
+                candidate_units_considered: 1,
+                candidate_units_pruned: 0,
+                composite_splits_planned: 1,
+                scan_units_planned: 1,
+            },
+        )
+    }
+
+    fn scan_files(
+        &self,
+        scan: &IcebergScanPayload,
+    ) -> Result<Vec<IcebergDataFileInfo>, ConnectorError> {
+        match (&scan.table.explicit_files, scan.snapshot_id) {
+            (Some(files), _) => Ok(files.clone()),
+            (None, None) => Ok(Vec::new()),
+            (None, Some(snapshot_id)) => {
+                let physical = self
+                    .runtime
+                    .load_table(&scan.table.namespace, &scan.table.table)
+                    .map_err(unavailable)?;
+                let expected_uuid = scan.table_uuid.as_deref().ok_or_else(|| {
+                    corrupt("Iceberg snapshot scan is missing its table incarnation")
+                })?;
+                if physical.table.metadata().uuid().to_string() != expected_uuid {
+                    return Err(corrupt(
+                        "Iceberg scan belongs to a different table incarnation",
+                    ));
+                }
+                let table = physical.table;
+                self.runtime
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(
+                        async move { extract_data_files_with_stats_at(&table, snapshot_id).await },
+                    )
+                    .map_err(unavailable)?
+                    .map_err(unavailable)
+                    .map(|files| {
+                        files
+                            .into_iter()
+                            .map(data_file_with_stats_to_iceberg_data_file_info)
+                            .collect()
+                    })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct IcebergTablePayload {
+    pub namespace: String,
+    pub table: String,
+    pub table_info: Option<IcebergTableInfo>,
+    pub metadata_columns: Vec<String>,
+    pub metadata_table_type: Option<MetadataTableType>,
+    pub prepared_files: Vec<IcebergDataFileInfo>,
+    pub explicit_files: Option<Vec<IcebergDataFileInfo>>,
+    #[serde(default)]
+    pub logical_type_columns: BTreeMap<String, String>,
+    #[serde(default)]
+    pub hidden_columns: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct IcebergScanPayload {
+    table: IcebergTablePayload,
+    snapshot_id: Option<i64>,
+    table_uuid: Option<String>,
+    projection: Vec<usize>,
+    limit: Option<u64>,
+    purpose: IcebergReadPurposeV1,
+    fact_columns: Vec<IcebergScanFactColumnV1>,
+    physical_predicates: Vec<IcebergPhysicalPredicate>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+enum IcebergReadPurposeV1 {
+    Query,
+    MvTargetState,
+    MvTargetLocator,
+}
+
+impl From<ConnectorReadPurpose> for IcebergReadPurposeV1 {
+    fn from(value: ConnectorReadPurpose) -> Self {
+        match value {
+            ConnectorReadPurpose::Query => Self::Query,
+            ConnectorReadPurpose::MvTargetState => Self::MvTargetState,
+            ConnectorReadPurpose::MvTargetLocator => Self::MvTargetLocator,
+        }
+    }
+}
+
+fn projected_schema(
+    table: &IcebergTablePayload,
+    projection: &[usize],
+) -> Result<SchemaRef, ConnectorError> {
+    let serialized = table
+        .table_info
+        .as_ref()
+        .and_then(|table| table.serialized_metadata.as_deref())
+        .ok_or_else(|| corrupt("Iceberg table handle has no serialized metadata"))?;
+    let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
+        .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
+    let storage = crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
+        .map_err(|error| corrupt(format!("convert Iceberg schema to Arrow: {error}")))?;
+    let mut fields = storage.fields().to_vec();
+    fields.extend(metadata_arrow_fields(&table.metadata_columns)?);
+    let indexes = if projection.is_empty() {
+        (0..fields.len()).collect::<Vec<_>>()
+    } else {
+        projection.to_vec()
+    };
+    let projected = indexes
+        .into_iter()
+        .map(|index| {
+            fields.get(index).cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("Iceberg projection index {index} is outside the table schema"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new(projected)))
+}
+
+fn projected_metadata_schema(
+    table: &IcebergTablePayload,
+    projection: &[usize],
+) -> Result<SchemaRef, ConnectorError> {
+    let metadata_table_type = table.metadata_table_type.ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg metadata schema requires a metadata table type",
+        )
+    })?;
+    let serialized = table
+        .table_info
+        .as_ref()
+        .and_then(|table| table.serialized_metadata.as_deref())
+        .ok_or_else(|| corrupt("Iceberg metadata alias has no serialized table metadata"))?;
+    let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
+        .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
+    let columns = metadata_table_output_columns(metadata_table_type, &metadata).map_err(corrupt)?;
+    let schema = metadata_output_schema(&columns).map_err(corrupt)?;
+    if projection.is_empty() {
+        return Ok(schema);
+    }
+    let fields = projection
+        .iter()
+        .map(|index| {
+            schema.fields().get(*index).cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("metadata projection index {index} is outside the visible schema"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn metadata_read_type(
+    metadata_table_type: MetadataTableType,
+) -> Result<crate::metadata_read::MetadataTableType, ConnectorError> {
+    match metadata_table_type {
+        MetadataTableType::Files => Ok(crate::metadata_read::MetadataTableType::Files),
+        MetadataTableType::Manifests => Ok(crate::metadata_read::MetadataTableType::Manifests),
+        MetadataTableType::LogicalIcebergMetadata => {
+            Ok(crate::metadata_read::MetadataTableType::LogicalIcebergMetadata)
+        }
+        _ => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg metadata manifest walk does not support this alias",
+        )),
+    }
+}
+
+fn partition_metadata_payload(files: &[IcebergDataFileInfo]) -> Result<String, String> {
+    use std::collections::BTreeSet;
+
+    let mut groups =
+        BTreeMap::<(i32, String), (i64, i64, BTreeSet<String>, BTreeSet<String>)>::new();
+    for file in files {
+        let spec_id = file.partition_spec_id.ok_or_else(|| {
+            format!(
+                "iceberg partitions metadata requires partition spec id for data file {}",
+                file.path
+            )
+        })?;
+        let rows = file.row_count.ok_or_else(|| {
+            format!(
+                "iceberg partitions metadata requires record_count for data file {}",
+                file.path
+            )
+        })?;
+        let entry = groups
+            .entry((
+                spec_id,
+                file.partition_key
+                    .clone()
+                    .unwrap_or_else(|| "Struct([])".to_string()),
+            ))
+            .or_default();
+        entry.0 = entry
+            .0
+            .checked_add(rows)
+            .ok_or_else(|| "iceberg partitions metadata record_count overflow".to_string())?;
+        entry.1 = entry
+            .1
+            .checked_add(1)
+            .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
+        for delete in &file.delete_files {
+            match delete.file_content {
+                crate::scan_model::IcebergDeleteFileContent::Position => {
+                    entry.2.insert(delete.path.clone());
+                }
+                crate::scan_model::IcebergDeleteFileContent::Equality => {
+                    entry.3.insert(delete.path.clone());
+                }
+            }
+        }
+    }
+    let rows = groups
+        .into_iter()
+        .map(
+            |((_spec_id, _partition), (record_count, file_count, position, equality))| {
+                Ok(serde_json::json!({
+                    "record_count": record_count,
+                    "file_count": file_count,
+                    "position_delete_file_count": i64::try_from(position.len()).map_err(|_| "iceberg partitions metadata position delete count overflow".to_string())?,
+                    "equality_delete_file_count": i64::try_from(equality.len()).map_err(|_| "iceberg partitions metadata equality delete count overflow".to_string())?,
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+    serde_json::to_string(&serde_json::json!({ "version": 1, "rows": rows }))
+        .map_err(|error| format!("serialize Iceberg partitions metadata payload: {error}"))
+}
+
+fn metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, ConnectorError> {
+    names
+        .iter()
+        .map(|name| {
+            let (data_type, nullable) = match name.as_str() {
+                "_file" => (arrow::datatypes::DataType::Utf8, false),
+                "_pos" | "_row_id" => (arrow::datatypes::DataType::Int64, false),
+                "_last_updated_sequence_number" => (arrow::datatypes::DataType::Int64, true),
+                other => {
+                    return Err(corrupt(format!(
+                        "unknown Iceberg metadata column `{other}`"
+                    )));
+                }
+            };
+            Ok(Arc::new(
+                Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+                    novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
+                    "true".to_string(),
+                )])),
+            ))
+        })
+        .collect()
+}
+
+fn scan_fact_columns(
+    output_schema: &SchemaRef,
+    projection: &[usize],
+    table: &IcebergTablePayload,
+) -> Result<Vec<IcebergScanFactColumnV1>, ConnectorError> {
+    let Some(table_info) = table.table_info.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let indexes = if projection.is_empty() {
+        (0..output_schema.fields().len()).collect::<Vec<_>>()
+    } else {
+        projection.to_vec()
+    };
+    if indexes.len() != output_schema.fields().len() {
+        return Err(corrupt(
+            "Iceberg output schema does not match its frozen projection",
+        ));
+    }
+    let mut columns = indexes
+        .into_iter()
+        .zip(output_schema.fields())
+        .filter_map(|(ordinal, field)| {
+            if is_metadata_column(field.name()) {
+                return None;
+            }
+            Some((ordinal, field))
+        })
+        .map(|(ordinal, field)| {
+            let field_ordinal = u32::try_from(ordinal).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg table-schema ordinal does not fit u32",
+                )
+            })?;
+            let frozen = table_info.schema.fields.get(ordinal).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("Iceberg projection index {ordinal} is outside the frozen schema"),
+                )
+            })?;
+            if !frozen.name.eq_ignore_ascii_case(field.name()) {
+                return Err(corrupt(
+                    "Iceberg frozen table schema disagrees with its output schema",
+                ));
+            }
+            Ok(IcebergScanFactColumnV1 {
+                field_ordinal,
+                field_id: frozen.field_id,
+                canonical_name: frozen.name.to_ascii_lowercase(),
+                scalar_type: scan_fact_scalar_type(field.data_type()),
+                nullable: field.is_nullable(),
+            })
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    columns.sort_by_key(|column| column.field_ordinal);
+    Ok(columns)
+}
+
+fn split_name_mapping(table: &IcebergTablePayload) -> Result<Option<String>, ConnectorError> {
+    let Some(serialized) = table
+        .table_info
+        .as_ref()
+        .and_then(|table| table.serialized_metadata.as_deref())
+    else {
+        return Ok(None);
+    };
+    let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
+        .map_err(|error| corrupt(format!("decode Iceberg name mapping metadata: {error}")))?;
+    metadata
+        .properties()
+        .get(crate::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+        .map(|mapping| canonical_split_name_mapping(mapping))
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_data_split(
+    provider: &IcebergControlProvider,
+    scan: &IcebergScanPayload,
+    name_mapping: &Option<String>,
+    splits: &mut Vec<ConnectorSplit>,
+    total_payload_bytes: &mut usize,
+    units: Vec<IcebergFrozenScanUnitPayload>,
+    estimated_bytes: u64,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    let payload = SplitPayload {
+        version: ICEBERG_SPLIT_V5,
+        owner_instance_id: provider.descriptor.instance_id.as_str().to_string(),
+        incarnation: provider.incarnation.to_bytes(),
+        namespace: scan.table.namespace.clone(),
+        table: scan.table.table.clone(),
+        snapshot_id: scan.snapshot_id,
+        table_uuid: scan.table_uuid.clone(),
+        schema_id: scan.table.table_info.as_ref().map(|table| table.schema_id),
+        units,
+        projection: scan.projection.clone(),
+        limit: scan.limit,
+        physical_predicates: scan.physical_predicates.clone(),
+        fact_columns: scan.fact_columns.clone(),
+        name_mapping: name_mapping.clone(),
+        delta: None,
+        distributed_rewrite_position: None,
+        metadata: None,
+    };
+    let payload = encode_payload(&payload, "split", context.max_handle_payload_bytes())?;
+    let next_total = total_payload_bytes
+        .checked_add(payload.len())
+        .filter(|total| *total <= context.max_total_payload_bytes())
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg split payloads exceed the request budget",
+            )
+        })?;
+    let split = ConnectorSplit::try_new(
+        provider.descriptor.instance_id.clone(),
+        format!(
+            "{}-{}",
+            scan.snapshot_id
+                .map(|snapshot| snapshot.to_string())
+                .unwrap_or_else(|| "explicit".to_string()),
+            splits.len()
+        ),
+        payload,
+        Some(estimated_bytes),
+    )?;
+    splits.push(split);
+    *total_payload_bytes = next_total;
+    Ok(())
+}
+
+fn select_snapshot(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    selector: ConnectorReadSelector,
+) -> Result<Option<i64>, ConnectorError> {
+    match selector {
+        ConnectorReadSelector::Current => Ok(metadata.current_snapshot_id()),
+        ConnectorReadSelector::SnapshotId(snapshot_id) => metadata
+            .snapshot_by_id(snapshot_id)
+            .map(|_| Some(snapshot_id))
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!("Iceberg snapshot {snapshot_id} does not exist"),
+                )
+            }),
+        ConnectorReadSelector::TimestampMicros(timestamp) => {
+            let millis = timestamp.div_euclid(1_000);
+            metadata
+                .history()
+                .iter()
+                .filter(|entry| entry.timestamp_ms() <= millis)
+                .max_by_key(|entry| entry.timestamp_ms())
+                .map(|entry| Some(entry.snapshot_id))
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "no Iceberg snapshot exists at the requested timestamp",
+                    )
+                })
+        }
+    }
+}
+
+fn is_metadata_column(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number"
+    )
+}
+
+fn resolve_table_request(
+    requested: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<(String, Option<MetadataTableType>), ConnectorError> {
+    let alias = requested.rsplit_once('$').and_then(|(table, suffix)| {
+        parse_metadata_table_type(suffix).map(|metadata_type| (table.to_string(), metadata_type))
+    });
+    match (resolution, alias) {
+        (ConnectorTableResolution::StrictBaseTable, Some(_)) => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "strict Iceberg table resolution does not accept metadata aliases",
+        )),
+        (ConnectorTableResolution::StrictBaseTable, None) => Ok((requested.to_string(), None)),
+        (ConnectorTableResolution::ProviderReadAlias, Some(alias)) => Ok((alias.0, Some(alias.1))),
+        (ConnectorTableResolution::ProviderReadAlias, None) => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg provider read alias must use `<table>$<metadata-type>`",
+        )),
+    }
+}
+
+fn parse_metadata_table_type(value: &str) -> Option<MetadataTableType> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "FILES" => Some(MetadataTableType::Files),
+        "MANIFESTS" => Some(MetadataTableType::Manifests),
+        "LOGICAL_ICEBERG_METADATA" | "ENTRIES" => Some(MetadataTableType::LogicalIcebergMetadata),
+        "SNAPSHOTS" => Some(MetadataTableType::Snapshots),
+        "HISTORY" => Some(MetadataTableType::History),
+        "REFS" => Some(MetadataTableType::Refs),
+        "PARTITIONS" => Some(MetadataTableType::Partitions),
+        _ => None,
+    }
+}
+
+fn negotiate_static_predicates(
+    table: &IcebergTablePayload,
+    predicates: &[ConnectorStaticPredicate],
+) -> (
+    Vec<IcebergPhysicalPredicate>,
+    Vec<ConnectorPredicateDisposition>,
+) {
+    let table_info = table
+        .metadata_table_type
+        .is_none()
+        .then_some(table.table_info.as_ref())
+        .flatten();
+    let mut physical_predicates = Vec::new();
+    let mut dispositions = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        let physical = table_info.and_then(|table_info| {
+            let field = table_info
+                .schema
+                .fields
+                .get(predicate.column.field_ordinal as usize)?;
+            static_predicate_to_physical(predicate, field.field_id, &field.name)
+        });
+        let kind = if let Some(predicate) = physical {
+            physical_predicates.push(predicate);
+            ConnectorPredicateDispositionKind::PruningOnly
+        } else {
+            ConnectorPredicateDispositionKind::Unsupported
+        };
+        dispositions.push(ConnectorPredicateDisposition {
+            predicate_id: predicate.id,
+            kind,
+        });
+    }
+    (physical_predicates, dispositions)
+}
+
+fn static_predicate_to_physical(
+    predicate: &ConnectorStaticPredicate,
+    field_id: i32,
+    column: &str,
+) -> Option<IcebergPhysicalPredicate> {
+    use ConnectorScalarType::{Boolean, Date32, Int32, Int64};
+
+    let value = |literal: &ConnectorScalarValue| match literal {
+        ConnectorScalarValue::Boolean(value) if predicate.column.data_type == Boolean => {
+            Some(IcebergPhysicalPredicateValue::Boolean(*value))
+        }
+        ConnectorScalarValue::Int32(value) if predicate.column.data_type == Int32 => {
+            Some(IcebergPhysicalPredicateValue::Int32(*value))
+        }
+        ConnectorScalarValue::Int64(value) if predicate.column.data_type == Int64 => {
+            Some(IcebergPhysicalPredicateValue::Int64(*value))
+        }
+        ConnectorScalarValue::Date32(value) if predicate.column.data_type == Date32 => {
+            Some(IcebergPhysicalPredicateValue::Date32(*value))
+        }
+        _ => None,
+    };
+    let domain = match &predicate.kind {
+        ConnectorStaticPredicateKind::Comparison { op, literal } => {
+            let op = match op {
+                ConnectorStaticComparisonOp::Eq => IcebergPhysicalPredicateOp::Eq,
+                ConnectorStaticComparisonOp::Lt => IcebergPhysicalPredicateOp::Lt,
+                ConnectorStaticComparisonOp::Le => IcebergPhysicalPredicateOp::Le,
+                ConnectorStaticComparisonOp::Gt => IcebergPhysicalPredicateOp::Gt,
+                ConnectorStaticComparisonOp::Ge => IcebergPhysicalPredicateOp::Ge,
+                ConnectorStaticComparisonOp::Ne => return None,
+                _ => return None,
+            };
+            IcebergPhysicalPredicateDomain::Range {
+                op,
+                value: value(literal)?,
+            }
+        }
+        ConnectorStaticPredicateKind::In { literals } => {
+            let values = literals.iter().map(value).collect::<Option<Vec<_>>>()?;
+            if values.is_empty() {
+                return None;
+            }
+            IcebergPhysicalPredicateDomain::DiscreteSet { values }
+        }
+        ConnectorStaticPredicateKind::IsNull | ConnectorStaticPredicateKind::IsNotNull => {
+            return None;
+        }
+        _ => return None,
+    };
+    Some(IcebergPhysicalPredicate {
+        field_id,
+        column: column.to_string(),
+        domain,
+    })
+}
+
+fn read_reference_facts(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
+    ConnectorReadReferenceFacts::try_new(
+        metadata
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .collect(),
+        metadata
+            .history()
+            .iter()
+            .map(|entry| ConnectorReadSnapshotLogEntry {
+                snapshot_id: entry.snapshot_id,
+                timestamp_millis: entry.timestamp_ms(),
+            })
+            .collect(),
+        metadata
+            .refs()
+            .iter()
+            .map(|(name, reference)| ConnectorReadNamedReference {
+                name: Arc::from(name.as_str()),
+                kind: if reference.is_branch() {
+                    ConnectorReadReferenceKind::Branch
+                } else {
+                    ConnectorReadReferenceKind::Tag
+                },
+                snapshot_id: reference.snapshot_id,
+            })
+            .collect(),
+        metadata.current_snapshot_id(),
+        context,
+    )
+}
+
+fn logical_type_columns(properties: &HashMap<String, String>) -> BTreeMap<String, String> {
+    properties
+        .iter()
+        .filter_map(|(key, value)| {
+            let column = key.strip_prefix(LOGICAL_TYPE_PROPERTY_PREFIX)?;
+            matches!(value.to_ascii_lowercase().as_str(), "bitmap" | "hll")
+                .then(|| (column.to_ascii_lowercase(), value.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+fn hidden_internal_columns(properties: &HashMap<String, String>) -> Vec<String> {
+    let mut hidden = Vec::new();
+    for value in properties
+        .get(APPLY_KEY_COLUMN_PROPERTY)
+        .into_iter()
+        .chain(properties.get(HIDDEN_COLUMNS_PROPERTY))
+    {
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !hidden
+                .iter()
+                .any(|current: &String| current.eq_ignore_ascii_case(name))
+            {
+                hidden.push(name.to_string());
+            }
+        }
+    }
+    hidden
+}
+
+fn annotate_hidden_fields(schema: SchemaRef, hidden: &[String]) -> SchemaRef {
+    if hidden.is_empty() {
+        return schema;
+    }
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if !hidden
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(field.name()))
+            {
+                return field.clone();
+            }
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
+                "true".to_string(),
+            );
+            Arc::new(field.as_ref().clone().with_metadata(metadata))
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn metadata_column_names(metadata: &crate::iceberg::spec::TableMetadata) -> Vec<String> {
+    let mut columns = vec!["_file".to_string(), "_pos".to_string()];
+    if row_lineage_enabled(metadata) {
+        columns.push("_row_id".to_string());
+        columns.push("_last_updated_sequence_number".to_string());
+    }
+    columns
+}
+
+fn encode_payload(
+    payload: &impl Serialize,
+    subject: &str,
+    max_payload_bytes: usize,
+) -> Result<Bytes, ConnectorError> {
+    let payload = serde_json::to_vec(payload).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            format!("serialize Iceberg {subject}: {error}"),
+        )
+    })?;
+    if payload.len() > max_payload_bytes {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!("Iceberg {subject} exceeds the request payload budget"),
+        ));
+    }
+    Ok(Bytes::from(payload))
+}
+
+fn decode_payload<T: for<'de> Deserialize<'de>>(
+    payload: &[u8],
+    subject: &str,
+) -> Result<T, ConnectorError> {
+    serde_json::from_slice(payload).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode Iceberg {subject}: {error}"),
+        )
+    })
+}
+
+fn corrupt(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::CorruptData, message.into())
+}
+
+fn unavailable(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
+        .with_retryable_before_progress()
+}

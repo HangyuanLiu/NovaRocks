@@ -84,7 +84,7 @@ async fn standalone_commit_round_trip_preserves_column_bounds() {
     assert_eq!(wf.upper_bounds.get(&1), Some(&Datum::int(1000)));
 
     let collector = crate::connector::iceberg::commit::IcebergCommitCollector::new(
-        crate::connector::iceberg::commit::CommitOpKind::FastAppend,
+        novarocks_connector_iceberg::commit::CommitOpKind::FastAppend,
         novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
         None,
         0,

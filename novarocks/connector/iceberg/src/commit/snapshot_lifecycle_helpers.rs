@@ -18,6 +18,11 @@
 //! Shared helpers for snapshot-lifecycle maintenance commands
 //! (EXPIRE SNAPSHOTS / REMOVE ORPHAN FILES / REWRITE MANIFESTS).
 
+#[path = "snapshot_lifecycle_helpers/expire_snapshots.rs"]
+pub mod expire_snapshots;
+#[path = "snapshot_lifecycle_helpers/rewrite_manifests.rs"]
+pub mod rewrite_manifests;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::iceberg::io::FileIO;

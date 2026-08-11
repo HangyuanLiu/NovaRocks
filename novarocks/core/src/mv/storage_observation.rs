@@ -17,32 +17,40 @@
 
 //! Consumer-owned observation boundary for MV storage facts.
 //!
-//! This is intentionally a Core-internal port.  Consumers retain an exact
+//! This is an application-owned public port. Consumers retain an exact
 //! connector planning lease while an adapter reads provider-specific storage,
 //! then receive only validated neutral values.  It is not a Connector SPI
 //! capability and must not expose concrete table handles or catalog entries.
 
 use std::collections::HashSet;
 
+use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorTableResolution, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use crate::mv::persistence::{descriptor::MvDescriptorV1, schema::MvPartitionContract};
 
+const MAX_MV_SCHEMA_VALIDATION_FIELDS: usize = 4_096;
+const MAX_MV_SCHEMA_VALIDATION_PARTITION_FIELDS: usize = 4_096;
+const MV_SCHEMA_VALIDATION_FIELD_BYTES: usize = 32;
+const MV_SCHEMA_VALIDATION_PARTITION_FIELD_BYTES: usize = 48;
+
 /// Exact target-schema facts observed immediately after CREATE/bootstrap.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvTargetCreationObservation {
-    pub(crate) table: ConnectorTableIdentity,
-    pub(crate) table_uuid: String,
-    pub(crate) schema_id: i32,
-    pub(crate) fields: Vec<MvObservedTargetField>,
-    pub(crate) partition: MvPartitionContract,
+pub struct MvTargetCreationObservation {
+    pub table: ConnectorTableIdentity,
+    pub table_uuid: String,
+    pub schema_id: i32,
+    pub fields: Vec<MvObservedTargetField>,
+    pub partition: MvPartitionContract,
 }
 
 impl MvTargetCreationObservation {
-    pub(crate) fn try_new(
+    pub fn try_new(
         table: ConnectorTableIdentity,
         table_uuid: String,
         schema_id: i32,
@@ -85,25 +93,291 @@ impl MvTargetCreationObservation {
     }
 }
 
+/// Exact current-schema facts consumed by the Core MV contract validator.
+///
+/// The provider-specific Server adapter constructs this value while retaining
+/// the exact connector generation that loaded the source metadata. Core never
+/// interprets the opaque table handle or provider schema values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSchemaValidationObservation {
+    table_uuid: String,
+    schema_id: i32,
+    format_v3: bool,
+    stored_row_lineage_enabled: bool,
+    fields: Vec<MvObservedTargetField>,
+    partition: MvSchemaValidationPartitionContract,
+}
+
+impl MvSchemaValidationObservation {
+    pub fn try_new(
+        table_uuid: String,
+        schema_id: i32,
+        format_v3: bool,
+        stored_row_lineage_enabled: bool,
+        fields: Vec<MvObservedTargetField>,
+        partition: MvSchemaValidationPartitionContract,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        validate_request_context(context)?;
+        Self::try_new_with_payload_limit(
+            table_uuid,
+            schema_id,
+            format_v3,
+            stored_row_lineage_enabled,
+            fields,
+            partition,
+            context.max_total_payload_bytes(),
+        )
+    }
+
+    pub(crate) fn try_new_with_maximum_payload(
+        table_uuid: String,
+        schema_id: i32,
+        format_v3: bool,
+        stored_row_lineage_enabled: bool,
+        fields: Vec<MvObservedTargetField>,
+        partition: MvSchemaValidationPartitionContract,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_payload_limit(
+            table_uuid,
+            schema_id,
+            format_v3,
+            stored_row_lineage_enabled,
+            fields,
+            partition,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+    }
+
+    fn try_new_with_payload_limit(
+        table_uuid: String,
+        schema_id: i32,
+        format_v3: bool,
+        stored_row_lineage_enabled: bool,
+        fields: Vec<MvObservedTargetField>,
+        partition: MvSchemaValidationPartitionContract,
+        max_total_payload_bytes: usize,
+    ) -> Result<Self, ConnectorError> {
+        require_non_empty(&table_uuid, "MV schema validation table UUID")?;
+        if schema_id < 0 {
+            return corrupt("MV schema validation observation has a negative schema ID");
+        }
+        if fields.len() > MAX_MV_SCHEMA_VALIDATION_FIELDS {
+            return exhausted("MV schema validation observation exceeds the field limit");
+        }
+        if partition.fields().len() > MAX_MV_SCHEMA_VALIDATION_PARTITION_FIELDS {
+            return exhausted("MV schema validation observation exceeds the partition field limit");
+        }
+
+        let mut payload_bytes = 0;
+        reserve_schema_validation_payload(
+            &mut payload_bytes,
+            table_uuid.len(),
+            max_total_payload_bytes,
+        )?;
+        let mut field_ids = HashSet::with_capacity(fields.len());
+        let mut field_names = HashSet::with_capacity(fields.len());
+        for field in &fields {
+            require_non_empty(&field.name, "MV schema validation field name")?;
+            require_non_empty(
+                &field.type_signature,
+                "MV schema validation field type signature",
+            )?;
+            if !field_ids.insert(field.field_id) {
+                return corrupt(format!(
+                    "MV schema validation observation has duplicate field ID {}",
+                    field.field_id
+                ));
+            }
+            let normalized_name = field.name.to_ascii_lowercase();
+            if !field_names.insert(normalized_name) {
+                return corrupt(format!(
+                    "MV schema validation observation has duplicate field name `{}`",
+                    field.name
+                ));
+            }
+            reserve_schema_validation_payload(
+                &mut payload_bytes,
+                MV_SCHEMA_VALIDATION_FIELD_BYTES
+                    .saturating_add(field.name.len())
+                    .saturating_add(field.type_signature.len()),
+                max_total_payload_bytes,
+            )?;
+        }
+        validate_schema_validation_partition_contract(&partition, &fields)?;
+        for field in partition.fields() {
+            reserve_schema_validation_payload(
+                &mut payload_bytes,
+                MV_SCHEMA_VALIDATION_PARTITION_FIELD_BYTES
+                    .saturating_add(field.partition_field_name().len())
+                    .saturating_add(field.source_column_name().len()),
+                max_total_payload_bytes,
+            )?;
+        }
+
+        Ok(Self {
+            table_uuid,
+            schema_id,
+            format_v3,
+            stored_row_lineage_enabled,
+            fields,
+            partition,
+        })
+    }
+
+    pub fn table_uuid(&self) -> &str {
+        &self.table_uuid
+    }
+
+    pub const fn schema_id(&self) -> i32 {
+        self.schema_id
+    }
+
+    pub const fn is_format_v3(&self) -> bool {
+        self.format_v3
+    }
+
+    /// Whether the table explicitly enables stored row-lineage values.
+    pub const fn stored_row_lineage_enabled(&self) -> bool {
+        self.stored_row_lineage_enabled
+    }
+
+    pub fn fields(&self) -> &[MvObservedTargetField] {
+        &self.fields
+    }
+
+    pub const fn partition(&self) -> &MvSchemaValidationPartitionContract {
+        &self.partition
+    }
+}
+
 /// One field in an observed target schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvObservedTargetField {
-    pub(crate) field_id: i32,
-    pub(crate) name: String,
-    pub(crate) type_signature: String,
-    pub(crate) nullable: bool,
+pub struct MvObservedTargetField {
+    pub field_id: i32,
+    pub name: String,
+    pub type_signature: String,
+    pub nullable: bool,
+}
+
+impl MvObservedTargetField {
+    pub fn new(field_id: i32, name: String, type_signature: String, nullable: bool) -> Self {
+        Self {
+            field_id,
+            name,
+            type_signature,
+            nullable,
+        }
+    }
+
+    pub const fn field_id(&self) -> i32 {
+        self.field_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn type_signature(&self) -> &str {
+        &self.type_signature
+    }
+
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+/// Provider-neutral current default partition specification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSchemaValidationPartitionContract {
+    spec_id: i32,
+    fields: Vec<MvSchemaValidationPartitionField>,
+}
+
+impl MvSchemaValidationPartitionContract {
+    pub fn new(spec_id: i32, fields: Vec<MvSchemaValidationPartitionField>) -> Self {
+        Self { spec_id, fields }
+    }
+
+    pub const fn spec_id(&self) -> i32 {
+        self.spec_id
+    }
+
+    pub fn fields(&self) -> &[MvSchemaValidationPartitionField] {
+        &self.fields
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSchemaValidationPartitionField {
+    partition_field_id: i32,
+    partition_field_name: String,
+    source_target_field_id: i32,
+    source_column_name: String,
+    transform: MvSchemaValidationPartitionTransform,
+}
+
+impl MvSchemaValidationPartitionField {
+    pub fn new(
+        partition_field_id: i32,
+        partition_field_name: String,
+        source_target_field_id: i32,
+        source_column_name: String,
+        transform: MvSchemaValidationPartitionTransform,
+    ) -> Self {
+        Self {
+            partition_field_id,
+            partition_field_name,
+            source_target_field_id,
+            source_column_name,
+            transform,
+        }
+    }
+
+    pub const fn partition_field_id(&self) -> i32 {
+        self.partition_field_id
+    }
+
+    pub fn partition_field_name(&self) -> &str {
+        &self.partition_field_name
+    }
+
+    pub const fn source_target_field_id(&self) -> i32 {
+        self.source_target_field_id
+    }
+
+    pub fn source_column_name(&self) -> &str {
+        &self.source_column_name
+    }
+
+    pub const fn transform(&self) -> &MvSchemaValidationPartitionTransform {
+        &self.transform
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvSchemaValidationPartitionTransform {
+    Identity,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Bucket { num_buckets: u32 },
+    Truncate { width: u32 },
+    Void,
+    Unsupported(String),
 }
 
 /// A discovered MV lake package, including its current publication state.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvLakePackageObservation {
-    pub(crate) table: ConnectorTableIdentity,
-    pub(crate) descriptor: MvDescriptorV1,
-    pub(crate) publication: MvLakePublication,
+pub struct MvLakePackageObservation {
+    pub table: ConnectorTableIdentity,
+    pub descriptor: MvDescriptorV1,
+    pub publication: MvLakePublication,
 }
 
 impl MvLakePackageObservation {
-    pub(crate) fn try_new(
+    pub fn try_new(
         table: ConnectorTableIdentity,
         descriptor: MvDescriptorV1,
         publication: MvLakePublication,
@@ -123,28 +397,28 @@ impl MvLakePackageObservation {
 
 /// The only publication states meaningful to lake recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MvLakePublication {
+pub enum MvLakePublication {
     NeverPublished,
     Published(MvPublishedLakeFacts),
 }
 
 /// Persisted refresh facts observed together with the lake package.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvPublishedLakeFacts {
-    pub(crate) target_snapshot_id: i64,
-    pub(crate) refresh_id: i64,
-    pub(crate) mv_id: i64,
-    pub(crate) token: String,
-    pub(crate) technique: MvPublishedRefreshTechnique,
-    pub(crate) bases: Vec<MvPublishedBaseFact>,
-    pub(crate) definition_fingerprint: String,
-    pub(crate) rows: i64,
-    pub(crate) provenance_hash: String,
-    pub(crate) waterline_hash: String,
+pub struct MvPublishedLakeFacts {
+    pub target_snapshot_id: i64,
+    pub refresh_id: i64,
+    pub mv_id: i64,
+    pub token: String,
+    pub technique: MvPublishedRefreshTechnique,
+    pub bases: Vec<MvPublishedBaseFact>,
+    pub definition_fingerprint: String,
+    pub rows: i64,
+    pub provenance_hash: String,
+    pub waterline_hash: String,
 }
 
 impl MvPublishedLakeFacts {
-    pub(crate) fn try_new(
+    pub fn try_new(
         target_snapshot_id: i64,
         refresh_id: i64,
         mv_id: i64,
@@ -219,16 +493,16 @@ impl MvPublishedLakeFacts {
 
 /// One base-table identity and refresh watermark from MV provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvPublishedBaseFact {
-    pub(crate) table_fqn: String,
-    pub(crate) table_uuid: String,
-    pub(crate) from_snapshot: Option<i64>,
-    pub(crate) to_snapshot: i64,
+pub struct MvPublishedBaseFact {
+    pub table_fqn: String,
+    pub table_uuid: String,
+    pub from_snapshot: Option<i64>,
+    pub to_snapshot: i64,
 }
 
 /// The published refresh technique, detached from provider provenance types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvPublishedRefreshTechnique {
+pub enum MvPublishedRefreshTechnique {
     Incremental,
     Full,
     MetadataOnly,
@@ -240,7 +514,7 @@ pub(crate) enum MvPublishedRefreshTechnique {
 /// gives the inspector that sealed metadata value.  The port deliberately has
 /// no catalog entry, table handle downcast, or "current generation" lookup:
 /// only the provider implementation may interpret its opaque table handle.
-pub(crate) trait MvStorageObservation: Send + Sync {
+pub trait MvStorageObservationPort: Send + Sync {
     fn observe_created_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
@@ -248,10 +522,12 @@ pub(crate) trait MvStorageObservation: Send + Sync {
         context: ConnectorRequestContext,
     ) -> Result<MvTargetCreationObservation, ConnectorError>;
 
-    fn discover_lake_packages(
+    fn observe_schema_validation(
         &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<Vec<MvLakePackageObservation>, ConnectorError>;
+    ) -> Result<MvSchemaValidationObservation, ConnectorError>;
 
     fn observe_lake_package(
         &self,
@@ -259,6 +535,190 @@ pub(crate) trait MvStorageObservation: Send + Sync {
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<Option<MvLakePackageObservation>, ConnectorError>;
+}
+
+/// Fail-closed default used until the Server composition root installs the
+/// provider-specific storage inspector adapter.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnavailableMvStorageObservationPort;
+
+impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
+    fn observe_created_target(
+        &self,
+        _exact_lease: &ConnectorControlPlanningLease,
+        _metadata: &ConnectorTableMetadata,
+        _context: ConnectorRequestContext,
+    ) -> Result<MvTargetCreationObservation, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "MV storage observation port is not installed",
+        ))
+    }
+
+    fn observe_schema_validation(
+        &self,
+        _exact_lease: &ConnectorControlPlanningLease,
+        _metadata: &ConnectorTableMetadata,
+        _context: ConnectorRequestContext,
+    ) -> Result<MvSchemaValidationObservation, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "MV schema validation observation port is not installed",
+        ))
+    }
+
+    fn observe_lake_package(
+        &self,
+        _exact_lease: &ConnectorControlPlanningLease,
+        _metadata: &ConnectorTableMetadata,
+        _context: ConnectorRequestContext,
+    ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "MV storage observation port is not installed",
+        ))
+    }
+}
+
+/// Enumerate MV lake packages through durable attachment identities.
+///
+/// The application supplies the attachment-derived instance IDs. This helper
+/// retains one exact generation while enumerating and loading every table,
+/// then passes only the lease-loaded metadata to the injected observation
+/// port. It never interprets an opaque provider handle.
+pub fn discover_mv_lake_packages(
+    controls: &dyn ConnectorControlResolver,
+    instance_ids: impl IntoIterator<Item = ConnectorInstanceId>,
+    observer: &dyn MvStorageObservationPort,
+    context: ConnectorRequestContext,
+) -> Result<Vec<MvLakePackageObservation>, ConnectorError> {
+    validate_request_context(&context)?;
+    let mut instance_ids = instance_ids.into_iter().collect::<Vec<_>>();
+    instance_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    instance_ids.dedup();
+    let mut budget = 0_usize;
+    let mut packages = Vec::new();
+
+    for instance_id in instance_ids {
+        validate_request_context(&context)?;
+        reserve_payload(&context, &mut budget, instance_id.as_str())?;
+        let exact_lease = controls.acquire_current(&instance_id)?;
+        if exact_lease.binding().descriptor().instance_id != instance_id {
+            return corrupt("connector lease does not match MV discovery attachment identity");
+        }
+        let metadata = exact_lease.binding().metadata();
+        let mut namespaces = metadata.list_namespaces(ConnectorListNamespacesRequest {
+            instance_id: instance_id.clone(),
+            context: context.clone(),
+        })?;
+        namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        namespaces.dedup_by(|left, right| left.namespace == right.namespace);
+
+        for namespace in namespaces {
+            if namespace.instance_id != instance_id || namespace.namespace.trim().is_empty() {
+                return corrupt("connector returned an invalid namespace during MV discovery");
+            }
+            if let Err(error) = normalize_identifier(namespace.namespace.as_ref()) {
+                tracing::warn!(
+                    instance = %instance_id.as_str(),
+                    namespace = %namespace.namespace,
+                    error,
+                    "skip connector namespace outside the Native identifier contract during MV lake discovery"
+                );
+                continue;
+            }
+            reserve_payload(&context, &mut budget, namespace.namespace.as_ref())?;
+            let mut tables = metadata.list_tables(ConnectorListTablesRequest {
+                namespace: namespace.clone(),
+                context: context.clone(),
+            })?;
+            tables.sort_by(|left, right| left.table.cmp(&right.table));
+            tables.dedup_by(|left, right| left.table == right.table);
+
+            for table in tables {
+                validate_request_context(&context)?;
+                if table.instance_id != instance_id
+                    || table.namespace != namespace.namespace
+                    || table.table.trim().is_empty()
+                {
+                    return corrupt("connector returned an invalid table during MV discovery");
+                }
+                reserve_payload(&context, &mut budget, table.table.as_ref())?;
+                let loaded = match metadata.load_table(ConnectorTableRequest {
+                    table: table.clone(),
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: context.clone(),
+                }) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        tracing::warn!(
+                            instance = %instance_id.as_str(),
+                            namespace = %table.namespace,
+                            table = %table.table,
+                            error = %error,
+                            "skip unreadable connector table during MV lake discovery"
+                        );
+                        continue;
+                    }
+                };
+                if loaded.identity != table {
+                    return corrupt(
+                        "connector loaded metadata for a different table during MV discovery",
+                    );
+                }
+                if let Some(package) =
+                    observer.observe_lake_package(&exact_lease, &loaded, context.clone())?
+                {
+                    packages.push(package);
+                }
+            }
+        }
+    }
+    packages.sort_by(|left, right| {
+        left.table
+            .instance_id
+            .as_str()
+            .cmp(right.table.instance_id.as_str())
+            .then(left.table.namespace.cmp(&right.table.namespace))
+            .then(left.table.table.cmp(&right.table.table))
+    });
+    Ok(packages)
+}
+
+fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
+    if context.cancellation().is_cancelled() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "MV storage observation request was cancelled",
+        ));
+    }
+    if std::time::Instant::now() >= context.deadline() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "MV storage observation request deadline elapsed",
+        ));
+    }
+    Ok(())
+}
+
+fn reserve_payload(
+    context: &ConnectorRequestContext,
+    used: &mut usize,
+    value: &str,
+) -> Result<(), ConnectorError> {
+    *used = used.checked_add(value.len()).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "MV lake discovery payload accounting overflowed",
+        )
+    })?;
+    if *used > context.max_total_payload_bytes() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "MV lake discovery names exceed the connector request payload budget",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_table_identity(
@@ -333,11 +793,95 @@ fn validate_partition_contract(
     Ok(())
 }
 
+fn validate_schema_validation_partition_contract(
+    partition: &MvSchemaValidationPartitionContract,
+    fields: &[MvObservedTargetField],
+) -> Result<(), ConnectorError> {
+    if partition.spec_id() < 0 {
+        return corrupt("MV schema validation partition contract has a negative spec ID");
+    }
+    let field_ids = fields
+        .iter()
+        .map(MvObservedTargetField::field_id)
+        .collect::<HashSet<_>>();
+    let mut partition_ids = HashSet::with_capacity(partition.fields().len());
+    let mut partition_names = HashSet::with_capacity(partition.fields().len());
+    for field in partition.fields() {
+        require_non_empty(
+            field.partition_field_name(),
+            "MV schema validation partition field name",
+        )?;
+        require_non_empty(
+            field.source_column_name(),
+            "MV schema validation partition source column name",
+        )?;
+        if !partition_ids.insert(field.partition_field_id()) {
+            return corrupt(format!(
+                "MV schema validation partition contract has duplicate field ID {}",
+                field.partition_field_id()
+            ));
+        }
+        if !partition_names.insert(field.partition_field_name().to_ascii_lowercase()) {
+            return corrupt(format!(
+                "MV schema validation partition contract has duplicate field name `{}`",
+                field.partition_field_name()
+            ));
+        }
+        if !field_ids.contains(&field.source_target_field_id()) {
+            return corrupt(format!(
+                "MV schema validation partition contract references missing target field ID {}",
+                field.source_target_field_id()
+            ));
+        }
+        match field.transform() {
+            MvSchemaValidationPartitionTransform::Bucket { num_buckets: 0 } => {
+                return corrupt(
+                    "MV schema validation partition contract contains a zero bucket count",
+                );
+            }
+            MvSchemaValidationPartitionTransform::Truncate { width: 0 } => {
+                return corrupt(
+                    "MV schema validation partition contract contains a zero truncate width",
+                );
+            }
+            MvSchemaValidationPartitionTransform::Unsupported(name) => {
+                require_non_empty(name, "MV schema validation unsupported partition transform")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn require_non_empty(value: &str, subject: &str) -> Result<(), ConnectorError> {
     if value.trim().is_empty() {
         return corrupt(format!("{subject} is empty"));
     }
     Ok(())
+}
+
+fn reserve_schema_validation_payload(
+    used: &mut usize,
+    additional: usize,
+    max_total_payload_bytes: usize,
+) -> Result<(), ConnectorError> {
+    *used = used.checked_add(additional).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "MV schema validation payload accounting overflowed",
+        )
+    })?;
+    if *used > max_total_payload_bytes {
+        return exhausted("MV schema validation observation exceeds the payload limit");
+    }
+    Ok(())
+}
+
+fn exhausted<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
+    Err(ConnectorError::new(
+        ConnectorErrorKind::ResourceExhausted,
+        message,
+    ))
 }
 
 fn corrupt<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
@@ -350,12 +894,16 @@ fn corrupt<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableIdentity};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+    };
 
     use super::{
         MvLakePackageObservation, MvLakePublication, MvObservedTargetField, MvPublishedBaseFact,
-        MvPublishedLakeFacts, MvPublishedRefreshTechnique, MvTargetCreationObservation,
+        MvPublishedLakeFacts, MvPublishedRefreshTechnique, MvSchemaValidationObservation,
+        MvTargetCreationObservation,
     };
     use crate::mv::persistence::{
         descriptor::MvDescriptorV1,
@@ -392,6 +940,24 @@ mod tests {
             type_signature: "int".to_string(),
             nullable: false,
         }]
+    }
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context(total_payload_bytes: usize) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(60),
+            Arc::new(NeverCancelled),
+            1,
+            total_payload_bytes,
+        )
+        .unwrap()
     }
 
     fn published_facts() -> MvPublishedLakeFacts {
@@ -459,6 +1025,62 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn schema_validation_observation_is_bounded_and_exposes_only_neutral_facts() {
+        let observed = MvSchemaValidationObservation::try_new(
+            "target-uuid".to_string(),
+            7,
+            true,
+            true,
+            target_fields(),
+            super::MvSchemaValidationPartitionContract::new(0, vec![]),
+            &context(1_024),
+        )
+        .unwrap();
+        assert_eq!(observed.table_uuid(), "target-uuid");
+        assert_eq!(observed.schema_id(), 7);
+        assert!(observed.is_format_v3());
+        assert!(observed.stored_row_lineage_enabled());
+        assert_eq!(observed.fields()[0].field_id(), 1);
+        assert_eq!(observed.fields()[0].name(), "c1");
+        assert_eq!(observed.fields()[0].type_signature(), "int");
+        assert!(!observed.fields()[0].nullable());
+        assert_eq!(observed.partition().spec_id(), 0);
+
+        let payload_error = MvSchemaValidationObservation::try_new(
+            "target-uuid".to_string(),
+            7,
+            true,
+            true,
+            target_fields(),
+            super::MvSchemaValidationPartitionContract::new(0, vec![]),
+            &context(1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            payload_error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+        );
+
+        let duplicate_name_error = MvSchemaValidationObservation::try_new(
+            "target-uuid".to_string(),
+            7,
+            true,
+            true,
+            vec![
+                MvObservedTargetField::new(1, "c1".to_string(), "int".to_string(), false),
+                MvObservedTargetField::new(2, "C1".to_string(), "long".to_string(), false),
+            ],
+            super::MvSchemaValidationPartitionContract::new(0, vec![]),
+            &context(1_024),
+        )
+        .unwrap_err();
+        assert_eq!(
+            duplicate_name_error.kind(),
             novarocks_spi::connector::ConnectorErrorKind::CorruptData
         );
     }

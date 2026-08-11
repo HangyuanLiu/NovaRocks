@@ -53,8 +53,8 @@ use super::write_service::{
     IcebergWriteReportCommitter, IcebergWriteServiceRegistry,
 };
 use crate::common::types::UniqueId;
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
+use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_connector_iceberg::manifest::DataFileWithStats;
 use novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info;
 use novarocks_connector_iceberg::row_lineage_synth::{

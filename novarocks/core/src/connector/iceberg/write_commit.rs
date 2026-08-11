@@ -22,9 +22,9 @@ use super::commit::{
     CleanupAttempt, CleanupPathMapper, CommitServiceError, CowUpdateRewriteSet,
     IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
-use crate::connector::iceberg::commit::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::AbortLog;
 use novarocks_connector_iceberg::commit::report::IcebergWriterReport;
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::write_codec::decode_write_receipt;
 
 /// Convert a sealed provider commit decision into the application-neutral

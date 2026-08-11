@@ -61,7 +61,7 @@ use super::helpers::{
 use super::overwrite::{
     enumerate_live_all_files, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
 };
-use crate::connector::iceberg::commit::types::CommitOutcome;
+use novarocks_connector_iceberg::commit::CommitOutcome;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct TruncateCommit;
@@ -419,7 +419,7 @@ mod tests {
         empty_v3_iceberg_table, run_commit_with, run_commit_with_properties,
         v3_table_with_n_data_files,
     };
-    use crate::connector::iceberg::commit::types::CommitOpKind;
+    use novarocks_connector_iceberg::commit::CommitOpKind;
     use novarocks_connector_iceberg::iceberg::spec::{
         DataFileBuilder, DataFileFormat, Operation, Struct,
     };

@@ -33,7 +33,7 @@ use novarocks_connector_iceberg::iceberg::table::Table;
 use uuid::Uuid;
 
 use super::collector::IcebergCommitCollector;
-use crate::connector::iceberg::commit::types::CommitOutcome;
+use novarocks_connector_iceberg::commit::CommitOutcome;
 use novarocks_connector_iceberg::commit::abort::AbortLog;
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_V1_PROP, MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1,

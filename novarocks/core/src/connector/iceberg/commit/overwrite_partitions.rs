@@ -58,9 +58,9 @@ use super::helpers::{
 use super::overwrite::{
     write_added_data_manifest, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
 };
-use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::partition_spec::{PartitionMatch, partition_match_in_touched};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 pub struct OverwritePartitionsCommit;

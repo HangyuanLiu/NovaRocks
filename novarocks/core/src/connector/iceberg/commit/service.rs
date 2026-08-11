@@ -15,477 +15,63 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Core application mapping for provider-owned Iceberg commit outcomes.
+
+pub use novarocks_connector_iceberg::commit::service::{
+    CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome, RecoveryEvidence,
+    classify_commit_error,
+};
+
 use super::collector::IcebergCommitCollector;
-use crate::connector::iceberg::commit::types::{CommitOpKind, CommitOutcome};
-use novarocks_connector_iceberg::commit::abort::CleanupError;
+use novarocks_connector_iceberg::commit::service::CommitRecoverySource;
 
-pub type CommitServiceOutcome = CommitOutcome;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommitFailureKind {
-    KnownUncommitted,
-    FinalizeFailedKnownCommitted,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CleanupAttempt {
-    pub attempted: bool,
-    pub error_count: usize,
-    pub error_paths: Vec<String>,
-}
-
-impl CleanupAttempt {
-    pub fn not_attempted() -> Self {
-        Self {
-            attempted: false,
-            error_count: 0,
-            error_paths: Vec::new(),
-        }
+impl CommitRecoverySource for IcebergCommitCollector {
+    fn recovery_table_ident(&self) -> String {
+        self.table_ident.to_string()
     }
 
-    pub fn completed(error_paths: Vec<String>) -> Self {
-        Self {
-            attempted: true,
-            error_count: error_paths.len(),
-            error_paths,
-        }
+    fn recovery_op_kind(&self) -> novarocks_connector_iceberg::commit::CommitOpKind {
+        self.op_kind
     }
 
-    pub fn from_cleanup_errors(errors: &[CleanupError]) -> Self {
-        Self::completed(errors.iter().map(|err| err.path.clone()).collect())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveryEvidence {
-    pub table_ident: String,
-    pub op_kind: CommitOpKind,
-    pub base_snapshot_id: Option<i64>,
-    pub base_sequence_number: i64,
-    pub staging_dir: String,
-}
-
-impl RecoveryEvidence {
-    pub fn from_collector(collector: &IcebergCommitCollector) -> Self {
-        Self {
-            table_ident: collector.table_ident.to_string(),
-            op_kind: collector.op_kind,
-            base_snapshot_id: collector.base_snapshot_id,
-            base_sequence_number: collector.base_sequence_number,
-            staging_dir: collector.staging_dir.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CommitServiceError {
-    KnownUncommitted {
-        message: String,
-        cleanup: CleanupAttempt,
-    },
-    Unknown {
-        message: String,
-        evidence: RecoveryEvidence,
-    },
-    InvalidInput {
-        message: String,
-    },
-    FinalizeFailedKnownCommitted {
-        outcome: Option<CommitOutcome>,
-        finalize_error: String,
-        evidence: RecoveryEvidence,
-    },
-}
-
-impl CommitServiceError {
-    pub fn known_uncommitted(message: String, cleanup: CleanupAttempt) -> Self {
-        Self::KnownUncommitted { message, cleanup }
+    fn recovery_base_snapshot_id(&self) -> Option<i64> {
+        self.base_snapshot_id
     }
 
-    pub fn unknown(message: String, evidence: RecoveryEvidence) -> Self {
-        Self::Unknown { message, evidence }
+    fn recovery_base_sequence_number(&self) -> i64 {
+        self.base_sequence_number
     }
 
-    pub fn invalid_input(message: String) -> Self {
-        Self::InvalidInput { message }
-    }
-
-    pub fn finalize_failed_known_committed(
-        outcome: Option<CommitOutcome>,
-        finalize_error: String,
-        evidence: RecoveryEvidence,
-    ) -> Self {
-        Self::FinalizeFailedKnownCommitted {
-            outcome,
-            finalize_error,
-            evidence,
-        }
-    }
-
-    pub fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown { .. })
-    }
-
-    pub fn is_finalize_failed_known_committed(&self) -> bool {
-        matches!(self, Self::FinalizeFailedKnownCommitted { .. })
-    }
-
-    pub fn message(&self) -> &str {
-        match self {
-            Self::KnownUncommitted { message, .. }
-            | Self::Unknown { message, .. }
-            | Self::InvalidInput { message } => message,
-            Self::FinalizeFailedKnownCommitted { finalize_error, .. } => finalize_error,
-        }
-    }
-
-    pub fn engine_error_code(&self) -> crate::common::engine_error::EngineErrorCode {
-        match self {
-            Self::KnownUncommitted { .. } | Self::InvalidInput { .. } => {
-                crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted
-            }
-            Self::Unknown { .. } => crate::common::engine_error::EngineErrorCode::CommitUnknown,
-            Self::FinalizeFailedKnownCommitted { .. } => {
-                crate::common::engine_error::EngineErrorCode::CommitKnownCommittedFinalizeFailed
-            }
-        }
-    }
-
-    pub fn into_legacy_string(self) -> String {
-        match self {
-            Self::KnownUncommitted { message, cleanup } => {
-                if cleanup.attempted {
-                    format!(
-                        "iceberg commit failed: {message}; abort cleanup ran ({} error(s))",
-                        cleanup.error_count
-                    )
-                } else {
-                    message
-                }
-            }
-            Self::Unknown { message, evidence } => format!(
-                "iceberg commit unknown ({message}); staged files left at {} for manual review",
-                evidence.staging_dir
-            ),
-            Self::InvalidInput { message } => message,
-            Self::FinalizeFailedKnownCommitted {
-                outcome,
-                finalize_error,
-                evidence,
-            } => match outcome {
-                Some(outcome) => format!(
-                    "iceberg commit is known committed at snapshot {} but finalization failed: {finalize_error}; do not retry commit",
-                    outcome.new_snapshot_id
-                ),
-                None => format!(
-                    "iceberg commit is known committed but finalization failed before snapshot id was captured: {finalize_error}; manual recovery required for {}",
-                    evidence.table_ident
-                ),
-            },
-        }
+    fn recovery_staging_dir(&self) -> String {
+        self.staging_dir.clone()
     }
 }
 
 impl From<CommitServiceError> for crate::common::engine_error::EngineError {
     fn from(value: CommitServiceError) -> Self {
-        let code = value.engine_error_code();
+        let kind = value.failure_kind();
         let message = value.into_legacy_string();
-        match code {
-            crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted => {
-                Self::commit_known_uncommitted(message)
-            }
-            crate::common::engine_error::EngineErrorCode::CommitUnknown => {
-                Self::commit_unknown(message)
-            }
-            crate::common::engine_error::EngineErrorCode::CommitKnownCommittedFinalizeFailed => {
+        match kind {
+            CommitFailureKind::KnownUncommitted => Self::commit_known_uncommitted(message),
+            CommitFailureKind::Unknown => Self::commit_unknown(message),
+            CommitFailureKind::FinalizeFailedKnownCommitted => {
                 Self::commit_known_committed_finalize_failed(message)
             }
-            _ => Self::internal_invariant(
-                crate::common::engine_error::InternalInvariantCode::UnexpectedReportStatusShape,
-                format!(
-                    "unexpected commit service engine error code: {}",
-                    code.as_str()
-                ),
-            ),
         }
-    }
-}
-
-pub fn classify_commit_error(err: &str) -> CommitFailureKind {
-    let lower = err.to_lowercase();
-    if (lower.contains("committed but")
-        && (lower.contains("not visible") || lower.contains("snapshot id")))
-        || (lower.contains("known committed") && lower.contains("finalization failed"))
-    {
-        return CommitFailureKind::FinalizeFailedKnownCommitted;
-    }
-
-    let definite_signals = [
-        "conflict",
-        "assertrefsnapshotid",
-        "ref_snapshot_id_match",
-        "schema id mismatch",
-        "schemaidmatch",
-        "spec id mismatch",
-        "specidmatch",
-        "data invalid",
-        "datainvalid",
-        "feature unsupported",
-        "featureunsupported",
-        "table not found",
-        "tablenotfound",
-        "table already exists",
-        "tablealreadyexists",
-        "namespace not found",
-        "namespacenotfound",
-        "namespace already exists",
-        "namespacealreadyexists",
-        "precondition failed",
-        "preconditionfailed",
-        "catalog commit conflict",
-        "catalogcommitconflict",
-        "expected data only",
-        "pipeline cancelled",
-        "pipeline failed",
-    ];
-    if definite_signals.iter().any(|s| lower.contains(s)) {
-        CommitFailureKind::KnownUncommitted
-    } else {
-        CommitFailureKind::Unknown
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PartitionSpec, Schema, Type};
-    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
-    use std::sync::Arc;
-
-    use crate::common::types::UniqueId;
-    use crate::connector::iceberg::commit::CommitOpKind;
-    use crate::connector::iceberg::commit::IcebergCommitCollector;
-
     use super::*;
 
-    fn test_collector() -> IcebergCommitCollector {
-        let schema = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long),
-            ))])
-            .build()
-            .expect("schema");
-        let partition_spec = PartitionSpec::builder(schema.clone())
-            .build()
-            .expect("partition spec");
-        IcebergCommitCollector::new(
-            CommitOpKind::FastAppend,
-            TableIdent::new(NamespaceIdent::new("db".to_string()), "tbl".to_string()),
-            Some(42),
-            7,
-            Arc::new(schema),
-            Arc::new(partition_spec),
-            "s3://bucket/db/tbl/data/_staging/abc".to_string(),
-            UniqueId::new(11, 22),
-        )
-    }
-
     #[test]
-    fn classify_commit_error_returns_known_uncommitted_for_definite_failures() {
+    fn provider_error_maps_to_core_application_error() {
+        let error = CommitServiceError::invalid_input("invalid commit".to_string());
+        let engine_error = crate::common::engine_error::EngineError::from(error);
         assert_eq!(
-            classify_commit_error(
-                "FastAppend commit failed: catalog commit conflict on assert-ref-snapshot-id"
-            ),
-            CommitFailureKind::KnownUncommitted
-        );
-        assert_eq!(
-            classify_commit_error("RowDelta commit failed: data invalid"),
-            CommitFailureKind::KnownUncommitted
-        );
-        assert_eq!(
-            classify_commit_error("pipeline cancelled mid-write"),
-            CommitFailureKind::KnownUncommitted
-        );
-    }
-
-    #[test]
-    fn classify_commit_error_returns_unknown_for_transport_like_failures() {
-        assert_eq!(
-            classify_commit_error("FastAppend commit failed: connection reset by peer"),
-            CommitFailureKind::Unknown
-        );
-        assert_eq!(
-            classify_commit_error("RowDelta commit failed: unexpected error"),
-            CommitFailureKind::Unknown
-        );
-    }
-
-    #[test]
-    fn classifier_marks_post_commit_visibility_as_known_committed_finalize_failure() {
-        assert_eq!(
-            classify_commit_error(
-                "FastAppend committed but target ref main is not visible after catalog commit"
-            ),
-            CommitFailureKind::FinalizeFailedKnownCommitted
-        );
-        assert_eq!(
-            classify_commit_error("RowDelta committed but snapshot id 123 was not captured"),
-            CommitFailureKind::FinalizeFailedKnownCommitted
-        );
-        assert_eq!(
-            classify_commit_error(
-                "iceberg write operation op-1: metadata commit succeeded (snapshot 99, known committed) but finalization failed; do not retry the write"
-            ),
-            CommitFailureKind::FinalizeFailedKnownCommitted
-        );
-    }
-
-    #[test]
-    fn unknown_error_carries_recovery_evidence_and_legacy_message() {
-        let collector = test_collector();
-        let evidence = RecoveryEvidence::from_collector(&collector);
-        let err =
-            CommitServiceError::unknown("connection reset by peer".to_string(), evidence.clone());
-        assert!(err.is_unknown());
-        assert_eq!(err.message(), "connection reset by peer");
-        assert_eq!(evidence.table_ident, "db.tbl");
-        assert_eq!(evidence.op_kind, CommitOpKind::FastAppend);
-        assert_eq!(evidence.base_snapshot_id, Some(42));
-        assert_eq!(evidence.base_sequence_number, 7);
-        assert_eq!(
-            err.clone().into_legacy_string(),
-            "iceberg commit unknown (connection reset by peer); staged files left at s3://bucket/db/tbl/data/_staging/abc for manual review"
-        );
-    }
-
-    #[test]
-    fn known_uncommitted_error_carries_cleanup_summary_and_legacy_message() {
-        let cleanup =
-            CleanupAttempt::completed(vec!["a.parquet".to_string(), "m.avro".to_string()]);
-        let err = CommitServiceError::known_uncommitted(
-            "catalog commit conflict".to_string(),
-            cleanup.clone(),
-        );
-        assert!(!err.is_unknown());
-        assert_eq!(err.message(), "catalog commit conflict");
-        assert_eq!(cleanup.error_count, 2);
-        assert_eq!(
-            err.into_legacy_string(),
-            "iceberg commit failed: catalog commit conflict; abort cleanup ran (2 error(s))"
-        );
-    }
-
-    #[test]
-    fn known_uncommitted_without_cleanup_preserves_legacy_raw_message() {
-        let err = CommitServiceError::known_uncommitted(
-            "CowUpdate commit requires a rewrite set".to_string(),
-            CleanupAttempt::not_attempted(),
-        );
-        assert_eq!(
-            err.into_legacy_string(),
-            "CowUpdate commit requires a rewrite set"
-        );
-    }
-
-    #[test]
-    fn invalid_input_maps_to_known_uncommitted_engine_error_without_cleanup() {
-        let err = CommitServiceError::invalid_input(
-            "CommitOpKind::RewriteManifests must be invoked directly".to_string(),
-        );
-        assert_eq!(
-            err.engine_error_code(),
+            engine_error.code(),
             crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted
-        );
-        assert_eq!(
-            err.clone().into_legacy_string(),
-            "CommitOpKind::RewriteManifests must be invoked directly"
-        );
-
-        let engine = crate::common::engine_error::EngineError::from(err);
-        assert_eq!(
-            engine.to_bracketed_user_message(),
-            "[CommitKnownUncommitted] CommitOpKind::RewriteManifests must be invoked directly"
-        );
-    }
-
-    #[test]
-    fn finalize_failed_known_committed_maps_to_distinct_engine_error() {
-        let outcome = CommitOutcome {
-            new_snapshot_id: 99,
-            written_manifest_paths: vec!["s3://warehouse/metadata/snap-99.avro".to_string()],
-        };
-        let err = CommitServiceError::finalize_failed_known_committed(
-            Some(outcome.clone()),
-            "target ref main is not visible after catalog commit".to_string(),
-            RecoveryEvidence {
-                table_ident: "ice.sales.orders".to_string(),
-                op_kind: CommitOpKind::FastAppend,
-                base_snapshot_id: Some(42),
-                base_sequence_number: 7,
-                staging_dir: "s3://warehouse/orders/_staging/attempt-1".to_string(),
-            },
-        );
-
-        assert!(err.is_finalize_failed_known_committed());
-        assert_eq!(
-            err.engine_error_code(),
-            crate::common::engine_error::EngineErrorCode::CommitKnownCommittedFinalizeFailed
-        );
-        assert_eq!(
-            err.message(),
-            "target ref main is not visible after catalog commit"
-        );
-        assert_eq!(
-            err.clone().into_legacy_string(),
-            "iceberg commit is known committed at snapshot 99 but finalization failed: target ref main is not visible after catalog commit; do not retry commit"
-        );
-
-        let engine = crate::common::engine_error::EngineError::from(err);
-        assert_eq!(
-            engine.to_bracketed_user_message(),
-            "[CommitKnownCommittedFinalizeFailed] iceberg commit is known committed at snapshot 99 but finalization failed: target ref main is not visible after catalog commit; do not retry commit"
-        );
-    }
-
-    #[test]
-    fn commit_service_error_converts_to_engine_error() {
-        let known = CommitServiceError::known_uncommitted(
-            "catalog commit conflict".to_string(),
-            CleanupAttempt::not_attempted(),
-        );
-        let known = crate::common::engine_error::EngineError::from(known);
-        assert_eq!(
-            known.code(),
-            crate::common::engine_error::EngineErrorCode::CommitKnownUncommitted
-        );
-        assert_eq!(
-            known.to_bracketed_user_message(),
-            "[CommitKnownUncommitted] catalog commit conflict"
-        );
-
-        let unknown = CommitServiceError::unknown(
-            "connection reset by peer".to_string(),
-            RecoveryEvidence {
-                table_ident: "db.t".to_string(),
-                op_kind: CommitOpKind::FastAppend,
-                base_snapshot_id: Some(10),
-                base_sequence_number: 7,
-                staging_dir: "s3://bucket/db/t/_staging/abc".to_string(),
-            },
-        );
-        let unknown = crate::common::engine_error::EngineError::from(unknown);
-        assert_eq!(
-            unknown.code(),
-            crate::common::engine_error::EngineErrorCode::CommitUnknown
-        );
-        assert!(
-            unknown
-                .to_bracketed_user_message()
-                .starts_with("[CommitUnknown] iceberg commit unknown"),
-            "got: {}",
-            unknown.to_bracketed_user_message()
         );
     }
 }

@@ -289,6 +289,9 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
                 config_path: frontend_config_path,
                 port_override: port,
                 connector_control_factories: Vec::new(),
+                mv_storage_observation: std::sync::Arc::new(
+                    composition::IcebergMvStorageObservationAdapter::default(),
+                ),
                 state_store_host_config,
             })
             .map_err(|error| anyhow::anyhow!("{error}"))

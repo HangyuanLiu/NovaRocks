@@ -57,8 +57,8 @@ use super::helpers::{
     read_snapshot_manifest_list, required_target_ref_snapshot_id, snapshot_summary,
     target_ref_snapshot_id, write_manifest_list,
 };
-use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
 
 pub struct RowDeltaCommit;
 

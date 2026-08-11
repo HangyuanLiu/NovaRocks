@@ -29,12 +29,16 @@
 use crate::sql::planner::vocabulary::ApplyKeySource;
 
 use super::model::{
-    BranchFieldValidationError, ContractDecision, CurrentIcebergTableView, JoinContractDecision,
-    JoinSchemaValidationError, SchemaEvolutionError,
+    BranchFieldValidationError, ContractDecision, JoinContractDecision, JoinSchemaValidationError,
+    SchemaEvolutionError,
 };
 use crate::mv::analysis::rebind::RebindColumn;
 use crate::mv::persistence::schema::{
     BaseContract, BranchIdColumnContract, MvPartitionTransformContract, MvSchemaContract,
+};
+use crate::mv::storage_observation::{
+    MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
+    MvSchemaValidationPartitionTransform,
 };
 use crate::sql::planner::vocabulary::{
     GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
@@ -42,24 +46,23 @@ use crate::sql::planner::vocabulary::{
 
 pub(crate) fn validate_schema_contract(
     contract: &MvSchemaContract,
-    current_base: &CurrentIcebergTableView<'_>,
-    current_target: &CurrentIcebergTableView<'_>,
+    current_base: &MvSchemaValidationObservation,
+    current_target: &MvSchemaValidationObservation,
 ) -> ContractDecision {
     // Stage 1: identity guard.
     if let Some(err) = validate_identity_guards(contract, current_base, current_target) {
         return ContractDecision::Incompatible(err);
     }
-    if let Some(err) = check_target_partition_spec(contract, current_target.default_partition_spec)
-    {
+    if let Some(err) = check_target_partition_spec(contract, current_target.partition()) {
         return ContractDecision::Incompatible(err);
     }
-    validate_schema_contract_after_identity(contract, current_base.schema, current_target.schema)
+    validate_observations_after_identity(contract, current_base, current_target)
 }
 
 pub(crate) fn validate_join_schema_contract(
     contract: &MvSchemaContract,
-    bases: &[(&str, CurrentIcebergTableView<'_>); 2],
-    current_target: &CurrentIcebergTableView<'_>,
+    bases: &[(&str, MvSchemaValidationObservation); 2],
+    current_target: &MvSchemaValidationObservation,
 ) -> Result<JoinContractDecision, JoinSchemaValidationError> {
     contract.ensure_self_consistent().map_err(|error| {
         JoinSchemaValidationError::SelfInconsistent {
@@ -71,16 +74,13 @@ pub(crate) fn validate_join_schema_contract(
             actual: contract.bases.len(),
         });
     }
-    if contract.target.table_uuid != current_target.table_uuid {
+    if contract.target.table_uuid != current_target.table_uuid() {
         return Err(JoinSchemaValidationError::TargetIdentityChanged);
     }
 
     let mut rebound_columns = Vec::new();
     for (base_fqn, current_base) in bases {
-        if current_base.format_version
-            != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-            || !current_base.row_lineage_enabled
-        {
+        if !current_base.is_format_v3() || !current_base.stored_row_lineage_enabled() {
             return Err(JoinSchemaValidationError::BaseRowLineageContractBroken {
                 base_fqn: (*base_fqn).to_string(),
             });
@@ -92,7 +92,7 @@ pub(crate) fn validate_join_schema_contract(
             .ok_or_else(|| JoinSchemaValidationError::MissingBaseContract {
                 base_fqn: (*base_fqn).to_string(),
             })?;
-        if base_contract.table_uuid != current_base.table_uuid {
+        if base_contract.table_uuid != current_base.table_uuid() {
             return Err(JoinSchemaValidationError::BaseIdentityChanged {
                 base_fqn: (*base_fqn).to_string(),
             });
@@ -100,7 +100,7 @@ pub(crate) fn validate_join_schema_contract(
         rebound_columns.extend(validate_join_base_schema_contract_for_rebind(
             base_fqn,
             base_contract,
-            current_base.schema,
+            current_base.fields(),
         )?);
     }
 
@@ -120,15 +120,13 @@ pub(crate) fn validate_join_schema_contract(
 fn validate_join_base_schema_contract_for_rebind(
     base_fqn: &str,
     base_contract: &BaseContract,
-    current_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    current_fields: &[MvObservedTargetField],
 ) -> Result<Vec<RebindColumn>, JoinSchemaValidationError> {
-    let current_schema = current_schema.as_struct();
     let mut rebound = Vec::new();
     for record in &base_contract.schema_at_create.fields {
-        let Some(field) = current_schema
-            .fields()
+        let Some(field) = current_fields
             .iter()
-            .find(|field| field.id == record.field_id)
+            .find(|field| field.field_id() == record.field_id)
         else {
             return Err(JoinSchemaValidationError::BaseFieldDropped {
                 base_fqn: base_fqn.to_string(),
@@ -136,7 +134,7 @@ fn validate_join_base_schema_contract_for_rebind(
                 name_at_create: record.name_at_create.clone(),
             });
         };
-        let current_type = field.field_type.to_string();
+        let current_type = field.type_signature().to_string();
         if current_type != record.type_signature {
             return Err(JoinSchemaValidationError::BaseFieldTypeChanged {
                 base_fqn: base_fqn.to_string(),
@@ -146,21 +144,22 @@ fn validate_join_base_schema_contract_for_rebind(
                 to: current_type,
             });
         }
-        if field.required != record.required {
+        let current_required = !field.nullable();
+        if current_required != record.required {
             return Err(JoinSchemaValidationError::BaseFieldNullabilityChanged {
                 base_fqn: base_fqn.to_string(),
                 field_id: record.field_id,
                 name_at_create: record.name_at_create.clone(),
                 from_required: record.required,
-                to_required: field.required,
+                to_required: current_required,
             });
         }
-        if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
+        if !field.name().eq_ignore_ascii_case(&record.name_at_create) {
             rebound.push(RebindColumn {
                 base_table_fqn: base_fqn.to_string(),
                 field_id: record.field_id,
                 name_at_create: record.name_at_create.clone(),
-                current_name: field.name.clone(),
+                current_name: field.name().to_string(),
             });
         }
     }
@@ -169,61 +168,59 @@ fn validate_join_base_schema_contract_for_rebind(
 
 pub(crate) fn validate_branch_id_field(
     contract: &BranchIdColumnContract,
-    target_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    target: &MvSchemaValidationObservation,
 ) -> Result<(), BranchFieldValidationError> {
-    let Some(field) = target_schema
-        .as_struct()
+    let Some(field) = target
         .fields()
         .iter()
-        .find(|field| field.id == contract.target_field_id)
+        .find(|field| field.field_id() == contract.target_field_id)
     else {
         return Err(BranchFieldValidationError::Missing {
             field_id: contract.target_field_id,
         });
     };
-    if !field.name.eq_ignore_ascii_case(&contract.column_name) {
+    if !field.name().eq_ignore_ascii_case(&contract.column_name) {
         return Err(BranchFieldValidationError::Renamed {
             expected: contract.column_name.clone(),
-            actual: field.name.clone(),
+            actual: field.name().to_string(),
         });
     }
-    if !field.required {
+    if field.nullable() {
         return Err(BranchFieldValidationError::NotRequired);
     }
-    match field.field_type.as_ref() {
-        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-        ) => Ok(()),
-        other => Err(BranchFieldValidationError::WrongType {
+    if field.type_signature() == "int" {
+        Ok(())
+    } else {
+        Err(BranchFieldValidationError::WrongType {
             expected: "Int".to_string(),
-            actual: other.to_string(),
-        }),
+            actual: field.type_signature().to_string(),
+        })
     }
 }
 
-fn validate_schema_contract_after_identity(
+fn validate_observations_after_identity(
     contract: &MvSchemaContract,
-    base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-    target_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    base: &MvSchemaValidationObservation,
+    target: &MvSchemaValidationObservation,
 ) -> ContractDecision {
     // Stage 2 fast path.
-    if base_schema.schema_id() == contract.base.schema_id_at_create
-        && target_schema.schema_id() == contract.target.schema_id_at_create
+    if base.schema_id() == contract.base.schema_id_at_create
+        && target.schema_id() == contract.target.schema_id_at_create
     {
         if contract.aggregate.is_some() {
-            if let Some(err) = check_target_schema(contract, target_schema) {
+            if let Some(err) = check_target_schema(contract, target.fields()) {
                 return ContractDecision::Incompatible(err);
             }
         }
         return ContractDecision::CompatibleSafe;
     }
     // Stage 2 precise base check.
-    let rebound = match check_base_referenced_fields(contract, base_schema) {
+    let rebound = match check_base_referenced_fields(contract, base.fields()) {
         Err(err) => return ContractDecision::Incompatible(err),
         Ok(r) => r,
     };
     // Stage 3 target check.
-    if let Some(err) = check_target_schema(contract, target_schema) {
+    if let Some(err) = check_target_schema(contract, target.fields()) {
         return ContractDecision::Incompatible(err);
     }
     if rebound.is_empty() {
@@ -237,44 +234,38 @@ fn validate_schema_contract_after_identity(
 
 fn validate_identity_guards(
     contract: &MvSchemaContract,
-    base: &CurrentIcebergTableView<'_>,
-    target: &CurrentIcebergTableView<'_>,
+    base: &MvSchemaValidationObservation,
+    target: &MvSchemaValidationObservation,
 ) -> Option<SchemaEvolutionError> {
-    if base.table_uuid != contract.base.table_uuid {
+    if base.table_uuid() != contract.base.table_uuid {
         return Some(SchemaEvolutionError::BaseTableIdentityChanged {
             expected: contract.base.table_uuid.clone(),
-            actual: base.table_uuid.clone(),
+            actual: base.table_uuid().to_string(),
         });
     }
-    if base.format_version != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
+    if !base.is_format_v3() {
         return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
-            reason: format!(
-                "base table must be Iceberg format v3, found {:?}",
-                base.format_version
-            ),
+            reason: "base table must be Iceberg format v3, found non-v3".to_string(),
         });
     }
-    if !base.row_lineage_enabled {
+    if !base.stored_row_lineage_enabled() {
         return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
             reason: "base table property write.row-lineage must be true".to_string(),
         });
     }
 
-    if target.table_uuid != contract.target.table_uuid {
+    if target.table_uuid() != contract.target.table_uuid {
         return Some(SchemaEvolutionError::TargetTableIdentityChanged {
             expected: contract.target.table_uuid.clone(),
-            actual: target.table_uuid.clone(),
+            actual: target.table_uuid().to_string(),
         });
     }
-    if target.format_version != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
+    if !target.is_format_v3() {
         return Some(SchemaEvolutionError::TargetRowLineageContractBroken {
-            reason: format!(
-                "target table must be Iceberg format v3, found {:?}",
-                target.format_version
-            ),
+            reason: "target table must be Iceberg format v3, found non-v3".to_string(),
         });
     }
-    if !target.row_lineage_enabled {
+    if !target.stored_row_lineage_enabled() {
         return Some(SchemaEvolutionError::TargetRowLineageContractBroken {
             reason: "target table property write.row-lineage must be true".to_string(),
         });
@@ -284,18 +275,20 @@ fn validate_identity_guards(
 
 fn check_base_referenced_fields(
     contract: &MvSchemaContract,
-    base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    current: &[MvObservedTargetField],
 ) -> Result<Vec<RebindColumn>, SchemaEvolutionError> {
-    let current = base_schema.as_struct();
     let mut rebound = Vec::new();
     for record in &contract.base.schema_at_create.fields {
-        let Some(field) = current.fields().iter().find(|f| f.id == record.field_id) else {
+        let Some(field) = current
+            .iter()
+            .find(|field| field.field_id() == record.field_id)
+        else {
             return Err(SchemaEvolutionError::BaseFieldDropped {
                 field_id: record.field_id,
                 name_at_create: record.name_at_create.clone(),
             });
         };
-        let current_signature = format!("{}", field.field_type);
+        let current_signature = field.type_signature().to_string();
         if current_signature != record.type_signature {
             return Err(SchemaEvolutionError::BaseFieldTypeChanged {
                 field_id: record.field_id,
@@ -304,20 +297,21 @@ fn check_base_referenced_fields(
                 to: current_signature,
             });
         }
-        if field.required != record.required {
+        let current_required = !field.nullable();
+        if current_required != record.required {
             return Err(SchemaEvolutionError::BaseFieldNullabilityChanged {
                 field_id: record.field_id,
                 name_at_create: record.name_at_create.clone(),
                 from_required: record.required,
-                to_required: field.required,
+                to_required: current_required,
             });
         }
-        if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
+        if !field.name().eq_ignore_ascii_case(&record.name_at_create) {
             rebound.push(RebindColumn {
                 base_table_fqn: contract.base.table_fqn.clone(),
                 field_id: record.field_id,
                 name_at_create: record.name_at_create.clone(),
-                current_name: field.name.clone(),
+                current_name: field.name().to_string(),
             });
         }
     }
@@ -326,7 +320,7 @@ fn check_base_referenced_fields(
 
 fn check_target_partition_spec(
     contract: &MvSchemaContract,
-    current_spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
+    current_spec: &MvSchemaValidationPartitionContract,
 ) -> Option<SchemaEvolutionError> {
     let Some(expected) = &contract.target.partition else {
         return None;
@@ -351,39 +345,59 @@ fn check_target_partition_spec(
         });
     }
     for (idx, (actual, expected)) in fields.iter().zip(expected.fields.iter()).enumerate() {
-        if actual.field_id != expected.partition_field_id {
+        if actual.partition_field_id() != expected.partition_field_id {
             return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
                 reason: format!(
                     "partition field #{idx} id expected {}, got {}",
-                    expected.partition_field_id, actual.field_id
+                    expected.partition_field_id,
+                    actual.partition_field_id()
                 ),
             });
         }
-        if actual.source_id != expected.source_target_field_id {
+        if actual.source_target_field_id() != expected.source_target_field_id {
             return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
                 reason: format!(
                     "partition field {} source id expected {}, got {}",
                     expected.partition_field_name,
                     expected.source_target_field_id,
-                    actual.source_id
+                    actual.source_target_field_id()
                 ),
             });
         }
-        if actual.name != expected.partition_field_name {
+        if actual.partition_field_name() != expected.partition_field_name {
             return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
                 reason: format!(
                     "partition field #{idx} name expected {}, got {}",
-                    expected.partition_field_name, actual.name
+                    expected.partition_field_name,
+                    actual.partition_field_name()
                 ),
             });
         }
-        let Some(actual_transform) = partition_transform_contract(&actual.transform) else {
-            return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
-                reason: format!(
-                    "partition field {} has unsupported transform {:?}",
-                    actual.name, actual.transform
-                ),
-            });
+        let actual_transform = match actual.transform() {
+            MvSchemaValidationPartitionTransform::Identity => {
+                MvPartitionTransformContract::Identity
+            }
+            MvSchemaValidationPartitionTransform::Year => MvPartitionTransformContract::Year,
+            MvSchemaValidationPartitionTransform::Month => MvPartitionTransformContract::Month,
+            MvSchemaValidationPartitionTransform::Day => MvPartitionTransformContract::Day,
+            MvSchemaValidationPartitionTransform::Hour => MvPartitionTransformContract::Hour,
+            MvSchemaValidationPartitionTransform::Bucket { num_buckets } => {
+                MvPartitionTransformContract::Bucket {
+                    num_buckets: *num_buckets,
+                }
+            }
+            MvSchemaValidationPartitionTransform::Truncate { width } => {
+                MvPartitionTransformContract::Truncate { width: *width }
+            }
+            MvSchemaValidationPartitionTransform::Void => MvPartitionTransformContract::Void,
+            MvSchemaValidationPartitionTransform::Unsupported(name) => {
+                return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
+                    reason: format!(
+                        "partition field {} has unsupported transform {name}",
+                        actual.partition_field_name()
+                    ),
+                });
+            }
         };
         if actual_transform != expected.transform {
             return Some(SchemaEvolutionError::TargetPartitionSpecChanged {
@@ -397,53 +411,21 @@ fn check_target_partition_spec(
     None
 }
 
-fn partition_transform_contract(
-    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
-) -> Option<MvPartitionTransformContract> {
-    match transform {
-        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
-            Some(MvPartitionTransformContract::Identity)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
-            Some(MvPartitionTransformContract::Year)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
-            Some(MvPartitionTransformContract::Month)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
-            Some(MvPartitionTransformContract::Day)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
-            Some(MvPartitionTransformContract::Hour)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
-            Some(MvPartitionTransformContract::Bucket {
-                num_buckets: *num_buckets,
-            })
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
-            Some(MvPartitionTransformContract::Truncate { width: *width })
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
-            Some(MvPartitionTransformContract::Void)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => None,
-    }
-}
-
 fn check_target_schema(
     contract: &MvSchemaContract,
-    target_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    current: &[MvObservedTargetField],
 ) -> Option<SchemaEvolutionError> {
-    let current = target_schema.as_struct();
     for tv in &contract.target.visible_columns {
-        let Some(field) = current.fields().iter().find(|f| f.id == tv.target_field_id) else {
+        let Some(field) = current
+            .iter()
+            .find(|field| field.field_id() == tv.target_field_id)
+        else {
             return Some(SchemaEvolutionError::TargetVisibleFieldDropped {
                 output_name: tv.output_name.clone(),
                 target_field_id: tv.target_field_id,
             });
         };
-        let sig = format!("{}", field.field_type);
+        let sig = field.type_signature().to_string();
         if sig != tv.type_signature {
             return Some(SchemaEvolutionError::TargetVisibleFieldTypeChanged {
                 target_field_id: tv.target_field_id,
@@ -451,20 +433,19 @@ fn check_target_schema(
                 to: sig,
             });
         }
-        if !field.name.eq_ignore_ascii_case(&tv.output_name) {
+        if !field.name().eq_ignore_ascii_case(&tv.output_name) {
             return Some(SchemaEvolutionError::TargetVisibleFieldRenamed {
                 target_field_id: tv.target_field_id,
                 expected: tv.output_name.clone(),
-                actual: field.name.clone(),
+                actual: field.name().to_string(),
             });
         }
     }
 
     let expected = &contract.target.hidden_apply_key;
     let Some(field) = current
-        .fields()
         .iter()
-        .find(|f| f.id == expected.target_field_id)
+        .find(|field| field.field_id() == expected.target_field_id)
     else {
         return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
             reason: format!(
@@ -479,46 +460,39 @@ fn check_target_schema(
         ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
     };
     if !field
-        .name
+        .name()
         .eq_ignore_ascii_case(expected_hidden_apply_key_column)
     {
         return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
-            reason: format!("hidden apply-key column renamed to {}", field.name),
+            reason: format!("hidden apply-key column renamed to {}", field.name()),
         });
     }
     if let Some(err) = check_aggregate_state_schema(contract, current) {
         return Some(err);
     }
-    if !field.required {
+    if field.nullable() {
         return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
             reason: "hidden apply-key column must be required".to_string(),
         });
     }
-    let expected_apply_key_type = match expected.source {
-        ApplyKeySource::BaseRowId => {
-            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long
-        }
-        ApplyKeySource::JoinRowKey | ApplyKeySource::GroupRowId => {
-            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String
-        }
+    let (expected_apply_key_type, expected_apply_key_display) = match expected.source {
+        ApplyKeySource::BaseRowId => ("long", "Long"),
+        ApplyKeySource::JoinRowKey | ApplyKeySource::GroupRowId => ("string", "String"),
     };
-    match field.field_type.as_ref() {
-        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(actual)
-            if actual == &expected_apply_key_type => {}
-        other => {
-            return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
-                reason: format!(
-                    "hidden apply-key column must be {expected_apply_key_type:?}, got {other}"
-                ),
-            });
-        }
+    if field.type_signature() != expected_apply_key_type {
+        return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
+            reason: format!(
+                "hidden apply-key column must be {expected_apply_key_display}, got {}",
+                field.type_signature()
+            ),
+        });
     }
     None
 }
 
 fn check_aggregate_state_schema(
     contract: &MvSchemaContract,
-    current: &novarocks_connector_iceberg::iceberg::spec::StructType,
+    current: &[MvObservedTargetField],
 ) -> Option<SchemaEvolutionError> {
     let aggregate = contract.aggregate.as_ref()?;
     if aggregate.state_layout_version != 1 {
@@ -542,9 +516,9 @@ fn check_aggregate_state_schema(
             ),
         });
     }
-    let mut row_id_matches = current.fields().iter().filter(|field| {
+    let mut row_id_matches = current.iter().filter(|field| {
         field
-            .name
+            .name()
             .eq_ignore_ascii_case(&aggregate.row_id_column_name)
     });
     let Some(row_id_field) = row_id_matches.next() else {
@@ -563,15 +537,16 @@ fn check_aggregate_state_schema(
             ),
         });
     }
-    if row_id_field.id != contract.target.hidden_apply_key.target_field_id {
+    if row_id_field.field_id() != contract.target.hidden_apply_key.target_field_id {
         return Some(SchemaEvolutionError::AggregateStateContractBroken {
             reason: format!(
                 "aggregate row-id field id {} must match hidden apply-key field id {}",
-                row_id_field.id, contract.target.hidden_apply_key.target_field_id
+                row_id_field.field_id(),
+                contract.target.hidden_apply_key.target_field_id
             ),
         });
     }
-    if !row_id_field.required {
+    if row_id_field.nullable() {
         return Some(SchemaEvolutionError::AggregateStateContractBroken {
             reason: format!(
                 "aggregate row-id column {} must be required",
@@ -579,25 +554,20 @@ fn check_aggregate_state_schema(
             ),
         });
     }
-    match row_id_field.field_type.as_ref() {
-        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-        ) => {}
-        other => {
-            return Some(SchemaEvolutionError::AggregateStateContractBroken {
-                reason: format!(
-                    "aggregate row-id column {} must be String, got {other}",
-                    aggregate.row_id_column_name
-                ),
-            });
-        }
+    if row_id_field.type_signature() != "string" {
+        return Some(SchemaEvolutionError::AggregateStateContractBroken {
+            reason: format!(
+                "aggregate row-id column {} must be String, got {}",
+                aggregate.row_id_column_name,
+                row_id_field.type_signature()
+            ),
+        });
     }
 
     for state_col in &aggregate.state_columns {
         let Some(field) = current
-            .fields()
             .iter()
-            .find(|field| field.id == state_col.target_field_id)
+            .find(|field| field.field_id() == state_col.target_field_id)
         else {
             return Some(SchemaEvolutionError::AggregateStateContractBroken {
                 reason: format!(
@@ -606,15 +576,17 @@ fn check_aggregate_state_schema(
                 ),
             });
         };
-        if !field.name.eq_ignore_ascii_case(&state_col.column_name) {
+        if !field.name().eq_ignore_ascii_case(&state_col.column_name) {
             return Some(SchemaEvolutionError::AggregateStateContractBroken {
                 reason: format!(
                     "aggregate state column {} field id {} renamed to {}",
-                    state_col.column_name, state_col.target_field_id, field.name
+                    state_col.column_name,
+                    state_col.target_field_id,
+                    field.name()
                 ),
             });
         }
-        let sig = format!("{}", field.field_type);
+        let sig = field.type_signature();
         if sig != state_col.type_signature {
             return Some(SchemaEvolutionError::AggregateStateContractBroken {
                 reason: format!(
@@ -623,7 +595,7 @@ fn check_aggregate_state_schema(
                 ),
             });
         }
-        let actual_nullable = !field.required;
+        let actual_nullable = field.nullable();
         if actual_nullable != state_col.nullable {
             return Some(SchemaEvolutionError::AggregateStateContractBroken {
                 reason: format!(
@@ -650,6 +622,7 @@ mod tests {
         MvPartitionTransformContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
     };
+    use crate::mv::storage_observation::MvSchemaValidationPartitionField;
     use crate::sql::planner::vocabulary::{
         BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
         JOIN_APPLY_KEY_COLUMN_NAME,
@@ -677,15 +650,209 @@ mod tests {
     }
 
     impl TestCurrentIcebergTable {
-        fn view(&self) -> CurrentIcebergTableView<'_> {
-            CurrentIcebergTableView {
-                table_uuid: self.table_uuid.clone(),
-                format_version: self.format_version,
-                row_lineage_enabled: self.row_lineage_enabled,
-                schema: &self.schema,
-                default_partition_spec: &self.default_partition_spec,
-            }
+        fn view(&self) -> MvSchemaValidationObservation {
+            test_observation(
+                &self.table_uuid,
+                self.format_version
+                    == novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+                self.row_lineage_enabled,
+                &self.schema,
+                &self.default_partition_spec,
+            )
         }
+    }
+
+    fn test_observation(
+        table_uuid: &str,
+        format_v3: bool,
+        stored_row_lineage_enabled: bool,
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+        partition: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
+    ) -> MvSchemaValidationObservation {
+        let fields = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| {
+                MvObservedTargetField::new(
+                    field.id,
+                    field.name.clone(),
+                    field.field_type.to_string(),
+                    !field.required,
+                )
+            })
+            .collect();
+        let partition_fields = partition
+            .fields()
+            .iter()
+            .map(|field| {
+                let source = schema
+                    .field_by_id(field.source_id)
+                    .expect("partition source");
+                let transform = match &field.transform {
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+                        MvSchemaValidationPartitionTransform::Identity
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+                        MvSchemaValidationPartitionTransform::Year
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+                        MvSchemaValidationPartitionTransform::Month
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+                        MvSchemaValidationPartitionTransform::Day
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+                        MvSchemaValidationPartitionTransform::Hour
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
+                        MvSchemaValidationPartitionTransform::Bucket {
+                            num_buckets: *num_buckets,
+                        }
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
+                        MvSchemaValidationPartitionTransform::Truncate { width: *width }
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+                        MvSchemaValidationPartitionTransform::Void
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => {
+                        MvSchemaValidationPartitionTransform::Unsupported("Unknown".to_string())
+                    }
+                };
+                MvSchemaValidationPartitionField::new(
+                    field.field_id,
+                    field.name.clone(),
+                    field.source_id,
+                    source.name.clone(),
+                    transform,
+                )
+            })
+            .collect();
+        MvSchemaValidationObservation::try_new_with_maximum_payload(
+            table_uuid.to_string(),
+            schema.schema_id(),
+            format_v3,
+            stored_row_lineage_enabled,
+            fields,
+            MvSchemaValidationPartitionContract::new(partition.spec_id(), partition_fields),
+        )
+        .expect("test schema observation")
+    }
+
+    fn validate_schema_contract_after_identity(
+        contract: &MvSchemaContract,
+        base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+        target_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> ContractDecision {
+        let unpartitioned =
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec();
+        let base = test_observation("base-test", true, true, base_schema, &unpartitioned);
+        let target = test_observation("target-test", true, true, target_schema, &unpartitioned);
+        validate_observations_after_identity(contract, &base, &target)
+    }
+
+    fn validate_branch_id_field(
+        contract: &BranchIdColumnContract,
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> Result<(), BranchFieldValidationError> {
+        let observation = test_observation(
+            "branch-test",
+            true,
+            true,
+            schema,
+            &novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+        );
+        super::validate_branch_id_field(contract, &observation)
+    }
+
+    fn observed_fields(
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> Vec<MvObservedTargetField> {
+        schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| {
+                MvObservedTargetField::new(
+                    field.id,
+                    field.name.clone(),
+                    field.field_type.to_string(),
+                    !field.required,
+                )
+            })
+            .collect()
+    }
+
+    fn check_base_referenced_fields(
+        contract: &MvSchemaContract,
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> Result<Vec<RebindColumn>, SchemaEvolutionError> {
+        super::check_base_referenced_fields(contract, &observed_fields(schema))
+    }
+
+    fn check_target_schema(
+        contract: &MvSchemaContract,
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> Option<SchemaEvolutionError> {
+        super::check_target_schema(contract, &observed_fields(schema))
+    }
+
+    fn check_target_partition_spec(
+        contract: &MvSchemaContract,
+        spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
+    ) -> Option<SchemaEvolutionError> {
+        if contract.target.partition.is_none() {
+            return None;
+        }
+        let fields = spec
+            .fields()
+            .iter()
+            .map(|field| {
+                let transform = match &field.transform {
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+                        MvSchemaValidationPartitionTransform::Identity
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+                        MvSchemaValidationPartitionTransform::Year
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+                        MvSchemaValidationPartitionTransform::Month
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+                        MvSchemaValidationPartitionTransform::Day
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+                        MvSchemaValidationPartitionTransform::Hour
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
+                        MvSchemaValidationPartitionTransform::Bucket {
+                            num_buckets: *num_buckets,
+                        }
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
+                        MvSchemaValidationPartitionTransform::Truncate { width: *width }
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+                        MvSchemaValidationPartitionTransform::Void
+                    }
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => {
+                        MvSchemaValidationPartitionTransform::Unsupported("Unknown".to_string())
+                    }
+                };
+                MvSchemaValidationPartitionField::new(
+                    field.field_id,
+                    field.name.clone(),
+                    field.source_id,
+                    format!("source_{}", field.source_id),
+                    transform,
+                )
+            })
+            .collect();
+        super::check_target_partition_spec(
+            contract,
+            &MvSchemaValidationPartitionContract::new(spec.spec_id(), fields),
+        )
     }
 
     fn identity_table(
@@ -884,7 +1051,7 @@ mod tests {
             (
                 &base_v2,
                 &good_target,
-                "iceberg MV refresh blocked: base table row-lineage contract broken (base table must be Iceberg format v3, found V2); run REFRESH FULL or recreate the MV",
+                "iceberg MV refresh blocked: base table row-lineage contract broken (base table must be Iceberg format v3, found non-v3); run REFRESH FULL or recreate the MV",
             ),
             (
                 &base_missing,
@@ -899,7 +1066,7 @@ mod tests {
             (
                 &good_base,
                 &target_v2,
-                "iceberg MV refresh blocked: target table row-lineage contract broken (target table must be Iceberg format v3, found V2); recreate the MV",
+                "iceberg MV refresh blocked: target table row-lineage contract broken (target table must be Iceberg format v3, found non-v3); recreate the MV",
             ),
             (
                 &good_base,
@@ -952,7 +1119,7 @@ mod tests {
         assert_eq!(
             validate_schema_contract(&contract, &base.view(), &target.view()),
             ContractDecision::Incompatible(SchemaEvolutionError::BaseRowLineageContractBroken {
-                reason: "base table must be Iceberg format v3, found V2".to_string(),
+                reason: "base table must be Iceberg format v3, found non-v3".to_string(),
             })
         );
 
@@ -979,7 +1146,7 @@ mod tests {
         assert_eq!(
             validate_schema_contract(&contract, &base.view(), &target.view()),
             ContractDecision::Incompatible(SchemaEvolutionError::TargetRowLineageContractBroken {
-                reason: "target table must be Iceberg format v3, found V2".to_string(),
+                reason: "target table must be Iceberg format v3, found non-v3".to_string(),
             })
         );
 
@@ -2184,7 +2351,7 @@ mod tests {
         .expect_err("generic target identity guard must precede partition");
         assert_eq!(
             error.to_string(),
-            "iceberg MV refresh blocked: target table row-lineage contract broken (target table must be Iceberg format v3, found V2); recreate the MV"
+            "iceberg MV refresh blocked: target table row-lineage contract broken (target table must be Iceberg format v3, found non-v3); recreate the MV"
         );
 
         target.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3;

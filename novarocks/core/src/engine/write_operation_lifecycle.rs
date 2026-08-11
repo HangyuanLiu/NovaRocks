@@ -20,7 +20,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::StandaloneState;
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCleanupOutcomeRecord, IcebergOperationFactUpdate,
@@ -28,6 +27,7 @@ use crate::meta::repository::iceberg_operation::{
     IcebergOperationNextAction, IcebergOperationState, IcebergOperationTarget,
 };
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput, WriterCommitInput};
+use novarocks_connector_iceberg::commit::CommitOpKind;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WriteOperationContext {
@@ -243,13 +243,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::common::types::UniqueId;
-    use crate::connector::iceberg::commit::CommitOpKind;
     use crate::meta::repository::iceberg_operation::{
         IcebergOperationFailureKind, IcebergOperationKind, IcebergOperationNextAction,
         IcebergOperationState, IcebergOperationTarget,
     };
     use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
     use crate::query_execution::write::{WriteAbortInput, WriterCommitInput, WriterKey};
+    use novarocks_connector_iceberg::commit::CommitOpKind;
 
     struct WriterOperationTestState {
         state: Arc<StandaloneState>,

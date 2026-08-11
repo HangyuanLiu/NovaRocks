@@ -33,6 +33,7 @@ use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergFileForQuery {
     pub(crate) path: String,
@@ -46,6 +47,7 @@ pub(crate) struct IcebergFileForQuery {
     pub(crate) row_id_allow_list: Option<std::collections::BTreeSet<i64>>,
 }
 
+#[cfg(test)]
 pub(crate) fn delete_temp_iceberg_file_for_query(
     path: String,
     size: i64,

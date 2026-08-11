@@ -48,7 +48,7 @@ use novarocks_spi::connector::{
 };
 
 use super::commit::{CommitServiceError, RecoveryEvidence};
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 use novarocks_connector_iceberg::write_codec::connector_write_receipt;
 
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;

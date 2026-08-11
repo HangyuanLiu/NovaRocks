@@ -46,8 +46,8 @@ use super::helpers::{
     required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
-use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::stats_assembler::CommitType;
 
 // `Eq` is intentionally omitted: `appended_files: Vec<WrittenFile>` and
@@ -1182,7 +1182,7 @@ mod tests {
         written: Vec<WrittenFile>,
     ) -> Result<CommitOutcome, String> {
         use super::super::collector::IcebergCommitCollector;
-        use crate::connector::iceberg::commit::types::CommitOpKind;
+        use novarocks_connector_iceberg::commit::CommitOpKind;
 
         let metadata = fixture.table.metadata();
         let staging_dir = format!("{}/staging", metadata.location());

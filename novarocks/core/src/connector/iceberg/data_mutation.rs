@@ -49,7 +49,7 @@ use super::commit::{
     RecoveryEvidence, RunInput, run_iceberg_commit,
 };
 use super::provider::decode_data_mutation_table_target;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
+use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 use novarocks_connector_iceberg::fs_io;
 
 const PLAN_PAYLOAD_VERSION: u16 = 1;

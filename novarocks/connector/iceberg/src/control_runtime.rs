@@ -24,7 +24,11 @@
 
 use std::sync::Arc;
 
+use novarocks_catalog::identifier::normalize_identifier;
+
 use crate::catalog_control::IcebergCatalogControlState;
+use crate::iceberg::{NamespaceIdent, TableIdent};
+use crate::loaded_table::IcebergPhysicalTable;
 use crate::resources::IcebergControlResources;
 
 #[allow(dead_code)] // Assembled into the concrete provider factory during R3C.
@@ -67,6 +71,101 @@ impl IcebergControlRuntime {
 
     pub(crate) fn catalog(&self) -> &Arc<dyn crate::iceberg::Catalog> {
         &self.catalog
+    }
+
+    pub(crate) fn resources(&self) -> &IcebergControlResources {
+        &self.resources
+    }
+
+    pub(crate) fn load_table(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<IcebergPhysicalTable, String> {
+        let namespace = normalize_identifier(namespace)?;
+        let table = normalize_identifier(table)?;
+        if let Some(table) = self
+            .control_state
+            .physical_table_cache()
+            .get(&namespace, &table)?
+        {
+            return Ok(table);
+        }
+        let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
+            .map_err(|error| format!("build Iceberg table identity: {error}"))?;
+        let catalog = Arc::clone(&self.catalog);
+        let loaded = self
+            .resources
+            .catalog_runtime()
+            .block_on(async move { catalog.load_table(&ident).await })?
+            .map_err(|error| format!("load Iceberg table {namespace}.{table}: {error}"))?;
+        let physical =
+            IcebergPhysicalTable::new(loaded, self.control_state.object_store_config().cloned());
+        self.control_state
+            .physical_table_cache()
+            .insert(&namespace, &table, physical.clone())?;
+        Ok(physical)
+    }
+
+    pub(crate) fn list_namespaces(&self) -> Result<Vec<String>, String> {
+        let catalog = Arc::clone(&self.catalog);
+        let mut namespaces = self
+            .resources
+            .catalog_runtime()
+            .block_on(async move { catalog.list_namespaces(None).await })?
+            .map_err(|error| format!("list Iceberg namespaces: {error}"))?
+            .into_iter()
+            .flat_map(|namespace| {
+                namespace
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|namespace| !namespace.starts_with('.'))
+            .collect::<Vec<_>>();
+        namespaces.sort();
+        namespaces.dedup();
+        Ok(namespaces)
+    }
+
+    pub(crate) fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
+        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
+        let namespace_label = namespace.to_string();
+        let catalog = Arc::clone(&self.catalog);
+        self.resources
+            .catalog_runtime()
+            .block_on(async move { catalog.namespace_exists(&namespace).await })?
+            .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
+    }
+
+    pub(crate) fn list_tables(&self, namespace: &str) -> Result<Vec<String>, String> {
+        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
+        let namespace_label = namespace.to_string();
+        let catalog = Arc::clone(&self.catalog);
+        let mut tables = self
+            .resources
+            .catalog_runtime()
+            .block_on(async move { catalog.list_tables(&namespace).await })?
+            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))?
+            .into_iter()
+            .map(|table| table.name)
+            .collect::<Vec<_>>();
+        tables.sort();
+        tables.dedup();
+        Ok(tables)
+    }
+
+    pub(crate) fn table_exists(&self, namespace: &str, table: &str) -> Result<bool, String> {
+        let ident = TableIdent::new(
+            NamespaceIdent::new(normalize_identifier(namespace)?),
+            normalize_identifier(table)?,
+        );
+        let ident_label = ident.to_string();
+        let catalog = Arc::clone(&self.catalog);
+        self.resources
+            .catalog_runtime()
+            .block_on(async move { catalog.table_exists(&ident).await })?
+            .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
     }
 
     /// Shared reservation scope for every write capability assembled from

@@ -996,39 +996,62 @@ pub(crate) fn execute_drop_database_statement(
             Some(&target.namespace),
         )?;
     }
+    let instance_id = mutation_instance_id(&target.catalog)?;
     if force {
-        let entry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
-            .get(&target.catalog)?;
+        let lease = state
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|error| error.to_string())?;
         // `IF EXISTS` applies to the complete FORCE decomposition.  In
         // particular, do not ask a remote catalog to enumerate a namespace
         // which the final DropNamespace mutation would correctly treat as a
         // no-op.
-        let namespace_exists = crate::connector::iceberg::catalog::registry::namespace_exists(
-            &entry,
-            &target.namespace,
-        )?;
+        let namespace_identity = ConnectorNamespaceIdentity {
+            instance_id: instance_id.clone(),
+            namespace: Arc::from(target.namespace.as_str()),
+        };
+        let namespace_exists = lease
+            .binding()
+            .metadata()
+            .namespace_exists(novarocks_spi::connector::ConnectorNamespaceRequest {
+                namespace: namespace_identity.clone(),
+                context: connector_context.clone(),
+            })
+            .map_err(|error| error.to_string())?;
         if !namespace_exists {
             if if_exists {
                 return Ok(StatementResult::Ok);
             }
             return Err(format!("namespace `{}` does not exist", target.namespace));
         }
-        let mut tables =
-            crate::connector::iceberg::catalog::registry::list_tables(&entry, &target.namespace)?;
+        let mut tables = lease
+            .binding()
+            .metadata()
+            .list_tables(novarocks_spi::connector::ConnectorListTablesRequest {
+                namespace: namespace_identity.clone(),
+                context: connector_context.clone(),
+            })
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|identity| identity.table.to_string())
+            .collect::<Vec<_>>();
         tables.sort();
-        let mut views = if matches!(
-            entry.kind,
-            novarocks_connector_iceberg::catalog_config::IcebergCatalogKind::Rest
-        ) {
-            crate::connector::iceberg::catalog::views::list_views(&entry, &target.namespace)?
-        } else {
-            Vec::new()
-        };
+        let mut views = lease
+            .binding()
+            .view_metadata()
+            .map(|view_metadata| {
+                view_metadata.list_views(novarocks_spi::connector::ConnectorListViewsRequest {
+                    namespace: namespace_identity,
+                    context: connector_context.clone(),
+                })
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|identity| identity.view.to_string())
+            .collect::<Vec<_>>();
         views.sort();
-        let instance_id = mutation_instance_id(&target.catalog)?;
         for table in tables {
             crate::connector::mutation::execute_catalog_mutation(
                 state.connector_control.as_ref(),
@@ -1073,7 +1096,6 @@ pub(crate) fn execute_drop_database_statement(
             )?;
         }
     }
-    let instance_id = mutation_instance_id(&target.catalog)?;
     crate::connector::mutation::execute_catalog_mutation(
         state.connector_control.as_ref(),
         &instance_id,

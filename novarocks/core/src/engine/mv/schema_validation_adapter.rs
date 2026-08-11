@@ -15,80 +15,108 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::persistence::schema::MvSchemaContract;
-use crate::mv::schema_validation::{
-    ContractDecision, CurrentIcebergTableView, JoinContractDecision, JoinSchemaValidationError,
-    validate_join_schema_contract, validate_schema_contract,
+use crate::mv::storage_observation::{
+    MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
+    MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
 };
-use novarocks_catalog::identifier::TableIdentity;
 
 const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
 
-pub(crate) fn current_iceberg_table_view(
+pub(crate) fn current_iceberg_table_observation(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> CurrentIcebergTableView<'_> {
-    current_iceberg_table_view_with_schema(table, table.metadata().current_schema())
+) -> Result<MvSchemaValidationObservation, String> {
+    current_iceberg_table_observation_with_schema(table, table.metadata().current_schema())
 }
 
-pub(crate) fn current_iceberg_table_view_with_schema<'a>(
-    table: &'a novarocks_connector_iceberg::iceberg::table::Table,
-    schema: &'a novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> CurrentIcebergTableView<'a> {
+fn current_iceberg_table_observation_with_schema(
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> Result<MvSchemaValidationObservation, String> {
     let metadata = table.metadata();
-    CurrentIcebergTableView {
-        table_uuid: metadata.uuid().to_string(),
-        format_version: metadata.format_version(),
-        row_lineage_enabled: row_lineage_enabled(metadata.properties()),
-        schema,
-        default_partition_spec: metadata.default_partition_spec(),
-    }
-}
-
-pub(crate) fn validate_current_schema_contract(
-    contract: &MvSchemaContract,
-    current_base_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> ContractDecision {
-    validate_current_schema_contract_with_base_schema(
-        contract,
-        current_base_table,
-        current_base_table.metadata().current_schema(),
-        current_target_table,
+    MvSchemaValidationObservation::try_new_with_maximum_payload(
+        metadata.uuid().to_string(),
+        schema.schema_id(),
+        metadata.format_version() == novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+        row_lineage_enabled(metadata.properties()),
+        schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| {
+                MvObservedTargetField::new(
+                    field.id,
+                    field.name.clone(),
+                    field.field_type.to_string(),
+                    !field.required,
+                )
+            })
+            .collect(),
+        partition_contract(metadata.default_partition_spec(), schema)?,
     )
+    .map_err(|error| error.to_string())
 }
 
-pub(crate) fn validate_current_schema_contract_with_base_schema(
-    contract: &MvSchemaContract,
-    current_base_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> ContractDecision {
-    let base_view = current_iceberg_table_view_with_schema(current_base_table, base_schema);
-    let target_view = current_iceberg_table_view(current_target_table);
-    validate_schema_contract(contract, &base_view, &target_view)
-}
-
-pub(crate) fn validate_current_join_schema_contract(
-    contract: &MvSchemaContract,
-    bases: &[(
-        &TableIdentity,
-        &novarocks_connector_iceberg::iceberg::table::Table,
-    ); 2],
-    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> Result<JoinContractDecision, JoinSchemaValidationError> {
-    let base_fqns = [bases[0].0.fqn(), bases[1].0.fqn()];
-    let base_views = [
-        (
-            base_fqns[0].as_str(),
-            current_iceberg_table_view(bases[0].1),
-        ),
-        (
-            base_fqns[1].as_str(),
-            current_iceberg_table_view(bases[1].1),
-        ),
-    ];
-    let target_view = current_iceberg_table_view(current_target_table);
-    validate_join_schema_contract(contract, &base_views, &target_view)
+fn partition_contract(
+    spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> Result<MvSchemaValidationPartitionContract, String> {
+    let fields = spec
+        .fields()
+        .iter()
+        .map(|field| {
+            let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+                format!(
+                    "partition field {} references missing source field ID {}",
+                    field.name, field.source_id
+                )
+            })?;
+            let transform = match &field.transform {
+                novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+                    MvSchemaValidationPartitionTransform::Identity
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+                    MvSchemaValidationPartitionTransform::Year
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+                    MvSchemaValidationPartitionTransform::Month
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+                    MvSchemaValidationPartitionTransform::Day
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+                    MvSchemaValidationPartitionTransform::Hour
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
+                    MvSchemaValidationPartitionTransform::Bucket {
+                        num_buckets: *num_buckets,
+                    }
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
+                    MvSchemaValidationPartitionTransform::Truncate { width: *width }
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+                    MvSchemaValidationPartitionTransform::Void
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => {
+                    MvSchemaValidationPartitionTransform::Unsupported(format!(
+                        "{:?}",
+                        field.transform
+                    ))
+                }
+            };
+            Ok(MvSchemaValidationPartitionField::new(
+                field.field_id,
+                field.name.clone(),
+                field.source_id,
+                source.name.clone(),
+                transform,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(MvSchemaValidationPartitionContract::new(
+        spec.spec_id(),
+        fields,
+    ))
 }
 
 fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> bool {
