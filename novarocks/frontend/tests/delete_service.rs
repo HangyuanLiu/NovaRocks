@@ -179,6 +179,8 @@ impl OperationJournal for FakeJournal {
                 payload: novarocks_frontend::dml::model::OperationPayload::ConnectorWriteLifecycle(
                     novarocks_frontend::dml::model::ConnectorWriteLifecycleRecord::Pending,
                 ),
+                coordination_provenance: None,
+                recovery_due_at_ms: None,
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,

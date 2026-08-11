@@ -18,13 +18,20 @@
 use std::sync::Arc;
 
 use novarocks::engine::statistics::{EmptyStatisticsService, StatisticsService};
+use tokio::runtime::Handle;
 
+use crate::coordination::FrontendCoordinationRuntime;
+use crate::dml::coordination::{ActiveDmlOperation, DmlCoordinator};
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
-    DmlOperationId, StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+    CreatePreparingRequest, CreateStatementOperationRequest, DmlOperationId, DmlRecoveryCandidate,
+    StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
 };
-use crate::dml::runner::{AlwaysAdmit, WriteAdmission, WriteExecutor, WriteTransactionRunner};
+use crate::dml::runner::{
+    ActiveWriteTransactionRunner, AlwaysAdmit, WriteAdmission, WriteExecutor,
+    WriteTransactionRunner, preparing_request,
+};
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
 /// admission) and drives write transactions. Constructed from narrow handles —
@@ -33,6 +40,8 @@ pub struct DmlService {
     journal: Option<Arc<dyn OperationJournal>>,
     statistics: Arc<dyn StatisticsService>,
     admission: Arc<dyn WriteAdmission>,
+    coordinator: Option<DmlCoordinator>,
+    allow_unfenced_focused_test_support: bool,
 }
 
 impl DmlService {
@@ -40,12 +49,14 @@ impl DmlService {
     ///
     /// Production composition uses [`Self::compose`]; this constructor keeps
     /// the statement-agnostic DML-1 runner usable in focused tests.
+    #[doc(hidden)]
     pub fn new(journal: Arc<dyn OperationJournal>) -> Self {
         Self::compose(Some(journal), Arc::new(EmptyStatisticsService))
     }
 
     /// Compose the production DML owner from optional StateStore capability
     /// and the host-owned statistics service.
+    #[doc(hidden)]
     pub fn compose(
         journal: Option<Arc<dyn OperationJournal>>,
         statistics: Arc<dyn StatisticsService>,
@@ -54,11 +65,28 @@ impl DmlService {
             journal,
             statistics,
             admission: Arc::new(AlwaysAdmit),
+            coordinator: None,
+            allow_unfenced_focused_test_support: true,
+        }
+    }
+
+    pub(crate) fn compose_with_coordination(
+        journal: Option<Arc<dyn OperationJournal>>,
+        statistics: Arc<dyn StatisticsService>,
+        frontend: Arc<FrontendCoordinationRuntime>,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            journal,
+            statistics,
+            admission: Arc::new(AlwaysAdmit),
+            coordinator: Some(DmlCoordinator::new(frontend, runtime)),
+            allow_unfenced_focused_test_support: false,
         }
     }
 
     /// Build a service with a custom admission gate (CP-3 fencing).
-    pub fn with_admission(
+    pub(crate) fn with_admission(
         journal: Option<Arc<dyn OperationJournal>>,
         statistics: Arc<dyn StatisticsService>,
         admission: Arc<dyn WriteAdmission>,
@@ -67,7 +95,95 @@ impl DmlService {
             journal,
             statistics,
             admission,
+            coordinator: None,
+            allow_unfenced_focused_test_support: true,
         }
+    }
+
+    pub(crate) fn begin_write_operation(
+        &self,
+        request: CreatePreparingRequest,
+    ) -> Result<ActiveDmlOperation, DmlError> {
+        let journal = self.require_journal_arc()?;
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            if self.allow_unfenced_focused_test_support {
+                let operation_id = journal.create_preparing(request)?;
+                let operation = journal.load(operation_id)?.ok_or_else(|| {
+                    DmlError::journal_unresolved(format!(
+                        "created DML operation {operation_id} cannot be read back"
+                    ))
+                })?;
+                return Ok(ActiveDmlOperation::legacy(journal, operation));
+            }
+            return Err(DmlError::coordination_unresolved(
+                "frontend DML coordination is not installed for this service",
+            ));
+        };
+        let operation_id = journal.create_preparing_admitted(request, coordinator.admission()?)?;
+        let operation = journal.load(operation_id)?.ok_or_else(|| {
+            DmlError::journal_unresolved(format!(
+                "created DML operation {operation_id} cannot be read back"
+            ))
+        })?;
+        coordinator.claim_foreground(journal, operation)
+    }
+
+    pub(crate) fn begin_statement_operation(
+        &self,
+        request: CreateStatementOperationRequest,
+    ) -> Result<ActiveDmlOperation, DmlError> {
+        let journal = self.require_journal_arc()?;
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            if self.allow_unfenced_focused_test_support {
+                let operation = journal.create_statement_operation(request)?;
+                return Ok(ActiveDmlOperation::legacy(journal, operation));
+            }
+            return Err(DmlError::coordination_unresolved(
+                "frontend DML coordination is not installed for this service",
+            ));
+        };
+        let operation =
+            journal.create_statement_operation_admitted(request, coordinator.admission()?)?;
+        coordinator.claim_foreground(journal, operation)
+    }
+
+    pub(crate) async fn shutdown_coordination(&self) -> Result<(), DmlError> {
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recovery_candidates(
+        &self,
+        shard: u8,
+        due_at_or_before_ms: i64,
+    ) -> Result<Vec<DmlRecoveryCandidate>, DmlError> {
+        self.require_journal()?
+            .recovery_candidates(shard, due_at_or_before_ms)
+    }
+
+    pub(crate) fn defer_recovery_candidate(
+        &self,
+        candidate: DmlRecoveryCandidate,
+        next_due_at_ms: i64,
+    ) -> Result<(), DmlError> {
+        let journal = self.require_journal_arc()?;
+        let Some(operation) = journal.load(candidate.operation_id)? else {
+            return Ok(());
+        };
+        if operation.revision != candidate.operation_revision
+            || operation.last_mutation_id != candidate.last_mutation_id
+            || operation.recovery_due_at_ms != Some(candidate.recovery_due_at_ms)
+        {
+            return Ok(());
+        }
+        let mut active = self
+            .require_coordinator()?
+            .claim_recovery(journal, operation)?;
+        let result = active.reschedule_recovery_due(Some(next_due_at_ms));
+        let release = active.release();
+        result.and(release)
     }
 
     /// Run one Iceberg write transaction with the given executor.
@@ -76,6 +192,15 @@ impl DmlService {
         spec: WriteTransactionSpec,
         executor: &E,
     ) -> Result<WriteTransactionOutcome, DmlError> {
+        if self.coordinator.is_some() {
+            let operation = self.begin_write_operation(preparing_request(&spec))?;
+            return ActiveWriteTransactionRunner::new(operation, executor).run(spec);
+        }
+        if !self.allow_unfenced_focused_test_support {
+            return Err(DmlError::coordination_unresolved(
+                "frontend DML coordination is not installed for this service",
+            ));
+        }
         let journal = self.require_journal()?;
         let runner = WriteTransactionRunner::new(journal, executor, self.admission.as_ref());
         runner.run(spec)
@@ -85,6 +210,22 @@ impl DmlService {
         self.journal.as_deref().ok_or_else(|| {
             DmlError::journal_unavailable(
                 "state store is required for Iceberg DML; configure [state_store]",
+            )
+        })
+    }
+
+    fn require_journal_arc(&self) -> Result<Arc<dyn OperationJournal>, DmlError> {
+        self.journal.clone().ok_or_else(|| {
+            DmlError::journal_unavailable(
+                "state store is required for Iceberg DML; configure [state_store]",
+            )
+        })
+    }
+
+    fn require_coordinator(&self) -> Result<&DmlCoordinator, DmlError> {
+        self.coordinator.as_ref().ok_or_else(|| {
+            DmlError::coordination_unresolved(
+                "frontend DML coordination is not installed for this service",
             )
         })
     }

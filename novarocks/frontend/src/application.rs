@@ -28,8 +28,10 @@ use novarocks_state_store::{
 };
 
 use crate::connector::ConnectorControlHost;
+use crate::coordination::FrontendCoordinationRuntime;
 use crate::coordinator::{BackendQueryActivity, FrontendDistributedQueryCoordinator};
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
+use crate::dml::recovery::DmlRecoveryController;
 use crate::dml::{DmlService, StateStoreOperationJournal};
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
@@ -53,6 +55,7 @@ const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
     StateStoreHost,
+    CoordinationOpen,
     DmlServiceOpen,
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
@@ -106,6 +109,7 @@ pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
+    dml_recovery_controller: Option<DmlRecoveryController>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
@@ -117,6 +121,7 @@ pub struct FrontendApplicationHost {
     mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
     mv_background_engine_sink: Option<Arc<dyn novarocks::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
+    coordination: Option<Arc<FrontendCoordinationRuntime>>,
     query_execution: Option<QueryExecutionService>,
     query_control: novarocks::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
@@ -188,6 +193,7 @@ impl FrontendApplicationHost {
             ),
             statistics_service: None,
             dml_service: None,
+            dml_recovery_controller: None,
             statistics_application_service: None,
             statistics_application_port: None,
             view_service: None,
@@ -198,6 +204,7 @@ impl FrontendApplicationHost {
             mv_refresh_provider_activation: None,
             mv_background_engine_sink: None,
             state_store_host: None,
+            coordination: None,
             query_execution: None,
             query_control: FrontendQueryControl::service(),
             coordinator: None,
@@ -205,9 +212,22 @@ impl FrontendApplicationHost {
             topology: None,
         };
 
-        if let Some(config) = config {
-            if let Err(error) = host.open_configured(config).await {
-                return Err(host.cleanup_open_error(error).await);
+        if let Some(config) = config
+            && let Err(error) = host.open_configured(config).await
+        {
+            return Err(host.cleanup_open_error(error).await);
+        }
+        if let Some(store) = host.state_store() {
+            match FrontendCoordinationRuntime::open(store).await {
+                Ok(coordination) => host.coordination = Some(Arc::new(coordination)),
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CoordinationOpen,
+                            error,
+                        ))
+                        .await);
+                }
             }
         }
         match ClusterBackendService::open(
@@ -246,10 +266,19 @@ impl FrontendApplicationHost {
             }
             None => None,
         };
-        host.dml_service = Some(Arc::new(DmlService::compose(
-            journal,
-            host.statistics_service(),
-        )));
+        let statistics = host.statistics_service();
+        host.dml_service = Some(Arc::new(match host.coordination() {
+            Some(coordination) => DmlService::compose_with_coordination(
+                journal,
+                statistics,
+                coordination,
+                tokio::runtime::Handle::current(),
+            ),
+            None => DmlService::compose(journal, statistics),
+        }));
+        if host.coordination.is_some() {
+            host.dml_recovery_controller = Some(DmlRecoveryController::start(host.dml_service()));
+        }
         match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
         {
             Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
@@ -353,10 +382,27 @@ impl FrontendApplicationHost {
             },
             None => Some(Arc::new(StatisticsApplicationService::unavailable())),
         };
-        host.statistics_application_port = Some(Arc::new(FrontendStatisticsApplicationPort::new(
-            host.statistics_application_service().as_ref().clone(),
-            tokio::runtime::Handle::current(),
-        )));
+        let statistics_application_port = match host.coordination() {
+            Some(coordination) => FrontendStatisticsApplicationPort::with_frontend_coordination(
+                host.statistics_application_service().as_ref().clone(),
+                tokio::runtime::Handle::current(),
+                coordination.as_ref(),
+            )
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::StatisticsApplicationServiceOpen,
+                    error,
+                )
+            }),
+            None => Ok(FrontendStatisticsApplicationPort::new(
+                host.statistics_application_service().as_ref().clone(),
+                tokio::runtime::Handle::current(),
+            )),
+        };
+        match statistics_application_port {
+            Ok(port) => host.statistics_application_port = Some(Arc::new(port)),
+            Err(error) => return Err(host.cleanup_open_error(error).await),
+        }
 
         Ok(host)
     }
@@ -446,6 +492,10 @@ impl FrontendApplicationHost {
         self.state_store_host
             .as_ref()
             .and_then(StateStoreHost::state_store)
+    }
+
+    pub(crate) fn coordination(&self) -> Option<Arc<FrontendCoordinationRuntime>> {
+        self.coordination.as_ref().map(Arc::clone)
     }
 
     pub fn execution_role(&self) -> novarocks::common::app_config::ClusterRole {
@@ -621,11 +671,11 @@ impl FrontendApplicationHost {
             .and_then(|port| port.shutdown_worker().err())
             .map(|error| format!("shutdown statistics analyze worker failed: {error}"));
         let mut primary_error = mv_worker_error;
-        if primary_error.is_some() {
+        if let Some(error) = primary_error.take() {
             // The MV workers still own request/topology/StateStore references.
             // Preserve them so a caller sees the explicit shutdown failure
             // rather than pretending that teardown completed.
-            return Err(primary_error.expect("MV worker shutdown error is present"));
+            return Err(error);
         }
         let table_maintenance_error = self
             .table_maintenance_service
@@ -658,6 +708,42 @@ impl FrontendApplicationHost {
                 primary_error = Some(table_maintenance_error);
             }
         }
+        if let Some(controller) = self.dml_recovery_controller.as_mut() {
+            controller.shutdown().await;
+        }
+        self.dml_recovery_controller.take();
+        let dml_coordination_error = if let Some(service) = self.dml_service.as_ref() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                service.shutdown_coordination(),
+            )
+            .await
+            {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!(
+                    "shutdown frontend DML coordination failed: {error}"
+                )),
+                Err(_) => {
+                    Some("shutdown frontend DML coordination exceeded the 5s deadline".to_string())
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(dml_coordination_error) = dml_coordination_error {
+            if let Some(mut primary) = primary_error.take() {
+                primary.push_str(&format!("; cleanup failed: {dml_coordination_error}"));
+                // A timed-out or failed authority drain may still own the DML
+                // service, coordination runtime, and StateStore. Preserve
+                // those dependencies so the caller cannot mistake a partial
+                // teardown for a completed shutdown.
+                return Err(primary);
+            } else {
+                // See the branch above: no dependent resource is released
+                // after an incomplete DML authority drain.
+                return Err(dml_coordination_error);
+            }
+        }
         self.dml_service.take();
         self.table_maintenance_service.take();
         self.statistics_service.take();
@@ -672,6 +758,7 @@ impl FrontendApplicationHost {
         self.mv_refresh_provider_activation.take();
         self.mv_background_engine_sink.take();
         self.mv_repository.take();
+        self.coordination.take();
         if let Some(host) = self.state_store_host.as_mut() {
             if let Err(error) = host
                 .shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)

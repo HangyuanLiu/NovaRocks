@@ -196,7 +196,6 @@ impl DeleteEngine for Arc<StandaloneState> {
             .any(|report| report.summary().artifact_count > 0);
         if !has_staged_output {
             completion
-                .session()
                 .finish_known_empty_noop()
                 .map_err(|error| error.to_string())?;
             return Ok(DeleteWriteReport::NoOp);

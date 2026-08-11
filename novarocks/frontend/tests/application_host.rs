@@ -32,8 +32,9 @@ use novarocks_frontend::{
 };
 use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
 use novarocks_state_store::{
-    SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig,
+    OperationId, SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig,
+    StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
+    coordination::{ControlPlaneMode, CoordinationErrorKind, IncarnationGate},
 };
 use sqlparser::ast::{Query, Statement};
 use sqlparser::parser::Parser;
@@ -251,6 +252,36 @@ async fn sqlite_host_reopens_dml_journal_after_shutdown() {
             .expect("reopened DML journal")
             .is_empty()
     );
+    reopened.shutdown().await.expect("reopened shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let config = sqlite_config(&temp);
+    let host = open_host(Some(config.clone())).await.expect("first host");
+    let store = host.state_store().expect("configured StateStore");
+    let gate = IncarnationGate::new(store);
+    let initial = gate.load().await.expect("bootstrapped control plane");
+    assert_eq!(initial.mode(), ControlPlaneMode::WriteOpen);
+    let reconciling = gate
+        .begin_restore(&initial, OperationId::new_v7())
+        .await
+        .expect("close writes for restore");
+    drop(gate);
+    host.shutdown().await.expect("first shutdown");
+
+    let reopened = open_host(Some(config)).await.expect("reopened host");
+    let gate = IncarnationGate::new(reopened.state_store().expect("reopened StateStore"));
+    let preserved = gate.load().await.expect("preserved control plane");
+    assert_eq!(preserved.mode(), ControlPlaneMode::Reconciling);
+    assert_eq!(preserved.incarnation(), reconciling.incarnation());
+    let error = gate
+        .admit_writes()
+        .await
+        .expect_err("host open must not reopen writes");
+    assert_eq!(error.kind(), CoordinationErrorKind::WriteClosed);
+    drop(gate);
     reopened.shutdown().await.expect("reopened shutdown");
 }
 

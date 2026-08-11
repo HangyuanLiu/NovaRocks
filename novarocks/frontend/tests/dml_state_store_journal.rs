@@ -17,31 +17,48 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use novarocks_frontend::dml::journal::{
+    DmlIntentAdmissionValidator, DmlMutationAuthority, DmlMutationAuthorityValidator,
+    dml_operation_resource_key,
+};
 use novarocks_frontend::dml::model::{
     CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
-    DML_CTAS_FACT_ENCODED_LIMIT, DML_CTAS_TOTAL_FACT_ENCODED_LIMIT,
-    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_OPERATION_SCHEMA_VERSION,
+    DML_COORDINATION_RESOURCE_CODEC_VERSION, DML_CTAS_FACT_ENCODED_LIMIT,
+    DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
+    DML_OPERATION_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE,
+};
+use novarocks_frontend::dml::model::{
+    DmlCoordinationClaimRequest, DmlCoordinationProvenance, DmlFencingTokenV1,
+    DmlRecoveryDueRescheduleRequest,
 };
 use novarocks_frontend::dml::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
     ConnectorWriteFailureKind, ConnectorWriteFailureRecord, ConnectorWriteLifecycleRecord,
     CreatePreparingRequest, CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
-    DmlErrorKind, DmlOperationId, DurableExternalFact, DurableMutationSummary, ExternalFactOutcome,
-    OperationFact, OperationJournal, OperationKind, OperationMutationRequest, OperationPayload,
-    OperationState, OperationTarget, SourceScopeOwnership, StateStoreOperationJournal,
-    StatementNextAction, StoredOperation, TruncateLifecyclePhase, TruncateLifecycleRecord,
+    DmlError, DmlErrorKind, DmlOperationId, DurableExternalFact, DurableMutationSummary,
+    ExternalFactOutcome, OperationFact, OperationJournal, OperationKind, OperationMutationRequest,
+    OperationPayload, OperationState, OperationTarget, SourceScopeOwnership,
+    StateStoreOperationJournal, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
+    TruncateLifecycleRecord,
 };
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome as StateStoreCommitOutcome, CommitResolution,
     FeDeploymentView, Key, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, WriteTransaction,
+};
+use novarocks_state_store::OperationId;
+use novarocks_state_store::coordination::{
+    AcquireOutcome, AttemptId, ClockHealth, ControlPlaneIncarnation, CoordinationError,
+    CoordinationErrorKind, FencingToken, HolderId, IncarnationGate, LeaseClock, LeaseFence,
+    LeaseGuard, LeaseManager, LeaseSettings, ResourceEpoch, WriteAdmission,
 };
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -50,6 +67,7 @@ use novarocks_state_store::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::{Uuid, Version};
 
 const OPERATION_PREFIX: &str = "novarocks/frontend/dml/v1/operations/";
@@ -184,6 +202,8 @@ fn raw_operation_with_kind(operation_id: Uuid, schema_version: u8, operation_kin
         "base_snapshot_map": {},
         "staged_artifacts": [],
         "payload": {"kind": "CONNECTOR_WRITE_LIFECYCLE", "details": {"outcome": "PENDING"}},
+        "coordination_provenance": null,
+        "recovery_due_at_ms": 1,
         "created_at_ms": 1,
         "updated_at_ms": 1,
         "finished_at_ms": null
@@ -197,6 +217,909 @@ fn raw_unfinished(operation_id: Uuid) -> Value {
         "operation_id": operation_id,
     });
     Value::try_from(Bytes::from(serde_json::to_vec(&value).unwrap())).unwrap()
+}
+
+#[derive(Default)]
+struct TestTransactionValidator {
+    calls: AtomicUsize,
+}
+
+impl TestTransactionValidator {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn validate(&self) -> Result<(), DmlError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DmlIntentAdmissionValidator for TestTransactionValidator {
+    async fn validate_in(&self, _transaction: &mut dyn WriteTransaction) -> Result<(), DmlError> {
+        self.validate()
+    }
+}
+
+#[async_trait]
+impl DmlMutationAuthorityValidator for TestTransactionValidator {
+    async fn validate_in(&self, _transaction: &mut dyn WriteTransaction) -> Result<(), DmlError> {
+        self.validate()
+    }
+}
+
+struct ManualDmlLeaseClock {
+    wall_ms: AtomicU64,
+    monotonic_ms: AtomicU64,
+    health: AtomicU8,
+    wall_readable: AtomicBool,
+}
+
+impl ManualDmlLeaseClock {
+    fn new(wall_ms: u64, monotonic_ms: u64) -> Self {
+        Self {
+            wall_ms: AtomicU64::new(wall_ms),
+            monotonic_ms: AtomicU64::new(monotonic_ms),
+            health: AtomicU8::new(0),
+            wall_readable: AtomicBool::new(true),
+        }
+    }
+
+    fn wall_ms(&self) -> u64 {
+        self.wall_ms.load(Ordering::SeqCst)
+    }
+
+    fn advance_wall(&self, millis: u64) {
+        self.wall_ms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(millis)
+            })
+            .expect("manual DML wall clock overflow");
+    }
+
+    fn advance_monotonic(&self, millis: u64) {
+        self.monotonic_ms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(millis)
+            })
+            .expect("manual DML monotonic clock overflow");
+    }
+
+    fn set_health(&self, health: ClockHealth) {
+        let encoded = match health {
+            ClockHealth::Healthy => 0,
+            ClockHealth::Unsafe => 1,
+            ClockHealth::Unknown => 2,
+        };
+        self.health.store(encoded, Ordering::SeqCst);
+    }
+}
+
+impl LeaseClock for ManualDmlLeaseClock {
+    fn wall_time_millis(&self) -> Result<u64, CoordinationError> {
+        if !self.wall_readable.load(Ordering::SeqCst) {
+            return Err(CoordinationError::clock_unsafe());
+        }
+        Ok(self.wall_ms())
+    }
+
+    fn monotonic_time_millis(&self) -> u64 {
+        self.monotonic_ms.load(Ordering::SeqCst)
+    }
+
+    fn health(&self) -> ClockHealth {
+        match self.health.load(Ordering::SeqCst) {
+            0 => ClockHealth::Healthy,
+            1 => ClockHealth::Unsafe,
+            _ => ClockHealth::Unknown,
+        }
+    }
+}
+
+type CoordinationRejection = Arc<Mutex<Option<CoordinationErrorKind>>>;
+
+fn dml_validator_rejection(
+    kind: CoordinationErrorKind,
+    observed: &CoordinationRejection,
+) -> DmlError {
+    *observed.lock().expect("coordination rejection lock") = Some(kind);
+    match DmlMutationAuthority::try_new(Uuid::nil(), Arc::new(TestTransactionValidator::default()))
+    {
+        Err(error) => error,
+        Ok(_) => panic!("nil UUID must not construct DML authority"),
+    }
+}
+
+struct Cp1AdmissionValidator {
+    admission: WriteAdmission,
+    observed: CoordinationRejection,
+}
+
+#[async_trait]
+impl DmlIntentAdmissionValidator for Cp1AdmissionValidator {
+    async fn validate_in(&self, transaction: &mut dyn WriteTransaction) -> Result<(), DmlError> {
+        self.admission
+            .validate_in(transaction)
+            .await
+            .map_err(|error| dml_validator_rejection(error.kind(), &self.observed))
+    }
+}
+
+enum Cp1FenceSource {
+    Current(Arc<AsyncMutex<LeaseGuard>>),
+    Static(LeaseFence),
+}
+
+struct Cp1AuthorityValidator {
+    source: Cp1FenceSource,
+    observed: CoordinationRejection,
+}
+
+#[async_trait]
+impl DmlMutationAuthorityValidator for Cp1AuthorityValidator {
+    async fn validate_in(&self, transaction: &mut dyn WriteTransaction) -> Result<(), DmlError> {
+        let result = match &self.source {
+            Cp1FenceSource::Current(guard) => {
+                guard.lock().await.fence().validate_in(transaction).await
+            }
+            Cp1FenceSource::Static(fence) => fence.validate_in(transaction).await,
+        };
+        result.map_err(|error| dml_validator_rejection(error.kind(), &self.observed))
+    }
+}
+
+fn lease_settings() -> LeaseSettings {
+    LeaseSettings::new(
+        Duration::from_secs(15),
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    )
+    .unwrap()
+}
+
+fn holder_id(holder_uuid: Uuid) -> HolderId {
+    HolderId::try_from(Bytes::from(format!(
+        "novarocks/frontend/test-holder/v1/{holder_uuid}"
+    )))
+    .unwrap()
+}
+
+fn acquired(outcome: AcquireOutcome) -> LeaseGuard {
+    match outcome {
+        AcquireOutcome::Acquired(guard) => guard,
+        AcquireOutcome::Contended(_) => panic!("expected acquired lease, found contention"),
+        AcquireOutcome::AwaitingTakeover(_) => {
+            panic!("expected acquired lease, found takeover observation")
+        }
+    }
+}
+
+fn current_authority(
+    attempt_uuid: Uuid,
+    guard: Arc<AsyncMutex<LeaseGuard>>,
+    observed: CoordinationRejection,
+) -> DmlMutationAuthority {
+    DmlMutationAuthority::try_new(
+        attempt_uuid,
+        Arc::new(Cp1AuthorityValidator {
+            source: Cp1FenceSource::Current(guard),
+            observed,
+        }),
+    )
+    .unwrap()
+}
+
+async fn real_provenance(
+    holder_uuid: Uuid,
+    attempt_uuid: Uuid,
+    guard: &Arc<AsyncMutex<LeaseGuard>>,
+    acquired_at_ms: i64,
+) -> DmlCoordinationProvenance {
+    let token = guard.lock().await.token().clone();
+    DmlCoordinationProvenance {
+        resource_codec_version: DML_COORDINATION_RESOURCE_CODEC_VERSION,
+        holder_id: holder_uuid,
+        coordination_attempt_id: attempt_uuid,
+        fencing_token: DmlFencingTokenV1::try_from_token(&token).unwrap(),
+        acquired_at_ms,
+    }
+}
+
+fn coordination_provenance(
+    holder_id: Uuid,
+    coordination_attempt_id: Uuid,
+    acquired_at_ms: i64,
+) -> DmlCoordinationProvenance {
+    let token = FencingToken::new(
+        "dml-journal-test",
+        ControlPlaneIncarnation::new(1).unwrap(),
+        ResourceEpoch::new(1).unwrap(),
+    )
+    .unwrap();
+    DmlCoordinationProvenance {
+        resource_codec_version: DML_COORDINATION_RESOURCE_CODEC_VERSION,
+        holder_id,
+        coordination_attempt_id,
+        fencing_token: DmlFencingTokenV1::try_from_token(&token).unwrap(),
+        acquired_at_ms,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admitted_claim_and_authority_validation_share_state_store_transactions() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission.clone())
+        .unwrap();
+    assert_eq!(admission.calls(), 1);
+
+    let attempt = Uuid::now_v7();
+    let claim_admission = Arc::new(TestTransactionValidator::default());
+    let authority_validator = Arc::new(TestTransactionValidator::default());
+    let authority = DmlMutationAuthority::try_new(attempt, authority_validator.clone()).unwrap();
+    let claimed = journal
+        .claim_operation_admitted(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: coordination_provenance(Uuid::now_v7(), attempt, 100),
+                recovery_due_at_ms: 500,
+            },
+            claim_admission.clone(),
+            authority,
+        )
+        .unwrap();
+    assert_eq!(claimed.schema_version, 5);
+    assert_eq!(claimed.revision, 2);
+    assert_eq!(claimed.recovery_due_at_ms, Some(500));
+    assert_eq!(
+        claimed
+            .coordination_provenance
+            .as_ref()
+            .unwrap()
+            .coordination_attempt_id,
+        attempt
+    );
+    assert_eq!(authority_validator.calls(), 1);
+    assert_eq!(claim_admission.calls(), 1);
+
+    let stale_attempt = Uuid::now_v7();
+    let stale_validator = Arc::new(TestTransactionValidator::default());
+    let stale_authority =
+        DmlMutationAuthority::try_new(stale_attempt, stale_validator.clone()).unwrap();
+    let error = journal
+        .reschedule_recovery_due(
+            DmlRecoveryDueRescheduleRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery_due_at_ms: Some(600),
+            },
+            stale_authority,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnresolved);
+    assert_eq!(stale_validator.calls(), 1);
+    assert_eq!(journal.load(operation_id).unwrap(), Some(claimed));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_due_index_is_sortable_fenced_and_removed_only_after_convergence() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap();
+    let shard = (0..journal.recovery_shard_count())
+        .find(|shard| {
+            journal
+                .recovery_candidates(*shard, 18_100)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.operation_id == operation_id)
+        })
+        .unwrap();
+    assert!(
+        journal
+            .recovery_candidates(shard, 18_099)
+            .unwrap()
+            .is_empty()
+    );
+
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let claimed = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: coordination_provenance(Uuid::now_v7(), attempt, 100),
+                recovery_due_at_ms: 500,
+            },
+            authority(),
+        )
+        .unwrap();
+    assert!(journal.recovery_candidates(shard, 499).unwrap().is_empty());
+    let candidates = journal.recovery_candidates(shard, 500).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].operation_revision, claimed.revision);
+    assert_eq!(candidates[0].last_mutation_id, claimed.last_mutation_id);
+    assert_eq!(candidates[0].coordination_attempt_id, Some(attempt));
+
+    let aborting = journal
+        .transition_authorized(
+            operation_id,
+            claimed.revision,
+            Uuid::now_v7(),
+            OperationState::Aborting,
+            Some(600),
+            authority(),
+        )
+        .unwrap();
+    let aborted = journal
+        .transition_authorized(
+            operation_id,
+            aborting.revision,
+            Uuid::now_v7(),
+            OperationState::Aborted,
+            None,
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(aborted.recovery_due_at_ms, None);
+    assert!(
+        journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(validator.calls(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_due_candidate_page_is_bounded_to_128() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let target_shard = 0_u8;
+    let mut operation_ids = Vec::new();
+    while operation_ids.len() <= DML_RECOVERY_PAGE_SIZE {
+        let operation_id = DmlOperationId::new_v7();
+        if Sha256::digest(operation_id.as_uuid().as_bytes())[0] & 15 == target_shard {
+            operation_ids.push(operation_id);
+        }
+    }
+    for operation_id in operation_ids {
+        journal
+            .create_statement_operation_admitted(
+                statement_request(
+                    operation_id,
+                    Uuid::now_v7(),
+                    OperationKind::CreateTableAsSelect,
+                    ctas_payload(CtasSagaPhase::PreparingSource),
+                ),
+                admission.clone(),
+            )
+            .unwrap();
+    }
+    let candidates = journal.recovery_candidates(target_shard, 18_200).unwrap();
+    assert_eq!(candidates.len(), DML_RECOVERY_PAGE_SIZE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_cp1_dynamic_current_fence_survives_renew_and_release_fences_journal() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    gate.bootstrap(OperationId::new_v7()).await.unwrap();
+    let admission_rejection = Arc::new(Mutex::new(None));
+    let operation_id = journal
+        .create_preparing_admitted(
+            request(),
+            Arc::new(Cp1AdmissionValidator {
+                admission: gate.admit_writes().await.unwrap(),
+                observed: Arc::clone(&admission_rejection),
+            }),
+        )
+        .unwrap();
+    assert_eq!(*admission_rejection.lock().unwrap(), None);
+
+    let clock = Arc::new(ManualDmlLeaseClock::new(100_000, 10_000));
+    let holder_a = Uuid::now_v7();
+    let holder_b = Uuid::now_v7();
+    let manager_a = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_a),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let manager_b = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_b),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let resource = dml_operation_resource_key(operation_id).unwrap();
+    let attempt_a_uuid = Uuid::now_v7();
+    let attempt_a = AttemptId::try_from(attempt_a_uuid).unwrap();
+    let guard = Arc::new(AsyncMutex::new(acquired(
+        manager_a
+            .acquire(resource.clone(), attempt_a, OperationId::new_v7())
+            .await
+            .unwrap(),
+    )));
+    let current_rejection = Arc::new(Mutex::new(None));
+    let claimed = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(
+                    holder_a,
+                    attempt_a_uuid,
+                    &guard,
+                    clock.wall_ms() as i64,
+                )
+                .await,
+                recovery_due_at_ms: 100_100,
+            },
+            current_authority(
+                attempt_a_uuid,
+                Arc::clone(&guard),
+                Arc::clone(&current_rejection),
+            ),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        manager_b
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(Uuid::now_v7()).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+        AcquireOutcome::Contended(_)
+    ));
+
+    let old_fence = guard.lock().await.fence();
+    clock.advance_wall(5_000);
+    guard
+        .lock()
+        .await
+        .renew(OperationId::new_v7())
+        .await
+        .unwrap();
+
+    let static_rejection = Arc::new(Mutex::new(None));
+    let static_authority = DmlMutationAuthority::try_new(
+        attempt_a_uuid,
+        Arc::new(Cp1AuthorityValidator {
+            source: Cp1FenceSource::Static(old_fence),
+            observed: Arc::clone(&static_rejection),
+        }),
+    )
+    .unwrap();
+    let static_error = journal
+        .transition_authorized(
+            operation_id,
+            claimed.revision,
+            Uuid::now_v7(),
+            OperationState::Writing,
+            Some(105_100),
+            static_authority,
+        )
+        .unwrap_err();
+    assert_eq!(static_error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *static_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed);
+
+    let writing = journal
+        .transition_authorized(
+            operation_id,
+            claimed.revision,
+            Uuid::now_v7(),
+            OperationState::Writing,
+            Some(105_100),
+            current_authority(
+                attempt_a_uuid,
+                Arc::clone(&guard),
+                Arc::clone(&current_rejection),
+            ),
+        )
+        .unwrap();
+    assert_eq!(*current_rejection.lock().unwrap(), None);
+
+    let stale_revision = journal
+        .transition_authorized(
+            operation_id,
+            claimed.revision,
+            Uuid::now_v7(),
+            OperationState::CommitUnknown,
+            Some(105_200),
+            current_authority(
+                attempt_a_uuid,
+                Arc::clone(&guard),
+                Arc::new(Mutex::new(None)),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(stale_revision.kind(), DmlErrorKind::JournalUnresolved);
+
+    let stale_attempt = journal
+        .transition_authorized(
+            operation_id,
+            writing.revision,
+            Uuid::now_v7(),
+            OperationState::CommitUnknown,
+            Some(105_200),
+            current_authority(
+                Uuid::now_v7(),
+                Arc::clone(&guard),
+                Arc::new(Mutex::new(None)),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(stale_attempt.kind(), DmlErrorKind::JournalUnresolved);
+
+    guard
+        .lock()
+        .await
+        .release(OperationId::new_v7())
+        .await
+        .unwrap();
+    let released_rejection = Arc::new(Mutex::new(None));
+    let released_error = journal
+        .transition_authorized(
+            operation_id,
+            writing.revision,
+            Uuid::now_v7(),
+            OperationState::CommitUnknown,
+            Some(105_200),
+            current_authority(
+                attempt_a_uuid,
+                Arc::clone(&guard),
+                Arc::clone(&released_rejection),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(released_error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *released_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), writing);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_cp1_two_holder_takeover_and_restore_invalidate_old_journal_authority() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    let open = gate.bootstrap(OperationId::new_v7()).await.unwrap();
+    let admission_rejection = Arc::new(Mutex::new(None));
+    let admission = Arc::new(Cp1AdmissionValidator {
+        admission: gate.admit_writes().await.unwrap(),
+        observed: Arc::clone(&admission_rejection),
+    });
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission.clone())
+        .unwrap();
+
+    let clock = Arc::new(ManualDmlLeaseClock::new(500_000, 20_000));
+    let holder_a = Uuid::now_v7();
+    let holder_b = Uuid::now_v7();
+    let manager_a = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_a),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let manager_b = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_b),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let resource = dml_operation_resource_key(operation_id).unwrap();
+    let attempt_a_uuid = Uuid::now_v7();
+    let attempt_b_uuid = Uuid::now_v7();
+    let guard_a = Arc::new(AsyncMutex::new(acquired(
+        manager_a
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_a_uuid).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+    let claimed_a = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(
+                    holder_a,
+                    attempt_a_uuid,
+                    &guard_a,
+                    clock.wall_ms() as i64,
+                )
+                .await,
+                recovery_due_at_ms: 500_100,
+            },
+            current_authority(
+                attempt_a_uuid,
+                Arc::clone(&guard_a),
+                Arc::new(Mutex::new(None)),
+            ),
+        )
+        .unwrap();
+
+    clock.advance_wall(16_001);
+    assert!(matches!(
+        manager_b
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_b_uuid).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(1_999);
+    assert!(matches!(
+        manager_b
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_b_uuid).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(1);
+    let guard_b = Arc::new(AsyncMutex::new(acquired(
+        manager_b
+            .acquire(
+                resource,
+                AttemptId::try_from(attempt_b_uuid).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+
+    let old_holder_rejection = Arc::new(Mutex::new(None));
+    let old_holder_error = journal
+        .transition_authorized(
+            operation_id,
+            claimed_a.revision,
+            Uuid::now_v7(),
+            OperationState::Writing,
+            Some(516_100),
+            current_authority(
+                attempt_a_uuid,
+                Arc::clone(&guard_a),
+                Arc::clone(&old_holder_rejection),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(old_holder_error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *old_holder_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed_a);
+
+    let claimed_b = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(
+                    holder_b,
+                    attempt_b_uuid,
+                    &guard_b,
+                    clock.wall_ms() as i64,
+                )
+                .await,
+                recovery_due_at_ms: 516_100,
+            },
+            current_authority(
+                attempt_b_uuid,
+                Arc::clone(&guard_b),
+                Arc::new(Mutex::new(None)),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        claimed_b
+            .coordination_provenance
+            .as_ref()
+            .unwrap()
+            .holder_id,
+        holder_b
+    );
+
+    let restoring = gate
+        .begin_restore(&open, OperationId::new_v7())
+        .await
+        .unwrap();
+    let restore_rejection = Arc::new(Mutex::new(None));
+    let restore_error = journal
+        .transition_authorized(
+            operation_id,
+            claimed_b.revision,
+            Uuid::now_v7(),
+            OperationState::Writing,
+            Some(516_200),
+            current_authority(
+                attempt_b_uuid,
+                Arc::clone(&guard_b),
+                Arc::clone(&restore_rejection),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(restore_error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *restore_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::IncarnationChanged)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed_b);
+
+    let admission_error = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap_err();
+    assert_eq!(admission_error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *admission_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::IncarnationChanged)
+    );
+    assert_eq!(journal.list_operations().unwrap().len(), 1);
+
+    let release_error = guard_b
+        .lock()
+        .await
+        .release(OperationId::new_v7())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        release_error.kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    gate.open_writes(&restoring, OperationId::new_v7())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_cp1_foreground_claim_revalidates_intent_admission_after_restore_starts() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    let open = gate.bootstrap(OperationId::new_v7()).await.unwrap();
+    let admission_rejection = Arc::new(Mutex::new(None));
+    let admission = Arc::new(Cp1AdmissionValidator {
+        admission: gate.admit_writes().await.unwrap(),
+        observed: Arc::clone(&admission_rejection),
+    });
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission.clone())
+        .unwrap();
+    let before_claim = journal.load(operation_id).unwrap().unwrap();
+
+    gate.begin_restore(&open, OperationId::new_v7())
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualDmlLeaseClock::new(600_000, 30_000));
+    let holder = Uuid::now_v7();
+    let manager = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let attempt_uuid = Uuid::now_v7();
+    let guard = Arc::new(AsyncMutex::new(acquired(
+        manager
+            .acquire(
+                dml_operation_resource_key(operation_id).unwrap(),
+                AttemptId::try_from(attempt_uuid).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+
+    let error = journal
+        .claim_operation_admitted(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: before_claim.revision,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(holder, attempt_uuid, &guard, clock.wall_ms() as i64)
+                    .await,
+                recovery_due_at_ms: 600_100,
+            },
+            admission,
+            current_authority(attempt_uuid, guard, Arc::new(Mutex::new(None))),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *admission_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::IncarnationChanged)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), before_claim);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_cp1_clock_unsafe_fails_renew_and_new_acquire_closed() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, _journal) = open_store(&temp.path().join("state.sqlite")).await;
+    IncarnationGate::new(Arc::clone(&store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualDmlLeaseClock::new(900_000, 30_000));
+    let manager = LeaseManager::new(
+        store,
+        holder_id(Uuid::now_v7()),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let mut guard = acquired(
+        manager
+            .acquire(
+                dml_operation_resource_key(DmlOperationId::new_v7()).unwrap(),
+                AttemptId::try_from(Uuid::now_v7()).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    );
+    clock.set_health(ClockHealth::Unsafe);
+    assert_eq!(
+        guard.renew(OperationId::new_v7()).await.unwrap_err().kind(),
+        CoordinationErrorKind::ClockUnsafe
+    );
+    assert_eq!(
+        manager
+            .acquire(
+                dml_operation_resource_key(DmlOperationId::new_v7()).unwrap(),
+                AttemptId::try_from(Uuid::now_v7()).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        CoordinationErrorKind::ClockUnsafe
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -531,7 +1454,7 @@ async fn illegal_transition_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unknown_schema_version_fails_open() {
+async fn unknown_schema_version_is_rejected_on_read_without_open_scan() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.sqlite");
     let (_host, store, journal) = open_store(&path).await;
@@ -543,11 +1466,13 @@ async fn unknown_schema_version_fails_open() {
         raw_operation(operation_id, 99),
     )
     .await;
-    let error =
+    let reopened =
         StateStoreOperationJournal::open(Arc::clone(&store), tokio::runtime::Handle::current())
             .await
-            .err()
-            .expect("unknown schema must fail open");
+            .expect("journal open must not scan operation records");
+    let error = reopened
+        .load(DmlOperationId::from(operation_id))
+        .expect_err("unknown schema must fail when read");
     assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
 }
 
@@ -565,11 +1490,13 @@ async fn key_value_operation_identity_mismatch_is_corruption() {
         raw_operation(value_id, DML_OPERATION_SCHEMA_VERSION),
     )
     .await;
-    let error =
+    let reopened =
         StateStoreOperationJournal::open(Arc::clone(&store), tokio::runtime::Handle::current())
             .await
-            .err()
-            .expect("identity mismatch must fail open");
+            .expect("journal open must not scan operation records");
+    let error = reopened
+        .load(DmlOperationId::from(key_id))
+        .expect_err("identity mismatch must fail when read");
     assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
     assert!(error.to_string().contains("identity mismatch"));
 }
@@ -848,6 +1775,8 @@ fn stored_statement_operation(
         base_snapshot_map: BTreeMap::new(),
         staged_artifacts: Vec::new(),
         payload,
+        coordination_provenance: None,
+        recovery_due_at_ms: Some(200),
         created_at_ms: 200,
         updated_at_ms: 200,
         finished_at_ms: None,
@@ -922,7 +1851,7 @@ fn add_files_planned(plan: &AddFilesArtifactDescriptor, scope_digest: &str) -> O
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn add_files_atomic_reservation_rejects_conflicts_and_restart_releases_undispatched_work() {
+async fn add_files_restart_open_is_read_only_and_preserves_reservation() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.sqlite");
     let (host, store, journal) = open_store(&path).await;
@@ -999,23 +1928,17 @@ async fn add_files_atomic_reservation_rejects_conflicts_and_restart_releases_und
     drop(host);
     let (_host, _store, recovered) = open_store(&path).await;
     let recovered_first = recovered.load(first_id).unwrap().unwrap();
-    assert_eq!(
-        recovered_first.state,
-        OperationState::FailedKnownUncommitted
-    );
+    assert_eq!(recovered_first, first_planned);
     assert!(
         recovered
             .list_unfinished()
             .unwrap()
             .iter()
-            .all(|op| op.operation_id != first_id)
+            .any(|operation| operation.operation_id == first_id)
     );
 
     let second_after_recovery = recovered.load(second_id).unwrap().unwrap();
-    assert_eq!(
-        second_after_recovery.state,
-        OperationState::FailedKnownUncommitted
-    );
+    assert_eq!(second_after_recovery, second);
     let third_id = DmlOperationId::new_v7();
     let third = recovered
         .create_statement_operation(statement_request(
@@ -1025,7 +1948,7 @@ async fn add_files_atomic_reservation_rejects_conflicts_and_restart_releases_und
             add_files_preparing(),
         ))
         .unwrap();
-    recovered
+    let conflict_after_restart = recovered
         .apply_add_files_mutation(AddFilesMutationRequest {
             operation: OperationMutationRequest {
                 operation_id: third_id,
@@ -1041,7 +1964,11 @@ async fn add_files_atomic_reservation_rejects_conflicts_and_restart_releases_und
                 ownership: SourceScopeOwnership::ReservedImmutable,
             }),
         })
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(
+        conflict_after_restart.kind(),
+        DmlErrorKind::JournalUnresolved
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

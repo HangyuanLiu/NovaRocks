@@ -15,14 +15,196 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use novarocks_spi::state_store::WriteTransaction;
+use novarocks_state_store::coordination::ResourceKey;
+use uuid::{Uuid, Version};
+
 use crate::dml::error::DmlError;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesMutationRequest, CreatePreparingRequest,
-    CreateStatementOperationRequest, DmlOperationId, OperationFact, OperationMutationRequest,
-    OperationState, StoredOperation,
+    CreateStatementOperationRequest, DML_COORDINATION_RESOURCE_CODEC_VERSION,
+    DML_RECOVERY_SHARD_COUNT, DmlCoordinationClaimRequest, DmlOperationId, DmlRecoveryCandidate,
+    DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest, OperationState,
+    StoredOperation,
 };
 
+#[async_trait]
+pub trait DmlIntentAdmissionValidator: Send + Sync {
+    async fn validate_in(&self, transaction: &mut dyn WriteTransaction) -> Result<(), DmlError>;
+}
+
+#[async_trait]
+pub trait DmlMutationAuthorityValidator: Send + Sync {
+    async fn validate_in(&self, transaction: &mut dyn WriteTransaction) -> Result<(), DmlError>;
+}
+
+/// Dynamic authority for one operation attempt. The validator must project
+/// the latest live fence on every invocation; callers must not capture the
+/// fence returned by the original acquire across renewals.
+#[derive(Clone)]
+pub struct DmlMutationAuthority {
+    coordination_attempt_id: Uuid,
+    validator: Arc<dyn DmlMutationAuthorityValidator>,
+}
+
+impl DmlMutationAuthority {
+    pub fn try_new(
+        coordination_attempt_id: Uuid,
+        validator: Arc<dyn DmlMutationAuthorityValidator>,
+    ) -> Result<Self, DmlError> {
+        if coordination_attempt_id.get_version() != Some(Version::SortRand)
+            || coordination_attempt_id.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err(DmlError::journal_corruption(
+                "DML coordination attempt id must be UUIDv7",
+            ));
+        }
+        Ok(Self {
+            coordination_attempt_id,
+            validator,
+        })
+    }
+
+    pub const fn coordination_attempt_id(&self) -> Uuid {
+        self.coordination_attempt_id
+    }
+
+    pub fn validator(&self) -> &Arc<dyn DmlMutationAuthorityValidator> {
+        &self.validator
+    }
+}
+
+pub fn dml_operation_resource_key(operation_id: DmlOperationId) -> Result<ResourceKey, DmlError> {
+    debug_assert_eq!(DML_COORDINATION_RESOURCE_CODEC_VERSION, 1);
+    ResourceKey::try_from(Bytes::from(format!(
+        "novarocks/frontend/dml/operation/v1/{operation_id}"
+    )))
+    .map_err(DmlError::journal_corruption)
+}
+
 pub trait OperationJournal: Send + Sync {
+    fn create_preparing_admitted(
+        &self,
+        _request: CreatePreparingRequest,
+        _admission: Arc<dyn DmlIntentAdmissionValidator>,
+    ) -> Result<DmlOperationId, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "transaction-scoped DML intent admission is not supported by this journal",
+        ))
+    }
+
+    fn create_statement_operation_admitted(
+        &self,
+        _request: CreateStatementOperationRequest,
+        _admission: Arc<dyn DmlIntentAdmissionValidator>,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "transaction-scoped statement intent admission is not supported by this journal",
+        ))
+    }
+
+    fn claim_operation(
+        &self,
+        _request: DmlCoordinationClaimRequest,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "DML operation coordination claim is not supported by this journal",
+        ))
+    }
+
+    fn claim_operation_admitted(
+        &self,
+        _request: DmlCoordinationClaimRequest,
+        _admission: Arc<dyn DmlIntentAdmissionValidator>,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "transaction-scoped foreground DML claim admission is not supported by this journal",
+        ))
+    }
+
+    fn transition_authorized(
+        &self,
+        _operation_id: DmlOperationId,
+        _expected_revision: u64,
+        _mutation_id: Uuid,
+        _to: OperationState,
+        _recovery_due_at_ms: Option<i64>,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "authorized DML transition is not supported by this journal",
+        ))
+    }
+
+    fn record_fact_authorized(
+        &self,
+        _operation_id: DmlOperationId,
+        _expected_revision: u64,
+        _mutation_id: Uuid,
+        _fact: OperationFact,
+        _recovery_due_at_ms: Option<i64>,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "authorized DML fact mutation is not supported by this journal",
+        ))
+    }
+
+    fn mutate_statement_operation_authorized(
+        &self,
+        _request: OperationMutationRequest,
+        _recovery_due_at_ms: Option<i64>,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "authorized statement DML mutation is not supported by this journal",
+        ))
+    }
+
+    fn apply_add_files_mutation_authorized(
+        &self,
+        _request: AddFilesMutationRequest,
+        _recovery_due_at_ms: Option<i64>,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "authorized ADD FILES mutation is not supported by this journal",
+        ))
+    }
+
+    fn recovery_candidates(
+        &self,
+        _shard: u8,
+        _due_at_or_before_ms: i64,
+    ) -> Result<Vec<DmlRecoveryCandidate>, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "bounded DML recovery candidate scan is not supported by this journal",
+        ))
+    }
+
+    fn reschedule_recovery_due(
+        &self,
+        _request: DmlRecoveryDueRescheduleRequest,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "fenced DML recovery reschedule is not supported by this journal",
+        ))
+    }
+
+    fn recovery_shard_count(&self) -> u8 {
+        DML_RECOVERY_SHARD_COUNT
+    }
+
+    // Focused-test compatibility surface for pre-coordination fake journals.
+    // FrontendApplicationHost never composes the unfenced DmlService mode;
+    // production routes use only the admitted/authorized methods above.
     fn create_preparing(&self, request: CreatePreparingRequest)
     -> Result<DmlOperationId, DmlError>;
     fn transition(&self, operation_id: DmlOperationId, to: OperationState) -> Result<(), DmlError>;
@@ -147,6 +329,8 @@ pub(crate) mod testing {
                 payload: OperationPayload::ConnectorWriteLifecycle(
                     ConnectorWriteLifecycleRecord::Pending,
                 ),
+                coordination_provenance: None,
+                recovery_due_at_ms: Some(request.created_at_ms),
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,
@@ -175,6 +359,7 @@ pub(crate) mod testing {
             operation.updated_at_ms = now_unix_millis();
             if to.is_finished() {
                 operation.finished_at_ms = Some(operation.updated_at_ms);
+                operation.recovery_due_at_ms = None;
             }
             Ok(())
         }
@@ -206,6 +391,7 @@ pub(crate) mod testing {
             operation.updated_at_ms = now_unix_millis();
             if fact.state.is_finished() {
                 operation.finished_at_ms = Some(operation.updated_at_ms);
+                operation.recovery_due_at_ms = None;
             }
             Ok(())
         }
@@ -261,6 +447,8 @@ pub(crate) mod testing {
                 base_snapshot_map: BTreeMap::new(),
                 staged_artifacts: Vec::new(),
                 payload: request.payload,
+                coordination_provenance: None,
+                recovery_due_at_ms: Some(request.created_at_ms),
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,

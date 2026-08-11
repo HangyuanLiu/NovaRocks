@@ -489,6 +489,8 @@ impl OperationJournal for FakeJournal {
             base_snapshot_map: BTreeMap::new(),
             staged_artifacts: Vec::new(),
             payload: request.payload,
+            coordination_provenance: None,
+            recovery_due_at_ms: None,
             created_at_ms: request.created_at_ms,
             updated_at_ms: request.created_at_ms,
             finished_at_ms: None,

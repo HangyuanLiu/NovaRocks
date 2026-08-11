@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, Value,
+    WriteTransaction,
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
@@ -31,24 +32,28 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
 
 use crate::dml::error::DmlError;
-use crate::dml::journal::OperationJournal;
+use crate::dml::journal::{DmlIntentAdmissionValidator, DmlMutationAuthority, OperationJournal};
 use crate::dml::model::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
     CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
     ConnectorWriteFinalizationRecord, ConnectorWriteLifecycleRecord, CreatePreparingRequest,
-    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DML_CTAS_FACT_ENCODED_LIMIT,
+    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
+    DML_COORDINATION_RESOURCE_CODEC_VERSION, DML_CTAS_FACT_ENCODED_LIMIT,
     DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
-    DML_OPERATION_SCHEMA_VERSION, DML_UNFINISHED_SCHEMA_VERSION, DmlOperationId,
-    DurableExternalFact, ExternalFactOutcome, OperationFact, OperationKind,
-    OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
-    SourceScopeOwnership, StatementNextAction, StoredOperation, validate_operation_transition,
-    validate_statement_operation_transition,
+    DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DML_OPERATION_SCHEMA_VERSION,
+    DML_RECOVERY_DUE_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE, DML_RECOVERY_SHARD_COUNT,
+    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest, DmlOperationId,
+    DmlRecoveryCandidate, DmlRecoveryDueRescheduleRequest, DurableExternalFact,
+    ExternalFactOutcome, OperationFact, OperationKind, OperationMutationRequest, OperationPayload,
+    OperationState, OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
+    validate_operation_transition, validate_statement_operation_transition,
 };
 use crate::dml::now_unix_millis;
 
 const OPERATION_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/operations/";
 const UNFINISHED_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/unfinished/";
+const RECOVERY_DUE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/recovery-due/";
 const ADD_FILES_ARTIFACT_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/add-files-artifacts/";
 const ADD_FILES_SOURCE_SCOPE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/add-files-source-scopes/";
 const ADD_FILES_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
@@ -71,6 +76,16 @@ struct StoredUnfinishedOperationV1 {
     operation_id: DmlOperationId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredRecoveryDueV1 {
+    schema_version: u8,
+    operation_id: DmlOperationId,
+    operation_revision: u64,
+    last_mutation_id: Uuid,
+    coordination_attempt_id: Option<Uuid>,
+    recovery_due_at_ms: i64,
+}
+
 #[derive(Clone)]
 pub struct StateStoreOperationJournal {
     store: Arc<dyn StateStore>,
@@ -81,260 +96,11 @@ pub struct StateStoreOperationJournal {
 impl StateStoreOperationJournal {
     pub async fn open(store: Arc<dyn StateStore>, runtime: Handle) -> Result<Self, DmlError> {
         let provider = store.metrics_snapshot().provider;
-        let journal = Self {
+        Ok(Self {
             store,
             runtime,
             metrics: Arc::new(StateStoreMetrics::new(provider)),
-        };
-        journal.validate_open_state().await?;
-        journal.recover_add_files_open_state().await?;
-        journal.validate_open_state().await?;
-        Ok(journal)
-    }
-
-    async fn validate_open_state(&self) -> Result<(), DmlError> {
-        let operations = self.scan_operations().await?;
-        let unfinished = self.scan_unfinished_ids().await?;
-        let indexed = unfinished.into_iter().collect::<BTreeSet<_>>();
-        for operation in &operations {
-            if operation.state.is_finished() && indexed.contains(&operation.operation_id) {
-                return Err(DmlError::journal_corruption(format!(
-                    "terminal DML operation {} remains in the unfinished index",
-                    operation.operation_id
-                )));
-            }
-            if !operation.state.is_finished() && !indexed.contains(&operation.operation_id) {
-                return Err(DmlError::journal_corruption(format!(
-                    "unfinished DML operation {} is missing its index",
-                    operation.operation_id
-                )));
-            }
-        }
-        let operation_ids = operations
-            .iter()
-            .map(|operation| operation.operation_id)
-            .collect::<BTreeSet<_>>();
-        if let Some(orphan) = indexed.difference(&operation_ids).next() {
-            return Err(DmlError::journal_corruption(format!(
-                "unfinished DML operation index {orphan} has no operation record"
-            )));
-        }
-        self.validate_add_files_artifact_state(&operations).await?;
-        Ok(())
-    }
-
-    async fn validate_add_files_artifact_state(
-        &self,
-        operations: &[StoredOperation],
-    ) -> Result<(), DmlError> {
-        let mut expected_artifact_keys = BTreeSet::new();
-        let mut expected_source_keys = BTreeSet::new();
-        for operation in operations {
-            let OperationPayload::AddFilesLifecycle(record) = &operation.payload else {
-                continue;
-            };
-            for descriptor in [
-                record.plan_artifact.as_ref(),
-                record.receipt_artifact.as_ref(),
-                record.evidence_artifact.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                self.load_add_files_artifact_async(operation.operation_id, descriptor.clone())
-                    .await?;
-                for index in 0..descriptor.chunk_count {
-                    expected_artifact_keys.insert(
-                        add_files_artifact_chunk_key(operation.operation_id, descriptor, index)?
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                }
-            }
-            // A contract failure may become possibly-dispatched before core
-            // returns a canonical source scope.  Freeze that operation for
-            // manual inspection, but never invent a source-index key from an
-            // untrusted/raw statement location.
-            if record.source_ownership != SourceScopeOwnership::Unclaimed
-                && record.source_scope_digest.is_some()
-            {
-                let provider_id = record.provider_id.as_deref().ok_or_else(|| {
-                    DmlError::journal_corruption("ADD FILES source owner has no provider")
-                })?;
-                let scope_digest = record.source_scope_digest.as_deref().ok_or_else(|| {
-                    DmlError::journal_corruption("ADD FILES source owner has no scope digest")
-                })?;
-                let key = add_files_source_scope_key(provider_id, scope_digest)?;
-                expected_source_keys.insert(key.as_bytes().to_vec());
-            }
-        }
-        for record in self.scan_prefix(ADD_FILES_ARTIFACT_PREFIX).await? {
-            if !expected_artifact_keys.contains(record.key.as_bytes()) {
-                return Err(DmlError::journal_corruption(
-                    "ADD FILES journal contains an orphan artifact chunk",
-                ));
-            }
-        }
-        let operation_by_id = operations
-            .iter()
-            .map(|operation| (operation.operation_id, operation))
-            .collect::<BTreeMap<_, _>>();
-        let mut actual_source_keys = BTreeSet::new();
-        for stored_source in self.scan_prefix(ADD_FILES_SOURCE_SCOPE_PREFIX).await? {
-            actual_source_keys.insert(stored_source.key.as_bytes().to_vec());
-            let source = decode_add_files_source_scope(&stored_source.key, stored_source.value)?;
-            let Some(operation) = operation_by_id.get(&source.operation_id) else {
-                return Err(DmlError::journal_corruption(
-                    "ADD FILES journal contains a source scope with no operation",
-                ));
-            };
-            let OperationPayload::AddFilesLifecycle(record) = &operation.payload else {
-                return Err(DmlError::journal_corruption(
-                    "ADD FILES source scope owner has a non-ADD-FILES operation",
-                ));
-            };
-            if record.provider_id.as_deref() != Some(source.provider_id.as_str())
-                || record.source_scope_digest.as_deref() != Some(source.scope_digest.as_str())
-                || record.source_ownership != source.ownership
-                || operation.target != source.target
-                || record.plan_digest.as_deref() != Some(source.plan_digest.as_str())
-                || !expected_source_keys.contains(stored_source.key.as_bytes())
-            {
-                return Err(DmlError::journal_corruption(
-                    "ADD FILES source scope conflicts with its durable operation",
-                ));
-            }
-        }
-        if actual_source_keys != expected_source_keys {
-            return Err(DmlError::journal_corruption(
-                "ADD FILES source scope ownership index is incomplete",
-            ));
-        }
-        Ok(())
-    }
-
-    /// No provider call is allowed while restoring the frontend journal.  A
-    /// prepared statement has not acquired a source scope yet and can be
-    /// failed closed; a planned but undispatched statement releases its
-    /// reservation; anything that might have crossed the provider boundary is
-    /// frozen for explicit operator inspection.
-    async fn recover_add_files_open_state(&self) -> Result<(), DmlError> {
-        for stored in self.scan_operations().await? {
-            if stored.operation_kind != OperationKind::AddFiles || stored.state.is_finished() {
-                continue;
-            }
-            let OperationPayload::AddFilesLifecycle(mut record) = stored.payload.clone() else {
-                return Err(DmlError::journal_corruption(
-                    "ADD FILES operation has a non-ADD-FILES lifecycle payload",
-                ));
-            };
-            let (state, source_action) = match record.phase {
-                AddFilesLifecyclePhase::Preparing => {
-                    record.phase = AddFilesLifecyclePhase::Failed;
-                    record.next_action = StatementNextAction::None;
-                    record.outcome = Some(DurableExternalFact {
-                        outcome: ExternalFactOutcome::KnownUncommitted,
-                        receipt: None,
-                        evidence: None,
-                        finalization_failure: None,
-                        failure: Some("frontend restart before ADD FILES planning".to_string()),
-                    });
-                    (OperationState::FailedKnownUncommitted, None)
-                }
-                AddFilesLifecyclePhase::Planned => {
-                    let provider_id = record.provider_id.clone().ok_or_else(|| {
-                        DmlError::journal_corruption("planned ADD FILES operation has no provider")
-                    })?;
-                    let scope_digest = record.source_scope_digest.clone().ok_or_else(|| {
-                        DmlError::journal_corruption(
-                            "planned ADD FILES operation has no source scope",
-                        )
-                    })?;
-                    if record.source_ownership != SourceScopeOwnership::ReservedImmutable {
-                        return Err(DmlError::journal_corruption(
-                            "planned ADD FILES operation does not own a reserved source scope",
-                        ));
-                    }
-                    record.phase = AddFilesLifecyclePhase::Failed;
-                    record.source_ownership = SourceScopeOwnership::Unclaimed;
-                    record.next_action = StatementNextAction::None;
-                    record.outcome = Some(DurableExternalFact {
-                        outcome: ExternalFactOutcome::KnownUncommitted,
-                        receipt: None,
-                        evidence: None,
-                        finalization_failure: None,
-                        failure: Some("frontend restart before ADD FILES dispatch".to_string()),
-                    });
-                    (
-                        OperationState::FailedKnownUncommitted,
-                        Some(AddFilesSourceAction::Release {
-                            provider_id,
-                            scope_digest,
-                        }),
-                    )
-                }
-                AddFilesLifecyclePhase::Executing
-                | AddFilesLifecyclePhase::CommitUnknown
-                | AddFilesLifecyclePhase::Reconciling => {
-                    let source_action = match record.source_ownership {
-                        SourceScopeOwnership::ReservedImmutable => {
-                            let provider_id = record.provider_id.clone().ok_or_else(|| {
-                                DmlError::journal_corruption("ADD FILES operation has no provider")
-                            })?;
-                            let scope_digest =
-                                record.source_scope_digest.clone().ok_or_else(|| {
-                                    DmlError::journal_corruption(
-                                        "ADD FILES operation has no source scope",
-                                    )
-                                })?;
-                            Some(AddFilesSourceAction::Transition {
-                                provider_id,
-                                scope_digest,
-                                expected: SourceScopeOwnership::ReservedImmutable,
-                                ownership: SourceScopeOwnership::Frozen,
-                            })
-                        }
-                        SourceScopeOwnership::Frozen => None,
-                        SourceScopeOwnership::Unclaimed | SourceScopeOwnership::TableOwned => {
-                            return Err(DmlError::journal_corruption(
-                                "possibly dispatched ADD FILES operation has invalid source ownership",
-                            ));
-                        }
-                    };
-                    record.phase = AddFilesLifecyclePhase::CommitUnknown;
-                    record.dispatch_certainty = AddFilesDispatchCertainty::PossiblyDispatched;
-                    record.source_ownership = SourceScopeOwnership::Frozen;
-                    record.next_action = StatementNextAction::ManualInspect;
-                    record.outcome = Some(DurableExternalFact {
-                        outcome: ExternalFactOutcome::CommitUnknown,
-                        receipt: None,
-                        evidence: record
-                            .evidence_artifact
-                            .as_ref()
-                            .map(|artifact| format!("sha256:{}", artifact.sha256)),
-                        finalization_failure: None,
-                        failure: Some(
-                            "frontend restart after ADD FILES dispatch boundary".to_string(),
-                        ),
-                    });
-                    (OperationState::CommitUnknown, source_action)
-                }
-                AddFilesLifecyclePhase::Committed | AddFilesLifecyclePhase::Failed => continue,
-            };
-            self.apply_add_files_mutation_async(AddFilesMutationRequest {
-                operation: OperationMutationRequest {
-                    operation_id: stored.operation_id,
-                    expected_revision: stored.revision,
-                    mutation_id: Uuid::now_v7(),
-                    state,
-                    payload: OperationPayload::AddFilesLifecycle(record),
-                },
-                artifacts: Vec::new(),
-                source_action,
-            })
-            .await?;
-        }
-        Ok(())
+        })
     }
 
     fn blocking<T>(
@@ -342,7 +108,7 @@ impl StateStoreOperationJournal {
         future: impl Future<Output = Result<T, DmlError>>,
     ) -> Result<T, DmlError> {
         match Handle::try_current() {
-            Ok(_) if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread => {
+            Ok(current) if current.runtime_flavor() == RuntimeFlavor::CurrentThread => {
                 Err(DmlError::journal_unavailable(
                     "DML journal synchronous commands cannot run on a current-thread Tokio runtime",
                 ))
@@ -355,10 +121,12 @@ impl StateStoreOperationJournal {
     async fn create_preparing_async(
         &self,
         request: CreatePreparingRequest,
+        admission: Option<Arc<dyn DmlIntentAdmissionValidator>>,
     ) -> Result<DmlOperationId, DmlError> {
         let operation_id = DmlOperationId::new_v7();
         let mutation_id = Uuid::now_v7();
         let now_ms = request.created_at_ms;
+        let recovery_due_at_ms = now_ms.saturating_add(DML_FOREGROUND_RECOVERY_VISIBILITY_MS);
         let operation = StoredOperation {
             schema_version: DML_OPERATION_SCHEMA_VERSION,
             operation_id,
@@ -375,12 +143,15 @@ impl StateStoreOperationJournal {
             payload: OperationPayload::ConnectorWriteLifecycle(
                 ConnectorWriteLifecycleRecord::Pending,
             ),
+            coordination_provenance: None,
+            recovery_due_at_ms: Some(recovery_due_at_ms),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             finished_at_ms: None,
         };
         let operation_key = operation_key(operation_id)?;
         let unfinished_key = unfinished_key(operation_id)?;
+        let recovery_due_key = recovery_due_key(operation_id, recovery_due_at_ms)?;
         let stored = operation.clone();
         let max_value_bytes = self.store.limits().max_value_bytes;
         let result = run_side_effect_free(
@@ -391,10 +162,18 @@ impl StateStoreOperationJournal {
             |transaction| {
                 let operation_key = operation_key.clone();
                 let unfinished_key = unfinished_key.clone();
+                let recovery_due_key = recovery_due_key.clone();
                 let stored = stored.clone();
+                let admission = admission.clone();
                 Box::pin(async move {
+                    if let Some(admission) = admission
+                        && let Err(error) = admission.validate_in(transaction).await
+                    {
+                        return Ok(Err(error));
+                    }
                     if transaction.get(&operation_key).await?.is_some()
                         || transaction.get(&unfinished_key).await?.is_some()
+                        || transaction.get(&recovery_due_key).await?.is_some()
                     {
                         return Ok(Err(DmlError::journal_corruption(format!(
                             "duplicate DML operation id {}",
@@ -410,11 +189,18 @@ impl StateStoreOperationJournal {
                         Ok(value) => value,
                         Err(error) => return Ok(Err(error)),
                     };
+                    let recovery_due_value = match encode_recovery_due(&stored) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     transaction
                         .put(operation_key, operation_value, Precondition::Absent)
                         .await?;
                     transaction
                         .put(unfinished_key, unfinished_value, Precondition::Absent)
+                        .await?;
+                    transaction
+                        .put(recovery_due_key, recovery_due_value, Precondition::Absent)
                         .await?;
                     Ok(Ok(operation_id))
                 })
@@ -428,7 +214,11 @@ impl StateStoreOperationJournal {
     async fn create_statement_operation_async(
         &self,
         request: CreateStatementOperationRequest,
+        admission: Option<Arc<dyn DmlIntentAdmissionValidator>>,
     ) -> Result<StoredOperation, DmlError> {
+        let recovery_due_at_ms = request
+            .created_at_ms
+            .saturating_add(DML_FOREGROUND_RECOVERY_VISIBILITY_MS);
         let operation = StoredOperation {
             schema_version: DML_OPERATION_SCHEMA_VERSION,
             operation_id: request.operation_id,
@@ -443,6 +233,8 @@ impl StateStoreOperationJournal {
             base_snapshot_map: std::collections::BTreeMap::new(),
             staged_artifacts: Vec::new(),
             payload: request.payload,
+            coordination_provenance: None,
+            recovery_due_at_ms: Some(recovery_due_at_ms),
             created_at_ms: request.created_at_ms,
             updated_at_ms: request.created_at_ms,
             finished_at_ms: None,
@@ -452,6 +244,7 @@ impl StateStoreOperationJournal {
         let mutation_id = operation.last_mutation_id;
         let operation_key = operation_key(operation_id)?;
         let unfinished_key = unfinished_key(operation_id)?;
+        let recovery_due_key = recovery_due_key(operation_id, recovery_due_at_ms)?;
         let stored = operation.clone();
         let max_value_bytes = self.store.limits().max_value_bytes;
         let result = run_side_effect_free(
@@ -462,17 +255,29 @@ impl StateStoreOperationJournal {
             |transaction| {
                 let operation_key = operation_key.clone();
                 let unfinished_key = unfinished_key.clone();
+                let recovery_due_key = recovery_due_key.clone();
                 let stored = stored.clone();
+                let admission = admission.clone();
                 Box::pin(async move {
+                    if let Some(admission) = admission
+                        && let Err(error) = admission.validate_in(transaction).await
+                    {
+                        return Ok(Err(error));
+                    }
                     let existing_operation = transaction.get(&operation_key).await?;
                     let existing_unfinished = transaction.get(&unfinished_key).await?;
+                    let existing_due = transaction.get(&recovery_due_key).await?;
                     if let Some(record) = existing_operation {
                         let existing = match decode_operation(record.key, record.value) {
                             Ok(existing) => existing,
                             Err(error) => return Ok(Err(error)),
                         };
-                        match (existing.state.is_finished(), existing_unfinished) {
-                            (false, Some(index)) => {
+                        match (
+                            existing.state.is_finished(),
+                            existing_unfinished,
+                            existing_due,
+                        ) {
+                            (false, Some(index), Some(due)) => {
                                 let indexed_id = match decode_unfinished(index.key, index.value) {
                                     Ok(indexed_id) => indexed_id,
                                     Err(error) => return Ok(Err(error)),
@@ -483,20 +288,28 @@ impl StateStoreOperationJournal {
                                         stored.operation_id
                                     ))));
                                 }
+                                if let Err(error) = validate_recovery_due_record(&existing, due) {
+                                    return Ok(Err(error));
+                                }
                             }
-                            (false, None) => {
+                            (false, _, _) => {
                                 return Ok(Err(DmlError::journal_corruption(format!(
-                                    "unfinished DML operation {} is missing its index",
+                                    "unfinished DML operation {} is missing an index",
                                     stored.operation_id
                                 ))));
                             }
-                            (true, Some(_)) => {
+                            (true, Some(_), _) => {
                                 return Ok(Err(DmlError::journal_corruption(format!(
                                     "terminal DML operation {} remains in the unfinished index",
                                     stored.operation_id
                                 ))));
                             }
-                            (true, None) => {}
+                            (true, None, Some(due)) => {
+                                if let Err(error) = validate_recovery_due_record(&existing, due) {
+                                    return Ok(Err(error));
+                                }
+                            }
+                            (true, None, None) => {}
                         }
                         if existing == stored {
                             return Ok(Ok(existing));
@@ -506,7 +319,7 @@ impl StateStoreOperationJournal {
                             stored.operation_id
                         ))));
                     }
-                    if existing_unfinished.is_some() {
+                    if existing_unfinished.is_some() || existing_due.is_some() {
                         return Ok(Err(DmlError::journal_corruption(format!(
                             "unfinished DML operation index {} has no operation record",
                             stored.operation_id
@@ -521,11 +334,18 @@ impl StateStoreOperationJournal {
                         Ok(value) => value,
                         Err(error) => return Ok(Err(error)),
                     };
+                    let recovery_due_value = match encode_recovery_due(&stored) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     transaction
                         .put(operation_key, operation_value, Precondition::Absent)
                         .await?;
                     transaction
                         .put(unfinished_key, unfinished_value, Precondition::Absent)
+                        .await?;
+                    transaction
+                        .put(recovery_due_key, recovery_due_value, Precondition::Absent)
                         .await?;
                     Ok(Ok(stored))
                 })
@@ -539,6 +359,8 @@ impl StateStoreOperationJournal {
     async fn mutate_statement_operation_async(
         &self,
         request: OperationMutationRequest,
+        authority: Option<DmlMutationAuthority>,
+        requested_recovery_due_at_ms: Option<Option<i64>>,
     ) -> Result<StoredOperation, DmlError> {
         let operation_id = request.operation_id;
         let mutation_id = request.mutation_id;
@@ -554,7 +376,13 @@ impl StateStoreOperationJournal {
                 let operation_key = operation_key.clone();
                 let unfinished_key = unfinished_key.clone();
                 let request = request.clone();
+                let authority = authority.clone();
                 Box::pin(async move {
+                    if let Some(authority) = &authority
+                        && let Err(error) = authority.validator().validate_in(transaction).await
+                    {
+                        return Ok(Err(error));
+                    }
                     let Some(record) = transaction.get(&operation_key).await? else {
                         return Ok(Err(DmlError::journal_unavailable(format!(
                             "DML operation {operation_id} not found"
@@ -565,6 +393,11 @@ impl StateStoreOperationJournal {
                         Ok(operation) => operation,
                         Err(error) => return Ok(Err(error)),
                     };
+                    if let Some(authority) = &authority
+                        && let Err(error) = validate_persisted_authority(&operation, authority)
+                    {
+                        return Ok(Err(error));
+                    }
                     if operation.last_mutation_id == request.mutation_id {
                         let expected_applied_revision =
                             request.expected_revision.checked_add(1).ok_or_else(|| {
@@ -601,6 +434,7 @@ impl StateStoreOperationJournal {
                     {
                         return Ok(Err(error));
                     }
+                    let previous = operation.clone();
                     operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
                     operation.revision = match operation.revision.checked_add(1) {
                         Some(revision) => revision,
@@ -613,6 +447,8 @@ impl StateStoreOperationJournal {
                     operation.last_mutation_id = request.mutation_id;
                     operation.state = request.state;
                     operation.payload = request.payload;
+                    operation.recovery_due_at_ms = requested_recovery_due_at_ms
+                        .unwrap_or_else(|| legacy_recovery_due_after_mutation(&operation, &previous));
                     operation.updated_at_ms = now_unix_millis();
                     if operation.state.is_finished() {
                         operation.finished_at_ms = Some(operation.updated_at_ms);
@@ -629,6 +465,11 @@ impl StateStoreOperationJournal {
                             Precondition::Version(operation_version),
                         )
                         .await?;
+                    if let Err(error) =
+                        update_recovery_due_index(transaction, &previous, &operation).await
+                    {
+                        return Ok(Err(error));
+                    }
                     if operation.state.is_finished() {
                         let Some(index) = transaction.get(&unfinished_key).await? else {
                             return Ok(Err(DmlError::journal_corruption(format!(
@@ -686,6 +527,8 @@ impl StateStoreOperationJournal {
     async fn apply_add_files_mutation_async(
         &self,
         request: AddFilesMutationRequest,
+        authority: Option<DmlMutationAuthority>,
+        requested_recovery_due_at_ms: Option<Option<i64>>,
     ) -> Result<StoredOperation, DmlError> {
         self.preflight_add_files_mutation_shape(&request)?;
         let operation_id = request.operation.operation_id;
@@ -702,7 +545,13 @@ impl StateStoreOperationJournal {
                 let operation_key = operation_key.clone();
                 let unfinished_key = unfinished_key.clone();
                 let request = request.clone();
+                let authority = authority.clone();
                 Box::pin(async move {
+                    if let Some(authority) = &authority
+                        && let Err(error) = authority.validator().validate_in(transaction).await
+                    {
+                        return Ok(Err(error));
+                    }
                     let Some(record) = transaction.get(&operation_key).await? else {
                         return Ok(Err(DmlError::journal_unavailable(format!(
                             "DML operation {operation_id} not found"
@@ -713,6 +562,11 @@ impl StateStoreOperationJournal {
                         Ok(operation) => operation,
                         Err(error) => return Ok(Err(error)),
                     };
+                    if let Some(authority) = &authority
+                        && let Err(error) = validate_persisted_authority(&operation, authority)
+                    {
+                        return Ok(Err(error));
+                    }
                     if operation.last_mutation_id == request.operation.mutation_id {
                         if operation.revision == request.operation.expected_revision.saturating_add(1)
                             && operation.state == request.operation.state
@@ -744,6 +598,7 @@ impl StateStoreOperationJournal {
                     {
                         return Ok(Err(error));
                     }
+                    let previous = operation.clone();
                     operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
                     operation.revision = match operation.revision.checked_add(1) {
                         Some(revision) => revision,
@@ -752,6 +607,8 @@ impl StateStoreOperationJournal {
                     operation.last_mutation_id = request.operation.mutation_id;
                     operation.state = request.operation.state;
                     operation.payload = request.operation.payload;
+                    operation.recovery_due_at_ms = requested_recovery_due_at_ms
+                        .unwrap_or_else(|| legacy_recovery_due_after_mutation(&operation, &previous));
                     operation.updated_at_ms = now_unix_millis();
                     if operation.state.is_finished() {
                         operation.finished_at_ms = Some(operation.updated_at_ms);
@@ -946,6 +803,11 @@ impl StateStoreOperationJournal {
                         Err(error) => return Ok(Err(error)),
                     };
                     transaction.put(operation_key, operation_value, Precondition::Version(operation_version)).await?;
+                    if let Err(error) =
+                        update_recovery_due_index(transaction, &previous, &operation).await
+                    {
+                        return Ok(Err(error));
+                    }
                     let Some(index) = transaction.get(&unfinished_key).await? else {
                         return Ok(Err(DmlError::journal_corruption("DML operation is missing its unfinished index")));
                     };
@@ -973,6 +835,253 @@ impl StateStoreOperationJournal {
         )
         .await;
         self.finish_statement_mutation(result, operation_key, mutation_id, "apply ADD FILES")
+            .await
+    }
+
+    async fn claim_operation_async(
+        &self,
+        request: DmlCoordinationClaimRequest,
+        admission: Option<Arc<dyn DmlIntentAdmissionValidator>>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        if request.provenance.coordination_attempt_id != authority.coordination_attempt_id() {
+            return Err(DmlError::journal_unresolved(
+                "DML coordination claim attempt does not match its live authority",
+            ));
+        }
+        validate_coordination_provenance(&request.provenance)?;
+        let provenance = request.provenance.clone();
+        self.mutate_operation_authorized_async(
+            request.operation_id,
+            request.expected_revision,
+            request.mutation_id,
+            Some(request.recovery_due_at_ms),
+            admission,
+            authority,
+            true,
+            move |operation| {
+                operation.coordination_provenance = Some(provenance.clone());
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn transition_authorized_async(
+        &self,
+        operation_id: DmlOperationId,
+        expected_revision: u64,
+        mutation_id: Uuid,
+        to: OperationState,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.mutate_operation_authorized_async(
+            operation_id,
+            expected_revision,
+            mutation_id,
+            recovery_due_at_ms,
+            None,
+            authority,
+            false,
+            move |operation| {
+                validate_operation_transition(operation.state, to)
+                    .map_err(DmlError::journal_unavailable)?;
+                operation.state = to;
+                if to.is_finished() {
+                    operation.finished_at_ms = Some(now_unix_millis());
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn record_fact_authorized_async(
+        &self,
+        operation_id: DmlOperationId,
+        expected_revision: u64,
+        mutation_id: Uuid,
+        fact: OperationFact,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.mutate_operation_authorized_async(
+            operation_id,
+            expected_revision,
+            mutation_id,
+            recovery_due_at_ms,
+            None,
+            authority,
+            false,
+            move |operation| {
+                validate_operation_transition(operation.state, fact.state)
+                    .map_err(DmlError::journal_unavailable)?;
+                if operation.state == fact.state {
+                    let identical = matches!(
+                        &operation.payload,
+                        OperationPayload::ConnectorWriteLifecycle(existing)
+                            if existing == &fact.lifecycle
+                    );
+                    if !identical {
+                        return Err(DmlError::journal_unavailable(format!(
+                            "conflicting DML operation fact replay for operation {operation_id} in state {}",
+                            fact.state.as_str()
+                        )));
+                    }
+                }
+                operation.state = fact.state;
+                operation.payload =
+                    OperationPayload::ConnectorWriteLifecycle(fact.lifecycle.clone());
+                if fact.state.is_finished() {
+                    operation.finished_at_ms = Some(now_unix_millis());
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn reschedule_recovery_due_async(
+        &self,
+        request: DmlRecoveryDueRescheduleRequest,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.mutate_operation_authorized_async(
+            request.operation_id,
+            request.expected_revision,
+            request.mutation_id,
+            request.recovery_due_at_ms,
+            None,
+            authority,
+            false,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    // Design: ADR-0054 (docs/adr/ADR-0054-frontend-dml-operation-authority-boundary.md)
+    async fn mutate_operation_authorized_async(
+        &self,
+        operation_id: DmlOperationId,
+        expected_revision: u64,
+        mutation_id: Uuid,
+        recovery_due_at_ms: Option<i64>,
+        admission: Option<Arc<dyn DmlIntentAdmissionValidator>>,
+        authority: DmlMutationAuthority,
+        allow_new_attempt: bool,
+        mutation: impl Fn(&mut StoredOperation) -> Result<(), DmlError> + Clone + Send + Sync + 'static,
+    ) -> Result<StoredOperation, DmlError> {
+        let operation_key = operation_key(operation_id)?;
+        let unfinished_key = unfinished_key(operation_id)?;
+        let max_value_bytes = self.store.limits().max_value_bytes;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            OperationId::from(mutation_id),
+            "mutate authorized frontend DML operation",
+            |transaction| {
+                let operation_key = operation_key.clone();
+                let unfinished_key = unfinished_key.clone();
+                let admission = admission.clone();
+                let authority = authority.clone();
+                let mutation = mutation.clone();
+                Box::pin(async move {
+                    if let Some(admission) = admission
+                        && let Err(error) = admission.validate_in(transaction).await
+                    {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) = authority.validator().validate_in(transaction).await {
+                        return Ok(Err(error));
+                    }
+                    let Some(record) = transaction.get(&operation_key).await? else {
+                        return Ok(Err(DmlError::journal_unavailable(format!(
+                            "DML operation {operation_id} not found"
+                        ))));
+                    };
+                    let operation_version = record.version.clone();
+                    let mut operation = match decode_operation(record.key, record.value) {
+                        Ok(operation) => operation,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if operation.last_mutation_id == mutation_id {
+                        let applied_revision = expected_revision.checked_add(1).ok_or_else(|| {
+                            DmlError::journal_corruption(format!(
+                                "DML operation {operation_id} revision overflow"
+                            ))
+                        });
+                        let applied_revision = match applied_revision {
+                            Ok(revision) => revision,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if operation.revision == applied_revision
+                            && operation.recovery_due_at_ms == recovery_due_at_ms
+                            && operation
+                                .coordination_provenance
+                                .as_ref()
+                                .map(|provenance| provenance.coordination_attempt_id)
+                                == Some(authority.coordination_attempt_id())
+                        {
+                            return Ok(Ok(operation));
+                        }
+                        return Ok(Err(DmlError::journal_unresolved(format!(
+                            "conflicting authorized DML mutation replay for operation {operation_id}"
+                        ))));
+                    }
+                    if operation.revision != expected_revision {
+                        return Ok(Err(DmlError::journal_unresolved(format!(
+                            "DML operation {operation_id} revision changed from expected {expected_revision} to {}",
+                            operation.revision
+                        ))));
+                    }
+                    if !allow_new_attempt
+                        && let Err(error) = validate_persisted_authority(&operation, &authority)
+                    {
+                        return Ok(Err(error));
+                    }
+                    let previous = operation.clone();
+                    if let Err(error) = mutation(&mut operation) {
+                        return Ok(Err(error));
+                    }
+                    operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
+                    operation.revision = match operation.revision.checked_add(1) {
+                        Some(revision) => revision,
+                        None => {
+                            return Ok(Err(DmlError::journal_corruption(format!(
+                                "DML operation {operation_id} revision overflow"
+                            ))));
+                        }
+                    };
+                    operation.last_mutation_id = mutation_id;
+                    operation.recovery_due_at_ms = recovery_due_at_ms;
+                    operation.updated_at_ms = now_unix_millis();
+                    if let Err(error) = validate_operation(&operation) {
+                        return Ok(Err(error));
+                    }
+                    let value = match encode_operation_with_limit(&operation, max_value_bytes) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    transaction
+                        .put(operation_key, value, Precondition::Version(operation_version))
+                        .await?;
+                    if let Err(error) =
+                        update_recovery_due_index(transaction, &previous, &operation).await
+                    {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) =
+                        update_unfinished_index(transaction, &operation, &unfinished_key).await
+                    {
+                        return Ok(Err(error));
+                    }
+                    Ok(Ok(operation))
+                })
+            },
+        )
+        .await;
+        self.finish_statement_mutation(result, operation_key, mutation_id, "authorized mutation")
             .await
     }
 
@@ -1053,6 +1162,7 @@ impl StateStoreOperationJournal {
                         Ok(operation) => operation,
                         Err(error) => return Ok(Err(error)),
                     };
+                    let previous = operation.clone();
                     if let Err(error) = mutation(&mut operation) {
                         return Ok(Err(error));
                     }
@@ -1066,7 +1176,12 @@ impl StateStoreOperationJournal {
                     };
                     operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
                     operation.last_mutation_id = mutation_id;
+                    operation.recovery_due_at_ms =
+                        legacy_recovery_due_after_mutation(&operation, &previous);
                     operation.updated_at_ms = now_unix_millis();
+                    if let Err(error) = validate_operation(&operation) {
+                        return Ok(Err(error));
+                    }
                     let operation_value = match encode_operation_with_limit(&operation, max_value_bytes) {
                         Ok(value) => value,
                         Err(error) => return Ok(Err(error)),
@@ -1078,6 +1193,11 @@ impl StateStoreOperationJournal {
                             Precondition::Version(operation_version),
                         )
                         .await?;
+                    if let Err(error) =
+                        update_recovery_due_index(transaction, &previous, &operation).await
+                    {
+                        return Ok(Err(error));
+                    }
                     if operation.state.is_finished() {
                         let Some(index) = transaction.get(&unfinished_key).await? else {
                             return Ok(Err(DmlError::journal_corruption(format!(
@@ -1137,11 +1257,11 @@ impl StateStoreOperationJournal {
         match result {
             Ok(success) => success.value,
             Err(RunFailure::CommitUnknown { .. }) => {
-                let authoritative = self.load_by_key(&operation_key).await?;
-                match authoritative {
-                    Some(operation) if operation.last_mutation_id == mutation_id => {
-                        Ok(committed_value)
-                    }
+                match self
+                    .load_authoritative_mutation(&operation_key, mutation_id)
+                    .await?
+                {
+                    Some(_) => Ok(committed_value),
                     _ => Err(DmlError::journal_unresolved(format!(
                         "DML journal {action} commit outcome is unresolved"
                     ))),
@@ -1164,9 +1284,11 @@ impl StateStoreOperationJournal {
         match result {
             Ok(success) => success.value,
             Err(RunFailure::CommitUnknown { .. }) => {
-                let authoritative = self.load_by_key(&operation_key).await?;
-                match authoritative {
-                    Some(operation) if operation.last_mutation_id == mutation_id => Ok(operation),
+                match self
+                    .load_authoritative_mutation(&operation_key, mutation_id)
+                    .await?
+                {
+                    Some(operation) => Ok(operation),
                     _ => Err(DmlError::journal_unresolved(format!(
                         "DML journal statement {action} commit outcome is unresolved"
                     ))),
@@ -1174,6 +1296,63 @@ impl StateStoreOperationJournal {
             }
             Err(failure) => Err(format_run_failure(action, failure)),
         }
+    }
+
+    async fn load_authoritative_mutation(
+        &self,
+        operation_key: &Key,
+        mutation_id: Uuid,
+    ) -> Result<Option<StoredOperation>, DmlError> {
+        let mut transaction = self
+            .store
+            .begin_read()
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        let Some(record) = transaction
+            .get(operation_key)
+            .await
+            .map_err(DmlError::journal_unavailable)?
+        else {
+            transaction
+                .abort()
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+            return Ok(None);
+        };
+        let operation = decode_operation(record.key, record.value)?;
+        if operation.last_mutation_id != mutation_id {
+            transaction
+                .abort()
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+            return Ok(None);
+        }
+        if let Some(due_at_ms) = operation.recovery_due_at_ms {
+            let due_key = recovery_due_key(operation.operation_id, due_at_ms)?;
+            let Some(indexed) = transaction
+                .get(&due_key)
+                .await
+                .map_err(DmlError::journal_unavailable)?
+            else {
+                transaction
+                    .abort()
+                    .await
+                    .map_err(DmlError::journal_unavailable)?;
+                return Ok(None);
+            };
+            if validate_recovery_due_record(&operation, indexed).is_err() {
+                transaction
+                    .abort()
+                    .await
+                    .map_err(DmlError::journal_unavailable)?;
+                return Ok(None);
+            }
+        }
+        transaction
+            .abort()
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        Ok(Some(operation))
     }
 
     async fn load_async(
@@ -1235,6 +1414,65 @@ impl StateStoreOperationJournal {
             operations.push(operation);
         }
         Ok(operations)
+    }
+
+    async fn recovery_candidates_async(
+        &self,
+        shard: u8,
+        due_at_or_before_ms: i64,
+    ) -> Result<Vec<DmlRecoveryCandidate>, DmlError> {
+        if shard >= DML_RECOVERY_SHARD_COUNT {
+            return Err(DmlError::journal_unavailable(format!(
+                "DML recovery shard {shard} is outside 0..{DML_RECOVERY_SHARD_COUNT}"
+            )));
+        }
+        let prefix = recovery_due_shard_prefix(shard)?;
+        let range = KeyRange::for_prefix(prefix).map_err(DmlError::journal_unavailable)?;
+        let mut transaction = self
+            .store
+            .begin_read()
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        let page = transaction
+            .range(&RangeRequest {
+                range,
+                direction: Direction::Forward,
+                page_size: DML_RECOVERY_PAGE_SIZE.min(self.store.limits().max_page_size),
+                continuation: None,
+            })
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        let mut candidates = Vec::with_capacity(page.records.len());
+        for record in page.records {
+            let indexed = decode_recovery_due(&record.key, record.value)?;
+            if indexed.recovery_due_at_ms > due_at_or_before_ms {
+                break;
+            }
+            let operation_record = transaction
+                .get(&operation_key(indexed.operation_id)?)
+                .await
+                .map_err(DmlError::journal_unavailable)?
+                .ok_or_else(|| {
+                    DmlError::journal_corruption(format!(
+                        "DML recovery due index {} has no operation",
+                        indexed.operation_id
+                    ))
+                })?;
+            let operation = decode_operation(operation_record.key, operation_record.value)?;
+            validate_recovery_due_identity(&operation, &indexed)?;
+            candidates.push(DmlRecoveryCandidate {
+                operation_id: indexed.operation_id,
+                operation_revision: indexed.operation_revision,
+                last_mutation_id: indexed.last_mutation_id,
+                coordination_attempt_id: indexed.coordination_attempt_id,
+                recovery_due_at_ms: indexed.recovery_due_at_ms,
+            });
+        }
+        transaction
+            .abort()
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        Ok(candidates)
     }
 
     async fn load_add_files_artifact_async(
@@ -1314,11 +1552,124 @@ impl StateStoreOperationJournal {
 }
 
 impl OperationJournal for StateStoreOperationJournal {
+    fn create_preparing_admitted(
+        &self,
+        request: CreatePreparingRequest,
+        admission: Arc<dyn DmlIntentAdmissionValidator>,
+    ) -> Result<DmlOperationId, DmlError> {
+        self.blocking(self.create_preparing_async(request, Some(admission)))
+    }
+
+    fn create_statement_operation_admitted(
+        &self,
+        request: CreateStatementOperationRequest,
+        admission: Arc<dyn DmlIntentAdmissionValidator>,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.create_statement_operation_async(request, Some(admission)))
+    }
+
+    fn claim_operation(
+        &self,
+        request: DmlCoordinationClaimRequest,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.claim_operation_async(request, None, authority))
+    }
+
+    fn claim_operation_admitted(
+        &self,
+        request: DmlCoordinationClaimRequest,
+        admission: Arc<dyn DmlIntentAdmissionValidator>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.claim_operation_async(request, Some(admission), authority))
+    }
+
+    fn transition_authorized(
+        &self,
+        operation_id: DmlOperationId,
+        expected_revision: u64,
+        mutation_id: Uuid,
+        to: OperationState,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.transition_authorized_async(
+            operation_id,
+            expected_revision,
+            mutation_id,
+            to,
+            recovery_due_at_ms,
+            authority,
+        ))
+    }
+
+    fn record_fact_authorized(
+        &self,
+        operation_id: DmlOperationId,
+        expected_revision: u64,
+        mutation_id: Uuid,
+        fact: OperationFact,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.record_fact_authorized_async(
+            operation_id,
+            expected_revision,
+            mutation_id,
+            fact,
+            recovery_due_at_ms,
+            authority,
+        ))
+    }
+
+    fn mutate_statement_operation_authorized(
+        &self,
+        request: OperationMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.mutate_statement_operation_async(
+            request,
+            Some(authority),
+            Some(recovery_due_at_ms),
+        ))
+    }
+
+    fn apply_add_files_mutation_authorized(
+        &self,
+        request: AddFilesMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.apply_add_files_mutation_async(
+            request,
+            Some(authority),
+            Some(recovery_due_at_ms),
+        ))
+    }
+
+    fn recovery_candidates(
+        &self,
+        shard: u8,
+        due_at_or_before_ms: i64,
+    ) -> Result<Vec<DmlRecoveryCandidate>, DmlError> {
+        self.blocking(self.recovery_candidates_async(shard, due_at_or_before_ms))
+    }
+
+    fn reschedule_recovery_due(
+        &self,
+        request: DmlRecoveryDueRescheduleRequest,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.reschedule_recovery_due_async(request, authority))
+    }
+
     fn create_preparing(
         &self,
         request: CreatePreparingRequest,
     ) -> Result<DmlOperationId, DmlError> {
-        self.blocking(self.create_preparing_async(request))
+        self.blocking(self.create_preparing_async(request, None))
     }
 
     fn transition(&self, operation_id: DmlOperationId, to: OperationState) -> Result<(), DmlError> {
@@ -1349,14 +1700,14 @@ impl OperationJournal for StateStoreOperationJournal {
         &self,
         request: CreateStatementOperationRequest,
     ) -> Result<StoredOperation, DmlError> {
-        self.blocking(self.create_statement_operation_async(request))
+        self.blocking(self.create_statement_operation_async(request, None))
     }
 
     fn mutate_statement_operation(
         &self,
         request: OperationMutationRequest,
     ) -> Result<StoredOperation, DmlError> {
-        self.blocking(self.mutate_statement_operation_async(request))
+        self.blocking(self.mutate_statement_operation_async(request, None, None))
     }
 
     fn preflight_statement_operation(&self, operation: &StoredOperation) -> Result<(), DmlError> {
@@ -1382,7 +1733,7 @@ impl OperationJournal for StateStoreOperationJournal {
         &self,
         request: AddFilesMutationRequest,
     ) -> Result<StoredOperation, DmlError> {
-        self.blocking(self.apply_add_files_mutation_async(request))
+        self.blocking(self.apply_add_files_mutation_async(request, None, None))
     }
 
     fn load_add_files_artifact(
@@ -1427,12 +1778,369 @@ impl StateStoreOperationJournal {
     }
 }
 
+fn validate_persisted_authority(
+    operation: &StoredOperation,
+    authority: &DmlMutationAuthority,
+) -> Result<(), DmlError> {
+    let Some(provenance) = &operation.coordination_provenance else {
+        return Err(DmlError::journal_unresolved(format!(
+            "DML operation {} has not been claimed",
+            operation.operation_id
+        )));
+    };
+    if provenance.coordination_attempt_id != authority.coordination_attempt_id() {
+        return Err(DmlError::journal_unresolved(format!(
+            "DML operation {} is owned by another coordination attempt",
+            operation.operation_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_coordination_provenance(
+    provenance: &crate::dml::model::DmlCoordinationProvenance,
+) -> Result<(), DmlError> {
+    if provenance.resource_codec_version != DML_COORDINATION_RESOURCE_CODEC_VERSION {
+        return Err(DmlError::journal_corruption(format!(
+            "unsupported DML operation resource codec version: {}",
+            provenance.resource_codec_version
+        )));
+    }
+    if !is_uuid_v7(provenance.holder_id) || !is_uuid_v7(provenance.coordination_attempt_id) {
+        return Err(DmlError::journal_corruption(
+            "DML coordination holder and attempt ids must be UUIDv7",
+        ));
+    }
+    provenance
+        .fencing_token
+        .try_decode()
+        .map_err(DmlError::journal_corruption)?;
+    if provenance.acquired_at_ms < 0 {
+        return Err(DmlError::journal_corruption(
+            "DML coordination acquired timestamp must be nonnegative",
+        ));
+    }
+    Ok(())
+}
+
+fn operation_requires_recovery(operation: &StoredOperation) -> bool {
+    if !operation.state.is_finished() {
+        return true;
+    }
+    match &operation.payload {
+        OperationPayload::ConnectorWriteLifecycle(_) => false,
+        OperationPayload::CtasSaga(record) => record.next_action != StatementNextAction::None,
+        OperationPayload::TruncateLifecycle(record) => {
+            record.next_action != StatementNextAction::None
+        }
+        OperationPayload::AddFilesLifecycle(record) => {
+            record.next_action != StatementNextAction::None
+        }
+    }
+}
+
+fn legacy_recovery_due_after_mutation(
+    operation: &StoredOperation,
+    previous: &StoredOperation,
+) -> Option<i64> {
+    operation_requires_recovery(operation).then_some(
+        previous
+            .recovery_due_at_ms
+            .unwrap_or(operation.updated_at_ms),
+    )
+}
+
+async fn update_unfinished_index(
+    transaction: &mut dyn WriteTransaction,
+    operation: &StoredOperation,
+    unfinished_key: &Key,
+) -> Result<(), DmlError> {
+    let existing = transaction
+        .get(unfinished_key)
+        .await
+        .map_err(DmlError::journal_unavailable)?;
+    match (operation.state.is_finished(), existing) {
+        (true, Some(index)) => {
+            let indexed_id = decode_unfinished(index.key, index.value)?;
+            if indexed_id != operation.operation_id {
+                return Err(DmlError::journal_corruption(
+                    "unfinished DML index identity mismatch",
+                ));
+            }
+            transaction
+                .delete(unfinished_key.clone(), Precondition::Version(index.version))
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+        }
+        (true, None) => {}
+        (false, Some(index)) => {
+            let indexed_id = decode_unfinished(index.key, index.value)?;
+            if indexed_id != operation.operation_id {
+                return Err(DmlError::journal_corruption(
+                    "unfinished DML index identity mismatch",
+                ));
+            }
+            transaction
+                .put(
+                    unfinished_key.clone(),
+                    encode_unfinished(operation.operation_id)?,
+                    Precondition::Version(index.version),
+                )
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+        }
+        (false, None) => {
+            return Err(DmlError::journal_corruption(
+                "unfinished DML operation is missing its index",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn update_recovery_due_index(
+    transaction: &mut dyn WriteTransaction,
+    previous: &StoredOperation,
+    operation: &StoredOperation,
+) -> Result<(), DmlError> {
+    let previous_entry = previous
+        .recovery_due_at_ms
+        .map(|due| recovery_due_key(previous.operation_id, due))
+        .transpose()?;
+    let next_entry = operation
+        .recovery_due_at_ms
+        .map(|due| recovery_due_key(operation.operation_id, due))
+        .transpose()?;
+    let existing = match &previous_entry {
+        Some(key) => transaction
+            .get(key)
+            .await
+            .map_err(DmlError::journal_unavailable)?,
+        None => None,
+    };
+    if let Some(existing) = &existing {
+        validate_recovery_due_record(previous, existing.clone())?;
+    } else if previous_entry.is_some() {
+        return Err(DmlError::journal_corruption(format!(
+            "DML operation {} is missing its recovery due index",
+            previous.operation_id
+        )));
+    }
+
+    match (previous_entry, next_entry, existing) {
+        (Some(previous_key), Some(next_key), Some(existing)) if previous_key == next_key => {
+            transaction
+                .put(
+                    next_key,
+                    encode_recovery_due(operation)?,
+                    Precondition::Version(existing.version),
+                )
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+        }
+        (Some(previous_key), Some(next_key), Some(existing)) => {
+            transaction
+                .delete(previous_key, Precondition::Version(existing.version))
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+            if transaction
+                .get(&next_key)
+                .await
+                .map_err(DmlError::journal_unavailable)?
+                .is_some()
+            {
+                return Err(DmlError::journal_corruption(
+                    "DML recovery due index target already exists",
+                ));
+            }
+            transaction
+                .put(
+                    next_key,
+                    encode_recovery_due(operation)?,
+                    Precondition::Absent,
+                )
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+        }
+        (Some(previous_key), None, Some(existing)) => {
+            transaction
+                .delete(previous_key, Precondition::Version(existing.version))
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+        }
+        (None, Some(next_key), None) => {
+            if transaction
+                .get(&next_key)
+                .await
+                .map_err(DmlError::journal_unavailable)?
+                .is_some()
+            {
+                return Err(DmlError::journal_corruption(
+                    "DML recovery due index target already exists",
+                ));
+            }
+            transaction
+                .put(
+                    next_key,
+                    encode_recovery_due(operation)?,
+                    Precondition::Absent,
+                )
+                .await
+                .map_err(DmlError::journal_unavailable)?;
+        }
+        (None, None, None) => {}
+        _ => {
+            return Err(DmlError::journal_corruption(
+                "DML recovery due index mutation has inconsistent state",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn operation_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(OPERATION_PREFIX, operation_id)
 }
 
 fn unfinished_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(UNFINISHED_PREFIX, operation_id)
+}
+
+fn recovery_due_shard(operation_id: DmlOperationId) -> u8 {
+    Sha256::digest(operation_id.as_uuid().as_bytes())[0] & (DML_RECOVERY_SHARD_COUNT - 1)
+}
+
+fn recovery_due_shard_prefix(shard: u8) -> Result<Key, DmlError> {
+    if shard >= DML_RECOVERY_SHARD_COUNT {
+        return Err(DmlError::journal_corruption(
+            "DML recovery shard is outside the configured range",
+        ));
+    }
+    let mut key = Vec::with_capacity(RECOVERY_DUE_PREFIX.len() + 3);
+    key.extend_from_slice(RECOVERY_DUE_PREFIX);
+    key.extend_from_slice(format!("{shard:02x}/").as_bytes());
+    Key::try_from(Bytes::from(key)).map_err(DmlError::journal_corruption)
+}
+
+fn recovery_due_key(
+    operation_id: DmlOperationId,
+    recovery_due_at_ms: i64,
+) -> Result<Key, DmlError> {
+    let shard = recovery_due_shard(operation_id);
+    let sortable_due = (recovery_due_at_ms as u64) ^ (1_u64 << 63);
+    let mut key = recovery_due_shard_prefix(shard)?.as_bytes().to_vec();
+    key.extend_from_slice(format!("{sortable_due:016x}/").as_bytes());
+    key.extend_from_slice(operation_id.as_uuid().simple().to_string().as_bytes());
+    Key::try_from(Bytes::from(key)).map_err(DmlError::journal_corruption)
+}
+
+fn decode_recovery_due_key(key: &Key) -> Result<(u8, i64, DmlOperationId), DmlError> {
+    let suffix = key
+        .as_bytes()
+        .strip_prefix(RECOVERY_DUE_PREFIX)
+        .ok_or_else(|| DmlError::journal_corruption("DML recovery key has an unknown prefix"))?;
+    let text = std::str::from_utf8(suffix)
+        .map_err(|_| DmlError::journal_corruption("DML recovery key is not UTF-8"))?;
+    let mut fields = text.split('/');
+    let shard_text = fields.next().unwrap_or_default();
+    let due_text = fields.next().unwrap_or_default();
+    let operation_text = fields.next().unwrap_or_default();
+    if fields.next().is_some()
+        || shard_text.len() != 2
+        || due_text.len() != 16
+        || operation_text.len() != 32
+    {
+        return Err(DmlError::journal_corruption(
+            "DML recovery key has a malformed shape",
+        ));
+    }
+    let shard = u8::from_str_radix(shard_text, 16)
+        .map_err(|_| DmlError::journal_corruption("DML recovery key has an invalid shard"))?;
+    let sortable_due = u64::from_str_radix(due_text, 16)
+        .map_err(|_| DmlError::journal_corruption("DML recovery key has an invalid due time"))?;
+    let recovery_due_at_ms = (sortable_due ^ (1_u64 << 63)) as i64;
+    let operation_uuid = Uuid::parse_str(operation_text).map_err(|_| {
+        DmlError::journal_corruption("DML recovery key has an invalid operation id")
+    })?;
+    let operation_id = DmlOperationId::from(operation_uuid);
+    if shard != recovery_due_shard(operation_id)
+        || recovery_due_key(operation_id, recovery_due_at_ms)? != *key
+    {
+        return Err(DmlError::journal_corruption(
+            "DML recovery key is not canonical",
+        ));
+    }
+    Ok((shard, recovery_due_at_ms, operation_id))
+}
+
+fn recovery_due_record(operation: &StoredOperation) -> Result<StoredRecoveryDueV1, DmlError> {
+    let recovery_due_at_ms = operation.recovery_due_at_ms.ok_or_else(|| {
+        DmlError::journal_corruption("DML operation has no recovery due timestamp")
+    })?;
+    Ok(StoredRecoveryDueV1 {
+        schema_version: DML_RECOVERY_DUE_SCHEMA_VERSION,
+        operation_id: operation.operation_id,
+        operation_revision: operation.revision,
+        last_mutation_id: operation.last_mutation_id,
+        coordination_attempt_id: operation
+            .coordination_provenance
+            .as_ref()
+            .map(|provenance| provenance.coordination_attempt_id),
+        recovery_due_at_ms,
+    })
+}
+
+fn encode_recovery_due(operation: &StoredOperation) -> Result<Value, DmlError> {
+    let bytes = serde_json::to_vec(&recovery_due_record(operation)?)
+        .map_err(DmlError::journal_corruption)?;
+    Value::try_from(Bytes::from(bytes)).map_err(DmlError::journal_unavailable)
+}
+
+fn decode_recovery_due(key: &Key, value: Value) -> Result<StoredRecoveryDueV1, DmlError> {
+    let (_, due_at_ms, operation_id) = decode_recovery_due_key(key)?;
+    let indexed: StoredRecoveryDueV1 =
+        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+    if indexed.schema_version != DML_RECOVERY_DUE_SCHEMA_VERSION
+        || indexed.operation_id != operation_id
+        || indexed.recovery_due_at_ms != due_at_ms
+        || indexed.operation_revision == 0
+        || !is_uuid_v7(indexed.last_mutation_id)
+        || indexed
+            .coordination_attempt_id
+            .is_some_and(|attempt| !is_uuid_v7(attempt))
+    {
+        return Err(DmlError::journal_corruption(
+            "DML recovery due index identity is invalid",
+        ));
+    }
+    Ok(indexed)
+}
+
+fn is_uuid_v7(value: Uuid) -> bool {
+    value.get_version() == Some(uuid::Version::SortRand)
+        && value.get_variant() == uuid::Variant::RFC4122
+}
+
+fn validate_recovery_due_identity(
+    operation: &StoredOperation,
+    indexed: &StoredRecoveryDueV1,
+) -> Result<(), DmlError> {
+    let expected = recovery_due_record(operation)?;
+    if &expected != indexed {
+        return Err(DmlError::journal_corruption(format!(
+            "DML recovery due index conflicts with operation {}",
+            operation.operation_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recovery_due_record(
+    operation: &StoredOperation,
+    indexed: StateRecord,
+) -> Result<(), DmlError> {
+    let due = decode_recovery_due(&indexed.key, indexed.value)?;
+    validate_recovery_due_identity(operation, &due)
 }
 
 fn add_files_artifact_chunk_key(
@@ -1683,6 +2391,21 @@ fn validate_operation(operation: &StoredOperation) -> Result<(), DmlError> {
             operation.operation_id
         )));
     }
+    if let Some(provenance) = &operation.coordination_provenance {
+        validate_coordination_provenance(provenance)?;
+        if provenance.acquired_at_ms < operation.created_at_ms {
+            return Err(DmlError::journal_corruption(format!(
+                "DML operation {} was acquired before it was created",
+                operation.operation_id
+            )));
+        }
+    }
+    if operation_requires_recovery(operation) != operation.recovery_due_at_ms.is_some() {
+        return Err(DmlError::journal_corruption(format!(
+            "DML operation {} has inconsistent recovery due eligibility",
+            operation.operation_id
+        )));
+    }
     if operation.state.is_finished() != operation.finished_at_ms.is_some() {
         return Err(DmlError::journal_corruption(format!(
             "DML operation {} has inconsistent terminal timestamp",
@@ -1758,23 +2481,23 @@ fn validate_add_files_record(record: &AddFilesLifecycleRecord) -> Result<(), Dml
         record.plan_artifact.as_ref(),
         record.receipt_artifact.as_ref(),
         record.evidence_artifact.as_ref(),
-    ] {
-        if let Some(artifact) = artifact {
-            validate_add_files_artifact(artifact)?;
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_add_files_artifact(artifact)?;
     }
     let has_scope = record.source_scope_version.is_some()
         || record.source_scope_kind.is_some()
         || record.source_scope_digest.is_some();
-    if has_scope {
-        if record.source_scope_version != Some(1)
+    if has_scope
+        && (record.source_scope_version != Some(1)
             || record.source_scope_kind.as_deref() != Some("DIRECTORY")
-            || !is_sha256(record.source_scope_digest.as_deref())
-        {
-            return Err(DmlError::journal_corruption(
-                "ADD FILES source scope is incomplete or invalid",
-            ));
-        }
+            || !is_sha256(record.source_scope_digest.as_deref()))
+    {
+        return Err(DmlError::journal_corruption(
+            "ADD FILES source scope is incomplete or invalid",
+        ));
     }
     if matches!(
         record.phase,
