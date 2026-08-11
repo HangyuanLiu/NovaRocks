@@ -755,6 +755,10 @@ impl ConnectorExecutionDistribution for FixtureDistribution {
 /// `files_by_table` is keyed by table name; the `"*"` key answers for every
 /// table with no explicit entry. `seen_projections`, when supplied, records
 /// each projection the fixture observed in `begin_scan`.
+// Design: ADR-0056 (docs/adr/ADR-0056-provider-test-assertion-ownership.md)
+// This fixture deliberately does not implement provider semantics such as
+// predicate pruning. A test that needs those belongs beside the implementation
+// that owns them, not here.
 pub(crate) fn planned_files_fixture_binding(
     catalog: &str,
     files_by_table: HashMap<String, Vec<FixtureScanFile>>,

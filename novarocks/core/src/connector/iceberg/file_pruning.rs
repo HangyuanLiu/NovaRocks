@@ -148,6 +148,10 @@ pub(crate) fn file_may_satisfy_scan_predicates(
 /// here: manifest statistics are keyed by the table's current logical name.
 /// The predicate was resolved from that same schema before it entered the
 /// opaque scan payload.
+///
+// Design: ADR-0056 (docs/adr/ADR-0056-provider-test-assertion-ownership.md)
+// The unit tests below are the parity baseline for provider-side pruning: this
+// is the only implementation of it today. Move them with the implementation.
 pub(crate) fn file_may_satisfy_physical_predicates(
     file: &IcebergDataFileInfo,
     predicates: &[IcebergPhysicalPredicate],

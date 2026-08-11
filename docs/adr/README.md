@@ -102,6 +102,7 @@ code-anchors:
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
 - ADR-0053 — MV snapshot change window 为何复用 exact-generation scan planning 并返回 sealed neutral admission（active）
 - ADR-0055 — row-DML 调用方为何只读 Provider 签发的 strategy，而 SQL 谓词合法性为何留在 Core（active）
+- ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
 
 #### 历史
 
