@@ -40,6 +40,7 @@ const MV_DESCRIPTOR_HASH_PROP: &str = "novarocks.mv.descriptor.hash";
 const MV_DESCRIPTOR_INLINE_PROP: &str = "novarocks.mv.descriptor.inline";
 const MAX_TARGET_FIELDS: usize = 4_096;
 const MAX_PARTITION_FIELDS: usize = 4_096;
+const MAX_TARGET_REFS: usize = 1_024;
 const MAX_PROVENANCE_BASES: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +86,21 @@ pub enum IcebergStoragePartitionTransform {
     Bucket { num_buckets: u32 },
     Truncate { width: u32 },
     Void,
+}
+
+/// Refresh-time facts of an MV target.
+///
+/// Distinct from [`IcebergStorageTargetObservation`]: apply needs snapshot and
+/// ref identity but not the per-field schema payload. Storage layout facts the
+/// physical writer needs — location, sequence numbers, partition spec objects —
+/// stay inside this crate's write preparation and are deliberately absent here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageRefreshTargetObservation {
+    pub table_uuid: String,
+    pub schema_id: i32,
+    pub partition: IcebergStoragePartitionContract,
+    pub current_snapshot_id: Option<i64>,
+    pub ref_snapshot_ids: BTreeMap<String, i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,6 +168,76 @@ impl IcebergStorageInspector {
         let table = decoded_table(exact_lease, metadata, &context)?;
         lake_package_observation(&table, &context)
     }
+
+    pub fn observe_refresh_target(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<IcebergStorageRefreshTargetObservation, ConnectorError> {
+        let table = decoded_table(exact_lease, metadata, &context)?;
+        refresh_target_observation(&table, &context)
+    }
+}
+
+fn refresh_target_observation(
+    table: &TableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageRefreshTargetObservation, ConnectorError> {
+    let schema = table.current_schema();
+    let spec = table.default_partition_spec();
+    if spec.fields().len() > MAX_PARTITION_FIELDS {
+        return Err(exhausted(
+            "Iceberg MV refresh target partition spec exceeds the inspection field limit",
+        ));
+    }
+    let mut budget = 0_usize;
+    let mut partition_fields = Vec::with_capacity(spec.fields().len());
+    for field in spec.fields() {
+        let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+            corrupt(format!(
+                "Iceberg MV refresh target partition field {} references missing target field ID {}",
+                field.name, field.source_id
+            ))
+        })?;
+        reserve(context, &mut budget, &field.name)?;
+        reserve(context, &mut budget, &source.name)?;
+        partition_fields.push(IcebergStoragePartitionField {
+            partition_field_id: field.field_id,
+            partition_field_name: field.name.clone(),
+            source_target_field_id: field.source_id,
+            source_column_name: source.name.clone(),
+            transform: partition_transform(&field.transform)?,
+        });
+    }
+
+    let refs = table.refs();
+    if refs.len() > MAX_TARGET_REFS {
+        return Err(exhausted(
+            "Iceberg MV refresh target exceeds the inspection ref limit",
+        ));
+    }
+    let mut ref_snapshot_ids = BTreeMap::new();
+    for (name, reference) in refs.iter() {
+        reserve(context, &mut budget, name)?;
+        ref_snapshot_ids.insert(name.clone(), reference.snapshot_id);
+    }
+
+    let table_uuid = table.uuid().to_string();
+    reserve(context, &mut budget, &table_uuid)?;
+    validate_context(context)?;
+    Ok(IcebergStorageRefreshTargetObservation {
+        table_uuid,
+        schema_id: table.current_schema_id(),
+        partition: IcebergStoragePartitionContract {
+            target_spec_id: spec.spec_id(),
+            fields: partition_fields,
+        },
+        current_snapshot_id: table
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id()),
+        ref_snapshot_ids,
+    })
 }
 
 fn target_observation(
