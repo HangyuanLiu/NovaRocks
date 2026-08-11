@@ -297,44 +297,4 @@ mod tests {
         .expect_err("foreign token must fail");
         assert!(error.contains("different request"));
     }
-
-    #[test]
-    fn sqlx2_write_binding_preserves_hidden_mv_target_fields() {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        1,
-                        "region",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        2,
-                        "__nova_base_row_id",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("target schema");
-        let fields = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
-            &schema,
-            &std::collections::HashMap::new(),
-        )
-        .expect("target columns");
-
-        assert_eq!(
-            fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["region", "__nova_base_row_id"]
-        );
-    }
 }

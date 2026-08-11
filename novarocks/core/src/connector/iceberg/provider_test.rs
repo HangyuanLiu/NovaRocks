@@ -36,9 +36,9 @@ use novarocks_spi::connector::{
     StatisticsReadRequest, StatisticsReader,
 };
 
-use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
-use super::iceberg::catalog::{IcebergCatalogRegistry, create_namespace};
-use super::iceberg::provider::IcebergControlProvider;
+use super::catalog::registry::{create_table, drop_table, insert_rows, load_table};
+use super::catalog::{IcebergCatalogRegistry, create_namespace};
+use super::provider::IcebergControlProvider;
 use crate::query_execution::statistics::{StatisticsCollectionFinalizer, ThetaSketchPartial};
 use crate::sql::{Literal, TableColumnDef};
 use novarocks_catalog::schema::SqlType;

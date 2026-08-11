@@ -699,3 +699,189 @@ fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_connector_iceberg::scan_model::{
+        IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+        IcebergPartitionFieldValue,
+    };
+
+    fn data_file(path: &str) -> IcebergDataFileInfo {
+        IcebergDataFileInfo {
+            path: path.to_string(),
+            size: 128,
+            row_count: Some(10),
+            column_stats: None,
+            partition_spec_id: Some(0),
+            partition_key: Some("Struct([])".to_string()),
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: Vec::new(),
+            manifest_path: None,
+            partition_values: Vec::new(),
+        }
+    }
+
+    fn i32_stats_file(path: &str, min: i32, max: i32) -> IcebergDataFileInfo {
+        let mut file = data_file(path);
+        file.column_stats = Some(HashMap::from([(
+            "id".to_string(),
+            IcebergColumnStats {
+                null_count: Some(0),
+                value_count: Some(10),
+                column_size: None,
+                lower_bound: Some(min.to_le_bytes().to_vec()),
+                upper_bound: Some(max.to_le_bytes().to_vec()),
+            },
+        )]));
+        file
+    }
+
+    fn identity_partition_file(path: &str, id: i32) -> IcebergDataFileInfo {
+        let mut file = data_file(path);
+        file.partition_key = Some(format!("Struct([{id}])"));
+        file.partition_values = vec![IcebergPartitionFieldValue {
+            source_column: "id".to_string(),
+            field_name: "id".to_string(),
+            transform: "identity".to_string(),
+            value: Some(IcebergPartitionValue::Int32(id)),
+        }];
+        file
+    }
+
+    fn id_eq(value: i32) -> Vec<IcebergPhysicalPredicate> {
+        vec![IcebergPhysicalPredicate {
+            field_id: 1,
+            column: "id".to_string(),
+            domain: IcebergPhysicalPredicateDomain::Range {
+                op: IcebergPhysicalPredicateOp::Eq,
+                value: IcebergPhysicalPredicateValue::Int32(value),
+            },
+        }]
+    }
+
+    fn surviving(
+        files: &[IcebergDataFileInfo],
+        predicates: &[IcebergPhysicalPredicate],
+    ) -> Vec<String> {
+        let mut counters = IcebergFilePruningCounters::default();
+        files
+            .iter()
+            .filter(|file| file_may_satisfy_physical_predicates(file, predicates, &mut counters))
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    /// `id = 12` cannot be satisfied by a file whose manifest bounds are
+    /// `[1, 5]`, so min/max statistics alone must drop it.
+    #[test]
+    fn eq_predicate_prunes_file_whose_min_max_bounds_exclude_the_literal() {
+        let files = vec![
+            i32_stats_file("s3://bucket/id-1-5.parquet", 1, 5),
+            i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
+        ];
+
+        assert_eq!(
+            surviving(&files, &id_eq(12)),
+            vec!["s3://bucket/id-10-20.parquet".to_string()]
+        );
+    }
+
+    /// The same literal against identity-partitioned files must be answered from
+    /// the partition value, without consulting column statistics.
+    #[test]
+    fn eq_predicate_prunes_identity_partition_that_cannot_hold_the_literal() {
+        let files = vec![
+            identity_partition_file("s3://bucket/id-1.parquet", 1),
+            identity_partition_file("s3://bucket/id-12.parquet", 12),
+        ];
+
+        assert_eq!(
+            surviving(&files, &id_eq(12)),
+            vec!["s3://bucket/id-12.parquet".to_string()]
+        );
+    }
+
+    /// A file carrying neither statistics nor partition values is unprunable, so
+    /// it must survive rather than be guessed away.
+    #[test]
+    fn file_without_stats_or_partition_values_is_never_pruned() {
+        let files = vec![data_file("s3://bucket/opaque.parquet")];
+
+        assert_eq!(
+            surviving(&files, &id_eq(12)),
+            vec!["s3://bucket/opaque.parquet".to_string()]
+        );
+    }
+
+    /// An empty predicate list prunes nothing and reports nothing pruned.
+    #[test]
+    fn empty_predicate_list_keeps_every_file() {
+        let files = vec![
+            i32_stats_file("s3://bucket/id-1-5.parquet", 1, 5),
+            i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
+        ];
+        let mut counters = IcebergFilePruningCounters::default();
+
+        for file in &files {
+            assert!(file_may_satisfy_physical_predicates(
+                file,
+                &[],
+                &mut counters
+            ));
+        }
+        assert_eq!(counters.files_pruned, 0);
+        assert_eq!(counters.files_selected, 2);
+    }
+
+    /// The pruning counters are the provider's evidence that pruning happened;
+    /// a dropped file must be reflected in `files_pruned`.
+    #[test]
+    fn counters_report_the_pruned_file_count() {
+        let files = vec![
+            i32_stats_file("s3://bucket/id-1-5.parquet", 1, 5),
+            i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
+        ];
+        let predicates = id_eq(12);
+        let mut counters = IcebergFilePruningCounters::default();
+
+        let kept = files
+            .iter()
+            .filter(|file| file_may_satisfy_physical_predicates(file, &predicates, &mut counters))
+            .count();
+
+        assert_eq!(kept, 1);
+        assert_eq!(counters.files_total, 2);
+        assert_eq!(counters.files_selected, 1);
+        assert_eq!(counters.files_pruned, 1);
+    }
+
+    /// Delete-file associations must not influence data-file pruning: a file
+    /// that satisfies the predicate survives even when it carries deletes.
+    #[test]
+    fn associated_delete_files_do_not_affect_data_file_pruning() {
+        let mut file = i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20);
+        file.delete_files = vec![IcebergDeleteFileInfo {
+            path: "s3://bucket/delete-0.parquet".to_string(),
+            file_format: IcebergDeleteFileFormat::Parquet,
+            file_content: IcebergDeleteFileContent::Position,
+            length: Some(1),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(2),
+            partition_spec_id: Some(0),
+            partition_key: Some("Struct([])".to_string()),
+            equality_column_names: Vec::new(),
+            equality_field_ids: Vec::new(),
+        }];
+
+        assert_eq!(
+            surviving(&[file], &id_eq(12)),
+            vec!["s3://bucket/id-10-20.parquet".to_string()]
+        );
+    }
+}

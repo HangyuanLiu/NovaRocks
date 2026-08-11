@@ -457,59 +457,6 @@ pub(crate) fn drop_local_table_registration_if_exists(
 }
 
 #[cfg(test)]
-pub(crate) fn build_iceberg_delta_table_def_with_files(
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    catalog_name: &str,
-    namespace: &str,
-    table_name: &str,
-    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
-    data_files: Vec<IcebergFileForQuery>,
-) -> Result<TableDef, String> {
-    let change_ops = validate_delta_file_change_ops(&data_files)?;
-    let data_files = iceberg_files_for_query_to_stats(data_files);
-    let mut frozen_files = data_files
-        .iter()
-        .cloned()
-        .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
-        .collect::<Vec<_>>();
-    let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
-        entry,
-        catalog_name,
-        namespace,
-        table_name,
-        loaded,
-        data_files,
-    )?;
-    stamp_delta_table_def_change_ops(&mut table_def, &mut frozen_files, &change_ops)?;
-    Ok(table_def)
-}
-
-#[cfg(test)]
-fn iceberg_files_for_query_to_stats(
-    data_files: Vec<IcebergFileForQuery>,
-) -> Vec<novarocks_connector_iceberg::manifest::DataFileWithStats> {
-    data_files
-        .into_iter()
-        .map(
-            |file| novarocks_connector_iceberg::manifest::DataFileWithStats {
-                path: file.path,
-                size: file.size,
-                record_count: file.record_count,
-                column_stats: None,
-                partition_spec_id: file.partition_spec_id,
-                partition_key: file.partition_key,
-                partition_values: None,
-                manifest_path: None,
-                partition_field_values: vec![],
-                first_row_id: file.first_row_id,
-                data_sequence_number: file.data_sequence_number,
-                delete_files: vec![],
-            },
-        )
-        .collect()
-}
-
-#[cfg(test)]
 fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<Vec<i8>, String> {
     data_files
         .iter()
@@ -529,10 +476,20 @@ fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<
         .collect()
 }
 
+/// Test-only stand-in for the provider-owned frozen data-file rows that
+/// `stamp_delta_table_def_change_ops` writes into. Core must not name a
+/// provider crate type here, and the stamping contract only depends on the
+/// frozen row count plus each row's change-op slot, so this minimal shape is
+/// the whole surface under test.
+#[cfg(test)]
+struct FrozenFileChangeOp {
+    ivm_change_op: Option<i8>,
+}
+
 #[cfg(test)]
 fn stamp_delta_table_def_change_ops(
     table_def: &mut TableDef,
-    files: &mut [novarocks_connector_iceberg::scan_model::IcebergDataFileInfo],
+    files: &mut [FrozenFileChangeOp],
     change_ops: &[i8],
 ) -> Result<(), String> {
     if table_def.columns.iter().any(|col| {
@@ -595,21 +552,9 @@ mod tests {
         )
     }
 
-    fn test_data_file() -> novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
-        novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
-            path: "file:///tmp/data.parquet".to_string(),
-            size: 10,
-            row_count: Some(1),
-            column_stats: None,
-            partition_spec_id: None,
-            partition_key: None,
-            first_row_id: None,
-            data_sequence_number: None,
+    fn test_data_file() -> super::FrozenFileChangeOp {
+        super::FrozenFileChangeOp {
             ivm_change_op: None,
-            included_positions: None,
-            delete_files: vec![],
-            manifest_path: None,
-            partition_values: vec![],
         }
     }
 

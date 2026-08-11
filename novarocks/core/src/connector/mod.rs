@@ -536,8 +536,6 @@ pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
 
 #[cfg(test)]
-mod iceberg_provider_test;
-#[cfg(test)]
 mod runtime_test;
 
 #[cfg(test)]
@@ -578,90 +576,172 @@ mod tests {
         assert_eq!(columns[0].name, "value");
     }
 
-    /// SPI-5G equivalence gate.
+    /// Write-default projection gate, Core side of the SPI boundary.
     ///
-    /// Every write default now reaches Core through the provider's planning
-    /// facts instead of a Core-side Iceberg literal decode. This asserts the
-    /// full `Iceberg literal -> provider -> SPI value -> catalog value` round
-    /// trip is lossless for every variant the neutral vocabulary admits, so the
-    /// value INSERT materializes for an omitted column is unchanged.
+    /// A write default reaches Core only as a sealed
+    /// [`ConnectorColumnDefault`]. This pins Core's projection of every variant
+    /// the sealed vocabulary admits onto the neutral catalog value, so the value
+    /// an INSERT materializes for an omitted column is unchanged. Producing that
+    /// sealed value from a provider's own literal vocabulary belongs to the
+    /// provider and is covered by its own conformance tests.
     #[test]
-    fn spi5g_write_default_round_trip_matches_direct_iceberg_decode() {
+    fn write_default_projection_covers_every_sealed_variant() {
         use novarocks_catalog::schema::ColumnDefault;
-        use novarocks_connector_iceberg::default_value::{
-            column_default_to_connector_default, iceberg_literal_to_column_default,
-        };
-        use novarocks_connector_iceberg::iceberg::spec::{
-            Literal, NestedField, PrimitiveType, Type,
-        };
+        use novarocks_spi::connector::ConnectorColumnDefault as Spi;
 
-        let cases: Vec<(&str, Type, Literal)> = vec![
-            (
-                "bool",
-                Type::Primitive(PrimitiveType::Boolean),
-                Literal::bool(true),
-            ),
-            ("i32", Type::Primitive(PrimitiveType::Int), Literal::int(-7)),
+        let cases: Vec<(&str, Spi, ColumnDefault)> = vec![
+            ("null", Spi::Null, ColumnDefault::Null),
+            ("bool", Spi::Boolean(true), ColumnDefault::Boolean(true)),
+            ("i32", Spi::Int32(-7), ColumnDefault::Int32(-7)),
             (
                 "i64",
-                Type::Primitive(PrimitiveType::Long),
-                Literal::long(1_i64 << 40),
+                Spi::Int64(1_i64 << 40),
+                ColumnDefault::Int64(1_i64 << 40),
             ),
             (
                 "f32",
-                Type::Primitive(PrimitiveType::Float),
-                Literal::float(1.5f32),
+                Spi::Float32 {
+                    bits: 1.5f32.to_bits(),
+                },
+                ColumnDefault::Float32 {
+                    bits: 1.5f32.to_bits(),
+                },
             ),
             (
                 "f64",
-                Type::Primitive(PrimitiveType::Double),
-                Literal::double(-2.25f64),
+                Spi::Float64 {
+                    bits: (-2.25f64).to_bits(),
+                },
+                ColumnDefault::Float64 {
+                    bits: (-2.25f64).to_bits(),
+                },
+            ),
+            (
+                "decimal",
+                Spi::Decimal {
+                    unscaled: -12_345,
+                    precision: 9,
+                    scale: 3,
+                },
+                ColumnDefault::Decimal {
+                    unscaled: -12_345,
+                    precision: 9,
+                    scale: 3,
+                },
             ),
             (
                 "text",
-                Type::Primitive(PrimitiveType::String),
-                Literal::string("fallback"),
+                Spi::String("fallback".into()),
+                ColumnDefault::String("fallback".to_string()),
             ),
             (
                 "blob",
-                Type::Primitive(PrimitiveType::Binary),
-                Literal::binary(vec![0u8, 255u8]),
+                Spi::Binary(vec![0u8, 255u8].into()),
+                ColumnDefault::Binary(vec![0u8, 255u8]),
             ),
             (
                 "day",
-                Type::Primitive(PrimitiveType::Date),
-                Literal::int(19_000),
+                Spi::Date {
+                    days_since_epoch: 19_000,
+                },
+                ColumnDefault::Date {
+                    days_since_epoch: 19_000,
+                },
+            ),
+            (
+                "time_micros",
+                Spi::TimeMicros {
+                    micros_since_midnight: 3_600_000_001,
+                },
+                ColumnDefault::TimeMicros {
+                    micros_since_midnight: 3_600_000_001,
+                },
+            ),
+            (
+                "timestamp_micros",
+                Spi::TimestampMicros {
+                    micros_since_epoch: -1_000_000,
+                },
+                ColumnDefault::TimestampMicros {
+                    micros_since_epoch: -1_000_000,
+                },
+            ),
+            (
+                "timestamptz_micros",
+                Spi::TimestamptzMicros {
+                    micros_since_epoch: 1_000_000,
+                },
+                ColumnDefault::TimestamptzMicros {
+                    micros_since_epoch: 1_000_000,
+                },
+            ),
+            (
+                "timestamp_nanos",
+                Spi::TimestampNanos {
+                    nanos_since_epoch: -9,
+                },
+                ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: -9,
+                },
+            ),
+            (
+                "timestamptz_nanos",
+                Spi::TimestamptzNanos {
+                    nanos_since_epoch: 9,
+                },
+                ColumnDefault::TimestamptzNanos {
+                    nanos_since_epoch: 9,
+                },
+            ),
+            ("uuid", Spi::Uuid([9u8; 16]), ColumnDefault::Uuid([9u8; 16])),
+            (
+                "fixed",
+                Spi::Fixed {
+                    size: 3,
+                    bytes: vec![1, 2, 3].into(),
+                },
+                ColumnDefault::Fixed {
+                    size: 3,
+                    bytes: vec![1, 2, 3],
+                },
             ),
         ];
 
-        for (name, iceberg_type, literal) in cases {
-            let direct: ColumnDefault = iceberg_literal_to_column_default(&literal, &iceberg_type)
-                .unwrap_or_else(|error| panic!("column `{name}` direct decode failed: {error}"));
-
-            // The path SPI-5G introduces: provider projects onto the sealed SPI
-            // value, Core projects it back onto the neutral catalog value.
-            let round_tripped = super::connector_default_to_column_default(
-                &column_default_to_connector_default(&direct),
-            );
-
+        for (name, sealed, expected) in cases {
             assert_eq!(
-                round_tripped, direct,
+                super::connector_default_to_column_default(&sealed),
+                expected,
                 "column `{name}` changed while crossing the SPI boundary"
             );
-
-            // The field is only used to prove the fixture is a legal Iceberg
-            // column carrying this default.
-            let _ = NestedField::optional(1, name, iceberg_type).with_write_default(literal);
         }
     }
 
-    /// Nested defaults are the ones a flat projection would silently truncate.
+    /// Nested defaults are the ones a flat projection would silently truncate,
+    /// so struct/array/map recursion is pinned separately from the scalars.
     #[test]
-    fn spi5g_nested_write_default_round_trip_is_lossless() {
+    fn write_default_projection_recurses_through_nested_variants() {
         use novarocks_catalog::schema::ColumnDefault;
-        use novarocks_connector_iceberg::default_value::column_default_to_connector_default;
+        use novarocks_spi::connector::ConnectorColumnDefault as Spi;
 
-        let nested = ColumnDefault::Struct(vec![
+        let sealed = Spi::Struct(vec![
+            (
+                "list".into(),
+                Spi::Array(vec![Spi::Int32(1), Spi::String("two".into())]),
+            ),
+            (
+                "map".into(),
+                Spi::Map(vec![(
+                    Spi::String("k".into()),
+                    Spi::Fixed {
+                        size: 3,
+                        bytes: vec![1, 2, 3].into(),
+                    },
+                )]),
+            ),
+            ("uuid".into(), Spi::Uuid([9u8; 16])),
+        ]);
+
+        let expected = ColumnDefault::Struct(vec![
             (
                 "list".to_string(),
                 ColumnDefault::Array(vec![
@@ -683,35 +763,34 @@ mod tests {
         ]);
 
         assert_eq!(
-            super::connector_default_to_column_default(&column_default_to_connector_default(
-                &nested
-            )),
-            nested
+            super::connector_default_to_column_default(&sealed),
+            expected
         );
     }
 
     /// Non-finite floats survive because both vocabularies carry the raw bit
     /// pattern rather than the float value.
     #[test]
-    fn spi5g_non_finite_write_default_round_trip_preserves_bits() {
+    fn write_default_projection_preserves_non_finite_float_bits() {
         use novarocks_catalog::schema::ColumnDefault;
-        use novarocks_connector_iceberg::default_value::column_default_to_connector_default;
+        use novarocks_spi::connector::ConnectorColumnDefault as Spi;
 
-        for value in [
+        assert_eq!(
+            super::connector_default_to_column_default(&Spi::Float32 {
+                bits: f32::NAN.to_bits(),
+            }),
             ColumnDefault::Float32 {
                 bits: f32::NAN.to_bits(),
-            },
+            }
+        );
+        assert_eq!(
+            super::connector_default_to_column_default(&Spi::Float64 {
+                bits: f64::NEG_INFINITY.to_bits(),
+            }),
             ColumnDefault::Float64 {
                 bits: f64::NEG_INFINITY.to_bits(),
-            },
-        ] {
-            assert_eq!(
-                super::connector_default_to_column_default(&column_default_to_connector_default(
-                    &value
-                )),
-                value
-            );
-        }
+            }
+        );
     }
 }
 

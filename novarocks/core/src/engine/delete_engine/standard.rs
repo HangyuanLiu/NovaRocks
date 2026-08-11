@@ -796,71 +796,8 @@ fn extract_integer_literal(expr: &sqlast::Expr) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
-    use std::fs;
-    use std::sync::Arc;
-
-    use arrow::array::{Int32Array, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use arrow::record_batch::RecordBatch;
-    use novarocks_connector_iceberg::iceberg::spec::{
-        Literal, NestedField, PrimitiveType, Struct, Type,
-    };
-    use parquet::arrow::ArrowWriter;
+    use arrow::datatypes::DataType;
     use sqlparser::ast as sqlast;
-
-    use novarocks_connector_iceberg::delete_file::{
-        IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
-    };
-
-    fn temp_dir_for(name: &str) -> std::path::PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "novarocks_delete_flow_tests_{}_{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create tmp dir");
-        dir
-    }
-
-    fn factory_for_dir(dir: &std::path::Path) -> novarocks_fs::FsAccessHandle {
-        novarocks_fs::FsAccessResolver::new()
-            .resolve_location(dir.join("__binding__").to_string_lossy(), None)
-            .expect("access")
-    }
-
-    fn write_eq_delete_parquet(path: &std::path::Path) {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
-            .expect("delete batch");
-        let file = fs::File::create(path).expect("create delete file");
-        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
-        writer.write(&batch).expect("write delete file");
-        writer.close().expect("close delete file");
-    }
-
-    fn delete_where_id_in_2_3() -> sqlast::Expr {
-        sqlast::Expr::InList {
-            expr: Box::new(sqlast::Expr::Identifier(sqlast::Ident::new("id"))),
-            list: vec![
-                sqlast::Expr::Value(sqlast::ValueWithSpan {
-                    value: sqlast::Value::Number("2".to_string(), false),
-                    span: sqlparser::tokenizer::Span::empty(),
-                }),
-                sqlast::Expr::Value(sqlast::ValueWithSpan {
-                    value: sqlast::Value::Number("3".to_string(), false),
-                    span: sqlparser::tokenizer::Span::empty(),
-                }),
-            ],
-            negated: false,
-        }
-    }
 
     fn column(name: &str, data_type: DataType) -> novarocks_catalog::schema::ColumnDef {
         novarocks_catalog::schema::ColumnDef {
@@ -984,18 +921,6 @@ mod tests {
 
     // --------------- Timestamp predicate tests ---------------
 
-    /// Build `WHERE ts = '<literal>'` as a sqlparser Expr.
-    fn delete_where_ts_eq(literal: &str) -> sqlast::Expr {
-        sqlast::Expr::BinaryOp {
-            left: Box::new(sqlast::Expr::Identifier(sqlast::Ident::new("ts"))),
-            op: sqlast::BinaryOperator::Eq,
-            right: Box::new(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::SingleQuotedString(literal.to_string()),
-                span: sqlparser::tokenizer::Span::empty(),
-            })),
-        }
-    }
-
     #[test]
     fn delete_validate_accepts_datetime_literals_with_and_without_subseconds() {
         for literal in ["2020-01-01 00:00:00", "2020-01-01 00:00:00.5"] {
@@ -1017,103 +942,5 @@ mod tests {
         let error = super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
             .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");
         assert!(error.contains("DATETIME"), "{error}");
-    }
-
-    // --------------- Scalar-function predicate tests ---------------
-
-    fn iceberg_schema_with_label() -> novarocks_connector_iceberg::iceberg::spec::Schema {
-        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )),
-                Arc::new(NestedField::required(
-                    2,
-                    "label",
-                    Type::Primitive(PrimitiveType::String),
-                )),
-            ])
-            .build()
-            .expect("build iceberg schema with label")
-    }
-
-    fn make_label_batch(labels: &[&str]) -> RecordBatch {
-        let n = labels.len() as i64;
-        let batch_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-            Field::new("label", DataType::Utf8, false),
-        ]));
-        RecordBatch::try_new(
-            batch_schema,
-            vec![
-                Arc::new(StringArray::from(
-                    (0..labels.len())
-                        .map(|_| "/wh/t/data.parquet")
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
-                Arc::new(Int32Array::from(
-                    (1..=labels.len() as i32).collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(labels.to_vec())),
-            ],
-        )
-        .expect("label batch")
-    }
-
-    fn delete_where_lower_label_eq(s: &str) -> sqlast::Expr {
-        sqlast::Expr::BinaryOp {
-            left: Box::new(sqlast::Expr::Function(sqlast::Function {
-                name: sqlast::ObjectName::from(vec![sqlast::Ident::new("lower")]),
-                args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
-                    duplicate_treatment: None,
-                    args: vec![sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
-                        sqlast::Expr::Identifier(sqlast::Ident::new("label")),
-                    ))],
-                    clauses: vec![],
-                }),
-                filter: None,
-                null_treatment: None,
-                over: None,
-                within_group: vec![],
-                parameters: sqlast::FunctionArguments::None,
-                uses_odbc_syntax: false,
-            })),
-            op: sqlast::BinaryOperator::Eq,
-            right: Box::new(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::SingleQuotedString(s.to_string()),
-                span: sqlparser::tokenizer::Span::empty(),
-            })),
-        }
-    }
-
-    fn delete_where_upper_label_eq(s: &str) -> sqlast::Expr {
-        sqlast::Expr::BinaryOp {
-            left: Box::new(sqlast::Expr::Function(sqlast::Function {
-                name: sqlast::ObjectName::from(vec![sqlast::Ident::new("upper")]),
-                args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
-                    duplicate_treatment: None,
-                    args: vec![sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
-                        sqlast::Expr::Identifier(sqlast::Ident::new("label")),
-                    ))],
-                    clauses: vec![],
-                }),
-                filter: None,
-                null_treatment: None,
-                over: None,
-                within_group: vec![],
-                parameters: sqlast::FunctionArguments::None,
-                uses_odbc_syntax: false,
-            })),
-            op: sqlast::BinaryOperator::Eq,
-            right: Box::new(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::SingleQuotedString(s.to_string()),
-                span: sqlparser::tokenizer::Span::empty(),
-            })),
-        }
     }
 }
