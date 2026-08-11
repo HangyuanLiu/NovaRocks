@@ -49,7 +49,7 @@ use crate::dml::model::{
 use crate::dml::now_unix_millis;
 
 #[derive(Clone)]
-// Design: ADR-0051 (docs/adr/ADR-0051-frontend-dml-operation-authority-boundary.md)
+// Design: ADR-0054 (docs/adr/ADR-0054-frontend-dml-operation-authority-boundary.md)
 pub(crate) struct DmlCoordinator {
     frontend: Arc<FrontendCoordinationRuntime>,
     runtime: Handle,

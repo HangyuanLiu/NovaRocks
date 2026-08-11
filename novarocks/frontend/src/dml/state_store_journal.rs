@@ -960,7 +960,7 @@ impl StateStoreOperationJournal {
         .await
     }
 
-    // Design: ADR-0051 (docs/adr/ADR-0051-frontend-dml-operation-authority-boundary.md)
+    // Design: ADR-0054 (docs/adr/ADR-0054-frontend-dml-operation-authority-boundary.md)
     async fn mutate_operation_authorized_async(
         &self,
         operation_id: DmlOperationId,

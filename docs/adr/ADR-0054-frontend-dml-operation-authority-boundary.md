@@ -1,5 +1,5 @@
 ---
-id: ADR-0051
+id: ADR-0054
 title: "Frontend DML uses operation-scoped StateStore authority without claiming external commit fencing"
 domain: [frontend-dml]
 status: active
