@@ -21332,20 +21332,24 @@ mod tests {
             ..iceberg_mv_test_state_defaults()
         });
         crate::connector::register_standalone_backends(&state);
+        // CREATE EXTERNAL CATALOG persists a durable attachment and only then
+        // materializes the runtime registry. Populating just the registry
+        // leaves anything that reads attachments -- lake MV rebuild is the one
+        // that matters -- looking at an empty catalog list.
+        let catalog_properties = vec![
+            ("type".to_string(), "iceberg".to_string()),
+            ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse_dir.path().display().to_string(),
+            ),
+        ];
+        crate::engine::persist_catalog_attachment_if_needed(&state, catalog, &catalog_properties)
+            .expect("persist iceberg catalog attachment");
         {
             let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
             catalogs
-                .create_catalog(
-                    catalog,
-                    &[
-                        ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                        (
-                            "iceberg.catalog.warehouse".to_string(),
-                            warehouse_dir.path().display().to_string(),
-                        ),
-                    ],
-                )
+                .create_catalog(catalog, &catalog_properties)
                 .expect("create iceberg catalog");
         }
         initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);

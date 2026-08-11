@@ -7438,7 +7438,15 @@ mysql_port = 47892
             .session()
             .execute("ALTER TABLE missing.db.t ADD COLUMN c INT")
             .expect_err("unknown catalog");
-        assert!(err.contains("unknown catalog"));
+        // What this pins is the dispatch, not the wording: ALTER TABLE must
+        // reach the Iceberg schema path and fail there on the unknown catalog,
+        // rather than falling through to the generic sqlparser statement
+        // handler. Naming the catalog in the message is what tells the two
+        // apart -- generic parsing never resolves a connector instance.
+        assert!(
+            err.contains("missing") && err.contains("connector control instance"),
+            "ALTER TABLE must fail while resolving the Iceberg catalog; got: {err}"
+        );
     }
 
     fn query_result_contains_string(result: &QueryResult, expected: &str) -> bool {
