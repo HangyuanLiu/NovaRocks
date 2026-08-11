@@ -7162,15 +7162,15 @@ fn refresh_execution_definition_fingerprint(
 
 fn build_refresh_state_baseline(
     mv_definition: &StoredMvDefinition,
-    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    target: &crate::mv::refresh::target_binding::MvTargetBinding,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<RefreshStateBaseline, String> {
     Ok(RefreshStateBaseline::SnapshotBacked {
         previous_snapshot_ids: mv_definition.last_refresh_snapshots.clone(),
         previous_table_uuids: mv_definition.last_refresh_table_uuids.clone(),
-        target_snapshot_id: expected_main_snapshot_id_from_table(target_table),
-        target_table_uuid: target_table.metadata().uuid().to_string(),
+        target_snapshot_id: target.current_snapshot_id(),
+        target_table_uuid: target.table_uuid().to_string(),
         definition_fingerprint: refresh_execution_definition_fingerprint(
             mv_definition,
             current_catalog,
@@ -7247,7 +7247,8 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
     .map_err(RefreshError::user)?;
     let refresh_state_baseline = build_refresh_state_baseline(
         &mv_definition,
-        &target_loaded.table,
+        &target_binding_for(state, &iceberg_target, connector_context)
+            .map_err(RefreshError::user)?,
         current_catalog,
         current_database,
     )
@@ -7747,7 +7748,8 @@ fn plan_iceberg_union_projection_mv_refresh(
     log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
     let state_baseline = build_refresh_state_baseline(
         mv_definition,
-        target_table,
+        &target_binding_for(state, iceberg_target, connector_context)
+            .map_err(RefreshError::user)?,
         current_catalog,
         current_database,
     )
@@ -7928,7 +7930,8 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         decision.refresh,
         build_refresh_state_baseline(
             mv_definition,
-            target_table,
+            &target_binding_for(state, iceberg_target, connector_context)
+                .map_err(RefreshError::user)?,
             current_catalog,
             current_database,
         )
@@ -8049,7 +8052,8 @@ fn plan_iceberg_aggregate_mv_refresh(
                 decision.refresh,
                 build_refresh_state_baseline(
                     mv_definition,
-                    target_table,
+                    &target_binding_for(state, iceberg_target, connector_context)
+                        .map_err(RefreshError::user)?,
                     current_catalog,
                     current_database,
                 )
@@ -8177,7 +8181,8 @@ fn plan_iceberg_aggregate_mv_refresh(
                 decision.refresh,
                 build_refresh_state_baseline(
                     mv_definition,
-                    target_table,
+                    &target_binding_for(state, iceberg_target, connector_context)
+                        .map_err(RefreshError::user)?,
                     current_catalog,
                     current_database,
                 )
@@ -8732,7 +8737,8 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
         .map_err(RefreshError::pre_commit)?;
     let observed_baseline = build_refresh_state_baseline(
         &mv_definition,
-        &target_loaded.table,
+        &target_binding_for(state, &contract_target, connector_context)
+            .map_err(RefreshError::pre_commit)?,
         plan.current_catalog.as_deref(),
         &plan.current_database,
     )
