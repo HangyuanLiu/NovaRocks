@@ -18,8 +18,12 @@ pub(crate) fn discard_exchange_transmitter() -> std::sync::Arc<dyn ExchangeFrame
 #[cfg(test)]
 pub(crate) fn in_process_test_exchange_transmitter() -> std::sync::Arc<dyn ExchangeFrameTransmitter>
 {
+    // The transmitter must deliver into the very registry the receiving
+    // fragment waits on. Building a fresh port here would let senders push
+    // frames into a registry nobody reads, so the receiver never observes EOS
+    // and the fragment blocks forever instead of failing.
     std::sync::Arc::new(InProcessTestExchangeFrameTransmitter {
-        receiver_port: InProcessTestExchangeReceiverPort::default(),
+        receiver_port: (*test_exchange_receiver_port()).clone(),
     })
 }
 
