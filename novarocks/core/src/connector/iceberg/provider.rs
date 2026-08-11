@@ -54,8 +54,8 @@ use novarocks_spi::connector::{
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorRowMutationRoute, ConnectorRowMutationStrategy, ConnectorScalarType,
     ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSealedWriteCohortSet, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorScanSelection, ConnectorSealedWriteCohortSet, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
     ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
@@ -4173,9 +4173,18 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 &request.projection,
             )?,
         };
+        let selector = match request.selection {
+            ConnectorScanSelection::Snapshot(selector) => selector,
+            ConnectorScanSelection::ChangeWindow(_) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "legacy Core Iceberg control does not admit change-window scans",
+                ));
+            }
+        };
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
             (None, None)
-        } else if matches!(request.selector, ConnectorReadSelector::Current) {
+        } else if matches!(selector, ConnectorReadSelector::Current) {
             let table_info = table.table_info.as_ref().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
@@ -4187,8 +4196,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 table_info.table_uuid.clone(),
             )
         } else {
-            let (snapshot_id, table_uuid) =
-                self.select_snapshot(&entry, &table, request.selector)?;
+            let (snapshot_id, table_uuid) = self.select_snapshot(&entry, &table, selector)?;
             (snapshot_id, Some(table_uuid))
         };
         let (physical_predicates, predicate_dispositions) =
@@ -4203,8 +4211,10 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             physical_predicates,
             fact_columns,
         };
-        Ok(ConnectorScan {
-            handle: ConnectorScanHandle::try_new(
+        ConnectorScan::try_new_snapshot(
+            self.binding_key.clone(),
+            selector,
+            ConnectorScanHandle::try_new(
                 self.instance_id.clone(),
                 encode_payload(
                     &payload,
@@ -4214,7 +4224,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             )?,
             output_schema,
             predicate_dispositions,
-        })
+        )
     }
 
     fn plan_splits(
@@ -8674,6 +8684,18 @@ fn plan_native_iceberg_read_with_bound_lease(
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    let selection = ConnectorScanSelection::Snapshot(
+        table
+            .current_snapshot_id
+            .filter(|_| {
+                matches!(
+                    binding,
+                    novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
+                )
+            })
+            .map(ConnectorReadSelector::SnapshotId)
+            .unwrap_or(ConnectorReadSelector::Current),
+    );
     let scan = control_binding
         .planning()
         .begin_scan(
@@ -8681,16 +8703,7 @@ fn plan_native_iceberg_read_with_bound_lease(
             novarocks_spi::connector::ConnectorBeginScanRequest {
                 projection: projection.to_vec(),
                 static_predicates: static_predicates.clone(),
-                selector: table
-                    .current_snapshot_id
-                    .filter(|_| {
-                        matches!(
-                            binding,
-                            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-                        )
-                    })
-                    .map(ConnectorReadSelector::SnapshotId)
-                    .unwrap_or(ConnectorReadSelector::Current),
+                selection,
                 purpose: ConnectorReadPurpose::Query,
                 limit: None,
                 batch: novarocks_spi::connector::ConnectorBatchBudget {
@@ -8704,12 +8717,20 @@ fn plan_native_iceberg_read_with_bound_lease(
             },
         )
         .map_err(|error| error.to_string())?;
-    normalize_predicate_dispositions(&static_predicates, &scan.predicate_dispositions)
+    scan.validate(
+        &ConnectorExecutionBindingKey {
+            instance_id: control_binding.descriptor().instance_id.clone(),
+            incarnation: control_binding.incarnation(),
+        },
+        selection,
+    )
+    .map_err(|error| error.to_string())?;
+    normalize_predicate_dispositions(&static_predicates, scan.predicate_dispositions())
         .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
     let split_result = control_binding
         .planning()
         .plan_splits(
-            &scan.handle,
+            scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism,
                 max_split_bytes,
@@ -10625,6 +10646,7 @@ fn planned_table_files_fixture_binding(
 
     struct Fixture {
         instance_id: ConnectorInstanceId,
+        incarnation: ConnectorInstanceIncarnation,
         files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
         seen_projections: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
     }
@@ -10690,8 +10712,22 @@ fn planned_table_files_fixture_binding(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(ConnectorScan {
-                handle: ConnectorScanHandle::try_new(
+            let selector = match request.selection {
+                ConnectorScanSelection::Snapshot(selector) => selector,
+                ConnectorScanSelection::ChangeWindow(_) => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "planned-files fixture does not support change-window scans",
+                    ));
+                }
+            };
+            ConnectorScan::try_new_snapshot(
+                ConnectorExecutionBindingKey {
+                    instance_id: self.instance_id.clone(),
+                    incarnation: self.incarnation,
+                },
+                selector,
+                ConnectorScanHandle::try_new(
                     self.instance_id.clone(),
                     encode_payload(
                         &ScanPayload {
@@ -10707,9 +10743,9 @@ fn planned_table_files_fixture_binding(
                         request.context.max_handle_payload_bytes(),
                     )?,
                 )?,
-                output_schema: Arc::new(Schema::new(fields)),
+                Arc::new(Schema::new(fields)),
                 predicate_dispositions,
-            })
+            )
         }
 
         fn plan_splits(
@@ -10879,8 +10915,10 @@ fn planned_table_files_fixture_binding(
     }
 
     let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture instance ID");
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
     let read = Arc::new(Fixture {
         instance_id: instance_id.clone(),
+        incarnation,
         files_by_table,
         seen_projections,
     });
@@ -10889,7 +10927,6 @@ fn planned_table_files_fixture_binding(
             .expect("fixture provider ID"),
         instance_id,
     };
-    let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
     ConnectorControlBinding::try_new(
         descriptor.clone(),
         incarnation,

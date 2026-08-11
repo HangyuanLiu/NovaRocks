@@ -563,7 +563,9 @@ mod tests {
                 novarocks_spi::connector::ConnectorBeginScanRequest {
                     projection: vec![0],
                     static_predicates: vec![],
-                    selector: ConnectorReadSelector::Current,
+                    selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
+                        ConnectorReadSelector::Current,
+                    ),
                     purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                     limit: None,
                     batch: ConnectorBatchBudget {
@@ -577,7 +579,7 @@ mod tests {
         let splits = binding
             .planning()
             .plan_splits(
-                &scan.handle,
+                scan.handle(),
                 ConnectorSplitPlanningRequest {
                     target_parallelism: NonZeroUsize::new(1).unwrap(),
                     max_split_bytes: None,
@@ -588,7 +590,7 @@ mod tests {
         (
             binding.execution_declaration(&context).unwrap(),
             splits.splits.into_iter().next().unwrap(),
-            scan.output_schema,
+            Arc::clone(scan.output_schema()),
         )
     }
 

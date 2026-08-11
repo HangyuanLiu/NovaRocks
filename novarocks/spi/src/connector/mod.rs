@@ -160,9 +160,13 @@ pub use predicate::{
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
-    ConnectorOpenReaderRequest, ConnectorReadPurpose, ConnectorReadSelector,
-    ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
+    ConnectorChangePartitionValue, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
+    ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
+    ConnectorChangeWindowReplaceFailure, ConnectorOpenReaderRequest, ConnectorReadPurpose,
+    ConnectorReadSelector, ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanAdmission,
+    ConnectorScanSelection, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult,
 };
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,

@@ -97,7 +97,7 @@ pub(super) fn plan_connector_read(
             ConnectorBeginScanRequest {
                 projection: projection.clone(),
                 static_predicates: static_predicates.clone(),
-                selector: *selector,
+                selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(*selector),
                 purpose: connector_read_purpose(scan),
                 limit: None,
                 batch,
@@ -105,11 +105,20 @@ pub(super) fn plan_connector_read(
             },
         )
         .map_err(|error| error.to_string())?;
+    connector_scan
+        .validate(
+            &novarocks_spi::connector::ConnectorExecutionBindingKey {
+                instance_id: binding.descriptor().instance_id.clone(),
+                incarnation: binding.incarnation(),
+            },
+            novarocks_spi::connector::ConnectorScanSelection::Snapshot(*selector),
+        )
+        .map_err(|error| error.to_string())?;
     let expected_fields = projection
         .iter()
         .map(|ordinal| schema.fields()[*ordinal].clone())
         .collect::<Vec<_>>();
-    if connector_scan.output_schema.fields().as_ref() != expected_fields.as_slice() {
+    if connector_scan.output_schema().fields().as_ref() != expected_fields.as_slice() {
         return Err(
             "connector read returned a schema that does not match the admitted projection"
                 .to_string(),
@@ -117,14 +126,14 @@ pub(super) fn plan_connector_read(
     }
     let predicate_dispositions = normalize_predicate_dispositions(
         &static_predicates,
-        &connector_scan.predicate_dispositions,
+        connector_scan.predicate_dispositions(),
     )
     .map_err(|error| format!("connector static predicate response: {error}"))?;
     let residual_predicates = residual_predicates(&scan.predicates, &predicate_dispositions)?;
     let split_result = binding
         .planning()
         .plan_splits(
-            &connector_scan.handle,
+            connector_scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism,
                 max_split_bytes,
@@ -198,7 +207,7 @@ pub(super) fn plan_iceberg_delta_connector_read(
         target_parallelism,
         max_split_bytes,
     )?;
-    let provider_field_ordinals = (0..planned.scan.output_schema.fields().len())
+    let provider_field_ordinals = (0..planned.scan.output_schema().fields().len())
         .map(|ordinal| {
             u32::try_from(ordinal)
                 .map_err(|_| "Iceberg delta provider field ordinal does not fit u32".to_string())

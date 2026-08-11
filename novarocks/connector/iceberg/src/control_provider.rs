@@ -16,14 +16,15 @@ use std::time::Instant;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
-    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorReadNamedReference, ConnectorReadPurpose, ConnectorReadReferenceFacts,
-    ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind, ConnectorReadSelector,
-    ConnectorReadSnapshotLogEntry, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorReadNamedReference, ConnectorReadPurpose,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
+    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
@@ -391,7 +392,16 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         } else {
             projected_schema(&table, &request.projection)?
         };
-        let (snapshot_id, table_uuid) = match request.selector {
+        let selector = match request.selection {
+            ConnectorScanSelection::Snapshot(selector) => selector,
+            ConnectorScanSelection::ChangeWindow(_) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Iceberg change-window scan admission is not installed",
+                ));
+            }
+        };
+        let (snapshot_id, table_uuid) = match selector {
             ConnectorReadSelector::Current => {
                 let table_info = table.table_info.as_ref().ok_or_else(|| {
                     corrupt("Iceberg current scan is missing its resolved table pin")
@@ -429,8 +439,13 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             fact_columns,
             physical_predicates,
         };
-        Ok(ConnectorScan {
-            handle: ConnectorScanHandle::try_new(
+        ConnectorScan::try_new_snapshot(
+            ConnectorExecutionBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            selector,
+            ConnectorScanHandle::try_new(
                 self.descriptor.instance_id.clone(),
                 encode_payload(
                     &payload,
@@ -440,7 +455,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             )?,
             output_schema,
             predicate_dispositions,
-        })
+        )
     }
 
     fn plan_splits(

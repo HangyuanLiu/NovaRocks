@@ -595,7 +595,9 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
             ConnectorBeginScanRequest {
                 projection: vec![0],
                 static_predicates: Vec::new(),
-                selector: ConnectorReadSelector::Current,
+                selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
+                    ConnectorReadSelector::Current,
+                ),
                 purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -609,7 +611,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
     let split = planning
         .planning()
         .plan_splits(
-            &scan.handle,
+            scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
                 max_split_bytes: None,
@@ -771,7 +773,9 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
             ConnectorBeginScanRequest {
                 projection: vec![0],
                 static_predicates: Vec::new(),
-                selector: ConnectorReadSelector::Current,
+                selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
+                    ConnectorReadSelector::Current,
+                ),
                 purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -785,7 +789,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     let splits = instance
         .planning()
         .plan_splits(
-            &scan.handle,
+            scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
                 max_split_bytes: None,
@@ -807,7 +811,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
             &execution,
             &splits[0],
             ConnectorOpenReaderRequest {
-                expected_schema: Arc::clone(&scan.output_schema),
+                expected_schema: Arc::clone(scan.output_schema()),
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
                     max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
@@ -857,7 +861,9 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
             ConnectorBeginScanRequest {
                 projection: vec![0],
                 static_predicates: Vec::new(),
-                selector: ConnectorReadSelector::Current,
+                selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
+                    ConnectorReadSelector::Current,
+                ),
                 purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -871,7 +877,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
     let stale_split = instance
         .planning()
         .plan_splits(
-            &scan.handle,
+            scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
                 max_split_bytes: None,
@@ -971,7 +977,9 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
             ConnectorBeginScanRequest {
                 projection: vec![0],
                 static_predicates: Vec::new(),
-                selector: ConnectorReadSelector::Current,
+                selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
+                    ConnectorReadSelector::Current,
+                ),
                 purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -985,7 +993,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
     let current_split = instance
         .planning()
         .plan_splits(
-            &current_scan.handle,
+            current_scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
                 max_split_bytes: None,

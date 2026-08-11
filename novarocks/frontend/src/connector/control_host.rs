@@ -1649,7 +1649,9 @@ pub(crate) mod tests {
                 ConnectorBeginScanRequest {
                     projection: vec![],
                     static_predicates: vec![],
-                    selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+                    selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
+                        novarocks_spi::connector::ConnectorReadSelector::Current,
+                    ),
                     purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                     limit: None,
                     batch: ConnectorBatchBudget {
@@ -1664,7 +1666,7 @@ pub(crate) mod tests {
             .binding()
             .planning()
             .plan_splits(
-                &scan.handle,
+                scan.handle(),
                 ConnectorSplitPlanningRequest {
                     target_parallelism: NonZeroUsize::new(1).unwrap(),
                     max_split_bytes: None,

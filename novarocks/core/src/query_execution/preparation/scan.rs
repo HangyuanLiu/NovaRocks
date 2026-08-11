@@ -274,16 +274,16 @@ impl ScanExecutionBindings {
                 "duplicate connector read fragment_id={fragment_id} node_id={node_id}"
             ));
         }
-        if read.scan.handle.owner() != &read.declaration.descriptor().instance_id {
+        if read.scan.handle().owner() != &read.declaration.descriptor().instance_id {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"
             ));
         }
-        if read.provider_field_ordinals.len() != read.scan.output_schema.fields().len() {
+        if read.provider_field_ordinals.len() != read.scan.output_schema().fields().len() {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} provider ordinal count {} does not match output schema field count {}",
                 read.provider_field_ordinals.len(),
-                read.scan.output_schema.fields().len(),
+                read.scan.output_schema().fields().len(),
             ));
         }
         let mut provider_ordinals = BTreeSet::new();

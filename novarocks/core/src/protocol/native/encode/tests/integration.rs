@@ -185,32 +185,39 @@ fn prepared_connector_scan_bindings(
         Bytes::from_static(b"integration-binding"),
     )
     .expect("fixture connector declaration");
+    let scan = novarocks_spi::connector::ConnectorScan::try_new_snapshot(
+        novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: declaration.incarnation(),
+        },
+        novarocks_spi::connector::ConnectorReadSelector::Current,
+        novarocks_spi::connector::ConnectorScanHandle::try_new(
+            instance_id,
+            Bytes::from_static(b"integration-scan"),
+        )
+        .expect("fixture connector scan handle"),
+        Arc::new(arrow::datatypes::Schema::new(
+            columns
+                .iter()
+                .map(|column| {
+                    arrow::datatypes::Field::new(
+                        &column.name,
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
+        Vec::new(),
+    )
+    .expect("sealed fixture connector scan");
     bindings
         .insert_connector_read(
             fragment_id,
             node_id,
             crate::query_execution::preparation::scan::PlannedConnectorRead {
                 declaration,
-                scan: novarocks_spi::connector::ConnectorScan {
-                    handle: novarocks_spi::connector::ConnectorScanHandle::try_new(
-                        instance_id,
-                        Bytes::from_static(b"integration-scan"),
-                    )
-                    .expect("fixture connector scan handle"),
-                    output_schema: Arc::new(arrow::datatypes::Schema::new(
-                        columns
-                            .iter()
-                            .map(|column| {
-                                arrow::datatypes::Field::new(
-                                    &column.name,
-                                    column.data_type.clone(),
-                                    column.nullable,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )),
-                    predicate_dispositions: Vec::new(),
-                },
+                scan,
                 splits: Vec::new(),
                 provider_field_ordinals: (0..columns.len() as u32).collect(),
                 planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(

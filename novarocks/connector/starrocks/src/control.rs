@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
     ConnectorReadSelector, ConnectorReadSessionLease, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorTableHandle,
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
     ConnectorTableRequest, StatisticsDataVersion, validate_static_predicates,
@@ -314,11 +314,20 @@ impl Provider {
         table: TablePayload,
         request: &ConnectorBeginScanRequest,
     ) -> Result<(FrozenRead, StarRocksFreezeDigest), ConnectorError> {
-        if request.selector != ConnectorReadSelector::Current {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "StarRocks connector does not yet support historical read selectors",
-            ));
+        match request.selection {
+            ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current) => {}
+            ConnectorScanSelection::Snapshot(_) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "StarRocks connector does not yet support historical read selectors",
+                ));
+            }
+            ConnectorScanSelection::ChangeWindow(_) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "StarRocks connector does not support change-window scans",
+                ));
+            }
         }
         validate_static_predicates(&request.static_predicates)?;
         let source_schema = decode_schema_ipc(&table.schema)?;
@@ -483,8 +492,13 @@ impl ConnectorScanPlanning for Provider {
             digest: Base64Bytes(Bytes::copy_from_slice(&digest.0)),
             frozen,
         };
-        Ok(ConnectorScan {
-            handle: ConnectorScanHandle::try_new(
+        ConnectorScan::try_new_snapshot(
+            ConnectorExecutionBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            ConnectorReadSelector::Current,
+            ConnectorScanHandle::try_new(
                 self.descriptor.instance_id.clone(),
                 encode_v1(
                     &payload,
@@ -493,7 +507,7 @@ impl ConnectorScanPlanning for Provider {
                 )?,
             )?,
             output_schema,
-            predicate_dispositions: request
+            request
                 .static_predicates
                 .iter()
                 .map(|predicate| ConnectorPredicateDisposition {
@@ -501,7 +515,7 @@ impl ConnectorScanPlanning for Provider {
                     kind: ConnectorPredicateDispositionKind::Unsupported,
                 })
                 .collect(),
-        })
+        )
     }
     fn plan_splits(
         &self,
@@ -979,7 +993,7 @@ mod tests {
                 ConnectorBeginScanRequest {
                     projection: vec![0],
                     static_predicates: vec![],
-                    selector: ConnectorReadSelector::Current,
+                    selection: ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
                     purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                     limit: None,
                     batch: ConnectorBatchBudget {
@@ -993,7 +1007,7 @@ mod tests {
         binding
             .planning()
             .plan_splits(
-                &scan.handle,
+                scan.handle(),
                 ConnectorSplitPlanningRequest {
                     target_parallelism: NonZeroUsize::new(1).unwrap(),
                     max_split_bytes: None,
@@ -1003,5 +1017,52 @@ mod tests {
             .unwrap();
         assert_eq!(rpc.load(Ordering::SeqCst), 0);
         assert_eq!(direct.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn change_window_scan_is_deterministically_unsupported() {
+        let (binding, _, _) = binding(
+            crate::StarRocksReadPolicy::Auto,
+            crate::StarRocksTopology::SharedData,
+            true,
+        );
+        let context = context();
+        let table = binding
+            .metadata()
+            .load_table(ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: binding.descriptor().instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("t"),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            })
+            .expect("table metadata");
+        let error = binding
+            .planning()
+            .begin_scan(
+                &table.table,
+                ConnectorBeginScanRequest {
+                    projection: vec![0],
+                    static_predicates: Vec::new(),
+                    selection: ConnectorScanSelection::ChangeWindow(
+                        novarocks_spi::connector::ConnectorChangeWindow::new(7, 9),
+                    ),
+                    purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
+                    limit: None,
+                    batch: ConnectorBatchBudget {
+                        max_rows: NonZeroUsize::new(1).expect("batch rows"),
+                        max_bytes: NonZeroUsize::new(1024).expect("batch bytes"),
+                    },
+                    context,
+                },
+            )
+            .expect_err("StarRocks must reject change-window scans");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            "Unsupported: StarRocks connector does not support change-window scans"
+        );
     }
 }

@@ -244,7 +244,9 @@ pub(crate) fn prepare_statistics_connector_read(
             ConnectorBeginScanRequest {
                 projection: program.plan.scan_projection(),
                 static_predicates: Vec::new(),
-                selector: ConnectorReadSelector::Current,
+                selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
+                    ConnectorReadSelector::Current,
+                ),
                 purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch,
@@ -252,11 +254,19 @@ pub(crate) fn prepare_statistics_connector_read(
             },
         )
         .map_err(connector_planning_error)?;
+    scan.validate(
+        &novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: lease.binding().descriptor().instance_id.clone(),
+            incarnation: lease.binding().incarnation(),
+        },
+        novarocks_spi::connector::ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
+    )
+    .map_err(connector_planning_error)?;
     let split_result = lease
         .binding()
         .planning()
         .plan_splits(
-            &scan.handle,
+            scan.handle(),
             ConnectorSplitPlanningRequest {
                 target_parallelism,
                 max_split_bytes: None,
@@ -280,7 +290,7 @@ pub(crate) fn prepare_statistics_connector_read(
         .map_err(connector_planning_error)?;
     Ok(PlannedConnectorRead {
         declaration,
-        provider_field_ordinals: (0..scan.output_schema.fields().len())
+        provider_field_ordinals: (0..scan.output_schema().fields().len())
             .map(|ordinal| u32::try_from(ordinal).expect("connector output ordinal fits u32"))
             .collect(),
         scan,

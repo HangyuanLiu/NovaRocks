@@ -19,7 +19,7 @@ use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteLease,
     ConnectorDistributedRewritePlan, ConnectorDistributedRewriteReceipt, ConnectorError,
-    ConnectorErrorKind, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorErrorKind, ConnectorReadSelector, ConnectorRequestContext, ConnectorScanSelection,
     ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorWriteAbortOutcome,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteExecutionId,
     ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationEvidence,
@@ -74,15 +74,19 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
         ConnectorBeginScanRequest {
             projection,
             static_predicates: Vec::new(),
-            selector: ConnectorReadSelector::Current,
+            selection: ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
             purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
             limit: None,
             batch,
             context: context.clone(),
         },
     )?;
+    scan.validate(
+        lease.binding_key(),
+        ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
+    )?;
     let split_result = lease.planning().plan_splits(
-        &scan.handle,
+        scan.handle(),
         ConnectorSplitPlanningRequest {
             target_parallelism,
             max_split_bytes: None,
@@ -100,7 +104,7 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
     }
     Ok(PlannedConnectorRead {
         declaration: lease.execution_declaration(&context)?,
-        provider_field_ordinals: (0..scan.output_schema.fields().len())
+        provider_field_ordinals: (0..scan.output_schema().fields().len())
             .map(|ordinal| u32::try_from(ordinal).expect("connector output ordinal fits u32"))
             .collect(),
         scan,
