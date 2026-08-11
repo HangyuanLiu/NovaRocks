@@ -104,10 +104,6 @@ pub enum DeleteWriteReport {
 
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
     fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
-    fn has_staged_output(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<bool, String>;
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -193,7 +189,16 @@ impl DeleteEngine for Arc<StandaloneState> {
         let Some(completion) = result.connector_completion else {
             return Ok(DeleteWriteReport::NoOp);
         };
-        if !prepared.execution.has_staged_output(&completion)? {
+        let has_staged_output = completion
+            .input()
+            .reports()
+            .iter()
+            .any(|report| report.summary().artifact_count > 0);
+        if !has_staged_output {
+            completion
+                .session()
+                .finish_known_empty_noop()
+                .map_err(|error| error.to_string())?;
             return Ok(DeleteWriteReport::NoOp);
         }
         Ok(DeleteWriteReport::CommitRequired(Arc::new(
@@ -222,23 +227,6 @@ impl DeleteEngine for Arc<StandaloneState> {
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {
         downcast_prepared(prepared)?.execution.finalize()
     }
-}
-
-pub(crate) fn has_iceberg_staged_output(
-    completion: &crate::query_execution::ConnectorWriteCompletion,
-    commit_executor: &crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor,
-) -> Result<bool, String> {
-    completion
-        .input()
-        .reports()
-        .iter()
-        .try_fold(false, |has_staged_output, staged| {
-            let reports = novarocks_connector_iceberg::write_codec::decode_writer_reports(
-                staged.payload(),
-                commit_executor.table.metadata(),
-            )?;
-            Ok(has_staged_output || !reports.is_empty())
-        })
 }
 
 struct CorePreparedDelete {

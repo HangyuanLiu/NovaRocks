@@ -34,7 +34,7 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
 use crate::connector::iceberg::commit::{
-    CleanupPathMapper, CommitServiceError, IcebergCommitCollector, ensure_iceberg_write_supported,
+    CleanupPathMapper, IcebergCommitCollector, ensure_iceberg_write_supported,
     ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
@@ -58,7 +58,7 @@ use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::SqlType;
 use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
-use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
 use novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
@@ -369,7 +369,6 @@ fn prepare_iceberg_distributed_write(
         operation_kind: operation_kind_for_commit_op_kind(commit_op_kind),
         attempt_id: connector_operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
-            commit_op_kind,
             base_snapshot_id,
             base_snapshot_map: BTreeMap::new(),
             target_ref: target_ref.to_string(),
@@ -926,8 +925,8 @@ impl PreparedIcebergWrite {
         &self.spec.attempt_id
     }
 
-    pub(crate) fn commit_op_kind(&self) -> CommitOpKind {
-        self.spec.commit.commit_op_kind
+    pub(crate) fn is_overwrite(&self) -> bool {
+        self.spec.operation_kind == IcebergOperationKind::InsertOverwrite
     }
 
     pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
@@ -981,16 +980,6 @@ impl PreparedIcebergWrite {
         )
     }
 
-    pub(crate) fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.executor.commit_executor,
-            completion,
-        )
-    }
-
     pub(crate) fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -1000,11 +989,10 @@ impl PreparedIcebergWrite {
         >,
         String,
     > {
-        crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
-            self.executor.connector_write.preparation().owner(),
-            self.executor.connector_write.operation_id(),
-            self.commit(completion),
-        )
+        completion
+            .session()
+            .commit(self.executor.connector_context.clone())
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
@@ -1090,21 +1078,6 @@ impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMut
             .is_some()
     }
 
-    fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError> {
-        let session = self
-            .operation_session
-            .lock()
-            .expect("prepared Iceberg mutation session lock poisoned")
-            .clone()
-            .expect("prepared Iceberg mutation abort requires a retained operation session");
-        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
-            &self.commit_executor,
-            &session,
-            self.connector_context.clone(),
-            reason,
-        )
-    }
-
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
@@ -1122,14 +1095,8 @@ impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMut
             .map_err(|error| error.to_string())
     }
 
-    fn commit(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        )
+    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {

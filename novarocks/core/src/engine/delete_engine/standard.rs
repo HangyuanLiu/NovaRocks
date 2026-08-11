@@ -49,9 +49,7 @@ use novarocks_connector_iceberg::iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::{
-    CommitServiceError, IcebergCommitCollector, classify_sql_delete_strategy,
-};
+use crate::connector::iceberg::commit::{IcebergCommitCollector, classify_sql_delete_strategy};
 #[cfg(test)]
 use crate::connector::iceberg::delete_visibility::{
     ExistingDeleteVisibility, load_existing_delete_visibility_by_data_file,
@@ -66,8 +64,7 @@ use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::delete_engine::{
-    DeleteOperation, PreparedDelete, PreparedDeleteExecution, has_iceberg_staged_output,
-    prepared_delete,
+    DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
@@ -78,7 +75,7 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy};
+use novarocks_connector_iceberg::commit::{CommitOpKind, IcebergSqlDeleteStrategy};
 use novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
@@ -232,7 +229,6 @@ struct DistributedDeleteWriteExecutor {
     delete_query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
@@ -256,13 +252,6 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
         Ok(result)
     }
 
-    fn has_staged_output(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<bool, String> {
-        has_iceberg_staged_output(completion, &self.commit_executor)
-    }
-
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -272,14 +261,10 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
         >,
         String,
     > {
-        crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
-            self.connector_write.preparation().owner(),
-            self.connector_write.operation_id(),
-            crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-                &self.commit_executor,
-                completion,
-            ),
-        )
+        completion
+            .session()
+            .commit(self.connector_context.clone())
+            .map_err(|error| error.to_string())
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -293,7 +278,6 @@ struct DistributedDvDeleteWriteExecutor {
     delete_query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
@@ -317,13 +301,6 @@ impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
         Ok(result)
     }
 
-    fn has_staged_output(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<bool, String> {
-        has_iceberg_staged_output(completion, &self.commit_executor)
-    }
-
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -333,14 +310,10 @@ impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
         >,
         String,
     > {
-        crate::connector::iceberg::write_control::terminal_outcome_from_iceberg_commit(
-            self.connector_write.preparation().owner(),
-            self.connector_write.operation_id(),
-            crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
-                &self.commit_executor,
-                completion,
-            ),
-        )
+        completion
+            .session()
+            .commit(self.connector_context.clone())
+            .map_err(|error| error.to_string())
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -453,7 +426,6 @@ fn prepare_delete_dv_write(
         delete_query,
         sql_write_input,
         table_bindings,
-        commit_executor,
         execution,
         connector_context: connector_context.clone(),
         connector_write,
@@ -553,7 +525,6 @@ fn prepare_delete_write(
         delete_query,
         sql_write_input,
         table_bindings,
-        commit_executor,
         execution,
         connector_context: connector_context.clone(),
         connector_write,

@@ -487,25 +487,17 @@ mod tests {
         CoreMutationAbort, CoreMutationPrepared, MutationAbort, MutationEngine, MutationOperation,
         MutationStatementKind, STAGED, parse_merge_statement, parse_update_statement,
     };
-    use crate::connector::iceberg::commit::CommitServiceError;
     use crate::engine::mutation_flow::MutationExecution;
-    use crate::query_execution::ConnectorWriteCompletion;
     use crate::query_execution::outcome::QueryExecutionResult;
-    use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
     use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
 
     struct TestExecution {
-        abort_outcome: Mutex<Option<Result<CommitOutcome, CommitServiceError>>>,
         abort_calls: AtomicUsize,
     }
 
     impl TestExecution {
         fn known_uncommitted() -> Self {
             Self {
-                abort_outcome: Mutex::new(Some(Ok(CommitOutcome {
-                    new_snapshot_id: 0,
-                    written_manifest_paths: Vec::new(),
-                }))),
                 abort_calls: AtomicUsize::new(0),
             }
         }
@@ -516,15 +508,6 @@ mod tests {
             Err("test execution must not stage".to_string())
         }
 
-        fn abort(&self, _reason: String) -> Result<CommitOutcome, CommitServiceError> {
-            self.abort_calls.fetch_add(1, Ordering::AcqRel);
-            self.abort_outcome
-                .lock()
-                .expect("test abort outcome lock")
-                .take()
-                .expect("abort called only once")
-        }
-
         fn abort_terminal(&self) -> Result<ConnectorWriteAbortOutcome, String> {
             self.abort_calls.fetch_add(1, Ordering::AcqRel);
             Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
@@ -532,10 +515,7 @@ mod tests {
             })
         }
 
-        fn commit(
-            &self,
-            _completion: &ConnectorWriteCompletion,
-        ) -> Result<CommitOutcome, CommitServiceError> {
+        fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
             panic!("test execution must not commit")
         }
 
