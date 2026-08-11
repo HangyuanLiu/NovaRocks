@@ -160,6 +160,46 @@ fn install_connector_bindings(
     Ok(Arc::new(resolver))
 }
 
+/// Driver executor shared by every fragment this harness runs.
+///
+/// Production drivers come from the backend's `ExecutionRuntime`. Core tests
+/// have no backend, so one small runtime is built once and reused rather than
+/// spun up per fragment.
+fn in_process_test_execution_runtime()
+-> Arc<novarocks_execution::runtime::execution_runtime::ExecutionRuntime> {
+    use novarocks_execution::runtime::execution_runtime::{
+        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+    };
+
+    static RUNTIME: std::sync::OnceLock<Arc<ExecutionRuntime>> = std::sync::OnceLock::new();
+    Arc::clone(RUNTIME.get_or_init(|| {
+        Arc::new(
+            ExecutionRuntime::new(ExecutionRuntimeConfig {
+                driver_threads: 2,
+                scan_threads: 2,
+                scan_queue_capacity: 64,
+                spill_io_threads: 1,
+                spill_io_queue_capacity: 8,
+                spill_storage: ExecutionSpillStorageConfig::default(),
+                exchange_io_threads: 1,
+                exchange_io_max_inflight_bytes: 32 * 1024 * 1024,
+                exchange_max_transmit_batched_bytes: 1024 * 1024,
+                operator_buffer_chunks: 8,
+                local_exchange_buffer_mem_limit_per_driver: 32 * 1024 * 1024,
+                local_exchange_max_buffered_rows: 1 << 20,
+                connector_io_tasks_per_scan_operator: 1,
+                scan_submit_fail_max: 8,
+                scan_submit_fail_timeout_ms: 1_000,
+                runtime_filter_scan_wait_time_ms_override: None,
+                runtime_filter_wait_timeout_ms_override: None,
+                sink_io_worker_threads: 1,
+                sink_io_max_blocking_threads: 1,
+            })
+            .expect("in-process test execution runtime config is valid"),
+        )
+    }))
+}
+
 pub(crate) fn execute(
     request: DistributedQueryRequest,
 ) -> Result<crate::query_execution::contract::DistributedQueryOutcome, DistributedQueryError> {
@@ -244,13 +284,22 @@ pub(crate) fn execute(
         });
         let handle = prepare_fragment(
             submission,
-            admission.into_prepare_context(
-                profiler,
-                Arc::clone(&exchange),
-                lookup.clone(),
-                Arc::clone(&result_writer),
-                events.clone(),
-            ),
+            admission
+                .into_prepare_context(
+                    profiler,
+                    Arc::clone(&exchange),
+                    lookup.clone(),
+                    Arc::clone(&result_writer),
+                    events.clone(),
+                )
+                // Fragment execution needs a driver executor and a place for
+                // exchange senders to land. In production both come from the
+                // backend; this in-process harness owns process-local stand-ins
+                // so Core tests can execute a plan without one.
+                .with_execution_runtime(in_process_test_execution_runtime())
+                .with_exchange_receiver_port(
+                    crate::runtime::fragment_test_io_exchange::in_process_test_exchange_receiver_port(),
+                ),
         )
         .map_err(|error| failed(error.to_string()))?;
         dormant.push(handle);
