@@ -23,10 +23,8 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int64Array, StringA
 use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_connector_iceberg::iceberg::Catalog;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::IcebergCommitCollector;
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::engine::StandaloneState;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
@@ -462,11 +460,12 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) stmt: UpdateStmt,
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::engine::backend_resolver::TargetBackend,
-    pub(crate) catalog: Arc<dyn Catalog>,
-    pub(crate) table_ident: novarocks_connector_iceberg::iceberg::TableIdent,
+    /// Still concrete: the copy-on-write rewrite overlay reads snapshot data
+    /// file stats (first row id, data sequence number, pre-existing deletes) to
+    /// build its per-file rewrite plans. Handing that back as a provider-signed
+    /// recipe is unfinished provider-side work, not a rewire.
     pub(crate) table: novarocks_connector_iceberg::iceberg::table::Table,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) target_ref: String,
     /// The one exact connector generation admitted with this statement.
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -501,11 +500,12 @@ pub(crate) struct PreparedMergeMutation {
     pub(crate) stmt: MergeStmt,
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::engine::backend_resolver::TargetBackend,
-    pub(crate) catalog: Arc<dyn Catalog>,
-    pub(crate) table_ident: novarocks_connector_iceberg::iceberg::TableIdent,
+    /// Still concrete: the copy-on-write rewrite overlay reads snapshot data
+    /// file stats (first row id, data sequence number, pre-existing deletes) to
+    /// build its per-file rewrite plans. Handing that back as a provider-signed
+    /// recipe is unfinished provider-side work, not a rewire.
     pub(crate) table: novarocks_connector_iceberg::iceberg::table::Table,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) table_write_mode: IcebergUpdateMode,
     /// The one exact connector generation admitted with this statement.
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -659,11 +659,8 @@ pub(crate) fn prepare_update_mutation(
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         target,
-        catalog,
-        table_ident,
         table,
         target_columns,
-        entry,
         target_ref,
         planning_lease,
         mor_write_target,
@@ -793,11 +790,8 @@ pub(crate) fn prepare_merge_mutation(
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         target,
-        catalog,
-        table_ident,
         table,
         target_columns,
-        entry,
         table_write_mode,
         planning_lease,
         mor_write_target,
@@ -820,11 +814,8 @@ pub(crate) fn stage_prepared_update_mutation(
         stmt,
         current_catalog,
         target,
-        catalog,
-        table_ident,
         table,
         target_columns,
-        entry,
         target_ref,
         planning_lease,
         mor_write_target,
@@ -880,27 +871,17 @@ pub(crate) fn stage_prepared_update_mutation(
                     &provider_plan,
                 )
                 .map_err(|error| format!("bind Provider COW UPDATE plan: {error}"))?;
-            let metadata = table.metadata();
             // Reuse the base version admission signed, so stage cannot observe a
             // ref that moved after the frontend recorded its intent.
             let base_snapshot_id = admitted_base_snapshot_id;
-            let collector = Arc::new(
-                IcebergCommitCollector::new(
-                    CommitOpKind::CowUpdate,
-                    table_ident,
+            let (commit_executor, entry) =
+                crate::engine::iceberg_writer::build_iceberg_row_commit_executor(
+                    state,
+                    &target,
+                    &target_ref,
+                    novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite,
                     base_snapshot_id,
-                    metadata.last_sequence_number(),
-                    metadata.current_schema().clone(),
-                    metadata.default_partition_spec().clone(),
-                    format!(
-                        "{}/data/_staging/{}",
-                        metadata.location(),
-                        uuid::Uuid::new_v4()
-                    ),
-                    novarocks_types::UniqueId::new(0, 0),
-                )
-                .with_table_metadata(metadata.clone()),
-            );
+                )?;
             let write = build_cow_update_distributed_write(
                 &target,
                 &table,
@@ -917,9 +898,7 @@ pub(crate) fn stage_prepared_update_mutation(
             let execution_handle = build_cow_update_distributed_execution(
                 state,
                 &target,
-                catalog,
-                table,
-                collector,
+                commit_executor,
                 entry,
                 &target_ref,
                 write,
@@ -954,28 +933,27 @@ pub(crate) fn stage_prepared_update_mutation(
             } = mor_write_target.ok_or_else(|| {
                 "MOR UPDATE reached stage without an admitted frozen write target".to_string()
             })?;
+            // The version rewritten rows belong to, signed at admission: a
+            // merge-on-read writer stamps it on every row it emits, and it must
+            // not be re-derived from a table that may have moved since.
+            let written_version = preparations
+                .preparation
+                .written_version_ordinal()
+                .ok_or_else(|| {
+                    "MOR UPDATE requires a provider-signed written version".to_string()
+                })?;
             let preparations = preparations.activate()?;
             let write_lease = write_planning_lease
                 .derive_write_lease()
                 .map_err(|error| format!("derive MOR UPDATE write lease: {error}"))?;
-            let metadata = table.metadata();
-            let collector = Arc::new(
-                IcebergCommitCollector::new(
-                    CommitOpKind::RowDeltaDvFromFiles,
-                    table_ident,
+            let (commit_executor, entry) =
+                crate::engine::iceberg_writer::build_iceberg_row_commit_executor(
+                    state,
+                    &target,
+                    &target_ref,
+                    novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead,
                     read_snapshot_id,
-                    metadata.last_sequence_number(),
-                    metadata.current_schema().clone(),
-                    metadata.default_partition_spec().clone(),
-                    format!(
-                        "{}/data/_staging/{}",
-                        metadata.location(),
-                        uuid::Uuid::new_v4()
-                    ),
-                    novarocks_types::UniqueId::new(0, 0),
-                )
-                .with_table_metadata(metadata.clone()),
-            );
+                )?;
             let write = build_update_mor_change_stream_write_plan(
                 state,
                 &target,
@@ -983,24 +961,12 @@ pub(crate) fn stage_prepared_update_mutation(
                 current_catalog.as_deref(),
                 &target_columns,
                 &target_ref,
-                metadata.last_sequence_number() + 1,
+                written_version,
                 &execution,
                 &connector_context,
                 &preparations,
                 write_planning_lease,
             )?;
-            let abort_cleanup =
-                crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-            let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-                catalog,
-                table,
-                collector,
-                fs: abort_cleanup.fs,
-                cleanup_path_mapper: abort_cleanup.path_mapper,
-                cow_update_rewrite: None,
-                target_ref: target_ref.clone(),
-                snapshot_properties: BTreeMap::new(),
-            });
             let operation_id = preparations.operation_id;
             let mut write = write;
             let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
@@ -2689,27 +2655,13 @@ fn run_one_cow_file_rewrite(
 fn build_cow_update_distributed_execution(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn Catalog>,
-    table: novarocks_connector_iceberg::iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
+    commit_executor: Arc<crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor>,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
     write: CowUpdateDistributedWrite,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<DistributedCowUpdateExecutor>, String> {
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table,
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
     let mut write = write;
     let operation_id = write
         .provider_plan
@@ -3291,11 +3243,8 @@ pub(crate) fn stage_prepared_merge_mutation(
         stmt,
         current_catalog,
         target,
-        catalog,
-        table_ident,
         table,
         target_columns,
-        entry,
         table_write_mode,
         planning_lease,
         mor_write_target,
@@ -3318,34 +3267,29 @@ pub(crate) fn stage_prepared_merge_mutation(
             return Ok(MutationStagedWrite::NoOp);
         }
         let base_snapshot_id = admitted_base_snapshot_id;
-        let metadata = table.metadata();
         let PreparedMorMergeWriteTarget {
             preparations,
             planning_lease: write_planning_lease,
         } = mor_write_target.ok_or_else(|| {
             "MOR MERGE reached stage without an admitted frozen write target".to_string()
         })?;
+        // See the MOR UPDATE path: the written version is signed at admission.
+        let written_version = preparations
+            .preparation
+            .written_version_ordinal()
+            .ok_or_else(|| "MOR MERGE requires a provider-signed written version".to_string())?;
         let preparations = preparations.activate()?;
         let write_lease = write_planning_lease
             .derive_write_lease()
             .map_err(|error| format!("derive MOR MERGE write lease: {error}"))?;
-        let collector = Arc::new(
-            IcebergCommitCollector::new(
-                CommitOpKind::RowDeltaDvFromFiles,
-                table_ident,
+        let (commit_executor, entry) =
+            crate::engine::iceberg_writer::build_iceberg_row_commit_executor(
+                state,
+                &target,
+                "main",
+                novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead,
                 base_snapshot_id,
-                metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
-                format!(
-                    "{}/data/_staging/{}",
-                    metadata.location(),
-                    uuid::Uuid::new_v4()
-                ),
-                novarocks_types::UniqueId::new(0, 0),
-            )
-            .with_table_metadata(metadata.clone()),
-        );
+            )?;
         let write = build_merge_mor_change_stream_write_plan(
             state,
             &target,
@@ -3354,24 +3298,12 @@ pub(crate) fn stage_prepared_merge_mutation(
             &target_columns,
             insert_columns_resolved.as_deref(),
             "main",
-            metadata.last_sequence_number() + 1,
+            written_version,
             &execution,
             &connector_context,
             &preparations,
             write_planning_lease,
         )?;
-        let abort_cleanup =
-            crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-        let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-            catalog,
-            table,
-            collector,
-            fs: abort_cleanup.fs,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
-            target_ref: "main".to_string(),
-            snapshot_properties: BTreeMap::new(),
-        });
         let operation_id = preparations.operation_id;
         let mut write = write;
         let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
@@ -3633,40 +3565,15 @@ pub(crate) fn stage_prepared_merge_mutation(
             completion,
         });
     }
-    let base_snapshot_id = table
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id());
-    let metadata = table.metadata();
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::CowUpdate,
-            table_ident,
+    let base_snapshot_id = admitted_base_snapshot_id;
+    let (commit_executor, entry) =
+        crate::engine::iceberg_writer::build_iceberg_row_commit_executor(
+            state,
+            &target,
+            "main",
+            novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite,
             base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            format!(
-                "{}/data/_staging/{}",
-                metadata.location(),
-                uuid::Uuid::new_v4()
-            ),
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table,
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: "main".to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
+        )?;
     let cow_operation = match &mut matched_branch {
         MergeMatchedBranch::CowUpdate(write) => Some(prepare_cow_merge_operation(
             state,

@@ -5646,6 +5646,10 @@ pub(crate) fn prepare_iceberg_row_mutation(
             // against a concrete table handle: the current snapshot for main,
             // the branch head otherwise.
             target_snapshot_id,
+            // The sequence number this mutation's rows will belong to. A
+            // merge-on-read writer stamps it on every rewritten row, so it has
+            // to be known before the commit exists.
+            Some(metadata.last_sequence_number() + 1),
             payload,
         )?,
     ))

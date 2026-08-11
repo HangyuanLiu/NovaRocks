@@ -482,6 +482,7 @@ pub struct ConnectorRowMutationPreparation {
     match_contract: ConnectorMutationMatchContract,
     strategy: ConnectorRowMutationStrategy,
     base_version_ordinal: Option<i64>,
+    written_version_ordinal: Option<i64>,
     payload: Bytes,
     digest: [u8; 32],
 }
@@ -498,6 +499,7 @@ impl ConnectorRowMutationPreparation {
         match_contract: ConnectorMutationMatchContract,
         strategy: ConnectorRowMutationStrategy,
         base_version_ordinal: Option<i64>,
+        written_version_ordinal: Option<i64>,
         payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         if table.owner() != &owner.instance_id
@@ -524,6 +526,7 @@ impl ConnectorRowMutationPreparation {
             &match_contract,
             strategy,
             base_version_ordinal,
+            written_version_ordinal,
             &payload,
         );
         Ok(Self {
@@ -536,6 +539,7 @@ impl ConnectorRowMutationPreparation {
             match_contract,
             strategy,
             base_version_ordinal,
+            written_version_ordinal,
             payload,
             digest,
         })
@@ -551,6 +555,7 @@ impl ConnectorRowMutationPreparation {
             self.match_contract.clone(),
             self.strategy,
             self.base_version_ordinal,
+            self.written_version_ordinal,
             self.payload.clone(),
         )?;
         if expected.digest != self.digest {
@@ -595,6 +600,17 @@ impl ConnectorRowMutationPreparation {
     /// means the target ref has no base state yet.
     pub const fn base_version_ordinal(&self) -> Option<i64> {
         self.base_version_ordinal
+    }
+    /// The version ordinal rows written by this mutation will carry, the
+    /// forward-looking counterpart of [`Self::base_version_ordinal`].
+    ///
+    /// A writer that must stamp each written row with the version it belongs to
+    /// needs this before the commit exists, so the provider states it at
+    /// admission. Core stamps and forwards the value; it never orders two of
+    /// them or derives read authority from one. `None` means the provider does
+    /// not version written rows.
+    pub const fn written_version_ordinal(&self) -> Option<i64> {
+        self.written_version_ordinal
     }
     pub fn payload(&self) -> &Bytes {
         &self.payload
@@ -1139,6 +1155,7 @@ fn preparation_digest(
     contract: &ConnectorMutationMatchContract,
     strategy: ConnectorRowMutationStrategy,
     base_version_ordinal: Option<i64>,
+    written_version_ordinal: Option<i64>,
     payload: &Bytes,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1160,13 +1177,15 @@ fn preparation_digest(
     hasher.update(base.digest());
     hasher.update(contract.digest());
     hasher.update([strategy_tag(strategy)]);
-    match base_version_ordinal {
-        None => hasher.update([0]),
-        Some(ordinal) => {
-            hasher.update([1]);
-            hasher.update(ordinal.to_be_bytes());
+    for ordinal in [base_version_ordinal, written_version_ordinal] {
+        match ordinal {
+            None => hasher.update([0]),
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update(value.to_be_bytes());
+            }
         }
-    };
+    }
     digest_bytes(&mut hasher, payload);
     hasher.finalize().into()
 }
@@ -1228,8 +1247,9 @@ mod tests {
 
     /// Minimal signed preparation whose only variable is the application-facing
     /// base version ordinal.
-    fn preparation_with_base_version_ordinal(
+    fn preparation_with_version_ordinals(
         base_version_ordinal: Option<i64>,
+        written_version_ordinal: Option<i64>,
     ) -> ConnectorRowMutationPreparation {
         let instance_id =
             super::super::ConnectorInstanceId::parse("iceberg").expect("valid instance ID");
@@ -1274,25 +1294,34 @@ mod tests {
             match_contract,
             ConnectorRowMutationStrategy::PositionDelete,
             base_version_ordinal,
+            written_version_ordinal,
             Bytes::from_static(b"payload"),
         )
         .expect("preparation")
     }
 
     #[test]
-    fn spi5h_base_version_ordinal_round_trips_and_is_digest_bound() {
-        let absent = preparation_with_base_version_ordinal(None);
+    fn spi5h_version_ordinals_round_trip_and_are_digest_bound() {
+        let absent = preparation_with_version_ordinals(None, None);
         assert_eq!(absent.base_version_ordinal(), None);
-        absent.validate().expect("absent ordinal validates");
+        assert_eq!(absent.written_version_ordinal(), None);
+        absent.validate().expect("absent ordinals validate");
 
-        let present = preparation_with_base_version_ordinal(Some(41));
+        let present = preparation_with_version_ordinals(Some(41), Some(42));
         assert_eq!(present.base_version_ordinal(), Some(41));
-        present.validate().expect("present ordinal validates");
+        assert_eq!(present.written_version_ordinal(), Some(42));
+        present.validate().expect("present ordinals validate");
 
-        // The ordinal is a signed field, so a different value must not be
-        // substitutable behind the same digest.
-        let other = preparation_with_base_version_ordinal(Some(42));
-        assert_ne!(present.digest(), other.digest());
+        // Both are signed fields, so neither a different value nor a swap of the
+        // two is substitutable behind the same digest.
+        assert_ne!(
+            present.digest(),
+            preparation_with_version_ordinals(Some(41), Some(43)).digest()
+        );
+        assert_ne!(
+            present.digest(),
+            preparation_with_version_ordinals(Some(42), Some(41)).digest()
+        );
         assert_ne!(present.digest(), absent.digest());
     }
 

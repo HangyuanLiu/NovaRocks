@@ -863,23 +863,6 @@ pub(crate) fn register_iceberg_row_delete_write_service(
     context: novarocks_spi::connector::ConnectorRequestContext,
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    use novarocks_connector_iceberg::commit::CommitOpKind;
-    use novarocks_spi::connector::ConnectorRowMutationStrategy;
-
-    let commit_op = match strategy {
-        ConnectorRowMutationStrategy::DeletionVector => CommitOpKind::RowDeltaDvFromFiles,
-        // Position deletes and equality deletes are both plain row-delta
-        // commits; they differ in the delete file each writer produces, not in
-        // how the snapshot is assembled.
-        ConnectorRowMutationStrategy::PositionDelete
-        | ConnectorRowMutationStrategy::EqualityDelete => CommitOpKind::RowDelta,
-        other => {
-            return Err(format!(
-                "Iceberg row-delete writer cannot serve row-mutation strategy {other:?}"
-            ));
-        }
-    };
-
     let entry = {
         let registry = state
             .iceberg_catalogs
@@ -910,7 +893,7 @@ pub(crate) fn register_iceberg_row_delete_write_service(
     );
     let collector = Arc::new(
         IcebergCommitCollector::new(
-            commit_op,
+            iceberg_commit_op_for_strategy(strategy),
             table_ident,
             base_snapshot_id,
             metadata.last_sequence_number(),
@@ -943,6 +926,97 @@ pub(crate) fn register_iceberg_row_delete_write_service(
         context,
         write_lease,
     )
+}
+
+/// Map a provider-signed row-mutation strategy onto the Iceberg commit operation
+/// that realizes it.
+///
+/// This is the only place the mapping exists. Row DML carries the neutral
+/// strategy and never names a commit operation kind.
+fn iceberg_commit_op_for_strategy(
+    strategy: novarocks_spi::connector::ConnectorRowMutationStrategy,
+) -> novarocks_connector_iceberg::commit::CommitOpKind {
+    use novarocks_connector_iceberg::commit::CommitOpKind;
+    use novarocks_spi::connector::ConnectorRowMutationStrategy;
+
+    match strategy {
+        // Deletion vectors and merge-on-read both land as a row delta assembled
+        // from the touched data files.
+        ConnectorRowMutationStrategy::DeletionVector
+        | ConnectorRowMutationStrategy::MergeOnRead => CommitOpKind::RowDeltaDvFromFiles,
+        // Position deletes and equality deletes differ in the delete file each
+        // writer produces, not in how the snapshot is assembled.
+        ConnectorRowMutationStrategy::PositionDelete
+        | ConnectorRowMutationStrategy::EqualityDelete => CommitOpKind::RowDelta,
+        ConnectorRowMutationStrategy::CopyOnWrite => CommitOpKind::CowUpdate,
+    }
+}
+
+/// Build the commit executor for a row mutation from its target, the signed
+/// strategy and the base version admission signed.
+///
+/// This keeps the Iceberg commit vocabulary -- the operation kind, the table
+/// identity, the staging location and the abort cleanup -- inside the legacy
+/// implementation, so a row-DML entry point hands over a target and a base
+/// version and nothing else. It disappears with the Core Iceberg
+/// implementation.
+pub(crate) fn build_iceberg_row_commit_executor(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    target_ref: &str,
+    strategy: novarocks_spi::connector::ConnectorRowMutationStrategy,
+    base_snapshot_id: Option<i64>,
+) -> Result<
+    (
+        Arc<IcebergWriteCommitExecutor>,
+        crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    ),
+    String,
+> {
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
+        registry.get(&target.catalog)?
+    };
+    let catalog = build_iceberg_catalog(&entry)?;
+    let table_ident = TableIdent::new(
+        NamespaceIdent::new(target.namespace.clone()),
+        target.table.clone(),
+    );
+    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
+        .map_err(|error| format!("load iceberg table {}: {error}", &table_ident))?;
+    let metadata = table.metadata();
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            iceberg_commit_op_for_strategy(strategy),
+            table_ident,
+            base_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!(
+                "{}/data/_staging/{}",
+                metadata.location(),
+                uuid::Uuid::new_v4()
+            ),
+            novarocks_types::UniqueId::new(0, 0),
+        )
+        .with_table_metadata(metadata.clone()),
+    );
+    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
+        catalog,
+        table,
+        collector,
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    });
+    Ok((commit_executor, entry))
 }
 
 /// Activate a row-level writer from a Provider-signed preparation.  The
