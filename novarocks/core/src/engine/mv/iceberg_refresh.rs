@@ -181,8 +181,8 @@ use crate::sql::planner::vocabulary::{
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_connector_iceberg::commit::CommitOutcome;
 use novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files;
-use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
@@ -9525,7 +9525,11 @@ fn commit_unknown_error_from_refresh(
         message,
         RecoveryEvidence {
             table_ident,
-            op_kind: CommitOpKind::FastAppend,
+            // Recovery evidence describes an append-shaped MV refresh; state
+            // the effect and let the single mapping point spell it.
+            op_kind: crate::mv::refresh::change_stream_write::iceberg_commit_op_kind(
+                MvTargetWriteEffect::Append,
+            ),
             base_snapshot_id: refresh.expected_main_snapshot_id,
             base_sequence_number: 0,
             staging_dir: refresh.staging_branch.clone().unwrap_or_default(),
@@ -11553,7 +11557,7 @@ fn commit_first_refresh_iceberg_mv(
                 iceberg_catalog,
                 target_entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 data_files,
                 staging_branch,
                 marker,
@@ -11861,7 +11865,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
                 iceberg_catalog,
                 target_entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 data_files,
                 staging_branch,
                 marker,
@@ -12596,7 +12600,7 @@ async fn commit_overwrite_iceberg_mv_with_ref(
         catalog,
         entry,
         ident,
-        CommitOpKind::Overwrite,
+        MvTargetWriteEffect::Overwrite,
         data_files,
         target_ref,
         snapshot_properties,
@@ -12610,7 +12614,7 @@ async fn commit_iceberg_mv_target_files(
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
     data_files: Vec<DataFile>,
 ) -> Result<CommitOutcome, CommitServiceError> {
     commit_iceberg_mv_target_files_with_ref(
@@ -12618,7 +12622,7 @@ async fn commit_iceberg_mv_target_files(
         catalog,
         entry,
         ident,
-        op_kind,
+        effect,
         data_files,
         "main",
         BTreeMap::new(),
@@ -12632,39 +12636,14 @@ async fn commit_iceberg_mv_target_files_with_ref(
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
     data_files: Vec<DataFile>,
     target_ref: &str,
     snapshot_properties: BTreeMap<String, String>,
 ) -> Result<CommitOutcome, CommitServiceError> {
     let metadata = table.metadata();
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            op_kind,
-            ident.clone(),
-            metadata
-                .refs()
-                .get(target_ref)
-                .map(|r| r.snapshot_id)
-                .or_else(|| {
-                    if target_ref == "main" {
-                        metadata.current_snapshot().map(|s| s.snapshot_id())
-                    } else {
-                        None
-                    }
-                }),
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
+    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
+        table, ident, target_ref, effect,
     );
     inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)
         .map_err(CommitServiceError::invalid_input)?;
@@ -12701,8 +12680,8 @@ async fn commit_iceberg_mv_target_files_with_ref(
 /// the caller can share the collector with the sink.
 ///
 /// The collector's `op_kind` must be set by the caller before any inject
-/// calls — typically `CommitOpKind::RowDeltaDvFromFiles` when the change batch
-/// has any DELETE-side rows, `CommitOpKind::FastAppend` otherwise.
+/// calls — typically `MvTargetWriteEffect::DeltaRetractingStagedFiles` when the
+/// change batch has any DELETE-side rows, `MvTargetWriteEffect::Append` otherwise.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) async fn commit_iceberg_mv_with_populated_collector(
@@ -12755,7 +12734,7 @@ async fn commit_iceberg_mv_apply_with_ref(
             catalog,
             entry,
             ident,
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
             data_files,
             target_ref,
             snapshot_properties,
@@ -12764,33 +12743,11 @@ async fn commit_iceberg_mv_apply_with_ref(
     }
 
     let metadata = table.metadata();
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::RowDeltaDv,
-            ident.clone(),
-            metadata
-                .refs()
-                .get(target_ref)
-                .map(|r| r.snapshot_id)
-                .or_else(|| {
-                    if target_ref == "main" {
-                        metadata.current_snapshot().map(|s| s.snapshot_id())
-                    } else {
-                        None
-                    }
-                }),
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
+    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
+        table,
+        ident,
+        target_ref,
+        MvTargetWriteEffect::DeltaRetractingExplicitPositions,
     );
     inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)
         .map_err(CommitServiceError::invalid_input)?;
@@ -22547,7 +22504,7 @@ mod tests {
                 &iceberg_catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 &staging_branch,
                 marker,
@@ -22614,7 +22571,7 @@ mod tests {
                 &iceberg_catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 "main",
                 BTreeMap::new(),
@@ -24567,7 +24524,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 &staging_branch,
                 marker,
@@ -27665,7 +27622,7 @@ mod tests {
             "connection reset by peer".to_string(),
             crate::connector::iceberg::commit::RecoveryEvidence {
                 table_ident: "ice.analytics.mv_orders".to_string(),
-                op_kind: CommitOpKind::FastAppend,
+                op_kind: novarocks_connector_iceberg::commit::CommitOpKind::FastAppend,
                 base_snapshot_id: Some(10),
                 base_sequence_number: 22,
                 staging_dir: "s3://warehouse/mv_orders/_staging/typed-unknown".to_string(),
@@ -27873,7 +27830,7 @@ mod tests {
                 "target ref is not visible after catalog commit".to_string(),
                 crate::connector::iceberg::commit::RecoveryEvidence {
                     table_ident: "ice.analytics.mv_orders".to_string(),
-                    op_kind: CommitOpKind::FastAppend,
+                    op_kind: novarocks_connector_iceberg::commit::CommitOpKind::FastAppend,
                     base_snapshot_id: Some(10),
                     base_sequence_number: 22,
                     staging_dir: "s3://warehouse/mv_orders/_staging/finalize".to_string(),
@@ -28354,7 +28311,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 &staging_branch,
                 marker,
@@ -28470,7 +28427,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28599,7 +28556,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28729,7 +28686,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28845,7 +28802,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28976,7 +28933,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -29060,7 +29017,7 @@ mod tests {
             "commit result unknown".to_string(),
             crate::connector::iceberg::commit::RecoveryEvidence {
                 table_ident: "ice.analytics.mv_orders".to_string(),
-                op_kind: CommitOpKind::FastAppend,
+                op_kind: novarocks_connector_iceberg::commit::CommitOpKind::FastAppend,
                 base_snapshot_id: None,
                 base_sequence_number: 0,
                 staging_dir: "__nova_mv_refresh_test_unknown".to_string(),
@@ -29362,7 +29319,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
             )
             .await
@@ -29447,7 +29404,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 initial_written,
             )
             .await
@@ -29490,7 +29447,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker.to_summary_properties(),
@@ -29666,7 +29623,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 initial_written,
             )
             .await
@@ -29789,7 +29746,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 vec![bad_file],
             )
             .await
@@ -29914,7 +29871,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
             )
             .await
