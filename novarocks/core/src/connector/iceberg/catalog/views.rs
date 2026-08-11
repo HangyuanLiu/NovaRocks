@@ -255,6 +255,11 @@ pub(crate) fn view_exists(
     namespace: &str,
     view_name: &str,
 ) -> Result<bool, String> {
+    // Same reasoning as `list_views`: a catalog that cannot create views holds
+    // none, so existence is answerable without a view catalog.
+    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+        return Ok(false);
+    }
     let catalog = catalog_for_views(entry)?;
     let (_ns, ident) = view_ident(namespace, view_name)?;
     block_on_iceberg(async { catalog.view_exists(&ident).await })
@@ -266,6 +271,14 @@ pub(crate) fn list_views(
     entry: &IcebergCatalogEntry,
     namespace: &str,
 ) -> Result<Vec<String>, String> {
+    // A catalog that cannot create views cannot contain any, so enumerating
+    // them answers "none" rather than failing. Callers that merely need to know
+    // whether a namespace holds views -- DROP DATABASE ... FORCE is the one
+    // that matters -- must not be turned into a hard error by a catalog kind
+    // they never asked about. Mutating view operations still fail loudly below.
+    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+        return Ok(Vec::new());
+    }
     let catalog = catalog_for_views(entry)?;
     let ns = NamespaceIdent::new(normalize_identifier(namespace)?);
     let idents = block_on_iceberg(async { catalog.list_views(&ns).await })
@@ -651,7 +664,20 @@ mod rest_view_tests {
             ),
         ];
         let entry = build_catalog_entry("ice_hadoop", &props).expect("hadoop entry");
-        let err = list_views(&entry, "analytics").expect_err("must fail");
+
+        // Enumerating views is answerable without REST: a catalog that cannot
+        // create a view holds none. DROP DATABASE ... FORCE relies on this, and
+        // previously failed outright on every Hadoop catalog.
+        assert_eq!(
+            list_views(&entry, "analytics").expect("listing is answerable"),
+            Vec::<String>::new()
+        );
+        assert!(!view_exists(&entry, "analytics", "v").expect("existence is answerable"));
+
+        // Everything that would actually need a view catalog still refuses.
+        let err = drop_view(&entry, "analytics", "v").expect_err("must fail");
+        assert!(err.contains("require a REST iceberg catalog"), "got: {err}");
+        let err = load_view(&entry, "analytics", "v").expect_err("must fail");
         assert!(err.contains("require a REST iceberg catalog"), "got: {err}");
     }
 }
