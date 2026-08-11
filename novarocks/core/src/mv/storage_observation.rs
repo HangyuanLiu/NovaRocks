@@ -536,6 +536,19 @@ pub struct MvRefreshTargetObservation {
     partition: MvPartitionContract,
     current_snapshot_id: Option<i64>,
     ref_snapshot_ids: BTreeMap<String, i64>,
+    main_ancestor_snapshot_ids: Vec<i64>,
+    snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
+}
+
+/// The MV refresh identity a target snapshot records.
+///
+/// The Provider decodes it from its own provenance encoding; Core only ever
+/// compares it against the identity in its own refresh ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvObservedRefreshMarker {
+    pub refresh_id: i64,
+    pub mv_id: i64,
+    pub token: String,
 }
 
 impl MvRefreshTargetObservation {
@@ -546,6 +559,8 @@ impl MvRefreshTargetObservation {
         partition: MvPartitionContract,
         current_snapshot_id: Option<i64>,
         ref_snapshot_ids: BTreeMap<String, i64>,
+        main_ancestor_snapshot_ids: Vec<i64>,
+        snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_request_context(context)?;
@@ -575,6 +590,18 @@ impl MvRefreshTargetObservation {
             return corrupt("MV refresh target observation has a negative current snapshot ID");
         }
 
+        for snapshot_id in main_ancestor_snapshot_ids.iter().copied() {
+            if snapshot_id < 0 {
+                return corrupt("MV refresh target lineage has a negative snapshot ID");
+            }
+        }
+        for (snapshot_id, marker) in &snapshot_markers {
+            if *snapshot_id < 0 {
+                return corrupt("MV refresh target marker has a negative snapshot ID");
+            }
+            require_non_empty(&marker.token, "MV refresh target marker token")?;
+        }
+
         Ok(Self {
             table,
             table_uuid,
@@ -582,7 +609,19 @@ impl MvRefreshTargetObservation {
             partition,
             current_snapshot_id,
             ref_snapshot_ids,
+            main_ancestor_snapshot_ids,
+            snapshot_markers,
         })
+    }
+
+    /// `main`'s snapshot chain, newest first.
+    pub fn main_ancestor_snapshot_ids(&self) -> &[i64] {
+        &self.main_ancestor_snapshot_ids
+    }
+
+    /// Marker recorded by `snapshot_id`, if that snapshot carries one.
+    pub fn snapshot_marker(&self, snapshot_id: i64) -> Option<&MvObservedRefreshMarker> {
+        self.snapshot_markers.get(&snapshot_id)
     }
 
     pub fn table(&self) -> &ConnectorTableIdentity {
@@ -1363,6 +1402,8 @@ mod tests {
             partition(),
             current_snapshot_id,
             refs,
+            Vec::new(),
+            BTreeMap::new(),
             &context(4096),
         )
     }
@@ -1378,6 +1419,8 @@ mod tests {
             partition(),
             None,
             BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
             &context(4096),
         )
         .unwrap_err();
@@ -1392,6 +1435,8 @@ mod tests {
             -1,
             partition(),
             None,
+            BTreeMap::new(),
+            Vec::new(),
             BTreeMap::new(),
             &context(4096),
         )

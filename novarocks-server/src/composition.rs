@@ -26,9 +26,9 @@ use novarocks::mv::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
 use novarocks::mv::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvObservedTargetField, MvPublishedBaseFact,
-    MvPublishedLakeFacts, MvPublishedRefreshTechnique, MvRefreshTargetObservation,
-    MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
+    MvLakePackageObservation, MvLakePublication, MvObservedRefreshMarker, MvObservedTargetField,
+    MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
     MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
     MvStorageObservationPort, MvTargetCreationObservation,
 };
@@ -274,6 +274,21 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             mv_partition_contract(observed.partition),
             observed.current_snapshot_id,
             observed.ref_snapshot_ids,
+            observed.main_ancestor_snapshot_ids,
+            observed
+                .snapshot_markers
+                .into_iter()
+                .map(|(snapshot_id, marker)| {
+                    (
+                        snapshot_id,
+                        MvObservedRefreshMarker {
+                            refresh_id: marker.refresh_id,
+                            mv_id: marker.mv_id,
+                            token: marker.token,
+                        },
+                    )
+                })
+                .collect(),
             &context,
         )
     }

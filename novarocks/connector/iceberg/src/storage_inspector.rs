@@ -41,6 +41,7 @@ const MV_DESCRIPTOR_INLINE_PROP: &str = "novarocks.mv.descriptor.inline";
 const MAX_TARGET_FIELDS: usize = 4_096;
 const MAX_PARTITION_FIELDS: usize = 4_096;
 const MAX_TARGET_REFS: usize = 1_024;
+const MAX_MAIN_ANCESTORS: usize = 100_000;
 const MAX_PROVENANCE_BASES: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +102,21 @@ pub struct IcebergStorageRefreshTargetObservation {
     pub partition: IcebergStoragePartitionContract,
     pub current_snapshot_id: Option<i64>,
     pub ref_snapshot_ids: BTreeMap<String, i64>,
+    /// `main`'s snapshot chain, newest first. MV reconciliation classifies a
+    /// staging snapshot by asking whether it is on this chain.
+    pub main_ancestor_snapshot_ids: Vec<i64>,
+    /// MV refresh marker carried by the current snapshot and by each ref tip,
+    /// decoded from provider-private provenance. Snapshots without a marker are
+    /// absent rather than present-and-empty.
+    pub snapshot_markers: BTreeMap<i64, IcebergStorageRefreshMarker>,
+}
+
+/// The MV refresh identity a snapshot's provenance records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageRefreshMarker {
+    pub refresh_id: i64,
+    pub mv_id: i64,
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +239,55 @@ fn refresh_target_observation(
         ref_snapshot_ids.insert(name.clone(), reference.snapshot_id);
     }
 
+    let current_snapshot_id = table
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id());
+
+    // `main`'s parent chain, newest first. Bounded so a pathological history
+    // cannot produce an unbounded observation.
+    let mut main_ancestor_snapshot_ids = Vec::new();
+    let mut cursor = current_snapshot_id;
+    while let Some(snapshot_id) = cursor {
+        if main_ancestor_snapshot_ids.len() >= MAX_MAIN_ANCESTORS {
+            return Err(exhausted(
+                "Iceberg MV refresh target snapshot history exceeds the inspection limit",
+            ));
+        }
+        main_ancestor_snapshot_ids.push(snapshot_id);
+        cursor = table
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+
+    // Markers for the snapshots MV reconciliation can reach: `main`'s current
+    // snapshot and every ref tip. Core compares these identities against its own
+    // ledger; it never parses the provider's provenance encoding.
+    let mut snapshot_markers = BTreeMap::new();
+    for snapshot_id in current_snapshot_id
+        .into_iter()
+        .chain(ref_snapshot_ids.values().copied())
+    {
+        if snapshot_markers.contains_key(&snapshot_id) {
+            continue;
+        }
+        let Some(snapshot) = table.snapshot_by_id(snapshot_id) else {
+            continue;
+        };
+        if let Some(provenance) =
+            MvProvenanceV1::from_snapshot_summary(snapshot).map_err(corrupt)?
+        {
+            reserve(context, &mut budget, &provenance.token)?;
+            snapshot_markers.insert(
+                snapshot_id,
+                IcebergStorageRefreshMarker {
+                    refresh_id: provenance.refresh_id,
+                    mv_id: provenance.mv_id,
+                    token: provenance.token,
+                },
+            );
+        }
+    }
+
     let table_uuid = table.uuid().to_string();
     reserve(context, &mut budget, &table_uuid)?;
     validate_context(context)?;
@@ -233,10 +298,10 @@ fn refresh_target_observation(
             target_spec_id: spec.spec_id(),
             fields: partition_fields,
         },
-        current_snapshot_id: table
-            .current_snapshot()
-            .map(|snapshot| snapshot.snapshot_id()),
+        current_snapshot_id,
         ref_snapshot_ids,
+        main_ancestor_snapshot_ids,
+        snapshot_markers,
     })
 }
 
