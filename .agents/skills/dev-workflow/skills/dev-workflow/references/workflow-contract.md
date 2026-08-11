@@ -75,8 +75,8 @@ DOC_ROOT/
 讨论清楚问题
   -> accepted design
   -> spec / umbrella
-  -> Codex Plan mode
-  -> approved plan 落盘
+  -> plan 阶段直接落盘并迭代 draft
+  -> 用户明确批准落盘版本
   -> goal 驱动的本地实现与验证
   -> 用户另行明确授权
   -> push / PR / archive
@@ -86,26 +86,32 @@ DOC_ROOT/
 
 | 阶段 | Skill | 终态 |
 |---|---|---|
+| 理解（只读旁路） | `$dev-workflow-explain-technical-concept` | 技术概念、当前机制、证据边界和权衡已讲清 |
 | 讨论 | `$dev-workflow-discuss-design` | 问题、证据、目标、非目标和关键裁决被接受 |
 | Spec | `$dev-workflow-write-spec` | 一个 PR spec 或多阶段 umbrella 已落盘 |
-| Plan | `$dev-workflow-plan` | Plan mode 批准且 plan 已落盘 |
+| Plan | `$dev-workflow-plan` | plan 已落盘，用户明确批准且状态为 `approved` |
 | Execute | `$dev-workflow-execute` | 本地实现完成且验证通过 |
 | Finish | `$dev-workflow-finish` | 明确授权的发布与归档完成 |
 
 只设置两个常规人工门：
 
 1. **设计接受门**：用户明确接受问题定义、目标、非目标和关键设计决策。
-2. **计划批准门**：用户在 Codex Plan mode 中批准最终实现计划。
+2. **计划批准门**：用户明确批准已经落盘的最终实现计划。
 
-端到端请求可以在阶段完成后自动继续，但 agent 无法自行切换 Codex 模式时，必须提示用户进入 Plan mode。Execute
-结束后不得自动发布；push 和 PR 始终需要独立的明确授权。
+技术讲解不是状态机中的交付阶段，可以从任意阶段进入。它保持只读，不表示设计已接受、plan 已批准或实现已获授权；讲解
+完成后返回进入前的阶段。若用户随后要求产出 spec、plan 或代码，再路由到对应 skill 并执行其阶段门。
+
+端到端请求可以在阶段完成后自动继续。plan 阶段必须在当前可编辑模式中直接写入并迭代文档，不得要求用户切换 Codex
+Plan mode，也不得把仅存在于对话中的计划当成阶段产物。Execute 结束后不得自动发布；push 和 PR 始终需要独立的明确
+授权。
 
 ## 4. 文档目录和类型
 
 - 会派生多个独立 spec 的多阶段 arc：项目启用 umbrella 时写入 `umbrella/`，`type: design-umbrella`；否则按项目
   约定记录父子关系。
 - 可独立实现、一个 PR 粒度的执行单元：写入 `specs/`，`type: design-spec`；项目启用 roadmap 时再添加对应字段。
-- 批准的实现计划：写入 `plans/`，`type: implementation-plan`、`status: approved`。
+- 实现计划：写入 `plans/`，`type: implementation-plan`；编写和评审期间为 `status: draft`，用户明确批准当前落盘版本后
+  改为 `status: approved`。
 - 已开 PR 的完成态文档：移动到 `archive/` 下同名类型目录。
 
 文件命名：
@@ -157,7 +163,7 @@ Plan 使用：
 title: "<Spec 标题>实现计划"
 date: YYYY-MM-DD
 type: implementation-plan
-status: approved
+status: draft
 spec: "[[<spec-basename>]]"
 tags:
   - dev-workflow/design
@@ -166,6 +172,9 @@ tags:
 ```
 
 Plan 正文必须链接 spec；spec 必须按项目约定反链 plan，没有既有约定时使用 `## 实现计划` 与 plan wikilink。
+plan 阶段开始后直接创建并维护这份文档。只有用户明确批准与磁盘内容一致的版本后，才把 `status` 更新为
+`approved`；未批准草案不得进入 Execute。影响 DAG、文件所有权、验收边界、关键依赖或风险裁决的修订会使批准失效，
+必须先退回 `draft` 并重新批准。
 
 项目启用 Roadmap 时，只更新文档 frontmatter、umbrella 子任务面板和阶段依赖图。`Roadmap.md` 由 Bases 聚合时，
 不手改其聚合行。
@@ -226,8 +235,8 @@ flowchart LR
 
 ## 7. Plan 并行任务图
 
-进入 Plan mode 时明确提示：尽量把实现计划设计成可由多个 sub-agent 安全并行调度的 task graph，但不得为了并行而
-制造错误边界。
+plan 阶段在当前可编辑模式中研究代码并把结果直接写入 plan 文档。尽量把实现计划设计成可由多个 sub-agent 安全并行
+调度的 task graph，但不得为了并行而制造错误边界。
 
 计划必须包含：
 
@@ -250,7 +259,7 @@ flowchart LR
 - 跨模块语义只能整体裁决；
 - 并行会造成重复迁移、冲突 owner 或不可独立验证的半状态。
 
-Plan mode 最终输出应提供一张调度表：
+落盘 plan 必须提供一张调度表：
 
 ```markdown
 | Task | Depends on | Wave | Label | File scope | Output | Validation | Commit |
@@ -328,8 +337,10 @@ spec/plan，并链接历史归档。
 
 声称阶段完成前：
 
+- Explanation：前置概念、贯穿示例、因果机制、证据边界、分层判断和现实权衡完整；未产生未经授权的修改。
 - Discussion：事实、怀疑、提案分离；重大决策已接受。
 - Spec：代码证据当前有效；frontmatter 可解析；启用 Roadmap / umbrella 时，元数据、反链和依赖图一致。
-- Plan：用户已在 Plan mode 批准；DAG、并行 waves、文件所有权、验证和 commit 边界完整。
+- Plan：文档已落盘；用户明确批准当前磁盘版本；状态为 `approved`；DAG、并行 waves、文件所有权、验证和 commit
+  边界完整。
 - Execute：plan 必需 task 全部完成；定向、集成和生产形态验证与风险相称；无临时文件和残留进程。
 - Finish：发布授权明确；PR 已创建；spec/plan 已归档；启用 umbrella / Roadmap 时，对应状态已更新。

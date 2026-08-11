@@ -696,15 +696,23 @@ existing path; when memory has no usable project documentation path, use
 Use the generic skills-only plugin under `.agents/skills/dev-workflow/`:
 
 - `dev-workflow`: identify and route the current stage;
+- `dev-workflow-explain-technical-concept`: explain technical concepts and
+  current mechanisms in Chinese from first principles, with one concrete
+  running example and explicit concept/design/implementation/impact layers;
 - `dev-workflow-discuss-design`: settle the problem and major design decisions;
 - `dev-workflow-write-spec`: write the accepted design into project docs;
-- `dev-workflow-plan`: plan with Codex Plan mode and persist the
-  approved plan;
+- `dev-workflow-plan`: write and iterate the plan directly in project docs,
+  then mark the persisted version approved after explicit user approval;
 - `dev-workflow-execute`: create a goal and execute continuously through
   verification;
 - `dev-workflow-finish`: publish and archive only when authorized.
 
 Codex discovers the project-local skill sources directly under `.agents/skills/`.
+
+Technical explanation is a read-only side route available from every stage. It
+does not accept a design, approve a plan, authorize implementation, or modify
+workflow state. Deliver the requested explanation before proposing a spec,
+plan, code change, commit, push, or PR.
 
 Do not skip the accepted-design and approved-plan gates. Sub-agents are allowed
 in every stage when they provide useful parallel investigation, independent
@@ -714,9 +722,12 @@ ownership and verifies their results.
 The bundle's
 `.agents/skills/dev-workflow/skills/dev-workflow/references/workflow-contract.md` is the
 only development-workflow contract. Do not depend on an external workflow
-document. In Plan mode, produce a task DAG with hard dependencies, parallel
-waves, non-overlapping file ownership, sub-agent scheduling labels, independent
-validation, integration gates, and local commit checkpoints.
+document. The plan stage runs in the current editable mode and persists its
+draft immediately; do not require Codex Plan mode. Produce a task DAG with hard
+dependencies, parallel waves, non-overlapping file ownership, sub-agent
+scheduling labels, independent validation, integration gates, and local commit
+checkpoints. Explicit user approval promotes the persisted plan from `draft` to
+`approved` before execution.
 
 Once execution starts, routine implementation difficulties are not reasons to
 stop; pause only for the major decision conditions defined by
