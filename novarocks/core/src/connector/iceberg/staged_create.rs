@@ -600,8 +600,10 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             let entry = &self.entry;
             let staged_table = &prepared.staged.table;
             let ident = staged_table.identifier();
+            let staged_schema = staged_table.metadata().current_schema();
             let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
-                staged_table.metadata().current_schema(),
+                staged_schema,
+                &staged_write_defaults(staged_schema).map_err(internal)?,
             )
             .map_err(internal)?;
             let sink_spec = staged_data_sink_spec(
@@ -1303,6 +1305,37 @@ fn operation_marker(
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+
+/// Decode the write defaults declared by a freshly staged CTAS table.
+///
+/// This stays inside the legacy Core Iceberg implementation on purpose: the
+/// staged table is created by this module and never passes through
+/// `ConnectorMetadata`, so there are no planning facts to read the defaults
+/// from. It disappears together with this module.
+fn staged_write_defaults(
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> Result<HashMap<String, novarocks_catalog::schema::ColumnDefault>, String> {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            field.write_default.as_ref().map(|literal| {
+                novarocks_connector_iceberg::default_value::iceberg_literal_to_column_default(
+                    literal,
+                    field.field_type.as_ref(),
+                )
+                .map(|value| (field.name.clone(), value))
+                .map_err(|error| {
+                    format!(
+                        "convert staged Iceberg write-default for column `{}` failed: {error}",
+                        field.name
+                    )
+                })
+            })
+        })
+        .collect()
 }
 
 fn internal(message: impl Into<String>) -> ConnectorError {

@@ -340,7 +340,7 @@ pub(crate) fn metadata_load_table_with_planning_lease(
             context,
         })
         .map_err(|error| error.to_string())?;
-    let columns = sql_columns_from_connector_schema(&metadata.schema);
+    let columns = sql_columns_from_connector_schema(&metadata.schema, &metadata.planning_facts);
     let schema_id = metadata.version.as_ref().and_then(|version| {
         <[u8; 4]>::try_from(version.as_ref())
             .ok()
@@ -394,24 +394,130 @@ pub(crate) fn metadata_load_connector_table_with_planning_lease(
 
 fn sql_columns_from_connector_schema(
     schema: &arrow::datatypes::Schema,
+    planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
 ) -> Vec<novarocks_catalog::schema::ColumnDef> {
     schema
         .fields()
         .iter()
-        .filter(|field| {
+        .enumerate()
+        // The ordinal must index the frozen schema, not this filtered view:
+        // planning facts are aligned to the schema Core received, and hidden
+        // fields keep their position in it.
+        .filter(|(_, field)| {
             field
                 .metadata()
                 .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
                 .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
         })
-        .map(|field| novarocks_catalog::schema::ColumnDef {
+        .map(|(ordinal, field)| novarocks_catalog::schema::ColumnDef {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
-            write_default: None,
+            write_default: connector_write_default_at(planning_facts, ordinal),
             logical_type: None,
         })
         .collect()
+}
+
+/// Read the write default a provider published for one frozen schema ordinal.
+///
+/// Facts are optional by contract: a provider with no column defaults returns
+/// empty facts, and the column then behaves exactly as it did before defaults
+/// were expressible.
+pub(crate) fn connector_write_default_at(
+    planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
+    ordinal: usize,
+) -> Option<novarocks_catalog::schema::ColumnDefault> {
+    planning_facts
+        .column_facts()
+        .get(ordinal)
+        .and_then(|fact| fact.write_default())
+        .map(connector_default_to_column_default)
+}
+
+/// Project the sealed SPI default value onto the neutral catalog value.
+///
+/// The two vocabularies are variant-for-variant identical; they are separate
+/// types only because the SPI dependency ceiling admits no application value
+/// crate.
+pub(crate) fn connector_default_to_column_default(
+    value: &novarocks_spi::connector::ConnectorColumnDefault,
+) -> novarocks_catalog::schema::ColumnDefault {
+    use novarocks_catalog::schema::ColumnDefault;
+    use novarocks_spi::connector::ConnectorColumnDefault as Spi;
+
+    match value {
+        Spi::Null => ColumnDefault::Null,
+        Spi::Boolean(value) => ColumnDefault::Boolean(*value),
+        Spi::Int32(value) => ColumnDefault::Int32(*value),
+        Spi::Int64(value) => ColumnDefault::Int64(*value),
+        Spi::Float32 { bits } => ColumnDefault::Float32 { bits: *bits },
+        Spi::Float64 { bits } => ColumnDefault::Float64 { bits: *bits },
+        Spi::Decimal {
+            unscaled,
+            precision,
+            scale,
+        } => ColumnDefault::Decimal {
+            unscaled: *unscaled,
+            precision: *precision,
+            scale: *scale,
+        },
+        Spi::String(text) => ColumnDefault::String(text.to_string()),
+        Spi::Binary(bytes) => ColumnDefault::Binary(bytes.to_vec()),
+        Spi::Date { days_since_epoch } => ColumnDefault::Date {
+            days_since_epoch: *days_since_epoch,
+        },
+        Spi::TimeMicros {
+            micros_since_midnight,
+        } => ColumnDefault::TimeMicros {
+            micros_since_midnight: *micros_since_midnight,
+        },
+        Spi::TimestampMicros { micros_since_epoch } => ColumnDefault::TimestampMicros {
+            micros_since_epoch: *micros_since_epoch,
+        },
+        Spi::TimestamptzMicros { micros_since_epoch } => ColumnDefault::TimestamptzMicros {
+            micros_since_epoch: *micros_since_epoch,
+        },
+        Spi::TimestampNanos { nanos_since_epoch } => ColumnDefault::TimestampNanos {
+            nanos_since_epoch: *nanos_since_epoch,
+        },
+        Spi::TimestamptzNanos { nanos_since_epoch } => ColumnDefault::TimestamptzNanos {
+            nanos_since_epoch: *nanos_since_epoch,
+        },
+        Spi::Uuid(bytes) => ColumnDefault::Uuid(*bytes),
+        Spi::Fixed { size, bytes } => ColumnDefault::Fixed {
+            size: *size,
+            bytes: bytes.to_vec(),
+        },
+        Spi::Struct(fields) => ColumnDefault::Struct(
+            fields
+                .iter()
+                .map(|(name, field_value)| {
+                    (
+                        name.to_string(),
+                        connector_default_to_column_default(field_value),
+                    )
+                })
+                .collect(),
+        ),
+        Spi::Array(elements) => ColumnDefault::Array(
+            elements
+                .iter()
+                .map(connector_default_to_column_default)
+                .collect(),
+        ),
+        Spi::Map(entries) => ColumnDefault::Map(
+            entries
+                .iter()
+                .map(|(key, entry_value)| {
+                    (
+                        connector_default_to_column_default(key),
+                        connector_default_to_column_default(entry_value),
+                    )
+                })
+                .collect(),
+        ),
+    }
 }
 
 pub(crate) fn acquire_metadata_planning_lease(
@@ -465,9 +571,148 @@ mod tests {
             )])),
         ]);
 
-        let columns = super::sql_columns_from_connector_schema(&schema);
+        let columns = super::sql_columns_from_connector_schema(
+            &schema,
+            &novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+        );
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "value");
+    }
+
+    /// SPI-5G equivalence gate.
+    ///
+    /// Every write default now reaches Core through the provider's planning
+    /// facts instead of a Core-side Iceberg literal decode. This asserts the
+    /// full `Iceberg literal -> provider -> SPI value -> catalog value` round
+    /// trip is lossless for every variant the neutral vocabulary admits, so the
+    /// value INSERT materializes for an omitted column is unchanged.
+    #[test]
+    fn spi5g_write_default_round_trip_matches_direct_iceberg_decode() {
+        use novarocks_catalog::schema::ColumnDefault;
+        use novarocks_connector_iceberg::default_value::{
+            column_default_to_connector_default, iceberg_literal_to_column_default,
+        };
+        use novarocks_connector_iceberg::iceberg::spec::{
+            Literal, NestedField, PrimitiveType, Type,
+        };
+
+        let cases: Vec<(&str, Type, Literal)> = vec![
+            (
+                "bool",
+                Type::Primitive(PrimitiveType::Boolean),
+                Literal::bool(true),
+            ),
+            ("i32", Type::Primitive(PrimitiveType::Int), Literal::int(-7)),
+            (
+                "i64",
+                Type::Primitive(PrimitiveType::Long),
+                Literal::long(1_i64 << 40),
+            ),
+            (
+                "f32",
+                Type::Primitive(PrimitiveType::Float),
+                Literal::float(1.5f32),
+            ),
+            (
+                "f64",
+                Type::Primitive(PrimitiveType::Double),
+                Literal::double(-2.25f64),
+            ),
+            (
+                "text",
+                Type::Primitive(PrimitiveType::String),
+                Literal::string("fallback"),
+            ),
+            (
+                "blob",
+                Type::Primitive(PrimitiveType::Binary),
+                Literal::binary(vec![0u8, 255u8]),
+            ),
+            (
+                "day",
+                Type::Primitive(PrimitiveType::Date),
+                Literal::int(19_000),
+            ),
+        ];
+
+        for (name, iceberg_type, literal) in cases {
+            let direct: ColumnDefault = iceberg_literal_to_column_default(&literal, &iceberg_type)
+                .unwrap_or_else(|error| panic!("column `{name}` direct decode failed: {error}"));
+
+            // The path SPI-5G introduces: provider projects onto the sealed SPI
+            // value, Core projects it back onto the neutral catalog value.
+            let round_tripped = super::connector_default_to_column_default(
+                &column_default_to_connector_default(&direct),
+            );
+
+            assert_eq!(
+                round_tripped, direct,
+                "column `{name}` changed while crossing the SPI boundary"
+            );
+
+            // The field is only used to prove the fixture is a legal Iceberg
+            // column carrying this default.
+            let _ = NestedField::optional(1, name, iceberg_type).with_write_default(literal);
+        }
+    }
+
+    /// Nested defaults are the ones a flat projection would silently truncate.
+    #[test]
+    fn spi5g_nested_write_default_round_trip_is_lossless() {
+        use novarocks_catalog::schema::ColumnDefault;
+        use novarocks_connector_iceberg::default_value::column_default_to_connector_default;
+
+        let nested = ColumnDefault::Struct(vec![
+            (
+                "list".to_string(),
+                ColumnDefault::Array(vec![
+                    ColumnDefault::Int32(1),
+                    ColumnDefault::String("two".to_string()),
+                ]),
+            ),
+            (
+                "map".to_string(),
+                ColumnDefault::Map(vec![(
+                    ColumnDefault::String("k".to_string()),
+                    ColumnDefault::Fixed {
+                        size: 3,
+                        bytes: vec![1, 2, 3],
+                    },
+                )]),
+            ),
+            ("uuid".to_string(), ColumnDefault::Uuid([9u8; 16])),
+        ]);
+
+        assert_eq!(
+            super::connector_default_to_column_default(&column_default_to_connector_default(
+                &nested
+            )),
+            nested
+        );
+    }
+
+    /// Non-finite floats survive because both vocabularies carry the raw bit
+    /// pattern rather than the float value.
+    #[test]
+    fn spi5g_non_finite_write_default_round_trip_preserves_bits() {
+        use novarocks_catalog::schema::ColumnDefault;
+        use novarocks_connector_iceberg::default_value::column_default_to_connector_default;
+
+        for value in [
+            ColumnDefault::Float32 {
+                bits: f32::NAN.to_bits(),
+            },
+            ColumnDefault::Float64 {
+                bits: f64::NEG_INFINITY.to_bits(),
+            },
+        ] {
+            assert_eq!(
+                super::connector_default_to_column_default(&column_default_to_connector_default(
+                    &value
+                )),
+                value
+            );
+        }
     }
 }
 

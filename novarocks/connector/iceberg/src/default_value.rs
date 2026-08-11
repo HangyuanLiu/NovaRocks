@@ -16,7 +16,11 @@ use crate::iceberg::spec::{
     Type,
 };
 
+use std::sync::Arc;
+
+use bytes::Bytes;
 use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
+use novarocks_spi::connector::ConnectorColumnDefault;
 
 pub fn iceberg_literal_to_column_default(
     literal: &IcebergLiteral,
@@ -197,6 +201,97 @@ fn iceberg_literal_to_nested_column_default(
     }
 }
 
+/// Project a neutral column default onto the sealed SPI planning-facts value.
+///
+/// The two vocabularies are intentionally variant-for-variant identical; the
+/// SPI keeps its own copy because its dependency ceiling admits no application
+/// value crate. Keeping the projection here means the provider stays the sole
+/// owner of the Iceberg literal decode that produced the value.
+pub fn column_default_to_connector_default(value: &ColumnDefault) -> ConnectorColumnDefault {
+    match value {
+        ColumnDefault::Null => ConnectorColumnDefault::Null,
+        ColumnDefault::Boolean(value) => ConnectorColumnDefault::Boolean(*value),
+        ColumnDefault::Int32(value) => ConnectorColumnDefault::Int32(*value),
+        ColumnDefault::Int64(value) => ConnectorColumnDefault::Int64(*value),
+        ColumnDefault::Float32 { bits } => ConnectorColumnDefault::Float32 { bits: *bits },
+        ColumnDefault::Float64 { bits } => ConnectorColumnDefault::Float64 { bits: *bits },
+        ColumnDefault::Decimal {
+            unscaled,
+            precision,
+            scale,
+        } => ConnectorColumnDefault::Decimal {
+            unscaled: *unscaled,
+            precision: *precision,
+            scale: *scale,
+        },
+        ColumnDefault::String(text) => ConnectorColumnDefault::String(Arc::from(text.as_str())),
+        ColumnDefault::Binary(bytes) => {
+            ConnectorColumnDefault::Binary(Bytes::copy_from_slice(bytes))
+        }
+        ColumnDefault::Date { days_since_epoch } => ConnectorColumnDefault::Date {
+            days_since_epoch: *days_since_epoch,
+        },
+        ColumnDefault::TimeMicros {
+            micros_since_midnight,
+        } => ConnectorColumnDefault::TimeMicros {
+            micros_since_midnight: *micros_since_midnight,
+        },
+        ColumnDefault::TimestampMicros { micros_since_epoch } => {
+            ConnectorColumnDefault::TimestampMicros {
+                micros_since_epoch: *micros_since_epoch,
+            }
+        }
+        ColumnDefault::TimestamptzMicros { micros_since_epoch } => {
+            ConnectorColumnDefault::TimestamptzMicros {
+                micros_since_epoch: *micros_since_epoch,
+            }
+        }
+        ColumnDefault::TimestampNanos { nanos_since_epoch } => {
+            ConnectorColumnDefault::TimestampNanos {
+                nanos_since_epoch: *nanos_since_epoch,
+            }
+        }
+        ColumnDefault::TimestamptzNanos { nanos_since_epoch } => {
+            ConnectorColumnDefault::TimestamptzNanos {
+                nanos_since_epoch: *nanos_since_epoch,
+            }
+        }
+        ColumnDefault::Uuid(bytes) => ConnectorColumnDefault::Uuid(*bytes),
+        ColumnDefault::Fixed { size, bytes } => ConnectorColumnDefault::Fixed {
+            size: *size,
+            bytes: Bytes::copy_from_slice(bytes),
+        },
+        ColumnDefault::Struct(fields) => ConnectorColumnDefault::Struct(
+            fields
+                .iter()
+                .map(|(name, field_value)| {
+                    (
+                        Arc::from(name.as_str()),
+                        column_default_to_connector_default(field_value),
+                    )
+                })
+                .collect(),
+        ),
+        ColumnDefault::Array(elements) => ConnectorColumnDefault::Array(
+            elements
+                .iter()
+                .map(column_default_to_connector_default)
+                .collect(),
+        ),
+        ColumnDefault::Map(entries) => ConnectorColumnDefault::Map(
+            entries
+                .iter()
+                .map(|(key, entry_value)| {
+                    (
+                        column_default_to_connector_default(key),
+                        column_default_to_connector_default(entry_value),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
 pub fn column_default_to_iceberg_literal(
     value: &ColumnDefault,
     iceberg_type: &Type,
@@ -372,8 +467,6 @@ pub fn require_v3_for_column_default(
     }
     Ok(())
 }
-
-use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,

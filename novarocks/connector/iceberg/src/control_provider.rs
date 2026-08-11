@@ -392,6 +392,7 @@ impl ConnectorMetadata for IcebergControlProvider {
         } else {
             table_planning_facts(IcebergTablePlanningFactsInput {
                 schema: &schema,
+                iceberg_schema: Some(definition_schema.as_ref()),
                 metadata_columns: &payload.metadata_columns,
                 hidden_columns: &payload.hidden_columns,
                 logical_type_columns: &payload.logical_type_columns,

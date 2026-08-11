@@ -149,7 +149,10 @@ pub(crate) fn connector_table_materialization_from_metadata(
             name: field.name().to_string(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
-            write_default: None,
+            write_default: crate::connector::connector_write_default_at(
+                &metadata.planning_facts,
+                ordinal,
+            ),
             logical_type,
         };
         match fact.map(|fact| fact.role()) {

@@ -21,7 +21,6 @@ pub mod application;
 pub mod background;
 pub mod dependency;
 pub(crate) mod model;
-pub(crate) mod partition;
 pub mod persistence;
 pub(crate) mod refresh;
 pub mod repository;

@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorRequestContext, ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
-    ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorColumnDefault, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableColumnPlanningFact,
+    ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
     ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTablePlanningFacts,
     ConnectorTableUniqueConstraint,
 };
@@ -157,6 +157,12 @@ fn corrupt<T>(message: String) -> Result<T, ConnectorError> {
 /// provider payload detail.
 pub struct IcebergTablePlanningFactsInput<'a> {
     pub schema: &'a SchemaRef,
+    /// Authoritative Iceberg schema behind `schema`, used only to read each
+    /// column's write default.
+    ///
+    /// Metadata tables have a synthetic Arrow schema with no Iceberg column
+    /// behind it, so they pass `None` and expose no write defaults.
+    pub iceberg_schema: Option<&'a crate::iceberg::spec::Schema>,
     pub metadata_columns: &'a [String],
     pub hidden_columns: &'a [String],
     pub logical_type_columns: &'a BTreeMap<String, String>,
@@ -203,6 +209,7 @@ pub fn table_planning_facts(
             } else {
                 ConnectorTableColumnRole::Ordinary
             };
+            let write_default = iceberg_write_default(input.iceberg_schema, field.name())?;
             Ok(ConnectorTableColumnPlanningFact::new(
                 u32::try_from(ordinal).map_err(|_| {
                     ConnectorError::new(
@@ -213,7 +220,8 @@ pub fn table_planning_facts(
                 visibility,
                 semantic_kind,
                 role,
-            ))
+            )
+            .with_write_default(write_default))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     let (unique_constraints, foreign_key_constraints) = input
@@ -237,6 +245,41 @@ pub fn table_planning_facts(
         foreign_key_constraints,
         input.context,
     )
+}
+
+/// Read one column's Iceberg write default and project it onto the sealed SPI
+/// value.
+///
+/// A column with no Iceberg write default, and every column of a metadata
+/// table, yields `None`. A default that cannot be decoded is a deterministic
+/// metadata failure: silently dropping it would let generic write admission
+/// fill an omitted column with NULL instead of the value the table declares.
+fn iceberg_write_default(
+    iceberg_schema: Option<&crate::iceberg::spec::Schema>,
+    column_name: &str,
+) -> Result<Option<ConnectorColumnDefault>, ConnectorError> {
+    let Some(iceberg_schema) = iceberg_schema else {
+        return Ok(None);
+    };
+    let Some(field) = iceberg_schema.field_by_name(column_name) else {
+        return Ok(None);
+    };
+    let Some(literal) = field.write_default.as_ref() else {
+        return Ok(None);
+    };
+    let value = crate::default_value::iceberg_literal_to_column_default(
+        literal,
+        field.field_type.as_ref(),
+    )
+    .map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("Iceberg write default for column `{column_name}` cannot be decoded: {error}"),
+        )
+    })?;
+    Ok(Some(
+        crate::default_value::column_default_to_connector_default(&value),
+    ))
 }
 
 fn iceberg_constraint_facts(
@@ -416,6 +459,7 @@ mod tests {
         let context = context();
         let facts = table_planning_facts(IcebergTablePlanningFactsInput {
             schema: &schema,
+            iceberg_schema: None,
             metadata_columns: &metadata_columns,
             hidden_columns: &[],
             logical_type_columns: &logical_type_columns,
@@ -485,5 +529,134 @@ mod tests {
             .expect_err("duplicate equality field identity must be rejected");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
         assert!(error.to_string().contains("duplicate equality field id 7"));
+    }
+
+    /// Build a two-column Iceberg schema where `with_default` carries a write
+    /// default and `plain` does not.
+    fn write_default_schema(
+        default_type: crate::iceberg::spec::Type,
+        default_literal: crate::iceberg::spec::Literal,
+    ) -> crate::iceberg::spec::Schema {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        Schema::builder()
+            .with_fields(vec![
+                Arc::new(
+                    NestedField::optional(1, "with_default", default_type)
+                        .with_write_default(default_literal),
+                ),
+                Arc::new(NestedField::optional(
+                    2,
+                    "plain",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("valid Iceberg schema")
+    }
+
+    fn write_default_facts(
+        iceberg_schema: Option<&crate::iceberg::spec::Schema>,
+        arrow_schema: &SchemaRef,
+    ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+        let namespace = Arc::from("db");
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let context = context();
+        table_planning_facts(IcebergTablePlanningFactsInput {
+            schema: arrow_schema,
+            iceberg_schema,
+            metadata_columns: &[],
+            hidden_columns: &[],
+            logical_type_columns: &BTreeMap::new(),
+            serialized_metadata: None,
+            namespace: &namespace,
+            instance_id: &instance_id,
+            context: &context,
+        })
+    }
+
+    #[test]
+    fn spi5g_write_default_is_projected_onto_planning_facts() {
+        use crate::iceberg::spec::{Literal, PrimitiveType, Type};
+
+        let iceberg_schema = write_default_schema(
+            Type::Primitive(PrimitiveType::String),
+            Literal::string("fallback"),
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("with_default", DataType::Utf8, true),
+            Field::new("plain", DataType::Int64, true),
+        ]));
+
+        let facts =
+            write_default_facts(Some(&iceberg_schema), &arrow_schema).expect("planning facts");
+
+        assert_eq!(
+            facts.column_facts()[0].write_default(),
+            Some(&ConnectorColumnDefault::String(Arc::from("fallback")))
+        );
+        assert_eq!(facts.column_facts()[1].write_default(), None);
+    }
+
+    #[test]
+    fn spi5g_metadata_tables_expose_no_write_default() {
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("with_default", DataType::Utf8, true),
+            Field::new("plain", DataType::Int64, true),
+        ]));
+
+        let facts = write_default_facts(None, &arrow_schema).expect("planning facts");
+
+        assert!(
+            facts
+                .column_facts()
+                .iter()
+                .all(|fact| fact.write_default().is_none())
+        );
+    }
+
+    #[test]
+    fn spi5g_undecodable_write_default_fails_closed() {
+        use crate::iceberg::spec::{Literal, PrimitiveType, Type};
+
+        // Variant column defaults have no neutral projection. Reporting the
+        // failure keeps generic write admission from silently substituting NULL
+        // for the value the table declares.
+        let iceberg_schema = write_default_schema(
+            Type::Primitive(PrimitiveType::Variant),
+            Literal::string("not-a-variant"),
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("with_default", DataType::LargeBinary, true),
+            Field::new("plain", DataType::Int64, true),
+        ]));
+
+        let error = write_default_facts(Some(&iceberg_schema), &arrow_schema)
+            .expect_err("an undecodable write default must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.to_string().contains("with_default"));
+    }
+
+    #[test]
+    fn spi5g_columns_absent_from_the_iceberg_schema_have_no_write_default() {
+        use crate::iceberg::spec::{Literal, PrimitiveType, Type};
+
+        // Synthesized Arrow columns (row lineage, virtual columns) have no
+        // Iceberg field behind them and must not inherit another column's
+        // default.
+        let iceberg_schema = write_default_schema(
+            Type::Primitive(PrimitiveType::String),
+            Literal::string("fallback"),
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("with_default", DataType::Utf8, true),
+            Field::new("plain", DataType::Int64, true),
+            Field::new("_synthesized", DataType::Int64, true),
+        ]));
+
+        let facts =
+            write_default_facts(Some(&iceberg_schema), &arrow_schema).expect("planning facts");
+
+        assert_eq!(facts.column_facts()[2].write_default(), None);
     }
 }
