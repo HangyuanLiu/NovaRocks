@@ -8976,8 +8976,14 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
+    use novarocks_connector_iceberg::file_reader::execution_payload::{
+        IcebergScanFactScalarTypeV1, iceberg_unit_domain_facts, validate_split_payload,
+    };
     use novarocks_connector_iceberg::scan_model::{
         IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    };
+    use novarocks_spi::connector::{
+        ConnectorScanUnitColumnDomain, ConnectorScanUnitColumnFacts, ConnectorScanUnitFactsEvidence,
     };
 
     fn explicit_test_read_binding(runtime: &tokio::runtime::Runtime) -> IcebergReadBinding {
