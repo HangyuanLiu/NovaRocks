@@ -504,6 +504,25 @@ fn validate_physical_field_identity(
 
 #[cfg(test)]
 mod tests {
+
+    /// Project an Iceberg fixture schema onto the neutral facts the rewrite
+    /// context consumes. Mirrors what the Server observation adapter does in
+    /// production.
+    fn neutral_target_schema(
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> (arrow::datatypes::SchemaRef, Arc<[i32]>) {
+        let arrow_schema = Arc::new(
+            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
+                .expect("convert fixture target schema to Arrow"),
+        );
+        let field_ids: Arc<[i32]> = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.id)
+            .collect();
+        (arrow_schema, field_ids)
+    }
     use std::sync::Arc;
 
     use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
@@ -718,6 +737,8 @@ mod tests {
             });
         }
         mutate_contract(&mut contract);
+        let (target_arrow_schema, target_field_ids) =
+            neutral_target_schema(metadata.current_schema());
 
         IcebergMvRewriteContext::from_definition_parts(
             make_target(),
@@ -730,7 +751,8 @@ mod tests {
             Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
             target_snapshot_id,
             metadata.uuid().to_string(),
-            metadata.current_schema().clone(),
+            target_arrow_schema,
+            target_field_ids,
             Some(Arc::new(contract)),
         )
         .expect("rewrite context")

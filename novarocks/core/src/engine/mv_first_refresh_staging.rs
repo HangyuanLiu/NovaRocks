@@ -473,17 +473,12 @@ fn mv_first_refresh_request(
         .hidden_apply_key
         .column_name
         .clone();
-    let target_schema = ctx.rewrite.target_schema.as_ref();
-    let target_arrow_schema =
-        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(target_schema)
-            .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
-    let target_field_ids = target_schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| field.id)
-        .collect();
-    if target_schema.field_by_name(&hidden_hash_key).is_none() {
+    let target_arrow_schema = ctx.rewrite.target_arrow_schema.as_ref().clone();
+    let target_field_ids: Vec<i32> = ctx.rewrite.target_field_ids.to_vec();
+    if target_arrow_schema
+        .field_with_name(&hidden_hash_key)
+        .is_err()
+    {
         return Err(format!(
             "MV first-refresh target schema is missing hidden hash key {hidden_hash_key}"
         ));
