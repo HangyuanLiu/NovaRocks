@@ -974,11 +974,10 @@ pub(crate) fn execute_drop_catalog_statement(
         catalog_name,
         None,
     )?;
-    #[cfg(test)]
     state
         .iceberg_catalogs
         .write()
-        .expect("test iceberg catalog write lock")
+        .expect("iceberg catalog write lock")
         .drop_catalog(&normalized_catalog)?;
     retire_iceberg_control_binding(state, &normalized_catalog)?;
     delete_catalog_attachment_if_needed(state, &normalized_catalog)?;

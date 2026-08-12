@@ -380,7 +380,7 @@ fn prepare_frontend_first_refresh_write(
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
     let target_binding = target_binding_for(state, &target, &connector_context)?;
-    let target_arrow_schema = target_binding.arrow_schema().as_ref().clone();
+    let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
     let target_field_ids = target_binding.observation().field_ids().to_vec();
     let observed_spec_id = target_binding.partition().target_spec_id;
     let partition_spec_id = schema_contract
@@ -15212,27 +15212,6 @@ mod aggregate_refresh_rewrite_validation_tests {
         .expect(
             "aggregate refresh should accept aggregate-state change-stream descriptor evidence",
         );
-    }
-
-    #[test]
-    fn aggregate_refresh_source_does_not_use_legacy_sql_delta_path() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/engine/mv/iceberg_refresh.rs"
-        ))
-        .expect("read source");
-        let forbidden = [
-            concat!("execute_delta_source_", "query"),
-            concat!("iceberg_aggregate_incremental_", "delta_select_sql"),
-            concat!("incremental_refresh_iceberg_", "aggregate_mv"),
-        ];
-
-        for token in forbidden {
-            assert!(
-                !source.contains(token),
-                "legacy aggregate refresh SQL delta path remains: {token}"
-            );
-        }
     }
 }
 

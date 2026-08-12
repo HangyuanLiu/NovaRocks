@@ -71,27 +71,24 @@ fn runtime_filter_contribution_digest_round_trips_canonical_payload() {
 }
 
 #[test]
-fn runtime_filter_contribution_digest_rejects_mutated_payload() {
+fn participant_manifest_digest_rejects_mutated_runtime_filter_digest() {
     let mut wire =
         encode_query_init_request(&request_with_runtime_filter()).expect("request encodes");
-    let lifecycle = wire
+    let contribution = wire
         .manifest
         .as_mut()
         .expect("manifest")
         .runtime_filter
         .as_mut()
-        .expect("runtime filter contribution")
-        .lifecycle
-        .as_mut()
-        .expect("runtime filter lifecycle");
-    lifecycle.delivery_expire_ms += 1;
+        .expect("runtime filter contribution");
+    contribution.contribution_digest[0] ^= 1;
 
     let error = decode_query_init_request(&wire)
-        .expect_err("mutated runtime filter payload must not retain the original digest");
+        .expect_err("mutated runtime filter carrier must not retain the manifest digest");
 
     assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
     assert_eq!(
         error.detail(),
-        "runtime filter contribution digest does not match canonical payload"
+        "participant manifest digest does not match canonical projection"
     );
 }

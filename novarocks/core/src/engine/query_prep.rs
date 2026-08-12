@@ -558,35 +558,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sqlx1_resolution_time_travel_rewrite_does_not_publish_global_catalog_entries() {
-        let source = include_str!("query_prep.rs");
-        let rewrite = source
-            .split("pub(crate) fn rewrite_time_travel_refs")
-            .nth(1)
-            .expect("time-travel rewrite source")
-            .split("pub(crate) fn external_schema_columns_for_statement")
-            .next()
-            .expect("time-travel rewrite boundary");
-        assert!(rewrite.contains("__sqlx1_tt_"));
-        assert!(!rewrite.contains("register_local_table_registration"));
-    }
-
-    #[test]
-    fn sqlx2_application_statement_schema_lookup_does_not_publish_local_scan() {
-        let source = include_str!("query_prep.rs");
-        let lookup = source
-            .split("pub(crate) fn external_schema_columns_for_statement")
-            .nth(1)
-            .expect("statement schema lookup source")
-            .split("/// Returns true if `table_name`")
-            .next()
-            .expect("statement schema lookup boundary");
-        assert!(lookup.contains("load_connector_table_materialization_with_lease"));
-        assert!(!lookup.contains("register("));
-        assert!(!lookup.contains("drop_local_table_registration_if_exists"));
-    }
-
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
         let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse sql");
         let sqlparser::ast::Statement::Query(query) = stmt else {

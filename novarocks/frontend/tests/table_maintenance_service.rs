@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -300,63 +299,30 @@ async fn non_maintenance_sql_is_not_claimed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn legacy_alter_statements_dispatch_typed_actions_and_optimize_only_enqueues() {
+async fn legacy_alter_statements_require_durable_engine_ports_and_optimize_only_enqueues() {
     let (_temp, _host, _store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
 
-    expect_ok(
-        service
-            .try_handle_statement(
-                &engine,
-                "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
-                context(),
-            )
-            .unwrap(),
-    );
-    expect_ok(
-        service
-            .try_handle_statement(
-                &engine,
-                "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS \
-                 OLDER THAN '2026-01-01 00:00:00' RETAIN LAST 2",
-                context(),
-            )
-            .unwrap(),
-    );
-    expect_ok(
-        service
-            .try_handle_statement(
-                &engine,
-                "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1767225600000",
-                context(),
-            )
-            .unwrap(),
-    );
+    for sql in [
+        "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+        "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS \
+         OLDER THAN '2026-01-01 00:00:00' RETAIN LAST 2",
+        "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1767225600000",
+    ] {
+        assert_eq!(
+            service
+                .try_handle_statement(&engine, sql, context())
+                .unwrap_err(),
+            "table maintenance service is not injected"
+        );
+    }
     expect_ok(
         service
             .try_handle_statement(&engine, "ALTER TABLE ice.db.orders OPTIMIZE", context())
             .unwrap(),
     );
 
-    assert_eq!(
-        engine.requests(),
-        vec![
-            MaintenanceActionRequest::RewriteManifests {
-                target: target("ice", "db", "orders"),
-                use_caching: None,
-                spec_id: None,
-            },
-            MaintenanceActionRequest::ExpireSnapshots {
-                target: target("ice", "db", "orders"),
-                older_than_ms: Some(1_767_225_600_000),
-                retain_last: Some(2),
-            },
-            MaintenanceActionRequest::RemoveOrphanFiles {
-                target: target("ice", "db", "orders"),
-                older_than_ms: 1_767_225_600_000,
-            },
-        ]
-    );
+    assert!(engine.requests().is_empty());
     assert_eq!(engine.guarded_targets().len(), 4);
 
     let show = expect_query(
@@ -558,7 +524,7 @@ async fn startup_reconciles_only_the_persisted_exact_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn spark_procedures_dispatch_typed_actions_and_preserve_result_schemas() {
+async fn spark_procedures_route_to_their_durable_frontend_owners() {
     let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
         .await
         .unwrap();
@@ -567,86 +533,41 @@ async fn spark_procedures_dispatch_typed_actions_and_preserve_result_schemas() {
         (
             "CALL ice.system.rewrite_data_files(\
              table => 'db.orders', options => map('rewrite-all', 'true'))",
-            vec![
-                "rewritten_data_files_count",
-                "added_data_files_count",
-                "rewritten_bytes_count",
-                "failed_data_files_count",
-                "removed_delete_files_count",
-            ],
+            "connector distributed rewrite requires frontend StateStore",
         ),
         (
             "CALL ice.system.rewrite_manifests(\
              table => 'db.orders', use_caching => false, spec_id => 7)",
-            vec!["rewritten_manifests_count", "added_manifests_count"],
+            "rewrite_manifests `use_caching` is not implemented in NovaRocks yet",
         ),
         (
             "CALL ice.system.expire_snapshots(\
              table => 'db.orders', older_than => TIMESTAMP '2026-01-01 00:00:00', \
              retain_last => 2)",
-            vec![
-                "deleted_data_files_count",
-                "deleted_position_delete_files_count",
-                "deleted_equality_delete_files_count",
-                "deleted_manifest_files_count",
-                "deleted_manifest_lists_count",
-                "deleted_statistics_files_count",
-            ],
+            "connector metadata maintenance requires frontend StateStore",
         ),
         (
             "CALL ice.system.rewrite_position_delete_files(\
              table => 'db.orders', options => map('rewrite-all', 'true'), \
              where => 'id > 10')",
-            vec![
-                "rewritten_delete_files_count",
-                "added_delete_files_count",
-                "rewritten_bytes_count",
-                "added_bytes_count",
-            ],
+            "rewrite_position_delete_files where is not supported in NovaRocks",
         ),
     ];
 
-    for (sql, expected_columns) in cases {
-        let result = expect_query(
+    for (sql, expected_error) in cases {
+        assert_eq!(
             service
                 .try_handle_statement(&engine, sql, context())
-                .unwrap(),
+                .unwrap_err(),
+            expected_error
         );
-        assert_eq!(column_names(&result), expected_columns);
     }
 
     assert_eq!(
         engine.resolved_name_parts(),
         vec![vec!["ice".to_string(), "db".to_string(), "orders".to_string()]; 4]
     );
-    assert_eq!(
-        engine.requests(),
-        vec![
-            MaintenanceActionRequest::RewriteDataFiles {
-                target: target("ice", "db", "orders"),
-                base_snapshot_id: 777,
-                job_id: None,
-                options: BTreeMap::from([("rewrite-all".to_string(), "true".to_string())]),
-                branch: None,
-                where_clause: None,
-            },
-            MaintenanceActionRequest::RewriteManifests {
-                target: target("ice", "db", "orders"),
-                use_caching: Some(false),
-                spec_id: Some(7),
-            },
-            MaintenanceActionRequest::ExpireSnapshots {
-                target: target("ice", "db", "orders"),
-                older_than_ms: Some(1_767_225_600_000),
-                retain_last: Some(2),
-            },
-            MaintenanceActionRequest::RewritePositionDeleteFiles {
-                target: target("ice", "db", "orders"),
-                options: BTreeMap::from([("rewrite-all".to_string(), "true".to_string())]),
-                where_clause: Some("id > 10".to_string()),
-            },
-        ]
-    );
+    assert!(engine.requests().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -721,7 +642,7 @@ async fn user_actions_are_rejected_by_mv_guard_before_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn automatic_calls_bypass_sql_parser_but_use_typed_engine_and_duplicate_result() {
+async fn automatic_calls_reject_actions_without_a_durable_route_and_deduplicate_optimize() {
     let (_temp, _host, _store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
     let mv_target = target("ice", "db", "mv_table");
@@ -731,16 +652,14 @@ async fn automatic_calls_bypass_sql_parser_but_use_typed_engine_and_duplicate_re
         spec_id: None,
     };
 
-    assert_eq!(
-        service
-            .execute_automatic_action(&engine, request.clone())
-            .unwrap(),
-        MaintenanceActionOutcome::RewriteManifests {
-            rewritten_manifests_count: 4,
-            added_manifests_count: 2,
-        }
+    let error = service
+        .execute_automatic_action(&engine, request)
+        .unwrap_err();
+    assert!(
+        error.starts_with("automatic maintenance action has no durable lifecycle route:"),
+        "{error}"
     );
-    assert_eq!(engine.requests(), vec![request]);
+    assert!(engine.requests().is_empty());
     assert!(engine.guarded_targets().is_empty());
 
     assert_eq!(
@@ -759,7 +678,7 @@ async fn automatic_calls_bypass_sql_parser_but_use_typed_engine_and_duplicate_re
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sqlx2_automatic_mv_expire_preserves_planned_retention_without_user_mv_guard() {
+async fn sqlx2_automatic_mv_expire_requires_the_durable_metadata_owner_without_user_mv_guard() {
     let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
         .await
         .expect("open frontend table-maintenance service");
@@ -772,18 +691,11 @@ async fn sqlx2_automatic_mv_expire_preserves_planned_retention_without_user_mv_g
 
     assert_eq!(
         service
-            .execute_automatic_action(&engine, request.clone())
-            .expect("execute frontend-owned automatic MV expire"),
-        MaintenanceActionOutcome::ExpireSnapshots {
-            deleted_data_files_count: Some(1),
-            deleted_position_delete_files_count: Some(2),
-            deleted_equality_delete_files_count: None,
-            deleted_manifest_files_count: Some(3),
-            deleted_manifest_lists_count: Some(4),
-            deleted_statistics_files_count: None,
-        }
+            .execute_automatic_action(&engine, request)
+            .unwrap_err(),
+        "connector metadata maintenance requires frontend StateStore"
     );
-    assert_eq!(engine.requests(), vec![request]);
+    assert!(engine.requests().is_empty());
     assert!(
         engine.guarded_targets().is_empty(),
         "automatic maintenance must not take the user-facing MV rejection path"
@@ -791,31 +703,35 @@ async fn sqlx2_automatic_mv_expire_preserves_planned_retention_without_user_mv_g
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn missing_state_store_only_blocks_repository_backed_operations() {
+async fn missing_state_store_blocks_every_durable_maintenance_operation() {
     let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
         .await
         .unwrap();
     let engine = FakeMaintenanceEngine::default();
 
-    expect_ok(
+    assert_eq!(
         service
             .try_handle_statement(
                 &engine,
                 "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
                 context(),
             )
-            .unwrap(),
+            .unwrap_err(),
+        "connector metadata maintenance requires frontend StateStore"
     );
-    service
-        .execute_automatic_action(
-            &engine,
-            MaintenanceActionRequest::RewriteManifests {
-                target: target("ice", "db", "orders"),
-                use_caching: None,
-                spec_id: None,
-            },
-        )
-        .unwrap();
+    assert_eq!(
+        service
+            .execute_automatic_action(
+                &engine,
+                MaintenanceActionRequest::ExpireSnapshots {
+                    target: target("ice", "db", "orders"),
+                    older_than_ms: Some(1_767_225_600_000),
+                    retain_last: Some(2),
+                },
+            )
+            .unwrap_err(),
+        "connector metadata maintenance requires frontend StateStore"
+    );
 
     let resolved_before_optimize = engine.resolved_name_parts().len();
     let guarded_before_optimize = engine.guarded_targets().len();
@@ -840,6 +756,7 @@ async fn missing_state_store_only_blocks_repository_backed_operations() {
     assert_eq!(engine.guarded_targets().len(), guarded_before_optimize);
     assert!(show.contains("StateStore"), "{show}");
     assert!(automatic.contains("StateStore"), "{automatic}");
+    assert!(engine.requests().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

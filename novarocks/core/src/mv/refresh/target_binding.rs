@@ -23,9 +23,11 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::{Schema, SchemaRef};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableResolution,
+    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableColumnRole,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTablePlanningFacts, ConnectorTableResolution,
 };
 
 use novarocks_catalog::identifier::TableIdentity;
@@ -83,8 +85,20 @@ impl MvTargetBinding {
         &self.metadata.identity
     }
 
-    pub(crate) fn arrow_schema(&self) -> &arrow::datatypes::SchemaRef {
-        &self.metadata.schema
+    /// Physical Arrow schema accepted by an MV target write.
+    ///
+    /// Connector metadata freezes the read schema, which may append synthetic
+    /// row-lineage fields such as `_file`, `_pos`, and `_row_id`. Those fields
+    /// are query inputs, not declared target fields, and therefore have no
+    /// provider field IDs. The planning facts identify them without exposing
+    /// provider vocabulary. Hidden ordinary fields remain because MV apply
+    /// keys and aggregate state are declared physical target fields.
+    pub(crate) fn physical_write_schema(&self) -> Result<SchemaRef, String> {
+        mv_target_physical_write_schema(
+            &self.metadata.schema,
+            &self.metadata.planning_facts,
+            self.observation.field_ids(),
+        )
     }
 
     pub(crate) const fn observation(&self) -> &MvRefreshTargetObservation {
@@ -143,4 +157,174 @@ pub(crate) fn load_mv_target_binding(
             )
         })?;
     Ok(MvTargetBinding::new(metadata, exact_lease, observation))
+}
+
+fn mv_target_physical_write_schema(
+    read_schema: &SchemaRef,
+    planning_facts: &ConnectorTablePlanningFacts,
+    field_ids: &[i32],
+) -> Result<SchemaRef, String> {
+    let column_facts = planning_facts.column_facts();
+    if !column_facts.is_empty() && column_facts.len() != read_schema.fields().len() {
+        return Err(format!(
+            "MV refresh target planning facts cover {} columns but read schema has {}",
+            column_facts.len(),
+            read_schema.fields().len()
+        ));
+    }
+
+    let fields = read_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, field)| {
+            let fact = column_facts.get(ordinal);
+            if fact.is_some_and(|fact| fact.role() == ConnectorTableColumnRole::RowLineageSystem) {
+                return None;
+            }
+            let data_type = fact
+                .and_then(|fact| fact.write_target_type())
+                .cloned()
+                .unwrap_or_else(|| field.data_type().clone());
+            Some(Arc::new(field.as_ref().clone().with_data_type(data_type)))
+        })
+        .collect::<Vec<_>>();
+    if fields.len() != field_ids.len() {
+        return Err(format!(
+            "MV refresh target physical schema has {} fields but observation has {} field IDs",
+            fields.len(),
+            field_ids.len()
+        ));
+    }
+
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        read_schema.metadata().clone(),
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use novarocks_spi::connector::{
+        ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
+        ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+        ConnectorTablePlanningFacts,
+    };
+
+    use super::mv_target_physical_write_schema;
+
+    fn fact(
+        ordinal: u32,
+        visibility: ConnectorTableColumnVisibility,
+        role: ConnectorTableColumnRole,
+    ) -> ConnectorTableColumnPlanningFact {
+        ConnectorTableColumnPlanningFact::new(
+            ordinal,
+            visibility,
+            ConnectorTableColumnSemanticKind::None,
+            role,
+        )
+    }
+
+    #[test]
+    fn physical_write_schema_drops_read_only_system_fields_and_preserves_write_facts() {
+        let hidden_metadata = HashMap::from([(
+            novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
+            "true".to_string(),
+        )]);
+        let read_schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("k1", DataType::Int32, false),
+                Field::new("payload", DataType::Binary, true),
+                Field::new("__nova_base_row_id", DataType::Int64, false)
+                    .with_metadata(hidden_metadata.clone()),
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+                Field::new("_row_id", DataType::Int64, false),
+                Field::new("_last_updated_sequence_number", DataType::Int64, true),
+            ],
+            HashMap::from([("schema-owner".to_string(), "connector".to_string())]),
+        ));
+        let facts = ConnectorTablePlanningFacts::try_new(
+            &read_schema,
+            vec![
+                fact(
+                    0,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                fact(
+                    1,
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnRole::Ordinary,
+                )
+                .with_write_target_type(Some(DataType::LargeBinary)),
+                fact(
+                    2,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnRole::Ordinary,
+                ),
+                fact(
+                    3,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+                fact(
+                    4,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+                fact(
+                    5,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+                fact(
+                    6,
+                    ConnectorTableColumnVisibility::Hidden,
+                    ConnectorTableColumnRole::RowLineageSystem,
+                ),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            &crate::connector::test_request_context(),
+        )
+        .expect("valid planning facts");
+
+        let physical = mv_target_physical_write_schema(&read_schema, &facts, &[1, 2, 3])
+            .expect("derive physical write schema");
+
+        assert_eq!(physical.fields().len(), 3);
+        assert_eq!(physical.field(0).name(), "k1");
+        assert_eq!(physical.field(1).name(), "payload");
+        assert_eq!(physical.field(1).data_type(), &DataType::LargeBinary);
+        assert_eq!(physical.field(2).name(), "__nova_base_row_id");
+        assert_eq!(physical.field(2).metadata(), &hidden_metadata);
+        assert_eq!(
+            physical.metadata().get("schema-owner").map(String::as_str),
+            Some("connector")
+        );
+    }
+
+    #[test]
+    fn physical_write_schema_fails_closed_when_field_ids_do_not_align() {
+        let read_schema = Arc::new(Schema::new(vec![Field::new("k1", DataType::Int32, false)]));
+
+        let error = mv_target_physical_write_schema(
+            &read_schema,
+            &ConnectorTablePlanningFacts::empty(),
+            &[],
+        )
+        .expect_err("misaligned field IDs must fail");
+
+        assert_eq!(
+            error,
+            "MV refresh target physical schema has 1 fields but observation has 0 field IDs"
+        );
+    }
 }

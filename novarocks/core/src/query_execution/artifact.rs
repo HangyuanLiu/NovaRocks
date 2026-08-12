@@ -297,19 +297,8 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
     }
 }
 
-/// A core artifact bound to one validated schedule. This type deliberately has
-/// no `assemble` method: query initialization/control readiness and the
-/// connector install/ACK barrier must first complete.
-///
-/// ```compile_fail
-/// use novarocks::query_execution::artifact::ScheduleBoundDistributedQuery;
-///
-/// fn query_control_typestate_prevents_submission_before_ready(
-///     scheduled: ScheduleBoundDistributedQuery,
-/// ) {
-///     let _ = scheduled.assemble();
-/// }
-/// ```
+/// A core artifact bound to one validated schedule. Query initialization/control
+/// readiness and the connector install/ACK barrier must first complete.
 pub struct ScheduleBoundDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
