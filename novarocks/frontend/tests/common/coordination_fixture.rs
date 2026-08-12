@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use novarocks_frontend::coordination::FrontendCoordinationRuntime;
+use novarocks_frontend::dml::state_store_journal::StateStoreOperationJournal;
+use novarocks_frontend::dml::{OperationJournal, OperationState, StoredOperation};
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -44,12 +46,16 @@ pub struct CoordinationFixture {
     pub coordination: Arc<FrontendCoordinationRuntime>,
     pub store: Arc<dyn StateStore>,
     _host: StateStoreHost,
-    _dir: tempfile::TempDir,
 }
 
 pub async fn open(cluster_id: &str) -> CoordinationFixture {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("state-store.sqlite");
+    // The directory deliberately outlives the fixture: a service built from it
+    // may be dropped before the test reads the journal back, and a deleted
+    // database would then look like a journal failure rather than the fixture
+    // teardown it actually is. The test binary's temp files are reclaimed by the
+    // OS.
+    let dir = tempfile::tempdir().expect("temp dir").keep();
+    let path = dir.join("state-store.sqlite");
     let registry = builtin_state_store_provider_registry().expect("provider registry");
     let host = StateStoreHost::open(
         &registry,
@@ -83,7 +89,6 @@ pub async fn open(cluster_id: &str) -> CoordinationFixture {
         coordination: Arc::new(coordination),
         store,
         _host: host,
-        _dir: dir,
     }
 }
 
@@ -93,25 +98,70 @@ pub async fn open(cluster_id: &str) -> CoordinationFixture {
 /// it; dropping the fixture tears both down together.
 pub struct BlockingCoordination {
     pub coordination: Arc<FrontendCoordinationRuntime>,
-    runtime: tokio::runtime::Runtime,
+    pub journal: Arc<StateStoreOperationJournal>,
     _fixture: CoordinationFixture,
 }
 
 impl BlockingCoordination {
     pub fn handle(&self) -> tokio::runtime::Handle {
-        self.runtime.handle().clone()
+        shared_runtime().handle().clone()
     }
 }
 
+/// One runtime for the whole test binary.
+///
+/// A per-fixture runtime would be torn down with the service that borrowed it,
+/// and any later read-back of the journal would then fail with a dead blocking
+/// worker. The store itself still lives and dies with each fixture.
+fn shared_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    })
+}
+
 pub fn open_blocking(cluster_id: &str) -> BlockingCoordination {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime");
+    let runtime = shared_runtime();
     let fixture = runtime.block_on(open(cluster_id));
+    let journal = runtime.block_on(async {
+        StateStoreOperationJournal::open(
+            Arc::clone(&fixture.store),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("open DML journal")
+    });
     BlockingCoordination {
         coordination: Arc::clone(&fixture.coordination),
-        runtime,
+        journal: Arc::new(journal),
         _fixture: fixture,
+    }
+}
+
+/// Read-back helpers the route tests used to get from their fake journal.
+///
+/// They now come from the real journal instead, so the assertions describe
+/// durable state rather than an in-memory stand-in.
+pub trait JournalInspect {
+    fn states(&self) -> Vec<OperationState>;
+    fn only_operation(&self) -> StoredOperation;
+}
+
+impl<T: OperationJournal + ?Sized> JournalInspect for T {
+    fn states(&self) -> Vec<OperationState> {
+        self.list_operations()
+            .expect("list operations")
+            .into_iter()
+            .map(|operation| operation.state)
+            .collect()
+    }
+
+    fn only_operation(&self) -> StoredOperation {
+        let mut operations = self.list_operations().expect("list operations");
+        assert_eq!(operations.len(), 1, "expected exactly one DML operation");
+        operations.remove(0)
     }
 }

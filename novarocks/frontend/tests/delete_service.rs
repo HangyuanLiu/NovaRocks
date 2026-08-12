@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use common::coordination_fixture::JournalInspect;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::engine::delete_engine::{
     DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatementKind,
@@ -39,6 +40,8 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 use uuid::Uuid;
+
+mod common;
 
 #[derive(Clone, Copy)]
 enum WriteBehavior {
@@ -86,6 +89,21 @@ impl FakeDeleteEngine {
 }
 
 impl DeleteEngine for FakeDeleteEngine {
+    /// Distributed write fails closed until a fence is established, so the fake
+    /// engine must expose a real write authority to fence against.
+    fn establish_delete_external_fence(
+        &self,
+        _prepared: &dyn novarocks::engine::delete_engine::DeletePrepared,
+        proposal: &dyn novarocks::engine::external_write_fence::ExternalWriteFenceProposal,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorEstablishedWriteFence,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        common::fence_fixture::establish_from_proposal(|operation_id, table, target_ref| {
+            proposal.seal(operation_id, table, target_ref)
+        })
+    }
+
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
         self.prepare_calls.lock().unwrap().push((
             request.kind,
@@ -293,8 +311,14 @@ fn delete_requires_journal_before_prepare() {
 #[test]
 fn delete_uses_admitted_context_and_records_noop_as_known_empty() {
     let engine = FakeDeleteEngine::new(WriteBehavior::NoOp);
-    let journal = Arc::new(FakeJournal::default());
-    let service = DmlService::new(Arc::clone(&journal) as Arc<dyn OperationJournal>);
+    let coordination = common::coordination_fixture::open_blocking("delete-service-test");
+    let journal = Arc::clone(&coordination.journal);
+    let service = DmlService::compose_with_coordination(
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+        Arc::clone(&coordination.coordination),
+        coordination.handle(),
+    );
     let (context, _, deadline) = context();
     assert_eq!(
         service
@@ -314,8 +338,14 @@ fn delete_uses_admitted_context_and_records_noop_as_known_empty() {
 #[test]
 fn equality_delete_commits_and_finalizes_row_delta() {
     let engine = FakeDeleteEngine::new(WriteBehavior::CommitRequired);
-    let journal = Arc::new(FakeJournal::default());
-    let service = DmlService::new(Arc::clone(&journal) as Arc<dyn OperationJournal>);
+    let coordination = common::coordination_fixture::open_blocking("delete-service-test");
+    let journal = Arc::clone(&coordination.journal);
+    let service = DmlService::compose_with_coordination(
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+        Arc::clone(&coordination.coordination),
+        coordination.handle(),
+    );
     let (context, _, _) = context();
     service
         .try_execute_delete(
@@ -341,8 +371,14 @@ fn equality_delete_commits_and_finalizes_row_delta() {
 #[test]
 fn aborted_delete_does_not_commit() {
     let engine = FakeDeleteEngine::new(WriteBehavior::Aborted);
-    let journal = Arc::new(FakeJournal::default());
-    let service = DmlService::new(Arc::clone(&journal) as Arc<dyn OperationJournal>);
+    let coordination = common::coordination_fixture::open_blocking("delete-service-test");
+    let journal = Arc::clone(&coordination.journal);
+    let service = DmlService::compose_with_coordination(
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+        Arc::clone(&coordination.coordination),
+        coordination.handle(),
+    );
     let (context, _, _) = context();
     let error = service
         .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
