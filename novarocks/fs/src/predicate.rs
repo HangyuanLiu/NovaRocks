@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::Ordering;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MinMaxPredicateValue {
     Boolean(bool),
@@ -66,6 +68,72 @@ pub enum ScanPredicateDomain {
     Membership {
         values: Vec<MinMaxPredicateValue>,
     },
+}
+
+impl ScanPredicateDomain {
+    /// Evaluate this domain against one `[min, max]` bound pair.
+    ///
+    /// The bounds may come from any statistics carrier -- a Parquet footer, an
+    /// Iceberg manifest, or another physical source. The evaluation is
+    /// deliberately source-agnostic: callers own the decoding that produces the
+    /// bounds, this function owns only the comparison. Keeping it here is what
+    /// lets file-level and row-group-level pruning share one judgement instead
+    /// of drifting apart.
+    ///
+    /// Returns `true` when a row satisfying the domain may exist inside the
+    /// bounds, i.e. the caller must keep the unit.
+    ///
+    /// Fallback direction: when two values are not comparable (different
+    /// variants), `compare` yields `None` and the enclosing `is_some_and` turns
+    /// that into "does not match", so the caller prunes the unit.
+    pub fn may_match_bounds(
+        &self,
+        min: &MinMaxPredicateValue,
+        max: &MinMaxPredicateValue,
+    ) -> bool {
+        match self {
+            Self::Range { op, value } => match op {
+                MinMaxPredicateOp::Le => {
+                    compare(min, value).is_some_and(|order| order != Ordering::Greater)
+                }
+                MinMaxPredicateOp::Lt => {
+                    compare(min, value).is_some_and(|order| order == Ordering::Less)
+                }
+                MinMaxPredicateOp::Ge => {
+                    compare(max, value).is_some_and(|order| order != Ordering::Less)
+                }
+                MinMaxPredicateOp::Gt => {
+                    compare(max, value).is_some_and(|order| order == Ordering::Greater)
+                }
+                MinMaxPredicateOp::Eq => {
+                    compare(min, value).is_some_and(|order| order != Ordering::Greater)
+                        && compare(max, value).is_some_and(|order| order != Ordering::Less)
+                }
+            },
+            Self::DiscreteSet { values, .. } | Self::Membership { values } => {
+                values.iter().any(|value| {
+                    compare(min, value).is_some_and(|order| order != Ordering::Greater)
+                        && compare(max, value).is_some_and(|order| order != Ordering::Less)
+                })
+            }
+        }
+    }
+}
+
+fn compare(left: &MinMaxPredicateValue, right: &MinMaxPredicateValue) -> Option<Ordering> {
+    match (left, right) {
+        (MinMaxPredicateValue::Boolean(a), MinMaxPredicateValue::Boolean(b)) => a.partial_cmp(b),
+        (MinMaxPredicateValue::Int32(a), MinMaxPredicateValue::Int32(b)) => a.partial_cmp(b),
+        (MinMaxPredicateValue::Int64(a), MinMaxPredicateValue::Int64(b)) => a.partial_cmp(b),
+        (MinMaxPredicateValue::Float(a), MinMaxPredicateValue::Float(b)) => a.partial_cmp(b),
+        (MinMaxPredicateValue::Double(a), MinMaxPredicateValue::Double(b)) => a.partial_cmp(b),
+        (MinMaxPredicateValue::ByteArray(a), MinMaxPredicateValue::ByteArray(b))
+        | (
+            MinMaxPredicateValue::FixedLenByteArray(a),
+            MinMaxPredicateValue::FixedLenByteArray(b),
+        ) => a.partial_cmp(b),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

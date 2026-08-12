@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,7 +35,7 @@ use super::chunk_reader::{BoundChunkReader, ReaderMetrics};
 use crate::{
     BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind,
     FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange, FileReadRequest,
-    FileResult, MinMaxPredicateOp, MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain,
+    FileResult, MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain,
 };
 
 /// Upper bounds for a footer inspection. They cap metadata retained before a
@@ -1107,31 +1106,7 @@ fn predicate_may_match(statistics: &Statistics, domain: &ScanPredicateDomain) ->
     let Some((min, max)) = statistic_bounds(statistics) else {
         return true;
     };
-    match domain {
-        ScanPredicateDomain::Range { op, value } => match op {
-            MinMaxPredicateOp::Le => {
-                compare(&min, value).is_some_and(|order| order != Ordering::Greater)
-            }
-            MinMaxPredicateOp::Lt => {
-                compare(&min, value).is_some_and(|order| order == Ordering::Less)
-            }
-            MinMaxPredicateOp::Ge => {
-                compare(&max, value).is_some_and(|order| order != Ordering::Less)
-            }
-            MinMaxPredicateOp::Gt => {
-                compare(&max, value).is_some_and(|order| order == Ordering::Greater)
-            }
-            MinMaxPredicateOp::Eq => {
-                compare(&min, value).is_some_and(|order| order != Ordering::Greater)
-                    && compare(&max, value).is_some_and(|order| order != Ordering::Less)
-            }
-        },
-        ScanPredicateDomain::DiscreteSet { values, .. }
-        | ScanPredicateDomain::Membership { values } => values.iter().any(|value| {
-            compare(&min, value).is_some_and(|order| order != Ordering::Greater)
-                && compare(&max, value).is_some_and(|order| order != Ordering::Less)
-        }),
-    }
+    domain.may_match_bounds(&min, &max)
 }
 
 fn statistic_bounds(
@@ -1283,22 +1258,6 @@ fn parquet_sort_order(value: SortOrder) -> ParquetStatisticsSortOrder {
         SortOrder::SIGNED => ParquetStatisticsSortOrder::Signed,
         SortOrder::UNSIGNED => ParquetStatisticsSortOrder::Unsigned,
         SortOrder::UNDEFINED => ParquetStatisticsSortOrder::Undefined,
-    }
-}
-
-fn compare(left: &MinMaxPredicateValue, right: &MinMaxPredicateValue) -> Option<Ordering> {
-    match (left, right) {
-        (MinMaxPredicateValue::Boolean(a), MinMaxPredicateValue::Boolean(b)) => a.partial_cmp(b),
-        (MinMaxPredicateValue::Int32(a), MinMaxPredicateValue::Int32(b)) => a.partial_cmp(b),
-        (MinMaxPredicateValue::Int64(a), MinMaxPredicateValue::Int64(b)) => a.partial_cmp(b),
-        (MinMaxPredicateValue::Float(a), MinMaxPredicateValue::Float(b)) => a.partial_cmp(b),
-        (MinMaxPredicateValue::Double(a), MinMaxPredicateValue::Double(b)) => a.partial_cmp(b),
-        (MinMaxPredicateValue::ByteArray(a), MinMaxPredicateValue::ByteArray(b))
-        | (
-            MinMaxPredicateValue::FixedLenByteArray(a),
-            MinMaxPredicateValue::FixedLenByteArray(b),
-        ) => a.partial_cmp(b),
-        _ => None,
     }
 }
 
