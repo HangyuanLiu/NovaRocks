@@ -635,7 +635,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 .with_table_metadata(metadata.clone()),
             );
             let cleanup =
-                crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
+                crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(entry)
                     .map_err(internal)?;
             let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> =
                 prepared.staged.catalog.clone();

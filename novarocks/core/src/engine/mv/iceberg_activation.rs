@@ -174,7 +174,7 @@ pub(crate) fn activate_first_refresh_connector_write(
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+        crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(
         crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
             catalog,

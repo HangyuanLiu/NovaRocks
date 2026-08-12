@@ -22,6 +22,7 @@
 //! Parquet file produced by the pipeline), and [`CommitOutcome`] (result of a
 //! successful commit).
 
+mod abort_cleanup;
 mod action;
 mod collector;
 mod data_file;
@@ -51,6 +52,7 @@ mod truncate;
 mod update_cow;
 mod validation;
 
+pub(crate) use abort_cleanup::{AbortCleanupOperator, build_abort_cleanup_for_catalog_entry};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use data_file::written_file_to_iceberg_data_file;

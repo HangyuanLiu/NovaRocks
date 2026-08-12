@@ -32,7 +32,9 @@ use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
-use crate::connector::iceberg::commit::{CleanupPathMapper, IcebergCommitCollector};
+use crate::connector::iceberg::commit::{
+    CleanupPathMapper, IcebergCommitCollector, build_abort_cleanup_for_catalog_entry,
+};
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_service::IcebergWriteReportCommitter;
 use crate::engine::StandaloneState;
@@ -1704,61 +1706,6 @@ pub(crate) fn run_select_to_chunks(
         None,
     )?;
     query_result_to_chunks(result)
-}
-
-pub(crate) struct AbortCleanupOperator {
-    pub(crate) fs: novarocks_connector_iceberg::opendal::Operator,
-    pub(crate) path_mapper: Option<CleanupPathMapper>,
-}
-
-pub(crate) fn build_abort_cleanup_for_catalog_entry(
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-) -> Result<AbortCleanupOperator, String> {
-    if let Some(s3_config) = entry.object_store_config() {
-        let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
-            &entry.warehouse_uri,
-            Some(s3_config),
-        )
-        .map_err(|e| format!("resolve warehouse URI for iceberg abort cleanup: {e}"))?;
-        let bucket = access
-            .handle()
-            .authority()
-            .ok_or_else(|| {
-                format!(
-                    "resolve warehouse URI for iceberg abort cleanup missing bucket: {}",
-                    entry.warehouse_uri
-                )
-            })?
-            .to_string();
-        let fs = access.operator();
-        let mapper: CleanupPathMapper = Arc::new(move |path| {
-            novarocks_fs::parse_object_store_path_parse_only(path)
-                .ok()
-                .and_then(|(actual_bucket, key)| {
-                    if actual_bucket == bucket {
-                        Some(key)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| path.to_string())
-        });
-        return Ok(AbortCleanupOperator {
-            fs,
-            path_mapper: Some(mapper),
-        });
-    }
-
-    let fs = novarocks_fs::FsAccessResolver::new()
-        .resolve_location("/__novarocks_local_root__", None)
-        .map_err(|error| format!("build local-FS operator failed: {error}"))?
-        .operator();
-    let mapper: CleanupPathMapper =
-        Arc::new(|path: &str| path.strip_prefix("file://").unwrap_or(path).to_string());
-    Ok(AbortCleanupOperator {
-        fs,
-        path_mapper: Some(mapper),
-    })
 }
 
 #[cfg(test)]
