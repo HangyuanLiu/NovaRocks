@@ -1709,12 +1709,21 @@ impl MvEngine for StandaloneMvEngine {
         _target: &CreatedMvTarget,
         definition: &StoredMvDefinition,
     ) -> Result<(), MvEngineError> {
+        // Reached from the MV engine trait, which carries no request context.
+        // Use the same bounded, non-cancellable context other context-free
+        // connector paths use.
+        let connector_context = crate::connector::connector_request_context(
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))?;
         sync_iceberg_mv_descriptor(
             &self.state,
             definition,
             &definition.refresh_policy,
             definition.refresh_paused,
             definition.refresh_interval_ms,
+            &connector_context,
         )
         .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
     }
@@ -2975,6 +2984,7 @@ pub(crate) fn sync_iceberg_mv_descriptor(
     refresh_policy: &StoredMvRefreshPolicy,
     refresh_paused: bool,
     refresh_interval_ms: Option<i64>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     if definition.storage_engine != MvStorageEngine::Iceberg.as_sql_str() {
         return Ok(());
@@ -3017,26 +3027,41 @@ pub(crate) fn sync_iceberg_mv_descriptor(
         descriptor.set_schema_contract(contract)?;
     }
     let descriptor_properties = descriptor.to_storage_properties()?;
-    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-    let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&loaded.table);
-    let mut action = tx.update_table_properties();
-    for (key, value) in descriptor_properties {
-        action = action.set(key, value);
-    }
-    let tx = action
-        .apply(tx)
-        .map_err(|e| format!("apply MV descriptor property update failed: {e}"))?;
-    crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-        tx.commit(catalog.as_ref()).await
-    })
-    .map_err(|e| format!("sync MV descriptor properties runtime failed: {e}"))?
-    .map_err(|e| format!("sync MV descriptor properties failed: {e}"))?;
+    // The MV descriptor lives in the target's engine-owned property namespace.
+    // Writing it is a catalog property mutation, not a reason for the MV path to
+    // open an Iceberg transaction of its own (SPI-5I F6).
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
+        .map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(namespace),
+                table: Arc::from(target_table_name),
+            },
+            changes: descriptor_properties
+                .into_iter()
+                .map(
+                    |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
+                        key: Arc::from(key.as_str()),
+                        value: Arc::from(value.as_str()),
+                    },
+                )
+                .collect(),
+            authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+        },
+        connector_context.clone(),
+    )
+    .map_err(|error| format!("sync MV descriptor properties failed: {error}"))?;
     entry.invalidate_table_cache(namespace, target_table_name);
     Ok(())
 }
 
 fn sync_iceberg_mv_descriptor_for_target(
     state: &Arc<StandaloneState>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
     let definition = load_iceberg_mv_definition_by_target(state, target)?;
@@ -3046,6 +3071,7 @@ fn sync_iceberg_mv_descriptor_for_target(
         &definition.refresh_policy,
         definition.refresh_paused,
         definition.refresh_interval_ms,
+        connector_context,
     )
 }
 
@@ -5125,7 +5151,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
             repartition_restore,
         );
         result.map_err(IcebergMvRefreshExecutionError::into_message)?;
-        sync_iceberg_mv_descriptor_for_target(state, &target)
+        sync_iceberg_mv_descriptor_for_target(state, connector_context, &target)
             .map_err(|e| format!("sync Iceberg MV descriptor after repartition failed: {e}"))?;
         register_iceberg_mv_target_in_catalog(state, &target)?;
         return Ok(StatementResult::Ok);
@@ -5160,7 +5186,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
         connector_context,
     );
     result.map_err(IcebergMvRefreshExecutionError::into_message)?;
-    sync_iceberg_mv_descriptor_for_target(state, &target)
+    sync_iceberg_mv_descriptor_for_target(state, connector_context, &target)
         .map_err(|e| format!("sync Iceberg MV descriptor after repartition failed: {e}"))?;
     register_iceberg_mv_target_in_catalog(state, &target)?;
     Ok(StatementResult::Ok)

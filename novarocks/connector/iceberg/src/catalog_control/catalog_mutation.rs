@@ -17,9 +17,9 @@ use novarocks_spi::connector::{
     ConnectorColumnPosition, ConnectorDataType, ConnectorDropTableDataDisposition, ConnectorError,
     ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorPartitionTransform, ConnectorPropertyChange, ConnectorRefAction,
-    ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind,
-    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ConnectorPartitionTransform, ConnectorPropertyAuthority, ConnectorPropertyChange,
+    ConnectorRefAction, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
+    ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
@@ -329,9 +329,13 @@ fn execute_operation(
             alter_partition_spec(provider.runtime(), table, add, drop)?;
             Ok(ExternalMutationEffect::Applied)
         }
-        ConnectorCatalogMutationOperation::AlterProperties { table, changes } => {
+        ConnectorCatalogMutationOperation::AlterProperties {
+            table,
+            changes,
+            authority,
+        } => {
             ensure_owner(provider, &table.instance_id)?;
-            alter_properties(provider.runtime(), table, changes)?;
+            alter_properties(provider.runtime(), table, changes, *authority)?;
             Ok(ExternalMutationEffect::Applied)
         }
         ConnectorCatalogMutationOperation::AlterRef { table, action } => {
@@ -778,6 +782,7 @@ fn alter_properties(
     runtime: &IcebergControlRuntime,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorPropertyChange],
+    authority: ConnectorPropertyAuthority,
 ) -> Result<(), ConnectorError> {
     if changes.is_empty() {
         return Err(invalid("Iceberg property mutation is empty"));
@@ -793,7 +798,12 @@ fn alter_properties(
             ConnectorPropertyChange::Set { key, .. }
             | ConnectorPropertyChange::Unset { key, .. } => key.as_ref(),
         };
-        if let Some(reason) = reserved_property(key) {
+        // Engine-owned writes are allowed into the engine's own namespace;
+        // user statements are not. Every other reserved key (Iceberg internals)
+        // stays rejected for both.
+        if let Some(reason) = reserved_property(key)
+            && !(authority == ConnectorPropertyAuthority::EngineOwned && is_engine_namespace(key))
+        {
             return Err(invalid(format!(
                 "Iceberg table property `{key}` is reserved: {reason}"
             )));
@@ -868,6 +878,14 @@ fn reserved_property(key: &str) -> Option<&'static str> {
     }
     key.starts_with("novarocks.")
         .then_some("novarocks.* is reserved for engine-owned properties")
+}
+
+/// Is `key` in the engine's own property namespace?
+///
+/// Only these are unlocked for `ConnectorPropertyAuthority::EngineOwned`;
+/// Iceberg's internal metadata keys stay rejected for every caller.
+fn is_engine_namespace(key: &str) -> bool {
+    key.starts_with("novarocks.")
 }
 
 fn alter_schema(

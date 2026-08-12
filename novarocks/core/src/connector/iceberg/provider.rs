@@ -1631,7 +1631,11 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                     })
                     .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
                 }
-                ConnectorCatalogMutationOperation::AlterProperties { table, changes } => {
+                ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes,
+                    authority,
+                } => {
                     if table.instance_id != self.instance_id {
                         return Err(ConnectorError::new(
                             ConnectorErrorKind::InvalidRequest,
@@ -1648,6 +1652,7 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         &table.namespace,
                         &table.table,
                         &operation,
+                        authority,
                     )
                     .map(|()| ExternalMutationEffect::Applied)
                     .map_err(map_iceberg_error)

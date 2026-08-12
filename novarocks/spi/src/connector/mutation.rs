@@ -379,6 +379,18 @@ pub enum ConnectorSchemaChange {
     },
 }
 
+/// Who is requesting a table property mutation.
+///
+/// The distinction is a permission boundary, not a hint: providers reject
+/// engine-reserved keys for `UserStatement` and accept them for `EngineOwned`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorPropertyAuthority {
+    /// Reached from a user's DDL statement (e.g. ALTER TABLE SET TBLPROPERTIES).
+    UserStatement,
+    /// The engine writing metadata it owns, such as an MV descriptor.
+    EngineOwned,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorPropertyChange {
     Set { key: Arc<str>, value: Arc<str> },
@@ -567,6 +579,13 @@ pub enum ConnectorCatalogMutationOperation {
     AlterProperties {
         table: ConnectorTableIdentity,
         changes: Vec<ConnectorPropertyChange>,
+        /// Who is asking. A user statement may not touch engine-reserved
+        /// property namespaces; the engine writing its own metadata may.
+        ///
+        /// Without this, "update the engine's own properties on an existing
+        /// table" has no neutral expression at all, and the only way to do it
+        /// is to bypass the SPI entirely (SPI-5I F6).
+        authority: ConnectorPropertyAuthority,
     },
     AlterRef {
         table: ConnectorTableIdentity,

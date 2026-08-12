@@ -2124,11 +2124,23 @@ mod tests {
                 ("novarocks.internal".to_string(), "x".to_string()),
             ],
         };
-        let hits = collect_property_denylist_hits(&op);
+        let hits = collect_property_denylist_hits(
+            &op,
+            novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
+        );
         assert_eq!(hits.len(), 2, "expected 2 denied keys, got: {hits:?}");
         let denied_keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
         assert!(denied_keys.contains(&"format-version"));
         assert!(denied_keys.contains(&"novarocks.internal"));
+
+        // An engine-owned write may touch the engine's own namespace, but the
+        // Iceberg internal key stays denied for it too.
+        let engine_hits = collect_property_denylist_hits(
+            &op,
+            novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+        );
+        let engine_denied: Vec<&str> = engine_hits.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(engine_denied, vec!["format-version"]);
     }
 
     #[test]
@@ -2143,11 +2155,22 @@ mod tests {
             ],
             if_exists: false,
         };
-        let hits = collect_property_denylist_hits(&op);
+        let hits = collect_property_denylist_hits(
+            &op,
+            novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
+        );
         assert_eq!(hits.len(), 2, "expected 2 denied keys, got: {hits:?}");
         let denied_keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
         assert!(denied_keys.contains(&"last-column-id"));
         assert!(denied_keys.contains(&"novarocks.nullability.attested.id"));
+
+        // Same asymmetry on unset.
+        let engine_hits = collect_property_denylist_hits(
+            &op,
+            novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+        );
+        let engine_denied: Vec<&str> = engine_hits.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(engine_denied, vec!["last-column-id"]);
     }
 
     #[test]
@@ -4098,19 +4121,36 @@ fn is_reserved_property_key(key: &str) -> Option<&'static str> {
 
 /// Collect any property keys in `op` that are blocked by the denylist.
 /// Returns a list of `(key, reason)` pairs for each denied key.
-fn collect_property_denylist_hits(op: &PropertiesOp) -> Vec<(String, &'static str)> {
+/// Engine-owned writes may touch the engine's own `novarocks.*` namespace; a
+/// user statement may not. Iceberg's internal metadata keys stay rejected for
+/// both (SPI-5I F6).
+fn collect_property_denylist_hits(
+    op: &PropertiesOp,
+    authority: novarocks_spi::connector::ConnectorPropertyAuthority,
+) -> Vec<(String, &'static str)> {
+    let engine_owned = matches!(
+        authority,
+        novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned
+    );
+    let denied = |key: &str| -> Option<&'static str> {
+        let reason = is_reserved_property_key(key)?;
+        if engine_owned && key.starts_with("novarocks.") {
+            return None;
+        }
+        Some(reason)
+    };
     let mut hits = Vec::new();
     match op {
         PropertiesOp::Set { entries } => {
             for (k, _) in entries {
-                if let Some(reason) = is_reserved_property_key(k) {
+                if let Some(reason) = denied(k) {
                     hits.push((k.clone(), reason));
                 }
             }
         }
         PropertiesOp::Unset { keys, .. } => {
             for k in keys {
-                if let Some(reason) = is_reserved_property_key(k) {
+                if let Some(reason) = denied(k) {
                     hits.push((k.clone(), reason));
                 }
             }
@@ -4186,8 +4226,9 @@ pub(crate) fn alter_table_properties_on_entry(
     namespace: &str,
     table: &str,
     op: &PropertiesOp,
+    authority: novarocks_spi::connector::ConnectorPropertyAuthority,
 ) -> Result<(), String> {
-    let denied = collect_property_denylist_hits(op);
+    let denied = collect_property_denylist_hits(op, authority);
     if !denied.is_empty() {
         let mut messages = denied
             .into_iter()
@@ -4324,7 +4365,11 @@ pub(crate) fn alter_table_properties(
     };
 
     // 2. Denylist check — fail fast before any IO.
-    let denied = collect_property_denylist_hits(&stmt.op);
+    // Reached from the user's ALTER TABLE statement.
+    let denied = collect_property_denylist_hits(
+        &stmt.op,
+        novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
+    );
     if !denied.is_empty() {
         let mut msgs: Vec<String> = denied
             .iter()

@@ -2595,6 +2595,7 @@ impl StandaloneSession {
                     table: Arc::from(target.table.as_str()),
                 },
                 changes,
+                authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
             },
             connector_context.clone(),
         )?;
