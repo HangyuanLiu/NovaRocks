@@ -98,6 +98,66 @@ pub struct AttemptScanPage {
     pub limit: Option<ConnectorMvAttemptScanLimit>,
 }
 
+/// Whether a ref is even a candidate staging attempt.
+///
+/// `main` is the published state and the fence ref arbitrates publication;
+/// proposing either as an attempt would let discovery suggest deleting the very
+/// ref that decides who may publish. Tags are user-visible surface and are never
+/// staging attempts.
+pub fn is_candidate_attempt_ref(ref_name: &str, is_branch: bool) -> bool {
+    is_branch
+        && ref_name != "main"
+        && ref_name != super::mv_publication_fence::MV_PUBLICATION_FENCE_REF
+}
+
+/// Reads every candidate staging ref off a loaded table's metadata.
+///
+/// `main` and the publication fence ref are excluded: neither is an attempt, and
+/// treating the fence as one would let discovery propose deleting the very ref
+/// that arbitrates publication. Everything else is a candidate, including refs
+/// this provider cannot decode — [`scan_attempt_page`] is what decides their
+/// disposition, precisely so that decision lives in one tested place.
+pub fn observe_attempt_refs(
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<Vec<ObservedAttemptRef>, String> {
+    let mut observed = Vec::new();
+    for (ref_name, reference) in metadata.refs() {
+        if !is_candidate_attempt_ref(ref_name, reference.is_branch()) {
+            continue;
+        }
+        let snapshot = metadata.snapshot_by_id(reference.snapshot_id);
+        let (provenance, undecodable_marker) = match snapshot {
+            Some(snapshot) => match MvProvenanceV2::from_snapshot_summary(snapshot) {
+                Ok(Some(record)) => (Some(record), false),
+                // Absent V2 key: only a candidate if it carries the legacy MV
+                // marker, otherwise it is an unrelated branch.
+                Ok(None) => (
+                    None,
+                    snapshot
+                        .summary()
+                        .additional_properties
+                        .contains_key(super::mv_refresh_ref::MV_REFRESH_ID_PROP),
+                ),
+                // Present but undecodable: a newer or corrupt schema. Reported,
+                // never skipped.
+                Err(_) => (None, true),
+            },
+            None => (None, false),
+        };
+        observed.push(ObservedAttemptRef {
+            ref_name: ref_name.clone(),
+            snapshot_id: reference.snapshot_id,
+            snapshot_present: snapshot.is_some(),
+            provenance,
+            undecodable_marker,
+        });
+    }
+    // Deterministic input order keeps a scan reproducible for a fixed metadata
+    // state, which the paging tests depend on.
+    observed.sort_by(|left, right| left.ref_name.cmp(&right.ref_name));
+    Ok(observed)
+}
+
 /// Selects one bounded page of attempts from the observed refs.
 ///
 /// `after` is an exclusive cursor over attempt IDs. Because the cursor is an
@@ -424,6 +484,24 @@ mod tests {
             page.unclaimable[0].reason,
             UnclaimableReason::MalformedAttemptIdentity
         );
+    }
+
+    #[test]
+    fn only_non_main_non_fence_branches_are_candidate_attempts() {
+        use crate::commit::mv_publication_fence::MV_PUBLICATION_FENCE_REF;
+
+        assert!(is_candidate_attempt_ref("mv_refresh_abc", true));
+
+        // `main` is the published state and the fence ref arbitrates publication.
+        // Treating either as an attempt would let discovery propose deleting the
+        // ref that decides who may publish.
+        assert!(!is_candidate_attempt_ref("main", true));
+        assert!(!is_candidate_attempt_ref(MV_PUBLICATION_FENCE_REF, true));
+
+        // Tags are user-visible surface, never staging attempts -- including a
+        // tag that happens to use a staging-looking name.
+        assert!(!is_candidate_attempt_ref("mv_refresh_abc", false));
+        assert!(!is_candidate_attempt_ref("some_user_tag", false));
     }
 
     #[test]
