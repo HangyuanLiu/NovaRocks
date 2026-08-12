@@ -2396,6 +2396,50 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    /// Take a stalled metadata operation over: prove the caller holds the live
+    /// lease, then rebind the record to the caller's attempt so its later
+    /// fenced transitions validate normally. The previous attempt's provenance
+    /// is replaced, never trusted.
+    pub async fn adopt_authority_fenced(
+        &self,
+        operation_id: Uuid,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("adopt metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "adopt frontend metadata maintenance operation",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_adopt(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Start,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
     pub async fn mark_reconcile_pending_fenced(
         &self,
         operation_id: Uuid,
@@ -3276,6 +3320,70 @@ async fn apply_metadata_create(
         .put(marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(MetadataMaintenanceOperation::from(&stored)))
+}
+
+/// Rebind a metadata operation to the caller's attempt after a takeover.
+///
+/// The live lease is the authority here; the stale attempt recorded by a dead
+/// frontend is replaced rather than compared. The business state is untouched,
+/// so this cannot skip a transition or fabricate progress.
+async fn apply_metadata_adopt(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    let loaded = match load_metadata_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!("adopt metadata maintenance operation {operation_id} failed: not found"),
+        )));
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if operation.stored.state.is_terminal() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "a terminal metadata maintenance operation cannot be adopted",
+        )));
+    }
+    operation.stored.schema_version = METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION;
+    operation.stored.authority = Some(authority.clone());
+    // Adoption only replaces provenance: the state indexes and the active
+    // target fence stay exactly where they are.
+    let operation_key = match metadata_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_metadata_operation(&operation.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match metadata_transaction_record(
+        transaction_operation_id,
+        StoredMetadataMaintenanceTransactionActionV2::Start,
+        &operation.stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(
+            operation_key,
+            operation_value,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)))
 }
 
 async fn apply_metadata_start(
@@ -4635,6 +4743,48 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Take a stalled distributed rewrite over: prove the live lease, rebind the
+    /// record's attempt, and leave the business state untouched.
+    pub async fn adopt_authority_fenced(
+        &self,
+        operation_id: Uuid,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("adopt distributed rewrite operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "adopt frontend distributed rewrite operation",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_rewrite_adopt(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_rewrite_result(
+            result,
+            transaction_operation_id,
+            StoredDistributedRewriteTransactionActionV3::Checkpoint,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
     pub async fn mark_abort_pending_fenced(
         &self,
         operation_id: Uuid,
@@ -5574,6 +5724,118 @@ async fn rewrite_transition_state(
     Ok(Ok(DistributedRewriteOperation::from(&operation.stored)))
 }
 
+/// Rebind a distributed rewrite to the caller's attempt after a takeover.
+async fn apply_rewrite_adopt(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<DistributedRewriteOperation> {
+    let loaded = match load_rewrite_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!("adopt distributed rewrite operation {operation_id} failed: not found"),
+        )));
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if operation.stored.state.is_terminal() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "a terminal distributed rewrite cannot be adopted",
+        )));
+    }
+    operation.stored.schema_version = DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION;
+    operation.stored.authority = Some(authority.clone());
+    let operation_key = match rewrite_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_rewrite_operation(&operation.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match rewrite_transaction_record(
+        transaction_operation_id,
+        StoredDistributedRewriteTransactionActionV3::Checkpoint,
+        &operation.stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(
+            operation_key,
+            operation_value,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(DistributedRewriteOperation::from(&operation.stored)))
+}
+
+/// Rebind a cleanup operation to the caller's attempt after a takeover.
+async fn apply_cleanup_adopt(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    operation_id: Uuid,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<CleanupOperation> {
+    let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            "cleanup operation not found",
+        )));
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if operation.stored.state.is_terminal() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "a terminal cleanup operation cannot be adopted",
+        )));
+    }
+    operation.stored.schema_version = CLEANUP_OPERATION_SCHEMA_VERSION;
+    operation.stored.authority = Some(authority.clone());
+    let operation_key = match cleanup_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_cleanup_operation(&operation.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match cleanup_transaction_record(
+        transaction_id,
+        StoredCleanupTransactionActionV4::Checkpoint,
+        &operation.stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(
+            operation_key,
+            operation_value,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(CleanupOperation::from(&operation.stored)))
+}
+
 async fn load_rewrite_operation(
     transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
     operation_id: Uuid,
@@ -6343,6 +6605,37 @@ impl CleanupOperationRepository {
             CleanupOperationState::ReconcilePending,
             None,
             now_ms,
+        )
+        .await
+    }
+
+    /// Take a stalled cleanup operation over: prove the live lease, rebind the
+    /// record's attempt, and leave the prepared-batch state untouched.
+    pub async fn adopt_authority_fenced(
+        &self,
+        operation_id: Uuid,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "adopt frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_adopt(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
         )
         .await
     }

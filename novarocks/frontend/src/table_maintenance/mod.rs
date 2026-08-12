@@ -246,6 +246,23 @@ impl FrontendTableMaintenanceService {
         }
     }
 
+    /// Recovery variant of [`Self::acquire_attempt`]: a target owned by another
+    /// live attempt is not an error, it is simply not ours to converge yet.
+    fn try_acquire_attempt(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<Option<MaintenanceLeaseAttempt>, String> {
+        let coordination = self.require_coordination()?;
+        match self
+            .block_on(coordination.acquire(target))
+            .map_err(|error| format!("acquire table maintenance authority failed: {error}"))?
+        {
+            MaintenanceAcquireOutcome::Acquired(attempt) => Ok(Some(attempt)),
+            MaintenanceAcquireOutcome::Contended(_)
+            | MaintenanceAcquireOutcome::AwaitingTakeover(_) => Ok(None),
+        }
+    }
+
     /// Read the durable provenance that every fenced transition of this
     /// attempt must carry, together with the validator that re-checks the
     /// lease inside the repository transaction.
@@ -1145,6 +1162,18 @@ impl FrontendTableMaintenanceService {
                 format!("list metadata maintenance recovery candidates failed: {error}")
             })?
         {
+            // Recovery is a takeover. Skip a target another frontend still
+            // owns instead of racing it.
+            let Some(attempt) = self.try_acquire_attempt(&operation.target)? else {
+                continue;
+            };
+            let (authority, validator) = self.attempt_authority(&attempt)?;
+            self.block_on(repository.adopt_authority_fenced(
+                operation.operation_id,
+                authority.clone(),
+                Arc::clone(&validator),
+            ))
+            .map_err(|error| format!("adopt metadata maintenance operation failed: {error}"))?;
             let result = (|| -> Result<(), String> {
                 let stored = self
                     .block_on(repository.load_plan(operation.operation_id))
@@ -1185,13 +1214,15 @@ impl FrontendTableMaintenanceService {
                 .map_err(|error| error.to_string())?;
                 let completed = engine.reconcile_metadata_maintenance(&operation.target, plan)?;
                 let receipt = completed.receipt;
-                self.block_on(repository.finish(
+                self.block_on(repository.finish_fenced(
                     operation.operation_id,
                     MetadataMaintenanceOpaquePayload {
                         digest: metadata_maintenance_payload_digest(receipt.provider_payload()),
                         payload: receipt.provider_payload().to_vec(),
                     },
                     now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(&validator),
                 ))
                 .map_err(|error| {
                     format!("persist recovered metadata maintenance receipt failed: {error}")
@@ -1199,10 +1230,12 @@ impl FrontendTableMaintenanceService {
                 Ok(())
             })();
             if let Err(error) = result {
-                self.block_on(repository.mark_unresolved(
+                self.block_on(repository.mark_unresolved_fenced(
                     operation.operation_id,
                     error,
                     now_unix_millis(),
+                    authority,
+                    validator,
                 ))
                 .map_err(|store| {
                     format!("mark metadata maintenance operation unresolved failed: {store}")
@@ -1226,10 +1259,22 @@ impl FrontendTableMaintenanceService {
                 format!("list distributed rewrite recovery candidates failed: {error}")
             })?
         {
-            self.block_on(repository.mark_unresolved(
+            let Some(attempt) = self.try_acquire_attempt(&operation.target)? else {
+                continue;
+            };
+            let (authority, validator) = self.attempt_authority(&attempt)?;
+            self.block_on(repository.adopt_authority_fenced(
+                operation.operation_id,
+                authority.clone(),
+                Arc::clone(&validator),
+            ))
+            .map_err(|error| format!("adopt distributed rewrite operation failed: {error}"))?;
+            self.block_on(repository.mark_unresolved_fenced(
                 operation.operation_id,
                 "distributed rewrite requires its original exact connector generation after frontend restart".to_string(),
                 now_unix_millis(),
+                authority,
+                validator,
             ))
             .map_err(|error| format!("mark distributed rewrite operation unresolved failed: {error}"))?;
         }
@@ -1247,6 +1292,16 @@ impl FrontendTableMaintenanceService {
             .block_on(repository.list_recovery_candidates())
             .map_err(|error| format!("list orphan cleanup recovery candidates failed: {error}"))?
         {
+            let Some(attempt) = self.try_acquire_attempt(&operation.target)? else {
+                continue;
+            };
+            let (authority, validator) = self.attempt_authority(&attempt)?;
+            self.block_on(repository.adopt_authority_fenced(
+                operation.operation_id,
+                authority.clone(),
+                Arc::clone(&validator),
+            ))
+            .map_err(|error| format!("adopt orphan cleanup operation failed: {error}"))?;
             let result = (|| -> Result<(), String> {
                 let stored_plan = self
                     .block_on(repository.load_plan(operation.operation_id))
@@ -1287,9 +1342,12 @@ impl FrontendTableMaintenanceService {
                 let receipt = engine.reconcile_cleanup_batch(&session, prepared)?;
                 let resolved = cleanup_receipt_checkpoint(checkpoint, &receipt);
                 let operation = self
-                    .block_on(
-                        repository.checkpoint_reconciled_batch(operation.operation_id, resolved),
-                    )
+                    .block_on(repository.checkpoint_reconciled_batch_fenced(
+                        operation.operation_id,
+                        resolved,
+                        authority.clone(),
+                        Arc::clone(&validator),
+                    ))
                     .map_err(|error| {
                         format!("persist reconciled orphan cleanup receipt failed: {error}")
                     })?;
@@ -1297,12 +1355,15 @@ impl FrontendTableMaintenanceService {
                     return Err("orphan cleanup reconcile outcome remains unknown".to_string());
                 }
                 if operation.next_batch_ordinal == operation.batch_count.unwrap_or(0) {
-                    self.block_on(repository.finish(operation.operation_id, now_unix_millis()))
-                        .map_err(|error| {
-                            format!(
-                                "persist recovered orphan cleanup terminal state failed: {error}"
-                            )
-                        })?;
+                    self.block_on(repository.finish_fenced(
+                        operation.operation_id,
+                        now_unix_millis(),
+                        authority.clone(),
+                        Arc::clone(&validator),
+                    ))
+                    .map_err(|error| {
+                        format!("persist recovered orphan cleanup terminal state failed: {error}")
+                    })?;
                     if let Err(error) = engine.finalize_cleanup_terminal(&session) {
                         tracing::warn!(%error, operation_id = %operation.operation_id, "orphan cleanup recovered terminal artifact finalization failed");
                     }
@@ -1310,10 +1371,12 @@ impl FrontendTableMaintenanceService {
                 Ok(())
             })();
             if let Err(error) = result {
-                self.block_on(repository.mark_unresolved(
+                self.block_on(repository.mark_unresolved_fenced(
                     operation.operation_id,
                     error,
                     now_unix_millis(),
+                    authority,
+                    validator,
                 ))
                 .map_err(|store| {
                     format!("mark orphan cleanup operation unresolved failed: {store}")
