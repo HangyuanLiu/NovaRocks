@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::novarocks_config::config as novarocks_app_config;
 
 /// Debug and test switches are supplied by the process environment, not the
 /// application config.
@@ -68,29 +67,4 @@ pub fn debug_emit_connector_reader_marker() -> bool {
 
 pub(crate) fn sql_test_fragment_failure_harness_enabled() -> bool {
     std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
-}
-
-pub fn exchange_wait_ms() -> u64 {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.exchange_wait_ms)
-        .unwrap_or(120_000)
-}
-
-pub(crate) fn data_runtime_worker_threads() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.actual_data_runtime_threads())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        })
-}
-
-pub(crate) fn data_runtime_max_blocking_threads() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.data_runtime_max_blocking_threads.max(1))
-        .unwrap_or(64)
 }

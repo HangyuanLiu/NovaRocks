@@ -19,7 +19,6 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::runtime::{Handle, Runtime};
 
-use crate::common::config::{data_runtime_max_blocking_threads, data_runtime_worker_threads};
 use tracing::info;
 
 /// Worker thread stack size for Tokio runtimes that run SQL workloads.
@@ -36,11 +35,89 @@ pub const WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 const DATA_RUNTIME_THREAD_NAME: &str = "novarocks-data-runtime";
 static DATA_RUNTIME: OnceLock<Result<Arc<Runtime>, String>> = OnceLock::new();
+static DATA_RUNTIME_SIZING: OnceLock<DataRuntimeSizing> = OnceLock::new();
+
+/// Thread sizing for the process-wide data runtime.
+///
+/// The runtime itself is legitimately a process singleton — roughly fifty call
+/// sites across connector, engine and MV code reach it from places that have no
+/// composition-time value to receive. Its *sizing*, however, is configuration,
+/// so the composition root installs it rather than having the runtime reach for
+/// a config global at first use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataRuntimeSizing {
+    pub worker_threads: usize,
+    pub max_blocking_threads: usize,
+}
+
+impl DataRuntimeSizing {
+    /// Sizing used when no composition root installed one: unit tests and
+    /// embedded engine users that never read a config file.
+    pub fn machine_default() -> Self {
+        Self {
+            worker_threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            max_blocking_threads: 64,
+        }
+    }
+
+    fn normalized(self) -> Self {
+        Self {
+            worker_threads: self.worker_threads.max(1),
+            max_blocking_threads: self.max_blocking_threads.max(1),
+        }
+    }
+}
+
+/// Installs the configured data-runtime sizing.
+///
+/// The composition root must call this before anything touches
+/// [`data_runtime()`]. Installing the same sizing twice is accepted so that
+/// `role=all-in-one`, where the frontend and backend roots share one config,
+/// does not have to coordinate which of them installs.
+///
+/// Returns `Err` when the runtime was already built, because that means
+/// something reached [`data_runtime()`] during startup and the configured
+/// sizing was silently ignored. Startup should fail on that rather than run at
+/// the fallback size while the operator believes their config took effect.
+pub fn install_data_runtime_sizing(sizing: DataRuntimeSizing) -> Result<(), String> {
+    let sizing = sizing.normalized();
+    if let Err(_already_installed) = DATA_RUNTIME_SIZING.set(sizing) {
+        let installed = DATA_RUNTIME_SIZING
+            .get()
+            .copied()
+            .expect("sizing set failed, so one is installed");
+        return if installed == sizing {
+            Ok(())
+        } else {
+            Err(format!(
+                "data runtime sizing already installed as {installed:?}; refusing to replace it with {sizing:?}"
+            ))
+        };
+    }
+    if DATA_RUNTIME.get().is_some() {
+        return Err(format!(
+            "data runtime was built before {sizing:?} was installed; \
+             install_data_runtime_sizing must run before any data_runtime() use"
+        ));
+    }
+    Ok(())
+}
 
 pub fn data_runtime() -> Result<&'static Arc<Runtime>, String> {
     match DATA_RUNTIME.get_or_init(|| {
-        let worker_threads = data_runtime_worker_threads().max(1);
-        let max_blocking_threads = data_runtime_max_blocking_threads().max(1);
+        // Deliberately does not initialize `DATA_RUNTIME_SIZING`: leaving it
+        // unset is what lets a late `install_data_runtime_sizing` report that
+        // it lost the race instead of reporting a value conflict.
+        let DataRuntimeSizing {
+            worker_threads,
+            max_blocking_threads,
+        } = DATA_RUNTIME_SIZING
+            .get()
+            .copied()
+            .unwrap_or_else(DataRuntimeSizing::machine_default)
+            .normalized();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(worker_threads)
@@ -93,6 +170,24 @@ where
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn sizing_normalization_floors_both_thread_counts_at_one() {
+        let normalized = DataRuntimeSizing {
+            worker_threads: 0,
+            max_blocking_threads: 0,
+        }
+        .normalized();
+        assert_eq!(normalized.worker_threads, 1);
+        assert_eq!(normalized.max_blocking_threads, 1);
+    }
+
+    #[test]
+    fn machine_default_sizing_is_usable_without_a_config() {
+        let sizing = DataRuntimeSizing::machine_default();
+        assert!(sizing.worker_threads >= 1);
+        assert_eq!(sizing.max_blocking_threads, 64);
+    }
 
     #[test]
     fn data_runtime_is_singleton_across_threads() {

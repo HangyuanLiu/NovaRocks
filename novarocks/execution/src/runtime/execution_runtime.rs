@@ -21,6 +21,8 @@ pub struct ExecutionRuntimeConfig {
     pub spill_io_threads: usize,
     pub spill_io_queue_capacity: usize,
     pub spill_storage: ExecutionSpillStorageConfig,
+    /// How long an exchange source waits for its senders before failing.
+    pub exchange_wait_ms: u64,
     pub exchange_io_threads: usize,
     pub exchange_io_max_inflight_bytes: usize,
     pub exchange_max_transmit_batched_bytes: usize,
@@ -240,6 +242,7 @@ mod tests {
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: ExecutionSpillStorageConfig::default(),
+            exchange_wait_ms: 120_000,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
             exchange_max_transmit_batched_bytes: 1,

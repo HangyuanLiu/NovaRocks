@@ -20,6 +20,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::native::expression::NativeExpressionInputLayout;
 use novarocks::connector::ConnectorRegistry;
@@ -55,6 +56,8 @@ pub(crate) struct NativePlanDecodeContext {
     connector_cancellation: Option<Arc<dyn ConnectorCancellation>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
+    /// Exchange-source wait resolved from `[runtime]` at Backend startup.
+    exchange_wait: Duration,
 }
 
 impl Default for NativePlanDecodeContext {
@@ -69,6 +72,7 @@ impl Default for NativePlanDecodeContext {
             connector_cancellation: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
+            exchange_wait: Duration::from_millis(120_000),
         }
     }
 }
@@ -84,6 +88,7 @@ impl NativePlanDecodeContext {
         connector_cancellation: Arc<dyn ConnectorCancellation>,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
+        exchange_wait: Duration,
     ) -> Self {
         Self {
             exchange_inputs,
@@ -95,6 +100,7 @@ impl NativePlanDecodeContext {
             connector_cancellation: Some(connector_cancellation),
             query_id: Some(query_id),
             fragment_instance_id,
+            exchange_wait,
         }
     }
 
@@ -158,6 +164,10 @@ impl NativePlanDecodeContext {
     }
     pub(crate) fn query_id(&self) -> Option<QueryId> {
         self.query_id
+    }
+
+    pub(crate) fn exchange_wait(&self) -> Duration {
+        self.exchange_wait
     }
 
     pub(crate) fn fragment_instance_id(&self) -> FragmentInstanceId {

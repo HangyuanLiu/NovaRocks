@@ -92,6 +92,7 @@ impl NativeFragmentRequest {
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
         connectors: Arc<ConnectorRegistry>,
+        exchange_wait: std::time::Duration,
     ) -> Result<Self, NativeFragmentIngressError> {
         Self::try_decode_with_execution_resolver(
             execution_id,
@@ -100,6 +101,7 @@ impl NativeFragmentRequest {
             connectors,
             Arc::new(MissingExecutionResolver),
             Arc::new(NeverCancelled),
+            exchange_wait,
         )
     }
 
@@ -110,6 +112,7 @@ impl NativeFragmentRequest {
         connectors: Arc<ConnectorRegistry>,
         execution_resolver: Arc<dyn ConnectorExecutionResolver>,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
+        exchange_wait: std::time::Duration,
     ) -> Result<Self, NativeFragmentIngressError> {
         let instance = decode_instance_params(&instance_params)?;
         let decoded = decode_fragment_submission(
@@ -119,6 +122,7 @@ impl NativeFragmentRequest {
             connectors,
             execution_resolver,
             connector_cancellation,
+            exchange_wait,
         )
         .map_err(NativeFragmentIngressError::new)?;
         let (submission, backend_num) = decoded.into_parts();

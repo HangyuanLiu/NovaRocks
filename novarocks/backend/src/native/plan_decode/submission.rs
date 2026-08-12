@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::FieldPath;
@@ -69,6 +70,7 @@ pub(crate) fn decode_fragment_submission(
     connectors: Arc<ConnectorRegistry>,
     execution_resolver: Arc<dyn ConnectorExecutionResolver>,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
+    exchange_wait: Duration,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = require_root(fragment).map_err(NativeFragmentDecodeError::from)?;
@@ -104,6 +106,7 @@ pub(crate) fn decode_fragment_submission(
         connector_cancellation,
         instance.query_id,
         instance.fragment_instance_id,
+        exchange_wait,
     );
     let mut ledger = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
