@@ -411,4 +411,78 @@ mod tests {
         drop(lease);
         assert_eq!(gate.tracked_target_count(), 0);
     }
+
+    /// The process-local gate is a fairness and shutdown mechanism, not a
+    /// correctness one. Two frontends are two `MvActivityGate` instances, and
+    /// this pins that they do not arbitrate between each other: both admit the
+    /// same target concurrently.
+    ///
+    /// This is the property that makes a durable per-target lease necessary
+    /// rather than merely tidy. If this test ever fails, someone has started
+    /// treating the gate as cluster-wide, and the lease would look redundant.
+    ///
+    /// Design: ADR-0065 (docs/adr/ADR-0065-mv-refresh-ownership-fencing.md)
+    #[test]
+    fn separate_gates_do_not_arbitrate_between_frontends() {
+        let target = CanonicalMvTarget::from_parts(Some("ice"), "sales", "daily");
+
+        // One gate serializes its own owners for the same target.
+        let first_frontend = MvActivityGate::new();
+        let mut ticket = first_frontend
+            .request(target.clone(), MvActivityOwner::ManualRefresh)
+            .expect("first admission");
+        let held = ticket
+            .try_acquire()
+            .expect("gate open")
+            .expect("first owner acquires immediately");
+
+        let mut contender = first_frontend
+            .request(target.clone(), MvActivityOwner::ScheduledRefresh)
+            .expect("second admission");
+        assert!(
+            contender.try_acquire().expect("gate open").is_none(),
+            "within one frontend the gate must serialize the same target"
+        );
+
+        // A second frontend's gate knows nothing about the first one's lease and
+        // admits the same target right away.
+        let second_frontend = MvActivityGate::new();
+        let mut other = second_frontend
+            .request(target, MvActivityOwner::ScheduledRefresh)
+            .expect("second frontend admission");
+        assert!(
+            other.try_acquire().expect("gate open").is_some(),
+            "a process-local gate cannot arbitrate across frontends -- this is why \
+             refresh ownership needs a durable per-target lease"
+        );
+
+        drop(held);
+    }
+
+    /// Clearing local gate state must not change what is safe, only what this
+    /// frontend happens to be tracking.
+    #[test]
+    fn dropping_local_gate_state_does_not_confer_ownership() {
+        let target = CanonicalMvTarget::from_parts(Some("ice"), "sales", "daily");
+        let gate = MvActivityGate::new();
+
+        let mut ticket = gate
+            .request(target.clone(), MvActivityOwner::ManualRefresh)
+            .expect("admission");
+        let lease = ticket.try_acquire().expect("gate open").expect("acquired");
+        assert_eq!(gate.tracked_target_count(), 1);
+
+        // Releasing the local lease frees local capacity and nothing else. The
+        // gate never held a durable claim to give up.
+        drop(lease);
+        assert_eq!(gate.tracked_target_count(), 0);
+
+        let mut again = gate
+            .request(target, MvActivityOwner::ScheduledRefresh)
+            .expect("admission after release");
+        assert!(
+            again.try_acquire().expect("gate open").is_some(),
+            "local capacity returns immediately, which is exactly why it proves nothing about ownership"
+        );
+    }
 }
