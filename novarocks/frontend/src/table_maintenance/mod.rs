@@ -1487,7 +1487,11 @@ impl FrontendTableMaintenanceService {
                 operation.plan_digest,
                 Some(operation.base_state_digest),
                 rewrite_dispatch_facts(operation.state),
-                Vec::new(),
+                // Every cohort attempt recorded the provider artifact it
+                // produced. Those handles are the only durable trace of what
+                // the dead generation staged, so the inspector gets all of
+                // them rather than being asked to rediscover the work.
+                rewrite_attempt_artifacts(self, repository, operation.operation_id)?,
                 attempt.attempt_id(),
             )
             .and_then(|descriptor| {
@@ -2114,6 +2118,33 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         *worker = WorkerLifecycle::Stopped(result.clone());
         result
     }
+}
+
+/// Load every cohort attempt artifact a rewrite recorded.
+fn rewrite_attempt_artifacts(
+    service: &FrontendTableMaintenanceService,
+    repository: &Arc<DistributedRewriteOperationRepository>,
+    operation_id: uuid::Uuid,
+) -> Result<Vec<ConnectorHistoricalMaintenanceArtifact>, String> {
+    let attempts = service
+        .block_on(repository.load_attempts(operation_id))
+        .map_err(|error| format!("load distributed rewrite recovery attempts failed: {error}"))?;
+    let mut artifacts = Vec::with_capacity(attempts.len());
+    for attempt in attempts {
+        if attempt.artifact_handle.is_empty() {
+            continue;
+        }
+        artifacts.push(
+            ConnectorHistoricalMaintenanceArtifact::try_new(
+                "distributed-rewrite-attempt",
+                bytes::Bytes::from(attempt.artifact_handle),
+            )
+            .map_err(|error| {
+                format!("build distributed rewrite recovery artifact failed: {error}")
+            })?,
+        );
+    }
+    Ok(artifacts)
 }
 
 /// The provider's own name for a distributed rewrite operation.
