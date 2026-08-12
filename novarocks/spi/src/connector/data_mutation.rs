@@ -552,16 +552,28 @@ impl fmt::Debug for ConnectorDataMutationPlan {
 #[derive(Clone)]
 pub struct ConnectorDataMutationExecuteRequest {
     pub plan: ConnectorDataMutationPlan,
+    /// How this direct mutation is fenced.
+    ///
+    /// Direct mutation reuses the distributed-write fence value rather than
+    /// defining a second one: TRUNCATE and ADD FILES change the same external
+    /// table truth, so they need the same linearization point, not a parallel
+    /// mechanism with its own ordering rules.
+    pub fence: super::ConnectorWriteFencing,
     pub context: ConnectorRequestContext,
 }
 
 impl ConnectorDataMutationExecuteRequest {
     pub fn try_new(
         plan: ConnectorDataMutationPlan,
+        fence: super::ConnectorWriteFencing,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         plan.validate()?;
-        Ok(Self { plan, context })
+        Ok(Self {
+            plan,
+            fence,
+            context,
+        })
     }
 }
 

@@ -173,6 +173,7 @@ trait IcebergDataMutationBackend: Send + Sync {
         &self,
         planned: &PlannedIcebergMutation,
         marker: &IcebergDataMutationMarkerV1,
+        fencing: &novarocks_spi::connector::ConnectorWriteFencing,
     ) -> Result<CommitOutcome, CommitServiceError>;
 
     fn lookup_marker(
@@ -330,6 +331,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         &self,
         planned: &PlannedIcebergMutation,
         marker: &IcebergDataMutationMarkerV1,
+        fencing: &novarocks_spi::connector::ConnectorWriteFencing,
     ) -> Result<CommitOutcome, CommitServiceError> {
         let payload = planned.payload();
         let table = self
@@ -413,6 +415,27 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 );
             }
         }
+        // Derive this attempt's fence assertion from external truth, the same
+        // way the row-DML commit path does: re-observing the fence ref is what
+        // lets a superseded attempt fail closed before it stages anything.
+        let fence_assertion = match fencing.fence() {
+            Some(spi_fence) => {
+                let facts = crate::commit::write_fence::fence_facts_from_spi(spi_fence);
+                Some(
+                    crate::commit::write_fence::derive_established_assertion(
+                        table.metadata(),
+                        &facts,
+                    )
+                    .map_err(|error| {
+                        connector_error_as_pre_dispatch(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            error.to_string(),
+                        ))
+                    })?,
+                )
+            }
+            None => None,
+        };
         let catalog = Arc::clone(self.runtime.catalog());
         ensure_hadoop_registration(&self.runtime, &table)
             .map_err(connector_error_as_pre_dispatch)?;
@@ -443,7 +466,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     target_ref,
                     snapshot_properties,
                     atomic_partition_replacement: None,
-                    fence: None,
+                    // A fenced direct mutation asserts its marker in the same
+                    // atomic catalog update as the write; an exempt one carries
+                    // no assertion and `run` refuses any op kind that could not
+                    // assert it anyway.
+                    fence: fence_assertion.clone(),
                 })
                 .await
             })
@@ -832,39 +859,44 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 ),
                 evidence: self.evidence(&request.plan, cached.private.payload())?,
             },
-            MarkerLookup::Missing => match self.backend.execute(&cached.private, &marker) {
-                Ok(commit) => self.committed(
-                    &request.plan,
-                    commit.new_snapshot_id,
-                    ExternalMutationFinalization::Complete,
-                )?,
-                Err(CommitServiceError::KnownUncommitted { message, .. })
-                | Err(CommitServiceError::InvalidInput { message }) => {
-                    ExternalMutationOutcome::KnownUncommitted {
-                        failure: failure(ConnectorMutationFailureKind::Conflict, message),
+            MarkerLookup::Missing => {
+                match self
+                    .backend
+                    .execute(&cached.private, &marker, &request.fence)
+                {
+                    Ok(commit) => self.committed(
+                        &request.plan,
+                        commit.new_snapshot_id,
+                        ExternalMutationFinalization::Complete,
+                    )?,
+                    Err(CommitServiceError::KnownUncommitted { message, .. })
+                    | Err(CommitServiceError::InvalidInput { message }) => {
+                        ExternalMutationOutcome::KnownUncommitted {
+                            failure: failure(ConnectorMutationFailureKind::Conflict, message),
+                        }
                     }
-                }
-                Err(CommitServiceError::Unknown { message, .. }) => {
-                    ExternalMutationOutcome::CommitUnknown {
-                        failure: failure(ConnectorMutationFailureKind::Unavailable, message),
-                        evidence: self.evidence(&request.plan, cached.private.payload())?,
+                    Err(CommitServiceError::Unknown { message, .. }) => {
+                        ExternalMutationOutcome::CommitUnknown {
+                            failure: failure(ConnectorMutationFailureKind::Unavailable, message),
+                            evidence: self.evidence(&request.plan, cached.private.payload())?,
+                        }
                     }
-                }
-                Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                    outcome,
-                    finalize_error,
-                    ..
-                }) => self.committed(
-                    &request.plan,
-                    outcome
-                        .map(|outcome| outcome.new_snapshot_id)
-                        .unwrap_or_default(),
-                    ExternalMutationFinalization::Failed(failure(
-                        ConnectorMutationFailureKind::Internal,
+                    Err(CommitServiceError::FinalizeFailedKnownCommitted {
+                        outcome,
                         finalize_error,
-                    )),
-                )?,
-            },
+                        ..
+                    }) => self.committed(
+                        &request.plan,
+                        outcome
+                            .map(|outcome| outcome.new_snapshot_id)
+                            .unwrap_or_default(),
+                        ExternalMutationFinalization::Failed(failure(
+                            ConnectorMutationFailureKind::Internal,
+                            finalize_error,
+                        )),
+                    )?,
+                }
+            }
         };
         self.terminal
             .lock()
@@ -1347,6 +1379,7 @@ mod tests {
             &self,
             planned: &PlannedIcebergMutation,
             _marker: &IcebergDataMutationMarkerV1,
+            _fencing: &novarocks_spi::connector::ConnectorWriteFencing,
         ) -> Result<CommitOutcome, CommitServiceError> {
             self.execute_count.fetch_add(1, Ordering::SeqCst);
             Err(CommitServiceError::unknown(
@@ -1518,8 +1551,14 @@ mod tests {
         )
         .expect("planning request");
         let plan = adapter.plan_mutation(planning).expect("plan truncate");
-        let request = ConnectorDataMutationExecuteRequest::try_new(plan, table_context())
-            .expect("execute request");
+        let request = ConnectorDataMutationExecuteRequest::try_new(
+            plan,
+            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
+                reason: "test does not exercise direct-mutation fencing",
+            },
+            table_context(),
+        )
+        .expect("execute request");
         let first = adapter.execute(request.clone()).expect("execute truncate");
         let replay = adapter.execute(request).expect("replay truncate");
         assert!(matches!(
@@ -1693,8 +1732,14 @@ mod tests {
                 "main",
             ))
             .expect("plan");
-        let execute = ConnectorDataMutationExecuteRequest::try_new(plan.clone(), test_context())
-            .expect("execute");
+        let execute = ConnectorDataMutationExecuteRequest::try_new(
+            plan.clone(),
+            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
+                reason: "test does not exercise direct-mutation fencing",
+            },
+            test_context(),
+        )
+        .expect("execute");
         let first = adapter.execute(execute.clone()).expect("unknown");
         let evidence = match first {
             ExternalMutationOutcome::CommitUnknown { evidence, .. } => evidence,
@@ -1731,8 +1776,14 @@ mod tests {
                 "main",
             ))
             .expect("plan");
-        let execute = ConnectorDataMutationExecuteRequest::try_new(plan.clone(), test_context())
-            .expect("execute");
+        let execute = ConnectorDataMutationExecuteRequest::try_new(
+            plan.clone(),
+            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
+                reason: "test does not exercise direct-mutation fencing",
+            },
+            test_context(),
+        )
+        .expect("execute");
         let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
             adapter.execute(execute).expect("unknown")
         else {
