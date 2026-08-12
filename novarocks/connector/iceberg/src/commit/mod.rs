@@ -29,6 +29,7 @@ pub mod equality_delete_writer;
 mod fast_append;
 pub mod frozen_write;
 mod helpers;
+pub mod mv_attempt_scan;
 pub mod mv_provenance;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
@@ -64,6 +65,10 @@ mod write_shared;
 
 pub use abort::{AbortLog, CleanupError};
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
+pub use mv_attempt_scan::{
+    AttemptScanPage, ObservedAttemptRef, ScannedAttempt, UnclaimableAttemptRef, UnclaimableReason,
+    scan_attempt_page,
+};
 pub use mv_provenance::{
     MV_PROVENANCE_V1_PROP, MV_PROVENANCE_V2_PROP, MV_PROVENANCE_V2_VERSION, MV_PROVENANCE_VERSION,
     MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1, MvProvenanceV2, MvPublicationV2Identity,
