@@ -1,0 +1,1407 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Provider-owned `ConnectorWriteControl::activate_row_mutation`.
+//!
+//! Materializes the provider-owned route graph after a durable operation has
+//! retained the exact write lease. This is deliberately not a call to
+//! `prepare_write`: route preparation is derived from the sealed row-mutation
+//! contract and every physical choice stays inside the Iceberg provider.
+
+use std::collections::BTreeMap;
+use std::time::Instant;
+
+use arrow::array::{Array, Int8Array, Int64Array, StringArray};
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
+
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorMutationRouteInput,
+    ConnectorMutationTargetField, ConnectorRowMutationActivationRequest,
+    ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
+    ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparation, ConnectorRowMutationRoute,
+    ConnectorRowMutationSelection, ConnectorRowMutationStrategy, ConnectorSealedWriteCohortSet,
+    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteFieldBinding,
+    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWritePreparation, ConnectorWriteRouteId,
+};
+
+use crate::control_provider::IcebergTablePayload;
+use crate::file_reader::execution_payload::decode_payload;
+use crate::iceberg::spec::TableMetadata;
+use crate::row_lineage_synth::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
+use crate::row_mutation_payload::encode_cow_recipe;
+
+/// Materialize the Provider-owned route graph after a durable operation has
+/// retained the exact write lease.  This is deliberately not a call to
+/// `prepare_write`: route preparation is derived from the sealed row-mutation
+/// contract and every physical choice remains inside the Iceberg provider.
+pub(crate) fn activate_row_mutation(
+    request: ConnectorRowMutationActivationRequest,
+    owner: &ConnectorExecutionBindingKey,
+) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
+    request.validate(owner)?;
+    if request.context().cancellation().is_cancelled() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "Iceberg row-mutation activation was cancelled before Provider planning",
+        ));
+    }
+    if Instant::now() >= request.context().deadline() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "Iceberg row-mutation activation deadline elapsed before Provider planning",
+        ));
+    }
+    let preparation = request.preparation().clone();
+    match request {
+        ConnectorRowMutationActivationRequest::Direct { .. } => {
+            activate_iceberg_direct_row_mutation(&preparation)
+        }
+        ConnectorRowMutationActivationRequest::CopyOnWrite { selection, .. } => {
+            activate_iceberg_cow_row_mutation(&preparation, &selection)
+        }
+    }
+}
+
+fn activate_iceberg_direct_row_mutation(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
+    let primary = ConnectorWriteCohortId::primary(preparation.operation_id());
+    let mut routes = Vec::new();
+    match preparation.strategy() {
+        ConnectorRowMutationStrategy::PositionDelete
+        | ConnectorRowMutationStrategy::DeletionVector => {
+            let effects = admitted_effects(preparation, &[ConnectorRowMutationEffect::Delete]);
+            if effects.is_empty() {
+                return Err(invalid_iceberg_row_mutation_activation(
+                    "Iceberg position-delete strategy cannot implement the admitted logical effects",
+                ));
+            }
+            let input = iceberg_position_input(preparation)?;
+            routes.push(iceberg_row_mutation_route(
+                preparation,
+                primary,
+                b"direct-position-delete",
+                effects,
+                input,
+                iceberg_position_partition_tokens(preparation)?,
+            )?);
+        }
+        ConnectorRowMutationStrategy::EqualityDelete => {
+            let effects = admitted_effects(preparation, &[ConnectorRowMutationEffect::Delete]);
+            if effects.is_empty() {
+                return Err(invalid_iceberg_row_mutation_activation(
+                    "Iceberg equality-delete strategy cannot implement the admitted logical effects",
+                ));
+            }
+            let input = ConnectorWriteInputShape::EqualityDelete {
+                equality_fields: target_bindings(preparation.match_contract().before_fields()),
+            };
+            routes.push(iceberg_row_mutation_route(
+                preparation,
+                primary,
+                b"direct-equality-delete",
+                effects,
+                input,
+                Vec::new(),
+            )?);
+        }
+        ConnectorRowMutationStrategy::MergeOnRead => {
+            // A Replace reaches both routes.  The delete route consumes its
+            // before-image identity while the data route consumes its
+            // after-image values; neither route learns the other's physical
+            // Iceberg policy.
+            let delete_effects = admitted_effects(
+                preparation,
+                &[
+                    ConnectorRowMutationEffect::Delete,
+                    ConnectorRowMutationEffect::Replace,
+                ],
+            );
+            if !delete_effects.is_empty() {
+                routes.push(iceberg_row_mutation_route(
+                    preparation,
+                    iceberg_row_mutation_direct_cohort(preparation, b"mor-delete")?,
+                    b"mor-delete",
+                    delete_effects,
+                    iceberg_mor_delete_input(preparation)?,
+                    iceberg_position_partition_tokens(preparation)?,
+                )?);
+            }
+            let replacement_effects =
+                admitted_effects(preparation, &[ConnectorRowMutationEffect::Replace]);
+            if !replacement_effects.is_empty() {
+                routes.push(iceberg_row_mutation_route(
+                    preparation,
+                    iceberg_row_mutation_direct_cohort(preparation, b"mor-replacement")?,
+                    b"mor-replacement",
+                    replacement_effects,
+                    iceberg_cow_rewrite_input(preparation)?,
+                    Vec::new(),
+                )?);
+            }
+            let insert_effects =
+                admitted_effects(preparation, &[ConnectorRowMutationEffect::Insert]);
+            if !insert_effects.is_empty() {
+                routes.push(iceberg_row_mutation_route(
+                    preparation,
+                    iceberg_row_mutation_direct_cohort(preparation, b"mor-insert")?,
+                    b"mor-insert",
+                    insert_effects,
+                    ConnectorWriteInputShape::Data {
+                        fields: target_bindings(preparation.match_contract().after_fields()),
+                    },
+                    Vec::new(),
+                )?);
+            }
+        }
+        ConnectorRowMutationStrategy::CopyOnWrite => {
+            return Err(invalid_iceberg_row_mutation_activation(
+                "Iceberg Copy-on-Write activation requires the bounded match selection",
+            ));
+        }
+    }
+    ConnectorRowMutationExecutionPlan::try_direct(preparation.clone(), routes)
+}
+
+fn activate_iceberg_cow_row_mutation(
+    preparation: &ConnectorRowMutationPreparation,
+    selection: &ConnectorRowMutationSelection,
+) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
+    if preparation.strategy() != ConnectorRowMutationStrategy::CopyOnWrite {
+        return Err(invalid_iceberg_row_mutation_activation(
+            "only an Iceberg Copy-on-Write preparation accepts a bounded selection",
+        ));
+    }
+    selection.validate()?;
+    let (rewrite_rows, has_append) = iceberg_cow_selection_groups(preparation, selection)?;
+    let mut routes = Vec::new();
+    let mut descriptors = Vec::new();
+    let mut recipes = Vec::new();
+    // A COW rewrite re-emits every live row from an old data file.  Preserve
+    // the row lineage alongside the replacement data so the writer retains
+    // the stable row-id and sequence-number semantics of the rewritten file.
+    let rewrite_preparation = ConnectorWritePreparation::try_new(
+        preparation.owner().clone(),
+        preparation.table().clone(),
+        preparation.target_ref().clone(),
+        ConnectorWriteIntent::RowDelta,
+        preparation.base_version().clone(),
+        iceberg_cow_rewrite_input(preparation)?,
+        iceberg_row_mutation_route_payload(preparation, b"cow-rewrite"),
+    )?;
+    for (old_file, row_ids) in rewrite_rows {
+        let old_file_digest: [u8; 32] = Sha256::digest(old_file.as_bytes()).into();
+        let cohort_id = ConnectorWriteCohortId::derive(
+            preparation.operation_id(),
+            b"iceberg-cow-rewrite",
+            old_file_digest,
+        )?;
+        let route = iceberg_row_mutation_route_with_preparation(
+            preparation,
+            cohort_id,
+            b"cow-rewrite",
+            admitted_effects(
+                preparation,
+                &[
+                    ConnectorRowMutationEffect::Delete,
+                    ConnectorRowMutationEffect::Replace,
+                ],
+            ),
+            rewrite_preparation.clone(),
+            Vec::new(),
+        )?;
+        let route_id = route.route_id();
+        descriptors.push(ConnectorWriteCohortDescriptor::new(
+            cohort_id,
+            ConnectorWriteIntent::RowDelta,
+            rewrite_preparation.digest(),
+        ));
+        recipes.push(ConnectorRowMutationCohortRecipe::try_new(
+            cohort_id,
+            route_id,
+            iceberg_cow_recipe_payload(b"rewrite", &old_file, &row_ids)?,
+        )?);
+        routes.push(route);
+    }
+    if has_append {
+        let append_digest: [u8; 32] = Sha256::digest(b"iceberg-cow-append").into();
+        let cohort_id = ConnectorWriteCohortId::derive(
+            preparation.operation_id(),
+            b"iceberg-cow-append",
+            append_digest,
+        )?;
+        let append_preparation = ConnectorWritePreparation::try_new(
+            preparation.owner().clone(),
+            preparation.table().clone(),
+            preparation.target_ref().clone(),
+            ConnectorWriteIntent::Append,
+            preparation.base_version().clone(),
+            ConnectorWriteInputShape::Data {
+                fields: target_bindings(preparation.match_contract().after_fields()),
+            },
+            iceberg_row_mutation_route_payload(preparation, b"cow-append"),
+        )?;
+        let route = iceberg_row_mutation_route_with_preparation(
+            preparation,
+            cohort_id,
+            b"cow-append",
+            admitted_effects(preparation, &[ConnectorRowMutationEffect::Insert]),
+            append_preparation.clone(),
+            Vec::new(),
+        )?;
+        let route_id = route.route_id();
+        descriptors.push(ConnectorWriteCohortDescriptor::new(
+            cohort_id,
+            ConnectorWriteIntent::Append,
+            append_preparation.digest(),
+        ));
+        recipes.push(ConnectorRowMutationCohortRecipe::try_new(
+            cohort_id,
+            route_id,
+            iceberg_cow_recipe_payload(b"append", "", &[])?,
+        )?);
+        routes.push(route);
+    }
+    let sealed = ConnectorSealedWriteCohortSet::try_new(preparation.operation_id(), descriptors)?;
+    ConnectorRowMutationExecutionPlan::try_copy_on_write(
+        preparation.clone(),
+        routes,
+        sealed,
+        recipes,
+    )
+}
+
+fn admitted_effects(
+    preparation: &ConnectorRowMutationPreparation,
+    candidates: &[ConnectorRowMutationEffect],
+) -> Vec<ConnectorRowMutationEffect> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|effect| preparation.intent().accepts(*effect))
+        .collect()
+}
+
+fn iceberg_row_mutation_route(
+    preparation: &ConnectorRowMutationPreparation,
+    cohort_id: ConnectorWriteCohortId,
+    route_kind: &[u8],
+    effects: Vec<ConnectorRowMutationEffect>,
+    input: ConnectorWriteInputShape,
+    partition_fields: Vec<ConnectorWriteFieldToken>,
+) -> Result<ConnectorRowMutationRoute, ConnectorError> {
+    let route_preparation = ConnectorWritePreparation::try_new(
+        preparation.owner().clone(),
+        preparation.table().clone(),
+        preparation.target_ref().clone(),
+        ConnectorWriteIntent::RowDelta,
+        preparation.base_version().clone(),
+        input,
+        iceberg_row_mutation_route_payload(preparation, route_kind),
+    )?;
+    iceberg_row_mutation_route_with_preparation(
+        preparation,
+        cohort_id,
+        route_kind,
+        effects,
+        route_preparation,
+        partition_fields,
+    )
+}
+
+fn iceberg_row_mutation_route_with_preparation(
+    preparation: &ConnectorRowMutationPreparation,
+    cohort_id: ConnectorWriteCohortId,
+    route_kind: &[u8],
+    effects: Vec<ConnectorRowMutationEffect>,
+    route_preparation: ConnectorWritePreparation,
+    partition_fields: Vec<ConnectorWriteFieldToken>,
+) -> Result<ConnectorRowMutationRoute, ConnectorError> {
+    if effects.is_empty() {
+        return Err(invalid_iceberg_row_mutation_activation(
+            "Iceberg row-mutation route has no admitted logical effects",
+        ));
+    }
+    let route_id = iceberg_row_mutation_route_id(preparation, cohort_id, route_kind);
+    let input_ordinals = route_preparation
+        .input()
+        .fields()
+        .into_iter()
+        .map(|binding| {
+            row_mutation_input_ordinal(preparation, binding.token())
+                .map(|ordinal| ConnectorMutationRouteInput::new(binding.token(), ordinal))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ConnectorRowMutationRoute::try_new(
+        route_id,
+        cohort_id,
+        effects,
+        route_preparation.input().clone(),
+        input_ordinals,
+        partition_fields,
+        route_preparation,
+    )
+}
+
+fn iceberg_row_mutation_route_id(
+    preparation: &ConnectorRowMutationPreparation,
+    cohort_id: ConnectorWriteCohortId,
+    route_kind: &[u8],
+) -> ConnectorWriteRouteId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.row-mutation-route.v1\0");
+    hasher.update(preparation.operation_id().to_bytes());
+    hasher.update(preparation.digest());
+    hasher.update(cohort_id.to_bytes());
+    hasher.update((route_kind.len() as u64).to_be_bytes());
+    hasher.update(route_kind);
+    ConnectorWriteRouteId::from_bytes(hasher.finalize().into())
+}
+
+fn iceberg_row_mutation_direct_cohort(
+    preparation: &ConnectorRowMutationPreparation,
+    route_kind: &[u8],
+) -> Result<ConnectorWriteCohortId, ConnectorError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.row-mutation-direct-cohort.v1\0");
+    hasher.update(preparation.digest());
+    hasher.update((route_kind.len() as u64).to_be_bytes());
+    hasher.update(route_kind);
+    ConnectorWriteCohortId::derive(
+        preparation.operation_id(),
+        b"iceberg-row-mutation-direct",
+        hasher.finalize().into(),
+    )
+}
+
+fn iceberg_row_mutation_route_payload(
+    preparation: &ConnectorRowMutationPreparation,
+    route_kind: &[u8],
+) -> Bytes {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.row-mutation-route-payload.v1\0");
+    hasher.update(preparation.operation_id().to_bytes());
+    hasher.update(preparation.digest());
+    hasher.update((route_kind.len() as u64).to_be_bytes());
+    hasher.update(route_kind);
+    Bytes::from(format!(
+        "iceberg/row-mutation-route/v1/{}",
+        lowercase_hex(hasher.finalize())
+    ))
+}
+
+/// Provider-private lowercase hex. Byte-for-byte identical to `hex::encode`,
+/// which the legacy Core implementation used; this crate deliberately does not
+/// take a dependency for a bounded 32-byte digest.
+fn lowercase_hex(value: impl AsRef<[u8]>) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let value = value.as_ref();
+    let mut output = String::with_capacity(value.len() * 2);
+    for byte in value {
+        output.push(DIGITS[usize::from(byte >> 4)] as char);
+        output.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+fn iceberg_cow_recipe_payload(
+    role: &[u8],
+    old_file: &str,
+    row_ids: &[i64],
+) -> Result<Bytes, ConnectorError> {
+    encode_cow_recipe(role, old_file, row_ids).map_err(invalid_iceberg_row_mutation_activation)
+}
+
+fn target_bindings(fields: &[ConnectorMutationTargetField]) -> Vec<ConnectorWriteFieldBinding> {
+    fields
+        .iter()
+        .map(|field| ConnectorWriteFieldBinding::new(field.token(), field.field().clone()))
+        .collect()
+}
+
+fn iceberg_cow_rewrite_input(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<ConnectorWriteInputShape, ConnectorError> {
+    let contract = preparation.match_contract();
+    let lineage = [ICEBERG_ROW_ID_COL, ICEBERG_LAST_UPDATED_SEQ_COL]
+        .into_iter()
+        .map(|name| {
+            contract
+                .identity_fields()
+                .iter()
+                .find(|field| field.field().name().eq_ignore_ascii_case(name))
+                .map(|field| ConnectorWriteFieldBinding::new(field.token(), field.field().clone()))
+                .ok_or_else(|| {
+                    invalid_iceberg_row_mutation_activation(format!(
+                        "Iceberg COW identity lacks `{name}`"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ConnectorWriteInputShape::RowLineage {
+        data_fields: target_bindings(contract.after_fields()),
+        row_identity_fields: lineage,
+    })
+}
+
+fn iceberg_position_input(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<ConnectorWriteInputShape, ConnectorError> {
+    let contract = preparation.match_contract();
+    let file = contract
+        .identity_fields()
+        .iter()
+        .find(|field| field.field().name().eq_ignore_ascii_case("_file"))
+        .ok_or_else(|| {
+            invalid_iceberg_row_mutation_activation("Iceberg row identity lacks `_file`")
+        })?;
+    let pos = contract
+        .identity_fields()
+        .iter()
+        .find(|field| field.field().name().eq_ignore_ascii_case("_pos"))
+        .ok_or_else(|| {
+            invalid_iceberg_row_mutation_activation("Iceberg row identity lacks `_pos`")
+        })?;
+    let partition_source_fields = iceberg_position_partition_bindings(preparation)?;
+    Ok(match preparation.strategy() {
+        ConnectorRowMutationStrategy::DeletionVector => ConnectorWriteInputShape::DeletionVector {
+            identity_fields: vec![
+                ConnectorWriteFieldBinding::new(
+                    file.token(),
+                    file.field().clone().with_nullable(false),
+                ),
+                ConnectorWriteFieldBinding::new(
+                    pos.token(),
+                    pos.field().clone().with_nullable(false),
+                ),
+            ],
+            partition_source_fields,
+        },
+        _ => ConnectorWriteInputShape::PositionDelete {
+            identity_fields: vec![
+                ConnectorWriteFieldBinding::new(
+                    file.token(),
+                    file.field().clone().with_nullable(false),
+                ),
+                ConnectorWriteFieldBinding::new(
+                    pos.token(),
+                    pos.field().clone().with_nullable(false),
+                ),
+            ],
+            partition_source_fields,
+        },
+    })
+}
+
+fn iceberg_mor_delete_input(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<ConnectorWriteInputShape, ConnectorError> {
+    // MOR is admitted only for Iceberg v3 row-lineage tables.  Its delete
+    // half therefore uses the v3 deletion-vector writer, while its data half
+    // remains an ordinary row-lineage append route.
+    match iceberg_position_input(preparation)? {
+        ConnectorWriteInputShape::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        } => Ok(ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        }),
+        input @ ConnectorWriteInputShape::DeletionVector { .. } => Ok(input),
+        _ => Err(invalid_iceberg_row_mutation_activation(
+            "Iceberg MOR delete route did not derive a position identity input",
+        )),
+    }
+}
+
+fn iceberg_position_partition_bindings(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<Vec<ConnectorWriteFieldBinding>, ConnectorError> {
+    let payload: IcebergTablePayload = decode_payload(
+        preparation.table().payload(),
+        "admitted Iceberg row-mutation table",
+    )?;
+    let table = payload.table_info.ok_or_else(|| {
+        invalid_iceberg_row_mutation_activation(
+            "admitted Iceberg row-mutation table is missing frozen metadata",
+        )
+    })?;
+    let metadata: TableMetadata =
+        serde_json::from_str(table.serialized_metadata.as_deref().ok_or_else(|| {
+            invalid_iceberg_row_mutation_activation(
+                "admitted Iceberg row-mutation table has no serialized metadata",
+            )
+        })?)
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode admitted Iceberg row-mutation metadata: {error}"),
+            )
+        })?;
+    metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .map(|partition| {
+            let source = metadata
+                .current_schema()
+                .field_by_id(partition.source_id)
+                .ok_or_else(|| {
+                    invalid_iceberg_row_mutation_activation(
+                        "Iceberg partition source is absent from the frozen schema",
+                    )
+                })?;
+            let field = preparation
+                .match_contract()
+                .before_fields()
+                .iter()
+                .find(|field| field.field().name().eq_ignore_ascii_case(&source.name))
+                .ok_or_else(|| {
+                    invalid_iceberg_row_mutation_activation(
+                        "Iceberg match contract is missing a partition source before-field",
+                    )
+                })?;
+            Ok(ConnectorWriteFieldBinding::new(
+                field.token(),
+                field.field().clone(),
+            ))
+        })
+        .collect()
+}
+
+fn iceberg_position_partition_tokens(
+    preparation: &ConnectorRowMutationPreparation,
+) -> Result<Vec<ConnectorWriteFieldToken>, ConnectorError> {
+    iceberg_position_partition_bindings(preparation).map(|bindings| {
+        bindings
+            .into_iter()
+            .map(|binding| binding.token())
+            .collect()
+    })
+}
+
+fn row_mutation_input_ordinal(
+    preparation: &ConnectorRowMutationPreparation,
+    token: ConnectorWriteFieldToken,
+) -> Result<u32, ConnectorError> {
+    let contract = preparation.match_contract();
+    if let Some(field) = contract
+        .identity_fields()
+        .iter()
+        .find(|field| field.token() == token)
+    {
+        return Ok(field.source_ordinal());
+    }
+    if let Some(field) = contract
+        .before_fields()
+        .iter()
+        .chain(contract.after_fields())
+        .find(|field| field.token() == token)
+    {
+        return Ok(field.target_ordinal());
+    }
+    Err(invalid_iceberg_row_mutation_activation(
+        "Iceberg route input token is foreign to its signed match contract",
+    ))
+}
+
+fn iceberg_cow_selection_groups(
+    preparation: &ConnectorRowMutationPreparation,
+    selection: &ConnectorRowMutationSelection,
+) -> Result<(BTreeMap<String, Vec<i64>>, bool), ConnectorError> {
+    let contract = preparation.match_contract();
+    let file_ordinal = contract
+        .identity_fields()
+        .iter()
+        .find(|field| field.field().name().eq_ignore_ascii_case("_file"))
+        .map(|field| field.source_ordinal() as usize)
+        .ok_or_else(|| {
+            invalid_iceberg_row_mutation_activation("Iceberg COW identity lacks `_file`")
+        })?;
+    let row_id_ordinal = contract
+        .identity_fields()
+        .iter()
+        .find(|field| field.field().name().eq_ignore_ascii_case("_row_id"))
+        .map(|field| field.source_ordinal() as usize)
+        .ok_or_else(|| {
+            invalid_iceberg_row_mutation_activation("Iceberg COW identity lacks `_row_id`")
+        })?;
+    let effect_ordinal = contract.effect_field().target_ordinal() as usize;
+    let mut grouped = BTreeMap::<String, Vec<i64>>::new();
+    let mut has_append = false;
+    for batch in selection.batches() {
+        let effects = batch
+            .column(effect_ordinal)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| {
+                invalid_iceberg_row_mutation_activation("Iceberg COW effect field is not Int8")
+            })?;
+        let files = batch
+            .column(file_ordinal)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                invalid_iceberg_row_mutation_activation("Iceberg COW `_file` identity is not UTF-8")
+            })?;
+        let row_ids = batch
+            .column(row_id_ordinal)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                invalid_iceberg_row_mutation_activation(
+                    "Iceberg COW `_row_id` identity is not INT64",
+                )
+            })?;
+        if effects.null_count() != 0 {
+            return Err(invalid_iceberg_row_mutation_activation(
+                "Iceberg COW effect field contains nulls",
+            ));
+        }
+        for index in 0..batch.num_rows() {
+            let effect = match effects.value(index) {
+                1 => ConnectorRowMutationEffect::Delete,
+                2 => ConnectorRowMutationEffect::Replace,
+                3 => ConnectorRowMutationEffect::Insert,
+                _ => {
+                    return Err(invalid_iceberg_row_mutation_activation(
+                        "Iceberg COW selection contains an unknown logical effect",
+                    ));
+                }
+            };
+            if !preparation.intent().accepts(effect) {
+                return Err(invalid_iceberg_row_mutation_activation(
+                    "Iceberg COW selection effect is not admitted by the preparation",
+                ));
+            }
+            if effect == ConnectorRowMutationEffect::Insert {
+                has_append = true;
+                continue;
+            }
+            if files.is_null(index) || row_ids.is_null(index) {
+                return Err(invalid_iceberg_row_mutation_activation(
+                    "Iceberg COW matched row has null file or row identity",
+                ));
+            }
+            grouped
+                .entry(files.value(index).to_string())
+                .or_default()
+                .push(row_ids.value(index));
+        }
+    }
+    for row_ids in grouped.values_mut() {
+        row_ids.sort_unstable();
+        if row_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid_iceberg_row_mutation_activation(
+                "Iceberg COW selection contains duplicate row identities for one old file",
+            ));
+        }
+    }
+    if grouped.is_empty() && !has_append {
+        return Err(invalid_iceberg_row_mutation_activation(
+            "Iceberg COW selection is known-empty and has no cohort to activate",
+        ));
+    }
+    Ok((grouped, has_append))
+}
+
+fn invalid_iceberg_row_mutation_activation(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::array::{ArrayRef, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorMutationEffectField, ConnectorMutationMatchContract, ConnectorMutationSourceField,
+        ConnectorRequestContext, ConnectorRowMutationIntent, ConnectorTableHandle,
+        ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteBaseVersion,
+        ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteLease,
+        ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
+        ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriteTargetRef,
+        ExternalMutationOutcome,
+    };
+
+    use crate::control_provider::IcebergTablePayload;
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
+    use crate::row_mutation_payload::decode_cow_recipe;
+    use crate::scan_model::IcebergTableInfo;
+
+    use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct AlwaysCancelled;
+
+    impl ConnectorCancellation for AlwaysCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    /// The activation path is the only method this control needs to answer;
+    /// the rest of `ConnectorWriteControl` exists so the SPI lease — and its
+    /// cohort/route validation — can be exercised without a catalog runtime.
+    struct ActivationOnlyControl {
+        key: ConnectorExecutionBindingKey,
+        tamper: bool,
+    }
+
+    impl ConnectorWriteControl for ActivationOnlyControl {
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.key
+        }
+
+        fn activate_row_mutation(
+            &self,
+            request: ConnectorRowMutationActivationRequest,
+        ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
+            let plan = activate_row_mutation(request, &self.key)?;
+            if !self.tamper {
+                return Ok(plan);
+            }
+            // Add one route whose cohort the sealed set does not carry. The
+            // plan constructor accepts it (its recipes stay consistent), so
+            // only the SPI lease can catch the unsealed cohort.
+            let preparation = plan.preparation().clone();
+            let (sealed, recipes) = plan.copy_on_write().expect("copy-on-write plan");
+            let mut routes = plan.routes().to_vec();
+            let foreign_cohort = ConnectorWriteCohortId::derive(
+                preparation.operation_id(),
+                b"iceberg-cow-rewrite",
+                [9_u8; 32],
+            )?;
+            routes.push(iceberg_row_mutation_route_with_preparation(
+                &preparation,
+                foreign_cohort,
+                b"cow-rewrite",
+                admitted_effects(&preparation, &[ConnectorRowMutationEffect::Replace]),
+                routes[0].preparation().clone(),
+                Vec::new(),
+            )?);
+            ConnectorRowMutationExecutionPlan::try_copy_on_write(
+                preparation,
+                routes,
+                sealed.clone(),
+                recipes.to_vec(),
+            )
+        }
+
+        fn plan_write(
+            &self,
+            _request: ConnectorWritePlanningRequest,
+        ) -> Result<ConnectorWritePlan, ConnectorError> {
+            Err(unsupported())
+        }
+
+        fn commit(
+            &self,
+            _request: ConnectorWriteCommitRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+            Err(unsupported())
+        }
+
+        fn abort(
+            &self,
+            _request: ConnectorWriteAbortRequest,
+        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+            Err(unsupported())
+        }
+
+        fn reconcile(
+            &self,
+            _request: ConnectorWriteReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+            Err(unsupported())
+        }
+    }
+
+    fn expect_error<T>(result: Result<T, ConnectorError>) -> ConnectorError {
+        match result {
+            Ok(_) => panic!("expected a connector error"),
+            Err(error) => error,
+        }
+    }
+
+    fn unsupported() -> ConnectorError {
+        ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "activation-only test control",
+        )
+    }
+
+    fn owner() -> ConnectorExecutionBindingKey {
+        ConnectorExecutionBindingKey {
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        }
+    }
+
+    fn lease(owner: &ConnectorExecutionBindingKey, tamper: bool) -> ConnectorWriteLease {
+        ConnectorWriteLease::new(
+            owner.clone(),
+            Arc::new(ActivationOnlyControl {
+                key: owner.clone(),
+                tamper,
+            }),
+            || {},
+        )
+        .expect("write lease")
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("context")
+    }
+
+    fn table_metadata() -> crate::iceberg::spec::TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema");
+        TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///warehouse/db/t".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata
+    }
+
+    fn table_handle(owner: &ConnectorExecutionBindingKey) -> ConnectorTableHandle {
+        let metadata = table_metadata();
+        let payload = IcebergTablePayload {
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            table_info: Some(IcebergTableInfo {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                table_uuid: Some(metadata.uuid().to_string()),
+                current_snapshot_id: metadata.current_snapshot_id(),
+                schema_id: metadata.current_schema_id(),
+                location: metadata.location().to_string(),
+                schema: crate::schema_facts::iceberg_schema_def(metadata.current_schema()),
+                serialized_metadata: Some(serde_json::to_string(&metadata).expect("metadata JSON")),
+                serialized_metadata_rows: None,
+            }),
+            metadata_columns: vec![
+                "_file".to_string(),
+                "_pos".to_string(),
+                "_row_id".to_string(),
+                "_last_updated_sequence_number".to_string(),
+            ],
+            metadata_table_type: None,
+            prepared_files: Vec::new(),
+            explicit_files: None,
+            logical_type_columns: BTreeMap::new(),
+            hidden_columns: Vec::new(),
+        };
+        ConnectorTableHandle::try_new(
+            owner.instance_id.clone(),
+            Bytes::from(serde_json::to_vec(&payload).expect("table payload")),
+        )
+        .expect("table handle")
+    }
+
+    fn token(marker: u8) -> ConnectorWriteFieldToken {
+        ConnectorWriteFieldToken::from_bytes([marker; 32])
+    }
+
+    /// Mirrors the layout `prepare_row_mutation` signs: identity source
+    /// ordinals first, then the before/after target block, then the effect
+    /// field. The activation port depends on exactly these ordinals.
+    fn preparation(
+        owner: &ConnectorExecutionBindingKey,
+        strategy: ConnectorRowMutationStrategy,
+        intent: ConnectorRowMutationIntent,
+    ) -> ConnectorRowMutationPreparation {
+        let table = table_handle(owner);
+        let base_version = ConnectorWriteBaseVersion::try_new(Bytes::from_static(
+            b"iceberg/row-mutation-base/v1/uuid/main/none",
+        ))
+        .expect("base version");
+        let identity_fields = vec![
+            ConnectorMutationSourceField::new(
+                token(1),
+                Field::new("_file", DataType::Utf8, true),
+                0,
+            ),
+            ConnectorMutationSourceField::new(
+                token(2),
+                Field::new("_pos", DataType::Int64, true),
+                1,
+            ),
+            ConnectorMutationSourceField::new(
+                token(3),
+                Field::new("_row_id", DataType::Int64, true),
+                2,
+            ),
+            ConnectorMutationSourceField::new(
+                token(4),
+                Field::new("_last_updated_sequence_number", DataType::Int64, true),
+                3,
+            ),
+        ];
+        let before_fields = vec![ConnectorMutationTargetField::new(
+            token(5),
+            Field::new("value", DataType::Int64, true),
+            4,
+        )];
+        let after_fields = vec![ConnectorMutationTargetField::new(
+            token(6),
+            Field::new("value", DataType::Int64, true),
+            5,
+        )];
+        let effect_field = ConnectorMutationEffectField::try_new(
+            token(7),
+            Field::new("__row_mutation_effect", DataType::Int8, false),
+            6,
+        )
+        .expect("effect field");
+        let contract = ConnectorMutationMatchContract::try_new(
+            owner.clone(),
+            table.clone(),
+            base_version.clone(),
+            identity_fields.clone(),
+            before_fields,
+            after_fields,
+            identity_fields
+                .iter()
+                .map(ConnectorMutationSourceField::token)
+                .collect(),
+            effect_field,
+        )
+        .expect("match contract");
+        ConnectorRowMutationPreparation::try_new(
+            owner.clone(),
+            ConnectorWriteOperationId::from_bytes([3; 16]),
+            table,
+            ConnectorWriteTargetRef::main(),
+            intent,
+            base_version,
+            contract,
+            strategy,
+            None,
+            Some(1),
+            Bytes::from_static(
+                b"iceberg/row-mutation-preparation/v1/ice/uuid/main/none/PositionDelete",
+            ),
+        )
+        .expect("preparation")
+    }
+
+    /// One selection batch laid out on the signed match ordinals:
+    /// `_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`, before
+    /// `value`, after `value`, effect.
+    fn selection_batch(
+        files: Vec<Option<&str>>,
+        row_ids: Vec<Option<i64>>,
+        effects: Vec<i8>,
+    ) -> RecordBatch {
+        let rows = effects.len();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("_file", DataType::Utf8, true),
+            Field::new("_pos", DataType::Int64, true),
+            Field::new("_row_id", DataType::Int64, true),
+            Field::new("_last_updated_sequence_number", DataType::Int64, true),
+            Field::new("before_value", DataType::Int64, true),
+            Field::new("after_value", DataType::Int64, true),
+            Field::new("__row_mutation_effect", DataType::Int8, false),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(files)),
+            Arc::new(Int64Array::from(vec![Some(0_i64); rows])),
+            Arc::new(Int64Array::from(row_ids)),
+            Arc::new(Int64Array::from(vec![Some(1_i64); rows])),
+            Arc::new(Int64Array::from(vec![Some(10_i64); rows])),
+            Arc::new(Int64Array::from(vec![Some(20_i64); rows])),
+            Arc::new(Int8Array::from(effects)),
+        ];
+        RecordBatch::try_new(schema, columns).expect("selection batch")
+    }
+
+    fn cow_selection() -> ConnectorRowMutationSelection {
+        ConnectorRowMutationSelection::try_new(
+            vec![selection_batch(
+                vec![
+                    Some("a.parquet"),
+                    Some("b.parquet"),
+                    Some("a.parquet"),
+                    None,
+                ],
+                vec![Some(7), Some(5), Some(3), None],
+                vec![2, 1, 2, 3],
+            )],
+            1024,
+            1024 * 1024,
+        )
+        .expect("selection")
+    }
+
+    #[test]
+    fn lowercase_hex_matches_the_canonical_encoding() {
+        assert_eq!(lowercase_hex([0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        assert_eq!(lowercase_hex([0u8; 32]).len(), 64);
+    }
+
+    #[test]
+    fn direct_position_delete_activation_builds_the_primary_route() {
+        let owner = owner();
+        let preparation = preparation(
+            &owner,
+            ConnectorRowMutationStrategy::PositionDelete,
+            ConnectorRowMutationIntent::Delete,
+        );
+        let plan = activate_row_mutation(
+            ConnectorRowMutationActivationRequest::Direct {
+                preparation: preparation.clone(),
+                context: context(),
+            },
+            &owner,
+        )
+        .expect("direct activation");
+        assert!(plan.copy_on_write().is_none());
+        assert_eq!(plan.routes().len(), 1);
+        let route = &plan.routes()[0];
+        assert_eq!(
+            route.cohort_id(),
+            ConnectorWriteCohortId::primary(preparation.operation_id())
+        );
+        assert_eq!(
+            route.accepted_effects(),
+            &[ConnectorRowMutationEffect::Delete]
+        );
+        assert_eq!(
+            route.route_id(),
+            iceberg_row_mutation_route_id(
+                &preparation,
+                route.cohort_id(),
+                b"direct-position-delete"
+            )
+        );
+        assert_eq!(route.preparation().intent(), ConnectorWriteIntent::RowDelta);
+        assert!(route.partition_fields().is_empty());
+        match route.input() {
+            ConnectorWriteInputShape::PositionDelete {
+                identity_fields,
+                partition_source_fields,
+            } => {
+                assert_eq!(identity_fields.len(), 2);
+                assert!(
+                    identity_fields
+                        .iter()
+                        .all(|field| !field.field().is_nullable())
+                );
+                assert_eq!(identity_fields[0].field().name(), "_file");
+                assert_eq!(identity_fields[1].field().name(), "_pos");
+                assert!(partition_source_fields.is_empty());
+            }
+            other => panic!("unexpected input shape: {other:?}"),
+        }
+        let ordinals = route
+            .input_ordinals()
+            .iter()
+            .map(ConnectorMutationRouteInput::input_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, vec![0, 1]);
+    }
+
+    #[test]
+    fn merge_on_read_activation_fans_out_three_sealed_cohorts() {
+        let owner = owner();
+        let preparation = preparation(
+            &owner,
+            ConnectorRowMutationStrategy::MergeOnRead,
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![
+                    ConnectorRowMutationEffect::Delete,
+                    ConnectorRowMutationEffect::Replace,
+                    ConnectorRowMutationEffect::Insert,
+                ],
+            },
+        );
+        let plan = activate_row_mutation(
+            ConnectorRowMutationActivationRequest::Direct {
+                preparation: preparation.clone(),
+                context: context(),
+            },
+            &owner,
+        )
+        .expect("merge-on-read activation");
+        assert_eq!(plan.routes().len(), 3);
+        for (route, kind) in
+            plan.routes()
+                .iter()
+                .zip([&b"mor-delete"[..], b"mor-replacement", b"mor-insert"])
+        {
+            assert_eq!(
+                route.cohort_id(),
+                iceberg_row_mutation_direct_cohort(&preparation, kind).expect("cohort")
+            );
+        }
+        assert!(matches!(
+            plan.routes()[0].input(),
+            ConnectorWriteInputShape::DeletionVector { .. }
+        ));
+        assert!(matches!(
+            plan.routes()[1].input(),
+            ConnectorWriteInputShape::RowLineage { .. }
+        ));
+        assert!(matches!(
+            plan.routes()[2].input(),
+            ConnectorWriteInputShape::Data { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_on_write_activation_seals_one_cohort_per_rewritten_file_and_the_append() {
+        let owner = owner();
+        let preparation = preparation(
+            &owner,
+            ConnectorRowMutationStrategy::CopyOnWrite,
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![
+                    ConnectorRowMutationEffect::Delete,
+                    ConnectorRowMutationEffect::Replace,
+                    ConnectorRowMutationEffect::Insert,
+                ],
+            },
+        );
+        let plan = activate_row_mutation(
+            ConnectorRowMutationActivationRequest::CopyOnWrite {
+                preparation: preparation.clone(),
+                selection: cow_selection(),
+                context: context(),
+            },
+            &owner,
+        )
+        .expect("copy-on-write activation");
+        let (sealed, recipes) = plan.copy_on_write().expect("copy-on-write body");
+        assert_eq!(plan.routes().len(), 3);
+        assert_eq!(sealed.cohorts().len(), 3);
+        assert_eq!(recipes.len(), 3);
+        assert_eq!(sealed.operation_id(), preparation.operation_id());
+        // Every route's cohort must be sealed, and every recipe must name a
+        // route that exists: this is exactly what the SPI re-checks.
+        for route in plan.routes() {
+            assert!(
+                sealed
+                    .cohorts()
+                    .iter()
+                    .any(|cohort| cohort.cohort_id() == route.cohort_id())
+            );
+        }
+        let mut decoded = recipes
+            .iter()
+            .map(|recipe| {
+                assert!(
+                    plan.routes()
+                        .iter()
+                        .any(|route| route.route_id() == recipe.route_id())
+                );
+                let payload = decode_cow_recipe(recipe.payload()).expect("recipe");
+                (payload.role, payload.old_file, payload.matched_row_ids)
+            })
+            .collect::<Vec<_>>();
+        decoded.sort();
+        assert_eq!(
+            decoded,
+            vec![
+                ("append".to_string(), String::new(), Vec::new()),
+                ("rewrite".to_string(), "a.parquet".to_string(), vec![3, 7]),
+                ("rewrite".to_string(), "b.parquet".to_string(), vec![5]),
+            ]
+        );
+        let append_cohort = ConnectorWriteCohortId::derive(
+            preparation.operation_id(),
+            b"iceberg-cow-append",
+            Sha256::digest(b"iceberg-cow-append").into(),
+        )
+        .expect("append cohort");
+        assert!(
+            sealed
+                .cohorts()
+                .iter()
+                .any(|cohort| cohort.cohort_id() == append_cohort
+                    && cohort.intent() == ConnectorWriteIntent::Append)
+        );
+    }
+
+    #[test]
+    fn direct_activation_rejects_a_copy_on_write_preparation() {
+        let owner = owner();
+        let preparation = preparation(
+            &owner,
+            ConnectorRowMutationStrategy::CopyOnWrite,
+            ConnectorRowMutationIntent::Update,
+        );
+        // The SPI request check fires first for a Direct/COW mismatch; drive
+        // the provider branch directly to cover its own fail-closed message.
+        let error = expect_error(activate_iceberg_direct_row_mutation(&preparation));
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.to_string(),
+            "InvalidRequest: Iceberg Copy-on-Write activation requires the bounded match selection"
+        );
+    }
+
+    #[test]
+    fn activation_fails_closed_when_the_request_is_cancelled() {
+        let owner = owner();
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AlwaysCancelled),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("context");
+        let error = expect_error(activate_row_mutation(
+            ConnectorRowMutationActivationRequest::Direct {
+                preparation: preparation(
+                    &owner,
+                    ConnectorRowMutationStrategy::PositionDelete,
+                    ConnectorRowMutationIntent::Delete,
+                ),
+                context,
+            },
+            &owner,
+        ));
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(
+            error.to_string(),
+            "Cancelled: Iceberg row-mutation activation was cancelled before Provider planning"
+        );
+    }
+
+    #[test]
+    fn activation_fails_closed_after_the_deadline() {
+        let owner = owner();
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() - Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("context");
+        let error = expect_error(activate_row_mutation(
+            ConnectorRowMutationActivationRequest::Direct {
+                preparation: preparation(
+                    &owner,
+                    ConnectorRowMutationStrategy::PositionDelete,
+                    ConnectorRowMutationIntent::Delete,
+                ),
+                context,
+            },
+            &owner,
+        ));
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert_eq!(
+            error.to_string(),
+            "DeadlineExceeded: Iceberg row-mutation activation deadline elapsed before Provider planning"
+        );
+    }
+
+    #[test]
+    fn spi_lease_accepts_the_direct_and_copy_on_write_plans() {
+        let owner = owner();
+        let lease = lease(&owner, false);
+        lease
+            .activate_row_mutation(ConnectorRowMutationActivationRequest::Direct {
+                preparation: preparation(
+                    &owner,
+                    ConnectorRowMutationStrategy::PositionDelete,
+                    ConnectorRowMutationIntent::Delete,
+                ),
+                context: context(),
+            })
+            .expect("direct plan passes SPI validation");
+        lease
+            .activate_row_mutation(ConnectorRowMutationActivationRequest::CopyOnWrite {
+                preparation: preparation(
+                    &owner,
+                    ConnectorRowMutationStrategy::CopyOnWrite,
+                    ConnectorRowMutationIntent::Merge {
+                        effects: vec![
+                            ConnectorRowMutationEffect::Delete,
+                            ConnectorRowMutationEffect::Replace,
+                            ConnectorRowMutationEffect::Insert,
+                        ],
+                    },
+                ),
+                selection: cow_selection(),
+                context: context(),
+            })
+            .expect("copy-on-write plan passes SPI validation");
+    }
+
+    #[test]
+    fn spi_lease_rejects_a_copy_on_write_route_whose_cohort_is_not_sealed() {
+        let owner = owner();
+        let error = expect_error(lease(&owner, true).activate_row_mutation(
+            ConnectorRowMutationActivationRequest::CopyOnWrite {
+                preparation: preparation(
+                    &owner,
+                    ConnectorRowMutationStrategy::CopyOnWrite,
+                    ConnectorRowMutationIntent::Merge {
+                        effects: vec![
+                            ConnectorRowMutationEffect::Delete,
+                            ConnectorRowMutationEffect::Replace,
+                            ConnectorRowMutationEffect::Insert,
+                        ],
+                    },
+                ),
+                selection: cow_selection(),
+                context: context(),
+            },
+        ));
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(
+            error.to_string(),
+            "CorruptData: copy-on-write activation does not seal exactly its operation cohorts"
+        );
+    }
+}

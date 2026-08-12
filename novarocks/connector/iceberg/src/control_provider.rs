@@ -1640,7 +1640,7 @@ fn partition_metadata_payload(files: &[IcebergDataFileInfo]) -> Result<String, S
         .map_err(|error| format!("serialize Iceberg partitions metadata payload: {error}"))
 }
 
-fn metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, ConnectorError> {
+pub(crate) fn metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, ConnectorError> {
     names
         .iter()
         .map(|name| {

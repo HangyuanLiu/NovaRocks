@@ -43,6 +43,10 @@ mod row_delta;
 mod row_delta_dv;
 mod row_delta_dv_from_files;
 pub mod row_delta_dv_metadata;
+mod row_mutation_activation;
+#[cfg(test)]
+mod row_mutation_parity_tests;
+mod row_mutation_preparation;
 mod run;
 mod selected_rewrite;
 pub mod service;
@@ -56,6 +60,8 @@ pub mod variant_write;
 pub mod write_control;
 pub mod write_execution;
 pub mod write_io;
+mod write_preparation;
+mod write_shared;
 
 pub use abort::{AbortLog, CleanupError};
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
