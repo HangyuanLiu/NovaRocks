@@ -373,7 +373,6 @@ impl BackendApplicationHost {
             config,
             execution_installers,
         } = config;
-        app_config::install_preloaded_config(config.clone());
         novarocks::connector::schema::install_be_store_settings(
             config.runtime.enable_tablet_write_log,
             config.runtime.tablet_write_log_buffer_size,

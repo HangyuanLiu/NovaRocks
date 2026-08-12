@@ -203,7 +203,6 @@ fn in_process_test_execution_runtime()
 pub(crate) fn execute(
     request: DistributedQueryRequest,
 ) -> Result<crate::query_execution::contract::DistributedQueryOutcome, DistributedQueryError> {
-    crate::novarocks_config::install_default_for_test();
     let parts = request.into_parts();
     let query_id = QueryId::new(
         TEST_QUERY_ID_HIGH,

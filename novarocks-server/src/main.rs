@@ -273,7 +273,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // Install the global config and initialize the tracing subscriber before
     // starting the server. Without this, standalone runs with no logging
     // path), so log_filter/log_level/sys_log_dir from the config are ignored.
-    novarocks::common::app_config::install_preloaded_config(cfg.clone());
     novarocks_logging::init_with_level(
         &resolve_log_filter(&cfg),
         &novarocks_logging::LogFileSettings {

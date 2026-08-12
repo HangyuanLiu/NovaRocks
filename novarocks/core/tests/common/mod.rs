@@ -76,8 +76,8 @@ parquet_page_cache_ttl_seconds = 3600
     }
 
     /// Load the test configuration.
-    pub fn load_config(&self) -> anyhow::Result<&'static novarocks_config::NovaRocksConfig> {
-        novarocks_config::init_from_path(&self.config_path)
+    pub fn load_config(&self) -> anyhow::Result<novarocks_config::NovaRocksConfig> {
+        novarocks_config::load_from_path(&self.config_path)
     }
 }
 

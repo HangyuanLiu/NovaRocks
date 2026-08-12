@@ -17,21 +17,12 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
 
 use novarocks_state_store::config::{
     FoundationDbClientConfig, StateStoreAppConfig, StateStoreProviderConfig,
 };
 
-static CONFIG: OnceLock<RwLock<&'static NovaRocksConfig>> = OnceLock::new();
 pub use crate::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
-
-fn install_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
-    let leaked: &'static NovaRocksConfig = Box::leak(Box::new(cfg));
-    let lock = CONFIG.get_or_init(|| RwLock::new(leaked));
-    *lock.write().expect("novarocks config lock poisoned") = leaked;
-    leaked
-}
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -192,61 +183,40 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
         })
 }
 
-pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig> {
+/// Loads the config at `path`, falling back to built-in defaults when the file
+/// is absent.
+///
+/// The result is a value the caller owns. There is no process-wide active
+/// config: whoever loads the config hands it to the components that need it.
+pub fn load_from_path(path: impl AsRef<Path>) -> Result<NovaRocksConfig> {
     let path = path.as_ref().to_path_buf();
-    let cfg = if !path.exists() {
+    if !path.exists() {
         eprintln!(
             "WARNING: config file '{}' not found, using built-in defaults",
             path.display()
         );
-        NovaRocksConfig::default()
-    } else {
-        NovaRocksConfig::load_from_file(&path)?
-    };
-    Ok(install_config(cfg))
+        return Ok(NovaRocksConfig::default());
+    }
+    NovaRocksConfig::load_from_file(&path)
 }
 
-pub fn init_from_env_or_default() -> Result<&'static NovaRocksConfig> {
-    if let Some(lock) = CONFIG.get() {
-        return Ok(*lock.read().expect("novarocks config lock poisoned"));
-    }
+/// Loads the config named by `NOVAROCKS_CONFIG`, else `./novarocks.toml`, else
+/// the built-in defaults.
+pub fn load_from_env_or_default() -> Result<NovaRocksConfig> {
     if let Ok(p) = std::env::var("NOVAROCKS_CONFIG") {
         let p = p.trim();
         if !p.is_empty() {
-            return init_from_path(PathBuf::from(p));
+            return load_from_path(PathBuf::from(p));
         }
     }
 
     let default_path = PathBuf::from("novarocks.toml");
     if default_path.exists() {
-        let cfg = NovaRocksConfig::load_from_file(&default_path)?;
-        return Ok(install_config(cfg));
+        return NovaRocksConfig::load_from_file(&default_path);
     }
 
     eprintln!("WARNING: config file 'novarocks.toml' not found, using built-in defaults");
-    Ok(install_config(NovaRocksConfig::default()))
-}
-
-/// Install an already-loaded config as the process-wide active config, replacing
-/// any existing global config.  Use this when the caller has already loaded and
-/// validated a [`NovaRocksConfig`] and wants to guarantee that the engine uses
-/// exactly that instance rather than performing a second disk read.
-pub fn install_preloaded_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
-    install_config(cfg)
-}
-
-/// Force-install the built-in default config, replacing any existing global config.
-/// Intended for test setup where each test must start from a known-clean config.
-#[cfg(test)]
-pub fn install_default_for_test() -> &'static NovaRocksConfig {
-    install_config(NovaRocksConfig::default())
-}
-
-pub fn config() -> Result<&'static NovaRocksConfig> {
-    if let Some(lock) = CONFIG.get() {
-        return Ok(*lock.read().expect("novarocks config lock poisoned"));
-    }
-    init_from_env_or_default()
+    Ok(NovaRocksConfig::default())
 }
 
 #[derive(Clone, Deserialize)]

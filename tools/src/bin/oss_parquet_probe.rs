@@ -23,7 +23,7 @@ use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
-use novarocks::novarocks_config::{NovaRocksConfig, init_from_env_or_default, init_from_path};
+use novarocks::novarocks_config::{NovaRocksConfig, load_from_env_or_default, load_from_path};
 use novarocks_fs::ObjectStoreConfig;
 
 #[derive(Clone, Debug)]
@@ -126,8 +126,8 @@ async fn main() -> Result<()> {
     }
 
     let app_cfg = match config_path.as_deref() {
-        Some(p) => init_from_path(p).context("load config")?,
-        None => init_from_env_or_default().context("load config")?,
+        Some(p) => load_from_path(p).context("load config")?,
+        None => load_from_env_or_default().context("load config")?,
     };
     let object_store_config = object_store_config_from_connector(&app_cfg)?;
     let location = probe_location_from_args(&prefix)?;

@@ -1431,24 +1431,24 @@ impl StandaloneNovaRocks {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
         let cfg = match opts.config_path.as_deref() {
-            Some(path) => novarocks_config::init_from_path(path)
+            Some(path) => novarocks_config::load_from_path(path)
                 .map_err(|e| format!("load config failed: {e}"))?,
             None => {
                 #[cfg(test)]
                 {
-                    novarocks_config::install_default_for_test()
+                    novarocks_config::NovaRocksConfig::default()
                 }
                 #[cfg(not(test))]
                 {
-                    novarocks_config::init_from_env_or_default()
+                    novarocks_config::load_from_env_or_default()
                         .map_err(|e| format!("load config failed: {e}"))?
                 }
             }
         };
         #[cfg(test)]
-        return Self::open_body(opts, cfg, services, _test_guard);
+        return Self::open_body(opts, &cfg, services, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(opts, cfg, services)
+        Self::open_body(opts, &cfg, services)
     }
 
     /// Open the engine using an already-loaded, validated config.
@@ -1464,18 +1464,17 @@ impl StandaloneNovaRocks {
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
-        let cfg = novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
-        return Self::open_body(opts, cfg, services, _test_guard);
+        return Self::open_body(opts, &cfg, services, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(opts, cfg, services)
+        Self::open_body(opts, &cfg, services)
     }
 
     /// Common engine-open body.  Called after the process-wide config has
     /// already been installed by the caller.
     fn open_body(
         opts: StandaloneOptions,
-        cfg: &'static novarocks_config::NovaRocksConfig,
+        cfg: &novarocks_config::NovaRocksConfig,
         services: StandaloneOpenServices,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
@@ -5666,7 +5665,6 @@ pub(crate) struct StandaloneLoopbackTestBackend {
 #[cfg(test)]
 pub(crate) fn install_all_in_one_loopback_backend_for_test() -> StandaloneLoopbackTestBackend {
     let test_guard = acquire_standalone_test_guard();
-    crate::novarocks_config::install_default_for_test();
     StandaloneLoopbackTestBackend {
         exchange_port: in_process_exchange_endpoint_sentinel(),
         _test_guard: test_guard,
@@ -7297,12 +7295,12 @@ path = "meta/catalog.db"
         )
         .expect("write config");
 
-        let cfg = crate::novarocks_config::init_from_path(&config_path).expect("load config");
+        let cfg = crate::novarocks_config::load_from_path(&config_path).expect("load config");
         let backend = super::resolve_metadata_backend(
             &StandaloneOptions {
                 config_path: Some(config_path.clone()),
             },
-            cfg,
+            &cfg,
         )
         .expect("resolve backend")
         .expect("metadata backend");
@@ -7327,12 +7325,12 @@ mysql_port = 19030
         )
         .expect("write config");
 
-        let cfg = crate::novarocks_config::init_from_path(&config_path).expect("load config");
+        let cfg = crate::novarocks_config::load_from_path(&config_path).expect("load config");
         let backend = super::resolve_metadata_backend(
             &StandaloneOptions {
                 config_path: Some(config_path.clone()),
             },
-            cfg,
+            &cfg,
         )
         .expect("resolve backend");
         assert!(backend.is_none());
