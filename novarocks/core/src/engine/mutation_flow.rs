@@ -3504,10 +3504,21 @@ pub(crate) fn stage_prepared_merge_mutation(
                         &table,
                         &matched,
                         &target_columns,
-                        table
-                            .metadata()
-                            .current_snapshot()
-                            .map(|snapshot| snapshot.snapshot_id()),
+                        // Reuse the base version admission signed, exactly as the
+                        // UPDATE path does.
+                        //
+                        // This used to read `table.metadata().current_snapshot()`
+                        // instead -- a second, independent load from the one that
+                        // produced the signed base version -- while the commit
+                        // executor below already used the admitted base. The two
+                        // could disagree if the ref moved between those loads.
+                        // That never produced a wrong rewrite: the overlay builder
+                        // re-checks the base against the lease-pinned
+                        // materialization and rejects a mismatch with "changed
+                        // after admission". So the effect was a spurious failure
+                        // on a MERGE that UPDATE would have completed correctly,
+                        // plus two base-snapshot sources inside one statement.
+                        admitted_base_snapshot_id,
                         "main",
                         planning_lease.clone(),
                         &connector_context,
