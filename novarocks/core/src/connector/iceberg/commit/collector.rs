@@ -1045,9 +1045,11 @@ mod parity_tests {
         partition_spec_id: i32,
         metadata: &TableMetadata,
     ) -> iceberg_report::IcebergWriterReport {
-        let written =
-            crate::engine::iceberg_writer::data_file_to_written_file(df, partition_spec_id)
-                .expect("written file");
+        let written = crate::connector::iceberg::catalog::registry::data_file_to_written_file(
+            df,
+            partition_spec_id,
+        )
+        .expect("written file");
         iceberg_report::writer_report_from_written_file(&written, metadata).expect("writer report")
     }
 
@@ -1109,7 +1111,8 @@ mod parity_tests {
         let df = b.build().expect("data file");
 
         let expected =
-            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+            crate::connector::iceberg::catalog::registry::data_file_to_written_file(&df, 0)
+                .expect("expected");
 
         let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = unpartitioned_collector(int_schema());
@@ -1135,7 +1138,8 @@ mod parity_tests {
         let df = b.build().expect("eq delete file");
 
         let expected =
-            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+            crate::connector::iceberg::catalog::registry::data_file_to_written_file(&df, 0)
+                .expect("expected");
 
         let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = unpartitioned_collector(int_schema());
@@ -1179,7 +1183,8 @@ mod parity_tests {
         let df = b.build().expect("data file");
 
         let expected =
-            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+            crate::connector::iceberg::catalog::registry::data_file_to_written_file(&df, 0)
+                .expect("expected");
 
         let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = IcebergCommitCollector::new(
@@ -1227,7 +1232,8 @@ mod parity_tests {
         let df = b.build().expect("data file");
 
         let expected =
-            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+            crate::connector::iceberg::catalog::registry::data_file_to_written_file(&df, 0)
+                .expect("expected");
 
         let report = writer_report_from_data_file(&df, 0, &metadata);
         let collector = IcebergCommitCollector::new(

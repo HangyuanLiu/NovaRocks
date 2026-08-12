@@ -12683,7 +12683,12 @@ fn inject_iceberg_mv_data_file_reports(
     let default_spec_id = metadata.default_partition_spec_id();
     let written_files = data_files
         .into_iter()
-        .map(|df| crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id))
+        .map(|df| {
+            crate::connector::iceberg::catalog::registry::data_file_to_written_file(
+                &df,
+                default_spec_id,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     collector.inject_written_files(written_files);
     Ok(())

@@ -24,7 +24,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Field;
-use novarocks_connector_iceberg::iceberg::spec::DataFile;
 
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
@@ -47,7 +46,6 @@ use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
-use novarocks_connector_iceberg::commit::WrittenFile;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
@@ -1176,49 +1174,6 @@ fn source_index_for_write_column(
         })
 }
 
-/// Shape the INSERT target columns for one Iceberg table.
-///
-/// The Arrow type still comes from the Iceberg schema because the SQL-facing
-/// Variant and Binary projections below are not the ones the provider publishes
-/// in `ConnectorTableMetadata.schema`; reconciling those two mappings is
-/// SPI-5H's decision, not this function's.
-///
-/// The write default, by contrast, is no longer decoded here: `write_defaults`
-/// carries the already-neutral value keyed by column name, so this function
-/// never interprets an Iceberg literal.
-pub(crate) fn iceberg_insert_columns_from_schema(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-    write_defaults: &HashMap<String, ColumnDefault>,
-) -> Result<Vec<ColumnDef>, String> {
-    let arrow_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
-        .map_err(|e| format!("convert iceberg insert schema to arrow schema failed: {e}"))?;
-    arrow_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let nested = schema
-                .field_by_name(field.name())
-                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
-            let data_type = match nested.field_type.as_ref() {
-                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Variant,
-                ) => arrow::datatypes::DataType::LargeBinary,
-                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Binary,
-                ) => arrow::datatypes::DataType::Binary,
-                _ => field.data_type().clone(),
-            };
-            Ok(ColumnDef {
-                name: field.name().clone(),
-                data_type,
-                nullable: field.is_nullable(),
-                write_default: write_defaults.get(field.name()).cloned(),
-                logical_type: None,
-            })
-        })
-        .collect()
-}
-
 /// Derive the INSERT write columns from neutral connector facts.
 ///
 /// This replaces reading the provider's Iceberg schema. Two facts make the
@@ -1571,35 +1526,6 @@ pub(crate) fn invalidate_iceberg_caches(
 
 fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
-}
-
-pub(crate) fn data_file_to_written_file(
-    df: &DataFile,
-    partition_spec_id: i32,
-) -> Result<WrittenFile, String> {
-    Ok(WrittenFile {
-        path: df.file_path().to_string(),
-        format: df.file_format(),
-        content: df.content_type(),
-        partition_values: df.partition().clone(),
-        partition_spec_id,
-        record_count: df.record_count(),
-        file_size_in_bytes: df.file_size_in_bytes(),
-        split_offsets: df.split_offsets().map(|s| s.to_vec()).unwrap_or_default(),
-        column_sizes: df.column_sizes().clone(),
-        value_counts: df.value_counts().clone(),
-        null_value_counts: df.null_value_counts().clone(),
-        nan_value_counts: df.nan_value_counts().clone(),
-        lower_bounds: df.lower_bounds().clone(),
-        upper_bounds: df.upper_bounds().clone(),
-        key_metadata: df.key_metadata().map(|s| s.to_vec()),
-        referenced_data_file: df.referenced_data_file().map(|s| s.to_string()),
-        equality_ids: df.equality_ids(),
-        first_row_id: df.first_row_id(),
-        content_offset: None,
-        content_size_in_bytes: None,
-        cardinality: None,
-    })
 }
 
 pub(crate) fn run_select_to_chunks(
@@ -2080,104 +2006,6 @@ mod tests {
         assert!(
             !rendered.contains("CAST(CAST(NULL"),
             "omitted complex columns must not produce nested casts, got: {rendered}"
-        );
-    }
-
-    #[test]
-    fn insert_writer_columns_follow_fresh_iceberg_schema_after_external_evolution() {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                std::sync::Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        1,
-                        "amount",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
-                        ),
-                    ),
-                ),
-                std::sync::Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        2,
-                        "id",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-                        ),
-                    ),
-                ),
-                std::sync::Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
-                        3,
-                        "category",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("schema");
-
-        let columns =
-            iceberg_insert_columns_from_schema(&schema, &HashMap::new()).expect("columns");
-        let names = columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>();
-        let types = columns
-            .iter()
-            .map(|column| column.data_type.clone())
-            .collect::<Vec<_>>();
-        let nullable = columns
-            .iter()
-            .map(|column| column.nullable)
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["amount", "id", "category"]);
-        assert_eq!(
-            types,
-            vec![DataType::Int64, DataType::Int32, DataType::Utf8]
-        );
-        assert_eq!(nullable, vec![false, false, true]);
-    }
-    /// Relocated from `query_planning/write_sink.rs`, whose test module held it
-    /// even though the whole body exercises
-    /// [`iceberg_insert_columns_from_schema`] above. Hidden MV target fields
-    /// must survive the schema projection that INSERT column binding depends on.
-    #[test]
-    fn sqlx2_write_binding_preserves_hidden_mv_target_fields() {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        1,
-                        "region",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        2,
-                        "__nova_base_row_id",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("target schema");
-        let fields = iceberg_insert_columns_from_schema(&schema, &std::collections::HashMap::new())
-            .expect("target columns");
-
-        assert_eq!(
-            fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["region", "__nova_base_row_id"]
         );
     }
 }

@@ -26,6 +26,7 @@ use sqlparser::ast::Statement;
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::catalog::IcebergCatalogEntry;
+use crate::connector::iceberg::catalog::registry::data_file_to_written_file;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry;
 use crate::connector::iceberg::commit::{
@@ -34,9 +35,7 @@ use crate::connector::iceberg::commit::{
 };
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
-use crate::engine::iceberg_writer::{
-    data_file_to_written_file, invalidate_iceberg_caches, run_select_to_chunks,
-};
+use crate::engine::iceberg_writer::{invalidate_iceberg_caches, run_select_to_chunks};
 use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use novarocks_connector_iceberg::commit::AbortLog;
 use novarocks_connector_iceberg::commit::CommitOpKind;

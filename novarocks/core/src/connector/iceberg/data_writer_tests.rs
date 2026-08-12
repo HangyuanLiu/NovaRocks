@@ -79,7 +79,8 @@ async fn standalone_commit_round_trip_preserves_column_bounds() {
 
     // Round-trip through the standalone commit path and assert the committed
     // DataFile still carries the bounds (the OQ-3.1 fix).
-    let wf = crate::engine::iceberg_writer::data_file_to_written_file(df, 0).expect("wf");
+    let wf =
+        crate::connector::iceberg::catalog::registry::data_file_to_written_file(df, 0).expect("wf");
     assert_eq!(wf.lower_bounds.get(&1), Some(&Datum::int(1)));
     assert_eq!(wf.upper_bounds.get(&1), Some(&Datum::int(1000)));
 
