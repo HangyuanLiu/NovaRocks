@@ -4320,7 +4320,7 @@ fn target_observation_from_loaded_for_test(
         metadata.uuid().to_string(),
         metadata.current_schema_id(),
         fields,
-        target_partition_contract_from_table(&loaded.table)?,
+        test_partition_contract_from_table(&loaded.table)?,
     )
     .map_err(|error| error.to_string())
 }
@@ -4380,7 +4380,14 @@ fn target_contract(
     })
 }
 
-fn target_partition_contract_from_table(
+/// Test-only projection of a live Iceberg partition spec onto the MV contract.
+///
+/// Production reads this from the neutral observation; the Provider owns the
+/// projection and rejects unknown transforms (spec D4). Fixtures that build a
+/// table by hand still need the same mapping, and it retires with the rest of
+/// the MV test scaffolding in T20/T21.
+#[cfg(test)]
+fn test_partition_contract_from_table(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<mv_schema::MvPartitionContract, String> {
     let metadata = table.metadata();
@@ -4408,6 +4415,7 @@ fn target_partition_contract_from_table(
     })
 }
 
+#[cfg(test)]
 fn mv_partition_transform_contract(
     transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
 ) -> Result<mv_schema::MvPartitionTransformContract, String> {
@@ -23893,7 +23901,7 @@ mod tests {
             .expect("replace default partition spec");
         let new_default_spec_id = updated_table.metadata().default_partition_spec_id();
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
 
         advance_target_main_without_refresh_marker(&env.state, "ice", "analytics", "mv_orders");
 
@@ -24186,7 +24194,7 @@ mod tests {
             )
             .expect("replace default partition spec");
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
         assert_ne!(new_partition_contract.target_spec_id, old_default_spec_id);
         assert_eq!(
             updated_table.metadata().default_partition_spec().fields()[0].name,
@@ -24334,7 +24342,7 @@ mod tests {
             )
             .expect("replace default partition spec");
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
         assert_eq!(
             new_partition_contract.fields[0].partition_field_name,
             "name_truncate_2"
@@ -28123,7 +28131,7 @@ mod tests {
             )
             .expect("replace default partition spec");
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
         assert_eq!(
             new_partition_contract.fields[0].partition_field_name,
             "name_truncate_2"
