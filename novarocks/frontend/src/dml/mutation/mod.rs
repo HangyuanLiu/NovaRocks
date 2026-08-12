@@ -51,18 +51,24 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
     /// The reverse port does not expose that authority yet, so this route fails
     /// closed: no writer and no commit may run without a fence the provider can
     /// compare at its external linearization point.
+    /// UPDATE and MERGE derive their write lease at preparation precisely so the
+    /// fence can be established here, before staging dispatches anything.
+    ///
+    /// `derive_write_lease` mints a fresh fence cell on every call, so a lease
+    /// derived later inside staging would carry no fence at all — which is why
+    /// the derivation was hoisted rather than the fence pushed later.
     fn establish_external_fence(
         &self,
         _spec: &WriteTransactionSpec,
-        _proposal: &DmlExternalFenceProposal,
+        proposal: &DmlExternalFenceProposal,
     ) -> Result<
         novarocks_spi::connector::ConnectorEstablishedWriteFence,
         novarocks_spi::connector::ConnectorError,
     > {
-        Err(novarocks_spi::connector::ConnectorError::external_fence(
-            novarocks_spi::connector::ConnectorExternalFenceFailure::NotEstablished,
-            "mutation engine does not expose an external operation fence authority",
-        ))
+        self.engine.establish_mutation_external_fence(
+            self.prepared.handle.as_ref(),
+            &|operation_id, table, target_ref| proposal.seal(operation_id, table, target_ref),
+        )
     }
 
     fn run_coordinated_write(
