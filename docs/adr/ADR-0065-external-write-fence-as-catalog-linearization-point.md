@@ -110,8 +110,12 @@ process-local session 的前提下，如何合法判断旧 operation 到底提�
 - **format-version-1 表的 INSERT 由此收窄为直接报错。** 放弃 iceberg-rust 内置 fast append、改走自组装路径
   后，V1 表落到"phase 1 不支持 V1"的错误上。仓库内没有创建或测试 V1 写入的地方，但这是真实的能力收窄，
   不是纯内部重构。
-- **marker snapshot 会出现在表的 snapshot 列表里。** 任何统计或展示 snapshot 的地方（测试、snapshot 列表、
-  过期策略）都必须能把它和用户写入的数据区分开；为此提供了 `is_fence_marker_snapshot`。
+- **"provider-private" 只对 ref 成立，对 marker snapshot 不成立。** fence ref 本身不在用户命名空间里，
+  但它指向的 marker snapshot 落在表的**全局 snapshot 列表**中——Iceberg 的 snapshot 是表级的，不隶属于某个
+  ref。后果：NovaRocks 自己的 `$snapshots` 元数据表已过滤掉 marker（`is_fence_marker_snapshot`），
+  但**其它引擎（Spark、Trino 等）读同一张表时仍会看到这些 marker snapshot**。这是 snapshot 载体的固有代价，
+  不是可以靠过滤消除的；任何统计或展示 snapshot 的地方（测试、列表、过期策略）都必须能区分它们。
+  若这一可见性在生产中成为问题，就是重新评估 fence 载体的信号。
 - **"表被 drop 后重建"只在单次 raise 的情况下可判别。** 当前实现通过"我们发布的 marker 是否有前驱"检测该情况；
   `raise → 崩溃 → 在重建后的表上再次 raise` 这一序列无法与正常序列区分，因而落到 `Ambiguous`。方向是安全的
   （绝不会误判成 `NotApplied`），但恢复不会自动收敛，需要人工介入。彻底闭合需要一个能按 digest 精确匹配历史

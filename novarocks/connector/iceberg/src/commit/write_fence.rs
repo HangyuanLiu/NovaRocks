@@ -53,6 +53,15 @@
 //!
 //! This also makes the "different operations must not reuse a marker"
 //! invariant structural rather than merely checked.
+//!
+//! # What "provider-private" does and does not cover
+//!
+//! The fence *ref* is private: it lives outside the user's branch namespace and
+//! nothing routes reads through it. The marker *snapshots* it points at are
+//! not — Iceberg snapshots belong to the table, not to a ref, so they appear in
+//! the table's global snapshot list. NovaRocks filters them out of its own
+//! `$snapshots` metadata table, but another engine reading the same table will
+//! still see them. That is inherent to using a snapshot as the carrier.
 
 // Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
 
