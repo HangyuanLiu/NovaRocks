@@ -3860,6 +3860,23 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
         .map_err(|e| format!("read current directory failed: {e}"))
 }
 
+/// Projects aggregate engine state into the explicit inputs a lake rebuild needs.
+///
+/// Living here keeps the rebuild itself free of engine state, which is what lets
+/// it move to the frontend without dragging `StandaloneState` along.
+fn lake_rebuild_context(
+    state: &Arc<StandaloneState>,
+) -> crate::engine::mv::lake_rebuild::LakeRebuildContext<'_> {
+    crate::engine::mv::lake_rebuild::LakeRebuildContext {
+        metadata_is_authority: state.metadata_provider.is_some(),
+        catalog_runtime_projection: state.catalog_runtime_projection.as_ref(),
+        catalog_application: state.catalog_application.as_deref(),
+        connector_control: state.connector_control.as_ref(),
+        mv_storage_observation: state.mv_storage_observation.as_ref(),
+        mv_repository: state.mv_repository.as_ref(),
+    }
+}
+
 /// Engine-side implementation of the MV startup restore steps.
 ///
 /// The steps read lake state through engine internals, so they stay here; the
@@ -3875,7 +3892,9 @@ impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_>
         // W4 statelessness: rediscover lake-native Iceberg MV packages present on
         // the lake but missing from a fresh `[metadata]` (SQLite) cache, and
         // persist their rebuilt definitions.
-        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(self.state)
+        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&lake_rebuild_context(
+            self.state,
+        ))
     }
 
     fn restore_targets(&self) -> Result<(), String> {

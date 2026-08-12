@@ -306,7 +306,10 @@ fn clear_sqlite_and_rebuild_from_lake(
     }
 
     // 3. Rebuild the single target MV purely from the lake package.
-    crate::engine::mv::lake_rebuild::rebuild_one_lake_package_if_missing(state, package)?;
+    crate::engine::mv::lake_rebuild::rebuild_one_lake_package_if_missing(
+        &crate::engine::lake_rebuild_context(state),
+        package,
+    )?;
 
     // 4. Confirm the definition reappeared. If it did not, statelessness failed:
     //    the lake package did not carry enough to reconstruct the SQLite record.
