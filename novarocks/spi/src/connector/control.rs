@@ -23,14 +23,14 @@ use super::{
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorHistoricalMaintenanceRecovery, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceResolver, ConnectorMvPublicationFencing, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorViewMetadata,
-    ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
+    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -812,6 +812,7 @@ pub trait ConnectorControlRegistry:
     + ConnectorMetadataMaintenanceResolver
     + ConnectorDistributedRewriteResolver
     + ConnectorCleanupMaintenanceResolver
+    + ConnectorHistoricalMaintenanceResolver
     + ConnectorStatisticsResolver
 {
     fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError>;
