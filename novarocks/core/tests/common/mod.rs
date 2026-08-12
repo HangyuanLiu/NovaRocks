@@ -72,7 +72,7 @@ parquet_page_cache_ttl_seconds = 3600
 
     /// Initialize logging for tests.
     pub fn init_logging(&self) {
-        novarocks_logging::init_with_level("debug");
+        novarocks_logging::init_with_level("debug", &Default::default());
     }
 
     /// Load the test configuration.

@@ -22,7 +22,6 @@ use std::sync::Arc;
 use chrono::NaiveDateTime;
 use regex::Regex;
 
-use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::backend_id;
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::node::BoxedExecIter;
@@ -509,41 +508,7 @@ fn build_be_log_rows(ctx: &SchemaScanContext) -> Result<Vec<SchemaRow>, String> 
 }
 
 fn active_log_settings() -> (PathBuf, String) {
-    let log_dir = env::var("NOVAROCKS_LOG_DIR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            env::var("LOG_DIR")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .or_else(|| {
-            novarocks_app_config()
-                .ok()
-                .map(|cfg| cfg.sys_log_dir.clone())
-        })
-        .unwrap_or_else(|| "log".to_string());
-    let log_basename = env::var("NOVAROCKS_LOG_BASENAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            env::var("NOVAROCKS_LOG_FILE")
-                .ok()
-                .and_then(|value| derive_log_basename(Path::new(value.trim())))
-        })
-        .unwrap_or_else(|| "novarocks".to_string());
-    (PathBuf::from(log_dir), log_basename)
-}
-
-fn derive_log_basename(path: &Path) -> Option<String> {
-    path.file_stem()
-        .and_then(|value| value.to_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    crate::novarocks_logging::active_log_location()
 }
 
 fn list_be_log_paths(

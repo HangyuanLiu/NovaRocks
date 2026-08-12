@@ -10956,7 +10956,7 @@ fn finalize_iceberg_mv_partition_state(
                     .iter()
                     .map(|key| key.canonical_string())
                     .collect::<BTreeSet<_>>();
-                let max_entries = mv_partition_state_max_entries();
+                let max_entries = state.mv_partition_state_max_entries;
                 state
                     .mv_repository
                     .replace_partition_states(ReplaceMvPartitionStatesRequest {
@@ -10997,17 +10997,6 @@ fn finalize_iceberg_mv_partition_state(
         },
     }
     Ok(())
-}
-
-fn mv_partition_state_max_entries() -> usize {
-    crate::novarocks_config::config()
-        .ok()
-        .and_then(|cfg| {
-            cfg.standalone_server
-                .as_ref()
-                .map(|standalone| standalone.mv_partition_state_max_entries)
-        })
-        .unwrap_or(10_000)
 }
 
 fn refresh_connector_context(

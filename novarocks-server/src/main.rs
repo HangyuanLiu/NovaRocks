@@ -274,7 +274,14 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // starting the server. Without this, standalone runs with no logging
     // path), so log_filter/log_level/sys_log_dir from the config are ignored.
     novarocks::common::app_config::install_preloaded_config(cfg.clone());
-    novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
+    novarocks_logging::init_with_level(
+        &resolve_log_filter(&cfg),
+        &novarocks_logging::LogFileSettings {
+            dir: cfg.sys_log_dir.clone(),
+            roll_mode: cfg.sys_log_roll_mode.clone(),
+            roll_num: cfg.sys_log_roll_num,
+        },
+    );
 
     // Sizing for the process-wide data runtime is configuration, so it is
     // installed here rather than read from a global the first time some
