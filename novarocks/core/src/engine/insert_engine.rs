@@ -261,8 +261,8 @@ impl InsertEngine for Arc<StandaloneState> {
             self.connector_control.as_ref(),
             &target.catalog,
         )?;
-        crate::connector::metadata_load_table_with_planning_lease(
-            planning_lease.clone(),
+        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+            &planning_lease,
             connector_context,
             &target.namespace,
             &target.table,
@@ -273,23 +273,7 @@ impl InsertEngine for Arc<StandaloneState> {
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
         )?;
-        // Connector metadata intentionally carries only Arrow schema fields.
-        // INSERT shaping additionally needs Iceberg write-defaults and logical
-        // types, so expose the write-side catalog view through this narrow
-        // adapter instead of making frontend depend on connector internals.
-        let columns = {
-            let entry = self
-                .iceberg_catalogs
-                .read()
-                .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
-                .get(&target.catalog)?;
-            crate::connector::iceberg::catalog::registry::load_table(
-                &entry,
-                &target.namespace,
-                &target.table,
-            )?
-            .columns
-        };
+        let columns = insert_columns_from_connector_metadata(&metadata);
         Ok(ResolvedInsertTarget {
             catalog: target.catalog,
             namespace: target.namespace,
@@ -383,6 +367,45 @@ impl InsertEngine for Arc<StandaloneState> {
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String> {
         downcast_prepared(prepared)?.prepared.finalize()
     }
+}
+
+/// Shape the INSERT target columns from one exact connector metadata load.
+///
+/// Every fact INSERT shaping needs is signed per column by the provider, so no
+/// concrete table is opened here:
+///
+/// - `ConnectorTableMetadata::schema` is the full physical Arrow schema. Hidden
+///   columns are *marked* in the planning facts rather than removed from the
+///   schema, so this field set is the provider's whole current schema.
+/// - `write_target_type()` is the provider-signed DML write type, published only
+///   where it differs from the read type, so falling back to the Arrow field
+///   type reproduces the read-side type exactly.
+/// - `write_default()` is the value a write omitting the column receives; it
+///   projects onto the neutral catalog vocabulary variant-for-variant.
+fn insert_columns_from_connector_metadata(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+) -> Vec<ColumnDef> {
+    let column_facts = metadata.planning_facts.column_facts();
+    metadata
+        .schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| ColumnDef {
+            name: field.name().clone(),
+            data_type: column_facts
+                .get(ordinal)
+                .and_then(|fact| fact.write_target_type())
+                .cloned()
+                .unwrap_or_else(|| field.data_type().clone()),
+            nullable: field.is_nullable(),
+            write_default: crate::connector::connector_write_default_at(
+                &metadata.planning_facts,
+                ordinal,
+            ),
+            logical_type: None,
+        })
+        .collect()
 }
 
 fn downcast_prepared(

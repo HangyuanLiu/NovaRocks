@@ -2779,46 +2779,13 @@ impl StandaloneSession {
                 ..
             } => field,
         };
-        if adding {
-            let entry = {
-                let registry = self
-                    .inner
-                    .iceberg_catalogs
-                    .read()
-                    .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
-                registry.get(&target.catalog)?
-            };
-            let loaded = crate::connector::iceberg::catalog::registry::load_table(
-                &entry,
-                &target.namespace,
-                &target.table,
-            )?;
-            let source_column = match partition_field {
-                crate::sql::parser::ast::IcebergPartitionFieldExpr::Identity { column }
-                | crate::sql::parser::ast::IcebergPartitionFieldExpr::Year { column }
-                | crate::sql::parser::ast::IcebergPartitionFieldExpr::Month { column }
-                | crate::sql::parser::ast::IcebergPartitionFieldExpr::Day { column }
-                | crate::sql::parser::ast::IcebergPartitionFieldExpr::Hour { column }
-                | crate::sql::parser::ast::IcebergPartitionFieldExpr::Bucket { column, .. }
-                | crate::sql::parser::ast::IcebergPartitionFieldExpr::Truncate { column, .. }
-                | crate::sql::parser::ast::IcebergPartitionFieldExpr::Void { column } => column,
-            };
-            if loaded.logical_types.iter().any(|(name, data_type)| {
-                name.eq_ignore_ascii_case(source_column)
-                    && matches!(data_type, novarocks_catalog::schema::SqlType::Variant)
-            }) {
-                return Err(format!(
-                    "iceberg table column `{source_column}` is variant; variant columns cannot appear in the partition spec. Use a non-variant source column for partition transforms."
-                ));
-            }
-            crate::connector::iceberg::partition_spec::build_evolved_partition_spec(
-                loaded.table.metadata().current_schema(),
-                loaded.table.metadata().default_partition_spec(),
-                crate::connector::iceberg::partition_spec::PartitionSpecChange::Add(
-                    partition_field,
-                ),
-            )?;
-        }
+        // Partition-transform admission is an Iceberg fact, so it belongs to the
+        // provider's `AlterPartitionSpec` operation below: that path evolves the
+        // spec from the same current schema and default spec, and rejects a
+        // variant source column, a non-temporal source under a temporal
+        // transform, an already-present field, and an unbuildable spec. The
+        // rejection set is unchanged, so this layer no longer loads a table to
+        // pre-answer it.
         let transform = connector_partition_transform(partition_field);
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| error.to_string())?;
