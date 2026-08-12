@@ -511,7 +511,7 @@ impl WriteRecoveryProfile {
             return self.park(ledger, now_ms, WriteRecoveryProgress::Resolved);
         }
 
-        let facts = match self.historical_facts(ledger, durable.as_ref())? {
+        let mut facts = match self.historical_facts(ledger, durable.as_ref())? {
             Ok(facts) => facts,
             Err(reason) => {
                 tracing::debug!(
@@ -550,18 +550,6 @@ impl WriteRecoveryProfile {
             Some(existing) => existing.clone(),
         };
 
-        let descriptor = match self.descriptor(&facts) {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                tracing::debug!(
-                    operation_id = %operation_id,
-                    error = %error,
-                    "historical write recovery cannot seal its descriptor; rescheduling"
-                );
-                return self.park(ledger, now_ms, WriteRecoveryProgress::Unresolved);
-            }
-        };
-
         // D2 step 3: close the historical authority before concluding anything.
         let context = request_context().map_err(DmlError::journal_unavailable)?;
         let handle = match self.resolver.resolve(&facts.table.instance_id) {
@@ -593,6 +581,22 @@ impl WriteRecoveryProfile {
             );
             return self.park(ledger, now_ms, WriteRecoveryProgress::Unresolved);
         }
+
+        // The descriptor can only be sealed now: it binds the receipt digest of
+        // the raise, which did not exist a moment ago. Sealing it earlier would
+        // have bound a digest nothing had produced.
+        facts.raised_fence_receipt_digest = raise_receipt.digest();
+        let descriptor = match self.descriptor(&facts) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                tracing::debug!(
+                    operation_id = %operation_id,
+                    error = %error,
+                    "historical write recovery cannot seal its descriptor; rescheduling"
+                );
+                return self.park(ledger, now_ms, WriteRecoveryProgress::Unresolved);
+            }
+        };
 
         // Publish the raised fence before the inspection that depends on it, so
         // a crash in between can never leave a classification whose fence has
@@ -2300,14 +2304,30 @@ mod tests {
         }
     }
 
+    /// A provider proof of non-dispatch is necessary but not sufficient.
+    ///
+    /// The external fence is only established after the operation has already
+    /// transitioned to `Writing`, so any operation that owns a fence receipt is
+    /// recorded as *possibly* dispatched. `journal_proves_nothing_dispatched`
+    /// therefore cannot hold, and the SPI refuses the continuation the provider
+    /// offered -- deliberately, because replaying a possibly-dispatched write is
+    /// exactly what the design forbids.
+    ///
+    /// The safe convergence is to keep the record open with the fence intact.
+    /// Issuing continuations for real would need a durable "writer dispatch
+    /// started" checkpoint that this change does not add; see ADR-0065.
     #[test]
-    fn a_not_dispatched_operation_keeps_its_continuation_and_its_fence() {
+    fn a_provider_proof_of_non_dispatch_alone_does_not_earn_a_continuation() {
         let facet = FakeFacet::new(FacetPlan::NotDispatched, FacetCleanup::Complete);
         let mut ledger = FakeLedger::new(OperationState::Writing);
         let progress = profile(&facet)
             .drive(&mut ledger, 3_000)
             .expect("one recovery cycle");
-        assert_eq!(progress, WriteRecoveryProgress::ContinuationPending);
+        assert_eq!(
+            progress,
+            WriteRecoveryProgress::Unresolved,
+            "a journal that cannot prove non-dispatch must leave the operation unresolved"
+        );
         assert!(
             !facet
                 .events()
@@ -2317,27 +2337,21 @@ mod tests {
              historical authority"
         );
         let record = ledger.recovery.expect("durable record");
-        let result = record.result.expect("typed result");
-        assert_eq!(
-            result.disposition,
-            DmlHistoricalWriteDisposition::NotDispatched
-        );
-        assert_eq!(result.cleanup, DmlHistoricalCleanupState::NotRequired);
-        assert!(
-            result.continuation_payload.is_some(),
-            "the signed continuation must be retained as bounded opaque bytes"
-        );
         assert_ne!(
             record.phase,
             DmlHistoricalRecoveryPhase::Resolved,
-            "a retained continuation is resumed through the ordinary path, so the record stays open"
+            "an unresolved record stays open for a later cycle"
+        );
+        assert!(
+            record.result.is_none(),
+            "a refused observation must not be published as a typed result"
         );
         assert!(
             !ledger
                 .events
                 .iter()
                 .any(|event| matches!(event, LedgerEvent::Fact(_))),
-            "a continuable operation must not be settled as a statement failure"
+            "nothing was concluded, so no statement fact may be settled"
         );
     }
 

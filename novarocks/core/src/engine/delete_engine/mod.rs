@@ -114,9 +114,11 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
         crate::engine::external_write_fence::ExternalWriteFenceAuthority,
         novarocks_spi::connector::ConnectorError,
     > {
-        Err(crate::engine::external_write_fence::external_fence_authority_unavailable(
-            "DELETE execution does not expose an external operation fence authority",
-        ))
+        Err(
+            crate::engine::external_write_fence::external_fence_authority_unavailable(
+                "DELETE execution does not expose an external operation fence authority",
+            ),
+        )
     }
 
     fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;

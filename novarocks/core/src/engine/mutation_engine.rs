@@ -259,14 +259,11 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
     > {
         let handle = prepared_handle(prepared)
             .map_err(crate::engine::external_write_fence::invalid_fence_request)?;
-        let kernel = handle
-            .kernel
-            .lock()
-            .map_err(|error| {
-                crate::engine::external_write_fence::invalid_fence_request(format!(
-                    "mutation prepared kernel lock: {error}"
-                ))
-            })?;
+        let kernel = handle.kernel.lock().map_err(|error| {
+            crate::engine::external_write_fence::invalid_fence_request(format!(
+                "mutation prepared kernel lock: {error}"
+            ))
+        })?;
         let kernel = kernel.as_ref().ok_or_else(|| {
             crate::engine::external_write_fence::invalid_fence_request(
                 "mutation prepared kernel was already consumed".to_string(),

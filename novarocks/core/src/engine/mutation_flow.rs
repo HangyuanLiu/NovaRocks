@@ -1133,8 +1133,10 @@ impl PreparedMergeMutation {
 fn prepared_write_operation_id(
     cow: Option<&DmlChangeStreamPreparations>,
     mor: Option<&PreparedMorUpdateWriteTarget>,
-) -> Result<novarocks_spi::connector::ConnectorWriteOperationId, novarocks_spi::connector::ConnectorError>
-{
+) -> Result<
+    novarocks_spi::connector::ConnectorWriteOperationId,
+    novarocks_spi::connector::ConnectorError,
+> {
     cow.map(|preparations| preparations.operation_id)
         .or_else(|| mor.map(|target| target.preparations.operation_id))
         .ok_or_else(|| {

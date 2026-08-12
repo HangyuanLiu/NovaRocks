@@ -116,6 +116,14 @@ process-local session 的前提下，如何合法判断旧 operation 到底提�
   `raise → 崩溃 → 在重建后的表上再次 raise` 这一序列无法与正常序列区分，因而落到 `Ambiguous`。方向是安全的
   （绝不会误判成 `NotApplied`），但恢复不会自动收敛，需要人工介入。彻底闭合需要一个能按 digest 精确匹配历史
   marker 的 fence 血缘读取器。
+- **continuation 目前结构上不可达。** 只有 provider 证明 `NotDispatched` **且** journal 也能证明从未 dispatch
+  时才允许签发 continuation（两个条件是合取，这是刻意的保守设计）。但 external fence 是在 operation 已经
+  transition 到 `Writing` 之后才建立的，因此任何持有 fence receipt 的 operation 在 journal 里都被记为
+  *possibly dispatched*，`journal_proves_nothing_dispatched()` 永远不成立。结果是：即使 provider 明确证明
+  没有 dispatch，收敛结果也只能是 unresolved（fence 保留、不发终态、不 cleanup），而不是 continuation。
+  这是安全方向——放宽合取条件等于允许重放一个可能已 dispatch 的写入，正是设计明令禁止的。要真正签发
+  continuation，需要一个 journal 层的"writer dispatch 已开始"耐久检查点，把 `Writing` 拆成"已 fence、未
+  dispatch"与"已 dispatch"两个可区分的事实；本次变更没有引入它。
 - **`Staged` 无法枚举被孤立的 writer 输出。** 历史 recovery 拿到的 bounded opaque evidence 不携带已写文件路径，
   而 staging 目录就是表的数据位置、文件名把 operation id 作为**中缀**嵌在分区路径下，因此没有"有界且可证明归属"
   的枚举方式。guarded cleanup 因此只回收 fence ref，不删数据文件；孤立数据文件仍归 orphan cleanup 维护能力处理。
