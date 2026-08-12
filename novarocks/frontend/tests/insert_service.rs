@@ -57,6 +57,8 @@ use novarocks_spi::connector::{
 };
 use uuid::Uuid;
 
+mod common;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Call {
     Resolve {
@@ -169,6 +171,22 @@ impl StatisticsEngine for FakeInsertEngine {
 }
 
 impl InsertEngine for FakeInsertEngine {
+    /// Distributed write fails closed until a fence is established, so the
+    /// fake engine must expose a real write authority to fence against. The
+    /// fixture seals the proposal exactly the way a production route does.
+    fn establish_iceberg_write_external_fence(
+        &self,
+        _prepared: &dyn novarocks::engine::insert_engine::IcebergPreparedInsert,
+        proposal: &dyn novarocks::engine::external_write_fence::ExternalWriteFenceProposal,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorEstablishedWriteFence,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        common::fence_fixture::establish_from_proposal(|operation_id, table, target_ref| {
+            proposal.seal(operation_id, table, target_ref)
+        })
+    }
+
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String> {
         self.calls.lock().unwrap().push(Call::Resolve {
             target: request.target.parts,

@@ -107,6 +107,18 @@ process-local session 的前提下，如何合法判断旧 operation 到底提�
   浪费。选这条是因为跨 generation 接管旧 cohort 需要额外证明 cohort/fence/lineage 不变量，而那套证明目前不存在。
 - **fence 载体绑定在 Iceberg 的 ref/snapshot 模型上。** 换成另一个 provider 时，"原子条件更新 + 可比较
   generation"这个契约要重新落地一次；SPI 层是中立的，物理载体不是。
+- **format-version-1 表的 INSERT 由此收窄为直接报错。** 放弃 iceberg-rust 内置 fast append、改走自组装路径
+  后，V1 表落到"phase 1 不支持 V1"的错误上。仓库内没有创建或测试 V1 写入的地方，但这是真实的能力收窄，
+  不是纯内部重构。
+- **marker snapshot 会出现在表的 snapshot 列表里。** 任何统计或展示 snapshot 的地方（测试、snapshot 列表、
+  过期策略）都必须能把它和用户写入的数据区分开；为此提供了 `is_fence_marker_snapshot`。
+- **"表被 drop 后重建"只在单次 raise 的情况下可判别。** 当前实现通过"我们发布的 marker 是否有前驱"检测该情况；
+  `raise → 崩溃 → 在重建后的表上再次 raise` 这一序列无法与正常序列区分，因而落到 `Ambiguous`。方向是安全的
+  （绝不会误判成 `NotApplied`），但恢复不会自动收敛，需要人工介入。彻底闭合需要一个能按 digest 精确匹配历史
+  marker 的 fence 血缘读取器。
+- **`Staged` 无法枚举被孤立的 writer 输出。** 历史 recovery 拿到的 bounded opaque evidence 不携带已写文件路径，
+  而 staging 目录就是表的数据位置、文件名把 operation id 作为**中缀**嵌在分区路径下，因此没有"有界且可证明归属"
+  的枚举方式。guarded cleanup 因此只回收 fence ref，不删数据文件；孤立数据文件仍归 orphan cleanup 维护能力处理。
 
 ## 何时重新评估
 

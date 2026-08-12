@@ -83,8 +83,15 @@ use novarocks_spi::connector::{
 
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;
 const ICEBERG_WRITE_OPERATION_KIND: &str = "iceberg.connector_write.v2";
-const ICEBERG_WRITE_OPERATION_MARKER_VERSION: u8 = 1;
-const ICEBERG_WRITE_OPERATION_MARKER_PROPERTY: &str = "novarocks.write.operation.v1";
+pub(crate) const ICEBERG_WRITE_OPERATION_MARKER_VERSION: u8 = 1;
+/// Snapshot-summary key carrying write provenance.
+///
+/// Exposed to the crate on purpose: historical write recovery classifies an
+/// old attempt by reading this marker back out of committed history. Sharing
+/// the key, the version and the payload type means renaming a field breaks
+/// the build instead of silently degrading a provable `Applied` into an
+/// `Ambiguous` that never converges.
+pub(crate) const ICEBERG_WRITE_OPERATION_MARKER_PROPERTY: &str = "novarocks.write.operation.v1";
 const MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES: usize = 16_384;
 
 /// Concrete write capability assembled with every other capability of one
@@ -272,14 +279,14 @@ struct CommitUnknownOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IcebergWriteOperationMarkerV1 {
-    version: u8,
-    instance_id: String,
-    incarnation_base64: String,
-    operation_id_base64: String,
-    target_ref: String,
-    cohort_set_digest_base64: String,
-    aggregate_digest_base64: String,
+pub(crate) struct IcebergWriteOperationMarkerV1 {
+    pub(crate) version: u8,
+    pub(crate) instance_id: String,
+    pub(crate) incarnation_base64: String,
+    pub(crate) operation_id_base64: String,
+    pub(crate) target_ref: String,
+    pub(crate) cohort_set_digest_base64: String,
+    pub(crate) aggregate_digest_base64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     partition_replacement_id_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3126,7 +3133,7 @@ pub(crate) fn operation_marker_partitioning(
     Ok(Some(committed))
 }
 
-fn operation_marker_from_snapshot(
+pub(crate) fn operation_marker_from_snapshot(
     snapshot: &crate::iceberg::spec::Snapshot,
 ) -> Result<Option<IcebergWriteOperationMarkerV1>, ConnectorError> {
     let Some(raw) = snapshot

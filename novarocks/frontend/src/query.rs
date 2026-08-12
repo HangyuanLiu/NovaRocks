@@ -1554,7 +1554,12 @@ mod tests {
             &context,
             QueryOptions::default(),
         )
-        .expect("frontend DELETE route");
+        // The statement is routed to the frontend DELETE owner and never falls
+        // through to the core command. It then fails closed inside the DML
+        // runner: CP-3B forbids dispatching a writer before an external
+        // operation fence is established, and this focused-test service has no
+        // coordination authority to mint one from.
+        .expect_err("an unfenced DELETE must not dispatch");
 
         let executions = delete_engine.executions.lock().unwrap();
         assert_eq!(executions.len(), 1);
