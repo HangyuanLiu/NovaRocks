@@ -77,13 +77,6 @@ pub fn exchange_wait_ms() -> u64 {
         .unwrap_or(120_000)
 }
 
-pub(crate) fn optimizer_query_mem_limit_bytes() -> u64 {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.optimizer_query_mem_limit_bytes)
-        .unwrap_or(2 * 1024 * 1024 * 1024)
-}
-
 pub(crate) fn data_runtime_worker_threads() -> usize {
     novarocks_app_config()
         .ok()

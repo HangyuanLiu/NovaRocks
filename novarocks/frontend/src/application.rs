@@ -127,7 +127,11 @@ pub struct FrontendApplicationHost {
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_role: novarocks::common::app_config::ClusterRole,
     topology: Option<Arc<ClusterBackendService>>,
+    optimizer_query_mem_limit_bytes: u64,
 }
+
+/// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
+const DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct FrontendExecutionConfig {
@@ -136,6 +140,11 @@ pub struct FrontendExecutionConfig {
     runtime_filter_worker_count: NonZeroUsize,
     mv_scheduler: FrontendMvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
+    /// Cost budget frozen from `[runtime]` and handed to statement admission.
+    ///
+    /// SQL costing only ever sees the value admission froze; it never consults
+    /// a process-global configuration.
+    optimizer_query_mem_limit_bytes: u64,
 }
 
 impl FrontendExecutionConfig {
@@ -150,7 +159,17 @@ impl FrontendExecutionConfig {
             runtime_filter_worker_count,
             mv_scheduler: FrontendMvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
+            optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
         }
+    }
+
+    pub fn with_optimizer_query_mem_limit_bytes(mut self, bytes: u64) -> Self {
+        self.optimizer_query_mem_limit_bytes = bytes;
+        self
+    }
+
+    pub(crate) fn optimizer_query_mem_limit_bytes(&self) -> u64 {
+        self.optimizer_query_mem_limit_bytes
     }
 
     pub(crate) fn with_mv_scheduler_config(mut self, config: FrontendMvSchedulerConfig) -> Self {
@@ -210,6 +229,7 @@ impl FrontendApplicationHost {
             coordinator: None,
             execution_role: backend.role(),
             topology: None,
+            optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
         };
 
         if let Some(config) = config
@@ -309,6 +329,7 @@ impl FrontendApplicationHost {
         // context consumed by frontend application services. Install it before
         // constructing those services so MV refresh never observes an
         // all-in-one-only direct execution fallback.
+        host.optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
         if let Err(error) = host.open_coordinator(execution.clone()) {
             return Err(host.cleanup_open_error(error).await);
         }
@@ -330,6 +351,7 @@ impl FrontendApplicationHost {
                             execution.mv_scheduler.clone(),
                             execution.mv_maintenance.clone(),
                             host.table_maintenance_service(),
+                            execution.optimizer_query_mem_limit_bytes(),
                         ));
                         host.mv_background_engine_sink = Some(
                             FrontendMvService::background_engine_sink(Arc::clone(&service)),
@@ -500,6 +522,11 @@ impl FrontendApplicationHost {
 
     pub fn execution_role(&self) -> novarocks::common::app_config::ClusterRole {
         self.execution_role
+    }
+
+    /// Cost budget frozen from `[runtime]`, handed to statement admission.
+    pub fn optimizer_query_mem_limit_bytes(&self) -> u64 {
+        self.optimizer_query_mem_limit_bytes
     }
 
     pub fn connector_control_registry(

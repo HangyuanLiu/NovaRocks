@@ -70,6 +70,9 @@ pub struct FrontendMvService {
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
     execution_role: novarocks::common::app_config::ClusterRole,
     topology: Option<BackendTopologyService>,
+    /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
+    /// carries the value that statement admission would otherwise have to guess.
+    optimizer_query_mem_limit_bytes: u64,
 }
 
 impl FrontendMvService {
@@ -85,6 +88,7 @@ impl FrontendMvService {
             table_maintenance_service: None,
             execution_role: novarocks::common::app_config::ClusterRole::AllInOne,
             topology: None,
+            optimizer_query_mem_limit_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 
@@ -100,6 +104,7 @@ impl FrontendMvService {
         table_maintenance_service: Arc<
             dyn novarocks::engine::table_maintenance::TableMaintenanceService,
         >,
+        optimizer_query_mem_limit_bytes: u64,
     ) -> Self {
         Self {
             repository,
@@ -116,6 +121,7 @@ impl FrontendMvService {
             table_maintenance_service: Some(table_maintenance_service),
             execution_role,
             topology: Some(topology),
+            optimizer_query_mem_limit_bytes,
         }
     }
 
@@ -198,6 +204,7 @@ impl FrontendMvService {
                 table_maintenance_service,
                 activity_gate: self.activity_gate.clone(),
                 maintenance_wakeup_tx: None,
+                optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
             },
         )?);
         Ok(())
@@ -384,6 +391,7 @@ struct RefreshWorkerDependencies {
         Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>,
     activity_gate: MvActivityGate,
     maintenance_wakeup_tx: Option<mpsc::SyncSender<()>>,
+    optimizer_query_mem_limit_bytes: u64,
 }
 
 struct FrontendMvBackgroundRuntime {
@@ -603,7 +611,12 @@ fn execute_scheduled_refresh(
         topology,
         Some(deadline),
         cancellation.clone(),
-        SessionOptimizerSettings::default(),
+        SessionOptimizerSettings {
+            optimizer_query_mem_limit_bytes: Some(
+                dependencies.optimizer_query_mem_limit_bytes as f64,
+            ),
+            ..SessionOptimizerSettings::default()
+        },
     ));
     let connector_context = match novarocks::connector::connector_request_context_for_execution(
         None,

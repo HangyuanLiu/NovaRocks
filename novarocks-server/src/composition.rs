@@ -445,6 +445,7 @@ async fn run_all_in_one_until<F>(
 where
     F: Future<Output = Result<(), String>> + Send,
 {
+    let optimizer_query_mem_limit_bytes = config.runtime.optimizer_query_mem_limit_bytes;
     let connector_control_factories = compose_frontend_control_factories();
     let connector_file_planning_resources = Some(compose_connector_file_planning_resources(
         &config,
@@ -525,6 +526,7 @@ where
                         add_files_engine,
                         ctas_engine,
                         truncate_engine,
+                        optimizer_query_mem_limit_bytes,
                     ),
                 ))
             },
