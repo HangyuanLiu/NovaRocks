@@ -1371,6 +1371,10 @@ struct IcebergMvCreatePreparation {
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )>,
+    base_field_observations: std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
     expected_apply_key_field_id: i32,
     created_at_ms: i64,
     columns: Vec<crate::sql::parser::ast::TableColumnDef>,
@@ -1691,6 +1695,7 @@ impl MvEngine for StandaloneMvEngine {
             &prepared.canonical_select_query,
             &prepared.analysis,
             &prepared.loaded_bases,
+            &prepared.base_field_observations,
             &prepared.target,
             &target_observation,
             actual_apply_key_field_id,
@@ -2039,6 +2044,11 @@ fn prepare_iceberg_mv_create(
     })?;
     let property = derive_fragment_property(&analysis.resolved_query)?;
     let loaded_bases = load_all_bases_with_row_lineage(state, &resolved_dependencies.base_refs)?;
+    // Neutral base-schema facts, observed once through the exact-generation
+    // observation port. The contract builders consume these instead of reading
+    // provider metadata off `loaded_bases`.
+    let base_field_observations =
+        observe_base_fields_for_refs(state, &resolved_dependencies.base_refs, connector_context)?;
     if let Some(pk_cols) = stmt.primary_key.as_deref() {
         match &property.identity {
             TargetIdentity::BaseRowId => validate_ivm_primary_key(pk_cols, &descriptor_from_loaded(&loaded_bases[0].1)).map_err(|e| e.to_string())?,
@@ -2154,6 +2164,7 @@ fn prepare_iceberg_mv_create(
         base_refs: resolved_dependencies.base_refs,
         dependencies: resolved_dependencies.dependencies,
         loaded_bases,
+        base_field_observations,
         expected_apply_key_field_id,
         columns,
         partition_fields,
@@ -2819,6 +2830,23 @@ fn first_union_branch_ast_query(
     Ok(branch)
 }
 
+/// Observe neutral schema fields for every base, keyed by table FQN.
+fn observe_base_fields_for_refs(
+    state: &Arc<StandaloneState>,
+    base_refs: &[TableIdentity],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    std::collections::BTreeMap<String, Vec<crate::mv::storage_observation::MvObservedTargetField>>,
+    String,
+> {
+    let mut observed = std::collections::BTreeMap::new();
+    for base_ref in base_refs {
+        let observation = observe_schema_validation_for_table(state, base_ref, connector_context)?;
+        observed.insert(base_ref.fqn(), observation.fields().to_vec());
+    }
+    Ok(observed)
+}
+
 fn load_all_bases_with_row_lineage(
     state: &Arc<StandaloneState>,
     base_refs: &[TableIdentity],
@@ -3173,6 +3201,10 @@ fn build_iceberg_mv_schema_contract(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
     target: &IcebergMvTarget,
     target_observation: &MvTargetCreationObservation,
     actual_apply_key_field_id: i32,
@@ -3196,6 +3228,7 @@ fn build_iceberg_mv_schema_contract(
             canonical_query,
             analysis,
             loaded_bases,
+            base_field_observations,
             target_observation,
             target_contract,
         )?,
@@ -3206,6 +3239,7 @@ fn build_iceberg_mv_schema_contract(
             &analysis.resolved_query,
             analysis,
             loaded_bases,
+            base_field_observations,
             target_observation,
             target_contract,
         )?,
@@ -3243,6 +3277,10 @@ fn build_non_branch_schema_contract(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
     target_observation: &MvTargetCreationObservation,
     target: mv_schema::TargetContract,
 ) -> Result<mv_schema::MvSchemaContract, String> {
@@ -3252,6 +3290,7 @@ fn build_non_branch_schema_contract(
         resolved_query,
         analysis,
         loaded_bases,
+        base_field_observations,
         target_observation,
     )?;
     let base = core.bases.first().cloned().ok_or_else(|| {
@@ -3289,6 +3328,10 @@ fn build_non_branch_contract_core(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<NonBranchContractCore, String> {
     match identity {
@@ -3302,7 +3345,7 @@ fn build_non_branch_contract_core(
             };
             let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
                 resolved_query,
-                &sql_mv_lineage_schema(loaded_base.table.metadata().current_schema()),
+                &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
             )?;
             let (base_fields, output) = persist_sql_mv_lineage(lineage);
             Ok(NonBranchContractCore {
@@ -3328,7 +3371,12 @@ fn build_non_branch_contract_core(
                     query,
                 )?;
             let (left_contract, right_contract, output, join) =
-                build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
+                build_join_base_contracts_and_lineage(
+                    &join_aliases,
+                    resolved_query,
+                    loaded_bases,
+                    base_field_observations,
+                )?;
             Ok(NonBranchContractCore {
                 contract_version: 2,
                 bases: vec![left_contract, right_contract],
@@ -3340,7 +3388,14 @@ fn build_non_branch_contract_core(
         // Aggregate group row, dispatched by what it sits over (legacy
         // SingleAggregate / JoinAggregate / FanInAggregate).
         TargetIdentity::GroupRowId(_) => {
-            build_aggregate_contract_core(query, resolved_query, analysis, loaded_bases, target_observation)
+            build_aggregate_contract_core(
+                query,
+                resolved_query,
+                analysis,
+                loaded_bases,
+                base_field_observations,
+                target_observation,
+            )
         }
         // `build_non_branch_contract_core` is only called for non-branch
         // identities (the branch top is handled separately).
@@ -3496,6 +3551,10 @@ fn build_aggregate_contract_core(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<NonBranchContractCore, String> {
     // Aggregate-call surface (group keys, aggregates, visible-output ordering)
@@ -3523,8 +3582,12 @@ fn build_aggregate_contract_core(
         let join_aliases =
             crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(query)?;
         // Aggregate over a two-table inner equi-join (legacy JoinAggregate).
-        let (left_contract, right_contract, output, join) =
-            build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
+        let (left_contract, right_contract, output, join) = build_join_base_contracts_and_lineage(
+            &join_aliases,
+            resolved_query,
+            loaded_bases,
+            base_field_observations,
+        )?;
         return Ok(NonBranchContractCore {
             contract_version: 3,
             bases: vec![left_contract, right_contract],
@@ -3555,14 +3618,17 @@ fn build_aggregate_contract_core(
         let bases = loaded_bases
             .iter()
             .map(|(base_ref, loaded_base)| {
-                base_contract(
+                Ok(base_contract(
                     base_ref,
                     loaded_base,
                     None,
-                    base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
-                )
+                    base_fields_from_observation(observed_base_fields(
+                        base_field_observations,
+                        base_ref,
+                    )?),
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(NonBranchContractCore {
             contract_version: 3,
             bases,
@@ -3591,14 +3657,17 @@ fn build_aggregate_contract_core(
         let bases = loaded_bases
             .iter()
             .map(|(base_ref, loaded_base)| {
-                base_contract(
+                Ok(base_contract(
                     base_ref,
                     loaded_base,
                     None,
-                    base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
-                )
+                    base_fields_from_observation(observed_base_fields(
+                        base_field_observations,
+                        base_ref,
+                    )?),
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(NonBranchContractCore {
             contract_version: 3,
             bases,
@@ -3615,7 +3684,7 @@ fn build_aggregate_contract_core(
         };
         let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
             resolved_query,
-            &sql_mv_lineage_schema(loaded_base.table.metadata().current_schema()),
+            &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
         )?;
         let (base_fields, output) = persist_sql_mv_lineage(lineage);
         Ok(NonBranchContractCore {
@@ -3639,6 +3708,10 @@ fn build_join_base_contracts_and_lineage(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
 ) -> Result<
     (
         mv_schema::BaseContract,
@@ -3652,8 +3725,10 @@ fn build_join_base_contracts_and_lineage(
         loaded_base_for_table_fqn(loaded_bases, &join_aliases.left_table)?;
     let (right_ref, right_loaded) =
         loaded_base_for_table_fqn(loaded_bases, &join_aliases.right_table)?;
-    let left_schema = sql_mv_lineage_schema(left_loaded.table.metadata().current_schema());
-    let right_schema = sql_mv_lineage_schema(right_loaded.table.metadata().current_schema());
+    let left_schema =
+        sql_mv_lineage_schema(observed_base_fields(base_field_observations, left_ref)?);
+    let right_schema =
+        sql_mv_lineage_schema(observed_base_fields(base_field_observations, right_ref)?);
     let left_fqn = left_ref.fqn();
     let right_fqn = right_ref.fqn();
     // The join predicate field-ids, output-column lineage, filter lineage, and
@@ -3711,6 +3786,10 @@ fn build_branch_union_schema_contract(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
     target_observation: &MvTargetCreationObservation,
     target: mv_schema::TargetContract,
 ) -> Result<mv_schema::MvSchemaContract, String> {
@@ -3722,14 +3801,17 @@ fn build_branch_union_schema_contract(
     let all_bases = loaded_bases
         .iter()
         .map(|(base_ref, loaded_base)| {
-            base_contract(
+            Ok(base_contract(
                 base_ref,
                 loaded_base,
                 None,
-                base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
-            )
+                base_fields_from_observation(observed_base_fields(
+                    base_field_observations,
+                    base_ref,
+                )?),
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     if all_bases.is_empty() {
         return Err("UNION ALL iceberg MV schema contract requires loaded bases".to_string());
     }
@@ -3752,10 +3834,12 @@ fn build_branch_union_schema_contract(
                 crate::mv::aggregate_state::aggregate_sql_calls::extract_single_scan_table_fqn(
                     &first_branch_ast,
                 )?;
-            let (_, first_loaded_base) =
+            let (first_base_ref, _) =
                 loaded_base_for_table_fqn(loaded_bases, &first_branch_base_table)?;
-            let first_schema = first_loaded_base.table.metadata().current_schema();
-            let first_schema = sql_mv_lineage_schema(first_schema);
+            let first_schema = sql_mv_lineage_schema(observed_base_fields(
+                base_field_observations,
+                first_base_ref,
+            )?);
             let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
                 &analysis.resolved_query,
                 &first_schema,
@@ -3808,6 +3892,7 @@ fn build_branch_union_schema_contract(
                 first_branch_resolved,
                 analysis,
                 &first_branch_loaded,
+                base_field_observations,
                 target_observation,
             )?;
             let bases = overlay_narrowed_bases(all_bases, core.bases);
@@ -4028,39 +4113,57 @@ fn base_contract(
     }
 }
 
-fn base_fields_from_current_schema(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+fn base_fields_from_observation(
+    fields: &[crate::mv::storage_observation::MvObservedTargetField],
 ) -> Vec<mv_schema::BaseFieldRecord> {
-    schema
-        .as_struct()
-        .fields()
+    fields
         .iter()
         .map(|field| mv_schema::BaseFieldRecord {
-            field_id: field.id,
+            field_id: field.field_id,
             name_at_create: field.name.clone(),
-            type_signature: format!("{}", field.field_type),
-            required: field.required,
+            type_signature: field.type_signature.clone(),
+            required: !field.nullable,
         })
         .collect()
+}
+
+/// Neutral base-schema fields observed for `base_ref`.
+///
+/// Fails closed: a base the caller did not observe is a programming error, not
+/// a reason to fall back to reading provider metadata.
+fn observed_base_fields<'a>(
+    base_field_observations: &'a std::collections::BTreeMap<
+        String,
+        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+    >,
+    base_ref: &TableIdentity,
+) -> Result<&'a [crate::mv::storage_observation::MvObservedTargetField], String> {
+    base_field_observations
+        .get(&base_ref.fqn())
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
+            format!(
+                "MV base {} was not observed before contract build",
+                base_ref.fqn()
+            )
+        })
 }
 
 /// Project provider schema metadata into the SQL-owned lineage vocabulary at
 /// the application boundary. The SQL analyzer never retains the provider
 /// schema object or consults it after this conversion.
 fn sql_mv_lineage_schema(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    fields: &[crate::mv::storage_observation::MvObservedTargetField],
 ) -> crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
     crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
-        fields: schema
-            .as_struct()
-            .fields()
+        fields: fields
             .iter()
             .map(
                 |field| crate::sql::analyzer::mv_lineage::SqlMvLineageField {
-                    field_id: field.id,
+                    field_id: field.field_id,
                     name_at_create: field.name.clone(),
-                    type_signature: format!("{}", field.field_type),
-                    required: field.required,
+                    type_signature: field.type_signature.clone(),
+                    required: !field.nullable,
                 },
             )
             .collect(),
@@ -25146,6 +25249,12 @@ mod tests {
             &query,
             &analysis,
             &loaded_bases,
+            &observe_base_fields_for_refs(
+                &env.state,
+                &resolved_dependencies.base_refs,
+                &crate::connector::test_request_context(),
+            )
+            .expect("base field observations"),
             &target,
             &target_observation,
             actual_apply_key_field_id,
