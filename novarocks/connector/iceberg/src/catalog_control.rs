@@ -37,8 +37,10 @@ mod cleanup_candidates;
 pub mod cleanup_maintenance;
 #[path = "catalog_control/data_mutation.rs"]
 pub mod data_mutation;
+#[path = "catalog_control/historical_maintenance_recovery.rs"]
+pub(crate) mod historical_maintenance_recovery;
 #[path = "catalog_control/metadata_maintenance.rs"]
-pub mod metadata_maintenance;
+pub(crate) mod metadata_maintenance;
 #[path = "catalog_control/staged_create.rs"]
 pub mod staged_create;
 #[path = "catalog_control/statistics.rs"]

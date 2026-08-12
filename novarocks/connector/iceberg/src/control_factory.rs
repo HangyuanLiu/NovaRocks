@@ -152,7 +152,7 @@ impl ConnectorControlFactory for IcebergControlFactory {
             Arc::clone(&write_control),
         )?);
         let cleanup_maintenance = Arc::new(IcebergCleanupMaintenanceAdapter::new(
-            key,
+            key.clone(),
             Arc::clone(&unpublished.runtime),
         )?);
         let staged_create = if unpublished.runtime.rest_catalog().is_some() {
@@ -179,6 +179,12 @@ impl ConnectorControlFactory for IcebergControlFactory {
                 Some(provider.clone()),
             )?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
+            .try_with_historical_maintenance_recovery(Some(Arc::new(
+                crate::catalog_control::historical_maintenance_recovery::IcebergHistoricalMaintenanceRecovery::new(
+                    key.clone(),
+                    Arc::clone(&unpublished.runtime),
+                )?,
+            )))?
             .try_with_mv_publication_fencing(Some(Arc::new(
                 crate::mv_publication_fencing::IcebergMvPublicationFencing::new(provider.clone()),
             )))?
