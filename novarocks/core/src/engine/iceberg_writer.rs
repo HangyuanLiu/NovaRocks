@@ -24,7 +24,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Field;
-use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::spec::DataFile;
 use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
@@ -33,7 +32,7 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
 use crate::connector::iceberg::commit::{
-    CleanupPathMapper, IcebergCommitCollector, build_abort_cleanup_for_catalog_entry,
+    IcebergCommitCollector, build_abort_cleanup_for_catalog_entry,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_service::IcebergWriteReportCommitter;
@@ -54,7 +53,7 @@ use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
-use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
+use novarocks_connector_iceberg::commit::WrittenFile;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
@@ -155,26 +154,23 @@ pub(crate) fn prepare_iceberg_write_with_options(
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
-    // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
+    // 1. Resolve the write target through the exact planning generation.
+    //
+    // The caller already holds the planning lease, so the metadata is loaded
+    // through that same lease rather than re-resolving `latest`: a concurrent
+    // commit must not be able to split one statement across two generations.
+    // What comes back is neutral -- Arrow schema, bounded planning facts and an
+    // opaque handle -- so this layer no longer holds a concrete Iceberg table.
+    let write_target = crate::connector::write_target::ConnectorWriteTargetBinding::new(
+        crate::connector::metadata_load_connector_table_with_planning_lease(
+            &planning_lease,
+            connector_context.clone(),
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?,
+        planning_lease,
     );
-    let table =
-        block_on_iceberg(async { catalog.load_table(&table_ident).await })?.map_err(|e| {
-            format!(
-                "load iceberg table {target_str}: {e}",
-                target_str = target_string(target)
-            )
-        })?;
 
     // 2. Write-support validation belongs to the Provider.
     //
@@ -201,14 +197,10 @@ pub(crate) fn prepare_iceberg_write_with_options(
         source,
         overwrite_mode,
         target_ref,
-        catalog,
-        table,
-        &entry,
-        table_ident,
+        &write_target,
         execution,
         connector_context,
         options,
-        planning_lease,
     )
 }
 
@@ -221,21 +213,19 @@ fn prepare_iceberg_distributed_write(
     source: &IcebergWriteInput,
     overwrite_mode: IcebergWriteMode,
     target_ref: &str,
-    catalog: Arc<dyn Catalog>,
-    table: novarocks_connector_iceberg::iceberg::table::Table,
-    entry: &IcebergCatalogEntry,
-    table_ident: TableIdent,
+    write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     options: IcebergWritePreparationOptions,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedIcebergWrite, String> {
-    let write_lease = planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive Iceberg write admission lease: {error}"))?;
-    let metadata = table.metadata();
-    let (query, write_columns) =
-        build_iceberg_write_plan(target, resolved, insert_columns, source, &table, entry)?;
+    let write_lease = write_target.derive_write_lease()?;
+    let (query, write_columns) = build_iceberg_write_plan(
+        target,
+        resolved,
+        insert_columns,
+        source,
+        write_target.metadata(),
+    )?;
     let intent = match overwrite_mode {
         IcebergWriteMode::Append => ConnectorWriteIntent::Append,
         IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
@@ -271,7 +261,7 @@ fn prepare_iceberg_distributed_write(
             table: target.table.clone(),
         },
         preparation.clone(),
-        planning_lease,
+        write_target.lease().clone(),
     )?;
     let sql_write_input = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
@@ -281,48 +271,13 @@ fn prepare_iceberg_distributed_write(
         None,
     )?;
 
-    let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
-    let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
-    let base_sequence_number = metadata.last_sequence_number();
-    let current_schema = metadata.current_schema().clone();
-    let default_partition_spec = metadata.default_partition_spec().clone();
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            commit_op_kind,
-            table_ident,
-            base_snapshot_id,
-            base_sequence_number,
-            current_schema,
-            default_partition_spec,
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table,
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: options.snapshot_properties.clone(),
-    });
     let connector_operation_id = options.operation_id;
-    let connector_write = register_insert_connector_write(
+    let (connector_write, base_snapshot_id) = register_insert_connector_write(
         state,
+        target,
         target_ref,
         preparation,
-        entry,
-        Arc::clone(&commit_executor),
+        options.snapshot_properties.clone(),
         connector_operation_id,
         connector_context.clone(),
         &write_lease,
@@ -333,7 +288,6 @@ fn prepare_iceberg_distributed_write(
         query,
         sql_write_input,
         table_bindings,
-        commit_executor,
         execution,
         connector_context: connector_context.clone(),
         connector_write,
@@ -345,7 +299,7 @@ fn prepare_iceberg_distributed_write(
             table: target.table.clone(),
             ref_name: (target_ref != "main").then(|| target_ref.to_string()),
         },
-        operation_kind: operation_kind_for_commit_op_kind(commit_op_kind),
+        operation_kind: operation_kind_for_overwrite_mode(overwrite_mode),
         attempt_id: connector_operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
             base_snapshot_id,
@@ -364,14 +318,40 @@ fn prepare_iceberg_distributed_write(
 #[allow(clippy::too_many_arguments)]
 fn register_insert_connector_write(
     state: &Arc<StandaloneState>,
+    target: &TargetBackend,
     target_ref: &str,
     preparation: ConnectorWritePreparation,
-    entry: &IcebergCatalogEntry,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    snapshot_properties: BTreeMap<String, String>,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+) -> Result<
+    (
+        crate::query_execution::contract::ConnectorWritePlanningTemplate,
+        Option<i64>,
+    ),
+    String,
+> {
+    // The catalog entry and the write-service registry are the two places this
+    // layer still touches the concrete registry. Both belong to the final
+    // factory cut; everything Iceberg-shaped beyond them is built by the
+    // provider below.
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
+        registry.get(&target.catalog)?
+    };
+    let (commit_executor, base_snapshot_id) =
+        crate::connector::iceberg::write_commit::build_admitted_data_write_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            target_ref,
+            preparation.intent(),
+            snapshot_properties,
+        )?;
     let services = state
         .iceberg_catalogs
         .read()
@@ -383,17 +363,19 @@ fn register_insert_connector_write(
         operation_id,
         &preparation,
         target_ref,
-        entry,
+        &entry,
         committer,
     )
     .map_err(|error| format!("activate Iceberg data writer from preparation: {error}"))?;
-    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-        operation_id,
-        preparation,
-        context,
-        exact_lease.clone(),
-    )
-    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
+    let template =
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+            operation_id,
+            preparation,
+            context,
+            exact_lease.clone(),
+        )
+        .map_err(|error| format!("activate exact Iceberg write generation: {error}"))?;
+    Ok((template, base_snapshot_id))
 }
 
 pub(crate) fn register_iceberg_change_stream_provider_binding(
@@ -1040,7 +1022,6 @@ struct PreparedIcebergWriteExecutor {
     query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
@@ -1057,17 +1038,16 @@ pub(crate) fn build_iceberg_write_plan(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     source: &IcebergWriteInput,
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-    entry: &IcebergCatalogEntry,
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<(sqlparser::ast::Query, Vec<ColumnDef>), String> {
-    let write_columns = iceberg_insert_columns_from_schema(
-        table.metadata().current_schema(),
+    let write_columns = insert_columns_from_connector_metadata(
+        metadata,
         &write_defaults_by_name(&resolved.columns),
-    )?;
+    );
     let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
     let query =
         append_source_to_query_for_write(source, insert_columns, &source_columns, &write_columns)?;
-    let _ = (target, entry);
+    let _ = target;
     Ok((query, write_columns))
 }
 
@@ -1321,6 +1301,45 @@ pub(crate) fn iceberg_insert_columns_from_schema(
                 write_default: write_defaults.get(field.name()).cloned(),
                 logical_type: None,
             })
+        })
+        .collect()
+}
+
+/// Derive the INSERT write columns from neutral connector facts.
+///
+/// This replaces reading the provider's Iceberg schema. Two facts make the
+/// substitution exact rather than approximate:
+///
+/// - `ConnectorTableMetadata::schema` is the full physical Arrow schema.
+///   Hidden columns (the IMV apply key, declared aggregate-state columns) are
+///   *marked* in the planning facts rather than filtered out of the schema, so
+///   the field set here is the same one `current_schema()` produced.
+/// - `write_target_type` is the provider-signed DML write type for variant and
+///   binary columns (ADR-0055 decision 5). The provider only signs it when it
+///   differs from the read type, so falling back to the Arrow field type
+///   reproduces the previous inline override exactly.
+///
+/// Write defaults keep coming from the resolved SQL table columns, unchanged.
+fn insert_columns_from_connector_metadata(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    write_defaults: &HashMap<String, ColumnDefault>,
+) -> Vec<ColumnDef> {
+    let column_facts = metadata.planning_facts.column_facts();
+    metadata
+        .schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| ColumnDef {
+            name: field.name().clone(),
+            data_type: column_facts
+                .get(ordinal)
+                .and_then(|fact| fact.write_target_type())
+                .cloned()
+                .unwrap_or_else(|| field.data_type().clone()),
+            nullable: field.is_nullable(),
+            write_default: write_defaults.get(field.name()).cloned(),
+            logical_type: None,
         })
         .collect()
 }
@@ -1602,21 +1621,20 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
     })
 }
 
-fn commit_op_kind_for_overwrite_mode(overwrite_mode: IcebergWriteMode) -> CommitOpKind {
+/// The durable operation-journal kind for a SQL write mode.
+///
+/// This used to route through `CommitOpKind`, the provider's physical commit
+/// vocabulary. `IcebergOperationKind` is Core's own durable journal type, so the
+/// mapping is now keyed on the Core-owned write mode directly and the physical
+/// commit vocabulary stays inside the provider. The three reachable outcomes are
+/// unchanged: append maps to InsertAppend, both overwrite shapes to
+/// InsertOverwrite.
+fn operation_kind_for_overwrite_mode(overwrite_mode: IcebergWriteMode) -> IcebergOperationKind {
     match overwrite_mode {
-        IcebergWriteMode::DynamicPartitionOverwrite => CommitOpKind::OverwritePartitions,
-        IcebergWriteMode::FullTableOverwrite => CommitOpKind::Overwrite,
-        IcebergWriteMode::Append => CommitOpKind::FastAppend,
-    }
-}
-
-fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind {
-    match kind {
-        CommitOpKind::FastAppend => IcebergOperationKind::InsertAppend,
-        CommitOpKind::Overwrite | CommitOpKind::OverwritePartitions => {
+        IcebergWriteMode::Append => IcebergOperationKind::InsertAppend,
+        IcebergWriteMode::FullTableOverwrite | IcebergWriteMode::DynamicPartitionOverwrite => {
             IcebergOperationKind::InsertOverwrite
         }
-        _ => IcebergOperationKind::Maintenance,
     }
 }
 
