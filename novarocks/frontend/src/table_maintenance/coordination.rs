@@ -51,6 +51,16 @@ pub const MAINTENANCE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 pub const MAINTENANCE_MAX_CLOCK_SKEW: Duration = Duration::from_secs(1);
 pub const MAINTENANCE_TAKEOVER_OBSERVATION: Duration = Duration::from_secs(2);
 
+/// How many definite acquire conflicts to absorb before giving up. Each one
+/// proves the acquire did not happen, so retrying is safe; the bound keeps a
+/// genuinely contended record from spinning.
+const ACQUIRE_CONFLICT_RETRIES: u8 = 3;
+
+/// How many definite release conflicts to absorb. A swallowed release failure
+/// strands the table for a whole lease duration, so this retries rather than
+/// leaving the next statement to wait it out.
+const RELEASE_CONFLICT_RETRIES: u8 = 3;
+
 pub type MaintenanceFenceValidator = Arc<
     dyn for<'txn> Fn(
             &'txn mut dyn WriteTransaction,
@@ -247,21 +257,38 @@ impl MaintenanceCoordination {
         target: &MaintenanceTarget,
     ) -> Result<MaintenanceAcquireOutcome, MaintenanceCoordinationError> {
         let resource = maintenance_resource_key_v1(target)?;
-        let attempt_uuid = Uuid::now_v7();
-        let attempt = AttemptId::try_from(attempt_uuid)?;
-        let operation_id = OperationId::new_v7();
-        let outcome = match self
-            .manager
-            .acquire(resource.clone(), attempt, operation_id)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                self.manager
-                    .recover_acquire(resource, attempt, operation_id)
-                    .await?
+        let mut remaining = ACQUIRE_CONFLICT_RETRIES;
+        let (attempt_uuid, outcome) = loop {
+            let attempt_uuid = Uuid::now_v7();
+            let attempt = AttemptId::try_from(attempt_uuid)?;
+            let operation_id = OperationId::new_v7();
+            match self
+                .manager
+                .acquire(resource.clone(), attempt, operation_id)
+                .await
+            {
+                Ok(outcome) => break (attempt_uuid, outcome),
+                Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                    break (
+                        attempt_uuid,
+                        self.manager
+                            .recover_acquire(resource.clone(), attempt, operation_id)
+                            .await?,
+                    );
+                }
+                // A definite transaction conflict: the acquire provably did not
+                // take effect, so nothing is half-done and a fresh attempt and
+                // operation ID may simply try again. Statements against one
+                // table arrive back to back, and each release races the next
+                // acquire on the same record.
+                Err(error)
+                    if error.kind() == CoordinationErrorKind::OperationNotCommitted
+                        && remaining > 0 =>
+                {
+                    remaining -= 1;
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
         Ok(match outcome {
             AcquireOutcome::Acquired(guard) => MaintenanceAcquireOutcome::Acquired(
@@ -411,16 +438,33 @@ impl MaintenanceLeaseAttempt {
 
     pub async fn release(&self) -> Result<(), MaintenanceCoordinationError> {
         self.stop_renewal().await?;
-        let operation_id = OperationId::new_v7();
         let mut guard = self.inner.guard.lock().await;
-        let result = match guard.release(operation_id).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                guard.recover_release(operation_id).await
+        let mut remaining = RELEASE_CONFLICT_RETRIES;
+        loop {
+            let operation_id = OperationId::new_v7();
+            let result = match guard.release(operation_id).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                    guard.recover_release(operation_id).await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                // A definite transaction conflict leaves the guard active and
+                // clears its recovery state, so releasing under a fresh
+                // operation ID is safe. Giving up here instead would strand the
+                // table until the lease expires -- fifteen seconds during which
+                // the next statement on it is refused for no reason.
+                Err(error)
+                    if error.kind() == CoordinationErrorKind::OperationNotCommitted
+                        && remaining > 0 =>
+                {
+                    remaining -= 1;
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => Err(error),
-        };
-        result.map_err(Into::into)
+        }
     }
 
     async fn stop_renewal(&self) -> Result<(), MaintenanceCoordinationError> {
