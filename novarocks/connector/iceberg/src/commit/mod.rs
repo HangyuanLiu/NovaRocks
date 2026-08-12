@@ -30,6 +30,7 @@ mod fast_append;
 pub mod frozen_write;
 mod helpers;
 pub mod mv_provenance;
+pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod overwrite;
 mod overwrite_partitions;
@@ -64,12 +65,20 @@ mod write_shared;
 pub use abort::{AbortLog, CleanupError};
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use mv_provenance::{
-    MV_PROVENANCE_V1_PROP, MV_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1,
-    ProvenanceBase, RefreshTechnique,
+    MV_PROVENANCE_V1_PROP, MV_PROVENANCE_V2_PROP, MV_PROVENANCE_V2_VERSION, MV_PROVENANCE_VERSION,
+    MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1, MvProvenanceV2, MvPublicationV2Identity,
+    ProvenanceBase, RefreshTechnique, waterline_hash_for,
+};
+pub use mv_publication_fence::{
+    MV_PUBLICATION_FENCE_MARKER_PROP, MV_PUBLICATION_FENCE_REF, MV_PUBLICATION_FENCE_VERSION,
+    MvPublicationFenceDecision, MvPublicationFenceMarker, MvPublicationFenceOutcome,
+    MvPublicationFencePlan, ObservedFence, build_fence_commit, decide_fence_establishment,
+    establish_publication_fence, observe_fence,
 };
 pub use mv_refresh_ref::{
     MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
-    MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
+    MvRefreshPublishPlan, MvRefreshPublishV2Plan, MvRefreshSnapshotMarker,
+    publish_staging_branch_to_main, publish_staging_branch_to_main_v2,
     snapshot_matches_refresh_marker,
 };
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
@@ -88,11 +97,11 @@ pub use retry::{
 pub use rewrite_data_files::{
     LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
 };
+pub(crate) use service::RecoveryEvidence;
 pub use service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome,
     classify_commit_error,
 };
-pub(crate) use service::RecoveryEvidence;
 pub use snapshot_lifecycle_helpers::{
     FileSet, build_dv_index, compute_live_snapshot_set, enumerate_files_for_snapshots,
     is_puffin_path, puffin_half_reference_protection,

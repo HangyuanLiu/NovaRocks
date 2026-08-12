@@ -238,6 +238,52 @@ impl ConnectorMvPublicationFenceGeneration {
         })
     }
 
+    /// Rebuilds a generation from its digests.
+    ///
+    /// A provider stores only digests, so this is how it reconstructs the
+    /// generation a persisted fence names — and therefore how the *single*
+    /// ordering implementation gets applied to lake evidence instead of the
+    /// provider re-deriving comparison rules from raw fields.
+    pub fn try_from_digests(
+        cluster_digest: [u8; 32],
+        control_plane_incarnation: u64,
+        resource_epoch: u64,
+        token_digest: [u8; 32],
+    ) -> Result<Self, ConnectorError> {
+        if cluster_digest == [0u8; 32] {
+            return Err(invalid(
+                "MV publication fence generation cluster digest must not be zero",
+            ));
+        }
+        if control_plane_incarnation == 0 {
+            return Err(invalid(
+                "MV publication fence generation control plane incarnation must be nonzero",
+            ));
+        }
+        if resource_epoch == 0 {
+            return Err(invalid(
+                "MV publication fence generation resource epoch must be nonzero",
+            ));
+        }
+        if token_digest == [0u8; 32] {
+            return Err(invalid(
+                "MV publication fence generation token digest must not be zero",
+            ));
+        }
+        Ok(Self {
+            cluster_digest,
+            control_plane_incarnation,
+            resource_epoch,
+            token_digest,
+            digest: generation_digest(
+                cluster_digest,
+                control_plane_incarnation,
+                resource_epoch,
+                token_digest,
+            ),
+        })
+    }
+
     pub const fn cluster_digest(&self) -> [u8; 32] {
         self.cluster_digest
     }
@@ -1177,6 +1223,36 @@ mod tests {
         assert!(
             base.try_order(&conflicting).is_err(),
             "one epoch with two tokens must fail closed"
+        );
+    }
+
+    #[test]
+    fn generation_rebuilds_from_digests_identically() {
+        let original = generation(3, 4);
+        let rebuilt = ConnectorMvPublicationFenceGeneration::try_from_digests(
+            original.cluster_digest(),
+            original.control_plane_incarnation(),
+            original.resource_epoch(),
+            original.token_digest(),
+        )
+        .unwrap();
+
+        assert_eq!(rebuilt, original);
+        assert_eq!(rebuilt.digest(), original.digest());
+        assert_eq!(
+            rebuilt.try_order(&original).unwrap(),
+            ConnectorMvPublicationFenceOrder::Same
+        );
+
+        assert!(
+            ConnectorMvPublicationFenceGeneration::try_from_digests([0u8; 32], 1, 1, [7u8; 32])
+                .is_err(),
+            "zero cluster digest"
+        );
+        assert!(
+            ConnectorMvPublicationFenceGeneration::try_from_digests([1u8; 32], 0, 1, [7u8; 32])
+                .is_err(),
+            "zero incarnation"
         );
     }
 
