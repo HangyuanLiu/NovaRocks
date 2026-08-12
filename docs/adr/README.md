@@ -166,7 +166,7 @@ exact-version delete 为线性化点，发布本地 control generation 才让 SQ
 generation；`Absent`（未知）与 `Unavailable`（本机未物化）永远分开，store 不可用时 DDL 与超预算的 read
 admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。
 
-- ADR-0064 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
+- ADR-0066 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
 
 ### frontend-dml
 
