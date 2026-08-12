@@ -38,7 +38,6 @@ use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
     MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
-use novarocks_connector_iceberg::commit::IcebergUpdateMode;
 
 fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
     write_commit
@@ -470,7 +469,10 @@ pub(crate) struct PreparedUpdateMutation {
     /// The one exact connector generation admitted with this statement.
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     pub(crate) mor_write_target: Option<PreparedMorUpdateWriteTarget>,
-    pub(crate) mode: IcebergUpdateMode,
+    /// The physical route the provider signed for this statement. Kept as the
+    /// neutral strategy rather than re-encoded into the provider's own write-mode
+    /// enum, so nothing downstream re-decides it.
+    pub(crate) mode: novarocks_spi::connector::ConnectorRowMutationStrategy,
     /// The base version the provider signed for this target ref. The frontend
     /// persists it in its durable DML journal; nothing here re-derives it from a
     /// table handle.
@@ -506,7 +508,8 @@ pub(crate) struct PreparedMergeMutation {
     /// recipe is unfinished provider-side work, not a rewire.
     pub(crate) table: novarocks_connector_iceberg::iceberg::table::Table,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub(crate) table_write_mode: IcebergUpdateMode,
+    /// See [`PreparedUpdateMutation::mode`].
+    pub(crate) table_write_mode: novarocks_spi::connector::ConnectorRowMutationStrategy,
     /// The one exact connector generation admitted with this statement.
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     pub(crate) mor_write_target: Option<PreparedMorMergeWriteTarget>,
@@ -622,13 +625,11 @@ pub(crate) fn prepare_update_mutation(
         novarocks_spi::connector::ConnectorRowMutationIntent::Update,
         connector_context.clone(),
     )?;
+    // Only the two row-rewrite routes can serve UPDATE; anything else is a
+    // provider/consumer disagreement and stays fail-fast.
     let mode = match strategy_preparation.strategy() {
-        novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite => {
-            IcebergUpdateMode::CopyOnWrite
-        }
-        novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead => {
-            IcebergUpdateMode::MergeOnRead
-        }
+        strategy @ (novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite
+        | novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead) => strategy,
         other => {
             return Err(format!(
                 "UPDATE cannot be served by row-mutation strategy {other:?}"
@@ -636,25 +637,26 @@ pub(crate) fn prepare_update_mutation(
         }
     };
     let admitted_base_snapshot_id = strategy_preparation.base_version_ordinal();
-    let mor_write_target = if mode == IcebergUpdateMode::MergeOnRead {
-        // The writer target is the preparation that already named the strategy.
-        // Signing a second one here would give a single UPDATE two base versions
-        // and two digests. Stage runs after frontend lifecycle persistence and
-        // must never reopen the connector generation or observe a later
-        // snapshot.
-        Some(PreparedMorUpdateWriteTarget {
-            read_snapshot_id: admitted_base_snapshot_id,
-            preparations: DmlChangeStreamPreparations::from_signed(
-                strategy_operation_id,
-                strategy_lease.clone(),
-                strategy_preparation.clone(),
-                connector_context.clone(),
-            ),
-            planning_lease: planning_lease.clone(),
-        })
-    } else {
-        None
-    };
+    let mor_write_target =
+        if mode == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead {
+            // The writer target is the preparation that already named the strategy.
+            // Signing a second one here would give a single UPDATE two base versions
+            // and two digests. Stage runs after frontend lifecycle persistence and
+            // must never reopen the connector generation or observe a later
+            // snapshot.
+            Some(PreparedMorUpdateWriteTarget {
+                read_snapshot_id: admitted_base_snapshot_id,
+                preparations: DmlChangeStreamPreparations::from_signed(
+                    strategy_operation_id,
+                    strategy_lease.clone(),
+                    strategy_preparation.clone(),
+                    connector_context.clone(),
+                ),
+                planning_lease: planning_lease.clone(),
+            })
+        } else {
+            None
+        };
     Ok(PreparedUpdateMutation {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
@@ -764,13 +766,10 @@ pub(crate) fn prepare_merge_mutation(
         effect_set,
         connector_context.clone(),
     )?;
+    // Same two-route restriction as UPDATE; see `prepare_update_mutation`.
     let table_write_mode = match preparations.preparation.strategy() {
-        novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite => {
-            IcebergUpdateMode::CopyOnWrite
-        }
-        novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead => {
-            IcebergUpdateMode::MergeOnRead
-        }
+        strategy @ (novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite
+        | novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead) => strategy,
         other => {
             return Err(format!(
                 "MERGE cannot be served by row-mutation strategy {other:?}"
@@ -778,7 +777,9 @@ pub(crate) fn prepare_merge_mutation(
         }
     };
     let admitted_base_snapshot_id = preparations.preparation.base_version_ordinal();
-    let mor_write_target = if table_write_mode == IcebergUpdateMode::MergeOnRead {
+    let mor_write_target = if table_write_mode
+        == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead
+    {
         Some(PreparedMorMergeWriteTarget {
             preparations,
             planning_lease: planning_lease.clone(),
@@ -825,7 +826,7 @@ pub(crate) fn stage_prepared_update_mutation(
         connector_context,
     } = prepared;
     match mode {
-        IcebergUpdateMode::CopyOnWrite => {
+        novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite => {
             let matched = materialize_update_matches(
                 state,
                 &target,
@@ -925,7 +926,12 @@ pub(crate) fn stage_prepared_update_mutation(
                 completion,
             })
         }
-        IcebergUpdateMode::MergeOnRead => {
+        other @ (novarocks_spi::connector::ConnectorRowMutationStrategy::PositionDelete
+        | novarocks_spi::connector::ConnectorRowMutationStrategy::DeletionVector
+        | novarocks_spi::connector::ConnectorRowMutationStrategy::EqualityDelete) => Err(format!(
+            "UPDATE cannot be served by row-mutation strategy {other:?}"
+        )),
+        novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead => {
             let PreparedMorUpdateWriteTarget {
                 read_snapshot_id,
                 preparations,
@@ -3262,7 +3268,9 @@ pub(crate) fn stage_prepared_merge_mutation(
         Some(MergeMatchedAction::Delete)
     );
     let has_not_matched_insert = stmt.not_matched.is_some();
-    if table_write_mode == IcebergUpdateMode::MergeOnRead || has_matched_delete {
+    if table_write_mode == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead
+        || has_matched_delete
+    {
         if !has_matched_update && !has_matched_delete && !has_not_matched_insert {
             return Ok(MutationStagedWrite::NoOp);
         }
