@@ -28,6 +28,9 @@ use novarocks::engine::table_maintenance::{
     TableMaintenanceService,
 };
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
+use novarocks_frontend::table_maintenance::coordination::{
+    MaintenanceCoordination, maintenance_lease_settings, new_maintenance_holder_id,
+};
 use novarocks_frontend::table_maintenance::model::{
     MetadataMaintenanceExactOwner, MetadataMaintenanceOperationCreate,
     MetadataMaintenanceOperationKind, MetadataMaintenanceOperationState,
@@ -45,6 +48,10 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorTableHandle,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
+use novarocks_state_store::OperationId;
+use novarocks_state_store::coordination::{
+    ClockHealth, CoordinationError, IncarnationGate, LeaseClock, LeaseManager,
+};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
@@ -233,6 +240,41 @@ async fn open_sqlite(path: &Path) -> (StateStoreHost, Arc<dyn StateStore>) {
     (host, store)
 }
 
+/// Wall/monotonic clock for the durable fixture. Production installs the
+/// frontend host's clock; these tests only need one that actually advances.
+#[derive(Debug)]
+struct SystemLeaseClock {
+    origin: Instant,
+}
+
+impl Default for SystemLeaseClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl LeaseClock for SystemLeaseClock {
+    fn wall_time_millis(&self) -> Result<u64, CoordinationError> {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| CoordinationError::clock_unsafe())?
+                .as_millis(),
+        )
+        .map_err(|_| CoordinationError::clock_unsafe())
+    }
+
+    fn monotonic_time_millis(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn health(&self) -> ClockHealth {
+        ClockHealth::Healthy
+    }
+}
+
 async fn durable_service() -> (
     TempDir,
     StateStoreHost,
@@ -241,13 +283,34 @@ async fn durable_service() -> (
 ) {
     let temp = TempDir::new().expect("create temp directory");
     let (host, store) = open_sqlite(&temp.path().join("state.sqlite")).await;
-    let service = FrontendTableMaintenanceService::open(
+    // The durable owner always carries coordination authority in production, so
+    // the durable fixture installs it too. Without it every durable path is
+    // expected to fail closed, which is asserted separately.
+    let service = FrontendTableMaintenanceService::open_with_coordination(
         Some(Arc::clone(&store)),
         tokio::runtime::Handle::current(),
+        test_coordination(&store).await,
     )
     .await
     .expect("open table-maintenance service");
     (temp, host, store, service)
+}
+
+async fn test_coordination(store: &Arc<dyn StateStore>) -> MaintenanceCoordination {
+    let gate = IncarnationGate::new(Arc::clone(store));
+    if gate.load().await.is_err() {
+        gate.bootstrap(OperationId::new_v7())
+            .await
+            .expect("bootstrap control incarnation");
+    }
+    let manager = LeaseManager::new(
+        Arc::clone(store),
+        new_maintenance_holder_id().expect("maintenance holder"),
+        Arc::new(SystemLeaseClock::default()) as Arc<dyn LeaseClock>,
+        maintenance_lease_settings().expect("maintenance lease settings"),
+    )
+    .expect("lease manager");
+    MaintenanceCoordination::new(gate, manager, tokio::runtime::Handle::current())
 }
 
 fn connector_context() -> ConnectorRequestContext {
@@ -296,6 +359,33 @@ async fn non_maintenance_sql_is_not_claimed() {
     );
     assert!(engine.resolved_name_parts().is_empty());
     assert!(engine.requests().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_statement_releases_the_table_for_the_next_statement() {
+    let (_temp, _host, _store, service) = durable_service().await;
+    let engine = FakeMaintenanceEngine::default();
+
+    // Each statement takes per-table dispatch authority and must give it back
+    // when it returns, including on the failure path. If it does not, the
+    // next statement on the same table is refused until the lease expires --
+    // fifteen seconds of a table looking permanently busy while nothing runs.
+    for sql in [
+        "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+        "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+        "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS \
+         OLDER THAN '2026-01-01 00:00:00' RETAIN LAST 2",
+        "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1767225600000",
+    ] {
+        let error = service
+            .try_handle_statement(&engine, sql, context())
+            .unwrap_err();
+        assert!(
+            !error.contains("owned by another frontend attempt"),
+            "statement {sql} was refused by a lease its own predecessor should have released: \
+             {error}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

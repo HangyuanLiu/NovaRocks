@@ -218,10 +218,24 @@ impl FrontendTableMaintenanceService {
     fn admit_and_acquire(
         &self,
         target: &MaintenanceTarget,
-    ) -> Result<(WriteAdmission, MaintenanceLeaseAttempt), String> {
+    ) -> Result<(WriteAdmission, MaintenanceAttemptGuard), String> {
         let admission = self.admit_intent()?;
         let attempt = self.acquire_attempt(target)?;
         Ok((admission, attempt))
+    }
+
+    /// Wrap an acquired attempt so it is released when the caller returns.
+    ///
+    /// A synchronous maintenance statement holds the table for the duration of
+    /// one action. Without an explicit release the lease would only lapse when
+    /// it expires, and the next statement on the same table — a different
+    /// family, usually — would be refused for a full lease duration even though
+    /// nothing is running.
+    fn guard_attempt(&self, attempt: MaintenanceLeaseAttempt) -> MaintenanceAttemptGuard {
+        MaintenanceAttemptGuard {
+            attempt: Some(attempt),
+            runtime: self.runtime.clone(),
+        }
     }
 
     /// Take per-table dispatch authority without creating a new intent. A
@@ -230,13 +244,13 @@ impl FrontendTableMaintenanceService {
     fn acquire_attempt(
         &self,
         target: &MaintenanceTarget,
-    ) -> Result<MaintenanceLeaseAttempt, String> {
+    ) -> Result<MaintenanceAttemptGuard, String> {
         let coordination = self.require_coordination()?;
         match self
             .block_on(coordination.acquire(target))
             .map_err(|error| format!("acquire table maintenance authority failed: {error}"))?
         {
-            MaintenanceAcquireOutcome::Acquired(attempt) => Ok(attempt),
+            MaintenanceAcquireOutcome::Acquired(attempt) => Ok(self.guard_attempt(attempt)),
             MaintenanceAcquireOutcome::Contended(observation)
             | MaintenanceAcquireOutcome::AwaitingTakeover(observation) => Err(format!(
                 "table maintenance for this table is currently owned by another frontend attempt; \
@@ -251,13 +265,13 @@ impl FrontendTableMaintenanceService {
     fn try_acquire_attempt(
         &self,
         target: &MaintenanceTarget,
-    ) -> Result<Option<MaintenanceLeaseAttempt>, String> {
+    ) -> Result<Option<MaintenanceAttemptGuard>, String> {
         let coordination = self.require_coordination()?;
         match self
             .block_on(coordination.acquire(target))
             .map_err(|error| format!("acquire table maintenance authority failed: {error}"))?
         {
-            MaintenanceAcquireOutcome::Acquired(attempt) => Ok(Some(attempt)),
+            MaintenanceAcquireOutcome::Acquired(attempt) => Ok(Some(self.guard_attempt(attempt))),
             MaintenanceAcquireOutcome::Contended(_)
             | MaintenanceAcquireOutcome::AwaitingTakeover(_) => Ok(None),
         }
@@ -606,14 +620,23 @@ impl FrontendTableMaintenanceService {
             .distributed_rewrite_repository
             .as_ref()
             .ok_or_else(|| DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED.to_string())?;
-        let (create_origin, attempt) = match origin {
+        // An inherited attempt belongs to the optimize job that claimed the
+        // table; only a self-acquired one is released here.
+        let (create_origin, attempt, _guard) = match origin {
             RewriteAuthorityOrigin::NewIntent => {
-                let (admission, attempt) = self.admit_and_acquire(&target)?;
-                (ResolvedRewriteCreate::Admitted(admission), attempt)
+                let (admission, guard) = self.admit_and_acquire(&target)?;
+                let attempt = guard.attempt().clone();
+                (
+                    ResolvedRewriteCreate::Admitted(admission),
+                    attempt,
+                    Some(guard),
+                )
             }
-            RewriteAuthorityOrigin::ClaimedOptimizeJob { job_id, attempt } => {
-                (ResolvedRewriteCreate::ClaimedOptimizeJob(job_id), attempt)
-            }
+            RewriteAuthorityOrigin::ClaimedOptimizeJob { job_id, attempt } => (
+                ResolvedRewriteCreate::ClaimedOptimizeJob(job_id),
+                attempt,
+                None,
+            ),
         };
         let (authority, validator) = self.attempt_authority(&attempt)?;
         let operation_id = ConnectorWriteOperationId::new();
@@ -1630,7 +1653,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             engine,
             target,
             claimed.job_id,
-            attempt,
+            attempt.attempt().clone(),
         );
         match outcome {
             Ok(outcome) => {
@@ -1687,6 +1710,55 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
         *worker = WorkerLifecycle::Stopped(result.clone());
         result
+    }
+}
+
+/// Releases a per-table maintenance attempt when its scope ends.
+///
+/// Release is best effort: the durable business result is already committed
+/// under the fence, and a failed release only means the lease lapses on its own
+/// while CP-1 takeover rules arbitrate the next acquire. It runs on the shared
+/// runtime because `Drop` cannot await.
+struct MaintenanceAttemptGuard {
+    attempt: Option<MaintenanceLeaseAttempt>,
+    runtime: Handle,
+}
+
+impl MaintenanceAttemptGuard {
+    fn attempt(&self) -> &MaintenanceLeaseAttempt {
+        self.attempt
+            .as_ref()
+            .expect("a maintenance attempt guard holds its attempt until drop")
+    }
+}
+
+impl std::ops::Deref for MaintenanceAttemptGuard {
+    type Target = MaintenanceLeaseAttempt;
+
+    fn deref(&self) -> &Self::Target {
+        self.attempt()
+    }
+}
+
+impl Drop for MaintenanceAttemptGuard {
+    fn drop(&mut self) {
+        let Some(attempt) = self.attempt.take() else {
+            return;
+        };
+        // Release before the caller returns, not on a spawned task. Two
+        // statements against the same table arrive back to back, and a release
+        // that is merely scheduled loses that race: the second statement is
+        // refused for a full lease duration even though nothing is running.
+        let release = async move {
+            if let Err(error) = attempt.release().await {
+                tracing::debug!(%error, "release table maintenance attempt failed");
+            }
+        };
+        if Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.block_on(release));
+        } else {
+            self.runtime.block_on(release);
+        }
     }
 }
 
