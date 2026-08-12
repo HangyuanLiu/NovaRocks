@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
 use sqlparser::ast as sqlast;
 
@@ -51,10 +51,7 @@ use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
-use novarocks_spi::connector::{
-    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, ConnectorWriteOperationId,
-};
+use novarocks_spi::connector::ConnectorWriteOperationId;
 
 pub(crate) fn prepare_delete_statement(
     state: &Arc<StandaloneState>,
@@ -357,13 +354,6 @@ fn build_delete_position_sink_query(
     parse_generated_query(&sql, "DELETE position-delete rewrite")
 }
 
-fn position_delete_identity_field_requests() -> Vec<ConnectorWriteFieldRequest> {
-    vec![
-        ConnectorWriteFieldRequest::new(Field::new("_file", DataType::Utf8, false)),
-        ConnectorWriteFieldRequest::new(Field::new("_pos", DataType::Int64, false)),
-    ]
-}
-
 fn write_input_columns(
     preparation: &novarocks_spi::connector::ConnectorWritePreparation,
 ) -> Vec<ColumnDef> {
@@ -379,25 +369,6 @@ fn write_input_columns(
             logical_type: None,
         })
         .collect()
-}
-
-fn row_delete_preparation(
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    target: &TargetBackend,
-    target_ref: &str,
-    input: ConnectorWriteInputRequest,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<novarocks_spi::connector::ConnectorWritePreparation, String> {
-    let intent = ConnectorWriteIntent::RowDelta;
-    crate::engine::iceberg_writer::prepare_iceberg_connector_write(
-        write_lease,
-        target,
-        target_ref,
-        intent,
-        input,
-        ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        context,
-    )
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {

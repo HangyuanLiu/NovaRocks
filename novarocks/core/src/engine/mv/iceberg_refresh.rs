@@ -12541,8 +12541,9 @@ async fn commit_iceberg_mv_target_files_with_ref(
     inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)
         .map_err(CommitServiceError::invalid_input)?;
 
-    let abort_cleanup = crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
-        .map_err(CommitServiceError::invalid_input)?;
+    let abort_cleanup =
+        crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(entry)
+            .map_err(CommitServiceError::invalid_input)?;
 
     let outcome = match run_iceberg_commit(RunInput {
         collector: collector.clone(),
@@ -12586,8 +12587,9 @@ pub(crate) async fn commit_iceberg_mv_with_populated_collector(
     target_ref: &str,
     snapshot_properties: BTreeMap<String, String>,
 ) -> Result<CommitOutcome, CommitServiceError> {
-    let abort_cleanup = crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
-        .map_err(CommitServiceError::invalid_input)?;
+    let abort_cleanup =
+        crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(entry)
+            .map_err(CommitServiceError::invalid_input)?;
     let outcome = match run_iceberg_commit(RunInput {
         collector: collector.clone(),
         catalog: catalog.clone(),
@@ -12648,8 +12650,9 @@ async fn commit_iceberg_mv_apply_with_ref(
         collector.inject_delete_group(group);
     }
 
-    let abort_cleanup = crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
-        .map_err(CommitServiceError::invalid_input)?;
+    let abort_cleanup =
+        crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(entry)
+            .map_err(CommitServiceError::invalid_input)?;
     let outcome = match run_iceberg_commit(RunInput {
         collector: collector.clone(),
         catalog: catalog.clone(),
@@ -12680,7 +12683,12 @@ fn inject_iceberg_mv_data_file_reports(
     let default_spec_id = metadata.default_partition_spec_id();
     let written_files = data_files
         .into_iter()
-        .map(|df| crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id))
+        .map(|df| {
+            crate::connector::iceberg::catalog::registry::data_file_to_written_file(
+                &df,
+                default_spec_id,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     collector.inject_written_files(written_files);
     Ok(())
@@ -16465,7 +16473,7 @@ fn execute_imv_change_stream_writer(
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+        crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(
         crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
             catalog,
@@ -16632,7 +16640,7 @@ fn prepare_imv_change_stream_writer(
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+        crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(
         crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
             catalog,

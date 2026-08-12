@@ -23,24 +23,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::{Field, Schema};
-use bytes::Bytes;
-use novarocks_connector_iceberg::iceberg::Catalog;
-use novarocks_connector_iceberg::iceberg::spec::DataFile;
-use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
+use arrow::datatypes::Field;
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::registry::{
-    IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
-};
-use crate::connector::iceberg::commit::{
-    CleanupPathMapper, IcebergCommitCollector, ensure_iceberg_write_supported,
-    ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
-};
+use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
-use crate::connector::iceberg::write_service::{
-    IcebergWriteControlService, IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
-};
+use crate::connector::iceberg::write_service::IcebergWriteReportCommitter;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
@@ -58,9 +46,6 @@ use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
-use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
-use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
-use novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
@@ -161,59 +146,40 @@ pub(crate) fn prepare_iceberg_write_with_options(
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
-    let overwrite_full_table = matches!(overwrite_mode, IcebergWriteMode::FullTableOverwrite);
-    let overwrite_partitions =
-        matches!(overwrite_mode, IcebergWriteMode::DynamicPartitionOverwrite);
-
-    // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
+    // 1. Resolve the write target through the exact planning generation.
+    //
+    // The caller already holds the planning lease, so the metadata is loaded
+    // through that same lease rather than re-resolving `latest`: a concurrent
+    // commit must not be able to split one statement across two generations.
+    // What comes back is neutral -- Arrow schema, bounded planning facts and an
+    // opaque handle -- so this layer no longer holds a concrete Iceberg table.
+    let write_target = crate::connector::write_target::ConnectorWriteTargetBinding::new(
+        crate::connector::metadata_load_connector_table_with_planning_lease(
+            &planning_lease,
+            connector_context.clone(),
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?,
+        planning_lease,
     );
-    let table =
-        block_on_iceberg(async { catalog.load_table(&table_ident).await })?.map_err(|e| {
-            format!(
-                "load iceberg table {target_str}: {e}",
-                target_str = target_string(target)
-            )
-        })?;
 
-    // 2. Pre-lowering validators.
-    let _write_mode = ensure_iceberg_write_supported(&table)?;
-    if overwrite_full_table {
-        ensure_overwrite_single_partition_spec(&table)?;
-        ensure_no_equality_deletes(&table)?;
-    }
-    if overwrite_partitions {
-        // v3 row-lineage + cross-historical-spec checks happen in
-        // OverwritePartitionsCommit.
-        if table.metadata().default_partition_spec().is_unpartitioned() {
-            return Err(format!(
-                "INSERT OVERWRITE PARTITIONS requires a partitioned table; \
-                 table {} is unpartitioned (use OVERWRITE without PARTITIONS)",
-                target_string(target),
-            ));
-        }
-    }
-    // Branch writes require Iceberg v3 (row-lineage semantics).
-    if target_ref != "main" {
-        let fmt = table.metadata().format_version();
-        if fmt != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
-            return Err(format!(
-                "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
-                target_string(target),
-                fmt as u8,
-            ));
-        }
-    }
+    // 2. Write-support validation belongs to the Provider.
+    //
+    // These guards reject table shapes this writer cannot encode: unresolvable
+    // default sort order, variant in partition spec or sort order, evolved
+    // partition specs under INSERT OVERWRITE, pre-existing equality deletes
+    // under INSERT OVERWRITE, unpartitioned targets under OVERWRITE PARTITIONS,
+    // and pre-v3 tables under a branch write. Every one of them is an Iceberg
+    // fact read off table metadata, so they now run inside
+    // `ConnectorWriteControl::prepare_write` against the frozen admitted
+    // metadata, and this layer no longer loads a table to answer them.
+    //
+    // Rejection set is unchanged. Two observable differences, both recorded in
+    // the plan: the message now carries the `Iceberg write admission denied:`
+    // prefix the SPI `Denied` outcome adds, and the guards fire after column
+    // shaping rather than before it, so a statement that violates both a guard
+    // and its column list now surfaces the column-list error first.
 
     prepare_iceberg_distributed_write(
         state,
@@ -223,14 +189,10 @@ pub(crate) fn prepare_iceberg_write_with_options(
         source,
         overwrite_mode,
         target_ref,
-        catalog,
-        table,
-        &entry,
-        table_ident,
+        &write_target,
         execution,
         connector_context,
         options,
-        planning_lease,
     )
 }
 
@@ -243,21 +205,19 @@ fn prepare_iceberg_distributed_write(
     source: &IcebergWriteInput,
     overwrite_mode: IcebergWriteMode,
     target_ref: &str,
-    catalog: Arc<dyn Catalog>,
-    table: novarocks_connector_iceberg::iceberg::table::Table,
-    entry: &IcebergCatalogEntry,
-    table_ident: TableIdent,
+    write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     options: IcebergWritePreparationOptions,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedIcebergWrite, String> {
-    let write_lease = planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive Iceberg write admission lease: {error}"))?;
-    let metadata = table.metadata();
-    let (query, write_columns) =
-        build_iceberg_write_plan(target, resolved, insert_columns, source, &table, entry)?;
+    let write_lease = write_target.derive_write_lease()?;
+    let (query, write_columns) = build_iceberg_write_plan(
+        target,
+        resolved,
+        insert_columns,
+        source,
+        write_target.metadata(),
+    )?;
     let intent = match overwrite_mode {
         IcebergWriteMode::Append => ConnectorWriteIntent::Append,
         IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
@@ -293,7 +253,7 @@ fn prepare_iceberg_distributed_write(
             table: target.table.clone(),
         },
         preparation.clone(),
-        planning_lease,
+        write_target.lease().clone(),
     )?;
     let sql_write_input = sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
@@ -303,48 +263,13 @@ fn prepare_iceberg_distributed_write(
         None,
     )?;
 
-    let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
-    let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
-    let base_sequence_number = metadata.last_sequence_number();
-    let current_schema = metadata.current_schema().clone();
-    let default_partition_spec = metadata.default_partition_spec().clone();
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            commit_op_kind,
-            table_ident,
-            base_snapshot_id,
-            base_sequence_number,
-            current_schema,
-            default_partition_spec,
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table,
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: options.snapshot_properties.clone(),
-    });
     let connector_operation_id = options.operation_id;
-    let connector_write = register_insert_connector_write(
+    let (connector_write, base_snapshot_id) = register_insert_connector_write(
         state,
+        target,
         target_ref,
         preparation,
-        entry,
-        Arc::clone(&commit_executor),
+        options.snapshot_properties.clone(),
         connector_operation_id,
         connector_context.clone(),
         &write_lease,
@@ -355,7 +280,6 @@ fn prepare_iceberg_distributed_write(
         query,
         sql_write_input,
         table_bindings,
-        commit_executor,
         execution,
         connector_context: connector_context.clone(),
         connector_write,
@@ -367,7 +291,7 @@ fn prepare_iceberg_distributed_write(
             table: target.table.clone(),
             ref_name: (target_ref != "main").then(|| target_ref.to_string()),
         },
-        operation_kind: operation_kind_for_commit_op_kind(commit_op_kind),
+        operation_kind: operation_kind_for_overwrite_mode(overwrite_mode),
         attempt_id: connector_operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
             base_snapshot_id,
@@ -386,14 +310,40 @@ fn prepare_iceberg_distributed_write(
 #[allow(clippy::too_many_arguments)]
 fn register_insert_connector_write(
     state: &Arc<StandaloneState>,
+    target: &TargetBackend,
     target_ref: &str,
     preparation: ConnectorWritePreparation,
-    entry: &IcebergCatalogEntry,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    snapshot_properties: BTreeMap<String, String>,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+) -> Result<
+    (
+        crate::query_execution::contract::ConnectorWritePlanningTemplate,
+        Option<i64>,
+    ),
+    String,
+> {
+    // The catalog entry and the write-service registry are the two places this
+    // layer still touches the concrete registry. Both belong to the final
+    // factory cut; everything Iceberg-shaped beyond them is built by the
+    // provider below.
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
+        registry.get(&target.catalog)?
+    };
+    let (commit_executor, base_snapshot_id) =
+        crate::connector::iceberg::write_commit::build_admitted_data_write_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            target_ref,
+            preparation.intent(),
+            snapshot_properties,
+        )?;
     let services = state
         .iceberg_catalogs
         .read()
@@ -405,17 +355,19 @@ fn register_insert_connector_write(
         operation_id,
         &preparation,
         target_ref,
-        entry,
+        &entry,
         committer,
     )
     .map_err(|error| format!("activate Iceberg data writer from preparation: {error}"))?;
-    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-        operation_id,
-        preparation,
-        context,
-        exact_lease.clone(),
-    )
-    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
+    let template =
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+            operation_id,
+            preparation,
+            context,
+            exact_lease.clone(),
+        )
+        .map_err(|error| format!("activate exact Iceberg write generation: {error}"))?;
+    Ok((template, base_snapshot_id))
 }
 
 pub(crate) fn register_iceberg_change_stream_provider_binding(
@@ -583,232 +535,6 @@ pub(crate) fn activate_iceberg_change_stream_connector_write(
     Ok(template)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn register_iceberg_connector_write_service<S>(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
-    intent: ConnectorWriteIntent,
-    input_schema: Arc<Schema>,
-    plan_payload: IcebergWritePlanPayloadV1,
-    service: S,
-    operation_id: ConnectorWriteOperationId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String>
-where
-    S: crate::connector::iceberg::write_control::IcebergWriteControlBackend + 'static,
-{
-    let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
-    let payload = plan_payload
-        .encode()
-        .map_err(|error| format!("encode Iceberg connector plan payload: {error}"))?;
-    let mut templates = register_iceberg_connector_write_cohort_service(
-        state,
-        target,
-        target_ref,
-        service,
-        operation_id,
-        exact_lease,
-        vec![(cohort_id, intent, input_schema, payload, context)],
-    )?;
-    Ok(templates
-        .pop()
-        .expect("single Iceberg cohort registration returns one template"))
-}
-
-#[allow(clippy::type_complexity)]
-pub(crate) fn register_iceberg_connector_write_cohort_service<S>(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
-    service: S,
-    operation_id: ConnectorWriteOperationId,
-    exact_lease: &ConnectorWriteLease,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String>
-where
-    S: crate::connector::iceberg::write_control::IcebergWriteControlBackend + 'static,
-{
-    if cohorts.is_empty() {
-        return Err("Iceberg connector write operation has no cohorts".to_string());
-    }
-    // Provider admission is deliberately before the local service registry
-    // mutation. A typed denial (notably managed-MV ordinary DML) therefore
-    // leaves no operation entry that could later be activated accidentally.
-    let templates = build_iceberg_connector_write_templates(
-        target,
-        target_ref,
-        operation_id,
-        exact_lease,
-        cohorts,
-    )?;
-    let instance_id = ConnectorInstanceId::parse(&target.catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let services = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
-        .write_services();
-    services
-        .register(operation_id, service)
-        .map_err(|error| format!("register Iceberg connector write service: {error}"))?;
-
-    Ok(templates)
-}
-
-/// Reserve an Iceberg write service only after the application has retained
-/// the exact write lease. The factory is evaluated lazily by the first SPI
-/// planning request, so SQL preparation cannot mutate the provider registry
-/// or accidentally bind a newer connector generation.
-#[allow(clippy::type_complexity)]
-pub(crate) fn reserve_iceberg_connector_write_cohort_service_with_exact_lease<F>(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
-    operation_id: ConnectorWriteOperationId,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-    activation_digest: [u8; 32],
-    exact_lease: &ConnectorWriteLease,
-    factory: F,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String>
-where
-    F: Fn() -> Result<
-            Arc<dyn crate::connector::iceberg::write_control::IcebergWriteControlBackend>,
-            novarocks_spi::connector::ConnectorError,
-        > + Send
-        + Sync
-        + 'static,
-{
-    if cohorts.is_empty() {
-        return Err("Iceberg connector write operation has no cohorts".to_string());
-    }
-    let instance_id = ConnectorInstanceId::parse(&target.catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    if exact_lease.binding_key().instance_id != instance_id {
-        return Err("Iceberg write lease does not match the target connector instance".to_string());
-    }
-    // As above, prepare against the exact retained generation before local
-    // lazy activation is visible to a later SPI planning request.
-    let templates = build_iceberg_connector_write_templates(
-        target,
-        target_ref,
-        operation_id,
-        exact_lease,
-        cohorts,
-    )?;
-    let services = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
-        .write_services();
-    services
-        .register_lazy(operation_id, activation_digest, factory)
-        .map_err(|error| format!("reserve Iceberg connector write service: {error}"))?;
-    Ok(templates)
-}
-
-#[allow(clippy::type_complexity)]
-fn build_iceberg_connector_write_templates(
-    target: &TargetBackend,
-    target_ref: &str,
-    operation_id: ConnectorWriteOperationId,
-    exact_lease: &ConnectorWriteLease,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
-    build_iceberg_connector_write_templates_with_purpose(
-        target,
-        target_ref,
-        operation_id,
-        exact_lease,
-        ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        cohorts,
-    )
-}
-
-#[allow(clippy::type_complexity)]
-fn build_iceberg_connector_write_templates_with_purpose(
-    target: &TargetBackend,
-    target_ref: &str,
-    operation_id: ConnectorWriteOperationId,
-    exact_lease: &ConnectorWriteLease,
-    purpose: ConnectorWriteAdmissionPurpose,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
-    let context = cohorts
-        .first()
-        .ok_or_else(|| "Iceberg connector write operation has no cohorts".to_string())?
-        .4
-        .clone();
-    cohorts
-        .into_iter()
-        .map(
-            |(cohort_id, intent, input_schema, provider_payload, context)| {
-                // The registered service still owns its provider-private
-                // payload during this C1 cutover, but the operation contract
-                // is now sealed exclusively from Provider-signed admission.
-                // In particular, no caller can put that payload into the
-                // generic planning template.
-                let preparation = prepare_iceberg_connector_write(
-                    exact_lease,
-                    target,
-                    target_ref,
-                    intent,
-                    ConnectorWriteInputRequest::Data {
-                        fields: input_schema
-                            .fields()
-                            .iter()
-                            .map(|field| ConnectorWriteFieldRequest::new((**field).clone()))
-                            .collect(),
-                    },
-                    purpose,
-                    context.clone(),
-                )?;
-                let _provider_payload = provider_payload;
-                if cohort_id
-                    != novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id)
-                {
-                    return Err(
-                        "ordinary connector write activation may only produce the primary cohort"
-                            .to_string(),
-                    );
-                }
-                crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-                    operation_id,
-                    preparation,
-                    context,
-                    exact_lease.clone(),
-                )
-                .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
-            },
-        )
-        .collect()
-}
-
 /// Request a sealed preparation from the write-control generation retained by
 /// the original planning lease.  This helper is the only generic-template
 /// construction seam: callers provide Arrow fields, never a table-format
@@ -870,51 +596,15 @@ pub(crate) fn register_iceberg_row_delete_write_service(
             .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
         registry.get(&target.catalog)?
     };
-    let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|error| format!("load iceberg table {}: {error}", &table_ident))?;
-
-    let metadata = table.metadata();
-    let base_snapshot_id = if target_ref == "main" {
-        metadata.current_snapshot_id()
-    } else {
-        novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
-            metadata, target_ref,
-        )?
-    };
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            iceberg_commit_op_for_strategy(strategy),
-            table_ident,
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table: table.clone(),
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
+    let (commit_executor, table) =
+        crate::connector::iceberg::write_commit::build_admitted_row_mutation_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            target_ref,
+            strategy,
+            crate::connector::iceberg::write_commit::RowMutationCommitBase::RefHead,
+        )?;
     register_iceberg_row_connector_write(
         state,
         target_ref,
@@ -928,30 +618,6 @@ pub(crate) fn register_iceberg_row_delete_write_service(
     )
 }
 
-/// Map a provider-signed row-mutation strategy onto the Iceberg commit operation
-/// that realizes it.
-///
-/// This is the only place the mapping exists. Row DML carries the neutral
-/// strategy and never names a commit operation kind.
-fn iceberg_commit_op_for_strategy(
-    strategy: novarocks_spi::connector::ConnectorRowMutationStrategy,
-) -> novarocks_connector_iceberg::commit::CommitOpKind {
-    use novarocks_connector_iceberg::commit::CommitOpKind;
-    use novarocks_spi::connector::ConnectorRowMutationStrategy;
-
-    match strategy {
-        // Deletion vectors and merge-on-read both land as a row delta assembled
-        // from the touched data files.
-        ConnectorRowMutationStrategy::DeletionVector
-        | ConnectorRowMutationStrategy::MergeOnRead => CommitOpKind::RowDeltaDvFromFiles,
-        // Position deletes and equality deletes differ in the delete file each
-        // writer produces, not in how the snapshot is assembled.
-        ConnectorRowMutationStrategy::PositionDelete
-        | ConnectorRowMutationStrategy::EqualityDelete => CommitOpKind::RowDelta,
-        ConnectorRowMutationStrategy::CopyOnWrite => CommitOpKind::CowUpdate,
-    }
-}
-
 /// Build the commit executor for a row mutation from its target, the signed
 /// strategy and the base version admission signed.
 ///
@@ -960,6 +626,11 @@ fn iceberg_commit_op_for_strategy(
 /// implementation, so a row-DML entry point hands over a target and a base
 /// version and nothing else. It disappears with the Core Iceberg
 /// implementation.
+/// Reserve the row-mutation commit driver for a Provider-signed route.
+///
+/// The caller passes the neutral strategy the provider signed and nothing else
+/// about the table. Everything Iceberg-shaped is built by the provider; this
+/// layer only resolves the catalog entry, which the final factory cut owns.
 pub(crate) fn build_iceberg_row_commit_executor(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
@@ -980,42 +651,17 @@ pub(crate) fn build_iceberg_row_commit_executor(
             .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
         registry.get(&target.catalog)?
     };
-    let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|error| format!("load iceberg table {}: {error}", &table_ident))?;
-    let metadata = table.metadata();
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            iceberg_commit_op_for_strategy(strategy),
-            table_ident,
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            format!(
-                "{}/data/_staging/{}",
-                metadata.location(),
-                uuid::Uuid::new_v4()
+    let (commit_executor, _table) =
+        crate::connector::iceberg::write_commit::build_admitted_row_mutation_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            target_ref,
+            strategy,
+            crate::connector::iceberg::write_commit::RowMutationCommitBase::Signed(
+                base_snapshot_id,
             ),
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table,
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
+        )?;
     Ok((commit_executor, entry))
 }
 
@@ -1185,7 +831,6 @@ impl PreparedIcebergWrite {
     ) -> Result<Arc<dyn crate::engine::mutation_flow::MutationExecution>, String> {
         let state = Arc::clone(&self.executor.state);
         let target = self.executor.target.clone();
-        let commit_executor = Arc::clone(&self.executor.commit_executor);
         let connector_context = self.executor.connector_context.clone();
         let execution = self.executor.execution.clone().ok_or_else(|| {
             "prepared Iceberg mutation write requires an admitted execution context".to_string()
@@ -1196,7 +841,6 @@ impl PreparedIcebergWrite {
             target,
             execution,
             prepared_request: Mutex::new(Some(prepared_request)),
-            commit_executor,
             connector_context,
             operation_session: Mutex::new(None),
         }))
@@ -1209,7 +853,6 @@ struct PreparedIcebergWriteMutationExecution {
     execution: QueryExecutionContext,
     prepared_request:
         Mutex<Option<crate::query_execution::prepared_write::PreparedDistributedWriteRequest>>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     operation_session:
         Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
@@ -1291,7 +934,6 @@ struct PreparedIcebergWriteExecutor {
     query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
@@ -1308,17 +950,16 @@ pub(crate) fn build_iceberg_write_plan(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     source: &IcebergWriteInput,
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-    entry: &IcebergCatalogEntry,
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<(sqlparser::ast::Query, Vec<ColumnDef>), String> {
-    let write_columns = iceberg_insert_columns_from_schema(
-        table.metadata().current_schema(),
+    let write_columns = insert_columns_from_connector_metadata(
+        metadata,
         &write_defaults_by_name(&resolved.columns),
-    )?;
+    );
     let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
     let query =
         append_source_to_query_for_write(source, insert_columns, &source_columns, &write_columns)?;
-    let _ = (target, entry);
+    let _ = target;
     Ok((query, write_columns))
 }
 
@@ -1533,45 +1174,52 @@ fn source_index_for_write_column(
         })
 }
 
-/// Shape the INSERT target columns for one Iceberg table.
+/// Derive the INSERT write columns from neutral connector facts.
 ///
-/// The Arrow type still comes from the Iceberg schema because the SQL-facing
-/// Variant and Binary projections below are not the ones the provider publishes
-/// in `ConnectorTableMetadata.schema`; reconciling those two mappings is
-/// SPI-5H's decision, not this function's.
+/// This replaces reading the provider's Iceberg schema. Two facts make the
+/// substitution exact rather than approximate:
 ///
-/// The write default, by contrast, is no longer decoded here: `write_defaults`
-/// carries the already-neutral value keyed by column name, so this function
-/// never interprets an Iceberg literal.
-pub(crate) fn iceberg_insert_columns_from_schema(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+/// - `ConnectorTableMetadata::schema` is the full physical Arrow schema.
+///   Hidden columns (the IMV apply key, declared aggregate-state columns) are
+///   *marked* in the planning facts rather than filtered out of the schema, so
+///   the field set here is the same one `current_schema()` produced.
+/// - `write_target_type` is the provider-signed DML write type for variant and
+///   binary columns (ADR-0055 decision 5). The provider only signs it when it
+///   differs from the read type, so falling back to the Arrow field type
+///   reproduces the previous inline override exactly.
+///
+/// Write defaults keep coming from the resolved SQL table columns, unchanged.
+fn insert_columns_from_connector_metadata(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     write_defaults: &HashMap<String, ColumnDefault>,
-) -> Result<Vec<ColumnDef>, String> {
-    let arrow_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
-        .map_err(|e| format!("convert iceberg insert schema to arrow schema failed: {e}"))?;
-    arrow_schema
+) -> Vec<ColumnDef> {
+    let column_facts = metadata.planning_facts.column_facts();
+    metadata
+        .schema
         .fields()
         .iter()
-        .map(|field| {
-            let nested = schema
-                .field_by_name(field.name())
-                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
-            let data_type = match nested.field_type.as_ref() {
-                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Variant,
-                ) => arrow::datatypes::DataType::LargeBinary,
-                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Binary,
-                ) => arrow::datatypes::DataType::Binary,
-                _ => field.data_type().clone(),
-            };
-            Ok(ColumnDef {
-                name: field.name().clone(),
-                data_type,
-                nullable: field.is_nullable(),
-                write_default: write_defaults.get(field.name()).cloned(),
-                logical_type: None,
+        .enumerate()
+        // The neutral schema is the read schema: it carries the Iceberg
+        // metadata columns (`_file`, `_pos`, row-lineage) that a scan exposes
+        // but that are not part of the table's declared column list. SQL column
+        // binding must see only declared columns, so drop the ones the provider
+        // marked as system columns. Hidden-but-declared columns (the IMV apply
+        // key, aggregate-state columns) are `Ordinary` and stay.
+        .filter(|(ordinal, _)| {
+            column_facts.get(*ordinal).is_none_or(|fact| {
+                fact.role() != novarocks_spi::connector::ConnectorTableColumnRole::RowLineageSystem
             })
+        })
+        .map(|(ordinal, field)| ColumnDef {
+            name: field.name().clone(),
+            data_type: column_facts
+                .get(ordinal)
+                .and_then(|fact| fact.write_target_type())
+                .cloned()
+                .unwrap_or_else(|| field.data_type().clone()),
+            nullable: field.is_nullable(),
+            write_default: write_defaults.get(field.name()).cloned(),
+            logical_type: None,
         })
         .collect()
 }
@@ -1853,36 +1501,21 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
     })
 }
 
-fn commit_op_kind_for_overwrite_mode(overwrite_mode: IcebergWriteMode) -> CommitOpKind {
+/// The durable operation-journal kind for a SQL write mode.
+///
+/// This used to route through `CommitOpKind`, the provider's physical commit
+/// vocabulary. `IcebergOperationKind` is Core's own durable journal type, so the
+/// mapping is now keyed on the Core-owned write mode directly and the physical
+/// commit vocabulary stays inside the provider. The three reachable outcomes are
+/// unchanged: append maps to InsertAppend, both overwrite shapes to
+/// InsertOverwrite.
+fn operation_kind_for_overwrite_mode(overwrite_mode: IcebergWriteMode) -> IcebergOperationKind {
     match overwrite_mode {
-        IcebergWriteMode::DynamicPartitionOverwrite => CommitOpKind::OverwritePartitions,
-        IcebergWriteMode::FullTableOverwrite => CommitOpKind::Overwrite,
-        IcebergWriteMode::Append => CommitOpKind::FastAppend,
-    }
-}
-
-fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind {
-    match kind {
-        CommitOpKind::FastAppend => IcebergOperationKind::InsertAppend,
-        CommitOpKind::Overwrite | CommitOpKind::OverwritePartitions => {
+        IcebergWriteMode::Append => IcebergOperationKind::InsertAppend,
+        IcebergWriteMode::FullTableOverwrite | IcebergWriteMode::DynamicPartitionOverwrite => {
             IcebergOperationKind::InsertOverwrite
         }
-        _ => IcebergOperationKind::Maintenance,
     }
-}
-
-fn write_base_snapshot_id(
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    target_ref: &str,
-) -> Result<Option<i64>, String> {
-    if target_ref == "main" {
-        return Ok(metadata.current_snapshot().map(|s| s.snapshot_id()));
-    }
-    metadata
-        .refs()
-        .get(target_ref)
-        .map(|snapshot_ref| Some(snapshot_ref.snapshot_id))
-        .ok_or_else(|| format!("iceberg ref: branch '{target_ref}' not found in table metadata"))
 }
 
 pub(crate) fn invalidate_iceberg_caches(
@@ -1904,35 +1537,6 @@ pub(crate) fn invalidate_iceberg_caches(
 
 fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
-}
-
-pub(crate) fn data_file_to_written_file(
-    df: &DataFile,
-    partition_spec_id: i32,
-) -> Result<WrittenFile, String> {
-    Ok(WrittenFile {
-        path: df.file_path().to_string(),
-        format: df.file_format(),
-        content: df.content_type(),
-        partition_values: df.partition().clone(),
-        partition_spec_id,
-        record_count: df.record_count(),
-        file_size_in_bytes: df.file_size_in_bytes(),
-        split_offsets: df.split_offsets().map(|s| s.to_vec()).unwrap_or_default(),
-        column_sizes: df.column_sizes().clone(),
-        value_counts: df.value_counts().clone(),
-        null_value_counts: df.null_value_counts().clone(),
-        nan_value_counts: df.nan_value_counts().clone(),
-        lower_bounds: df.lower_bounds().clone(),
-        upper_bounds: df.upper_bounds().clone(),
-        key_metadata: df.key_metadata().map(|s| s.to_vec()),
-        referenced_data_file: df.referenced_data_file().map(|s| s.to_string()),
-        equality_ids: df.equality_ids(),
-        first_row_id: df.first_row_id(),
-        content_offset: None,
-        content_size_in_bytes: None,
-        cardinality: None,
-    })
 }
 
 pub(crate) fn run_select_to_chunks(
@@ -1957,61 +1561,6 @@ pub(crate) fn run_select_to_chunks(
         None,
     )?;
     query_result_to_chunks(result)
-}
-
-pub(crate) struct AbortCleanupOperator {
-    pub(crate) fs: novarocks_connector_iceberg::opendal::Operator,
-    pub(crate) path_mapper: Option<CleanupPathMapper>,
-}
-
-pub(crate) fn build_abort_cleanup_for_catalog_entry(
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-) -> Result<AbortCleanupOperator, String> {
-    if let Some(s3_config) = entry.object_store_config() {
-        let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
-            &entry.warehouse_uri,
-            Some(s3_config),
-        )
-        .map_err(|e| format!("resolve warehouse URI for iceberg abort cleanup: {e}"))?;
-        let bucket = access
-            .handle()
-            .authority()
-            .ok_or_else(|| {
-                format!(
-                    "resolve warehouse URI for iceberg abort cleanup missing bucket: {}",
-                    entry.warehouse_uri
-                )
-            })?
-            .to_string();
-        let fs = access.operator();
-        let mapper: CleanupPathMapper = Arc::new(move |path| {
-            novarocks_fs::parse_object_store_path_parse_only(path)
-                .ok()
-                .and_then(|(actual_bucket, key)| {
-                    if actual_bucket == bucket {
-                        Some(key)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| path.to_string())
-        });
-        return Ok(AbortCleanupOperator {
-            fs,
-            path_mapper: Some(mapper),
-        });
-    }
-
-    let fs = novarocks_fs::FsAccessResolver::new()
-        .resolve_location("/__novarocks_local_root__", None)
-        .map_err(|error| format!("build local-FS operator failed: {error}"))?
-        .operator();
-    let mapper: CleanupPathMapper =
-        Arc::new(|path: &str| path.strip_prefix("file://").unwrap_or(path).to_string());
-    Ok(AbortCleanupOperator {
-        fs,
-        path_mapper: Some(mapper),
-    })
 }
 
 #[cfg(test)]
@@ -2066,253 +1615,6 @@ mod tests {
                 .map(|(name, data_type)| Arc::new(Field::new(name, data_type, true)))
                 .collect::<Vec<_>>(),
         ))
-    }
-
-    #[test]
-    fn branch_write_uses_the_branch_head_as_its_base_snapshot() {
-        let metadata = crate::connector::iceberg::test_metadata::metadata_with_two_snapshots()
-            .into_builder(None)
-            .set_ref(
-                "dev",
-                SnapshotReference::new(1, SnapshotRetention::branch(None, None, None)),
-            )
-            .expect("add dev branch")
-            .build()
-            .expect("build metadata with dev branch")
-            .metadata;
-
-        assert_eq!(write_base_snapshot_id(&metadata, "main").unwrap(), Some(2));
-        assert_eq!(write_base_snapshot_id(&metadata, "dev").unwrap(), Some(1));
-    }
-
-    fn test_iceberg_metadata_with_identity_partition(
-        source_column_name: &str,
-        source_field_id: i32,
-        partition_spec_id: i32,
-    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
-        test_iceberg_metadata_with_partition(
-            source_column_name,
-            source_column_name,
-            novarocks_connector_iceberg::iceberg::spec::Transform::Identity,
-            source_field_id,
-            partition_spec_id,
-        )
-    }
-
-    fn test_iceberg_metadata_with_partition(
-        source_column_name: &str,
-        partition_field_name: &str,
-        transform: novarocks_connector_iceberg::iceberg::spec::Transform,
-        source_field_id: i32,
-        partition_spec_id: i32,
-    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        source_field_id,
-                        source_column_name,
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-                        ),
-                    ),
-                ),
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
-                        source_field_id + 1,
-                        "v",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("schema");
-        let partition_spec = novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(
-            Arc::new(schema.clone()),
-        )
-        .with_spec_id(partition_spec_id)
-        .add_partition_field(source_column_name, partition_field_name, transform)
-        .expect("partition field")
-        .build()
-        .expect("partition spec");
-        let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
-            .name("t".to_string())
-            .location("file:///warehouse/db/t".to_string())
-            .schema(schema)
-            .partition_spec(partition_spec.into_unbound())
-            .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3)
-            .build();
-        let metadata =
-            novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::from_table_creation(
-                creation,
-            )
-            .expect("metadata builder")
-            .build()
-            .expect("metadata")
-            .metadata;
-        retag_test_metadata_partition_source(metadata, source_field_id, partition_spec_id)
-    }
-
-    fn retag_test_metadata_partition_source(
-        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-        source_field_id: i32,
-        partition_spec_id: i32,
-    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
-        // TableMetadataBuilder::from_table_creation intentionally reassigns
-        // field and spec ids; this fixture retags serialized metadata so tests
-        // can assert planner descriptors carry target-table ids verbatim.
-        let mut value = serde_json::to_value(metadata).expect("metadata json");
-        let object = value.as_object_mut().expect("metadata object");
-        object.insert(
-            "default-spec-id".to_string(),
-            serde_json::Value::from(partition_spec_id),
-        );
-        object.insert(
-            "last-column-id".to_string(),
-            serde_json::Value::from(source_field_id + 1),
-        );
-
-        let schemas = object
-            .get_mut("schemas")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("schemas array");
-        let schema_fields = schemas[0]
-            .as_object_mut()
-            .and_then(|schema| schema.get_mut("fields"))
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("schema fields");
-        schema_fields[0]
-            .as_object_mut()
-            .expect("first field")
-            .insert("id".to_string(), serde_json::Value::from(source_field_id));
-        schema_fields[1]
-            .as_object_mut()
-            .expect("second field")
-            .insert(
-                "id".to_string(),
-                serde_json::Value::from(source_field_id + 1),
-            );
-
-        let specs = object
-            .get_mut("partition-specs")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("partition specs");
-        let spec = specs[0].as_object_mut().expect("partition spec object");
-        spec.insert(
-            "spec-id".to_string(),
-            serde_json::Value::from(partition_spec_id),
-        );
-        let partition_fields = spec
-            .get_mut("fields")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("partition fields");
-        partition_fields[0]
-            .as_object_mut()
-            .expect("partition field")
-            .insert(
-                "source-id".to_string(),
-                serde_json::Value::from(source_field_id),
-            );
-
-        serde_json::from_value(value).expect("retagged metadata")
-    }
-
-    fn test_iceberg_target() -> TargetBackend {
-        TargetBackend {
-            backend_name: "iceberg",
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "target_orders".to_string(),
-        }
-    }
-
-    fn test_resolved_table(columns: Vec<ColumnDef>) -> ResolvedTable {
-        ResolvedTable {
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "target_orders".to_string(),
-            columns,
-            statistics_pin: None,
-        }
-    }
-
-    fn test_iceberg_table(
-        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    ) -> novarocks_connector_iceberg::iceberg::table::Table {
-        novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(TableIdent::new(
-                NamespaceIdent::new("test_db".to_string()),
-                "target_orders".to_string(),
-            ))
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("iceberg table")
-    }
-
-    fn test_iceberg_catalog_entry() -> IcebergCatalogEntry {
-        let warehouse = tempfile::TempDir::new().expect("warehouse tempdir");
-        crate::connector::iceberg::catalog::registry::build_catalog_entry(
-            "test_catalog",
-            &[
-                ("type".to_string(), "iceberg".to_string()),
-                (
-                    "iceberg.catalog.warehouse".to_string(),
-                    warehouse.path().display().to_string(),
-                ),
-            ],
-        )
-        .expect("iceberg catalog entry")
-    }
-
-    fn assert_position_delete_output_field(
-        field: &novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteOutputField,
-        output_expr_index: i32,
-        name: &str,
-        data_type: &DataType,
-        field_id: i32,
-    ) {
-        assert_eq!(field.output_expr_index, output_expr_index as usize);
-        assert_eq!(field.name, name);
-        assert_eq!(&field.data_type, data_type);
-        assert_eq!(field.field_id, field_id);
-    }
-
-    fn assert_position_delete_descriptor_contract(
-        desc: &novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
-    ) {
-        use novarocks_connector_iceberg::position_delete_descriptor::{
-            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-            ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        };
-
-        assert_eq!(desc.target_partition_spec_id, 7);
-        assert_position_delete_output_field(
-            &desc.file_path,
-            0,
-            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
-            &DataType::Utf8,
-            ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-        );
-        assert_position_delete_output_field(
-            &desc.pos,
-            1,
-            ICEBERG_POSITION_DELETE_POS_COLUMN,
-            &DataType::Int64,
-            ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        );
-        let partition_field = desc
-            .partition_source_fields
-            .first()
-            .expect("partition source field");
-        assert_eq!(partition_field.output_expr_index, 2);
-        assert_eq!(partition_field.source_column_name, "id");
-        assert_eq!(partition_field.partition_field_name, "id_bucket");
-        assert_eq!(partition_field.transform_expr, "bucket[8]");
-        assert_eq!(partition_field.source_field_id, 42);
-        assert_eq!(partition_field.data_type, DataType::Int32);
     }
 
     #[test]
@@ -2715,104 +2017,6 @@ mod tests {
         assert!(
             !rendered.contains("CAST(CAST(NULL"),
             "omitted complex columns must not produce nested casts, got: {rendered}"
-        );
-    }
-
-    #[test]
-    fn insert_writer_columns_follow_fresh_iceberg_schema_after_external_evolution() {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                std::sync::Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        1,
-                        "amount",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
-                        ),
-                    ),
-                ),
-                std::sync::Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        2,
-                        "id",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-                        ),
-                    ),
-                ),
-                std::sync::Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
-                        3,
-                        "category",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("schema");
-
-        let columns =
-            iceberg_insert_columns_from_schema(&schema, &HashMap::new()).expect("columns");
-        let names = columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>();
-        let types = columns
-            .iter()
-            .map(|column| column.data_type.clone())
-            .collect::<Vec<_>>();
-        let nullable = columns
-            .iter()
-            .map(|column| column.nullable)
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["amount", "id", "category"]);
-        assert_eq!(
-            types,
-            vec![DataType::Int64, DataType::Int32, DataType::Utf8]
-        );
-        assert_eq!(nullable, vec![false, false, true]);
-    }
-    /// Relocated from `query_planning/write_sink.rs`, whose test module held it
-    /// even though the whole body exercises
-    /// [`iceberg_insert_columns_from_schema`] above. Hidden MV target fields
-    /// must survive the schema projection that INSERT column binding depends on.
-    #[test]
-    fn sqlx2_write_binding_preserves_hidden_mv_target_fields() {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        1,
-                        "region",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        2,
-                        "__nova_base_row_id",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("target schema");
-        let fields = iceberg_insert_columns_from_schema(&schema, &std::collections::HashMap::new())
-            .expect("target columns");
-
-        assert_eq!(
-            fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["region", "__nova_base_row_id"]
         );
     }
 }

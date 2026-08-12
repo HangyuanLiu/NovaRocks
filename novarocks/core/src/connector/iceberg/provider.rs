@@ -8935,6 +8935,14 @@ fn map_iceberg_error(error: String) -> ConnectorError {
         || normalized.contains("iceberg internal metadata key")
         || normalized.contains("novarocks.* namespace is reserved")
         || normalized.contains("variant columns cannot appear in the partition spec")
+        // Partition-spec evolution rejections raised by
+        // `build_evolved_partition_spec` before any commit is dispatched. These
+        // reach this classifier now that ALTER TABLE ADD PARTITION COLUMN stopped
+        // duplicating the check in the SQL layer; without them the same
+        // rejections would be reported as commit-unknown rather than as the
+        // validation errors they are.
+        || normalized.contains("temporal partition transform requires")
+        || normalized.contains("already exists in current default spec")
     {
         // These are local Iceberg semantic rejections, before any catalog
         // commit can have been dispatched.  Keeping them out of the unknown

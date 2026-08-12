@@ -601,11 +601,12 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             let staged_table = &prepared.staged.table;
             let ident = staged_table.identifier();
             let staged_schema = staged_table.metadata().current_schema();
-            let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
-                staged_schema,
-                &staged_write_defaults(staged_schema).map_err(internal)?,
-            )
-            .map_err(internal)?;
+            let columns =
+                crate::connector::iceberg::catalog::registry::iceberg_insert_columns_from_schema(
+                    staged_schema,
+                    &staged_write_defaults(staged_schema).map_err(internal)?,
+                )
+                .map_err(internal)?;
             let sink_spec = staged_data_sink_spec(
                 self.descriptor.instance_id.as_str(),
                 staged_table,
@@ -635,7 +636,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 .with_table_metadata(metadata.clone()),
             );
             let cleanup =
-                crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
+                crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(entry)
                     .map_err(internal)?;
             let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> =
                 prepared.staged.catalog.clone();

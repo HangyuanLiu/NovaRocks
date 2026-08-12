@@ -266,9 +266,15 @@ fn ensure_update_properties_require_v3_row_lineage(
 /// partition spec. Multiple historical specs (partition evolution) require
 /// per-file spec routing in the writer that we don't have yet.
 pub fn ensure_single_partition_spec(table: &Table) -> Result<(), String> {
-    let m = table.metadata();
-    let default_id = m.default_partition_spec_id();
-    let other = m
+    ensure_single_partition_spec_from_metadata(table.metadata())
+}
+
+/// [`ensure_single_partition_spec`] for callers that hold frozen metadata
+/// rather than a live catalog table, such as write preparation working from an
+/// already-admitted table payload.
+pub fn ensure_single_partition_spec_from_metadata(metadata: &TableMetadata) -> Result<(), String> {
+    let default_id = metadata.default_partition_spec_id();
+    let other = metadata
         .partition_specs_iter()
         .filter(|s| s.spec_id() != default_id)
         .count();
@@ -283,13 +289,27 @@ pub fn ensure_single_partition_spec(table: &Table) -> Result<(), String> {
 }
 
 pub fn ensure_overwrite_single_partition_spec(table: &Table) -> Result<(), String> {
-    ensure_single_partition_spec(table).map_err(|err| {
+    ensure_overwrite_single_partition_spec_from_metadata(table.metadata())
+}
+
+/// [`ensure_overwrite_single_partition_spec`] for callers that hold frozen metadata.
+pub fn ensure_overwrite_single_partition_spec_from_metadata(
+    metadata: &TableMetadata,
+) -> Result<(), String> {
+    ensure_single_partition_spec_from_metadata(metadata).map_err(|err| {
         format!("INSERT OVERWRITE on an evolved Iceberg table is not supported yet: {err}")
     })
 }
 
 pub fn ensure_equality_delete_single_partition_spec(table: &Table) -> Result<(), String> {
-    ensure_single_partition_spec(table).map_err(|err| {
+    ensure_equality_delete_single_partition_spec_from_metadata(table.metadata())
+}
+
+/// [`ensure_equality_delete_single_partition_spec`] for callers that hold frozen metadata.
+pub fn ensure_equality_delete_single_partition_spec_from_metadata(
+    metadata: &TableMetadata,
+) -> Result<(), String> {
+    ensure_single_partition_spec_from_metadata(metadata).map_err(|err| {
         format!("ADD EQUALITY DELETE on an evolved Iceberg table is not supported yet: {err}")
     })
 }
@@ -302,7 +322,12 @@ pub fn ensure_equality_delete_single_partition_spec(table: &Table) -> Result<(),
 /// property. When absent, we accept (no manifest walk yet — that belongs to
 /// Tasks 9/10). Empty table (no current snapshot) → accept.
 pub fn ensure_no_equality_deletes(table: &Table) -> Result<(), String> {
-    let snap = match table.metadata().current_snapshot() {
+    ensure_no_equality_deletes_from_metadata(table.metadata())
+}
+
+/// [`ensure_no_equality_deletes`] for callers that hold frozen metadata.
+pub fn ensure_no_equality_deletes_from_metadata(metadata: &TableMetadata) -> Result<(), String> {
+    let snap = match metadata.current_snapshot() {
         Some(s) => s,
         None => return Ok(()), // empty table — no manifests to inspect
     };
