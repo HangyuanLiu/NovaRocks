@@ -50,6 +50,7 @@ pub mod loaded_table;
 pub mod manifest;
 pub mod metadata_batch_reader;
 pub mod metadata_read;
+pub mod mv_publication_fencing;
 pub mod planning_facts;
 pub mod position_delete;
 pub mod position_delete_descriptor;

@@ -24,12 +24,12 @@ use super::{
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorViewMetadata,
-    ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
+    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -235,6 +235,7 @@ pub struct ConnectorControlBinding {
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
+    mv_publication_fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
@@ -419,6 +420,7 @@ impl ConnectorControlBinding {
             write,
             statistics,
             staged_publication_recovery: None,
+            mv_publication_fencing: None,
             view_metadata: None,
         })
     }
@@ -707,6 +709,31 @@ impl ConnectorControlBinding {
         &self,
     ) -> Option<&Arc<dyn ConnectorStagedPublicationRecovery>> {
         self.staged_publication_recovery.as_ref()
+    }
+
+    /// Installs the provider-owned external MV publication fence.
+    ///
+    /// It is a builder for the same reason staged-publication recovery is: it
+    /// keeps the existing control-binding constructors intact. Establishing a
+    /// fence and publishing under it are control-plane external mutations, so
+    /// this facet deliberately never reaches a BE execution binding.
+    pub fn try_with_mv_publication_fencing(
+        mut self,
+        fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(fencing) = &fencing {
+            super::mv_publication_fencing::validate_mv_publication_fencing_owner(
+                &self.descriptor,
+                self.incarnation,
+                fencing.as_ref(),
+            )?;
+        }
+        self.mv_publication_fencing = fencing;
+        Ok(self)
+    }
+
+    pub fn mv_publication_fencing(&self) -> Option<&Arc<dyn ConnectorMvPublicationFencing>> {
+        self.mv_publication_fencing.as_ref()
     }
 
     pub fn execution_declaration(

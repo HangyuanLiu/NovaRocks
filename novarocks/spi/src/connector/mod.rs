@@ -29,6 +29,7 @@ mod identity;
 mod metadata;
 mod metadata_maintenance;
 mod mutation;
+mod mv_publication_fencing;
 mod predicate;
 mod read;
 mod read_session;
@@ -152,6 +153,19 @@ pub use mutation::{
     ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+};
+pub use mv_publication_fencing::{
+    CONNECTOR_MV_PUBLICATION_FENCING_CONTRACT_VERSION, ConnectorMvPublicationDisposition,
+    ConnectorMvPublicationFenceGeneration, ConnectorMvPublicationFenceOrder,
+    ConnectorMvPublicationFenceReceipt, ConnectorMvPublicationFenceRequest,
+    ConnectorMvPublicationFencing, ConnectorMvPublicationFencingLease,
+    ConnectorMvPublicationFencingResolver, ConnectorMvPublicationInspectRequest,
+    ConnectorMvPublicationInspection, ConnectorMvPublicationOperation,
+    ConnectorMvPublicationPermit, ConnectorMvPublicationTargetObservation,
+    ConnectorMvPublicationTargetRequest, ConnectorMvRefreshAttemptId,
+    ConnectorMvRefreshPublicationReceipt, ConnectorMvRefreshPublicationRequest,
+    ConnectorMvRefreshResourceIdentity, ESTABLISH_MV_PUBLICATION_FENCE_KIND,
+    PUBLISH_MV_REFRESH_KIND,
 };
 pub use predicate::{
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,

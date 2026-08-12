@@ -50,6 +50,7 @@
 use std::collections::BTreeMap;
 
 use crate::iceberg::spec::Snapshot;
+use novarocks_spi::connector::ConnectorMvPublicationPermit;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -158,26 +159,7 @@ impl MvProvenanceV1 {
     /// the hash the W0 harness exposes as `WaterlineHash` — it changes
     /// exactly when the consumed base state changes.
     pub fn waterline_hash(&self) -> Result<String, String> {
-        let mut waterline_bases: Vec<WaterlineBase> = self
-            .bases
-            .iter()
-            .map(|base| WaterlineBase {
-                table_fqn: base.table_fqn.clone(),
-                uuid: base.uuid.clone(),
-                to_snapshot: base.to_snapshot,
-            })
-            .collect();
-        waterline_bases.sort_by(|left, right| {
-            (left.table_fqn.as_str(), left.uuid.as_str())
-                .cmp(&(right.table_fqn.as_str(), right.uuid.as_str()))
-        });
-
-        let value = serde_json::to_value(&waterline_bases)
-            .map_err(|err| format!("failed to serialize MV provenance waterline: {err}"))?;
-        let canonical_json = serde_json::to_string(&sort_json_value(value)).map_err(|err| {
-            format!("failed to render canonical MV provenance waterline JSON: {err}")
-        })?;
-        Ok(hex_encode(&Sha256::digest(canonical_json.as_bytes())))
+        waterline_hash_for(&self.bases)
     }
 
     pub fn to_canonical_json(&self) -> Result<String, String> {
@@ -200,7 +182,197 @@ impl MvProvenanceV1 {
     }
 }
 
-fn sort_json_value(value: Value) -> Value {
+pub const MV_PROVENANCE_V2_PROP: &str = "novarocks.mv.provenance.v2";
+pub const MV_PROVENANCE_V2_VERSION: u16 = 2;
+
+/// The stable identity a V2 staged snapshot must prove before it may be
+/// published.
+///
+/// This is the provider-side projection of the SPI publication permit: resource
+/// domain, ownership generation, attempt, and the exact permit digest. It exists
+/// as its own type so the four-way publication guard compares one object rather
+/// than eight loose fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvPublicationV2Identity {
+    pub resource_digest: String,
+    pub target_table_uuid: String,
+    pub cluster_digest: String,
+    pub control_plane_incarnation: u64,
+    pub resource_epoch: u64,
+    pub token_digest: String,
+    pub attempt_id: String,
+    pub permit_digest: String,
+}
+
+impl MvPublicationV2Identity {
+    pub fn from_permit(permit: &ConnectorMvPublicationPermit) -> Self {
+        let resource = permit.resource();
+        let generation = permit.generation();
+        Self {
+            resource_digest: hex_encode(&resource.digest()),
+            target_table_uuid: resource.target_table_uuid().to_string(),
+            cluster_digest: hex_encode(&generation.cluster_digest()),
+            control_plane_incarnation: generation.control_plane_incarnation(),
+            resource_epoch: generation.resource_epoch(),
+            token_digest: hex_encode(&generation.token_digest()),
+            attempt_id: hex_encode(&permit.attempt().to_bytes()),
+            permit_digest: hex_encode(&permit.digest()),
+        }
+    }
+}
+
+/// Per-refresh provenance record for externally fenced publication.
+///
+/// V2 is not a superset of V1: it deliberately drops `refresh_id` / `mv_id` /
+/// `token` as authoritative identity, because a StateStore rebuild reassigns
+/// the numeric MV ID and therefore cannot anchor an external fence. Instead it
+/// carries the stable resource, the ownership generation, and the permit that
+/// authorized the publication.
+///
+/// A V2 attempt never also writes a V1 authoritative record: two authoritative
+/// identity schemas on one snapshot would leave "which one wins" undefined.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvProvenanceV2 {
+    pub provenance_version: u16,
+    pub resource_digest: String,
+    pub target_table_uuid: String,
+    pub cluster_digest: String,
+    pub control_plane_incarnation: u64,
+    pub resource_epoch: u64,
+    pub token_digest: String,
+    pub attempt_id: String,
+    pub permit_digest: String,
+    pub technique: RefreshTechnique,
+    pub bases: Vec<ProvenanceBase>,
+    pub definition_fingerprint: String,
+    pub rows: i64,
+}
+
+impl MvProvenanceV2 {
+    pub fn new(
+        identity: &MvPublicationV2Identity,
+        technique: RefreshTechnique,
+        bases: Vec<ProvenanceBase>,
+        definition_fingerprint: String,
+        rows: i64,
+    ) -> Self {
+        Self {
+            provenance_version: MV_PROVENANCE_V2_VERSION,
+            resource_digest: identity.resource_digest.clone(),
+            target_table_uuid: identity.target_table_uuid.clone(),
+            cluster_digest: identity.cluster_digest.clone(),
+            control_plane_incarnation: identity.control_plane_incarnation,
+            resource_epoch: identity.resource_epoch,
+            token_digest: identity.token_digest.clone(),
+            attempt_id: identity.attempt_id.clone(),
+            permit_digest: identity.permit_digest.clone(),
+            technique,
+            bases,
+            definition_fingerprint,
+            rows,
+        }
+    }
+
+    pub fn identity(&self) -> MvPublicationV2Identity {
+        MvPublicationV2Identity {
+            resource_digest: self.resource_digest.clone(),
+            target_table_uuid: self.target_table_uuid.clone(),
+            cluster_digest: self.cluster_digest.clone(),
+            control_plane_incarnation: self.control_plane_incarnation,
+            resource_epoch: self.resource_epoch,
+            token_digest: self.token_digest.clone(),
+            attempt_id: self.attempt_id.clone(),
+            permit_digest: self.permit_digest.clone(),
+        }
+    }
+
+    /// Emits only the V2 key. V1's narrow marker keys are intentionally absent.
+    pub fn to_summary_properties(&self) -> Result<BTreeMap<String, String>, String> {
+        Ok(BTreeMap::from([(
+            MV_PROVENANCE_V2_PROP.to_string(),
+            self.to_canonical_json()?,
+        )]))
+    }
+
+    pub fn from_snapshot_summary(snapshot: &Snapshot) -> Result<Option<Self>, String> {
+        let Some(raw) = snapshot
+            .summary()
+            .additional_properties
+            .get(MV_PROVENANCE_V2_PROP)
+        else {
+            return Ok(None);
+        };
+        Self::from_json(raw).map(Some)
+    }
+
+    pub fn to_canonical_json(&self) -> Result<String, String> {
+        let value = serde_json::to_value(self)
+            .map_err(|err| format!("failed to serialize MV provenance v2: {err}"))?;
+        serde_json::to_string(&sort_json_value(value))
+            .map_err(|err| format!("failed to render canonical MV provenance v2 JSON: {err}"))
+    }
+
+    pub fn from_json(raw: &str) -> Result<Self, String> {
+        let record: Self = serde_json::from_str(raw)
+            .map_err(|err| format!("failed to parse MV provenance v2 JSON: {err}"))?;
+        if record.provenance_version != MV_PROVENANCE_V2_VERSION {
+            return Err(format!(
+                "unsupported MV provenance v2 version: expected {}, got {}",
+                MV_PROVENANCE_V2_VERSION, record.provenance_version
+            ));
+        }
+        Ok(record)
+    }
+
+    pub fn content_hash(&self) -> Result<String, String> {
+        let canonical_json = self.to_canonical_json()?;
+        Ok(hex_encode(&Sha256::digest(canonical_json.as_bytes())))
+    }
+
+    pub fn waterline_hash(&self) -> Result<String, String> {
+        waterline_hash_for(&self.bases)
+    }
+
+    pub fn with_rows(&self, rows: i64) -> Result<Self, String> {
+        if rows < 0 {
+            return Err("MV provenance row count cannot be negative".to_string());
+        }
+        let mut updated = self.clone();
+        updated.rows = rows;
+        Ok(updated)
+    }
+}
+
+/// Sha256 hex over the canonical watermark-only projection of `bases`.
+///
+/// Shared by V1 and V2 provenance: the waterline is a property of the consumed
+/// base state, so both record versions must produce the identical hash for the
+/// identical watermark set.
+pub fn waterline_hash_for(bases: &[ProvenanceBase]) -> Result<String, String> {
+    let mut waterline_bases: Vec<WaterlineBase> = bases
+        .iter()
+        .map(|base| WaterlineBase {
+            table_fqn: base.table_fqn.clone(),
+            uuid: base.uuid.clone(),
+            to_snapshot: base.to_snapshot,
+        })
+        .collect();
+    waterline_bases.sort_by(|left, right| {
+        (left.table_fqn.as_str(), left.uuid.as_str())
+            .cmp(&(right.table_fqn.as_str(), right.uuid.as_str()))
+    });
+
+    let value = serde_json::to_value(&waterline_bases)
+        .map_err(|err| format!("failed to serialize MV provenance waterline: {err}"))?;
+    let canonical_json = serde_json::to_string(&sort_json_value(value))
+        .map_err(|err| format!("failed to render canonical MV provenance waterline JSON: {err}"))?;
+    Ok(hex_encode(&Sha256::digest(canonical_json.as_bytes())))
+}
+
+/// Recursively key-sorts a JSON value so two records with identical content
+/// always render to identical bytes. Shared with the MV publication fence
+/// marker so both canonical encodings are produced by one implementation.
+pub(crate) fn sort_json_value(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(sort_json_value).collect()),
         Value::Object(object) => {
@@ -220,7 +392,7 @@ fn sort_json_value(value: Value) -> Value {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut encoded = String::with_capacity(bytes.len() * 2);
