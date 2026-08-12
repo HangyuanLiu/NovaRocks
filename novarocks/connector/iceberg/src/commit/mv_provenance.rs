@@ -333,6 +333,24 @@ impl MvProvenanceV2 {
         waterline_hash_for(&self.bases)
     }
 
+    /// Rebuilds the ownership generation this record names.
+    ///
+    /// Goes through the contract's own constructor so generation ordering has one
+    /// implementation, whether it is applied to a fence marker or to provenance.
+    pub fn generation_from_digests(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMvPublicationFenceGeneration, String> {
+        let cluster = decode_hex_digest(&self.cluster_digest, "cluster digest")?;
+        let token = decode_hex_digest(&self.token_digest, "token digest")?;
+        novarocks_spi::connector::ConnectorMvPublicationFenceGeneration::try_from_digests(
+            cluster,
+            self.control_plane_incarnation,
+            self.resource_epoch,
+            token,
+        )
+        .map_err(|error| format!("MV provenance v2 names an invalid generation: {error}"))
+    }
+
     pub fn with_rows(&self, rows: i64) -> Result<Self, String> {
         if rows < 0 {
             return Err("MV provenance row count cannot be negative".to_string());
@@ -341,6 +359,20 @@ impl MvProvenanceV2 {
         updated.rows = rows;
         Ok(updated)
     }
+}
+
+fn decode_hex_digest(value: &str, field: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err(format!(
+            "MV provenance v2 {field} must be 64 hex characters"
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, slot) in digest.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| format!("MV provenance v2 {field} is not valid hex"))?;
+    }
+    Ok(digest)
 }
 
 /// Sha256 hex over the canonical watermark-only projection of `bases`.

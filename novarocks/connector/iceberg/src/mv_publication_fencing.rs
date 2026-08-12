@@ -39,11 +39,13 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorInstanceIncarnation, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMvPublicationDisposition, ConnectorMvPublicationFenceGeneration,
-    ConnectorMvPublicationFenceReceipt, ConnectorMvPublicationFenceRequest,
-    ConnectorMvPublicationFencing, ConnectorMvPublicationInspectRequest,
-    ConnectorMvPublicationInspection, ConnectorMvPublicationOperation,
-    ConnectorMvPublicationTargetObservation, ConnectorMvPublicationTargetRequest,
+    ConnectorMvAttemptDiscovery, ConnectorMvAttemptDiscoveryRequest, ConnectorMvAttemptPage,
+    ConnectorMvAttemptSummary, ConnectorMvPublicationDisposition,
+    ConnectorMvPublicationFenceGeneration, ConnectorMvPublicationFenceReceipt,
+    ConnectorMvPublicationFenceRequest, ConnectorMvPublicationFencing,
+    ConnectorMvPublicationInspectRequest, ConnectorMvPublicationInspection,
+    ConnectorMvPublicationOperation, ConnectorMvPublicationTargetObservation,
+    ConnectorMvPublicationTargetRequest, ConnectorMvRefreshAttemptId,
     ConnectorMvRefreshPublicationReceipt, ConnectorMvRefreshPublicationRequest,
     ConnectorMvRefreshResourceIdentity, ESTABLISH_MV_PUBLICATION_FENCE_KIND,
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
@@ -53,8 +55,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::commit::{
     MvProvenanceV2, MvPublicationError, MvPublicationFencePlan, MvPublicationOperationStatus,
-    MvRefreshPublishV2Plan, classify_fence_operation, establish_publication_fence, observe_fence,
-    publish_staging_branch_to_main_v2,
+    MvRefreshPublishV2Plan, classify_fence_operation, establish_publication_fence,
+    observe_attempt_refs, observe_fence, publish_staging_branch_to_main_v2, scan_attempt_page,
 };
 use crate::control_provider::{IcebergControlProvider, staged_publication_target_ancestors};
 
@@ -548,6 +550,112 @@ impl ConnectorMvPublicationFencing for IcebergMvPublicationFencing {
     }
 }
 
+/// Target-scoped attempt discovery, on the same capability owner as fencing.
+///
+/// Deliberately not a second MV capability family: discovery and fencing share
+/// the provider, the stable resource vocabulary, and the same freshness
+/// requirement, so they share one implementor.
+impl ConnectorMvAttemptDiscovery for IcebergMvPublicationFencing {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        self.provider.descriptor()
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.provider.incarnation()
+    }
+
+    fn discover_attempts(
+        &self,
+        request: ConnectorMvAttemptDiscoveryRequest,
+    ) -> Result<ConnectorMvAttemptPage, ConnectorError> {
+        self.provider.validate_context(&request.context)?;
+        request.validate()?;
+        let (namespace, table) = self.table_location(&request.table)?;
+        // Discovery decides whether artifacts are abandoned, so it must never
+        // read a cached metadata pointer.
+        let loaded = self.load_fresh(&namespace, &table)?;
+        let metadata = loaded.table.metadata();
+
+        // A DROP/recreate under the same name is a different fence domain. Its
+        // refs are not this resource's attempts, and reporting them as such could
+        // get another target's data deleted.
+        if metadata.uuid() != request.resource.target_table_uuid() {
+            return ConnectorMvAttemptPage::try_new(
+                request.resource,
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                Some(novarocks_spi::connector::ConnectorMvAttemptScanLimit::StorageUnavailable),
+            );
+        }
+
+        let observed = observe_attempt_refs(metadata).map_err(corrupt)?;
+        let after = match &request.continuation {
+            Some(continuation) => Some(decode_attempt_cursor(continuation.payload())?),
+            None => None,
+        };
+        let page = scan_attempt_page(&observed, &request.resource, request.page_size, after)
+            .map_err(corrupt)?;
+
+        let mut attempts = Vec::with_capacity(page.attempts.len());
+        for scanned in &page.attempts {
+            let generation = scanned
+                .provenance
+                .generation_from_digests()
+                .map_err(corrupt)?;
+            let staged_version =
+                committed_version("staged", scanned.staged_snapshot_id).map_err(corrupt)?;
+            attempts.push(ConnectorMvAttemptSummary::try_new(
+                scanned.attempt,
+                generation,
+                Some(staged_version),
+                crate::commit::MV_PROVENANCE_V2_VERSION,
+            )?);
+        }
+
+        let current_visible_version = metadata
+            .current_snapshot()
+            .map(|snapshot| committed_version("target", snapshot.snapshot_id()))
+            .transpose()
+            .map_err(corrupt)?;
+        let established_generation = match observe_fence(metadata).map_err(corrupt)? {
+            Some(fence) => Some(fence.marker.generation().map_err(corrupt)?),
+            None => None,
+        };
+        let continuation = match page.next_after {
+            Some(cursor) => Some(
+                novarocks_spi::connector::ConnectorMvAttemptContinuation::try_new(Bytes::from(
+                    cursor.to_bytes().to_vec(),
+                ))?,
+            ),
+            None => None,
+        };
+
+        ConnectorMvAttemptPage::try_new(
+            request.resource,
+            attempts,
+            current_visible_version,
+            established_generation,
+            continuation,
+            page.complete,
+            page.limit,
+        )
+    }
+}
+
+/// Decodes the opaque continuation back into its attempt cursor.
+fn decode_attempt_cursor(payload: &Bytes) -> Result<ConnectorMvRefreshAttemptId, ConnectorError> {
+    let bytes: [u8; 16] = payload.as_ref().try_into().map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg MV attempt continuation is not a valid cursor",
+        )
+    })?;
+    ConnectorMvRefreshAttemptId::try_from_bytes(bytes)
+}
+
 fn build_inspection(
     request: &ConnectorMvPublicationInspectRequest,
     operation: ConnectorMvPublicationOperation,
@@ -723,6 +831,28 @@ mod tests {
             IcebergMvPublicationOperationV1::Publish.spi(),
             ConnectorMvPublicationOperation::Publish
         );
+    }
+
+    #[test]
+    fn attempt_cursors_round_trip_and_reject_malformed_payloads() {
+        let attempt = ConnectorMvRefreshAttemptId::new();
+        let encoded = Bytes::from(attempt.to_bytes().to_vec());
+
+        assert_eq!(
+            decode_attempt_cursor(&encoded).unwrap(),
+            attempt,
+            "a continuation must resume at exactly the attempt it encoded"
+        );
+
+        // A truncated or foreign cursor is rejected rather than silently
+        // resuming from an arbitrary position, which would skip attempts.
+        assert!(decode_attempt_cursor(&Bytes::from_static(b"short")).is_err());
+        assert!(decode_attempt_cursor(&Bytes::new()).is_err());
+
+        // A well-sized but non-v7 cursor is not a valid attempt identity.
+        let mut v4_shaped = [0xabu8; 16];
+        v4_shaped[6] = (v4_shaped[6] & 0x0f) | 0x40;
+        assert!(decode_attempt_cursor(&Bytes::from(v4_shaped.to_vec())).is_err());
     }
 
     #[test]

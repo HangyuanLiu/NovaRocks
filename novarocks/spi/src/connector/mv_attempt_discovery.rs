@@ -325,9 +325,6 @@ pub trait ConnectorMvAttemptDiscovery: Send + Sync {
     ) -> Result<ConnectorMvAttemptPage, ConnectorError>;
 }
 
-// Consumed when the capability is installed on the control binding, alongside
-// the Iceberg-side scan.
-#[allow(dead_code)]
 pub(crate) fn validate_mv_attempt_discovery_owner(
     descriptor: &ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
