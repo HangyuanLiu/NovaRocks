@@ -40,7 +40,7 @@ use novarocks_spi::connector::{
 use novarocks_spi::connector::{
     ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceDescriptor,
     ConnectorHistoricalMaintenanceDisposition, ConnectorHistoricalMaintenanceFamily,
-    ConnectorHistoricalMaintenanceObservation,
+    ConnectorHistoricalMaintenanceObservation, ConnectorHistoricalMaintenanceOutcome,
 };
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::coordination::WriteAdmission;
@@ -1674,20 +1674,177 @@ impl FrontendTableMaintenanceService {
                 }
                 Ok(())
             })();
+            // Same shape as metadata: the exact generation is the better
+            // reconciler while it exists, and historical inspection is what
+            // remains once it does not. Cleanup is the one family where this
+            // must never widen into re-execution -- a dispatched batch may
+            // already have deleted files.
             if let Err(error) = result {
-                self.block_on(repository.mark_unresolved_fenced(
-                    operation.operation_id,
+                let reason = self.converge_historical_cleanup(
+                    repository,
+                    engine,
+                    &operation,
+                    &cancellation.context(),
+                    &attempt,
+                    &authority,
+                    &validator,
                     error,
-                    now_unix_millis(),
-                    authority,
-                    validator,
-                ))
-                .map_err(|store| {
-                    format!("mark orphan cleanup operation unresolved failed: {store}")
-                })?;
+                )?;
+                if let Some(reason) = reason {
+                    self.block_on(repository.mark_unresolved_fenced(
+                        operation.operation_id,
+                        reason,
+                        now_unix_millis(),
+                        authority,
+                        validator,
+                    ))
+                    .map_err(|store| {
+                        format!("mark orphan cleanup operation unresolved failed: {store}")
+                    })?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Classify a destructive cleanup batch whose exact generation is gone.
+    ///
+    /// This never prepares, plans or executes anything. It reads what the old
+    /// attempt provably did to the exact batch already recorded, writes that
+    /// down, and leaves anything it cannot prove unresolved. `Unknown` deletes
+    /// stay unknown: retrying them is precisely the failure mode the immutable
+    /// manifest and single-dispatch contract exist to prevent.
+    #[allow(clippy::too_many_arguments)]
+    fn converge_historical_cleanup(
+        &self,
+        repository: &Arc<CleanupOperationRepository>,
+        engine: &dyn TableMaintenanceEngine,
+        operation: &model::CleanupOperation,
+        attempt_context: &novarocks::engine::table_maintenance::MaintenanceAttemptContext,
+        attempt: &MaintenanceAttemptGuard,
+        authority: &MaintenanceAuthorityV1,
+        validator: &MaintenanceFenceValidator,
+        exact_failure: String,
+    ) -> Result<Option<String>, String> {
+        let ordinal = if operation.state == CleanupOperationState::ReconcilePending {
+            operation.next_batch_ordinal.saturating_sub(1)
+        } else {
+            operation.next_batch_ordinal
+        };
+        let checkpoint = match self.block_on(repository.load_batch(operation.operation_id, ordinal))
+        {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => return Ok(Some(exact_failure)),
+            Err(error) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; load orphan cleanup recovery batch failed: {error}"
+                )));
+            }
+        };
+        let descriptor = match historical_descriptor(
+            &operation.target,
+            &operation.owner,
+            ConnectorHistoricalMaintenanceFamily::Cleanup,
+            operation.operation_id,
+            operation.request_digest,
+            operation.plan_digest,
+            None,
+            ConnectorHistoricalDispatchFacts {
+                dispatch_started: true,
+                batch_ordinal: Some(u32::from(checkpoint.ordinal)),
+                receipt_digest: Some(checkpoint.prepared_handle_digest),
+            },
+            attempt.attempt_id(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        let observation = match engine.inspect_historical_maintenance(
+            &operation.target,
+            descriptor,
+            attempt_context,
+        ) {
+            Ok(HistoricalMaintenanceInspection::Observed(observation)) => observation,
+            Ok(HistoricalMaintenanceInspection::Unsupported(reason)) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; no historical recovery capability: {reason}"
+                )));
+            }
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        let ConnectorHistoricalMaintenanceOutcome::Cleanup {
+            deleted_count,
+            already_absent_count,
+            skipped_count: _,
+            failed_count,
+            unknown_count,
+        } = observation.outcome
+        else {
+            return Ok(Some(format!(
+                "{exact_failure}; historical inspection answered a non-cleanup outcome"
+            )));
+        };
+        if unknown_count > 0
+            || matches!(
+                observation.disposition,
+                ConnectorHistoricalMaintenanceDisposition::Ambiguous
+            )
+        {
+            return Ok(Some(format!(
+                "{exact_failure}; historical inspection left {unknown_count} cleanup candidates \
+                 unknown"
+            )));
+        }
+        // The durable checkpoint counts a bounded batch, so a count that does
+        // not fit is corrupt evidence rather than a very large batch.
+        let counts: Vec<u32> = match [
+            deleted_count,
+            already_absent_count,
+            failed_count,
+            unknown_count,
+        ]
+        .into_iter()
+        .map(u32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(counts) => counts,
+            Err(_) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; historical inspection reported cleanup counts outside the \
+                     durable batch range"
+                )));
+            }
+        };
+        let mut resolved = checkpoint;
+        let proof = observation.proof.payload().to_vec();
+        resolved.receipt_handle_digest = Some(cleanup_payload_digest(&proof));
+        resolved.receipt_handle = Some(proof);
+        resolved.deleted_count = counts[0];
+        resolved.already_absent_count = counts[1];
+        resolved.failed_count = counts[2];
+        resolved.unknown_count = counts[3];
+        let operation = self
+            .block_on(repository.checkpoint_reconciled_batch_fenced(
+                operation.operation_id,
+                resolved,
+                authority.clone(),
+                Arc::clone(validator),
+            ))
+            .map_err(|error| {
+                format!("persist historically reconciled orphan cleanup batch failed: {error}")
+            })?;
+        if operation.next_batch_ordinal == operation.batch_count.unwrap_or(0) {
+            self.block_on(repository.finish_fenced(
+                operation.operation_id,
+                now_unix_millis(),
+                authority.clone(),
+                Arc::clone(validator),
+            ))
+            .map_err(|error| {
+                format!("persist historically recovered orphan cleanup terminal failed: {error}")
+            })?;
+        }
+        Ok(None)
     }
 }
 
