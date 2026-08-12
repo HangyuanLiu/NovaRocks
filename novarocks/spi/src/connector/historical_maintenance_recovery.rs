@@ -32,15 +32,16 @@
 //! current generation signs against current live truth.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorMutationOperationId, ConnectorRequestContext,
-    ConnectorTableIdentity, ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorTableIdentity, ExternalMutationEvidence,
+    ExternalMutationOutcome,
 };
 
 pub const MAX_CONNECTOR_HISTORICAL_MAINTENANCE_PROOF_BYTES: usize = 64 * 1024;
@@ -530,6 +531,125 @@ pub trait ConnectorHistoricalMaintenanceRecovery: Send + Sync {
         evidence: ExternalMutationEvidence,
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorHistoricalMaintenanceCleanupReceipt>, ConnectorError>;
+}
+
+/// Resolve the *current* generation's historical inspector.
+///
+/// There is deliberately no exact-generation variant. Exact resolution is what
+/// recovery has already lost; offering it here would invite a caller to pretend
+/// the dead generation is still reachable.
+pub trait ConnectorHistoricalMaintenanceResolver: Send + Sync {
+    fn acquire_current_historical_maintenance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorHistoricalMaintenanceLease, ConnectorError>;
+}
+
+#[derive(Clone)]
+pub struct ConnectorHistoricalMaintenanceLease {
+    descriptor: ConnectorInstanceDescriptor,
+    key: ConnectorExecutionBindingKey,
+    recovery: Arc<dyn ConnectorHistoricalMaintenanceRecovery>,
+    _release: Arc<HistoricalMaintenanceRelease>,
+}
+
+struct HistoricalMaintenanceRelease {
+    release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
+}
+
+impl Drop for HistoricalMaintenanceRelease {
+    fn drop(&mut self) {
+        if let Some(release) = self
+            .release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            release();
+        }
+    }
+}
+
+impl ConnectorHistoricalMaintenanceLease {
+    pub fn new(
+        descriptor: ConnectorInstanceDescriptor,
+        key: ConnectorExecutionBindingKey,
+        recovery: Arc<dyn ConnectorHistoricalMaintenanceRecovery>,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Result<Self, ConnectorError> {
+        if descriptor.instance_id != key.instance_id || recovery.binding_key() != &key {
+            return Err(invalid(
+                "historical maintenance capability does not match lease generation",
+            ));
+        }
+        Ok(Self {
+            descriptor,
+            key,
+            recovery,
+            _release: Arc::new(HistoricalMaintenanceRelease {
+                release: Mutex::new(Some(Box::new(release))),
+            }),
+        })
+    }
+
+    pub const fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    pub const fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    /// Inspect one historical operation under this live generation.
+    ///
+    /// The descriptor's own binding is the dead one being investigated; this
+    /// lease is the live generation doing the investigating. They must differ,
+    /// otherwise the caller still holds the original generation and should use
+    /// the ordinary exact-generation reconcile instead of historical recovery.
+    pub fn inspect(
+        &self,
+        descriptor: ConnectorHistoricalMaintenanceDescriptor,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorHistoricalMaintenanceObservation, ConnectorError> {
+        descriptor.validate()?;
+        if descriptor.table.instance_id != self.key.instance_id {
+            return Err(invalid(
+                "historical maintenance descriptor belongs to another connector instance",
+            ));
+        }
+        if descriptor.historical_binding == self.key {
+            return Err(invalid(
+                "historical maintenance inspection was asked for the live generation itself",
+            ));
+        }
+        let observation = self.recovery.inspect(descriptor.clone(), context)?;
+        if observation.descriptor_digest != descriptor.digest() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "historical maintenance observation answers a different descriptor",
+            ));
+        }
+        Ok(observation)
+    }
+
+    pub fn cleanup(
+        &self,
+        request: ConnectorHistoricalMaintenanceCleanupRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorHistoricalMaintenanceCleanupReceipt>, ConnectorError>
+    {
+        self.recovery.cleanup(request)
+    }
+
+    pub fn reconcile_cleanup(
+        &self,
+        operation_id: ConnectorMutationOperationId,
+        evidence: ExternalMutationEvidence,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorHistoricalMaintenanceCleanupReceipt>, ConnectorError>
+    {
+        self.recovery
+            .reconcile_cleanup(operation_id, evidence, context)
+    }
 }
 
 /// The capability must belong to the live control generation that offered it.
