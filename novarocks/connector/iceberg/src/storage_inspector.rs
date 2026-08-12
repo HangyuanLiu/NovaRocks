@@ -21,7 +21,7 @@
 //! retains the exact control generation that loaded it. Its outputs contain
 //! no Iceberg values, catalog clients, or application-owned MV types.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -46,6 +46,26 @@ const MAX_MAIN_ANCESTORS: usize = 100_000;
 const MV_BOOTSTRAP_PROP: &str = "novarocks.mv.bootstrap";
 const MV_BOOTSTRAP_OPERATION_ID_PROP: &str = "novarocks.bootstrap.empty.operation-id";
 const MAX_PROVENANCE_BASES: usize = 16_384;
+const MAX_MAINTENANCE_SNAPSHOTS: usize = 100_000;
+/// Two `i64` values per projected snapshot, charged against the request budget.
+const MAINTENANCE_SNAPSHOT_BYTES: usize = 16;
+
+/// The branch every Iceberg table has by default. A ref with any other name is
+/// a non-default reference as far as maintenance is concerned; this literal is
+/// provider knowledge and never crosses the neutral observation boundary.
+const DEFAULT_BRANCH_REF: &str = "main";
+
+/// Iceberg snapshot-summary keys (string literals: the matching constants in
+/// the vendored spec crate are private).
+const TOTAL_DATA_FILES_SUMMARY_KEY: &str = "total-data-files";
+const TOTAL_DELETE_FILES_SUMMARY_KEY: &str = "total-delete-files";
+const TOTAL_FILES_SIZE_SUMMARY_KEY: &str = "total-files-size";
+
+/// Table properties that declare maintenance policy values.
+const MAINTENANCE_ENABLED_PROPERTY: &str = "novarocks.maintenance.enabled";
+const EXPIRE_MAX_SNAPSHOT_AGE_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
+const EXPIRE_MIN_SNAPSHOTS_TO_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
+const TARGET_FILE_SIZE_PROPERTY: &str = "write.target-file-size-bytes";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStorageTargetObservation {
@@ -169,6 +189,58 @@ pub enum IcebergStorageRefreshTechnique {
     MetadataOnly,
 }
 
+/// Pure `TableMetadata` projection of the facts MV maintenance policy needs.
+///
+/// Every value comes from the already-loaded metadata document. Facts that
+/// require provider runtime IO — anything that has to read a manifest — are
+/// deliberately absent: they carry a different cost profile and belong to a
+/// separate observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageMaintenanceMetadataObservation {
+    pub current_snapshot_id: Option<i64>,
+    /// Every snapshot the table still retains, sorted by snapshot ID.
+    ///
+    /// Projected from the snapshot set, never from the snapshot log: the log
+    /// only records commits to the default branch, so a snapshot reachable
+    /// only through another ref has a timestamp the log cannot report. A
+    /// consumer that cannot resolve such a timestamp must treat retention as
+    /// unresolved, so dropping those snapshots here would silently block it.
+    pub snapshots: Vec<IcebergStorageSnapshotInfo>,
+    /// Number of named refs other than the default branch.
+    pub non_default_reference_count: usize,
+    /// Current-snapshot summary counters. Absent when the table has no current
+    /// snapshot, or the counter is missing or not a valid unsigned integer.
+    pub total_data_files: Option<u64>,
+    pub total_delete_files: Option<u64>,
+    pub total_files_size_bytes: Option<u64>,
+    /// Maintenance policy values exactly as the table declares them. Defaults
+    /// and clamping belong to the policy owner, not to this projection.
+    pub policy: IcebergStorageMaintenancePolicy,
+}
+
+/// One retained snapshot and the instant it was committed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergStorageSnapshotInfo {
+    pub snapshot_id: i64,
+    pub timestamp_ms: i64,
+}
+
+/// Typed maintenance policy values declared by table properties.
+///
+/// Each value is absent when its property is missing or cannot be parsed.
+/// This projection applies no default and no clamping: it reports only what
+/// the table actually declares.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IcebergStorageMaintenancePolicy {
+    /// `Some(false)` only when the property explicitly spells `false`
+    /// (case-insensitively, ignoring surrounding whitespace); any other
+    /// declared value is `Some(true)`.
+    pub maintenance_enabled: Option<bool>,
+    pub expire_max_snapshot_age_ms: Option<i64>,
+    pub expire_min_snapshots_to_keep: Option<u32>,
+    pub target_file_size_bytes: Option<i64>,
+}
+
 /// Stateless inspector installed only by the Server composition root.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergStorageInspector;
@@ -203,6 +275,97 @@ impl IcebergStorageInspector {
         let table = decoded_table(exact_lease, metadata, &context)?;
         refresh_target_observation(&table, &context)
     }
+
+    /// Project the maintenance facts carried by the table metadata itself.
+    pub fn observe_maintenance_metadata(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<IcebergStorageMaintenanceMetadataObservation, ConnectorError> {
+        let table = decoded_table(exact_lease, metadata, &context)?;
+        maintenance_metadata_observation(&table, &context)
+    }
+}
+
+fn maintenance_metadata_observation(
+    table: &TableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageMaintenanceMetadataObservation, ConnectorError> {
+    if table.snapshots().len() > MAX_MAINTENANCE_SNAPSHOTS {
+        return Err(exhausted(
+            "Iceberg MV maintenance metadata exceeds the inspection snapshot limit",
+        ));
+    }
+    let mut budget = 0_usize;
+    let mut snapshots = Vec::with_capacity(table.snapshots().len());
+    // `snapshots()`, never `history()`: the snapshot log only records commits
+    // to the default branch, so any snapshot reachable through another ref has
+    // a real timestamp that the log simply does not carry.
+    for snapshot in table.snapshots() {
+        reserve_bytes(context, &mut budget, MAINTENANCE_SNAPSHOT_BYTES)?;
+        snapshots.push(IcebergStorageSnapshotInfo {
+            snapshot_id: snapshot.snapshot_id(),
+            timestamp_ms: snapshot.timestamp_ms(),
+        });
+    }
+    // The snapshot set is stored by ID, so iteration order is unspecified.
+    // Sort for a deterministic observation; this ordering carries no retention
+    // meaning of its own.
+    snapshots.sort_by_key(|snapshot| snapshot.snapshot_id);
+
+    let non_default_reference_count = table
+        .refs()
+        .keys()
+        .filter(|name| name.as_str() != DEFAULT_BRANCH_REF)
+        .count();
+
+    let summary = table
+        .current_snapshot()
+        .map(|snapshot| &snapshot.summary().additional_properties);
+
+    validate_context(context)?;
+    Ok(IcebergStorageMaintenanceMetadataObservation {
+        current_snapshot_id: table.current_snapshot_id(),
+        snapshots,
+        non_default_reference_count,
+        total_data_files: summary
+            .and_then(|summary| summary_u64(summary, TOTAL_DATA_FILES_SUMMARY_KEY)),
+        total_delete_files: summary
+            .and_then(|summary| summary_u64(summary, TOTAL_DELETE_FILES_SUMMARY_KEY)),
+        total_files_size_bytes: summary
+            .and_then(|summary| summary_u64(summary, TOTAL_FILES_SIZE_SUMMARY_KEY)),
+        policy: maintenance_policy(table.properties()),
+    })
+}
+
+fn summary_u64(summary: &HashMap<String, String>, key: &str) -> Option<u64> {
+    summary
+        .get(key)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn maintenance_policy(properties: &HashMap<String, String>) -> IcebergStorageMaintenancePolicy {
+    IcebergStorageMaintenancePolicy {
+        maintenance_enabled: properties
+            .get(MAINTENANCE_ENABLED_PROPERTY)
+            .map(|value| !value.trim().eq_ignore_ascii_case("false")),
+        expire_max_snapshot_age_ms: parsed_property(properties, EXPIRE_MAX_SNAPSHOT_AGE_PROPERTY),
+        expire_min_snapshots_to_keep: parsed_property(
+            properties,
+            EXPIRE_MIN_SNAPSHOTS_TO_KEEP_PROPERTY,
+        ),
+        target_file_size_bytes: parsed_property(properties, TARGET_FILE_SIZE_PROPERTY),
+    }
+}
+
+fn parsed_property<T: std::str::FromStr>(
+    properties: &HashMap<String, String>,
+    key: &str,
+) -> Option<T> {
+    properties
+        .get(key)
+        .and_then(|value| value.trim().parse::<T>().ok())
 }
 
 fn refresh_target_observation(
@@ -605,8 +768,16 @@ fn reserve(
     budget: &mut usize,
     value: &str,
 ) -> Result<(), ConnectorError> {
+    reserve_bytes(context, budget, value.len())
+}
+
+fn reserve_bytes(
+    context: &ConnectorRequestContext,
+    budget: &mut usize,
+    additional: usize,
+) -> Result<(), ConnectorError> {
     *budget = budget
-        .checked_add(value.len())
+        .checked_add(additional)
         .ok_or_else(|| exhausted("Iceberg storage inspection payload accounting overflowed"))?;
     if *budget > context.max_total_payload_bytes() {
         return Err(exhausted(
@@ -630,15 +801,14 @@ fn exhausted(message: impl Into<String>) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     use novarocks_spi::connector::{ConnectorCancellation, ConnectorErrorKind};
 
     use crate::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
-        TableMetadataBuilder, Type,
+        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
+        SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Type,
     };
 
     use super::*;
@@ -768,5 +938,303 @@ mod tests {
     fn unknown_partition_transform_fails_closed() {
         let error = partition_transform(&Transform::Unknown).expect_err("unknown transform");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    /// One snapshot to install, plus the ref (if any) that should point at it.
+    ///
+    /// A ref named `main` is what puts a snapshot into the snapshot log; every
+    /// other ref leaves the snapshot reachable but unlogged.
+    struct SnapshotFixture {
+        snapshot_id: i64,
+        timestamp_ms: i64,
+        summary: Vec<(&'static str, &'static str)>,
+        reference: Option<(&'static str, SnapshotRetention)>,
+    }
+
+    impl SnapshotFixture {
+        fn new(snapshot_id: i64, timestamp_ms: i64) -> Self {
+            Self {
+                snapshot_id,
+                timestamp_ms,
+                summary: Vec::new(),
+                reference: None,
+            }
+        }
+
+        fn with_summary(mut self, summary: Vec<(&'static str, &'static str)>) -> Self {
+            self.summary = summary;
+            self
+        }
+
+        fn with_reference(mut self, name: &'static str, retention: SnapshotRetention) -> Self {
+            self.reference = Some((name, retention));
+            self
+        }
+
+        fn on_main(self) -> Self {
+            self.with_reference("main", SnapshotRetention::branch(None, None, None))
+        }
+    }
+
+    fn maintenance_metadata(
+        snapshots: Vec<SnapshotFixture>,
+        properties: HashMap<String, String>,
+    ) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let mut builder = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///maintenance-inspector-test".to_string(),
+            FormatVersion::V2,
+            properties,
+        )
+        .expect("metadata builder");
+
+        for (index, fixture) in snapshots.into_iter().enumerate() {
+            let snapshot = Snapshot::builder()
+                .with_snapshot_id(fixture.snapshot_id)
+                .with_parent_snapshot_id(None)
+                .with_sequence_number(index as i64 + 1)
+                .with_timestamp_ms(fixture.timestamp_ms)
+                .with_manifest_list(format!(
+                    "file:///maintenance-inspector-test/metadata/snap-{}.avro",
+                    fixture.snapshot_id
+                ))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: fixture
+                        .summary
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                })
+                .build();
+            builder = builder.add_snapshot(snapshot).expect("add snapshot");
+            if let Some((name, retention)) = fixture.reference {
+                builder = builder
+                    .set_ref(name, SnapshotReference::new(fixture.snapshot_id, retention))
+                    .expect("set ref");
+            }
+        }
+
+        builder.build().expect("build").metadata
+    }
+
+    /// The regression this projection exists to prevent: the snapshot log only
+    /// records the default branch, so projecting it would drop the timestamp of
+    /// every snapshot reachable only through another ref.
+    #[test]
+    fn maintenance_projection_reports_snapshots_missing_from_the_snapshot_log() {
+        let table = maintenance_metadata(
+            vec![
+                SnapshotFixture::new(11, 1_700_000_001_000).on_main(),
+                SnapshotFixture::new(22, 1_700_000_002_000)
+                    .with_reference("audit", SnapshotRetention::branch(None, None, None)),
+                SnapshotFixture::new(33, 1_700_000_003_000).with_reference(
+                    "release",
+                    SnapshotRetention::Tag {
+                        max_ref_age_ms: None,
+                    },
+                ),
+            ],
+            HashMap::new(),
+        );
+
+        // The fixture really does exercise the gap: the log knows only `main`.
+        let logged: Vec<i64> = table
+            .history()
+            .iter()
+            .map(|entry| entry.snapshot_id)
+            .collect();
+        assert_eq!(logged, vec![11]);
+
+        let observed =
+            maintenance_metadata_observation(&table, &context(4096)).expect("maintenance");
+        assert_eq!(
+            observed.snapshots,
+            vec![
+                IcebergStorageSnapshotInfo {
+                    snapshot_id: 11,
+                    timestamp_ms: 1_700_000_001_000,
+                },
+                IcebergStorageSnapshotInfo {
+                    snapshot_id: 22,
+                    timestamp_ms: 1_700_000_002_000,
+                },
+                IcebergStorageSnapshotInfo {
+                    snapshot_id: 33,
+                    timestamp_ms: 1_700_000_003_000,
+                },
+            ]
+        );
+        assert_eq!(observed.current_snapshot_id, Some(11));
+    }
+
+    #[test]
+    fn maintenance_projection_counts_only_non_default_references() {
+        let default_only = maintenance_metadata(
+            vec![SnapshotFixture::new(11, 1_700_000_001_000).on_main()],
+            HashMap::new(),
+        );
+        let observed =
+            maintenance_metadata_observation(&default_only, &context(4096)).expect("maintenance");
+        assert_eq!(observed.non_default_reference_count, 0);
+
+        let with_extra_refs = maintenance_metadata(
+            vec![
+                SnapshotFixture::new(11, 1_700_000_001_000).on_main(),
+                SnapshotFixture::new(22, 1_700_000_002_000)
+                    .with_reference("audit", SnapshotRetention::branch(None, None, None)),
+                SnapshotFixture::new(33, 1_700_000_003_000).with_reference(
+                    "release",
+                    SnapshotRetention::Tag {
+                        max_ref_age_ms: None,
+                    },
+                ),
+            ],
+            HashMap::new(),
+        );
+        let observed = maintenance_metadata_observation(&with_extra_refs, &context(4096))
+            .expect("maintenance");
+        assert_eq!(observed.non_default_reference_count, 2);
+    }
+
+    #[test]
+    fn maintenance_projection_has_no_summary_counters_without_a_current_snapshot() {
+        let table = maintenance_metadata(Vec::new(), HashMap::new());
+        let observed =
+            maintenance_metadata_observation(&table, &context(4096)).expect("maintenance");
+        assert_eq!(observed.current_snapshot_id, None);
+        assert!(observed.snapshots.is_empty());
+        assert_eq!(observed.non_default_reference_count, 0);
+        assert_eq!(observed.total_data_files, None);
+        assert_eq!(observed.total_delete_files, None);
+        assert_eq!(observed.total_files_size_bytes, None);
+    }
+
+    #[test]
+    fn maintenance_projection_reads_summary_counters_and_ignores_unparsable_values() {
+        let missing = maintenance_metadata(
+            vec![SnapshotFixture::new(11, 1_700_000_001_000).on_main()],
+            HashMap::new(),
+        );
+        let observed =
+            maintenance_metadata_observation(&missing, &context(4096)).expect("maintenance");
+        assert_eq!(observed.total_data_files, None);
+        assert_eq!(observed.total_delete_files, None);
+        assert_eq!(observed.total_files_size_bytes, None);
+
+        let unparsable = maintenance_metadata(
+            vec![
+                SnapshotFixture::new(11, 1_700_000_001_000)
+                    .with_summary(vec![
+                        ("total-data-files", "many"),
+                        ("total-delete-files", "-1"),
+                        ("total-files-size", ""),
+                    ])
+                    .on_main(),
+            ],
+            HashMap::new(),
+        );
+        let observed =
+            maintenance_metadata_observation(&unparsable, &context(4096)).expect("maintenance");
+        assert_eq!(observed.total_data_files, None);
+        assert_eq!(observed.total_delete_files, None);
+        assert_eq!(observed.total_files_size_bytes, None);
+
+        let valid = maintenance_metadata(
+            vec![
+                SnapshotFixture::new(11, 1_700_000_001_000)
+                    .with_summary(vec![
+                        ("total-data-files", "42"),
+                        ("total-delete-files", " 7 "),
+                        ("total-files-size", "104857600"),
+                    ])
+                    .on_main(),
+            ],
+            HashMap::new(),
+        );
+        let observed =
+            maintenance_metadata_observation(&valid, &context(4096)).expect("maintenance");
+        assert_eq!(observed.total_data_files, Some(42));
+        assert_eq!(observed.total_delete_files, Some(7));
+        assert_eq!(observed.total_files_size_bytes, Some(104_857_600));
+    }
+
+    fn observed_policy(properties: Vec<(&str, &str)>) -> IcebergStorageMaintenancePolicy {
+        let table = maintenance_metadata(
+            vec![SnapshotFixture::new(11, 1_700_000_001_000).on_main()],
+            properties
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        );
+        maintenance_metadata_observation(&table, &context(4096))
+            .expect("maintenance")
+            .policy
+    }
+
+    #[test]
+    fn maintenance_policy_projection_distinguishes_absent_unparsable_and_declared_values() {
+        assert_eq!(
+            observed_policy(Vec::new()),
+            IcebergStorageMaintenancePolicy::default()
+        );
+
+        let unparsable = observed_policy(vec![
+            ("history.expire.max-snapshot-age-ms", "soon"),
+            ("history.expire.min-snapshots-to-keep", "-1"),
+            ("write.target-file-size-bytes", ""),
+        ]);
+        assert_eq!(unparsable.expire_max_snapshot_age_ms, None);
+        assert_eq!(unparsable.expire_min_snapshots_to_keep, None);
+        assert_eq!(unparsable.target_file_size_bytes, None);
+
+        let declared = observed_policy(vec![
+            ("history.expire.max-snapshot-age-ms", " 900000 "),
+            ("history.expire.min-snapshots-to-keep", "3"),
+            ("write.target-file-size-bytes", "268435456"),
+        ]);
+        assert_eq!(declared.expire_max_snapshot_age_ms, Some(900_000));
+        assert_eq!(declared.expire_min_snapshots_to_keep, Some(3));
+        assert_eq!(declared.target_file_size_bytes, Some(268_435_456));
+
+        // The projection reports what the table declares. Clamping a zero up to
+        // a usable minimum is the policy owner's job, not the observer's.
+        let zeroed = observed_policy(vec![
+            ("history.expire.max-snapshot-age-ms", "0"),
+            ("history.expire.min-snapshots-to-keep", "0"),
+            ("write.target-file-size-bytes", "0"),
+        ]);
+        assert_eq!(zeroed.expire_max_snapshot_age_ms, Some(0));
+        assert_eq!(zeroed.expire_min_snapshots_to_keep, Some(0));
+        assert_eq!(zeroed.target_file_size_bytes, Some(0));
+    }
+
+    #[test]
+    fn maintenance_enabled_projection_treats_only_an_explicit_false_as_disabled() {
+        assert_eq!(observed_policy(Vec::new()).maintenance_enabled, None);
+        for disabled in ["false", "FALSE", " false ", "\tFalse\n"] {
+            assert_eq!(
+                observed_policy(vec![("novarocks.maintenance.enabled", disabled)])
+                    .maintenance_enabled,
+                Some(false),
+                "`{disabled}` must read as disabled"
+            );
+        }
+        for enabled in ["true", "TRUE", "", "no", "0"] {
+            assert_eq!(
+                observed_policy(vec![("novarocks.maintenance.enabled", enabled)])
+                    .maintenance_enabled,
+                Some(true),
+                "`{enabled}` must read as enabled"
+            );
+        }
     }
 }

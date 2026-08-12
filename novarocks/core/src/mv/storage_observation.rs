@@ -681,6 +681,148 @@ impl MvRefreshTargetObservation {
     }
 }
 
+/// Maximum number of snapshots carried by one maintenance observation.
+const MAX_MV_MAINTENANCE_SNAPSHOTS: usize = 100_000;
+
+/// Two `i64` values per projected snapshot, charged against the payload budget.
+const MV_MAINTENANCE_SNAPSHOT_BYTES: usize = 16;
+
+/// Exact maintenance facts a provider can project from one metadata load.
+///
+/// Every value here is a pure metadata projection, so one already-loaded
+/// metadata document answers the whole observation. Facts that need provider
+/// runtime IO are deliberately absent: they have a different cost profile and
+/// belong to a separate observation with its own failure modes.
+///
+/// Core owns retention and policy decisions, so snapshot identity, ref counts,
+/// declared policy values, and the current-snapshot counters are legitimate
+/// neutral facts. Provider-specific naming is not: the observation reports how
+/// many references are not the provider's default one, never which ref that is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvMaintenanceMetadataObservation {
+    current_snapshot_id: Option<i64>,
+    snapshots: Vec<MvObservedSnapshot>,
+    non_default_reference_count: usize,
+    total_data_files: Option<u64>,
+    total_delete_files: Option<u64>,
+    total_files_size_bytes: Option<u64>,
+    policy: MvObservedMaintenancePolicy,
+}
+
+/// One retained snapshot and the instant it was committed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MvObservedSnapshot {
+    pub snapshot_id: i64,
+    pub timestamp_ms: i64,
+}
+
+/// Maintenance policy values exactly as the storage table declares them.
+///
+/// Each value is absent when the table declares nothing usable. Defaults and
+/// clamping belong to the policy owner, never to the observation: an absent
+/// value and a declared value must stay distinguishable across the boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MvObservedMaintenancePolicy {
+    pub maintenance_enabled: Option<bool>,
+    pub expire_max_snapshot_age_ms: Option<i64>,
+    pub expire_min_snapshots_to_keep: Option<u32>,
+    pub target_file_size_bytes: Option<i64>,
+}
+
+impl MvMaintenanceMetadataObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        current_snapshot_id: Option<i64>,
+        snapshots: Vec<MvObservedSnapshot>,
+        non_default_reference_count: usize,
+        total_data_files: Option<u64>,
+        total_delete_files: Option<u64>,
+        total_files_size_bytes: Option<u64>,
+        policy: MvObservedMaintenancePolicy,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        validate_request_context(context)?;
+        if snapshots.len() > MAX_MV_MAINTENANCE_SNAPSHOTS {
+            return exhausted("MV maintenance observation exceeds the snapshot limit");
+        }
+        if let Some(snapshot_id) = current_snapshot_id
+            && snapshot_id < 0
+        {
+            return corrupt("MV maintenance observation has a negative current snapshot ID");
+        }
+
+        let mut payload_bytes = 0;
+        let mut snapshot_ids = HashSet::with_capacity(snapshots.len());
+        for snapshot in &snapshots {
+            if snapshot.snapshot_id < 0 {
+                return corrupt("MV maintenance observation has a negative snapshot ID");
+            }
+            if !snapshot_ids.insert(snapshot.snapshot_id) {
+                return corrupt(format!(
+                    "MV maintenance observation has duplicate snapshot ID {}",
+                    snapshot.snapshot_id
+                ));
+            }
+            reserve_maintenance_payload(
+                &mut payload_bytes,
+                MV_MAINTENANCE_SNAPSHOT_BYTES,
+                context.max_total_payload_bytes(),
+            )?;
+        }
+        // The retained-snapshot list is the only place a consumer can resolve a
+        // snapshot's timestamp, so a current snapshot missing from it is
+        // corrupt metadata rather than a fact worth forwarding.
+        if let Some(snapshot_id) = current_snapshot_id
+            && !snapshot_ids.contains(&snapshot_id)
+        {
+            return corrupt(format!(
+                "MV maintenance observation current snapshot {snapshot_id} is not retained"
+            ));
+        }
+
+        Ok(Self {
+            current_snapshot_id,
+            snapshots,
+            non_default_reference_count,
+            total_data_files,
+            total_delete_files,
+            total_files_size_bytes,
+            policy,
+        })
+    }
+
+    pub const fn current_snapshot_id(&self) -> Option<i64> {
+        self.current_snapshot_id
+    }
+
+    /// Every snapshot the table still retains, including snapshots reachable
+    /// only through a non-default reference.
+    pub fn snapshots(&self) -> &[MvObservedSnapshot] {
+        &self.snapshots
+    }
+
+    /// How many named references are not the provider's default one.
+    pub const fn non_default_reference_count(&self) -> usize {
+        self.non_default_reference_count
+    }
+
+    pub const fn total_data_files(&self) -> Option<u64> {
+        self.total_data_files
+    }
+
+    pub const fn total_delete_files(&self) -> Option<u64> {
+        self.total_delete_files
+    }
+
+    pub const fn total_files_size_bytes(&self) -> Option<u64> {
+        self.total_files_size_bytes
+    }
+
+    pub const fn policy(&self) -> &MvObservedMaintenancePolicy {
+        &self.policy
+    }
+}
+
 /// Observation port implemented by a composition-injected storage inspector.
 ///
 /// The Core application loads metadata through the retained exact lease, then
@@ -720,6 +862,19 @@ pub trait MvStorageObservationPort: Send + Sync {
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvRefreshTargetObservation, ConnectorError>;
+
+    /// Observe the maintenance facts a provider can project from `metadata`
+    /// alone.
+    ///
+    /// Scoped to pure metadata on purpose: it never triggers provider runtime
+    /// IO, so a maintenance pass can gather these facts for every table at the
+    /// cost of the metadata load it already performed.
+    fn observe_maintenance_metadata(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvMaintenanceMetadataObservation, ConnectorError>;
 }
 
 /// Fail-closed default used until the Server composition root installs the
@@ -773,6 +928,18 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "MV refresh target observation port is not installed",
+        ))
+    }
+
+    fn observe_maintenance_metadata(
+        &self,
+        _exact_lease: &ConnectorControlPlanningLease,
+        _metadata: &ConnectorTableMetadata,
+        _context: ConnectorRequestContext,
+    ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "MV maintenance metadata observation port is not installed",
         ))
     }
 }
@@ -1095,6 +1262,23 @@ fn reserve_schema_validation_payload(
     Ok(())
 }
 
+fn reserve_maintenance_payload(
+    used: &mut usize,
+    additional: usize,
+    max_total_payload_bytes: usize,
+) -> Result<(), ConnectorError> {
+    *used = used.checked_add(additional).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "MV maintenance observation payload accounting overflowed",
+        )
+    })?;
+    if *used > max_total_payload_bytes {
+        return exhausted("MV maintenance observation exceeds the payload limit");
+    }
+    Ok(())
+}
+
 fn exhausted<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
     Err(ConnectorError::new(
         ConnectorErrorKind::ResourceExhausted,
@@ -1119,7 +1303,8 @@ mod tests {
     };
 
     use super::{
-        BTreeMap, MvLakePackageObservation, MvLakePublication, MvObservedTargetField,
+        BTreeMap, MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
+        MvObservedMaintenancePolicy, MvObservedSnapshot, MvObservedTargetField,
         MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
         MvRefreshTargetObservation, MvSchemaValidationObservation, MvTargetCreationObservation,
     };
@@ -1505,5 +1690,139 @@ mod tests {
         // A table with no current snapshot reports `main` as absent too.
         let empty = refresh_target(None, BTreeMap::new()).unwrap();
         assert_eq!(empty.snapshot_id_for_ref("main"), None);
+    }
+
+    fn maintenance_metadata(
+        current_snapshot_id: Option<i64>,
+        snapshots: Vec<MvObservedSnapshot>,
+        payload_bytes: usize,
+    ) -> Result<MvMaintenanceMetadataObservation, novarocks_spi::connector::ConnectorError> {
+        MvMaintenanceMetadataObservation::try_new(
+            current_snapshot_id,
+            snapshots,
+            2,
+            Some(42),
+            Some(7),
+            Some(104_857_600),
+            MvObservedMaintenancePolicy {
+                maintenance_enabled: Some(false),
+                expire_max_snapshot_age_ms: Some(900_000),
+                expire_min_snapshots_to_keep: Some(0),
+                target_file_size_bytes: None,
+            },
+            &context(payload_bytes),
+        )
+    }
+
+    #[test]
+    fn maintenance_observation_exposes_declared_facts_without_applying_policy_defaults() {
+        let observed = maintenance_metadata(
+            Some(11),
+            vec![
+                MvObservedSnapshot {
+                    snapshot_id: 11,
+                    timestamp_ms: 1_700_000_001_000,
+                },
+                MvObservedSnapshot {
+                    snapshot_id: 22,
+                    timestamp_ms: 1_700_000_002_000,
+                },
+            ],
+            4_096,
+        )
+        .unwrap();
+
+        assert_eq!(observed.current_snapshot_id(), Some(11));
+        assert_eq!(observed.snapshots().len(), 2);
+        assert_eq!(observed.snapshots()[1].snapshot_id, 22);
+        assert_eq!(observed.snapshots()[1].timestamp_ms, 1_700_000_002_000);
+        assert_eq!(observed.non_default_reference_count(), 2);
+        assert_eq!(observed.total_data_files(), Some(42));
+        assert_eq!(observed.total_delete_files(), Some(7));
+        assert_eq!(observed.total_files_size_bytes(), Some(104_857_600));
+        // Absent stays absent and a declared zero stays zero: substituting a
+        // default here would erase the distinction the policy owner needs.
+        assert_eq!(observed.policy().maintenance_enabled, Some(false));
+        assert_eq!(observed.policy().expire_min_snapshots_to_keep, Some(0));
+        assert_eq!(observed.policy().target_file_size_bytes, None);
+    }
+
+    #[test]
+    fn maintenance_observation_rejects_corrupt_snapshot_identity_and_oversized_payloads() {
+        let err = maintenance_metadata(Some(-1), Vec::new(), 4_096).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let err = maintenance_metadata(
+            None,
+            vec![MvObservedSnapshot {
+                snapshot_id: -3,
+                timestamp_ms: 1,
+            }],
+            4_096,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let err = maintenance_metadata(
+            Some(11),
+            vec![
+                MvObservedSnapshot {
+                    snapshot_id: 11,
+                    timestamp_ms: 1,
+                },
+                MvObservedSnapshot {
+                    snapshot_id: 11,
+                    timestamp_ms: 2,
+                },
+            ],
+            4_096,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let err = maintenance_metadata(
+            Some(11),
+            vec![MvObservedSnapshot {
+                snapshot_id: 11,
+                timestamp_ms: 1,
+            }],
+            8,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn maintenance_observation_rejects_a_current_snapshot_that_is_not_retained() {
+        let err = maintenance_metadata(
+            Some(12),
+            vec![MvObservedSnapshot {
+                snapshot_id: 11,
+                timestamp_ms: 1,
+            }],
+            4_096,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        // A table that never published keeps no current snapshot; that is a
+        // fact, not corruption.
+        maintenance_metadata(None, Vec::new(), 4_096)
+            .expect("an unpublished target observes no current snapshot");
     }
 }
