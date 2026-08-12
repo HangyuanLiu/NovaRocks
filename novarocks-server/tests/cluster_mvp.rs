@@ -137,10 +137,6 @@ impl ProcessGuard {
         Self::spawn_inner(config_path, None, debug_env)
     }
 
-    fn spawn_backend(config_path: &Path, backend_index: usize) -> Self {
-        Self::spawn_inner(config_path, Some(backend_index), &[])
-    }
-
     fn spawn_backend_with_debug_env(
         config_path: &Path,
         backend_index: usize,
@@ -349,10 +345,6 @@ fn connect_mysql(port: u16) -> MysqlConn {
             }
         }
     }
-}
-
-fn start_all_in_one(extra: &str) -> (ProcessGuard, u16) {
-    start_all_in_one_with_debug_env(extra, &[])
 }
 
 fn start_all_in_one_with_debug_env(extra: &str, debug_env: &[(&str, &str)]) -> (ProcessGuard, u16) {

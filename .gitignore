@@ -34,3 +34,7 @@ nosetests.xml
 /reports/
 __pycache__/
 *.pyc
+
+# Per-crate log dirs written by integration tests (the root /log rule misses these).
+novarocks/*/log/
+novarocks-server/log/

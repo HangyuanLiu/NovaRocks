@@ -25,25 +25,6 @@ pub const AWS_S3_ACCESS_KEY_SECRET_KEYS: &[&str] = &["aws.s3.accessKeySecret", "
 pub const AWS_S3_SESSION_TOKEN_KEYS: &[&str] = &["aws.s3.sessionToken", "aws.s3.session_token"];
 pub const AWS_S3_REGION_KEYS: &[&str] = &["aws.s3.region"];
 pub const AWS_S3_ENABLE_PATH_STYLE_ACCESS_KEYS: &[&str] = &["aws.s3.enable_path_style_access"];
-pub const AWS_S3_CREDENTIAL_PROPERTY_KEYS: &[&str] = &[
-    "aws.s3.endpoint",
-    "aws.s3.endpoint_url",
-    "aws.s3.accessKeyId",
-    "aws.s3.access_key",
-    "aws.s3.accessKeySecret",
-    "aws.s3.secret_key",
-    "aws.s3.sessionToken",
-    "aws.s3.session_token",
-    "aws.s3.region",
-    "aws.s3.enable_path_style_access",
-    "aws.s3.max_retries",
-    "aws.s3.retry_max_times",
-    "aws.s3.retry_min_delay_ms",
-    "aws.s3.retry_max_delay_ms",
-    "aws.s3.request_timeout_ms",
-    "aws.s3.timeout_ms",
-    "aws.s3.io_timeout_ms",
-];
 pub const FS_S3A_ENDPOINT_KEYS: &[&str] = &["fs.s3a.endpoint"];
 pub const FS_S3A_ACCESS_KEY_ID_KEYS: &[&str] = &["fs.s3a.access.key"];
 pub const FS_S3A_ACCESS_KEY_SECRET_KEYS: &[&str] = &["fs.s3a.secret.key"];

@@ -42,7 +42,7 @@ struct ParquetProbe {
 fn object_store_config_from_connector(app_cfg: &NovaRocksConfig) -> Result<ObjectStoreConfig> {
     app_cfg
         .connector
-        .object_store_config()
+        .object_store_config(&app_cfg.runtime.object_storage.retry_settings())
         .map_err(anyhow::Error::msg)?
         .context("missing [connector.object_store] config")
 }
