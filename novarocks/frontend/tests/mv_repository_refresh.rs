@@ -22,10 +22,14 @@ use novarocks::mv::repository::{
     FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
     RecordFrontendMvRecoveryCleanupOutcomeRequest, RecordFrontendMvRecoveryObservationRequest,
 };
+use novarocks_frontend::mv::coordination::{
+    MvRefreshOwnershipContext, OwnershipRefusal, acquire_refresh_ownership,
+};
 use novarocks_frontend::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, FenceValidator, MvRefreshFenceSource,
     StateStoreMvRepository,
 };
+use novarocks_spi::connector::{ConnectorMvRefreshResourceIdentity, ConnectorProviderId};
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -1223,4 +1227,103 @@ fn installing_a_fence_source_without_registration_stops_every_refresh() {
             .is_err(),
         "install-without-registration must fail closed for every target"
     );
+}
+
+/// Two logical frontends sharing one StateStore, competing for the same target.
+///
+/// This is the property the whole ownership layer exists for: two frontends both
+/// find a target due, and exactly one may proceed. It is asserted against real
+/// coordination over a shared SQLite StateStore rather than a mock, because the
+/// failure this guards against is precisely two processes disagreeing about who
+/// won.
+#[test]
+fn two_frontends_competing_for_one_target_yield_a_single_owner() {
+    let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let registry = builtin_state_store_provider_registry().expect("providers");
+    let host = runtime
+        .block_on(StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "mv-ownership-race".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: temp.path().join("state-store.sqlite"),
+                            deployment_owner: "mv-ownership-race".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                // The SQLite backend supports one FE deployment. That is fine
+                // here: the race being tested is between two logical controllers
+                // sharing a store, which is what two coordination runtimes model.
+                active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+                topology_revision: Bytes::from_static(b"mv-ownership-race-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        ))
+        .expect("open SQLite StateStore host");
+    let store = host.state_store().expect("host exposes StateStore");
+
+    // Two independent coordination runtimes over one store: this is what two
+    // frontend processes look like to the lease manager.
+    let first = runtime
+        .block_on(MvRefreshOwnershipContext::open(Arc::clone(&store)))
+        .expect("first frontend coordination");
+    let second = runtime
+        .block_on(MvRefreshOwnershipContext::open(Arc::clone(&store)))
+        .expect("second frontend coordination");
+
+    let resource = ConnectorMvRefreshResourceIdentity::try_new(
+        ConnectorProviderId::parse("iceberg").expect("provider"),
+        uuid::Uuid::from_u128(0x5150),
+    )
+    .expect("stable target resource");
+
+    let winner = runtime
+        .block_on(acquire_refresh_ownership(
+            &first.coordination,
+            &first.registry,
+            42,
+            resource.clone(),
+        ))
+        .expect("the first frontend acquires an uncontended target");
+
+    // The second frontend sees the same target as due and tries to take it.
+    let refusal = runtime
+        .block_on(acquire_refresh_ownership(
+            &second.coordination,
+            &second.registry,
+            42,
+            resource.clone(),
+        ))
+        .expect_err("a second frontend must not also own the target");
+    assert!(
+        matches!(
+            refusal,
+            OwnershipRefusal::Contended | OwnershipRefusal::AwaitingTakeover
+        ),
+        "contention must be reported as contention, not as unavailability: {refusal:?}"
+    );
+
+    // And the loser has no registered fence, so its durable transitions would
+    // fail closed rather than racing the winner's.
+    assert!(
+        !second.registry.holds(42),
+        "a frontend that lost the race must not be registered as an owner"
+    );
+    assert!(
+        first.registry.holds(42),
+        "the winner must be registered so its transitions can prove ownership"
+    );
+
+    // Releasing lets the other frontend take over -- ownership is transferable,
+    // not permanent, or a crashed frontend would strand the target forever.
+    drop(winner);
+    assert!(!first.registry.holds(42));
 }

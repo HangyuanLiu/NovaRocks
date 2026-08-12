@@ -80,13 +80,13 @@ pub(crate) fn mv_refresh_resource_key(
 
 /// Per-target MV refresh ownership, shared by every refresh entry point.
 #[derive(Clone)]
-pub(crate) struct MvRefreshCoordination {
+pub struct MvRefreshCoordination {
     frontend: FrontendCoordinationRuntime,
     manager: LeaseManager,
 }
 
 impl MvRefreshCoordination {
-    pub(crate) async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
+    pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
         let frontend = FrontendCoordinationRuntime::open(store).await?;
         Self::from_frontend(&frontend)
     }
@@ -195,20 +195,20 @@ pub(crate) fn resolve_target_resource(
 /// Bundled so composition passes one value and the refresh path cannot end up
 /// holding a lease manager whose grants nobody records.
 #[derive(Clone)]
-pub(crate) struct MvRefreshOwnershipContext {
-    pub(crate) coordination: MvRefreshCoordination,
-    pub(crate) registry: Arc<MvRefreshOwnershipRegistry>,
+pub struct MvRefreshOwnershipContext {
+    pub coordination: MvRefreshCoordination,
+    pub registry: Arc<MvRefreshOwnershipRegistry>,
 }
 
 impl MvRefreshOwnershipContext {
-    pub(crate) async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
+    pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
         Ok(Self {
             coordination: MvRefreshCoordination::open(store).await?,
             registry: MvRefreshOwnershipRegistry::new(),
         })
     }
 
-    pub(crate) fn registry(&self) -> Arc<dyn MvRefreshFenceSource> {
+    pub fn registry(&self) -> Arc<dyn MvRefreshFenceSource> {
         Arc::clone(&self.registry) as Arc<dyn MvRefreshFenceSource>
     }
 }
@@ -248,7 +248,7 @@ pub(crate) fn resolve_target_resource_for(
 /// recorded together so a takeover cannot leave an `mv_id` pointing at a fence
 /// from a previous target incarnation.
 #[derive(Default)]
-pub(crate) struct MvRefreshOwnershipRegistry {
+pub struct MvRefreshOwnershipRegistry {
     held: RwLock<HashMap<i64, HeldRefreshLease>>,
 }
 
@@ -259,7 +259,7 @@ struct HeldRefreshLease {
 }
 
 impl MvRefreshOwnershipRegistry {
-    pub(crate) fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
@@ -267,7 +267,7 @@ impl MvRefreshOwnershipRegistry {
     ///
     /// Re-registering the same MV replaces the entry: a takeover-then-reacquire
     /// must not leave the previous generation's fence reachable.
-    pub(crate) fn register(
+    pub fn register(
         &self,
         mv_id: i64,
         resource: ConnectorMvRefreshResourceIdentity,
@@ -296,7 +296,7 @@ impl MvRefreshOwnershipRegistry {
     /// Called when a lease is released, lost, or the worker shuts down. After
     /// this, the repository rejects durable transitions for `mv_id` rather than
     /// letting them through unfenced.
-    pub(crate) fn release(&self, mv_id: i64) {
+    pub fn release(&self, mv_id: i64) {
         if let Ok(mut held) = self.held.write() {
             held.remove(&mv_id);
         }
@@ -311,7 +311,7 @@ impl MvRefreshOwnershipRegistry {
             .map(|held| held.resource.clone())
     }
 
-    pub(crate) fn holds(&self, mv_id: i64) -> bool {
+    pub fn holds(&self, mv_id: i64) -> bool {
         self.held.read().is_ok_and(|held| held.contains_key(&mv_id))
     }
 }
@@ -339,12 +339,15 @@ impl MvRefreshFenceSource for MvRefreshOwnershipRegistry {
 
 /// Ownership of one target's refresh, held for as long as this value lives.
 ///
+/// `Debug` prints only the target it owns: the lease guard behind it carries
+/// coordination internals that have no business in a log line.
+///
 /// Dropping it releases registry ownership, so a durable transition attempted
 /// after the handle is gone fails closed. Tying release to the handle's lifetime
 /// rather than to an explicit call is deliberate: an early return or a panic on
 /// the refresh path must not leave this frontend appearing to own a target it has
 /// stopped working on.
-pub(crate) struct OwnedRefresh {
+pub struct OwnedRefresh {
     mv_id: i64,
     registry: Arc<MvRefreshOwnershipRegistry>,
     /// Held so the StateStore lease is renewed and released with the handle.
@@ -352,8 +355,17 @@ pub(crate) struct OwnedRefresh {
 }
 
 impl OwnedRefresh {
-    pub(crate) const fn mv_id(&self) -> i64 {
+    pub const fn mv_id(&self) -> i64 {
         self.mv_id
+    }
+}
+
+impl std::fmt::Debug for OwnedRefresh {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedRefresh")
+            .field("mv_id", &self.mv_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -365,7 +377,7 @@ impl Drop for OwnedRefresh {
 
 /// Why a refresh could not take ownership of its target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OwnershipRefusal {
+pub enum OwnershipRefusal {
     /// Another frontend currently holds the lease.
     Contended,
     /// The previous holder's lease has not yet aged out.
@@ -385,7 +397,7 @@ pub(crate) enum OwnershipRefusal {
 /// Contention is not an error to surface to a user as a failure: manual refresh
 /// maps it to a retryable conflict, and the workers back off. Only genuine
 /// coordination unavailability is exceptional.
-pub(crate) async fn acquire_refresh_ownership(
+pub async fn acquire_refresh_ownership(
     coordination: &MvRefreshCoordination,
     registry: &Arc<MvRefreshOwnershipRegistry>,
     mv_id: i64,
