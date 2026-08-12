@@ -27,6 +27,7 @@ pub(crate) mod scan_model;
 pub mod schema;
 pub(crate) mod stats;
 pub(crate) mod unified_statistics;
+pub(crate) mod write_target;
 
 pub(crate) use backend::MvBackend;
 #[cfg(test)]
