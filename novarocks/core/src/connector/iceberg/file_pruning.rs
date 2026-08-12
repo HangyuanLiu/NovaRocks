@@ -735,6 +735,7 @@ mod tests {
         file.column_stats = Some(HashMap::from([(
             "id".to_string(),
             IcebergColumnStats {
+                field_id: None,
                 null_count: Some(0),
                 value_count: Some(10),
                 column_size: None,
@@ -887,5 +888,247 @@ mod tests {
             surviving(&[file], &id_eq(12)),
             vec!["s3://bucket/id-10-20.parquet".to_string()]
         );
+    }
+}
+
+/// Temporary parity scaffolding for SPI-5N.
+///
+/// The provider crate grew its own file-level pruning so that SPI-5J can flip
+/// the FE control factory without losing this capability. These cases pin the
+/// two implementations against the same fixtures until SPI-5J deletes the Core
+/// one.
+///
+/// **Delete this module together with the Core implementation it compares
+/// against.** It must not outlive the migration or turn into a permanent test.
+#[cfg(test)]
+mod spi_5n_provider_parity_tests {
+    use std::collections::HashMap;
+
+    use novarocks_connector_iceberg::scan_model::{
+        IcebergPartitionFieldValue, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
+        IcebergPhysicalPredicateValue,
+    };
+
+    use super::*;
+
+    fn core_keeps(file: &IcebergDataFileInfo, predicates: &[IcebergPhysicalPredicate]) -> bool {
+        let mut counters = IcebergFilePruningCounters::default();
+        file_may_satisfy_physical_predicates(file, predicates, &mut counters)
+    }
+
+    fn provider_keeps(file: &IcebergDataFileInfo, predicates: &[IcebergPhysicalPredicate]) -> bool {
+        novarocks_connector_iceberg::file_pruning::file_may_satisfy_physical_predicates(
+            file, predicates,
+        )
+    }
+
+    fn assert_same(
+        case: &str,
+        file: &IcebergDataFileInfo,
+        predicates: &[IcebergPhysicalPredicate],
+    ) -> bool {
+        let core = core_keeps(file, predicates);
+        let provider = provider_keeps(file, predicates);
+        assert_eq!(core, provider, "{case}: Core kept {core}, provider {provider}");
+        core
+    }
+
+    fn stats_file(path: &str, column: &str, field_id: Option<i32>, min: i32, max: i32) -> IcebergDataFileInfo {
+        let mut file = IcebergDataFileInfo::for_test(path, 128, 10);
+        file.column_stats = Some(HashMap::from([(
+            column.to_string(),
+            IcebergColumnStats {
+                field_id,
+                null_count: Some(0),
+                value_count: Some(10),
+                column_size: None,
+                lower_bound: Some(min.to_le_bytes().to_vec()),
+                upper_bound: Some(max.to_le_bytes().to_vec()),
+            },
+        )]));
+        file
+    }
+
+    fn eq(column: &str, field_id: i32, value: IcebergPhysicalPredicateValue) -> IcebergPhysicalPredicate {
+        IcebergPhysicalPredicate {
+            column: column.to_string(),
+            field_id,
+            domain: IcebergPhysicalPredicateDomain::Range {
+                op: IcebergPhysicalPredicateOp::Eq,
+                value,
+            },
+        }
+    }
+
+    #[test]
+    fn min_max_bounds_agree() {
+        let excluded = stats_file("a", "id", Some(7), 1, 5);
+        assert!(!assert_same(
+            "bounds exclude",
+            &excluded,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int32(12))]
+        ));
+
+        let included = stats_file("b", "id", Some(7), 10, 20);
+        assert!(assert_same(
+            "bounds include",
+            &included,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int32(12))]
+        ));
+    }
+
+    #[test]
+    fn every_comparison_operator_agrees() {
+        let file = stats_file("c", "id", Some(7), 10, 20);
+        for (op, literal) in [
+            (IcebergPhysicalPredicateOp::Eq, 12),
+            (IcebergPhysicalPredicateOp::Eq, 30),
+            (IcebergPhysicalPredicateOp::Lt, 10),
+            (IcebergPhysicalPredicateOp::Lt, 15),
+            (IcebergPhysicalPredicateOp::Le, 9),
+            (IcebergPhysicalPredicateOp::Le, 10),
+            (IcebergPhysicalPredicateOp::Gt, 20),
+            (IcebergPhysicalPredicateOp::Gt, 15),
+            (IcebergPhysicalPredicateOp::Ge, 21),
+            (IcebergPhysicalPredicateOp::Ge, 20),
+        ] {
+            let predicate = IcebergPhysicalPredicate {
+                column: "id".to_string(),
+                field_id: 7,
+                domain: IcebergPhysicalPredicateDomain::Range {
+                    op,
+                    value: IcebergPhysicalPredicateValue::Int32(literal),
+                },
+            };
+            assert_same(&format!("{op:?} {literal}"), &file, &[predicate]);
+        }
+    }
+
+    #[test]
+    fn discrete_sets_agree() {
+        let file = stats_file("d", "id", Some(7), 10, 20);
+        for values in [vec![1, 30], vec![1, 12], vec![12]] {
+            let predicate = IcebergPhysicalPredicate {
+                column: "id".to_string(),
+                field_id: 7,
+                domain: IcebergPhysicalPredicateDomain::DiscreteSet {
+                    values: values
+                        .iter()
+                        .map(|value| IcebergPhysicalPredicateValue::Int32(*value))
+                        .collect(),
+                },
+            };
+            assert_same(&format!("IN {values:?}"), &file, &[predicate]);
+        }
+    }
+
+    #[test]
+    fn identity_partitions_agree() {
+        let mut file = IcebergDataFileInfo::for_test("e", 128, 10);
+        file.partition_values = vec![IcebergPartitionFieldValue::identity_int64_for_test("id", 12)];
+        assert!(assert_same(
+            "partition hit",
+            &file,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int32(12))]
+        ));
+        assert!(!assert_same(
+            "partition miss",
+            &file,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int32(1))]
+        ));
+
+        let mut null_partition = IcebergDataFileInfo::for_test("f", 128, 10);
+        null_partition.partition_values = vec![IcebergPartitionFieldValue {
+            source_column: "id".to_string(),
+            field_name: "id".to_string(),
+            transform: "identity".to_string(),
+            value: None,
+        }];
+        assert!(!assert_same(
+            "null partition",
+            &null_partition,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int32(12))]
+        ));
+    }
+
+    #[test]
+    fn degenerate_inputs_agree_on_keeping_the_file() {
+        let predicate = [eq("id", 7, IcebergPhysicalPredicateValue::Int32(12))];
+
+        let no_stats = IcebergDataFileInfo::for_test("g", 128, 10);
+        assert!(assert_same("no statistics", &no_stats, &predicate));
+
+        let mut no_bounds = IcebergDataFileInfo::for_test("h", 128, 10);
+        no_bounds.column_stats = Some(HashMap::from([(
+            "id".to_string(),
+            IcebergColumnStats {
+                field_id: Some(7),
+                null_count: Some(0),
+                value_count: Some(10),
+                column_size: None,
+                lower_bound: None,
+                upper_bound: None,
+            },
+        )]));
+        assert!(assert_same("no bound pair", &no_bounds, &predicate));
+
+        let other_column = stats_file("i", "unrelated", Some(99), 1, 5);
+        assert!(assert_same("unbindable column", &other_column, &predicate));
+
+        assert!(assert_same("no predicates", &no_stats, &[]));
+    }
+
+    /// An Iceberg `int -> long` promotion leaves four-byte bounds behind while
+    /// the literal arrives as `Int64`. Both implementations widen the bound onto
+    /// i64, so file-level pruning agrees. (The divergence this promotion causes
+    /// lives at the row-group level, which SPI-5N fixes separately in
+    /// `novarocks-fs`.)
+    #[test]
+    fn int_to_long_promotion_agrees() {
+        let excluded = stats_file("j", "id", Some(7), 1, 5);
+        assert!(!assert_same(
+            "promoted literal, bounds exclude",
+            &excluded,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int64(12))]
+        ));
+
+        let included = stats_file("k", "id", Some(7), 10, 20);
+        assert!(assert_same(
+            "promoted literal, bounds include",
+            &included,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int64(12))]
+        ));
+    }
+
+    /// The one intended divergence (SPI-5N D2). After a rename the manifest key
+    /// is the old name, so Core -- which binds by name -- cannot judge and keeps
+    /// the file. The provider binds by field id, judges it, and prunes.
+    ///
+    /// Both are sound; the provider is simply not blind here.
+    #[test]
+    fn renamed_column_is_the_intended_divergence() {
+        let file = stats_file("l", "old_name", Some(7), 1, 5);
+        let predicate = [eq("new_name", 7, IcebergPhysicalPredicateValue::Int32(12))];
+
+        assert!(
+            core_keeps(&file, &predicate),
+            "Core binds by name, so a renamed column leaves it unable to judge"
+        );
+        assert!(
+            !provider_keeps(&file, &predicate),
+            "the provider binds by field id and prunes the file"
+        );
+    }
+
+    /// Without a field id the provider must fall back to the name, which is what
+    /// keeps manifests written before the carrier existed judgeable.
+    #[test]
+    fn provider_falls_back_to_the_name_without_a_field_id() {
+        let file = stats_file("m", "id", None, 1, 5);
+        assert!(!assert_same(
+            "no field id, name matches",
+            &file,
+            &[eq("id", 7, IcebergPhysicalPredicateValue::Int32(12))]
+        ));
     }
 }
