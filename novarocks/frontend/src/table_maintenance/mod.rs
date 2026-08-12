@@ -26,9 +26,9 @@ use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
 use novarocks::engine::table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine,
-    TableMaintenanceService,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceAttemptCancellationSource,
+    MaintenanceRequestContext, MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission,
+    TableMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_spi::connector::{
     BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
@@ -263,6 +263,39 @@ impl FrontendTableMaintenanceService {
         }
     }
 
+    /// Bridge one lease attempt to the provider-neutral cancellation Core
+    /// exposes.
+    ///
+    /// Core never sees the lease: it only observes a boolean that flips when
+    /// this frontend loses dispatch authority, so an in-flight provider call
+    /// stops doing new work without Core learning about leases, repositories
+    /// or providers. The watcher lives as long as the returned source.
+    fn attempt_cancellation(
+        &self,
+        attempt: &MaintenanceLeaseAttempt,
+    ) -> MaintenanceAttemptCancellationSource {
+        let source = MaintenanceAttemptCancellationSource::new();
+        if attempt.authority_failure().is_some() {
+            source.cancel();
+            return source;
+        }
+        let watcher_source = source.clone();
+        let mut cancellation = attempt.cancellation();
+        self.runtime.spawn(async move {
+            loop {
+                if cancellation.borrow_and_update().is_some() {
+                    watcher_source.cancel();
+                    return;
+                }
+                if cancellation.changed().await.is_err() {
+                    // The attempt is gone; nothing else will dispatch under it.
+                    return;
+                }
+            }
+        });
+        source
+    }
+
     /// Read the durable provenance that every fenced transition of this
     /// attempt must carry, together with the validator that re-checks the
     /// lease inside the repository transaction.
@@ -404,7 +437,13 @@ impl FrontendTableMaintenanceService {
         let (authority, validator) = self.attempt_authority(&attempt)?;
         let operation_id = ConnectorCleanupOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
-        let session = engine.plan_cleanup_maintenance(&target, operation_id, older_than_ms)?;
+        let cancellation = self.attempt_cancellation(&attempt);
+        let session = engine.plan_cleanup_maintenance_with_attempt_context(
+            &target,
+            operation_id,
+            older_than_ms,
+            &cancellation.context(),
+        )?;
         let plan = session.plan_ref();
         let owner = MetadataMaintenanceExactOwner {
             instance_id: plan.owner().instance_id.as_str().to_string(),
@@ -580,7 +619,13 @@ impl FrontendTableMaintenanceService {
         let operation_id = ConnectorWriteOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
         let request_payload = distributed_rewrite_request_payload(intent);
-        let session = engine.plan_distributed_rewrite(&target, operation_id, intent)?;
+        let cancellation = self.attempt_cancellation(&attempt);
+        let session = engine.plan_distributed_rewrite_with_attempt_context(
+            &target,
+            operation_id,
+            intent,
+            &cancellation.context(),
+        )?;
         let plan = session.plan();
         let create = DistributedRewriteOperationCreate {
             operation_id: durable_id,
@@ -919,7 +964,13 @@ impl FrontendTableMaintenanceService {
         let (admission, attempt) = self.admit_and_acquire(&target)?;
         let operation_id = ConnectorMutationOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
-        let session = engine.plan_metadata_maintenance(&target, operation_id, intent)?;
+        let cancellation = self.attempt_cancellation(&attempt);
+        let session = engine.plan_metadata_maintenance_with_attempt_context(
+            &target,
+            operation_id,
+            intent,
+            &cancellation.context(),
+        )?;
         let plan = session.plan_ref();
         let request_payload = plan.provider_payload().to_vec();
         let request_payload_digest = metadata_maintenance_payload_digest(&request_payload);
@@ -1174,6 +1225,7 @@ impl FrontendTableMaintenanceService {
                 Arc::clone(&validator),
             ))
             .map_err(|error| format!("adopt metadata maintenance operation failed: {error}"))?;
+            let cancellation = self.attempt_cancellation(&attempt);
             let result = (|| -> Result<(), String> {
                 let stored = self
                     .block_on(repository.load_plan(operation.operation_id))
@@ -1212,7 +1264,11 @@ impl FrontendTableMaintenanceService {
                     stored.plan_digest,
                 )
                 .map_err(|error| error.to_string())?;
-                let completed = engine.reconcile_metadata_maintenance(&operation.target, plan)?;
+                let completed = engine.reconcile_metadata_maintenance_with_attempt_context(
+                    &operation.target,
+                    plan,
+                    &cancellation.context(),
+                )?;
                 let receipt = completed.receipt;
                 self.block_on(repository.finish_fenced(
                     operation.operation_id,
@@ -1302,6 +1358,7 @@ impl FrontendTableMaintenanceService {
                 Arc::clone(&validator),
             ))
             .map_err(|error| format!("adopt orphan cleanup operation failed: {error}"))?;
+            let cancellation = self.attempt_cancellation(&attempt);
             let result = (|| -> Result<(), String> {
                 let stored_plan = self
                     .block_on(repository.load_plan(operation.operation_id))
@@ -1334,10 +1391,11 @@ impl FrontendTableMaintenanceService {
                     checkpoint.prepared_handle.clone(),
                 ))
                 .map_err(|error| format!("restore orphan cleanup prepared evidence: {error}"))?;
-                let session = engine.recover_cleanup_for_reconcile(
+                let session = engine.recover_cleanup_for_reconcile_with_attempt_context(
                     &operation.target,
                     plan,
                     prepared.clone(),
+                    &cancellation.context(),
                 )?;
                 let receipt = engine.reconcile_cleanup_batch(&session, prepared)?;
                 let resolved = cleanup_receipt_checkpoint(checkpoint, &receipt);
