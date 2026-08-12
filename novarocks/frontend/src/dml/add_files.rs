@@ -199,6 +199,33 @@ fn execute_add_files_operation(
     )?;
 
     active.check_before_dispatch()?;
+
+    // Establish the external fence before registering any file. ADD FILES
+    // brings external files under the table's ownership, so a superseded
+    // owner's late execute has to be refused at the catalog rather than
+    // reported once the files are already claimed. ADD FILES always targets
+    // main; it has no branch-qualified form.
+    let fence = active
+        .external_fence()?
+        .seal(
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
+                prepared.facts.mutation_operation_id,
+            ),
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                    prepared.facts.instance_id.as_str(),
+                )
+                .map_err(DmlError::executor)?,
+                namespace: std::sync::Arc::from(prepared.facts.namespace.as_str()),
+                table: std::sync::Arc::from(prepared.facts.table.as_str()),
+            },
+            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+        )
+        .map_err(DmlError::executor)?;
+    engine
+        .establish_add_files_external_fence(prepared.handle.as_ref(), fence)
+        .map_err(DmlError::executor)?;
+
     finish_outcome(
         engine,
         active,
@@ -1031,6 +1058,17 @@ mod tests {
     }
 
     impl AddFilesEngine for FakeEngine {
+        /// Accept the sealed fence: this fake owns no mutation authority to
+        /// establish it on. What these tests exercise is the
+        /// establish-before-dispatch ordering and the lifecycle around it.
+        fn establish_add_files_external_fence(
+            &self,
+            _prepared: &dyn novarocks::engine::add_files_engine::AddFilesPrepared,
+            _fence: novarocks_spi::connector::ConnectorExternalOperationFence,
+        ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            Ok(())
+        }
+
         fn classify_add_files(&self, sql: &str) -> Result<Option<AddFilesCommand>, String> {
             self.classify_calls.fetch_add(1, Ordering::SeqCst);
             Ok((sql == "ADD").then(|| AddFilesCommand {
@@ -1252,6 +1290,39 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        /// The coordinated path admits and validates inside the journal
+        /// transaction. This fake has no transaction to do that inside; the
+        /// transactional guarantees are covered by the StateStore journal
+        /// tests. Here these only need to let a coordinated operation proceed
+        /// so ADD FILES routing runs under a real fence.
+        fn create_statement_operation_admitted(
+            &self,
+            request: CreateStatementOperationRequest,
+            _admission: Arc<dyn crate::dml::journal::DmlIntentAdmissionValidator>,
+        ) -> Result<StoredOperation, DmlError> {
+            self.create_statement_operation(request)
+        }
+
+        fn claim_operation_admitted(
+            &self,
+            request: crate::dml::model::DmlCoordinationClaimRequest,
+            _admission: Arc<dyn crate::dml::journal::DmlIntentAdmissionValidator>,
+            _authority: crate::dml::journal::DmlMutationAuthority,
+        ) -> Result<StoredOperation, DmlError> {
+            Ok(self
+                .load(request.operation_id)?
+                .expect("claimed DML operation must exist in this fake journal"))
+        }
+
+        fn mutate_statement_operation_authorized(
+            &self,
+            request: OperationMutationRequest,
+            _recovery_due_at_ms: Option<i64>,
+            _authority: crate::dml::journal::DmlMutationAuthority,
+        ) -> Result<StoredOperation, DmlError> {
+            self.mutate_statement_operation(request)
+        }
+
         fn create_statement_operation(
             &self,
             request: CreateStatementOperationRequest,
@@ -1290,6 +1361,15 @@ mod tests {
             self.preflight_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        fn apply_add_files_mutation_authorized(
+            &self,
+            request: AddFilesMutationRequest,
+            _recovery_due_at_ms: Option<i64>,
+            _authority: crate::dml::journal::DmlMutationAuthority,
+        ) -> Result<StoredOperation, DmlError> {
+            self.apply_add_files_mutation(request)
+        }
+
         fn apply_add_files_mutation(
             &self,
             request: AddFilesMutationRequest,
@@ -1348,12 +1428,77 @@ mod tests {
         }
     }
 
+    /// One runtime for the whole test binary: a per-harness runtime would be
+    /// dropped with the service that borrowed it.
+    fn shared_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+        })
+    }
+
+    /// Real coordination over a temporary SQLite StateStore.
+    ///
+    /// Dispatch is fenced now, and a fence can only be minted from a live
+    /// coordination lease, so a service composed without coordination cannot
+    /// dispatch at all. These tests therefore stand up the genuine coordination
+    /// runtime rather than reaching for a test-only fence -- the seam that
+    /// would have given them one also disables the guard asserting that an
+    /// operation without authority cannot dispatch.
+    fn coordination() -> Arc<crate::coordination::FrontendCoordinationRuntime> {
+        let dir = tempfile::tempdir().expect("temp dir").keep();
+        let registry = novarocks_state_store::builtin_state_store_provider_registry()
+            .expect("provider registry");
+        let runtime = shared_runtime();
+        let host = runtime
+            .block_on(novarocks_state_store::StateStoreHost::open(
+                &registry,
+                novarocks_state_store::StateStoreHostConfig {
+                    state_store: novarocks_state_store::StateStoreAppConfig {
+                        store: novarocks_state_store::StateStoreConfig {
+                            cluster_id: "add-files-focused-test".to_string(),
+                            limits: novarocks_state_store::StateStoreLimitOverrides::default(),
+                            provider: novarocks_state_store::StateStoreProviderConfig::Sqlite {
+                                path: dir.join("state.sqlite"),
+                                deployment_owner: "add-files-fe".to_string(),
+                            },
+                        },
+                        mysql_client: None,
+                    },
+                    foundationdb_client: None,
+                },
+                novarocks_spi::state_store::FeDeploymentView {
+                    active_fe_count: std::num::NonZeroUsize::new(1).unwrap(),
+                    topology_revision: bytes::Bytes::from_static(b"add-files-topology"),
+                },
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            ))
+            .expect("open state store host");
+        let store = host.state_store().expect("StateStore exposure");
+        let coordination = runtime
+            .block_on(crate::coordination::FrontendCoordinationRuntime::open(
+                store,
+            ))
+            .expect("open frontend coordination");
+        // The host owns the database; keep it alive for the process.
+        std::mem::forget(host);
+        Arc::new(coordination)
+    }
+
     fn harness(engine: &mut FakeEngine) -> (DmlService, Arc<FakeJournal>) {
         let journal = Arc::new(FakeJournal::default());
         engine.plan_is_durable = Arc::clone(&journal.plan_is_durable);
         engine.evidence_is_durable = Arc::clone(&journal.evidence_is_durable);
         (
-            DmlService::new(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+            DmlService::compose_with_coordination(
+                Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+                Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+                coordination(),
+                shared_runtime().handle().clone(),
+            ),
             journal,
         )
     }
