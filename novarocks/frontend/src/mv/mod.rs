@@ -16,6 +16,10 @@
 // under the License.
 
 pub(crate) mod activity;
+// Consumed when lake-first discovery replaces ledger-driven enumeration; the
+// classifier is pure and lands with its rules tested first.
+#[allow(dead_code)]
+mod attempt_classification;
 // The acquisition surface here is consumed when the three refresh entry points
 // are switched onto it. The repository-side fence it feeds is already live, so
 // it lands first and is wired next rather than being held back.
