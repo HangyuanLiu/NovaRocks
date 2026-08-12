@@ -408,50 +408,68 @@ async fn fail_preserves_error_and_clears_running_and_active_indexes() {
 }
 
 #[tokio::test]
-async fn restart_reconcile_fails_running_jobs_and_leaves_pending_jobs_claimable() {
-    let (_temp, store, repository) = fixture().await;
-    let running = repository
-        .create(create_request("ice", "db", "running", 10, 100))
+async fn recovery_returns_an_undispatched_claim_and_fails_a_dispatched_one() {
+    let (_temp, _store, repository) = fixture().await;
+    let accepting: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let undispatched = repository
+        .create(create_request("ice", "db", "undispatched", 10, 100))
         .await
-        .expect("create running job");
-    let pending = repository
-        .create(create_request("ice", "db", "pending", 20, 101))
-        .await
-        .expect("create pending job");
+        .expect("create undispatched job");
     repository
-        .claim(running.job_id, 200)
+        .claim_fenced(
+            undispatched.job_id,
+            200,
+            test_authority(),
+            Arc::clone(&accepting),
+        )
         .await
         .unwrap()
         .unwrap();
 
-    assert_eq!(repository.reconcile_startup(300).await.unwrap(), 1);
+    // A different attempt takes the target over. Nothing was dispatched, so the
+    // job goes back to the queue instead of being failed.
+    repository
+        .release_undispatched_fenced(
+            undispatched.job_id,
+            test_authority(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect("undispatched claim is releasable");
+    let released = repository
+        .list_pending()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.job_id == undispatched.job_id)
+        .expect("released job is claimable again");
+    assert_eq!(released.state, OptimizeJobState::Pending);
+    assert_eq!(released.started_at_ms, None);
+    assert_eq!(released.dispatched_child, None);
 
-    let jobs = repository.list().await.unwrap();
-    let reconciled = jobs
-        .iter()
-        .find(|job| job.job_id == running.job_id)
+    // A lost fence cannot recover anything.
+    let rejecting: MaintenanceFenceValidator = Arc::new(|_| {
+        Box::pin(async {
+            Err(MaintenanceAuthorityFailure::Coordination(
+                CoordinationError::clock_unsafe(),
+            ))
+        })
+    });
+    repository
+        .claim_fenced(
+            undispatched.job_id,
+            201,
+            test_authority(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .unwrap()
         .unwrap();
-    assert_eq!(reconciled.state, OptimizeJobState::Failed);
-    assert!(
-        reconciled
-            .error_message
-            .as_deref()
-            .unwrap()
-            .contains("restart")
-    );
-    let still_pending = jobs
-        .iter()
-        .find(|job| job.job_id == pending.job_id)
-        .unwrap();
-    assert_eq!(still_pending.state, OptimizeJobState::Pending);
-    assert!(
-        repository
-            .claim(pending.job_id, 400)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(!raw_key_exists(store.as_ref(), &raw_key("state/running/0000000000000001")).await);
+    let error = repository
+        .release_undispatched_fenced(undispatched.job_id, test_authority(), rejecting)
+        .await
+        .expect_err("a lost fence must not recover a claimed job");
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
 }
 
 #[tokio::test]
@@ -491,11 +509,11 @@ async fn restart_reconcile_finishes_running_job_with_durable_outcome_and_clears_
     let restarted = OptimizeJobRepository::open(Arc::clone(&restarted_store))
         .await
         .expect("reopen optimize job repository");
-    assert_eq!(
-        restarted.reconcile_startup(300).await.unwrap(),
-        1,
-        "one durable running job must be reconciled"
-    );
+    let accepting: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    restarted
+        .finish_recovered_fenced(created.job_id, 300, test_authority(), accepting)
+        .await
+        .expect("a durable outcome is finalized by the recovering attempt");
 
     let finished = restarted.list().await.unwrap().remove(0);
     assert_eq!(finished.state, OptimizeJobState::Finished);

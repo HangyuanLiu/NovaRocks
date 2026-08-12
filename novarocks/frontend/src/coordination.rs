@@ -97,6 +97,15 @@ impl FrontendCoordinationRuntime {
         self.manager.clone()
     }
 
+    /// Share the process-wide control incarnation gate.
+    ///
+    /// Domain coordination facades consume this handle so the whole frontend
+    /// observes one control incarnation. They must never construct a second
+    /// [`IncarnationGate`] over the same store.
+    pub(crate) fn gate(&self) -> Arc<IncarnationGate> {
+        Arc::clone(&self.gate)
+    }
+
     pub(crate) fn store(&self) -> Arc<dyn StateStore> {
         Arc::clone(&self.store)
     }

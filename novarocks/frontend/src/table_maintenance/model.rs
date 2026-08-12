@@ -113,6 +113,9 @@ pub struct OptimizeJob {
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+    /// Set once this job has dispatched a distributed rewrite. Recovery must
+    /// never re-execute a job that already has one.
+    pub dispatched_child: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -155,6 +158,14 @@ pub struct StoredOptimizeJobV1 {
     pub last_operation_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<MaintenanceAuthorityV1>,
+    /// The distributed-rewrite operation this claimed job already dispatched.
+    ///
+    /// Recovery needs to tell "claimed but never dispatched" from "dispatched
+    /// and the external outcome is unknown". Only the second case is unsafe to
+    /// run again, so the link is written in the same transaction that creates
+    /// the child. `None` on a RUNNING record proves no child exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_child: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -260,6 +271,7 @@ impl From<&StoredOptimizeJobV1> for OptimizeJob {
             created_at_ms: value.created_at_ms,
             started_at_ms: value.started_at_ms,
             finished_at_ms: value.finished_at_ms,
+            dispatched_child: value.dispatched_child,
         }
     }
 }

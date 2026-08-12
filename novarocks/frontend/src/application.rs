@@ -48,6 +48,7 @@ use crate::statistics_jobs::service::{
     FrontendStatisticsApplicationPort, StatisticsApplicationService,
 };
 use crate::table_maintenance::FrontendTableMaintenanceService;
+use crate::table_maintenance::coordination::MaintenanceCoordination;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
 
@@ -437,12 +438,30 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
-        match FrontendTableMaintenanceService::open(
-            host.state_store(),
-            tokio::runtime::Handle::current(),
-        )
-        .await
-        {
+        // A frontend that owns durable maintenance records also owns the lease
+        // authority for them. `coordination` is present whenever a StateStore
+        // is, so this never installs an unfenced durable owner.
+        let table_maintenance_open = match host.coordination() {
+            Some(coordination) => {
+                FrontendTableMaintenanceService::open_with_coordination(
+                    host.state_store(),
+                    tokio::runtime::Handle::current(),
+                    MaintenanceCoordination::from_frontend(
+                        coordination.as_ref(),
+                        tokio::runtime::Handle::current(),
+                    ),
+                )
+                .await
+            }
+            None => {
+                FrontendTableMaintenanceService::open(
+                    host.state_store(),
+                    tokio::runtime::Handle::current(),
+                )
+                .await
+            }
+        };
+        match table_maintenance_open {
             Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),
             Err(error) => {
                 let error = FrontendApplicationError::new(

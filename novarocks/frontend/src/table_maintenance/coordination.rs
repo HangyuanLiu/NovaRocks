@@ -131,15 +131,45 @@ pub fn maintenance_resource_key_v1(
     ResourceKey::try_from(resource_key_bytes_v1(target)?).map_err(Into::into)
 }
 
+/// Canonicalize one namespace or table segment of a coordination resource key.
+///
+/// This is deliberately not SQL-identifier validation. The key is a concurrency
+/// identity for an external table that already exists, and lake table names may
+/// legally contain characters no SQL identifier allows (`sales-2026`). Applying
+/// identifier rules here would make every maintenance action on such a table
+/// fail closed at acquire, which is a worse outcome than coordinating on its
+/// canonical name. Only genuinely unusable segments are rejected: empty after
+/// trimming, or carrying control characters that no canonical form can express.
+fn normalize_resource_component(
+    raw: &str,
+    what: &str,
+) -> Result<String, MaintenanceCoordinationError> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix('`')
+        .and_then(|value| value.strip_suffix('`'))
+        .unwrap_or(trimmed)
+        .trim();
+    if trimmed.is_empty() {
+        return Err(MaintenanceCoordinationError::InvalidTarget(format!(
+            "maintenance {what} is empty"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(MaintenanceCoordinationError::InvalidTarget(format!(
+            "maintenance {what} contains control characters"
+        )));
+    }
+    Ok(trimmed.to_lowercase())
+}
+
 fn resource_key_bytes_v1(
     target: &MaintenanceTarget,
 ) -> Result<Bytes, MaintenanceCoordinationError> {
     let instance = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| MaintenanceCoordinationError::InvalidTarget(error.to_string()))?;
-    let namespace = normalize_identifier(&target.namespace)
-        .map_err(MaintenanceCoordinationError::InvalidTarget)?;
-    let table =
-        normalize_identifier(&target.table).map_err(MaintenanceCoordinationError::InvalidTarget)?;
+    let namespace = normalize_resource_component(&target.namespace, "namespace")?;
+    let table = normalize_resource_component(&target.table, "table")?;
 
     let components = [
         instance.as_str().as_bytes(),
@@ -188,6 +218,22 @@ impl MaintenanceCoordination {
         Self {
             gate: Arc::new(gate),
             manager,
+            runtime,
+        }
+    }
+
+    /// Build the production facade from the host-owned coordination runtime.
+    ///
+    /// The gate handle and the process-scoped `HolderId` are shared with every
+    /// other frontend domain, so table maintenance neither opens a second
+    /// StateStore nor creates a second control incarnation.
+    pub(crate) fn from_frontend(
+        frontend: &crate::coordination::FrontendCoordinationRuntime,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            gate: frontend.gate(),
+            manager: frontend.lease_manager(),
             runtime,
         }
     }
@@ -619,6 +665,27 @@ mod tests {
     }
 
     #[test]
+    fn resource_codec_coordinates_lake_names_that_are_not_sql_identifiers() {
+        // A hyphenated or dotted lake table is legal and must still be
+        // coordinable; rejecting it here would make every maintenance action on
+        // that table fail closed at acquire.
+        let hyphenated = target("analytics", "sales-eu", "orders-2026");
+        let key = maintenance_resource_key_v1(&hyphenated).expect("hyphenated target key");
+        assert_eq!(
+            key,
+            maintenance_resource_key_v1(&target("analytics", " Sales-EU ", "`ORDERS-2026`"))
+                .expect("alias key")
+        );
+        assert_ne!(
+            key,
+            maintenance_resource_key_v1(&target("analytics", "sales-eu", "orders-2025"))
+                .expect("different table key")
+        );
+        assert!(maintenance_resource_key_v1(&target("analytics", "sales", "  ")).is_err());
+        assert!(maintenance_resource_key_v1(&target("analytics", "sales", "or\u{7}ders")).is_err());
+    }
+
+    #[test]
     fn resource_codec_is_versioned_canonical_and_bounded() {
         let canonical = target("analytics", "sales", "orders");
         let aliases = target("ANALYTICS", " Sales ", "`ORDERS`");
@@ -637,7 +704,6 @@ mod tests {
                 .starts_with(b"frontend/table-maintenance/table/v1\0")
         );
         assert!(maintenance_resource_key_v1(&target("", "sales", "orders")).is_err());
-        assert!(maintenance_resource_key_v1(&target("analytics", "sales-east", "orders")).is_err());
         assert!(
             maintenance_resource_key_v1(&target(
                 "analytics",

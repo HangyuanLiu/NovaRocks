@@ -344,6 +344,13 @@ impl OptimizeJobRepository {
             .await
     }
 
+    /// Jobs a previous attempt claimed but never terminalized. The RUNNING
+    /// index bounds the scan; recovery decides per job under its own attempt.
+    pub async fn list_running(&self) -> RepositoryResult<Vec<OptimizeJob>> {
+        self.list_indexed_jobs(RUNNING_PREFIX, OptimizeJobState::Running)
+            .await
+    }
+
     pub async fn claim(&self, job_id: i64, now_ms: i64) -> RepositoryResult<Option<OptimizeJob>> {
         validate_job_id(job_id, "claim optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -481,6 +488,141 @@ impl OptimizeJobRepository {
             StoredOptimizeOperationActionV1::RecordOutcome,
             job_id,
             "record outcome for optimize job",
+        )
+        .await
+    }
+
+    /// Recovery-only takeover: finalize a job whose outcome the previous
+    /// attempt already recorded. The caller proves it holds the live lease;
+    /// the stale attempt bound to the record is irrelevant and is replaced.
+    pub async fn finish_recovered_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "finish recovered optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "finish recovered frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_recovered_terminal(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        None,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Finish,
+            job_id,
+            "finish recovered optimize job",
+        )
+        .await
+    }
+
+    /// Recovery-only takeover: fail a job that already dispatched external work
+    /// whose outcome this frontend cannot prove.
+    pub async fn fail_recovered_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        message: String,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fail recovered optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fail recovered frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                let message = message.clone();
+                Box::pin(async move {
+                    apply_recovered_terminal(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        Some(message),
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Fail,
+            job_id,
+            "fail recovered optimize job",
+        )
+        .await
+    }
+
+    /// Recovery-only transition: hand a claimed-but-undispatched job back to
+    /// the PENDING queue so any frontend can execute it under a new attempt.
+    pub async fn release_undispatched_fenced(
+        &self,
+        job_id: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "release undispatched optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "release undispatched frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_release_undispatched(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Claim,
+            job_id,
+            "release undispatched optimize job",
         )
         .await
     }
@@ -661,27 +803,6 @@ impl OptimizeJobRepository {
             "fenced fail optimize job",
         )
         .await
-    }
-
-    pub async fn reconcile_startup(&self, now_ms: i64) -> RepositoryResult<usize> {
-        let running = self
-            .list_indexed_jobs(RUNNING_PREFIX, OptimizeJobState::Running)
-            .await?;
-        let mut reconciled = 0;
-        for job in running {
-            if job.outcome.is_some() {
-                self.finish(job.job_id, now_ms).await?;
-            } else {
-                self.fail(
-                    job.job_id,
-                    now_ms,
-                    "optimize job failed during frontend restart reconciliation".to_string(),
-                )
-                .await?;
-            }
-            reconciled += 1;
-        }
-        Ok(reconciled)
     }
 
     async fn list_indexed_jobs(
@@ -1102,6 +1223,7 @@ async fn apply_create(
         finished_at_ms: None,
         last_operation_id: *operation_id.as_uuid(),
         authority: None,
+        dispatched_child: None,
     };
     let counter = StoredOptimizeCounterV1 {
         schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
@@ -1273,6 +1395,142 @@ async fn apply_claim(
         .put(operation_key, operation_value, Precondition::Absent)
         .await?;
     Ok(Ok(Some(OptimizeJob::from(&job.stored))))
+}
+
+/// Terminalize a job left RUNNING by a previous attempt.
+///
+/// `message` selects the terminal state: `None` finalizes a job whose outcome
+/// is already durable, `Some` fails a job whose external effect this frontend
+/// cannot prove. Both are takeovers, so the live lease is the authority and the
+/// record is rebound to the recovering attempt.
+async fn apply_recovered_terminal(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: OperationId,
+    job_id: i64,
+    now_ms: i64,
+    message: Option<String>,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<()> {
+    let mut job = match require_running_job(transaction, job_id, "recover optimize job").await? {
+        Ok(job) => job,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    job.stored.schema_version = OPTIMIZE_JOB_SCHEMA_VERSION;
+    job.stored.authority = Some(authority.clone());
+    let action = match message {
+        Some(message) => {
+            job.stored.state = StoredOptimizeJobStateV1::Failed;
+            job.stored.error_message = Some(message);
+            StoredOptimizeOperationActionV1::Fail
+        }
+        None => {
+            if job.stored.outcome.is_none() {
+                return Ok(Err(RepositoryError::new(
+                    RepositoryErrorKind::InvalidTransition,
+                    format!("recover optimize job {job_id} failed: outcome has not been recorded"),
+                )));
+            }
+            job.stored.state = StoredOptimizeJobStateV1::Finished;
+            job.stored.error_message = None;
+            StoredOptimizeOperationActionV1::Finish
+        }
+    };
+    job.stored.finished_at_ms = Some(now_ms);
+    job.stored.last_operation_id = *operation_id.as_uuid();
+    terminalize_job(transaction, operation_id, action, job).await
+}
+
+/// Return a claimed-but-never-dispatched job to PENDING under the recovering
+/// attempt. This is only legal while `dispatched_child` is absent: the job has
+/// produced no external effect, so re-running it is not a replay.
+///
+/// Recovery is a takeover, so the caller's authority is validated against the
+/// live lease rather than against the stale attempt bound to the record. A
+/// frontend that lost the lease fails this check exactly like any other
+/// authority-bearing transition.
+async fn apply_release_undispatched(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: OperationId,
+    job_id: i64,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<()> {
+    let mut job = match require_running_job(
+        transaction,
+        job_id,
+        "release undispatched optimize job",
+    )
+    .await?
+    {
+        Ok(job) => job,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if job.stored.dispatched_child.is_some() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "optimize job already dispatched a distributed rewrite",
+        )));
+    }
+    if job.stored.outcome.is_some() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "optimize job already recorded an outcome",
+        )));
+    }
+    job.stored.state = StoredOptimizeJobStateV1::Pending;
+    job.stored.started_at_ms = None;
+    // The next executor takes a new attempt; leaving the old provenance would
+    // let a stale fence look current to a later fenced transition.
+    job.stored.authority = None;
+    job.stored.last_operation_id = *operation_id.as_uuid();
+    let value = match encode_job(&job.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let key = match job_key(job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let running_key = match state_key(RUNNING_PREFIX, job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let pending_key = match state_key(PENDING_PREFIX, job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let index_value = match encode_index_value(job_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (operation_key, operation_value) = match operation_record(
+        operation_id,
+        StoredOptimizeOperationActionV1::Claim,
+        &job.stored,
+    ) {
+        Ok(record) => record,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(key, value, Precondition::Version(job.version))
+        .await?;
+    transaction
+        .delete(running_key, Precondition::Present)
+        .await?;
+    transaction
+        .put(pending_key, index_value, Precondition::Absent)
+        .await?;
+    transaction
+        .put(operation_key, operation_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(()))
 }
 
 async fn apply_record_outcome(
@@ -4377,6 +4635,168 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    pub async fn mark_abort_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::AbortPending,
+            &[
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+            ],
+            DistributedRewriteOperationState::AbortPending,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn mark_commit_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::CommitPending,
+            &[DistributedRewriteOperationState::Staging],
+            DistributedRewriteOperationState::CommitPending,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        evidence: DistributedRewriteOpaquePayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &evidence.payload,
+            evidence.digest,
+            "distributed rewrite evidence",
+        )?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::ReconcilePending,
+            &[DistributedRewriteOperationState::CommitPending],
+            DistributedRewriteOperationState::ReconcilePending,
+            Some(RewriteTransitionPayload::Evidence(evidence)),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn finish_fenced(
+        &self,
+        operation_id: Uuid,
+        receipt: DistributedRewriteOpaquePayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &receipt.payload,
+            receipt.digest,
+            "distributed rewrite receipt",
+        )?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Finish,
+            &[
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::AbortPending,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+            ],
+            DistributedRewriteOperationState::Finished,
+            Some(RewriteTransitionPayload::Receipt(receipt)),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn fail_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_error(&message)?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Fail,
+            &[
+                DistributedRewriteOperationState::Pending,
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::AbortPending,
+            ],
+            DistributedRewriteOperationState::Failed,
+            Some(RewriteTransitionPayload::Error(message)),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_error(&message)?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Unresolve,
+            &[
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+                DistributedRewriteOperationState::AbortPending,
+            ],
+            DistributedRewriteOperationState::Unresolved,
+            Some(RewriteTransitionPayload::Error(message)),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     pub async fn get(
         &self,
         operation_id: Uuid,
@@ -4783,7 +5203,7 @@ async fn apply_rewrite_create(
             )));
         }
         let active_job = match load_job_from_transaction(transaction, active_job_id).await? {
-            Ok(Some(job)) => job.stored,
+            Ok(Some(job)) => job,
             Ok(None) => {
                 return Ok(Err(RepositoryError::corruption(format!(
                     "create distributed rewrite operation failed: active optimize job {active_job_id} is missing"
@@ -4791,6 +5211,8 @@ async fn apply_rewrite_create(
             }
             Err(error) => return Ok(Err(error)),
         };
+        let active_job_version = active_job.version.clone();
+        let mut active_job = active_job.stored;
         if active_job.target != StoredMaintenanceTargetV1::from(&request.target)
             || active_job.state != StoredOptimizeJobStateV1::Running
         {
@@ -4809,6 +5231,28 @@ async fn apply_rewrite_create(
             {
                 return Ok(Err(error));
             }
+        }
+        // Record the dispatch link in this same transaction. After a crash the
+        // recovery owner reads it to know an external rewrite may already have
+        // happened, instead of guessing from the absence of an outcome.
+        if active_job.dispatched_child.is_none() {
+            active_job.dispatched_child = Some(request.operation_id);
+            active_job.schema_version = OPTIMIZE_JOB_SCHEMA_VERSION;
+            let job_value = match encode_job(&active_job) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            let job_record_key = match job_key(active_job_id) {
+                Ok(key) => key,
+                Err(error) => return Ok(Err(error)),
+            };
+            transaction
+                .put(
+                    job_record_key,
+                    job_value,
+                    Precondition::Version(active_job_version),
+                )
+                .await?;
         }
     } else if let Some(claimed_job_id) = claimed_optimize_job_id {
         return Ok(Err(RepositoryError::corruption(format!(
@@ -5715,6 +6159,44 @@ impl CleanupOperationRepository {
                         operation_id,
                         checkpoint,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Fenced twin of [`Self::prepare_batch`]. This is the transition that
+    /// authorizes a destructive provider call, so it must prove the caller
+    /// still holds the attempt inside the same transaction.
+    pub async fn prepare_batch_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, false)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Prepare,
+            "fenced persist frontend connector cleanup prepared batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_prepare(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -5739,8 +6221,47 @@ impl CleanupOperationRepository {
             move |transaction, transaction_id| {
                 let checkpoint = checkpoint.clone();
                 Box::pin(async move {
-                    apply_cleanup_checkpoint(transaction, transaction_id, operation_id, checkpoint)
-                        .await
+                    apply_cleanup_checkpoint(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Fenced twin of [`Self::checkpoint_batch`].
+    pub async fn checkpoint_batch_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, true)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "fenced checkpoint frontend connector cleanup batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_checkpoint(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        Some((&authority, &validator)),
+                    )
+                    .await
                 })
             },
         )
@@ -5768,6 +6289,40 @@ impl CleanupOperationRepository {
                         transaction_id,
                         operation_id,
                         checkpoint,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Fenced twin of [`Self::checkpoint_reconciled_batch`].
+    pub async fn checkpoint_reconciled_batch_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, true)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "fenced checkpoint reconciled frontend connector cleanup batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_reconciled_checkpoint(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -5792,6 +6347,26 @@ impl CleanupOperationRepository {
         .await
     }
 
+    pub async fn mark_reconcile_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::ReconcilePending,
+            &[CleanupOperationState::Running],
+            CleanupOperationState::ReconcilePending,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     pub async fn resume_running(
         &self,
         operation_id: Uuid,
@@ -5804,6 +6379,26 @@ impl CleanupOperationRepository {
             CleanupOperationState::Running,
             None,
             now_ms,
+        )
+        .await
+    }
+
+    pub async fn resume_running_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Resume,
+            &[CleanupOperationState::ReconcilePending],
+            CleanupOperationState::Running,
+            None,
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -5823,6 +6418,29 @@ impl CleanupOperationRepository {
             CleanupOperationState::Finished,
             None,
             now_ms,
+        )
+        .await
+    }
+
+    pub async fn finish_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Finish,
+            &[
+                CleanupOperationState::Planned,
+                CleanupOperationState::Running,
+            ],
+            CleanupOperationState::Finished,
+            None,
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -5850,6 +6468,31 @@ impl CleanupOperationRepository {
         .await
     }
 
+    pub async fn fail_before_dispatch_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_error(&message)?;
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Fail,
+            &[
+                CleanupOperationState::Pending,
+                CleanupOperationState::Planned,
+            ],
+            CleanupOperationState::Failed,
+            Some(message),
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     pub async fn mark_unresolved(
         &self,
         operation_id: Uuid,
@@ -5867,6 +6510,31 @@ impl CleanupOperationRepository {
             CleanupOperationState::Unresolved,
             Some(message),
             now_ms,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_error(&message)?;
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Unresolve,
+            &[
+                CleanupOperationState::Running,
+                CleanupOperationState::ReconcilePending,
+            ],
+            CleanupOperationState::Unresolved,
+            Some(message),
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -6004,6 +6672,46 @@ impl CleanupOperationRepository {
                         next,
                         error,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn cleanup_transition_fenced(
+        &self,
+        operation_id: Uuid,
+        action: StoredCleanupTransactionActionV4,
+        allowed: &'static [CleanupOperationState],
+        next: CleanupOperationState,
+        error: Option<String>,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            action,
+            "fenced transition frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                let error = error.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_transition(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        action,
+                        allowed,
+                        next,
+                        error,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -6307,6 +7015,7 @@ async fn apply_cleanup_prepare(
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
     _now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -6314,6 +7023,17 @@ async fn apply_cleanup_prepare(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if !matches!(
         operation.stored.state,
         CleanupOperationState::Planned | CleanupOperationState::Running
@@ -6379,6 +7099,7 @@ async fn apply_cleanup_checkpoint(
     transaction_id: OperationId,
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -6386,6 +7107,17 @@ async fn apply_cleanup_checkpoint(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state != CleanupOperationState::Running {
         return Ok(Err(RepositoryError::new(
             RepositoryErrorKind::InvalidTransition,
@@ -6465,6 +7197,7 @@ async fn apply_cleanup_reconciled_checkpoint(
     transaction_id: OperationId,
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -6472,6 +7205,17 @@ async fn apply_cleanup_reconciled_checkpoint(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state != CleanupOperationState::ReconcilePending
         || !matches!(
             operation.stored.next_batch_ordinal,
@@ -6548,6 +7292,7 @@ async fn apply_cleanup_transition(
     next: CleanupOperationState,
     error: Option<String>,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -6555,6 +7300,17 @@ async fn apply_cleanup_transition(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state == next {
         return Ok(Ok(CleanupOperation::from(&operation.stored)));
     }

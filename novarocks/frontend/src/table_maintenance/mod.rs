@@ -38,15 +38,21 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization, ExternalMutationOutcome, PreparedBatch,
 };
 use novarocks_spi::state_store::StateStore;
+use novarocks_state_store::coordination::WriteAdmission;
 use tokio::runtime::Handle;
 
+use self::coordination::{
+    MaintenanceAcquireOutcome, MaintenanceCoordination, MaintenanceFenceValidator,
+    MaintenanceLeaseAttempt,
+};
 use self::model::{
     CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
-    DistributedRewriteOperationKind, DistributedRewritePlanPayload, MetadataMaintenanceExactOwner,
-    MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperationCreate,
-    MetadataMaintenanceOperationKind, MetadataMaintenancePlanPayload, OptimizeJobCreate,
+    DistributedRewriteOperationKind, DistributedRewritePlanPayload, MaintenanceAuthorityV1,
+    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
+    MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
+    MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use self::parser::{
     ParsedMaintenanceAction, ParsedMaintenanceStatement, is_spark_maintenance_call,
@@ -84,18 +90,60 @@ enum WorkerLifecycle {
     Stopped(Result<(), String>),
 }
 
+/// Where a distributed rewrite takes its per-table dispatch authority from.
+pub(crate) enum RewriteAuthorityOrigin {
+    /// A newly admitted user or scheduler intent: admit writes, then acquire.
+    NewIntent,
+    /// A child of an already-claimed V1 optimize job. The parent attempt is
+    /// reused verbatim; acquiring the same table resource twice would either
+    /// deadlock against the parent or invent a second authority for one table.
+    ClaimedOptimizeJob {
+        job_id: i64,
+        attempt: MaintenanceLeaseAttempt,
+    },
+}
+
+/// The create transition a resolved rewrite origin maps to.
+enum ResolvedRewriteCreate {
+    Admitted(WriteAdmission),
+    ClaimedOptimizeJob(i64),
+}
+
+const COORDINATION_REQUIRED: &str =
+    "durable table maintenance requires frontend coordination authority";
+
 // Design: ADR-0009 (docs/adr/ADR-0009-frontend-table-maintenance-owner.md)
 pub struct FrontendTableMaintenanceService {
     repository: Option<Arc<OptimizeJobRepository>>,
     metadata_repository: Option<Arc<MetadataMaintenanceOperationRepository>>,
     distributed_rewrite_repository: Option<Arc<DistributedRewriteOperationRepository>>,
     cleanup_repository: Option<Arc<CleanupOperationRepository>>,
+    coordination: Option<MaintenanceCoordination>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
 }
 
 impl FrontendTableMaintenanceService {
     pub async fn open(store: Option<Arc<dyn StateStore>>, runtime: Handle) -> Result<Self, String> {
+        Self::open_inner(store, runtime, None).await
+    }
+
+    /// Production composition: bind the durable owner to the host-owned
+    /// coordination runtime so every durable maintenance transition carries a
+    /// per-table lease attempt and an in-transaction fence.
+    pub async fn open_with_coordination(
+        store: Option<Arc<dyn StateStore>>,
+        runtime: Handle,
+        coordination: MaintenanceCoordination,
+    ) -> Result<Self, String> {
+        Self::open_inner(store, runtime, Some(coordination)).await
+    }
+
+    async fn open_inner(
+        store: Option<Arc<dyn StateStore>>,
+        runtime: Handle,
+        coordination: Option<MaintenanceCoordination>,
+    ) -> Result<Self, String> {
         let (repository, metadata_repository, distributed_rewrite_repository, cleanup_repository) =
             match store {
                 Some(store) => (
@@ -139,9 +187,76 @@ impl FrontendTableMaintenanceService {
             metadata_repository,
             distributed_rewrite_repository,
             cleanup_repository,
+            coordination,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
         })
+    }
+
+    /// Fail closed when a durable maintenance path runs without installed
+    /// authority. There is no unfenced fallback: a frontend that owns durable
+    /// maintenance records must also own a lease attempt for the target.
+    fn require_coordination(&self) -> Result<&MaintenanceCoordination, String> {
+        self.coordination
+            .as_ref()
+            .ok_or_else(|| COORDINATION_REQUIRED.to_string())
+    }
+
+    /// Admit a new user or scheduler intent against the control incarnation.
+    ///
+    /// Intent creation is a short transaction and takes no lease: restore or
+    /// reconciling mode rejects it, and an unavailable gate fails closed
+    /// instead of persisting a job the cluster cannot own.
+    fn admit_intent(&self) -> Result<WriteAdmission, String> {
+        let coordination = self.require_coordination()?;
+        self.block_on(coordination.admit_writes())
+            .map_err(|error| format!("admit table maintenance intent failed: {error}"))
+    }
+
+    /// Admit a new intent and immediately take per-table dispatch authority
+    /// for it. Used by the synchronous paths that dispatch in the same call.
+    fn admit_and_acquire(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<(WriteAdmission, MaintenanceLeaseAttempt), String> {
+        let admission = self.admit_intent()?;
+        let attempt = self.acquire_attempt(target)?;
+        Ok((admission, attempt))
+    }
+
+    /// Take per-table dispatch authority without creating a new intent. A
+    /// contended or awaiting-takeover target is not an error: the current
+    /// holder still owns it, and the caller must not touch durable state.
+    fn acquire_attempt(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<MaintenanceLeaseAttempt, String> {
+        let coordination = self.require_coordination()?;
+        match self
+            .block_on(coordination.acquire(target))
+            .map_err(|error| format!("acquire table maintenance authority failed: {error}"))?
+        {
+            MaintenanceAcquireOutcome::Acquired(attempt) => Ok(attempt),
+            MaintenanceAcquireOutcome::Contended(observation)
+            | MaintenanceAcquireOutcome::AwaitingTakeover(observation) => Err(format!(
+                "table maintenance for this table is currently owned by another frontend attempt; \
+                 retry after {}ms",
+                observation.retry_after().as_millis()
+            )),
+        }
+    }
+
+    /// Read the durable provenance that every fenced transition of this
+    /// attempt must carry, together with the validator that re-checks the
+    /// lease inside the repository transaction.
+    fn attempt_authority(
+        &self,
+        attempt: &MaintenanceLeaseAttempt,
+    ) -> Result<(MaintenanceAuthorityV1, MaintenanceFenceValidator), String> {
+        let authority = self
+            .block_on(attempt.durable_authority())
+            .map_err(|error| format!("read table maintenance authority failed: {error}"))?;
+        Ok((authority, attempt.fence_validator()))
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -214,7 +329,7 @@ impl FrontendTableMaintenanceService {
                 target,
                 intent,
                 DistributedRewriteOperationKind::RewriteDataFiles,
-                None,
+                RewriteAuthorityOrigin::NewIntent,
             )?;
             return if spark_result {
                 action_result(outcome)
@@ -233,7 +348,7 @@ impl FrontendTableMaintenanceService {
                 target,
                 intent,
                 DistributedRewriteOperationKind::RewritePositionDeleteFiles,
-                None,
+                RewriteAuthorityOrigin::NewIntent,
             )?;
             return if spark_result {
                 action_result(outcome)
@@ -268,6 +383,8 @@ impl FrontendTableMaintenanceService {
             .cleanup_repository
             .as_ref()
             .ok_or_else(|| CLEANUP_STATE_STORE_REQUIRED.to_string())?;
+        let (admission, attempt) = self.admit_and_acquire(&target)?;
+        let (authority, validator) = self.attempt_authority(&attempt)?;
         let operation_id = ConnectorCleanupOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
         let session = engine.plan_cleanup_maintenance(&target, operation_id, older_than_ms)?;
@@ -276,14 +393,17 @@ impl FrontendTableMaintenanceService {
             instance_id: plan.owner().instance_id.as_str().to_string(),
             incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
         };
-        self.block_on(repository.create(CleanupOperationCreate {
-            operation_id: durable_id,
-            target: target.clone(),
-            owner,
-            request_digest: plan.request_digest(),
-            older_than_ms,
-            created_at_ms: now_unix_millis(),
-        }))
+        self.block_on(repository.create_admitted(
+            CleanupOperationCreate {
+                operation_id: durable_id,
+                target: target.clone(),
+                owner,
+                request_digest: plan.request_digest(),
+                older_than_ms,
+                created_at_ms: now_unix_millis(),
+            },
+            admission,
+        ))
         .map_err(|error| format!("persist orphan cleanup pending operation failed: {error}"))?;
         let candidate_count = u32::try_from(plan.summary().candidate_count())
             .map_err(|_| "orphan cleanup candidate count exceeds durable limit".to_string())?;
@@ -292,7 +412,7 @@ impl FrontendTableMaintenanceService {
         let manifest_parts = u16::try_from(plan.summary().manifest_parts())
             .map_err(|_| "orphan cleanup manifest part count exceeds durable limit".to_string())?;
         let artifact_handle = plan.provider_payload().to_vec();
-        self.block_on(repository.plan(
+        self.block_on(repository.plan_fenced(
             durable_id,
             CleanupPlanPayload {
                 plan_digest: plan.plan_digest(),
@@ -306,15 +426,20 @@ impl FrontendTableMaintenanceService {
                 batch_count,
             },
             now_unix_millis(),
+            authority.clone(),
+            Arc::clone(&validator),
         ))
         .map_err(|error| format!("persist orphan cleanup plan failed: {error}"))?;
 
         if batch_count == 0 {
             let locations = cleanup_candidate_locations(engine, &session)?;
-            self.block_on(repository.finish(durable_id, now_unix_millis()))
-                .map_err(|error| {
-                    format!("persist zero-candidate cleanup finish failed: {error}")
-                })?;
+            self.block_on(repository.finish_fenced(
+                durable_id,
+                now_unix_millis(),
+                authority.clone(),
+                Arc::clone(&validator),
+            ))
+            .map_err(|error| format!("persist zero-candidate cleanup finish failed: {error}"))?;
             if let Err(error) = engine.finalize_cleanup_terminal(&session) {
                 tracing::warn!(%error, operation_id = %durable_id, "orphan cleanup terminal artifact finalization failed");
             }
@@ -324,6 +449,12 @@ impl FrontendTableMaintenanceService {
         }
 
         for ordinal in 0..batch_count {
+            // A prepared batch is a single-dispatch destructive unit. Refuse to
+            // prepare the next one once authority is gone: the new owner must
+            // reconcile the already-dispatched batch, never re-plan it.
+            attempt
+                .ensure_active()
+                .map_err(|failure| format!("orphan cleanup dispatch authority lost: {failure}"))?;
             let prepared = engine.prepare_cleanup_batch(&session, u32::from(ordinal))?;
             let prepared_handle = prepared
                 .try_to_wire_v1()
@@ -340,10 +471,12 @@ impl FrontendTableMaintenanceService {
                 failed_count: 0,
                 unknown_count: 0,
             };
-            self.block_on(repository.prepare_batch(
+            self.block_on(repository.prepare_batch_fenced(
                 durable_id,
                 prepared_checkpoint.clone(),
                 now_unix_millis(),
+                authority.clone(),
+                Arc::clone(&validator),
             ))
             .map_err(|error| format!("persist orphan cleanup prepared batch failed: {error}"))?;
             match engine.execute_cleanup_batch(&session, prepared)? {
@@ -355,7 +488,12 @@ impl FrontendTableMaintenanceService {
                         return Err("debug cleanup checkpoint write failed; exact-generation reconciliation is required".to_string());
                     }
                     let operation = self
-                        .block_on(repository.checkpoint_batch(durable_id, checkpoint))
+                        .block_on(repository.checkpoint_batch_fenced(
+                            durable_id,
+                            checkpoint,
+                            authority.clone(),
+                            Arc::clone(&validator),
+                        ))
                         .map_err(|error| {
                             format!("persist orphan cleanup batch receipt failed: {error}")
                         })?;
@@ -364,10 +502,15 @@ impl FrontendTableMaintenanceService {
                     }
                 }
                 CleanupBatchExecution::Uncertain(error) => {
-                    self.block_on(repository.mark_reconcile_pending(durable_id, now_unix_millis()))
-                        .map_err(|store| {
-                            format!("persist orphan cleanup uncertain dispatch failed: {store}")
-                        })?;
+                    self.block_on(repository.mark_reconcile_pending_fenced(
+                        durable_id,
+                        now_unix_millis(),
+                        authority.clone(),
+                        Arc::clone(&validator),
+                    ))
+                    .map_err(|store| {
+                        format!("persist orphan cleanup uncertain dispatch failed: {store}")
+                    })?;
                     return Err(format!(
                         "orphan cleanup dispatch outcome is unknown: {error}"
                     ));
@@ -375,8 +518,13 @@ impl FrontendTableMaintenanceService {
             }
         }
         let locations = cleanup_candidate_locations(engine, &session)?;
-        self.block_on(repository.finish(durable_id, now_unix_millis()))
-            .map_err(|error| format!("persist orphan cleanup terminal state failed: {error}"))?;
+        self.block_on(repository.finish_fenced(
+            durable_id,
+            now_unix_millis(),
+            authority,
+            validator,
+        ))
+        .map_err(|error| format!("persist orphan cleanup terminal state failed: {error}"))?;
         if let Err(error) = engine.finalize_cleanup_terminal(&session) {
             tracing::warn!(%error, operation_id = %durable_id, "orphan cleanup terminal artifact finalization failed");
         }
@@ -385,18 +533,33 @@ impl FrontendTableMaintenanceService {
         })
     }
 
+    /// Run a distributed rewrite under an explicit authority origin.
+    ///
+    /// A user or scheduler intent is admitted and takes a fresh per-table
+    /// attempt. A V1 optimize child inherits the attempt its parent already
+    /// holds: the same table resource must not be acquired twice.
     fn execute_durable_distributed_rewrite(
         &self,
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
         intent: DistributedRewriteIntent,
         kind: DistributedRewriteOperationKind,
-        claimed_optimize_job_id: Option<i64>,
+        origin: RewriteAuthorityOrigin,
     ) -> Result<MaintenanceActionOutcome, String> {
         let repository = self
             .distributed_rewrite_repository
             .as_ref()
             .ok_or_else(|| DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED.to_string())?;
+        let (create_origin, attempt) = match origin {
+            RewriteAuthorityOrigin::NewIntent => {
+                let (admission, attempt) = self.admit_and_acquire(&target)?;
+                (ResolvedRewriteCreate::Admitted(admission), attempt)
+            }
+            RewriteAuthorityOrigin::ClaimedOptimizeJob { job_id, attempt } => {
+                (ResolvedRewriteCreate::ClaimedOptimizeJob(job_id), attempt)
+            }
+        };
+        let (authority, validator) = self.attempt_authority(&attempt)?;
         let operation_id = ConnectorWriteOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
         let request_payload = distributed_rewrite_request_payload(intent);
@@ -416,18 +579,25 @@ impl FrontendTableMaintenanceService {
             request_payload,
             created_at_ms: now_unix_millis(),
         };
-        let created = match claimed_optimize_job_id {
-            Some(job_id) => {
-                self.block_on(repository.create_for_claimed_optimize_job(create, job_id))
+        let created = match create_origin {
+            ResolvedRewriteCreate::ClaimedOptimizeJob(job_id) => {
+                self.block_on(repository.create_for_claimed_optimize_job_fenced(
+                    create,
+                    job_id,
+                    authority.clone(),
+                    Arc::clone(&validator),
+                ))
             }
-            None => self.block_on(repository.create(create)),
+            ResolvedRewriteCreate::Admitted(admission) => {
+                self.block_on(repository.create_admitted(create, admission))
+            }
         };
         created.map_err(|error| {
             format!("persist distributed rewrite pending operation failed: {error}")
         })?;
         let plan_payload = plan.provider_payload().to_vec();
         self.block_on(
-            repository.plan(
+            repository.plan_fenced(
                 durable_id,
                 DistributedRewritePlanPayload {
                     plan_digest: plan.plan_digest(),
@@ -439,19 +609,23 @@ impl FrontendTableMaintenanceService {
                         .map_err(|_| "distributed rewrite cohort count exceeds u32".to_string())?,
                 },
                 now_unix_millis(),
+                authority.clone(),
+                Arc::clone(&validator),
             ),
         )
         .map_err(|error| format!("persist distributed rewrite plan failed: {error}"))?;
 
         if session.is_noop() {
             let receipt = b"distributed-rewrite-noop-v1".to_vec();
-            self.block_on(repository.finish(
+            self.block_on(repository.finish_fenced(
                 durable_id,
                 DistributedRewriteOpaquePayload {
                     digest: distributed_rewrite_payload_digest(&receipt),
                     payload: receipt,
                 },
                 now_unix_millis(),
+                authority.clone(),
+                Arc::clone(&validator),
             ))
             .map_err(|error| {
                 format!("persist distributed rewrite no-op receipt failed: {error}")
@@ -459,17 +633,26 @@ impl FrontendTableMaintenanceService {
             return rewrite_noop_outcome(kind);
         }
 
-        self.block_on(repository.start_staging(durable_id, now_unix_millis()))
-            .map_err(|error| {
-                format!("persist distributed rewrite staging state failed: {error}")
-            })?;
+        self.block_on(repository.start_staging_fenced(
+            durable_id,
+            now_unix_millis(),
+            authority.clone(),
+            Arc::clone(&validator),
+        ))
+        .map_err(|error| format!("persist distributed rewrite staging state failed: {error}"))?;
         for cohort in plan.cohorts() {
+            // Every cohort is an external dispatch. Re-check authority before
+            // each one so a lost lease stops further side effects instead of
+            // racing the new owner.
+            attempt.ensure_active().map_err(|failure| {
+                format!("distributed rewrite staging authority lost: {failure}")
+            })?;
             let completion =
                 match engine.stage_distributed_rewrite_cohort(&session, cohort.cohort_id()) {
                     Ok(completion) => completion,
                     Err(error) => {
                         return self.abort_failed_distributed_rewrite(
-                            engine, repository, durable_id, &session, error,
+                            engine, repository, durable_id, &session, error, &authority, &validator,
                         );
                     }
                 };
@@ -478,20 +661,30 @@ impl FrontendTableMaintenanceService {
                     Ok(checkpoint) => checkpoint,
                     Err(error) => {
                         return self.abort_failed_distributed_rewrite(
-                            engine, repository, durable_id, &session, error,
+                            engine, repository, durable_id, &session, error, &authority, &validator,
                         );
                     }
                 };
-            self.block_on(
-                repository
-                    .checkpoint_attempt(durable_id, distributed_rewrite_checkpoint(checkpoint)),
-            )
+            self.block_on(repository.checkpoint_attempt_fenced(
+                durable_id,
+                distributed_rewrite_checkpoint(checkpoint),
+                authority.clone(),
+                Arc::clone(&validator),
+            ))
             .map_err(|error| {
                 format!("persist distributed rewrite attempt checkpoint failed: {error}")
             })?;
         }
-        self.block_on(repository.mark_commit_pending(durable_id, now_unix_millis()))
-            .map_err(|error| format!("persist distributed rewrite commit state failed: {error}"))?;
+        self.block_on(repository.mark_commit_pending_fenced(
+            durable_id,
+            now_unix_millis(),
+            authority.clone(),
+            Arc::clone(&validator),
+        ))
+        .map_err(|error| format!("persist distributed rewrite commit state failed: {error}"))?;
+        attempt
+            .ensure_active()
+            .map_err(|failure| format!("distributed rewrite commit authority lost: {failure}"))?;
         match engine.commit_distributed_rewrite(&session)? {
             ExternalMutationOutcome::KnownCommitted {
                 receipt,
@@ -500,13 +693,15 @@ impl FrontendTableMaintenanceService {
             } => {
                 let rewrite_receipt = engine.finalize_distributed_rewrite(&session, &receipt)?;
                 let payload = rewrite_receipt.provider_payload().to_vec();
-                self.block_on(repository.finish(
+                self.block_on(repository.finish_fenced(
                     durable_id,
                     DistributedRewriteOpaquePayload {
                         digest: distributed_rewrite_payload_digest(&payload),
                         payload,
                     },
                     now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(&validator),
                 ))
                 .map_err(|error| format!("persist distributed rewrite receipt failed: {error}"))?;
                 if let ExternalMutationFinalization::Failed(failure) = finalization {
@@ -523,6 +718,8 @@ impl FrontendTableMaintenanceService {
                     durable_id,
                     &session,
                     format!("distributed rewrite commit was not applied: {failure}"),
+                    &authority,
+                    &validator,
                 ),
             ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
                 let payload = evidence
@@ -531,13 +728,15 @@ impl FrontendTableMaintenanceService {
                     .to_vec();
                 let evidence = ExternalMutationEvidence::try_from_wire_v1(&payload)
                     .map_err(|error| format!("restore distributed rewrite evidence: {error}"))?;
-                self.block_on(repository.mark_reconcile_pending(
+                self.block_on(repository.mark_reconcile_pending_fenced(
                     durable_id,
                     DistributedRewriteOpaquePayload {
                         digest: distributed_rewrite_payload_digest(&payload),
                         payload,
                     },
                     now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(&validator),
                 ))
                 .map_err(|error| {
                     format!("persist distributed rewrite reconcile state failed: {error}")
@@ -551,13 +750,15 @@ impl FrontendTableMaintenanceService {
                         let rewrite_receipt =
                             engine.finalize_distributed_rewrite(&session, &receipt)?;
                         let payload = rewrite_receipt.provider_payload().to_vec();
-                        self.block_on(repository.finish(
+                        self.block_on(repository.finish_fenced(
                             durable_id,
                             DistributedRewriteOpaquePayload {
                                 digest: distributed_rewrite_payload_digest(&payload),
                                 payload,
                             },
                             now_unix_millis(),
+                            authority.clone(),
+                            Arc::clone(&validator),
                         ))
                         .map_err(|error| {
                             format!("persist reconciled distributed rewrite receipt failed: {error}")
@@ -578,6 +779,8 @@ impl FrontendTableMaintenanceService {
                             format!(
                                 "distributed rewrite commit was not applied after reconcile: {reconcile_failure}"
                             ),
+                            &authority,
+                            &validator,
                         )
                     }
                     ExternalMutationOutcome::CommitUnknown { failure: reconcile_failure, .. } => {
@@ -590,6 +793,7 @@ impl FrontendTableMaintenanceService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn abort_failed_distributed_rewrite(
         &self,
         engine: &dyn TableMaintenanceEngine,
@@ -597,22 +801,35 @@ impl FrontendTableMaintenanceService {
         operation_id: uuid::Uuid,
         session: &novarocks::connector::distributed_rewrite_application::DistributedRewriteMaintenanceSession,
         error: String,
+        authority: &MaintenanceAuthorityV1,
+        validator: &MaintenanceFenceValidator,
     ) -> Result<MaintenanceActionOutcome, String> {
-        self.block_on(repository.mark_abort_pending(operation_id, now_unix_millis()))
-            .map_err(|store| format!("persist distributed rewrite abort state failed: {store}"))?;
+        self.block_on(repository.mark_abort_pending_fenced(
+            operation_id,
+            now_unix_millis(),
+            authority.clone(),
+            Arc::clone(validator),
+        ))
+        .map_err(|store| format!("persist distributed rewrite abort state failed: {store}"))?;
         match engine.abort_distributed_rewrite(session) {
             Ok(_) => {
-                self.block_on(repository.fail(operation_id, error.clone(), now_unix_millis()))
-                    .map_err(|store| {
-                        format!("persist distributed rewrite failure failed: {store}")
-                    })?;
+                self.block_on(repository.fail_fenced(
+                    operation_id,
+                    error.clone(),
+                    now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(validator),
+                ))
+                .map_err(|store| format!("persist distributed rewrite failure failed: {store}"))?;
                 Err(error)
             }
             Err(abort) => {
-                self.block_on(repository.mark_unresolved(
+                self.block_on(repository.mark_unresolved_fenced(
                     operation_id,
                     format!("{error}; abort unresolved: {abort}"),
                     now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(validator),
                 ))
                 .map_err(|store| {
                     format!("persist distributed rewrite unresolved state failed: {store}")
@@ -634,12 +851,16 @@ impl FrontendTableMaintenanceService {
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
         claimed_optimize_job_id: i64,
+        attempt: MaintenanceLeaseAttempt,
     ) -> Result<MaintenanceActionOutcome, String> {
         let service = Self {
             repository: None,
             metadata_repository: None,
             distributed_rewrite_repository: Some(distributed_rewrite_repository),
             cleanup_repository: None,
+            // The child never admits or acquires: it runs entirely under the
+            // caller's already-held attempt.
+            coordination: None,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime: runtime.clone(),
         };
@@ -648,7 +869,10 @@ impl FrontendTableMaintenanceService {
             target,
             DistributedRewriteIntent::DataFiles { rewrite_all: true },
             DistributedRewriteOperationKind::RewriteDataFiles,
-            Some(claimed_optimize_job_id),
+            RewriteAuthorityOrigin::ClaimedOptimizeJob {
+                job_id: claimed_optimize_job_id,
+                attempt,
+            },
         )
     }
 
@@ -675,31 +899,36 @@ impl FrontendTableMaintenanceService {
             .metadata_repository
             .as_ref()
             .ok_or_else(|| METADATA_MAINTENANCE_STATE_STORE_REQUIRED.to_string())?;
+        let (admission, attempt) = self.admit_and_acquire(&target)?;
         let operation_id = ConnectorMutationOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
         let session = engine.plan_metadata_maintenance(&target, operation_id, intent)?;
         let plan = session.plan_ref();
         let request_payload = plan.provider_payload().to_vec();
         let request_payload_digest = metadata_maintenance_payload_digest(&request_payload);
-        self.block_on(repository.create(MetadataMaintenanceOperationCreate {
-            operation_id: durable_id,
-            target: target.clone(),
-            owner: MetadataMaintenanceExactOwner {
-                instance_id: plan.owner().instance_id.as_str().to_string(),
-                incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
+        self.block_on(repository.create_admitted(
+            MetadataMaintenanceOperationCreate {
+                operation_id: durable_id,
+                target: target.clone(),
+                owner: MetadataMaintenanceExactOwner {
+                    instance_id: plan.owner().instance_id.as_str().to_string(),
+                    incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
+                },
+                kind,
+                request_digest: plan.request_digest(),
+                request_payload_digest,
+                base_state_digest: plan.state_digest(),
+                request_payload,
+                created_at_ms: now_unix_millis(),
             },
-            kind,
-            request_digest: plan.request_digest(),
-            request_payload_digest,
-            base_state_digest: plan.state_digest(),
-            request_payload,
-            created_at_ms: now_unix_millis(),
-        }))
+            admission,
+        ))
         .map_err(|error| {
             format!("persist metadata maintenance pending operation failed: {error}")
         })?;
         let plan_payload = plan.provider_payload().to_vec();
-        self.block_on(repository.start(
+        let (authority, validator) = self.attempt_authority(&attempt)?;
+        self.block_on(repository.start_fenced(
             durable_id,
             MetadataMaintenancePlanPayload {
                 plan_digest: plan.plan_digest(),
@@ -714,18 +943,28 @@ impl FrontendTableMaintenanceService {
                 ],
             },
             now_unix_millis(),
+            authority.clone(),
+            Arc::clone(&validator),
         ))
         .map_err(|error| format!("persist metadata maintenance plan failed: {error}"))?;
+        // The plan checkpoint is durable. Refuse to dispatch once authority is
+        // already gone: a lost lease means another frontend may reconcile this
+        // exact operation.
+        attempt.ensure_active().map_err(|failure| {
+            format!("metadata maintenance dispatch authority lost: {failure}")
+        })?;
         match engine.execute_planned_metadata_maintenance(session) {
             Ok(completed) => {
                 let receipt = completed.receipt;
-                self.block_on(repository.finish(
+                self.block_on(repository.finish_fenced(
                     durable_id,
                     MetadataMaintenanceOpaquePayload {
                         digest: metadata_maintenance_payload_digest(receipt.provider_payload()),
                         payload: receipt.provider_payload().to_vec(),
                     },
                     now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(&validator),
                 ))
                 .map_err(|error| format!("persist metadata maintenance receipt failed: {error}"))?;
                 let summary = receipt.summary();
@@ -759,12 +998,14 @@ impl FrontendTableMaintenanceService {
                 // Preserve the operation fence and opaque evidence for an
                 // exact-generation reconcile owner.
                 let evidence = error.as_bytes().to_vec();
-                self.block_on(repository.mark_reconcile_pending(
+                self.block_on(repository.mark_reconcile_pending_fenced(
                     durable_id,
                     MetadataMaintenanceOpaquePayload {
                         digest: metadata_maintenance_payload_digest(&evidence),
                         payload: evidence,
                     },
+                    authority,
+                    validator,
                 ))
                 .map_err(|store| {
                     format!("record metadata maintenance reconcile state failed: {store}")
@@ -799,7 +1040,8 @@ impl FrontendTableMaintenanceService {
             base_snapshot_id,
             created_at_ms: now_unix_millis(),
         };
-        match self.block_on(repository.create(request)) {
+        let admission = self.admit_intent()?;
+        match self.block_on(repository.create_admitted(request, admission)) {
             Ok(_) => {
                 self.wakeup_worker()?;
                 Ok(())
@@ -824,11 +1066,15 @@ impl FrontendTableMaintenanceService {
             .as_ref()
             .ok_or_else(|| AUTOMATIC_OPTIMIZE_STATE_STORE_REQUIRED.to_string())?;
         let base_snapshot_id = engine.current_snapshot_id(&target)?;
-        match self.block_on(repository.create(OptimizeJobCreate {
-            target,
-            base_snapshot_id,
-            created_at_ms: now_unix_millis(),
-        })) {
+        let admission = self.admit_intent()?;
+        match self.block_on(repository.create_admitted(
+            OptimizeJobCreate {
+                target,
+                base_snapshot_id,
+                created_at_ms: now_unix_millis(),
+            },
+            admission,
+        )) {
             Ok(job) => {
                 self.wakeup_worker()?;
                 Ok(OptimizeSubmission::Submitted { job_id: job.job_id })
@@ -1102,6 +1348,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                             Arc::clone(repository),
                             Arc::clone(distributed_rewrite_repository),
                             Arc::downgrade(&engine),
+                            self.require_coordination()?.clone(),
                         )
                     })
                     .transpose()?;
@@ -1164,7 +1411,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                     where_clause.as_deref(),
                 )?,
                 DistributedRewriteOperationKind::RewriteDataFiles,
-                None,
+                RewriteAuthorityOrigin::NewIntent,
             ),
             MaintenanceActionRequest::RewritePositionDeleteFiles {
                 target,
@@ -1175,7 +1422,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 target,
                 distributed_position_rewrite_intent(&options, where_clause.as_deref())?,
                 DistributedRewriteOperationKind::RewritePositionDeleteFiles,
-                None,
+                RewriteAuthorityOrigin::NewIntent,
             ),
             MaintenanceActionRequest::RemoveOrphanFiles {
                 target,
@@ -1221,19 +1468,29 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .as_ref()
             .ok_or_else(|| DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED.to_string())?;
         let base_snapshot_id = engine.current_snapshot_id(&target)?;
-        let job = match self.block_on(repository.create(OptimizeJobCreate {
-            target: target.clone(),
-            base_snapshot_id,
-            created_at_ms: now_unix_millis(),
-        })) {
+        let (admission, attempt) = self.admit_and_acquire(&target)?;
+        let job = match self.block_on(repository.create_admitted(
+            OptimizeJobCreate {
+                target: target.clone(),
+                base_snapshot_id,
+                created_at_ms: now_unix_millis(),
+            },
+            admission,
+        )) {
             Ok(job) => job,
             Err(error) if error.kind() == RepositoryErrorKind::AlreadyActive => {
                 return Ok(OptimizeSubmission::AlreadyActive);
             }
             Err(error) => return Err(format!("create automatic optimize job failed: {error}")),
         };
+        let (authority, validator) = self.attempt_authority(&attempt)?;
         let claimed = self
-            .block_on(repository.claim(job.job_id, now_unix_millis()))
+            .block_on(repository.claim_fenced(
+                job.job_id,
+                now_unix_millis(),
+                authority.clone(),
+                Arc::clone(&validator),
+            ))
             .map_err(|error| {
                 format!(
                     "claim automatic optimize job {} failed: {error}",
@@ -1252,16 +1509,25 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             engine,
             target,
             claimed.job_id,
+            attempt,
         );
         match outcome {
             Ok(outcome) => {
                 let outcome = worker::optimize_outcome(outcome)?;
-                self.block_on(repository.record_outcome(claimed.job_id, outcome))
-                    .map_err(|error| {
-                        format!("record automatic optimize outcome failed: {error}")
-                    })?;
-                self.block_on(repository.finish(claimed.job_id, now_unix_millis()))
-                    .map_err(|error| format!("finish automatic optimize job failed: {error}"))?;
+                self.block_on(repository.record_outcome_fenced(
+                    claimed.job_id,
+                    outcome,
+                    authority.clone(),
+                    Arc::clone(&validator),
+                ))
+                .map_err(|error| format!("record automatic optimize outcome failed: {error}"))?;
+                self.block_on(repository.finish_fenced(
+                    claimed.job_id,
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| format!("finish automatic optimize job failed: {error}"))?;
                 Ok(OptimizeSubmission::Submitted {
                     job_id: claimed.job_id,
                 })

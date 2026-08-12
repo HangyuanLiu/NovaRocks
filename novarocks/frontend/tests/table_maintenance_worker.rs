@@ -28,14 +28,21 @@ use novarocks::engine::table_maintenance::{
     MaintenanceTarget, OptimizeJobState, TableMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
+use novarocks_frontend::table_maintenance::coordination::{
+    MaintenanceAcquireOutcome, MaintenanceCoordination, MaintenanceLeaseAttempt,
+    maintenance_lease_settings, new_maintenance_holder_id,
+};
 use novarocks_frontend::table_maintenance::model::{OptimizeJob, OptimizeJobCreate};
 use novarocks_frontend::table_maintenance::repository::OptimizeJobRepository;
 use novarocks_frontend::table_maintenance::worker::{OptimizeJobExecutor, OptimizeWorker};
 use novarocks_spi::state_store::{
     CommitOutcome, FeDeploymentView, Key, Precondition, StateStore, TransactionId, Value,
 };
+use novarocks_state_store::coordination::{
+    ClockHealth, CoordinationError, IncarnationGate, LeaseClock, LeaseManager,
+};
 use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
@@ -198,6 +205,7 @@ impl OptimizeJobExecutor for LegacyFakeOptimizeExecutor {
         _runtime: &tokio::runtime::Handle,
         engine: &dyn TableMaintenanceEngine,
         job: &OptimizeJob,
+        _attempt: &MaintenanceLeaseAttempt,
     ) -> Result<MaintenanceActionOutcome, String> {
         engine.execute_action(MaintenanceActionRequest::RewriteDataFiles {
             target: job.target.clone(),
@@ -266,9 +274,10 @@ async fn fixture() -> (
             .expect("open optimize job repository"),
     );
     let service = Arc::new(
-        FrontendTableMaintenanceService::open(
+        FrontendTableMaintenanceService::open_with_coordination(
             Some(Arc::clone(&store)),
             tokio::runtime::Handle::current(),
+            test_coordination(Arc::clone(&store)).await,
         )
         .await
         .expect("open table-maintenance service"),
@@ -276,23 +285,98 @@ async fn fixture() -> (
     (temp, store, repository, service)
 }
 
+/// A monotonic clock good enough for worker scheduling assertions. The
+/// deterministic contention and takeover cases live in the coordination unit
+/// tests; here the lease only has to stay held for the duration of a job.
+const BASE_CLOCK_MS: u64 = 10_000;
+
+#[derive(Debug)]
+struct WorkerTestClock {
+    origin: Instant,
+}
+
+impl WorkerTestClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl LeaseClock for WorkerTestClock {
+    fn wall_time_millis(&self) -> Result<u64, CoordinationError> {
+        Ok(self.monotonic_time_millis())
+    }
+
+    fn monotonic_time_millis(&self) -> u64 {
+        BASE_CLOCK_MS + u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn health(&self) -> ClockHealth {
+        ClockHealth::Healthy
+    }
+}
+
+async fn test_coordination(store: Arc<dyn StateStore>) -> MaintenanceCoordination {
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    if gate.load().await.is_err() {
+        gate.bootstrap(OperationId::new_v7())
+            .await
+            .expect("bootstrap control incarnation");
+    }
+    let manager = LeaseManager::new(
+        store,
+        new_maintenance_holder_id().expect("process holder"),
+        Arc::new(WorkerTestClock::new()),
+        maintenance_lease_settings().expect("maintenance lease settings"),
+    )
+    .expect("lease manager");
+    MaintenanceCoordination::new(gate, manager, tokio::runtime::Handle::current())
+}
+
 async fn create_job(
+    store: &Arc<dyn StateStore>,
     repository: &OptimizeJobRepository,
     table: &str,
     base_snapshot_id: i64,
     created_at_ms: i64,
 ) -> OptimizeJob {
+    create_job_for(
+        repository,
+        &test_coordination(Arc::clone(store)).await,
+        table,
+        base_snapshot_id,
+        created_at_ms,
+    )
+    .await
+}
+
+async fn create_job_for(
+    repository: &OptimizeJobRepository,
+    coordination: &MaintenanceCoordination,
+    table: &str,
+    base_snapshot_id: i64,
+    created_at_ms: i64,
+) -> OptimizeJob {
+    let admission = coordination
+        .admit_writes()
+        .await
+        .expect("admit optimize intent");
     repository
-        .create(OptimizeJobCreate {
-            target: target("ice", "db", table),
-            base_snapshot_id,
-            created_at_ms,
-        })
+        .create_admitted(
+            OptimizeJobCreate {
+                target: target("ice", "db", table),
+                base_snapshot_id,
+                created_at_ms,
+            },
+            admission,
+        )
         .await
         .expect("create optimize job")
 }
 
-fn start_test_worker(
+async fn start_test_worker(
+    store: &Arc<dyn StateStore>,
     repository: Arc<OptimizeJobRepository>,
     engine: &Arc<FakeMaintenanceEngine>,
 ) -> OptimizeWorker {
@@ -302,6 +386,7 @@ fn start_test_worker(
         repository,
         Arc::downgrade(&engine),
         Arc::new(LegacyFakeOptimizeExecutor),
+        test_coordination(Arc::clone(store)).await,
     )
     .expect("start maintenance worker")
 }
@@ -344,32 +429,42 @@ async fn wait_for_terminal_jobs(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn start_reconciles_running_before_processing_pending_in_job_id_order() {
-    let (_temp, _store, repository, _service) = fixture().await;
-    let running = create_job(&repository, "running", 10, 100).await;
+async fn startup_returns_undispatched_claims_and_processes_pending_in_job_id_order() {
+    let (_temp, store, repository, _service) = fixture().await;
+    let claimed = create_job(&store, &repository, "claimed", 10, 100).await;
+    let coordination = test_coordination(Arc::clone(&store)).await;
+    let attempt = match coordination
+        .acquire(&target("ice", "db", "claimed"))
+        .await
+        .expect("acquire claimed target")
+    {
+        MaintenanceAcquireOutcome::Acquired(attempt) => attempt,
+        _ => panic!("fresh target must be acquirable"),
+    };
     repository
-        .claim(running.job_id, 150)
+        .claim_fenced(
+            claimed.job_id,
+            150,
+            attempt.durable_authority().await.expect("authority"),
+            attempt.fence_validator(),
+        )
         .await
         .expect("claim running job")
         .expect("pending job was claimable");
-    let first_pending = create_job(&repository, "first", 20, 200).await;
-    let second_pending = create_job(&repository, "second", 30, 300).await;
+    // Release the lease so the recovering worker can take the target over.
+    attempt.release().await.expect("release attempt");
+    let first_pending = create_job(&store, &repository, "first", 20, 200).await;
+    let second_pending = create_job(&store, &repository, "second", 30, 300).await;
     let engine = Arc::new(FakeMaintenanceEngine::succeeding());
 
-    let mut worker = start_test_worker(Arc::clone(&repository), &engine);
+    let mut worker = start_test_worker(&store, Arc::clone(&repository), &engine).await;
 
+    // The claimed job never dispatched an external rewrite, so recovery must
+    // return it to the queue and run it rather than failing it outright.
     let jobs = wait_for_terminal_jobs(&repository, 3).await;
-    assert_eq!(jobs[0].job_id, running.job_id);
-    assert_eq!(jobs[0].state, OptimizeJobState::Failed);
-    assert!(
-        jobs[0]
-            .error_message
-            .as_deref()
-            .unwrap()
-            .contains("frontend restart reconciliation")
-    );
-    assert_eq!(jobs[1].state, OptimizeJobState::Finished);
-    assert_eq!(jobs[2].state, OptimizeJobState::Finished);
+    for job in &jobs {
+        assert_eq!(job.state, OptimizeJobState::Finished, "job {job:?}");
+    }
     assert_eq!(
         jobs[1].outcome.as_ref().unwrap(),
         &novarocks_frontend::table_maintenance::model::OptimizeJobOutcome {
@@ -380,39 +475,34 @@ async fn start_reconciles_running_before_processing_pending_in_job_id_order() {
             output_record_count: 88,
         }
     );
-    assert_eq!(
-        engine.requests(),
-        vec![
-            MaintenanceActionRequest::RewriteDataFiles {
-                target: first_pending.target,
-                base_snapshot_id: 20,
-                job_id: Some(first_pending.job_id),
-                options: BTreeMap::new(),
-                branch: None,
-                where_clause: None,
-            },
-            MaintenanceActionRequest::RewriteDataFiles {
-                target: second_pending.target,
-                base_snapshot_id: 30,
-                job_id: Some(second_pending.job_id),
-                options: BTreeMap::new(),
-                branch: None,
-                where_clause: None,
-            },
-        ]
-    );
+    let requests = engine.requests();
+    assert_eq!(requests.len(), 3, "every job executes exactly once");
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        MaintenanceActionRequest::RewriteDataFiles { job_id: Some(id), .. } if *id == claimed.job_id
+    )));
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        MaintenanceActionRequest::RewriteDataFiles { job_id: Some(id), .. }
+            if *id == first_pending.job_id
+    )));
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        MaintenanceActionRequest::RewriteDataFiles { job_id: Some(id), .. }
+            if *id == second_pending.job_id
+    )));
     worker.shutdown().expect("shutdown maintenance worker");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_claims_before_execute_and_terminalizes_before_claiming_the_next_job() {
-    let (_temp, _store, repository, _service) = fixture().await;
-    let first = create_job(&repository, "first", 41, 100).await;
-    let second = create_job(&repository, "second", 42, 200).await;
+    let (_temp, store, repository, _service) = fixture().await;
+    let first = create_job(&store, &repository, "first", 41, 100).await;
+    let second = create_job(&store, &repository, "second", 42, 200).await;
     let gate = Arc::new(ExecutionGate::new(1));
     let engine = Arc::new(FakeMaintenanceEngine::gated(Arc::clone(&gate)));
 
-    let mut worker = start_test_worker(Arc::clone(&repository), &engine);
+    let mut worker = start_test_worker(&store, Arc::clone(&repository), &engine).await;
     wait_for_request_count(&engine, 1).await;
 
     let jobs = repository.list().await.expect("list jobs during execution");
@@ -441,15 +531,15 @@ async fn worker_claims_before_execute_and_terminalizes_before_claiming_the_next_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn execution_failure_fails_the_job_preserves_message_and_keeps_worker_running() {
-    let (_temp, _store, repository, _service) = fixture().await;
-    let failed = create_job(&repository, "failed", 51, 100).await;
-    let succeeded = create_job(&repository, "succeeded", 52, 200).await;
+    let (_temp, store, repository, _service) = fixture().await;
+    let failed = create_job(&store, &repository, "failed", 51, 100).await;
+    let succeeded = create_job(&store, &repository, "succeeded", 52, 200).await;
     let engine = Arc::new(FakeMaintenanceEngine::with_results(vec![
         Err("rewrite engine exploded".to_string()),
         Ok(rewrite_outcome()),
     ]));
 
-    let mut worker = start_test_worker(Arc::clone(&repository), &engine);
+    let mut worker = start_test_worker(&store, Arc::clone(&repository), &engine).await;
 
     let jobs = wait_for_terminal_jobs(&repository, 2).await;
     assert_eq!(jobs[0].job_id, failed.job_id);
@@ -467,7 +557,7 @@ async fn execution_failure_fails_the_job_preserves_message_and_keeps_worker_runn
 
 #[tokio::test(flavor = "multi_thread")]
 async fn service_start_accepts_an_engine_exactly_once() {
-    let (_temp, _store, _repository, service) = fixture().await;
+    let (_temp, store, _repository, service) = fixture().await;
     let engine = Arc::new(FakeMaintenanceEngine::succeeding());
     let first: Arc<dyn TableMaintenanceEngine> = engine.clone();
     let second: Arc<dyn TableMaintenanceEngine> = engine.clone();
@@ -488,9 +578,9 @@ async fn service_start_accepts_an_engine_exactly_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_wakes_and_joins_worker_and_prevents_later_claims() {
-    let (_temp, _store, repository, _service) = fixture().await;
+    let (_temp, store, repository, _service) = fixture().await;
     let engine = Arc::new(FakeMaintenanceEngine::succeeding());
-    let mut worker = start_test_worker(Arc::clone(&repository), &engine);
+    let mut worker = start_test_worker(&store, Arc::clone(&repository), &engine).await;
     sleep(Duration::from_millis(100)).await;
 
     timeout(
@@ -502,7 +592,7 @@ async fn shutdown_wakes_and_joins_worker_and_prevents_later_claims() {
     .expect("join shutdown task")
     .expect("shutdown maintenance worker");
 
-    let pending = create_job(&repository, "after-shutdown", 61, 100).await;
+    let pending = create_job(&store, &repository, "after-shutdown", 61, 100).await;
     sleep(Duration::from_millis(600)).await;
     let jobs = repository.list().await.expect("list jobs after shutdown");
     assert_eq!(jobs[0].job_id, pending.job_id);
@@ -511,7 +601,7 @@ async fn shutdown_wakes_and_joins_worker_and_prevents_later_claims() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_engine_weak_reference_ends_worker_without_a_reference_cycle() {
-    let (_temp, _store, _repository, service) = fixture().await;
+    let (_temp, store, _repository, service) = fixture().await;
     let dropped = Arc::new(AtomicBool::new(false));
     let engine = Arc::new(FakeMaintenanceEngine::with_drop_flag(Arc::clone(&dropped)));
     let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
@@ -534,8 +624,8 @@ async fn expired_engine_weak_reference_ends_worker_without_a_reference_cycle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_worker_exits_autonomously_before_shutdown_when_engine_expires() {
-    let (_temp, _store, repository, _service) = fixture().await;
-    create_job(&repository, "idle-exit", 71, 100).await;
+    let (_temp, store, repository, _service) = fixture().await;
+    create_job(&store, &repository, "idle-exit", 71, 100).await;
     let dropped = Arc::new(AtomicBool::new(false));
     let engine = Arc::new(FakeMaintenanceEngine::with_drop_flag(Arc::clone(&dropped)));
     let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
@@ -545,6 +635,7 @@ async fn idle_worker_exits_autonomously_before_shutdown_when_engine_expires() {
         Arc::clone(&repository),
         engine_weak,
         Arc::new(LegacyFakeOptimizeExecutor),
+        test_coordination(Arc::clone(&store)).await,
     )
     .expect("start worker");
 
@@ -566,12 +657,12 @@ async fn idle_worker_exits_autonomously_before_shutdown_when_engine_expires() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_wakeup_dispatches_a_submitted_job_before_polling() {
-    let (_temp, _store, repository, _service) = fixture().await;
+    let (_temp, store, repository, _service) = fixture().await;
     let engine = Arc::new(FakeMaintenanceEngine::succeeding());
-    let mut worker = start_test_worker(Arc::clone(&repository), &engine);
+    let mut worker = start_test_worker(&store, Arc::clone(&repository), &engine).await;
     sleep(Duration::from_millis(100)).await;
 
-    create_job(&repository, "submitted", 1, 10).await;
+    create_job(&store, &repository, "submitted", 1, 10).await;
     worker.wakeup();
     timeout(
         Duration::from_millis(300),
@@ -586,7 +677,7 @@ async fn explicit_wakeup_dispatches_a_submitted_job_before_polling() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_shutdown_is_idempotent() {
-    let (_temp, _store, _repository, service) = fixture().await;
+    let (_temp, store, _repository, service) = fixture().await;
     let engine = Arc::new(FakeMaintenanceEngine::succeeding());
     let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
     service
