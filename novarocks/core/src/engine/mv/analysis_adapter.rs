@@ -68,30 +68,35 @@ pub(crate) struct BaseTableDescriptor {
 pub(crate) fn validate_ivm_primary_key(
     pk_columns: &[String],
     base: &BaseTableDescriptor,
-) -> Result<(), novarocks_connector_iceberg::delta::ChangeError> {
-    use novarocks_connector_iceberg::delta::ChangeError;
-
+) -> Result<(), String> {
+    // Messages are byte-identical to the provider's ChangeError Display, which
+    // this used to borrow purely to render them; the only caller already
+    // discarded the typed error via to_string().
     if base.format_version != 2 && base.format_version != 3 {
-        return Err(ChangeError::IcebergFormatUnsupported {
-            format_version: base.format_version,
-        });
+        return Err(format!(
+            "iceberg base table format-version {} is not supported; IVM requires v2 or v3",
+            base.format_version
+        ));
     }
     for pk in pk_columns {
         let col = base
             .columns
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(pk))
-            .ok_or_else(|| ChangeError::PrimaryKeyMissingFromBase { pk_col: pk.clone() })?;
+            .ok_or_else(|| {
+                format!("PRIMARY KEY column `{pk}` does not exist on the iceberg base table")
+            })?;
         if col.nullable {
-            return Err(ChangeError::PrimaryKeyNullable {
-                pk_col: col.name.clone(),
-            });
+            return Err(format!(
+                "PRIMARY KEY column `{}` must be NOT NULL on the iceberg base table",
+                col.name
+            ));
         }
         if !is_hashable_pk_type(&col.sql_type) {
-            return Err(ChangeError::PrimaryKeyTypeUnsupported {
-                pk_col: col.name.clone(),
-                ty: col.sql_type.clone(),
-            });
+            return Err(format!(
+                "PRIMARY KEY column `{}` has unsupported type `{}`; only hashable scalar types are allowed",
+                col.name, col.sql_type
+            ));
         }
     }
     Ok(())
