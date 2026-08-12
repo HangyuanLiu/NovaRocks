@@ -5271,37 +5271,30 @@ fn refresh_iceberg_mv_with_planned_partitions(
     // W2: verify the lake descriptor carries the same schema contract the store
     // has — the descriptor is the authoritative home at refresh time.
     {
-        let entry = {
-            let catalogs = state
-                .iceberg_catalogs
-                .read()
-                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-            catalogs.get(&target.catalog)?
-        };
-        entry.invalidate_table_cache(&target.namespace, &target.table);
-        let loaded = crate::connector::iceberg::catalog::registry::load_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )?;
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
-        let descriptor_contract = descriptor.schema_contract_typed()?;
+        // The lake package carries both facts this check needs: the descriptor
+        // the target stores, and the publication provenance of its current
+        // snapshot. Neither is read off provider metadata here.
+        let package = observe_mv_lake_package(state, &target, connector_context)?.ok_or_else(|| {
+            format!(
+                "iceberg MV target {}.{}.{} carries no MV descriptor; rebuild or recreate the MV",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+        let descriptor_contract = package.descriptor.schema_contract_typed()?;
         crate::engine::mv::metadata_consistency::ensure_descriptor_schema_contract_matches(
             descriptor_contract.as_ref(),
             dispatch_schema_contract,
         )?;
         // W3a: verify the watermark recorded in the MV table's current
-        // snapshot provenance matches the store. First refresh (no current
-        // snapshot, or a snapshot without provenance) has no watermark yet —
-        // skip.
-        if let Some(current) = loaded.table.metadata().current_snapshot() {
-            if let Some(prov) = MvProvenanceV1::from_snapshot_summary(current)? {
-                crate::engine::mv::metadata_consistency::ensure_summary_watermark_matches_store(
-                    &prov.bases,
-                    &mv_definition.last_refresh_snapshots,
-                )?;
-            }
+        // snapshot provenance matches the store. First refresh (never
+        // published) has no watermark yet — skip.
+        if let crate::mv::storage_observation::MvLakePublication::Published(facts) =
+            &package.publication
+        {
+            crate::engine::mv::metadata_consistency::ensure_summary_watermark_matches_store(
+                &facts.bases,
+                &mv_definition.last_refresh_snapshots,
+            )?;
         }
     }
     let caps = RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?;
@@ -5692,6 +5685,35 @@ fn refresh_iceberg_mv_with_planned_partitions(
             )
         },
     )
+}
+
+/// Observe the MV lake package (descriptor + publication provenance) for a
+/// target through one exact generation.
+fn observe_mv_lake_package(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Option<crate::mv::storage_observation::MvLakePackageObservation>, String> {
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    state
+        .mv_storage_observation
+        .observe_lake_package(&exact_lease, &metadata, connector_context.clone())
+        .map_err(|error| {
+            format!(
+                "observe MV lake package for {}.{}.{}: {error}",
+                target.catalog, target.namespace, target.table
+            )
+        })
 }
 
 fn observe_schema_validation_for_table(
