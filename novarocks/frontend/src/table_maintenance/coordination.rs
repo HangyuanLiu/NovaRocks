@@ -205,7 +205,7 @@ pub enum MaintenanceAcquireOutcome {
     AwaitingTakeover(LeaseObservation),
 }
 
-// Design: ADR-0064 (docs/adr/ADR-0064-per-table-maintenance-lease-attempt-authority.md)
+// Design: ADR-0065 (docs/adr/ADR-0065-per-table-maintenance-lease-attempt-authority.md)
 #[derive(Clone)]
 pub struct MaintenanceCoordination {
     gate: Arc<IncarnationGate>,

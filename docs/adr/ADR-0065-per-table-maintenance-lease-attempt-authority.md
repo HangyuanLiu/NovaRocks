@@ -1,5 +1,5 @@
 ---
-id: ADR-0064
+id: ADR-0065
 title: "A per-table lease attempt is the single dispatch authority for frontend table maintenance"
 domain: [table-maintenance]
 status: active

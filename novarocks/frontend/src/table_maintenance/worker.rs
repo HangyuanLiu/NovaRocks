@@ -249,7 +249,7 @@ async fn run_worker(
     }
 }
 
-// Design: ADR-0064 (docs/adr/ADR-0064-per-table-maintenance-lease-attempt-authority.md)
+// Design: ADR-0065 (docs/adr/ADR-0065-per-table-maintenance-lease-attempt-authority.md)
 /// Converge jobs a previous attempt left RUNNING.
 ///
 /// This replaces the single-frontend restart policy that failed every running
