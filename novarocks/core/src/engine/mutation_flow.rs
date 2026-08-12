@@ -38,7 +38,7 @@ use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
     MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
-use novarocks_connector_iceberg::commit::{CommitOpKind, IcebergUpdateMode};
+use novarocks_connector_iceberg::commit::IcebergUpdateMode;
 
 fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
     write_commit
@@ -3612,7 +3612,6 @@ pub(crate) fn stage_prepared_merge_mutation(
     let execution_handle = Arc::new(DistributedMergeExecutor {
         state: Arc::clone(state),
         target,
-        commit_op_kind: CommitOpKind::CowUpdate,
         branches: Mutex::new(Some(MergeBranchSet {
             insert: insert_branch,
             matched: matched_branch,
@@ -4513,7 +4512,6 @@ struct MergeBranchSet {
 struct DistributedMergeExecutor {
     state: Arc<StandaloneState>,
     target: crate::engine::backend_resolver::TargetBackend,
-    commit_op_kind: CommitOpKind,
     branches: Mutex<Option<MergeBranchSet>>,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
@@ -4675,12 +4673,6 @@ impl DistributedMergeExecutor {
         }
 
         if let Some((query, preparation, _)) = branches.insert.as_ref() {
-            if self.commit_op_kind != CommitOpKind::FastAppend {
-                return Err(format!(
-                    "MERGE not-matched INSERT fold does not support commit op {:?}",
-                    self.commit_op_kind
-                ));
-            }
             return self.run_insert_branch(query, preparation);
         }
         Err("MERGE operation produced no writable branch".to_string())

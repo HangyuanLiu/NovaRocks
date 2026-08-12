@@ -23,8 +23,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::{Field, Schema};
-use bytes::Bytes;
+use arrow::datatypes::Field;
 use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::spec::DataFile;
 use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
@@ -38,9 +37,7 @@ use crate::connector::iceberg::commit::{
     ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
-use crate::connector::iceberg::write_service::{
-    IcebergWriteControlService, IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
-};
+use crate::connector::iceberg::write_service::IcebergWriteReportCommitter;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
@@ -58,9 +55,7 @@ use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
-use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
 use novarocks_connector_iceberg::commit::{CommitOpKind, WrittenFile};
-use novarocks_connector_iceberg::write_payload::IcebergWritePlanPayloadV1;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
@@ -583,232 +578,6 @@ pub(crate) fn activate_iceberg_change_stream_connector_write(
     Ok(template)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn register_iceberg_connector_write_service<S>(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
-    intent: ConnectorWriteIntent,
-    input_schema: Arc<Schema>,
-    plan_payload: IcebergWritePlanPayloadV1,
-    service: S,
-    operation_id: ConnectorWriteOperationId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String>
-where
-    S: crate::connector::iceberg::write_control::IcebergWriteControlBackend + 'static,
-{
-    let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
-    let payload = plan_payload
-        .encode()
-        .map_err(|error| format!("encode Iceberg connector plan payload: {error}"))?;
-    let mut templates = register_iceberg_connector_write_cohort_service(
-        state,
-        target,
-        target_ref,
-        service,
-        operation_id,
-        exact_lease,
-        vec![(cohort_id, intent, input_schema, payload, context)],
-    )?;
-    Ok(templates
-        .pop()
-        .expect("single Iceberg cohort registration returns one template"))
-}
-
-#[allow(clippy::type_complexity)]
-pub(crate) fn register_iceberg_connector_write_cohort_service<S>(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
-    service: S,
-    operation_id: ConnectorWriteOperationId,
-    exact_lease: &ConnectorWriteLease,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String>
-where
-    S: crate::connector::iceberg::write_control::IcebergWriteControlBackend + 'static,
-{
-    if cohorts.is_empty() {
-        return Err("Iceberg connector write operation has no cohorts".to_string());
-    }
-    // Provider admission is deliberately before the local service registry
-    // mutation. A typed denial (notably managed-MV ordinary DML) therefore
-    // leaves no operation entry that could later be activated accidentally.
-    let templates = build_iceberg_connector_write_templates(
-        target,
-        target_ref,
-        operation_id,
-        exact_lease,
-        cohorts,
-    )?;
-    let instance_id = ConnectorInstanceId::parse(&target.catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let services = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
-        .write_services();
-    services
-        .register(operation_id, service)
-        .map_err(|error| format!("register Iceberg connector write service: {error}"))?;
-
-    Ok(templates)
-}
-
-/// Reserve an Iceberg write service only after the application has retained
-/// the exact write lease. The factory is evaluated lazily by the first SPI
-/// planning request, so SQL preparation cannot mutate the provider registry
-/// or accidentally bind a newer connector generation.
-#[allow(clippy::type_complexity)]
-pub(crate) fn reserve_iceberg_connector_write_cohort_service_with_exact_lease<F>(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
-    operation_id: ConnectorWriteOperationId,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-    activation_digest: [u8; 32],
-    exact_lease: &ConnectorWriteLease,
-    factory: F,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String>
-where
-    F: Fn() -> Result<
-            Arc<dyn crate::connector::iceberg::write_control::IcebergWriteControlBackend>,
-            novarocks_spi::connector::ConnectorError,
-        > + Send
-        + Sync
-        + 'static,
-{
-    if cohorts.is_empty() {
-        return Err("Iceberg connector write operation has no cohorts".to_string());
-    }
-    let instance_id = ConnectorInstanceId::parse(&target.catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    if exact_lease.binding_key().instance_id != instance_id {
-        return Err("Iceberg write lease does not match the target connector instance".to_string());
-    }
-    // As above, prepare against the exact retained generation before local
-    // lazy activation is visible to a later SPI planning request.
-    let templates = build_iceberg_connector_write_templates(
-        target,
-        target_ref,
-        operation_id,
-        exact_lease,
-        cohorts,
-    )?;
-    let services = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
-        .write_services();
-    services
-        .register_lazy(operation_id, activation_digest, factory)
-        .map_err(|error| format!("reserve Iceberg connector write service: {error}"))?;
-    Ok(templates)
-}
-
-#[allow(clippy::type_complexity)]
-fn build_iceberg_connector_write_templates(
-    target: &TargetBackend,
-    target_ref: &str,
-    operation_id: ConnectorWriteOperationId,
-    exact_lease: &ConnectorWriteLease,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
-    build_iceberg_connector_write_templates_with_purpose(
-        target,
-        target_ref,
-        operation_id,
-        exact_lease,
-        ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        cohorts,
-    )
-}
-
-#[allow(clippy::type_complexity)]
-fn build_iceberg_connector_write_templates_with_purpose(
-    target: &TargetBackend,
-    target_ref: &str,
-    operation_id: ConnectorWriteOperationId,
-    exact_lease: &ConnectorWriteLease,
-    purpose: ConnectorWriteAdmissionPurpose,
-    cohorts: Vec<(
-        novarocks_spi::connector::ConnectorWriteCohortId,
-        ConnectorWriteIntent,
-        Arc<Schema>,
-        Bytes,
-        novarocks_spi::connector::ConnectorRequestContext,
-    )>,
-) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
-    let context = cohorts
-        .first()
-        .ok_or_else(|| "Iceberg connector write operation has no cohorts".to_string())?
-        .4
-        .clone();
-    cohorts
-        .into_iter()
-        .map(
-            |(cohort_id, intent, input_schema, provider_payload, context)| {
-                // The registered service still owns its provider-private
-                // payload during this C1 cutover, but the operation contract
-                // is now sealed exclusively from Provider-signed admission.
-                // In particular, no caller can put that payload into the
-                // generic planning template.
-                let preparation = prepare_iceberg_connector_write(
-                    exact_lease,
-                    target,
-                    target_ref,
-                    intent,
-                    ConnectorWriteInputRequest::Data {
-                        fields: input_schema
-                            .fields()
-                            .iter()
-                            .map(|field| ConnectorWriteFieldRequest::new((**field).clone()))
-                            .collect(),
-                    },
-                    purpose,
-                    context.clone(),
-                )?;
-                let _provider_payload = provider_payload;
-                if cohort_id
-                    != novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id)
-                {
-                    return Err(
-                        "ordinary connector write activation may only produce the primary cohort"
-                            .to_string(),
-                    );
-                }
-                crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-                    operation_id,
-                    preparation,
-                    context,
-                    exact_lease.clone(),
-                )
-                .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
-            },
-        )
-        .collect()
-}
-
 /// Request a sealed preparation from the write-control generation retained by
 /// the original planning lease.  This helper is the only generic-template
 /// construction seam: callers provide Arrow fields, never a table-format
@@ -1185,7 +954,6 @@ impl PreparedIcebergWrite {
     ) -> Result<Arc<dyn crate::engine::mutation_flow::MutationExecution>, String> {
         let state = Arc::clone(&self.executor.state);
         let target = self.executor.target.clone();
-        let commit_executor = Arc::clone(&self.executor.commit_executor);
         let connector_context = self.executor.connector_context.clone();
         let execution = self.executor.execution.clone().ok_or_else(|| {
             "prepared Iceberg mutation write requires an admitted execution context".to_string()
@@ -1196,7 +964,6 @@ impl PreparedIcebergWrite {
             target,
             execution,
             prepared_request: Mutex::new(Some(prepared_request)),
-            commit_executor,
             connector_context,
             operation_session: Mutex::new(None),
         }))
@@ -1209,7 +976,6 @@ struct PreparedIcebergWriteMutationExecution {
     execution: QueryExecutionContext,
     prepared_request:
         Mutex<Option<crate::query_execution::prepared_write::PreparedDistributedWriteRequest>>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     operation_session:
         Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
@@ -2083,236 +1849,6 @@ mod tests {
 
         assert_eq!(write_base_snapshot_id(&metadata, "main").unwrap(), Some(2));
         assert_eq!(write_base_snapshot_id(&metadata, "dev").unwrap(), Some(1));
-    }
-
-    fn test_iceberg_metadata_with_identity_partition(
-        source_column_name: &str,
-        source_field_id: i32,
-        partition_spec_id: i32,
-    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
-        test_iceberg_metadata_with_partition(
-            source_column_name,
-            source_column_name,
-            novarocks_connector_iceberg::iceberg::spec::Transform::Identity,
-            source_field_id,
-            partition_spec_id,
-        )
-    }
-
-    fn test_iceberg_metadata_with_partition(
-        source_column_name: &str,
-        partition_field_name: &str,
-        transform: novarocks_connector_iceberg::iceberg::spec::Transform,
-        source_field_id: i32,
-        partition_spec_id: i32,
-    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        source_field_id,
-                        source_column_name,
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-                        ),
-                    ),
-                ),
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
-                        source_field_id + 1,
-                        "v",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("schema");
-        let partition_spec = novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(
-            Arc::new(schema.clone()),
-        )
-        .with_spec_id(partition_spec_id)
-        .add_partition_field(source_column_name, partition_field_name, transform)
-        .expect("partition field")
-        .build()
-        .expect("partition spec");
-        let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
-            .name("t".to_string())
-            .location("file:///warehouse/db/t".to_string())
-            .schema(schema)
-            .partition_spec(partition_spec.into_unbound())
-            .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3)
-            .build();
-        let metadata =
-            novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::from_table_creation(
-                creation,
-            )
-            .expect("metadata builder")
-            .build()
-            .expect("metadata")
-            .metadata;
-        retag_test_metadata_partition_source(metadata, source_field_id, partition_spec_id)
-    }
-
-    fn retag_test_metadata_partition_source(
-        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-        source_field_id: i32,
-        partition_spec_id: i32,
-    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
-        // TableMetadataBuilder::from_table_creation intentionally reassigns
-        // field and spec ids; this fixture retags serialized metadata so tests
-        // can assert planner descriptors carry target-table ids verbatim.
-        let mut value = serde_json::to_value(metadata).expect("metadata json");
-        let object = value.as_object_mut().expect("metadata object");
-        object.insert(
-            "default-spec-id".to_string(),
-            serde_json::Value::from(partition_spec_id),
-        );
-        object.insert(
-            "last-column-id".to_string(),
-            serde_json::Value::from(source_field_id + 1),
-        );
-
-        let schemas = object
-            .get_mut("schemas")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("schemas array");
-        let schema_fields = schemas[0]
-            .as_object_mut()
-            .and_then(|schema| schema.get_mut("fields"))
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("schema fields");
-        schema_fields[0]
-            .as_object_mut()
-            .expect("first field")
-            .insert("id".to_string(), serde_json::Value::from(source_field_id));
-        schema_fields[1]
-            .as_object_mut()
-            .expect("second field")
-            .insert(
-                "id".to_string(),
-                serde_json::Value::from(source_field_id + 1),
-            );
-
-        let specs = object
-            .get_mut("partition-specs")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("partition specs");
-        let spec = specs[0].as_object_mut().expect("partition spec object");
-        spec.insert(
-            "spec-id".to_string(),
-            serde_json::Value::from(partition_spec_id),
-        );
-        let partition_fields = spec
-            .get_mut("fields")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("partition fields");
-        partition_fields[0]
-            .as_object_mut()
-            .expect("partition field")
-            .insert(
-                "source-id".to_string(),
-                serde_json::Value::from(source_field_id),
-            );
-
-        serde_json::from_value(value).expect("retagged metadata")
-    }
-
-    fn test_iceberg_target() -> TargetBackend {
-        TargetBackend {
-            backend_name: "iceberg",
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "target_orders".to_string(),
-        }
-    }
-
-    fn test_resolved_table(columns: Vec<ColumnDef>) -> ResolvedTable {
-        ResolvedTable {
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "target_orders".to_string(),
-            columns,
-            statistics_pin: None,
-        }
-    }
-
-    fn test_iceberg_table(
-        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    ) -> novarocks_connector_iceberg::iceberg::table::Table {
-        novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(TableIdent::new(
-                NamespaceIdent::new("test_db".to_string()),
-                "target_orders".to_string(),
-            ))
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("iceberg table")
-    }
-
-    fn test_iceberg_catalog_entry() -> IcebergCatalogEntry {
-        let warehouse = tempfile::TempDir::new().expect("warehouse tempdir");
-        crate::connector::iceberg::catalog::registry::build_catalog_entry(
-            "test_catalog",
-            &[
-                ("type".to_string(), "iceberg".to_string()),
-                (
-                    "iceberg.catalog.warehouse".to_string(),
-                    warehouse.path().display().to_string(),
-                ),
-            ],
-        )
-        .expect("iceberg catalog entry")
-    }
-
-    fn assert_position_delete_output_field(
-        field: &novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteOutputField,
-        output_expr_index: i32,
-        name: &str,
-        data_type: &DataType,
-        field_id: i32,
-    ) {
-        assert_eq!(field.output_expr_index, output_expr_index as usize);
-        assert_eq!(field.name, name);
-        assert_eq!(&field.data_type, data_type);
-        assert_eq!(field.field_id, field_id);
-    }
-
-    fn assert_position_delete_descriptor_contract(
-        desc: &novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorInput,
-    ) {
-        use novarocks_connector_iceberg::position_delete_descriptor::{
-            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-            ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        };
-
-        assert_eq!(desc.target_partition_spec_id, 7);
-        assert_position_delete_output_field(
-            &desc.file_path,
-            0,
-            ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
-            &DataType::Utf8,
-            ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-        );
-        assert_position_delete_output_field(
-            &desc.pos,
-            1,
-            ICEBERG_POSITION_DELETE_POS_COLUMN,
-            &DataType::Int64,
-            ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        );
-        let partition_field = desc
-            .partition_source_fields
-            .first()
-            .expect("partition source field");
-        assert_eq!(partition_field.output_expr_index, 2);
-        assert_eq!(partition_field.source_column_name, "id");
-        assert_eq!(partition_field.partition_field_name, "id_bucket");
-        assert_eq!(partition_field.transform_expr, "bucket[8]");
-        assert_eq!(partition_field.source_field_id, 42);
-        assert_eq!(partition_field.data_type, DataType::Int32);
     }
 
     #[test]
