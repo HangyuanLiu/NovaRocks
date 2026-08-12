@@ -33,13 +33,17 @@ use novarocks_spi::connector::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::commit::validation::{
+    ensure_iceberg_write_supported_from_metadata, ensure_no_equality_deletes_from_metadata,
+    ensure_overwrite_single_partition_spec_from_metadata,
+};
 use crate::commit::write_shared::{
     exact_requested_write_fields, invalid_write_activation, snapshot_token,
     write_target_snapshot_id,
 };
 use crate::control_provider::IcebergTablePayload;
 use crate::file_reader::execution_payload::decode_payload;
-use crate::iceberg::spec::TableMetadata;
+use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::storage_inspector::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 
 /// Sign the SQL-proposed Arrow input while the Iceberg provider still owns the
@@ -95,6 +99,11 @@ pub(crate) fn prepare_write(
         ));
     }
 
+    let target_fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
+    if let Some(denied) = write_support_denial(&metadata, &request, &target_fqn) {
+        return Ok(ConnectorWritePreparationOutcome::Denied(denied));
+    }
+
     let input = bind_write_input(&request, owner, &metadata)?;
     let target_snapshot_id = write_target_snapshot_id(&metadata, request.target_ref.as_str())?;
     let table_uuid = table.table_uuid.as_deref().ok_or_else(|| {
@@ -125,6 +134,73 @@ pub(crate) fn prepare_write(
             preparation_payload,
         )?,
     ))
+}
+
+/// Write-support guards for the INSERT-shaped intents.
+///
+/// These reject table shapes this writer cannot encode. They used to run in the
+/// SQL application layer, which had to load a concrete Iceberg table to do it;
+/// the rules are Iceberg facts, so they belong here, next to the frozen
+/// metadata the provider already decoded.
+///
+/// Scoped deliberately to `Append` / `Overwrite` / `PartitionOverwrite`.
+/// `RowDelta` is untouched: row-mutation admission runs its own guards through
+/// `row_mutation_strategy_from_metadata`, and the equality-delete single-spec
+/// guard still lives with its SQL entry point. Widening this to `RowDelta`
+/// would newly reject tables that equality delete accepts today.
+fn write_support_denial(
+    metadata: &TableMetadata,
+    request: &ConnectorWritePreparationRequest,
+    target_fqn: &str,
+) -> Option<ConnectorError> {
+    let insert_shaped = matches!(
+        request.intent,
+        ConnectorWriteIntent::Append
+            | ConnectorWriteIntent::Overwrite
+            | ConnectorWriteIntent::PartitionOverwrite
+    );
+    if !insert_shaped {
+        return None;
+    }
+
+    let invalid =
+        |message: String| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+
+    if let Err(error) = ensure_iceberg_write_supported_from_metadata(metadata) {
+        return Some(invalid(error));
+    }
+
+    if matches!(request.intent, ConnectorWriteIntent::Overwrite) {
+        if let Err(error) = ensure_overwrite_single_partition_spec_from_metadata(metadata) {
+            return Some(invalid(error));
+        }
+        if let Err(error) = ensure_no_equality_deletes_from_metadata(metadata) {
+            return Some(invalid(error));
+        }
+    }
+
+    if matches!(request.intent, ConnectorWriteIntent::PartitionOverwrite)
+        && metadata.default_partition_spec().is_unpartitioned()
+    {
+        return Some(invalid(format!(
+            "INSERT OVERWRITE PARTITIONS requires a partitioned table; \
+             table {} is unpartitioned (use OVERWRITE without PARTITIONS)",
+            target_fqn,
+        )));
+    }
+
+    // Branch writes carry row-lineage semantics, which are Iceberg v3 only.
+    if request.target_ref.as_str() != "main" {
+        let format_version = metadata.format_version();
+        if format_version != FormatVersion::V3 {
+            return Some(invalid(format!(
+                "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
+                target_fqn, format_version as u8,
+            )));
+        }
+    }
+
+    None
 }
 
 fn bind_write_input(
@@ -484,6 +560,111 @@ mod tests {
                 panic!("expected a prepared admission, got denial: {error}")
             }
         }
+    }
+
+    /// SPI-5M relocated the write-support guards out of the SQL layer, which
+    /// had to load a concrete Iceberg table to run them, into write
+    /// preparation, which already holds the frozen admitted metadata. These
+    /// four cases pin the relocated behaviour: the two conditional denials, the
+    /// absence of a false denial on the ordinary path, and the deliberate
+    /// exclusion of `RowDelta`.
+    ///
+    /// The evolved-partition-spec and pre-existing-equality-delete denials are
+    /// covered end to end by `sql-tests/iceberg-ddl/sql/partition_evolution_unsupported.sql`,
+    /// which asserts their messages through `@expect_error`; building a second
+    /// partition spec in a unit fixture would restate that without adding
+    /// coverage.
+    #[test]
+    fn spi5m_branch_write_on_a_pre_v3_table_is_denied_by_write_preparation() {
+        let owner = owner();
+        let metadata = metadata(); // FormatVersion::V2
+        let payload = table_payload(Some(table_info(&metadata)));
+        let mut request = data_request(
+            &owner,
+            &payload,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        );
+        request.target_ref = ConnectorWriteTargetRef::parse("nightly").expect("branch ref");
+
+        let error = expect_denied(prepare_write(request, &owner).expect("prepare branch write"));
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.to_string(),
+            "InvalidRequest: iceberg ref: branch writes require Iceberg v3 tables \
+             (table ice.db.t is v2)",
+            "the relocated guard must reproduce the message the SQL layer used to emit"
+        );
+    }
+
+    #[test]
+    fn spi5m_partition_overwrite_on_an_unpartitioned_table_is_denied_by_write_preparation() {
+        let owner = owner();
+        let metadata = metadata(); // unpartition_spec
+        let payload = table_payload(Some(table_info(&metadata)));
+        let mut request = data_request(
+            &owner,
+            &payload,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        );
+        request.intent = ConnectorWriteIntent::PartitionOverwrite;
+
+        let error =
+            expect_denied(prepare_write(request, &owner).expect("prepare partition overwrite"));
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.to_string(),
+            "InvalidRequest: INSERT OVERWRITE PARTITIONS requires a partitioned table; \
+             table ice.db.t is unpartitioned (use OVERWRITE without PARTITIONS)",
+        );
+    }
+
+    #[test]
+    fn spi5m_append_on_main_is_not_denied_by_the_relocated_write_guards() {
+        let owner = owner();
+        let metadata = metadata();
+        let payload = table_payload(Some(table_info(&metadata)));
+        let request = data_request(
+            &owner,
+            &payload,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        );
+
+        // A plain v2 append must stay admissible: relocating the guards must
+        // not widen the rejection set.
+        let preparation =
+            expect_prepared(prepare_write(request, &owner).expect("prepare ordinary append"));
+        assert_eq!(preparation.intent(), ConnectorWriteIntent::Append);
+    }
+
+    #[test]
+    fn spi5m_row_delta_branch_write_is_left_to_row_mutation_admission() {
+        let owner = owner();
+        let metadata = metadata(); // FormatVersion::V2
+        let payload = table_payload(Some(table_info(&metadata)));
+        let mut request = data_request(
+            &owner,
+            &payload,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        );
+        request.intent = ConnectorWriteIntent::RowDelta;
+        request.target_ref = ConnectorWriteTargetRef::parse("nightly").expect("branch ref");
+
+        // The INSERT-shaped guards deliberately skip RowDelta: row-mutation
+        // admission enforces its own v3 branch rule through
+        // `row_mutation_strategy_from_metadata`, and equality delete keeps its
+        // single-spec guard at the SQL entry point. Running them here would
+        // newly reject tables those paths accept today.
+        //
+        // Proof that the guard was skipped: this same request under an
+        // INSERT-shaped intent is denied with the v3 message (see the branch
+        // test above), whereas RowDelta gets past it and only then hits the
+        // pre-existing downstream ref-resolution check.
+        let error = expect_error(prepare_write(request, &owner));
+        assert_eq!(
+            error.to_string(),
+            "InvalidRequest: iceberg ref: branch 'nightly' not found in table metadata",
+            "RowDelta must reach ref resolution, not the INSERT-shaped v3 guard"
+        );
     }
 
     #[test]

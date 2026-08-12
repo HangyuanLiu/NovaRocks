@@ -32,10 +32,7 @@ use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
-use crate::connector::iceberg::commit::{
-    CleanupPathMapper, IcebergCommitCollector, ensure_iceberg_write_supported,
-    ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
-};
+use crate::connector::iceberg::commit::{CleanupPathMapper, IcebergCommitCollector};
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_service::IcebergWriteReportCommitter;
 use crate::engine::StandaloneState;
@@ -156,10 +153,6 @@ pub(crate) fn prepare_iceberg_write_with_options(
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
-    let overwrite_full_table = matches!(overwrite_mode, IcebergWriteMode::FullTableOverwrite);
-    let overwrite_partitions =
-        matches!(overwrite_mode, IcebergWriteMode::DynamicPartitionOverwrite);
-
     // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
     let entry = {
         let registry = state
@@ -181,34 +174,22 @@ pub(crate) fn prepare_iceberg_write_with_options(
             )
         })?;
 
-    // 2. Pre-lowering validators.
-    let _write_mode = ensure_iceberg_write_supported(&table)?;
-    if overwrite_full_table {
-        ensure_overwrite_single_partition_spec(&table)?;
-        ensure_no_equality_deletes(&table)?;
-    }
-    if overwrite_partitions {
-        // v3 row-lineage + cross-historical-spec checks happen in
-        // OverwritePartitionsCommit.
-        if table.metadata().default_partition_spec().is_unpartitioned() {
-            return Err(format!(
-                "INSERT OVERWRITE PARTITIONS requires a partitioned table; \
-                 table {} is unpartitioned (use OVERWRITE without PARTITIONS)",
-                target_string(target),
-            ));
-        }
-    }
-    // Branch writes require Iceberg v3 (row-lineage semantics).
-    if target_ref != "main" {
-        let fmt = table.metadata().format_version();
-        if fmt != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
-            return Err(format!(
-                "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
-                target_string(target),
-                fmt as u8,
-            ));
-        }
-    }
+    // 2. Write-support validation belongs to the Provider.
+    //
+    // These guards reject table shapes this writer cannot encode: unresolvable
+    // default sort order, variant in partition spec or sort order, evolved
+    // partition specs under INSERT OVERWRITE, pre-existing equality deletes
+    // under INSERT OVERWRITE, unpartitioned targets under OVERWRITE PARTITIONS,
+    // and pre-v3 tables under a branch write. Every one of them is an Iceberg
+    // fact read off table metadata, so they now run inside
+    // `ConnectorWriteControl::prepare_write` against the frozen admitted
+    // metadata, and this layer no longer loads a table to answer them.
+    //
+    // Rejection set is unchanged. Two observable differences, both recorded in
+    // the plan: the message now carries the `Iceberg write admission denied:`
+    // prefix the SPI `Denied` outcome adds, and the guards fire after column
+    // shaping rather than before it, so a statement that violates both a guard
+    // and its column list now surfaces the column-list error first.
 
     prepare_iceberg_distributed_write(
         state,
