@@ -198,6 +198,9 @@ pub struct FrontendQueryService {
     add_files_engine: Arc<dyn AddFilesEngine>,
     ctas_engine: Arc<dyn CtasEngine>,
     truncate_engine: Arc<dyn TruncateEngine>,
+    /// Cost budget frozen from `[runtime]` and handed to statement admission
+    /// whenever the session did not set one itself.
+    optimizer_query_mem_limit_bytes: u64,
 }
 
 impl FrontendQueryService {
@@ -214,6 +217,7 @@ impl FrontendQueryService {
         add_files_engine: Arc<dyn AddFilesEngine>,
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
+        optimizer_query_mem_limit_bytes: u64,
     ) -> Self {
         Self {
             engine,
@@ -228,6 +232,7 @@ impl FrontendQueryService {
             add_files_engine,
             ctas_engine,
             truncate_engine,
+            optimizer_query_mem_limit_bytes,
         }
     }
 }
@@ -538,6 +543,13 @@ impl FrontendQuerySession {
                 ));
             }
         };
+        let mut optimizer_settings = state.optimizer_settings;
+        // A session `SET` wins; otherwise admission freezes the process budget so
+        // SQL costing never consults a process-global configuration.
+        if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
+            optimizer_settings.optimizer_query_mem_limit_bytes =
+                Some(self.service.optimizer_query_mem_limit_bytes as f64);
+        }
         let context = RequestContext::admit(RequestAdmission::new(
             state.current_catalog,
             state.current_database,
@@ -545,7 +557,7 @@ impl FrontendQuerySession {
             topology,
             deadline,
             cancellation.clone(),
-            state.optimizer_settings,
+            optimizer_settings,
         ));
         let compiler = self.service.engine.query_compiler();
         let command_executor = self.service.engine.command_executor();

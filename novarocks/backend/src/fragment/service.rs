@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use novarocks::common::app_config;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::novarocks_logging::error;
 #[cfg(test)]
@@ -78,6 +77,7 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: novarocks_execution::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
+            exchange_wait_ms: 120_000,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
             exchange_max_transmit_batched_bytes: 1,
@@ -103,14 +103,14 @@ fn runner_stage_prepare_failure(
     Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
     NativeFragmentIngressError,
 > {
-    let Some(root) = app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
-    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(root, available_fragments)
-        .map_err(NativeFragmentIngressError::new)
+    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(
+        &root,
+        available_fragments,
+    )
+    .map_err(NativeFragmentIngressError::new)
 }
 
 #[cfg(not(debug_assertions))]
@@ -296,6 +296,7 @@ impl NativeFragmentService {
                 Arc::new(self.execution_host.resolver_for(execution_id)),
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
+                std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
             )?;
             self.stage_one(request, Arc::clone(&gate))?;
         }
@@ -324,9 +325,6 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
-        let cache_options = request
-            .cache_options()
-            .map_err(NativeFragmentIngressError::new)?;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -336,7 +334,6 @@ impl NativeFragmentService {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                cache_options,
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
@@ -479,9 +476,6 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
-        let cache_options = request
-            .cache_options()
-            .map_err(NativeFragmentIngressError::new)?;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -491,7 +485,6 @@ impl NativeFragmentService {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                cache_options,
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
@@ -946,6 +939,7 @@ mod tests {
                 ..Default::default()
             },
             Arc::new(ConnectorRegistry::new()),
+            std::time::Duration::from_millis(120_000),
         )
         .expect("valid native fragment request")
     }
@@ -1009,7 +1003,6 @@ mod tests {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                request.cache_options().expect("valid cache options"),
                 None,
             )
             .expect("native fragment admission");

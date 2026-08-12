@@ -25,6 +25,8 @@ mod access;
 mod cache;
 mod catalog_properties;
 mod error;
+mod object_store_credentials;
+mod object_store_settings;
 mod physical_reader;
 mod predicate;
 mod read;
@@ -50,6 +52,8 @@ pub use catalog_properties::{
     object_store_config_from_aws_s3_catalog_property_pairs,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
+pub use object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
+pub use object_store_settings::ObjectStoreRetrySettings;
 pub use physical_reader::{
     MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS, MAX_PARQUET_INSPECTION_ROW_GROUPS,
     MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,

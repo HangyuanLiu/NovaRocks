@@ -318,32 +318,6 @@ pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragme
     }
 }
 
-/// Loads the object-store configuration that was installed on this BE at
-/// startup. Native fragment payloads must not carry credentials or endpoint
-/// configuration because every BE receives the same deployment configuration.
-pub(super) fn resolve_native_connector_object_store_config(
-    cloud_properties: &HashMap<String, String>,
-) -> Result<Option<ObjectStoreConfig>, NativeFragmentLeafDecodeError> {
-    reject_native_connector_cloud_properties(cloud_properties)?;
-    crate::common::app_config::config()
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "connector.object_store",
-                error,
-            )
-        })?
-        .connector
-        .object_store_config()
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "connector.object_store",
-                error,
-            )
-        })
-}
-
 pub(super) fn reject_native_connector_cloud_properties(
     cloud_properties: &HashMap<String, String>,
 ) -> Result<(), NativeFragmentLeafDecodeError> {

@@ -17,13 +17,10 @@
 #[cfg(test)]
 mod tests;
 
-pub mod cache;
 pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;
 pub mod engine;
-pub mod formats;
-pub mod fs;
 pub mod meta;
 pub mod mv;
 pub mod protocol;

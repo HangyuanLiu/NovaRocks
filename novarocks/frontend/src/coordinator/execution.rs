@@ -519,6 +519,29 @@ pub struct FrontendDistributedQueryCoordinator {
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
     connector_control: Arc<ConnectorControlHost>,
+    /// Validated once at startup from the timeouts the composition root froze;
+    /// query admission consumes it rather than re-reading configuration.
+    lifecycle_config: FrontendQueryLifecycleConfig,
+    pre_start_timeout: Duration,
+}
+
+fn build_lifecycle_config(
+    timeouts: crate::application::FrontendQueryControlTimeouts,
+) -> Result<FrontendQueryLifecycleConfig, DistributedQueryError> {
+    FrontendQueryLifecycleConfig::new(
+        Duration::from_millis(timeouts.heartbeat_interval_ms),
+        Duration::from_millis(timeouts.heartbeat_timeout_ms),
+        Duration::from_millis(timeouts.init_rpc_timeout_ms),
+        Duration::from_millis(timeouts.attach_timeout_ms),
+    )?
+    .with_stage_start_timeouts(
+        Duration::from_millis(timeouts.stage_rpc_timeout_ms),
+        Duration::from_millis(timeouts.start_rpc_timeout_ms),
+    )?
+    .with_terminal_timeouts(
+        Duration::from_millis(timeouts.terminal_drain_timeout_ms),
+        Duration::from_millis(timeouts.terminal_ack_timeout_ms),
+    )
 }
 
 impl FrontendDistributedQueryCoordinator {
@@ -526,11 +549,15 @@ impl FrontendDistributedQueryCoordinator {
         advertised_report_host: String,
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
+        query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
         connector_control: Arc<ConnectorControlHost>,
-    ) -> Self {
+    ) -> Result<Self, DistributedQueryError> {
+        // Reject an unusable `[runtime]` query-control section at startup rather
+        // than on the first query that tries to use it.
+        let lifecycle_config = build_lifecycle_config(query_control_timeouts)?;
         connector_control.set_retirement_sink(Arc::new(GrpcConnectorControlRetirementSink));
-        Self {
+        Ok(Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::new(
                 advertised_report_host,
                 configured_report_port,
@@ -542,7 +569,9 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(UniqueQueryIdSource::default()),
             registry: Arc::new(FrontendQueryRegistry::default()),
             connector_control,
-        }
+            lifecycle_config,
+            pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
+        })
     }
 
     #[cfg(test)]
@@ -581,6 +610,7 @@ impl FrontendDistributedQueryCoordinator {
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
     ) -> Self {
+        let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
@@ -596,6 +626,9 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
             connector_control: Arc::new(ConnectorControlHost::new()),
+            lifecycle_config: build_lifecycle_config(test_timeouts)
+                .expect("default query-control timeouts validate"),
+            pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
         }
     }
 
@@ -613,6 +646,7 @@ impl FrontendDistributedQueryCoordinator {
             .iter()
             .flat_map(|scheduler| scheduler.live_targets())
             .collect::<Vec<_>>();
+        let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
@@ -630,6 +664,9 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
             connector_control: Arc::new(ConnectorControlHost::new()),
+            lifecycle_config: build_lifecycle_config(test_timeouts)
+                .expect("default query-control timeouts validate"),
+            pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
         }
     }
 
@@ -799,27 +836,10 @@ impl FrontendDistributedQueryCoordinator {
             .saturating_add(u128::from(timeout_ms.max(1) as u64))
             .try_into()
             .map_err(|_| failed("query deadline exceeds u64 milliseconds"))?;
-        let runtime = &novarocks::common::app_config::config()
-            .map_err(|error| failed(format!("load query lifecycle config: {error}")))?
-            .runtime;
-        let lifecycle_config = FrontendQueryLifecycleConfig::new(
-            Duration::from_millis(runtime.query_control_heartbeat_interval_ms),
-            Duration::from_millis(runtime.query_control_heartbeat_timeout_ms),
-            Duration::from_millis(runtime.query_control_init_rpc_timeout_ms),
-            Duration::from_millis(runtime.query_control_attach_timeout_ms),
-        )?
-        .with_stage_start_timeouts(
-            Duration::from_millis(runtime.query_control_stage_rpc_timeout_ms),
-            Duration::from_millis(runtime.query_control_start_rpc_timeout_ms),
-        )?
-        .with_terminal_timeouts(
-            Duration::from_millis(runtime.query_control_terminal_drain_timeout_ms),
-            Duration::from_millis(runtime.query_control_terminal_ack_timeout_ms),
-        )?;
         let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
             Arc::clone(&backend_services.lifecycle_transport),
             Arc::clone(&self.registry),
-            lifecycle_config,
+            self.lifecycle_config,
         )
         .with_cancellation(parts.cancellation.clone());
         let init_options = QueryInitOptions::new(
@@ -827,7 +847,7 @@ impl FrontendDistributedQueryCoordinator {
             backend_services.live_backends,
             &parts.options,
             query_deadline_unix_ms,
-            Duration::from_millis(runtime.query_control_pre_start_timeout_ms),
+            self.pre_start_timeout,
             self.report_endpoint.resolve()?,
         )?;
         let connector_binding_dispatcher =

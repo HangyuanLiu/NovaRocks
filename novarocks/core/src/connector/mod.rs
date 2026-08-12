@@ -533,8 +533,6 @@ pub(crate) use novarocks_execution::exec::min_max_predicate::{
 };
 
 pub use crate::connector::file_execution::FileScanRange;
-pub use crate::formats::orc::OrcScanConfig;
-pub use crate::formats::parquet::ParquetScanConfig;
 
 #[cfg(test)]
 mod runtime_test;

@@ -78,6 +78,17 @@ pub struct StagePrepareFailure {
     pub ordinal: usize,
 }
 
+/// The runner-owned fault root, or `None` when no fault injection is armed.
+///
+/// Read the process environment directly rather than the application-config
+/// singleton: these hooks sit in synchronous coordinator and ingress paths that
+/// must not trigger a second config initialization, and the value is owned by
+/// the test runner that spawned this process. Release builds reject the
+/// variable at startup, so this returns `None` there by construction.
+pub fn configured_root() -> Option<PathBuf> {
+    std::env::var_os("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR").map(PathBuf::from)
+}
+
 pub fn arm_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind) -> PathBuf {
     root.join(format!("be-{backend_index}.{}.arm", kind.file_stem()))
 }

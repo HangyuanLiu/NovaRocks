@@ -373,7 +373,11 @@ impl BackendApplicationHost {
             config,
             execution_installers,
         } = config;
-        app_config::install_preloaded_config(config.clone());
+        novarocks::connector::schema::install_be_store_settings(
+            config.runtime.enable_tablet_write_log,
+            config.runtime.tablet_write_log_buffer_size,
+            config.runtime.be_txn_info_history_size,
+        );
 
         let advertise_endpoint = network::standalone_advertise_endpoint_for_config(&config)
             .map_err(|error| {
@@ -483,6 +487,7 @@ fn execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig 
             block_size_bytes: config.spill.block_size_bytes.max(1),
             ipc_compression: config.spill.ipc_compression.clone(),
         },
+        exchange_wait_ms: runtime.exchange_wait_ms,
         exchange_io_threads: runtime.exchange_io_threads.max(1),
         exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
         exchange_max_transmit_batched_bytes: runtime.exchange_max_transmit_batched_bytes.max(1),

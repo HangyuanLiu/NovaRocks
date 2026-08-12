@@ -32,7 +32,7 @@ use crate::mv::{maintenance::MaintenanceCoordinatorConfig, scheduler::FrontendMv
 use crate::native::report_server::FrontendReportServerHandle;
 use crate::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-    FrontendApplicationHost, FrontendExecutionConfig,
+    FrontendApplicationHost, FrontendExecutionConfig, FrontendQueryControlTimeouts,
 };
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -146,6 +146,7 @@ where
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let execution = resolve_frontend_execution_config(&config)?;
+    let optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
     let backend = cluster_backend_open_config(&config.config)?;
     let connector_factories = config.connector_control_factories.clone();
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
@@ -214,6 +215,7 @@ where
                         add_files_engine,
                         ctas_engine,
                         truncate_engine,
+                        optimizer_query_mem_limit_bytes,
                     )))
                 },
                 shutdown,
@@ -241,6 +243,7 @@ where
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let execution = resolve_frontend_execution_config(&config)?;
+    let optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
     let backend = cluster_backend_open_config(&config.config)?;
     let connector_factories = config.connector_control_factories.clone();
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
@@ -309,6 +312,7 @@ where
                         add_files_engine,
                         ctas_engine,
                         truncate_engine,
+                        optimizer_query_mem_limit_bytes,
                     )))
                 },
                 shutdown,
@@ -339,7 +343,22 @@ fn resolve_frontend_execution_config(
         advertised.host,
         advertised.port,
         runtime_filter_worker_count,
-    );
+    )
+    .with_optimizer_query_mem_limit_bytes(server.config.runtime.optimizer_query_mem_limit_bytes)
+    .with_query_control_timeouts(FrontendQueryControlTimeouts {
+        heartbeat_interval_ms: server.config.runtime.query_control_heartbeat_interval_ms,
+        heartbeat_timeout_ms: server.config.runtime.query_control_heartbeat_timeout_ms,
+        init_rpc_timeout_ms: server.config.runtime.query_control_init_rpc_timeout_ms,
+        attach_timeout_ms: server.config.runtime.query_control_attach_timeout_ms,
+        stage_rpc_timeout_ms: server.config.runtime.query_control_stage_rpc_timeout_ms,
+        start_rpc_timeout_ms: server.config.runtime.query_control_start_rpc_timeout_ms,
+        terminal_drain_timeout_ms: server
+            .config
+            .runtime
+            .query_control_terminal_drain_timeout_ms,
+        terminal_ack_timeout_ms: server.config.runtime.query_control_terminal_ack_timeout_ms,
+        pre_start_timeout_ms: server.config.runtime.query_control_pre_start_timeout_ms,
+    });
     if let Some(standalone) = server.config.standalone_server.as_ref() {
         let failure_backoff_ms = standalone.mv_refresh_scheduler_failure_backoff_ms.max(1);
         execution = execution.with_mv_scheduler_config(FrontendMvSchedulerConfig {

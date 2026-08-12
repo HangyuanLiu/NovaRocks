@@ -160,14 +160,15 @@ impl RequestContext {
         Self { session, execution }
     }
 
+    /// Freeze one statement's context.
+    ///
+    /// The cost budget arrives inside `optimizer_settings`: the frontend query
+    /// service and the MV worker each carry the value resolved from `[runtime]`
+    /// at composition, so admission never reads a process-global configuration.
+    /// A settings value of `None` means "no budget", which leaves optimizer
+    /// costing on its profile default.
     pub fn admit(admission: RequestAdmission) -> Self {
-        let mut settings = admission.optimizer_settings;
-        // Runtime configuration is an application concern. Capture its cost
-        // budget once at admission so SQL only receives an immutable value.
-        if settings.optimizer_query_mem_limit_bytes.is_none() {
-            settings.optimizer_query_mem_limit_bytes =
-                Some(crate::common::config::optimizer_query_mem_limit_bytes() as f64);
-        }
+        let settings = admission.optimizer_settings;
         Self::new(
             RequestSessionContext::new(
                 admission.current_catalog,
@@ -295,19 +296,31 @@ mod tests {
     }
 
     #[test]
-    fn sqlx2_application_admission_freezes_optimizer_query_memory_once() {
-        struct ConfigReset;
-        impl Drop for ConfigReset {
-            fn drop(&mut self) {
-                crate::common::app_config::install_default_for_test();
-            }
-        }
+    fn admission_carries_the_optimizer_query_memory_budget_verbatim() {
+        let context = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db1".to_string(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(7),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings {
+                optimizer_query_mem_limit_bytes: Some(512.0 * 1024.0 * 1024.0),
+                ..SessionOptimizerSettings::default()
+            },
+        ));
 
-        let mut config = crate::common::app_config::NovaRocksConfig::default();
-        config.runtime.optimizer_query_mem_limit_bytes = 512 * 1024 * 1024;
-        crate::common::app_config::install_preloaded_config(config);
-        let _reset = ConfigReset;
+        assert_eq!(
+            context
+                .execution()
+                .optimizer_settings()
+                .optimizer_query_mem_limit_bytes,
+            Some(512.0 * 1024.0 * 1024.0)
+        );
+    }
 
+    #[test]
+    fn admission_without_a_budget_leaves_costing_on_its_profile_default() {
         let context = RequestContext::admit(RequestAdmission::new(
             None,
             "db1".to_string(),
@@ -323,7 +336,7 @@ mod tests {
                 .execution()
                 .optimizer_settings()
                 .optimizer_query_mem_limit_bytes,
-            Some(512.0 * 1024.0 * 1024.0)
+            None
         );
     }
 }

@@ -364,6 +364,9 @@ pub(crate) struct StandaloneState {
         Arc<crate::connector::unified_statistics::UnifiedStatisticsResolver>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) mv_refresh_pruning_limits: MvRefreshPruningLimits,
+    /// `[standalone_server] mv_partition_state_max_entries`, frozen at engine
+    /// open so MV refresh does not reach for a process-global config.
+    pub(crate) mv_partition_state_max_entries: usize,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
     /// Provider-neutral MV metadata boundary. Production wiring is installed by
     /// the frontend host; the core default deliberately rejects MV operations.
@@ -441,6 +444,7 @@ impl Default for StandaloneState {
             ),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
+            mv_partition_state_max_entries: DEFAULT_MV_PARTITION_STATE_MAX_ENTRIES,
             metadata_provider: None,
             mv_repository: Arc::new(UnavailableMvRepository),
             mv_application_service: Arc::new(UnavailableMvApplicationService),
@@ -1426,27 +1430,25 @@ impl StandaloneNovaRocks {
     pub fn open(opts: StandaloneOptions, services: StandaloneOpenServices) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
-        match opts.config_path.as_deref() {
-            Some(path) => {
-                novarocks_config::init_from_path(path)
-                    .map_err(|e| format!("load config failed: {e}"))?;
-            }
+        let cfg = match opts.config_path.as_deref() {
+            Some(path) => novarocks_config::load_from_path(path)
+                .map_err(|e| format!("load config failed: {e}"))?,
             None => {
                 #[cfg(test)]
                 {
-                    novarocks_config::install_default_for_test();
+                    novarocks_config::NovaRocksConfig::default()
                 }
                 #[cfg(not(test))]
                 {
-                    novarocks_config::init_from_env_or_default()
-                        .map_err(|e| format!("load config failed: {e}"))?;
+                    novarocks_config::load_from_env_or_default()
+                        .map_err(|e| format!("load config failed: {e}"))?
                 }
             }
-        }
+        };
         #[cfg(test)]
-        return Self::open_body(opts, services, _test_guard);
+        return Self::open_body(opts, &cfg, services, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(opts, services)
+        Self::open_body(opts, &cfg, services)
     }
 
     /// Open the engine using an already-loaded, validated config.
@@ -1462,26 +1464,31 @@ impl StandaloneNovaRocks {
     ) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
-        novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
-        return Self::open_body(opts, services, _test_guard);
+        return Self::open_body(opts, &cfg, services, _test_guard);
         #[cfg(not(test))]
-        Self::open_body(opts, services)
+        Self::open_body(opts, &cfg, services)
     }
 
     /// Common engine-open body.  Called after the process-wide config has
     /// already been installed by the caller.
     fn open_body(
         opts: StandaloneOptions,
+        cfg: &novarocks_config::NovaRocksConfig,
         services: StandaloneOpenServices,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
-        let metadata_backend = resolve_metadata_backend(&opts)?;
+        let metadata_backend = resolve_metadata_backend(&opts, cfg)?;
         let metadata_provider = metadata_backend
             .as_ref()
             .map(open_metadata_provider)
             .transpose()?;
-        let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
+        let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits(cfg);
+        let mv_partition_state_max_entries = cfg
+            .standalone_server
+            .as_ref()
+            .map(|standalone| standalone.mv_partition_state_max_entries)
+            .unwrap_or(DEFAULT_MV_PARTITION_STATE_MAX_ENTRIES);
         let StandaloneOpenServices {
             execution_role,
             system_catalog,
@@ -1513,6 +1520,7 @@ impl StandaloneNovaRocks {
                 crate::engine::query_planning::catalog_runtime::new_query_catalog_service(),
             ),
             mv_refresh_pruning_limits,
+            mv_partition_state_max_entries,
             metadata_provider: metadata_provider.clone(),
             mv_repository,
             mv_application_service,
@@ -3691,8 +3699,8 @@ struct ResolvedMetadataBackend {
 
 fn resolve_metadata_backend(
     opts: &StandaloneOptions,
+    cfg: &novarocks_config::NovaRocksConfig,
 ) -> Result<Option<ResolvedMetadataBackend>, String> {
-    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
     if let Some(metadata) = cfg.metadata.as_ref() {
         return Ok(Some(ResolvedMetadataBackend {
             provider: metadata.provider,
@@ -3714,16 +3722,19 @@ fn open_metadata_provider(
     }
 }
 
-fn resolve_mv_refresh_pruning_limits() -> Result<MvRefreshPruningLimits, String> {
-    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-    Ok(cfg
-        .standalone_server
+/// Matches the `[standalone_server] mv_partition_state_max_entries` default.
+pub(crate) const DEFAULT_MV_PARTITION_STATE_MAX_ENTRIES: usize = 10_000;
+
+fn resolve_mv_refresh_pruning_limits(
+    cfg: &novarocks_config::NovaRocksConfig,
+) -> MvRefreshPruningLimits {
+    cfg.standalone_server
         .as_ref()
         .map(|config| MvRefreshPruningLimits {
             max_touched_groups: config.mv_refresh_max_touched_groups,
             max_affected_partitions: config.mv_refresh_max_affected_partitions,
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
 }
 
 fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<PathBuf, String> {
@@ -5654,7 +5665,6 @@ pub(crate) struct StandaloneLoopbackTestBackend {
 #[cfg(test)]
 pub(crate) fn install_all_in_one_loopback_backend_for_test() -> StandaloneLoopbackTestBackend {
     let test_guard = acquire_standalone_test_guard();
-    crate::novarocks_config::install_default_for_test();
     StandaloneLoopbackTestBackend {
         exchange_port: in_process_exchange_endpoint_sentinel(),
         _test_guard: test_guard,
@@ -7285,10 +7295,13 @@ path = "meta/catalog.db"
         )
         .expect("write config");
 
-        crate::novarocks_config::init_from_path(&config_path).expect("load config");
-        let backend = super::resolve_metadata_backend(&StandaloneOptions {
-            config_path: Some(config_path.clone()),
-        })
+        let cfg = crate::novarocks_config::load_from_path(&config_path).expect("load config");
+        let backend = super::resolve_metadata_backend(
+            &StandaloneOptions {
+                config_path: Some(config_path.clone()),
+            },
+            &cfg,
+        )
         .expect("resolve backend")
         .expect("metadata backend");
 
@@ -7312,10 +7325,13 @@ mysql_port = 19030
         )
         .expect("write config");
 
-        crate::novarocks_config::init_from_path(&config_path).expect("load config");
-        let backend = super::resolve_metadata_backend(&StandaloneOptions {
-            config_path: Some(config_path.clone()),
-        })
+        let cfg = crate::novarocks_config::load_from_path(&config_path).expect("load config");
+        let backend = super::resolve_metadata_backend(
+            &StandaloneOptions {
+                config_path: Some(config_path.clone()),
+            },
+            &cfg,
+        )
         .expect("resolve backend");
         assert!(backend.is_none());
     }

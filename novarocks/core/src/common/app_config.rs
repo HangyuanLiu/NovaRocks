@@ -17,21 +17,12 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
 
 use novarocks_state_store::config::{
     FoundationDbClientConfig, StateStoreAppConfig, StateStoreProviderConfig,
 };
 
-static CONFIG: OnceLock<RwLock<&'static NovaRocksConfig>> = OnceLock::new();
 pub use crate::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
-
-fn install_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
-    let leaked: &'static NovaRocksConfig = Box::leak(Box::new(cfg));
-    let lock = CONFIG.get_or_init(|| RwLock::new(leaked));
-    *lock.write().expect("novarocks config lock poisoned") = leaked;
-    leaked
-}
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -192,61 +183,40 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
         })
 }
 
-pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig> {
+/// Loads the config at `path`, falling back to built-in defaults when the file
+/// is absent.
+///
+/// The result is a value the caller owns. There is no process-wide active
+/// config: whoever loads the config hands it to the components that need it.
+pub fn load_from_path(path: impl AsRef<Path>) -> Result<NovaRocksConfig> {
     let path = path.as_ref().to_path_buf();
-    let cfg = if !path.exists() {
+    if !path.exists() {
         eprintln!(
             "WARNING: config file '{}' not found, using built-in defaults",
             path.display()
         );
-        NovaRocksConfig::default()
-    } else {
-        NovaRocksConfig::load_from_file(&path)?
-    };
-    Ok(install_config(cfg))
+        return Ok(NovaRocksConfig::default());
+    }
+    NovaRocksConfig::load_from_file(&path)
 }
 
-pub fn init_from_env_or_default() -> Result<&'static NovaRocksConfig> {
-    if let Some(lock) = CONFIG.get() {
-        return Ok(*lock.read().expect("novarocks config lock poisoned"));
-    }
+/// Loads the config named by `NOVAROCKS_CONFIG`, else `./novarocks.toml`, else
+/// the built-in defaults.
+pub fn load_from_env_or_default() -> Result<NovaRocksConfig> {
     if let Ok(p) = std::env::var("NOVAROCKS_CONFIG") {
         let p = p.trim();
         if !p.is_empty() {
-            return init_from_path(PathBuf::from(p));
+            return load_from_path(PathBuf::from(p));
         }
     }
 
     let default_path = PathBuf::from("novarocks.toml");
     if default_path.exists() {
-        let cfg = NovaRocksConfig::load_from_file(&default_path)?;
-        return Ok(install_config(cfg));
+        return NovaRocksConfig::load_from_file(&default_path);
     }
 
     eprintln!("WARNING: config file 'novarocks.toml' not found, using built-in defaults");
-    Ok(install_config(NovaRocksConfig::default()))
-}
-
-/// Install an already-loaded config as the process-wide active config, replacing
-/// any existing global config.  Use this when the caller has already loaded and
-/// validated a [`NovaRocksConfig`] and wants to guarantee that the engine uses
-/// exactly that instance rather than performing a second disk read.
-pub fn install_preloaded_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
-    install_config(cfg)
-}
-
-/// Force-install the built-in default config, replacing any existing global config.
-/// Intended for test setup where each test must start from a known-clean config.
-#[cfg(test)]
-pub fn install_default_for_test() -> &'static NovaRocksConfig {
-    install_config(NovaRocksConfig::default())
-}
-
-pub fn config() -> Result<&'static NovaRocksConfig> {
-    if let Some(lock) = CONFIG.get() {
-        return Ok(*lock.read().expect("novarocks config lock poisoned"));
-    }
-    init_from_env_or_default()
+    Ok(NovaRocksConfig::default())
 }
 
 #[derive(Clone, Deserialize)]
@@ -276,12 +246,6 @@ pub struct NovaRocksConfig {
     pub runtime: RuntimeConfig,
 
     #[serde(default)]
-    pub debug: DebugConfig,
-
-    #[serde(default)]
-    pub jdbc: Option<JdbcConfig>,
-
-    #[serde(default)]
     pub metadata: Option<MetadataConfig>,
 
     #[serde(default)]
@@ -300,9 +264,6 @@ pub struct NovaRocksConfig {
     pub spill: SpillStorageConfig,
 
     #[serde(default)]
-    pub starrocks: StarRocksConfig,
-
-    #[serde(default)]
     pub cluster: ClusterConfig,
 }
 
@@ -310,119 +271,39 @@ impl NovaRocksConfig {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("read config file: {}", path.display()))?;
-        let value: toml::Value =
+        let cfg: NovaRocksConfig =
             toml::from_str(&s).with_context(|| format!("parse toml: {}", path.display()))?;
-        reject_removed_plan_wire_format(&value)?;
-        reject_retired_native_table_config(&value)?;
-        let cfg: NovaRocksConfig = value
-            .try_into()
-            .with_context(|| format!("parse toml: {}", path.display()))?;
         validate_state_store_configuration(&cfg)?;
         validate_query_control_config(&cfg.runtime)?;
-        validate_query_lifecycle_fault_environment(&cfg)?;
-        validate_cleanup_fault_environment(&cfg)?;
+        #[cfg(not(debug_assertions))]
+        reject_fault_injection_environment()?;
         Ok(cfg)
     }
-
-    pub fn jdbc_config(&self) -> Option<&JdbcConfig> {
-        self.jdbc.as_ref()
-    }
 }
 
-fn validate_query_lifecycle_fault_environment(cfg: &NovaRocksConfig) -> Result<()> {
-    let environment =
-        std::env::var_os("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR").map(PathBuf::from);
-    #[cfg(debug_assertions)]
-    {
-        let configured = cfg.debug.query_lifecycle_fault_dir().map(Path::to_path_buf);
-        match (configured, environment) {
-            (None, None) => Ok(()),
-            (Some(configured), Some(environment)) if configured == environment => Ok(()),
-            (Some(configured), Some(environment)) => bail!(
-                "debug.query_lifecycle_fault_dir {} does not match runner-owned environment {}",
-                configured.display(),
-                environment.display()
-            ),
-            (Some(_), None) => bail!(
-                "debug.query_lifecycle_fault_dir requires NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR"
-            ),
-            (None, Some(_)) => bail!(
-                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR requires debug.query_lifecycle_fault_dir"
-            ),
+/// Reject runner-owned fault-injection environment variables in release builds.
+///
+/// The fault hooks themselves read these variables directly (see
+/// `common::query_lifecycle_fault` and `common::cleanup_fault`) and are compiled
+/// out of release builds. Failing startup here keeps a release binary from
+/// silently ignoring an armed fault and letting a cross-process test pass
+/// vacuously.
+#[cfg(not(debug_assertions))]
+fn reject_fault_injection_environment() -> Result<()> {
+    for name in [
+        "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+        "NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR",
+        "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
+        "NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER",
+        "NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER",
+        "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
+        "NOVAROCKS_DEBUG_EXEC_NODE_OUTPUT",
+    ] {
+        if std::env::var_os(name).is_some() {
+            bail!("{name} is only available in debug builds");
         }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = cfg;
-        if environment.is_some() {
-            bail!("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR is only available in debug builds");
-        }
-        Ok(())
-    }
-}
-
-fn validate_cleanup_fault_environment(cfg: &NovaRocksConfig) -> Result<()> {
-    let environment = std::env::var_os("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR").map(PathBuf::from);
-    #[cfg(debug_assertions)]
-    {
-        let configured = cfg.debug.cleanup_fault_dir().map(Path::to_path_buf);
-        match (configured, environment) {
-            (None, None) => Ok(()),
-            (Some(configured), Some(environment)) if configured == environment => Ok(()),
-            (Some(configured), Some(environment)) => bail!(
-                "debug.cleanup_fault_dir {} does not match runner-owned environment {}",
-                configured.display(),
-                environment.display()
-            ),
-            (Some(_), None) => {
-                bail!("debug.cleanup_fault_dir requires NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR")
-            }
-            (None, Some(_)) => {
-                bail!("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR requires debug.cleanup_fault_dir")
-            }
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = cfg;
-        if environment.is_some() {
-            bail!("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR is only available in debug builds");
-        }
-        Ok(())
-    }
-}
-
-fn reject_removed_plan_wire_format(value: &toml::Value) -> Result<()> {
-    let has_removed_key = value
-        .get("runtime")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|runtime| runtime.contains_key("plan_wire_format"));
-    if has_removed_key {
-        bail!(
-            "runtime.plan_wire_format has been removed; NovaRocks-generated plans always use native Proto"
-        );
     }
     Ok(())
-}
-
-fn reject_retired_native_table_config(value: &toml::Value) -> Result<()> {
-    let Some(standalone) = value
-        .get("standalone_server")
-        .and_then(toml::Value::as_table)
-    else {
-        return Ok(());
-    };
-    let retired = ["warehouse_uri", "object_store", "mv_default_storage_engine"]
-        .into_iter()
-        .filter(|key| standalone.contains_key(*key))
-        .collect::<Vec<_>>();
-    if retired.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "retired native table configuration under [standalone_server]: {}; native persistent tables must be external Iceberg catalog tables, and shared object-store credentials belong under [connector.object_store]",
-        retired.join(", ")
-    );
 }
 
 impl Default for NovaRocksConfig {
@@ -435,15 +316,12 @@ impl Default for NovaRocksConfig {
             sys_log_roll_num: default_sys_log_roll_num(),
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
-            debug: DebugConfig::default(),
-            jdbc: None,
             metadata: None,
             state_store: None,
             foundationdb_client: None,
             standalone_server: None,
             connector: ConnectorConfig::default(),
             spill: SpillStorageConfig::default(),
-            starrocks: StarRocksConfig::default(),
             cluster: ClusterConfig::default(),
         }
     }
@@ -547,22 +425,32 @@ pub struct ConnectorConfig {
 }
 
 impl ConnectorConfig {
+    /// Project the `[connector.object_store]` credentials onto a neutral
+    /// filesystem config, filling unset retry knobs from `retry`.
+    ///
+    /// The retry defaults arrive as an argument rather than being read from a
+    /// process-global config, so that `novarocks-fs` owns no configuration
+    /// source of its own.
     pub fn object_store_config(
         &self,
+        retry: &novarocks_fs::ObjectStoreRetrySettings,
     ) -> std::result::Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
         let Some(object_store) = self.object_store.as_ref() else {
             return Ok(None);
         };
-        let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::ConnectorStartupConfig,
+        let credentials = novarocks_fs::ObjectStoreCredentials::from_parts(
+            novarocks_fs::ObjectStoreCredentialsSource::ConnectorStartupConfig,
             object_store.endpoint.as_deref().unwrap_or_default(),
             object_store.access_key_id.as_deref().unwrap_or_default(),
-            object_store.access_key_secret.as_deref().unwrap_or_default(),
+            object_store
+                .access_key_secret
+                .as_deref()
+                .unwrap_or_default(),
             object_store.region.as_deref(),
             object_store.enable_path_style_access,
         )?;
         let mut config = credentials.to_object_store_config();
-        crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
+        retry.apply_if_absent(&mut config);
         Ok(Some(config))
     }
 }
@@ -854,6 +742,19 @@ pub struct ObjectStorageConfig {
     pub retry_log_first_n: u32,
 }
 
+impl ObjectStorageConfig {
+    /// The retry knobs this section contributes to filesystem resources.
+    pub fn retry_settings(&self) -> novarocks_fs::ObjectStoreRetrySettings {
+        novarocks_fs::ObjectStoreRetrySettings {
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct SpillStorageConfig {
     #[serde(default = "default_spill_enable")]
@@ -892,53 +793,6 @@ impl Default for SpillStorageConfig {
             dir_max_bytes: default_spill_dir_max_bytes(),
             block_size_bytes: default_spill_block_size_bytes(),
             ipc_compression: default_spill_ipc_compression(),
-        }
-    }
-}
-
-#[derive(Clone, Deserialize)]
-pub struct StarRocksConfig {
-    #[serde(default)]
-    pub fe_http_endpoint: Option<String>,
-    #[serde(default = "default_fe_catalog")]
-    pub fe_catalog: String,
-    #[serde(default)]
-    pub auth_mode: Option<String>,
-    #[serde(default)]
-    pub basic_user: Option<String>,
-    #[serde(default)]
-    pub basic_password: Option<String>,
-    #[serde(default)]
-    pub auth_token: Option<String>,
-    #[serde(default = "default_starrocks_meta_cache_ttl_ms")]
-    pub meta_cache_ttl_ms: u64,
-    #[serde(default = "default_starrocks_lake_data_write_format")]
-    pub lake_data_write_format: String,
-}
-
-fn default_fe_catalog() -> String {
-    "default_catalog".to_string()
-}
-
-fn default_starrocks_meta_cache_ttl_ms() -> u64 {
-    0
-}
-
-fn default_starrocks_lake_data_write_format() -> String {
-    "native".to_string()
-}
-
-impl Default for StarRocksConfig {
-    fn default() -> Self {
-        Self {
-            fe_http_endpoint: None,
-            fe_catalog: default_fe_catalog(),
-            auth_mode: None,
-            basic_user: None,
-            basic_password: None,
-            auth_token: None,
-            meta_cache_ttl_ms: default_starrocks_meta_cache_ttl_ms(),
-            lake_data_write_format: default_starrocks_lake_data_write_format(),
         }
     }
 }
@@ -1684,190 +1538,6 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct DebugConfig {
-    pub exec_node_output: bool,
-    #[cfg(debug_assertions)]
-    pub fault_inject_fetch_not_ready_count: Option<usize>,
-    #[cfg(debug_assertions)]
-    pub emit_cancel_marker: bool,
-    #[cfg(debug_assertions)]
-    pub emit_grpc_fragment_marker: bool,
-    #[cfg(debug_assertions)]
-    pub query_lifecycle_fault_dir: Option<PathBuf>,
-    #[cfg(debug_assertions)]
-    pub cleanup_fault_dir: Option<PathBuf>,
-    #[cfg(debug_assertions)]
-    pub emit_connector_reader_marker: bool,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct DebugConfigToml {
-    exec_node_output: bool,
-    fault_inject_fetch_not_ready_count: Option<usize>,
-    emit_cancel_marker: bool,
-    emit_grpc_fragment_marker: bool,
-    query_lifecycle_fault_dir: Option<PathBuf>,
-    cleanup_fault_dir: Option<PathBuf>,
-    emit_connector_reader_marker: bool,
-}
-
-#[cfg(not(debug_assertions))]
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct DebugConfigToml {
-    exec_node_output: bool,
-    fault_inject_fetch_not_ready_count: Option<usize>,
-    emit_cancel_marker: Option<bool>,
-    emit_grpc_fragment_marker: Option<bool>,
-    query_lifecycle_fault_dir: Option<PathBuf>,
-    cleanup_fault_dir: Option<PathBuf>,
-    emit_connector_reader_marker: Option<bool>,
-}
-
-impl<'de> Deserialize<'de> for DebugConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = DebugConfigToml::deserialize(deserializer)?;
-        #[cfg(debug_assertions)]
-        {
-            Ok(Self {
-                exec_node_output: raw.exec_node_output,
-                fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
-                emit_cancel_marker: raw.emit_cancel_marker,
-                emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
-                query_lifecycle_fault_dir: raw.query_lifecycle_fault_dir,
-                cleanup_fault_dir: raw.cleanup_fault_dir,
-                emit_connector_reader_marker: raw.emit_connector_reader_marker,
-            })
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            if raw.fault_inject_fetch_not_ready_count.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.fault_inject_fetch_not_ready_count is only available in debug builds",
-                ));
-            }
-            if raw.emit_cancel_marker.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.emit_cancel_marker is only available in debug builds",
-                ));
-            }
-            if raw.emit_grpc_fragment_marker.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.emit_grpc_fragment_marker is only available in debug builds",
-                ));
-            }
-            if raw.query_lifecycle_fault_dir.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.query_lifecycle_fault_dir is only available in debug builds",
-                ));
-            }
-            if raw.cleanup_fault_dir.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.cleanup_fault_dir is only available in debug builds",
-                ));
-            }
-            if raw.emit_connector_reader_marker.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.emit_connector_reader_marker is only available in debug builds",
-                ));
-            }
-            Ok(Self {
-                exec_node_output: raw.exec_node_output,
-            })
-        }
-    }
-}
-
-impl DebugConfig {
-    #[cfg(debug_assertions)]
-    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
-        self.fault_inject_fetch_not_ready_count
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
-        None
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn emit_cancel_marker(&self) -> bool {
-        self.emit_cancel_marker
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn emit_cancel_marker(&self) -> bool {
-        false
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn emit_grpc_fragment_marker(&self) -> bool {
-        self.emit_grpc_fragment_marker
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn emit_grpc_fragment_marker(&self) -> bool {
-        false
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
-        self.query_lifecycle_fault_dir.as_deref()
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn cleanup_fault_dir(&self) -> Option<&Path> {
-        self.cleanup_fault_dir.as_deref()
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn cleanup_fault_dir(&self) -> Option<&Path> {
-        None
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
-        None
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn emit_connector_reader_marker(&self) -> bool {
-        self.emit_connector_reader_marker
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn emit_connector_reader_marker(&self) -> bool {
-        false
-    }
-}
-
-#[derive(Clone, Deserialize)]
-pub struct JdbcConfig {
-    pub url: String,
-    #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-    #[serde(default)]
-    pub default_db: Option<String>,
-}
-
-impl std::fmt::Debug for JdbcConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JdbcConfig")
-            .field("url", &self.url)
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "***"))
-            .field("default_db", &self.default_db)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2258,96 +1928,6 @@ mysql_port = 19030
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    fn test_debug_fault_injection_knobs_parse_in_debug_builds() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[debug]
-fault_inject_fetch_not_ready_count = 2
-emit_cancel_marker = true
-emit_grpc_fragment_marker = true
-query_lifecycle_fault_dir = "/tmp/runner-owned-query-lifecycle-faults"
-emit_connector_reader_marker = true
-"#,
-        )
-        .expect("parse config");
-        assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
-        assert!(cfg.debug.emit_cancel_marker);
-        assert!(cfg.debug.emit_grpc_fragment_marker);
-        assert_eq!(
-            cfg.debug.query_lifecycle_fault_dir.as_deref(),
-            Some(std::path::Path::new(
-                "/tmp/runner-owned-query-lifecycle-faults"
-            ))
-        );
-        assert!(cfg.debug.emit_connector_reader_marker);
-    }
-
-    #[test]
-    #[cfg(not(debug_assertions))]
-    fn test_debug_fault_injection_knobs_are_rejected_in_release_builds() {
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-emit_cancel_marker = false
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject emit_cancel_marker knob"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("emit_cancel_marker"),
-            "unexpected parse error: {err}"
-        );
-
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-query_lifecycle_fault_dir = "/tmp/not-allowed"
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject query lifecycle fault hooks"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("query_lifecycle_fault_dir"),
-            "unexpected parse error: {err}"
-        );
-
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-emit_grpc_fragment_marker = false
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject emit_grpc_fragment_marker knob"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("emit_grpc_fragment_marker"),
-            "unexpected parse error: {err}"
-        );
-
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-emit_connector_reader_marker = false
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject emit_connector_reader_marker knob"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("emit_connector_reader_marker"),
-            "unexpected parse error: {err}"
-        );
-    }
-
-    #[test]
     fn test_runtime_olap_sink_threshold_defaults() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
@@ -2376,71 +1956,6 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         assert_eq!(
             cfg.runtime.olap_sink_max_tablet_write_chunk_bytes,
             67_108_864
-        );
-    }
-
-    fn assert_removed_plan_wire_format_is_rejected(value: &str) {
-        let path = std::env::temp_dir().join(format!(
-            "novarocks-removed-plan-wire-format-{}-{value}.toml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            format!("[runtime]\nplan_wire_format = \"{value}\"\n"),
-        )
-        .expect("write config fixture");
-
-        let result = NovaRocksConfig::load_from_file(&path);
-        std::fs::remove_file(&path).expect("remove config fixture");
-        let err = match result {
-            Ok(_) => panic!("removed runtime.plan_wire_format={value} must be rejected"),
-            Err(err) => err,
-        };
-
-        assert_eq!(
-            err.to_string(),
-            "runtime.plan_wire_format has been removed; NovaRocks-generated plans always use native Proto"
-        );
-    }
-
-    #[test]
-    fn test_load_from_file_rejects_removed_proto_plan_wire_format() {
-        assert_removed_plan_wire_format_is_rejected("proto");
-    }
-
-    #[test]
-    fn test_load_from_file_rejects_removed_thrift_plan_wire_format() {
-        assert_removed_plan_wire_format_is_rejected("thrift");
-    }
-
-    #[test]
-    fn test_load_from_file_rejects_retired_native_table_config() {
-        let path = std::env::temp_dir().join(format!(
-            "novarocks-retired-native-table-config-{}.toml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            r#"
-[standalone_server]
-warehouse_uri = "s3://novarocks/internal"
-mv_default_storage_engine = "starrocks"
-
-[standalone_server.object_store]
-endpoint = "http://127.0.0.1:9000"
-"#,
-        )
-        .expect("write config fixture");
-
-        let result = NovaRocksConfig::load_from_file(&path);
-        std::fs::remove_file(&path).expect("remove config fixture");
-        let err = match result {
-            Ok(_) => panic!("retired native table keys must fail config loading"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.to_string(),
-            "retired native table configuration under [standalone_server]: warehouse_uri, object_store, mv_default_storage_engine; native persistent tables must be external Iceberg catalog tables, and shared object-store credentials belong under [connector.object_store]"
         );
     }
 

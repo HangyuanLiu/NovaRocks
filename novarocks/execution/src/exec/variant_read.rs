@@ -33,41 +33,39 @@ use parquet::variant::{
     GetOptions, VariantArray, unshred_variant, variant_get as kernel_variant_get,
 };
 
-use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
 use novarocks_types::SlotId;
+use novarocks_types::value::variant::is_variant_struct_data_type;
 use novarocks_types::value::variant::{
     VariantMetadata, VariantPathSegment, VariantValue, parse_variant_path, split_serialized,
 };
 
-fn is_binary_like(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-    )
+/// Wire-decoded description of one variant-path extraction.
+#[derive(Clone, Debug)]
+pub struct VariantPathSpec {
+    pub source_slot_id: SlotId,
+    pub source_read_slot_id: SlotId,
+    pub output_slot_id: SlotId,
+    pub source_field_id: Option<i32>,
+    pub source_name: String,
+    pub output_name: String,
+    pub source_field: Field,
+    pub output_field: Field,
+    pub canonical_path: String,
+    pub requested_type: DataType,
+    pub strict: bool,
 }
 
-/// True when `data_type` is a parquet variant struct layout we can collapse:
-/// a `metadata` binary child plus at least one of `value` (binary) /
-/// `typed_value` (shredded subtree). Any other child name disqualifies.
-pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
-    let DataType::Struct(fields) = data_type else {
-        return false;
-    };
-    if fields.is_empty() {
-        return false;
+/// Whether a projected parquet slot carries a variant column or a regular one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParquetSlotKind {
+    Regular,
+    Variant,
+}
+
+impl ParquetSlotKind {
+    pub fn is_variant(self) -> bool {
+        self == Self::Variant
     }
-    let mut has_metadata = false;
-    let mut has_value = false;
-    let mut has_typed_value = false;
-    for f in fields {
-        match f.name().as_str() {
-            "metadata" if is_binary_like(f.data_type()) => has_metadata = true,
-            "value" if is_binary_like(f.data_type()) => has_value = true,
-            "typed_value" => has_typed_value = true,
-            _ => return false,
-        }
-    }
-    has_metadata && (has_value || has_typed_value)
 }
 
 fn binary_value_at_any(arr: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String> {
@@ -611,11 +609,9 @@ mod tests {
     use parquet::variant::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     use super::{ParquetSlotKind, VariantPathSpec};
-    use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-    use novarocks_execution::exec::expr::function::variant::{
-        eval_try_variant_get, eval_variant_get,
-    };
-    use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::function::variant::{eval_try_variant_get, eval_variant_get};
+    use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
     use novarocks_types::SlotId;
     use novarocks_types::value::variant::{
         parse_variant_path, variant_query, variant_to_i64, variant_to_string,

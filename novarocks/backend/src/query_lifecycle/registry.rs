@@ -3341,10 +3341,7 @@ fn format_execution_id(execution_id: QueryExecutionId) -> String {
 
 #[cfg(debug_assertions)]
 pub(super) fn query_lifecycle_test_markers_enabled() -> bool {
-    novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-        .is_some()
+    novarocks::common::query_lifecycle_fault::configured_root().is_some()
 }
 
 #[cfg(not(debug_assertions))]

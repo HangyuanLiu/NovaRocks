@@ -21,7 +21,6 @@ use super::common::parse_optional_nonnegative_i64;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::common::config::exchange_wait_ms;
 use novarocks::protocol::common::error::FieldPath;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
@@ -75,7 +74,7 @@ pub(super) fn lower_exchange_receiver(
         node: ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
                 node.node_id,
-                Duration::from_millis(exchange_wait_ms()),
+                ctx.exchange_wait(),
                 output_schema.clone(),
             )),
         },

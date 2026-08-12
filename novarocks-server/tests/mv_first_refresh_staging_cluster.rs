@@ -147,14 +147,10 @@ grpc_port = {}
 
 [cluster]
 role = "be"
-
-[debug]
-query_lifecycle_fault_dir = "{}"
 "#,
                     root.path().join(format!("be-{index}")).display(),
                     http.port,
                     grpc.port,
-                    query_lifecycle_fault_dir.display(),
                 ),
             )
             .expect("write backend config");
@@ -383,9 +379,6 @@ provider = "sqlite"
 path = "{}"
 cluster_id = "mvx2w-native-staging"
 deployment_owner = "fe-1"
-
-[debug]
-query_lifecycle_fault_dir = "{}"
 "#,
             fe_http_port,
             fe_grpc_port,
@@ -393,7 +386,6 @@ query_lifecycle_fault_dir = "{}"
             backend_list,
             metadata_path.display(),
             state_path.display(),
-            query_lifecycle_fault_dir.path().display(),
         ),
     )
     .expect("write frontend config");

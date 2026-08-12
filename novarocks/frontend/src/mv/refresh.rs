@@ -776,10 +776,7 @@ fn sha256(payload: &[u8]) -> [u8; 32] {
 fn recovery_phase_barrier(phase: &str) -> Result<(), MvApplicationError> {
     use std::time::{Duration, Instant};
 
-    let Some(root) = novarocks::common::app_config::config()
-        .ok()
-        .and_then(|config| config.debug.query_lifecycle_fault_dir())
-    else {
+    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     let path = root.join(format!("mv-refresh-at-{phase}.trigger"));

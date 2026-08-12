@@ -25,7 +25,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks::cache::CacheOptions;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -93,6 +92,7 @@ impl NativeFragmentRequest {
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
         connectors: Arc<ConnectorRegistry>,
+        exchange_wait: std::time::Duration,
     ) -> Result<Self, NativeFragmentIngressError> {
         Self::try_decode_with_execution_resolver(
             execution_id,
@@ -101,6 +101,7 @@ impl NativeFragmentRequest {
             connectors,
             Arc::new(MissingExecutionResolver),
             Arc::new(NeverCancelled),
+            exchange_wait,
         )
     }
 
@@ -111,6 +112,7 @@ impl NativeFragmentRequest {
         connectors: Arc<ConnectorRegistry>,
         execution_resolver: Arc<dyn ConnectorExecutionResolver>,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
+        exchange_wait: std::time::Duration,
     ) -> Result<Self, NativeFragmentIngressError> {
         let instance = decode_instance_params(&instance_params)?;
         let decoded = decode_fragment_submission(
@@ -120,6 +122,7 @@ impl NativeFragmentRequest {
             connectors,
             execution_resolver,
             connector_cancellation,
+            exchange_wait,
         )
         .map_err(NativeFragmentIngressError::new)?;
         let (submission, backend_num) = decoded.into_parts();
@@ -159,10 +162,6 @@ impl NativeFragmentRequest {
         novarocks_execution::runtime::query_options::query_expire_durations(Some(
             self.query_options(),
         ))
-    }
-    pub(crate) fn cache_options(&self) -> Result<CacheOptions, NativeFragmentIngressError> {
-        CacheOptions::from_query_options(Some(self.query_options()))
-            .map_err(NativeFragmentIngressError::new)
     }
     pub(crate) fn has_runtime_filter_bindings(&self) -> bool {
         self.submission.program().runtime_filters().has_bindings()

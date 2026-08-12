@@ -22,6 +22,24 @@ mod context;
 mod op;
 
 pub(crate) use be_tablet_write_log_store::BeTabletWriteLoadLogRecord;
+
+/// Install the BE-local store policies resolved from `[runtime]`.
+///
+/// Called once by the Backend application during startup so these stores stop
+/// reading a process-global configuration on every access.
+pub fn install_be_store_settings(
+    enable_tablet_write_log: bool,
+    tablet_write_log_buffer_size: usize,
+    be_txn_info_history_size: usize,
+) {
+    be_tablet_write_log_store::install_settings(
+        be_tablet_write_log_store::BeTabletWriteLogSettings {
+            enable: enable_tablet_write_log,
+            buffer_size: tablet_write_log_buffer_size,
+        },
+    );
+    be_txn_store::install_history_size(be_txn_info_history_size);
+}
 pub(crate) use be_txn_store::BeTxnActiveRecord;
 pub use chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
 

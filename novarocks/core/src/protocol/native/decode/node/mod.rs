@@ -91,6 +91,9 @@ pub(crate) struct NativePlanDecodeContext {
     output_layout_decoder: Option<Arc<dyn NativeOutputLayoutDecoder>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
+    /// Exchange-source wait resolved from `[runtime]`; the production decoder in
+    /// `novarocks-backend` receives the same value from `ExecutionRuntime`.
+    exchange_wait: std::time::Duration,
 }
 
 impl Default for NativePlanDecodeContext {
@@ -106,6 +109,7 @@ impl Default for NativePlanDecodeContext {
             output_layout_decoder: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
+            exchange_wait: std::time::Duration::from_millis(120_000),
         }
     }
 }
@@ -128,6 +132,9 @@ impl NativePlanDecodeContext {
             execution_resolver: None,
             expression_decoder: None,
             output_layout_decoder: None,
+            // This whole decoder is `#[cfg(test)]`; the production decoder in
+            // `novarocks-backend` receives the configured value from `ExecutionRuntime`.
+            exchange_wait: std::time::Duration::from_millis(120_000),
             query_id: Some(query_id),
             fragment_instance_id,
         }
@@ -321,6 +328,10 @@ impl NativePlanDecodeContext {
 
     pub(crate) fn query_id(&self) -> Option<QueryId> {
         self.query_id
+    }
+
+    pub(crate) fn exchange_wait(&self) -> std::time::Duration {
+        self.exchange_wait
     }
 
     pub(crate) fn fragment_instance_id(&self) -> FragmentInstanceId {

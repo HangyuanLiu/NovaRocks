@@ -128,11 +128,32 @@ impl ProcessGuard {
         Self::spawn_with_backend_index(config_path, None)
     }
 
-    fn spawn_backend(config_path: &Path, backend_index: usize) -> Self {
-        Self::spawn_with_backend_index(config_path, Some(backend_index))
+    /// Spawn with runner-owned debug switches exported to the child.
+    ///
+    /// The debug and fault-injection knobs live in the process environment
+    /// rather than the config file, so a test that wants a marker sets the
+    /// variable on the process it launches.
+    fn spawn_with_debug_env(config_path: &Path, debug_env: &[(&str, &str)]) -> Self {
+        Self::spawn_inner(config_path, None, debug_env)
+    }
+
+    fn spawn_backend_with_debug_env(
+        config_path: &Path,
+        backend_index: usize,
+        debug_env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn_inner(config_path, Some(backend_index), debug_env)
     }
 
     fn spawn_with_backend_index(config_path: &Path, backend_index: Option<usize>) -> Self {
+        Self::spawn_inner(config_path, backend_index, &[])
+    }
+
+    fn spawn_inner(
+        config_path: &Path,
+        backend_index: Option<usize>,
+        debug_env: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
         command
             .arg("standalone")
@@ -140,6 +161,9 @@ impl ProcessGuard {
             .arg(config_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in debug_env {
+            command.env(name, value);
+        }
         if let Some(backend_index) = backend_index {
             command.env(
                 "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
@@ -323,7 +347,7 @@ fn connect_mysql(port: u16) -> MysqlConn {
     }
 }
 
-fn start_all_in_one(extra: &str) -> (ProcessGuard, u16) {
+fn start_all_in_one_with_debug_env(extra: &str, debug_env: &[(&str, &str)]) -> (ProcessGuard, u16) {
     let mysql = ReservedPort::new();
     let http = ReservedPort::new();
     let grpc = ReservedPort::new();
@@ -352,7 +376,7 @@ role = "all-in-one"
     let _ = mysql.release();
     let _ = http.release();
     let _ = grpc.release();
-    let mut process = ProcessGuard::spawn(config.path());
+    let mut process = ProcessGuard::spawn_with_debug_env(config.path(), debug_env);
     process.wait_for_ready("NOVAROCKS_READY mysql_port=");
     (process, mysql_port)
 }
@@ -367,6 +391,10 @@ struct ClusterHarness {
 
 impl ClusterHarness {
     fn start(be_debug: &str, fe_extra: &str) -> Self {
+        Self::start_with_debug_env(be_debug, &[], fe_extra)
+    }
+
+    fn start_with_debug_env(be_debug: &str, be_debug_env: &[(&str, &str)], fe_extra: &str) -> Self {
         let be_http = ReservedPort::new();
         let be_grpc = ReservedPort::new();
         let fe_mysql = ReservedPort::new();
@@ -427,7 +455,7 @@ deployment_owner = "fe-1"
 
         let _ = be_http.release();
         let _ = be_grpc.release();
-        let mut be = ProcessGuard::spawn(be_config.path());
+        let mut be = ProcessGuard::spawn_with_debug_env(be_config.path(), be_debug_env);
         be.wait_for_ready("NOVAROCKS_READY role=be");
 
         let _ = fe_mysql.release();
@@ -462,24 +490,41 @@ struct MultiBeClusterHarness {
 
 impl MultiBeClusterHarness {
     fn start_n_be(n: usize, be_debug: &str, fe_extra: &str) -> Self {
+        Self::start_n_be_with_debug_env(n, be_debug, &[], fe_extra)
+    }
+
+    fn start_n_be_with_debug_env(
+        n: usize,
+        be_debug: &str,
+        be_debug_env: &[(&str, &str)],
+        fe_extra: &str,
+    ) -> Self {
         // Callers that explicitly exercise StateStore lifecycle supply their
         // own durable backend; do not render a duplicate TOML table for them.
-        Self::start_n_be_with_options(n, be_debug, fe_extra, !fe_extra.contains("[state_store]"))
+        Self::start_n_be_with_options(
+            n,
+            be_debug,
+            be_debug_env,
+            fe_extra,
+            !fe_extra.contains("[state_store]"),
+        )
     }
 
     fn start_n_be_without_state_store(n: usize, be_debug: &str, fe_extra: &str) -> Self {
-        Self::start_n_be_with_options(n, be_debug, fe_extra, false)
+        Self::start_n_be_with_options(n, be_debug, &[], fe_extra, false)
     }
 
     fn start_n_be_with_options(
         n: usize,
         be_debug: &str,
+        be_debug_env: &[(&str, &str)],
         fe_extra: &str,
         default_state_store: bool,
     ) -> Self {
         Self::start_n_be_with_options_and_standalone_extra(
             n,
             be_debug,
+            be_debug_env,
             fe_extra,
             default_state_store,
             "",
@@ -489,6 +534,7 @@ impl MultiBeClusterHarness {
     fn start_n_be_with_options_and_standalone_extra(
         n: usize,
         be_debug: &str,
+        be_debug_env: &[(&str, &str)],
         fe_extra: &str,
         default_state_store: bool,
         standalone_server_extra: &str,
@@ -605,7 +651,11 @@ backends = [{backends_list}]
         for (i, port_set) in be_port_sets.drain(..).enumerate() {
             let _ = port_set.http.release();
             let _ = port_set.grpc.release();
-            bes.push(ProcessGuard::spawn_backend(be_configs[i].path(), i));
+            bes.push(ProcessGuard::spawn_backend_with_debug_env(
+                be_configs[i].path(),
+                i,
+                be_debug_env,
+            ));
         }
         for be in &mut bes {
             be.wait_for_ready("NOVAROCKS_READY role=be");
@@ -657,7 +707,7 @@ deployment_owner = "fe-1"
 "#,
             state_store_path.display()
         );
-        Self::start_n_be_with_options(3, "", &state_store_config, false)
+        Self::start_n_be_with_options(3, "", &[], &state_store_config, false)
     }
 
     fn start_three_be_sqlite_state_store_with_metadata(
@@ -669,6 +719,7 @@ deployment_owner = "fe-1"
             state_store_path,
             metadata_path,
             cluster_id,
+            &[],
             "",
         )
     }
@@ -677,6 +728,7 @@ deployment_owner = "fe-1"
         state_store_path: &Path,
         metadata_path: &Path,
         cluster_id: &str,
+        be_debug_env: &[(&str, &str)],
         be_extra: &str,
     ) -> Self {
         Self::start_three_be_sqlite_state_store_with_metadata_and_extras(
@@ -684,6 +736,7 @@ deployment_owner = "fe-1"
             metadata_path,
             cluster_id,
             be_extra,
+            be_debug_env,
             "",
         )
     }
@@ -693,6 +746,7 @@ deployment_owner = "fe-1"
         metadata_path: &Path,
         cluster_id: &str,
         be_extra: &str,
+        be_debug_env: &[(&str, &str)],
         frontend_extra: &str,
     ) -> Self {
         assert!(
@@ -723,6 +777,7 @@ deployment_owner = "fe-1"
         Self::start_n_be_with_options_and_standalone_extra(
             3,
             be_extra,
+            be_debug_env,
             &fe_extra,
             false,
             frontend_extra,
@@ -735,13 +790,10 @@ deployment_owner = "fe-1"
         cluster_id: &str,
         fault_dir: &Path,
     ) -> Self {
-        let debug = format!(
-            r#"
-[debug]
-query_lifecycle_fault_dir = "{}"
-"#,
-            fault_dir.display()
-        );
+        // Fault injection is armed through NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR;
+        // the process config carries no fault-injection key.
+        let _ = fault_dir;
+        let debug = String::new();
         let fe_extra = format!(
             r#"
 [metadata]
@@ -759,7 +811,7 @@ deployment_owner = "fe-1"
             metadata_path.display(),
             state_store_path.display(),
         );
-        Self::start_n_be_with_options(3, &debug, &fe_extra, false)
+        Self::start_n_be_with_options(3, &debug, &[], &fe_extra, false)
     }
 
     fn fe_mysql_port(&self) -> u16 {
@@ -1282,11 +1334,9 @@ fn all_in_one_loopback_stage_start_select_succeeds() {
     }
     let _lock = lock_cluster_mvp();
 
-    let (mut srv, mysql_port) = start_all_in_one(
-        r#"
-[debug]
-emit_grpc_fragment_marker = true
-"#,
+    let (mut srv, mysql_port) = start_all_in_one_with_debug_env(
+        "",
+        &[("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1")],
     );
     let mut conn = connect_mysql(mysql_port);
     let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
@@ -1616,12 +1666,12 @@ fn cross_process_three_be_connector_read_distributes_splits_and_cancels() {
             &fixture_dir.path().join("frontend-state.sqlite"),
             &fixture_dir.path().join("frontend-metadata.sqlite"),
             "connector-cancellation",
+            &[
+                ("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1"),
+                ("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1"),
+                ("NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER", "1"),
+            ],
             r#"
-[debug]
-emit_grpc_fragment_marker = true
-emit_connector_reader_marker = true
-emit_cancel_marker = true
-
 [runtime]
 operator_buffer_chunks = 1
 "#,
@@ -1777,12 +1827,10 @@ path = "{}"
 "#,
         metadata_dir.path().join("catalog.db").display()
     );
-    let mut cluster = MultiBeClusterHarness::start_n_be(
+    let mut cluster = MultiBeClusterHarness::start_n_be_with_debug_env(
         3,
-        r#"
-[debug]
-emit_connector_reader_marker = true
-"#,
+        "",
+        &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
         &metadata_config,
     );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create catalog mutation warehouse");
@@ -1883,12 +1931,10 @@ path = "{}"
 "#,
         metadata_dir.path().join("catalog.db").display()
     );
-    let mut cluster = MultiBeClusterHarness::start_n_be(
+    let mut cluster = MultiBeClusterHarness::start_n_be_with_debug_env(
         3,
-        r#"
-[debug]
-emit_connector_reader_marker = true
-"#,
+        "",
+        &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
         &metadata_config,
     );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create static-pruning warehouse");
@@ -2033,10 +2079,8 @@ fn cross_process_three_be_connector_read_applies_deletion_vectors() {
             &fixture_dir.path().join("frontend-state.sqlite"),
             &fixture_dir.path().join("frontend-metadata.sqlite"),
             "connector-deletion-vectors",
-            r#"
-[debug]
-emit_connector_reader_marker = true
-"#,
+            &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
+            "",
         );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create DV warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -2124,10 +2168,8 @@ fn cross_process_three_be_connector_generation_replacement_drains_old_readers() 
             &fixture_dir.path().join("frontend-state.sqlite"),
             &fixture_dir.path().join("frontend-metadata.sqlite"),
             "connector-generation",
+            &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
             r#"
-[debug]
-emit_connector_reader_marker = true
-
 [runtime]
 operator_buffer_chunks = 1
 "#,
@@ -2273,11 +2315,12 @@ fn be_kill9_during_query_fails_cleanly() {
     }
     let _lock = lock_cluster_mvp();
 
-    let cluster = ClusterHarness::start(
-        r#"
-[debug]
-fault_inject_fetch_not_ready_count = 1000
-"#,
+    let cluster = ClusterHarness::start_with_debug_env(
+        "",
+        &[(
+            "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
+            "1000",
+        )],
         "",
     );
 
@@ -2828,6 +2871,7 @@ enable_path_style_access = true
             &metadata_path,
             cluster_id,
             &be_object_store,
+            &[],
             &be_object_store,
         );
 
@@ -3190,6 +3234,7 @@ enable_path_style_access = true
             &metadata_path,
             cluster_id,
             &be_object_store,
+            &[],
             &be_object_store,
         );
 
@@ -3324,6 +3369,7 @@ enable_path_style_access = true
             &metadata_path,
             cluster_id,
             &be_object_store,
+            &[],
             &be_object_store,
         );
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -4011,6 +4057,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1_000
             &metadata_path,
             "mvx4-scheduler",
             "",
+            &[],
             scheduler_config,
         );
     let diagnostics = cluster.log_diagnostics();
@@ -4121,6 +4168,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1_000
             &metadata_path,
             "mvx4-shutdown-recovery",
             "",
+            &[],
             scheduler_config,
         );
     let diagnostics = cluster.log_diagnostics();

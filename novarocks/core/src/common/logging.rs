@@ -31,9 +31,11 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Registry, fmt as tracing_fmt};
 
-use crate::novarocks_config;
-
 static INIT: OnceLock<()> = OnceLock::new();
+/// The settings logging actually resolved, so readers of the log files (the
+/// `be_logs` system table) report the files that were really opened instead of
+/// re-deriving the same fallback chain from a process-global config.
+static ACTIVE: OnceLock<LogSettings> = OnceLock::new();
 
 const DEFAULT_BASENAME: &str = "novarocks";
 const DEFAULT_LOG_DIR: &str = "log";
@@ -149,9 +151,31 @@ impl SeverityFile {
     }
 }
 
+/// The `[server]` log-file settings, supplied by whoever initializes logging.
+///
+/// Logging is initialized by the composition root, which already holds the
+/// loaded config, so these arrive as values instead of being read back out of a
+/// process-global. `NOVAROCKS_LOG_DIR` / `LOG_DIR` / `NOVAROCKS_LOG_ROLL_*`
+/// still win, because the launching environment owns them.
+#[derive(Clone, Debug)]
+pub struct LogFileSettings {
+    pub dir: String,
+    pub roll_mode: String,
+    pub roll_num: usize,
+}
+
+impl Default for LogFileSettings {
+    fn default() -> Self {
+        Self {
+            dir: DEFAULT_LOG_DIR.to_string(),
+            roll_mode: DEFAULT_ROLL_MODE.to_string(),
+            roll_num: DEFAULT_ROLL_NUM,
+        }
+    }
+}
+
 impl LogSettings {
-    fn from_config_and_env() -> Self {
-        let cfg = novarocks_config::config().ok();
+    fn from_files_and_env(files: &LogFileSettings) -> Self {
         let dir = std::env::var("NOVAROCKS_LOG_DIR")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -160,8 +184,7 @@ impl LogSettings {
                     .ok()
                     .filter(|v| !v.trim().is_empty())
             })
-            .or_else(|| cfg.as_ref().map(|c| c.sys_log_dir.clone()))
-            .unwrap_or_else(|| DEFAULT_LOG_DIR.to_string());
+            .unwrap_or_else(|| files.dir.clone());
         let basename = std::env::var("NOVAROCKS_LOG_BASENAME")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -175,14 +198,12 @@ impl LogSettings {
         let roll_mode = std::env::var("NOVAROCKS_LOG_ROLL_MODE")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .or_else(|| cfg.as_ref().map(|c| c.sys_log_roll_mode.clone()))
             .map(|v| RollMode::parse(&v))
-            .unwrap_or_else(|| RollMode::parse(DEFAULT_ROLL_MODE));
+            .unwrap_or_else(|| RollMode::parse(&files.roll_mode));
         let roll_num = std::env::var("NOVAROCKS_LOG_ROLL_NUM")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .or_else(|| cfg.as_ref().map(|c| c.sys_log_roll_num))
-            .unwrap_or(DEFAULT_ROLL_NUM)
+            .unwrap_or(files.roll_num)
             .max(1);
 
         Self {
@@ -196,10 +217,6 @@ impl LogSettings {
     fn active_log_path(&self, severity: SeverityFile) -> PathBuf {
         self.dir
             .join(format!("{}.{}", self.basename, severity.suffix()))
-    }
-
-    fn stdout_log_path(&self) -> PathBuf {
-        self.dir.join(format!("{}.out", self.basename))
     }
 }
 
@@ -484,14 +501,11 @@ fn open_log_writers(settings: &LogSettings) -> io::Result<LevelWriters> {
     })
 }
 
-pub fn resolve_stdout_log_path() -> PathBuf {
-    LogSettings::from_config_and_env().stdout_log_path()
-}
-
-pub fn init_with_level(level: &str) {
+pub fn init_with_level(level: &str, files: &LogFileSettings) {
     INIT.get_or_init(|| {
         let env_filter = EnvFilter::new(level);
-        let settings = LogSettings::from_config_and_env();
+        let settings = LogSettings::from_files_and_env(files);
+        let _ = ACTIVE.set(settings.clone());
 
         if let Ok(writers) = open_log_writers(&settings) {
             let info_layer = tracing_fmt::layer()
@@ -538,8 +552,19 @@ pub fn init_with_level(level: &str) {
     });
 }
 
+/// The directory and basename of the log files logging opened, for code that
+/// reads those files back. Falls back to the env-and-defaults resolution when
+/// logging was never initialized, which is the case in unit tests.
+pub fn active_log_location() -> (PathBuf, String) {
+    let settings = ACTIVE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| LogSettings::from_files_and_env(&LogFileSettings::default()));
+    (settings.dir, settings.basename)
+}
+
 pub fn init() {
-    init_with_level("info");
+    init_with_level("info", &LogFileSettings::default());
 }
 
 pub use tracing::instrument;

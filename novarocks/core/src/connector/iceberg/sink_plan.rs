@@ -21,12 +21,11 @@ use arrow::datatypes::SchemaRef;
 use novarocks_connector_iceberg::iceberg::spec::{Struct, TableMetadata};
 use parquet::basic::Compression;
 
-use crate::fs::object_store_credentials::ObjectStoreCredentials;
 use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
 use novarocks_connector_iceberg::delete_file::IcebergFileFormat;
 use novarocks_connector_iceberg::position_delete_descriptor::PositionDeleteDescriptorBinding;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
-use novarocks_fs::ObjectStoreConfig;
+use novarocks_fs::{ObjectStoreConfig, ObjectStoreCredentials};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IcebergSinkMode {

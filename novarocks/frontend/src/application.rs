@@ -127,6 +127,44 @@ pub struct FrontendApplicationHost {
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_role: novarocks::common::app_config::ClusterRole,
     topology: Option<Arc<ClusterBackendService>>,
+    optimizer_query_mem_limit_bytes: u64,
+}
+
+/// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
+const DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Query-control timeouts frozen from `[runtime]` at startup.
+///
+/// Coordinator code receives these; it never reads a process-global config
+/// while admitting a query. Defaults mirror `RuntimeConfig`'s serde defaults so
+/// a `FrontendExecutionConfig` built without a config file still validates.
+#[derive(Clone, Copy, Debug)]
+pub struct FrontendQueryControlTimeouts {
+    pub heartbeat_interval_ms: u64,
+    pub heartbeat_timeout_ms: u64,
+    pub init_rpc_timeout_ms: u64,
+    pub attach_timeout_ms: u64,
+    pub stage_rpc_timeout_ms: u64,
+    pub start_rpc_timeout_ms: u64,
+    pub terminal_drain_timeout_ms: u64,
+    pub terminal_ack_timeout_ms: u64,
+    pub pre_start_timeout_ms: u64,
+}
+
+impl Default for FrontendQueryControlTimeouts {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: 1_000,
+            heartbeat_timeout_ms: 5_000,
+            init_rpc_timeout_ms: 5_000,
+            attach_timeout_ms: 5_000,
+            stage_rpc_timeout_ms: 5_000,
+            start_rpc_timeout_ms: 2_000,
+            terminal_drain_timeout_ms: 30_000,
+            terminal_ack_timeout_ms: 5_000,
+            pre_start_timeout_ms: 30_000,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -136,6 +174,14 @@ pub struct FrontendExecutionConfig {
     runtime_filter_worker_count: NonZeroUsize,
     mv_scheduler: FrontendMvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
+    /// Cost budget frozen from `[runtime]` and handed to statement admission.
+    ///
+    /// SQL costing only ever sees the value admission froze; it never consults
+    /// a process-global configuration.
+    optimizer_query_mem_limit_bytes: u64,
+    /// Query-control timeouts frozen from `[runtime]` and handed to the
+    /// coordinator, which validates them once at startup instead of per query.
+    query_control_timeouts: FrontendQueryControlTimeouts,
 }
 
 impl FrontendExecutionConfig {
@@ -150,7 +196,23 @@ impl FrontendExecutionConfig {
             runtime_filter_worker_count,
             mv_scheduler: FrontendMvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
+            optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
+            query_control_timeouts: FrontendQueryControlTimeouts::default(),
         }
+    }
+
+    pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
+        self.query_control_timeouts = timeouts;
+        self
+    }
+
+    pub fn with_optimizer_query_mem_limit_bytes(mut self, bytes: u64) -> Self {
+        self.optimizer_query_mem_limit_bytes = bytes;
+        self
+    }
+
+    pub(crate) fn optimizer_query_mem_limit_bytes(&self) -> u64 {
+        self.optimizer_query_mem_limit_bytes
     }
 
     pub(crate) fn with_mv_scheduler_config(mut self, config: FrontendMvSchedulerConfig) -> Self {
@@ -210,6 +272,7 @@ impl FrontendApplicationHost {
             coordinator: None,
             execution_role: backend.role(),
             topology: None,
+            optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
         };
 
         if let Some(config) = config
@@ -309,6 +372,7 @@ impl FrontendApplicationHost {
         // context consumed by frontend application services. Install it before
         // constructing those services so MV refresh never observes an
         // all-in-one-only direct execution fallback.
+        host.optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
         if let Err(error) = host.open_coordinator(execution.clone()) {
             return Err(host.cleanup_open_error(error).await);
         }
@@ -330,6 +394,7 @@ impl FrontendApplicationHost {
                             execution.mv_scheduler.clone(),
                             execution.mv_maintenance.clone(),
                             host.table_maintenance_service(),
+                            execution.optimizer_query_mem_limit_bytes(),
                         ));
                         host.mv_background_engine_sink = Some(
                             FrontendMvService::background_engine_sink(Arc::clone(&service)),
@@ -502,6 +567,11 @@ impl FrontendApplicationHost {
         self.execution_role
     }
 
+    /// Cost budget frozen from `[runtime]`, handed to statement admission.
+    pub fn optimizer_query_mem_limit_bytes(&self) -> u64 {
+        self.optimizer_query_mem_limit_bytes
+    }
+
     pub fn connector_control_registry(
         &self,
     ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
@@ -633,13 +703,17 @@ impl FrontendApplicationHost {
         &mut self,
         execution: FrontendExecutionConfig,
     ) -> Result<(), FrontendApplicationError> {
-        let coordinator = Arc::new(FrontendDistributedQueryCoordinator::new(
-            execution.advertised_report_host,
-            execution.configured_report_port,
-            execution.runtime_filter_worker_count,
-            self.backend_topology_port(),
-            Arc::clone(&self.connector_control),
-        ));
+        let coordinator = Arc::new(
+            FrontendDistributedQueryCoordinator::new(
+                execution.advertised_report_host,
+                execution.configured_report_port,
+                execution.runtime_filter_worker_count,
+                execution.query_control_timeouts,
+                self.backend_topology_port(),
+                Arc::clone(&self.connector_control),
+            )
+            .map_err(FrontendApplicationError::server)?,
+        );
         self.topology()
             .attach_query_events(Arc::new(coordinator.backend_query_activity()));
         self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));

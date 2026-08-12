@@ -60,8 +60,6 @@ parquet_meta_cache_ttl_seconds = 3600
 parquet_page_cache_capacity = 1000
 parquet_page_cache_ttl_seconds = 3600
 
-[debug]
-exec_node_output = false
 "#;
 
         std::fs::write(&config_path, config_content)?;
@@ -74,12 +72,12 @@ exec_node_output = false
 
     /// Initialize logging for tests.
     pub fn init_logging(&self) {
-        novarocks_logging::init_with_level("debug");
+        novarocks_logging::init_with_level("debug", &Default::default());
     }
 
     /// Load the test configuration.
-    pub fn load_config(&self) -> anyhow::Result<&'static novarocks_config::NovaRocksConfig> {
-        novarocks_config::init_from_path(&self.config_path)
+    pub fn load_config(&self) -> anyhow::Result<novarocks_config::NovaRocksConfig> {
+        novarocks_config::load_from_path(&self.config_path)
     }
 }
 

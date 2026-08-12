@@ -954,24 +954,7 @@ fn render_cross_process_launch_config(
             ),
         );
     }
-    // Cross-process SQL fixtures own both process logs, so they may enable the
-    // bounded connector scan lifecycle markers used for structural evidence.
-    // This is a test-runner config only; production configs retain the default.
-    table_mut(root, "debug").insert(
-        "emit_connector_reader_marker".to_string(),
-        Value::Boolean(true),
-    );
     if query_lifecycle_faults_enabled {
-        let debug = table_mut(root, "debug");
-        debug.insert(
-            "query_lifecycle_fault_dir".to_string(),
-            Value::String(
-                runtime_dir
-                    .join("query-lifecycle-faults")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        );
         // The production terminal-retention contract remains 120s.  Runner
         // fault scenarios use a short, self-contained lease so a deliberately
         // crashed FE proves BE runtime release and bounded record reclamation
@@ -2485,6 +2468,10 @@ pub(crate) fn build_novarocks_command(binary: &Path, role: &str, config_path: &P
         .arg(config_path)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD", "1")
+        // Cross-process SQL fixtures own both process logs, so they enable the
+        // bounded connector scan lifecycle markers used for structural
+        // evidence. This is runner-owned and compiled out of release builds.
+        .env("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
@@ -3159,9 +3146,6 @@ user = "root"
 endpoint = "http://127.0.0.1:9000"
 access_key_id = "admin"
 enable_path_style_access = true
-
-[debug]
-exec_node_output = true
 "#;
 
     #[test]
@@ -3193,7 +3177,6 @@ exec_node_output = true
             fe_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
-        assert_eq!(fe_value["debug"]["exec_node_output"].as_bool(), Some(true));
         assert_eq!(fe_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
         assert_eq!(fe_value["server"]["grpc_port"].as_integer(), Some(29070));
@@ -3230,7 +3213,6 @@ exec_node_output = true
             be_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
-        assert_eq!(be_value["debug"]["exec_node_output"].as_bool(), Some(true));
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
         assert_eq!(be_value["server"]["grpc_port"].as_integer(), Some(19070));
@@ -3364,7 +3346,6 @@ exec_node_output = true
             plain_fe_value["standalone_server"]["mysql_port"]
         );
         assert_eq!(fe_value["connector"], plain_fe_value["connector"]);
-        assert_eq!(fe_value["debug"], plain_fe_value["debug"]);
 
         // BE role also gets the override, independent of FE.
         let be = render_cross_process_config_with_metadata_db_override(
@@ -3436,38 +3417,15 @@ exec_node_output = true
             "ephemeral clusters must not restore stale backend rows from another launch"
         );
         assert!(
-            first["debug"].get("query_lifecycle_fault_dir").is_none(),
-            "ordinary cross-process config must remain usable by release binaries"
+            first.get("debug").is_none(),
+            "ordinary cross-process config must not render debug knobs"
         );
         assert!(
-            second["debug"].get("query_lifecycle_fault_dir").is_none(),
-            "ordinary cross-process config must not enable lifecycle fault hooks"
+            second.get("debug").is_none(),
+            "ordinary cross-process config must not render debug knobs"
         );
     }
 
-    #[test]
-    fn lifecycle_fault_cross_process_config_requires_explicit_debug_preflight() {
-        let runtime = make_runtime_1be();
-        let runtime_dir = Path::new("/tmp/novarocks-cross-process-lifecycle-fault");
-        let rendered = render_cross_process_launch_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-            runtime_dir,
-            CrossProcessMetadataMode::Isolated,
-            true,
-            false,
-        )
-        .expect("render explicit lifecycle fault config")
-        .parse::<Value>()
-        .expect("parse lifecycle fault config");
-
-        assert_eq!(
-            rendered["debug"]["query_lifecycle_fault_dir"].as_str(),
-            runtime_dir.join("query-lifecycle-faults").to_str()
-        );
-    }
 
     #[test]
     fn imv_l2_metadata_isolation_preserves_shared_lake_fixture() {

@@ -36,7 +36,7 @@ pub mod view;
 
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig,
+    FrontendExecutionConfig, FrontendQueryControlTimeouts,
 };
 pub use mv::FrontendMvService;
 pub use query::FrontendQueryService;

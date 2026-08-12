@@ -33,7 +33,6 @@ use novarocks_spi::connector::{
     ConnectorExecutionInstaller, ConnectorExecutionResolver,
 };
 
-use crate::cache::CacheOptions;
 use crate::query_execution::artifact::{
     BackendPlacement, FragmentScheduleDraft, PreparedDistributedQuery,
     RuntimeFilterBoundPreparedDistributedQuery, ValidatedFragmentSchedule,
@@ -181,6 +180,7 @@ fn in_process_test_execution_runtime()
                 spill_io_threads: 1,
                 spill_io_queue_capacity: 8,
                 spill_storage: ExecutionSpillStorageConfig::default(),
+                exchange_wait_ms: 120_000,
                 exchange_io_threads: 1,
                 exchange_io_max_inflight_bytes: 32 * 1024 * 1024,
                 exchange_max_transmit_batched_bytes: 1024 * 1024,
@@ -203,7 +203,6 @@ fn in_process_test_execution_runtime()
 pub(crate) fn execute(
     request: DistributedQueryRequest,
 ) -> Result<crate::query_execution::contract::DistributedQueryOutcome, DistributedQueryError> {
-    crate::novarocks_config::install_default_for_test();
     let parts = request.into_parts();
     let query_id = QueryId::new(
         TEST_QUERY_ID_HIGH,
@@ -262,15 +261,12 @@ pub(crate) fn execute(
         let fragment_instance_id = submission.fragment_instance_id();
         let (delivery_expire, query_expire) =
             query_expire_durations(Some(submission.query_options()));
-        let cache_options =
-            CacheOptions::from_query_options(Some(submission.query_options())).map_err(failed)?;
         let admission = NativeFragmentQueryRuntime::global()
             .prepare_admission(
                 submission.query_id(),
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
-                cache_options,
                 None,
             )
             .map_err(failed)?;

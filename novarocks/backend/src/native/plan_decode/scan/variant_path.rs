@@ -21,8 +21,8 @@ use arrow::datatypes::{DataType, Field};
 
 use super::super::error::NativeFragmentLeafDecodeError;
 use super::common::{column_def_data_type, output_column_data_type};
-use novarocks::formats::parquet::VariantPathSpec;
 use novarocks::protocol::ProtocolErrorKind;
+use novarocks_execution::exec::variant_read::VariantPathSpec;
 use novarocks_protocol::{common, plan};
 use novarocks_types::SlotId;
 
