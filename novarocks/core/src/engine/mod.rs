@@ -3850,22 +3850,42 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
         .map_err(|e| format!("read current directory failed: {e}"))
 }
 
+/// Engine-side implementation of the MV startup restore steps.
+///
+/// The steps read lake state through engine internals, so they stay here; the
+/// ordering that makes them correct lives in the port. Separating the two is the
+/// dependency-inversion step before the implementation itself moves out of
+/// aggregate Core.
+struct EngineMvStartupRestore<'a> {
+    state: &'a Arc<StandaloneState>,
+}
+
+impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_> {
+    fn rebuild_cache_from_lake(&self) -> Result<(), String> {
+        // W4 statelessness: rediscover lake-native Iceberg MV packages present on
+        // the lake but missing from a fresh `[metadata]` (SQLite) cache, and
+        // persist their rebuilt definitions.
+        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(self.state)
+    }
+
+    fn restore_targets(&self) -> Result<(), String> {
+        crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(self.state)
+    }
+
+    fn recover_unfinished_refreshes(&self) -> Result<(), String> {
+        // Recovery is a frontend application decision; the engine only sequences
+        // it after the state it depends on has been restored.
+        self.state
+            .mv_application_service
+            .recover_startup_mv_refreshes()
+            .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
+    }
+}
+
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
     // Catalog attachments are restored by the Frontend controller from
     // StateStore before the engine opens; Core has no attachment reader.
-    // W4 statelessness: rediscover lake-native Iceberg MV packages that are
-    // present on the lake but missing from a fresh `[metadata]` (SQLite) cache,
-    // and persist their rebuilt definitions.
-    crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(state)?;
-    crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
-    // Recovery is a frontend application decision. At this point catalog
-    // bindings and target descriptors have both been restored, so the service
-    // can acquire one current-generation inspection lease per fenced attempt.
-    state
-        .mv_application_service
-        .recover_startup_mv_refreshes()
-        .map_err(|error| format!("frontend MV startup recovery failed: {error}"))?;
-    Ok(())
+    crate::mv::startup_restore::run_mv_startup_restore(&EngineMvStartupRestore { state })
 }
 
 /// The engine's only catalog authority.
