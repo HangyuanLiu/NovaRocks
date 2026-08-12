@@ -351,6 +351,11 @@ impl OptimizeJobRepository {
             .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn claim(&self, job_id: i64, now_ms: i64) -> RepositoryResult<Option<OptimizeJob>> {
         validate_job_id(job_id, "claim optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -462,6 +467,11 @@ impl OptimizeJobRepository {
         }
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn record_outcome(
         &self,
         job_id: i64,
@@ -670,6 +680,11 @@ impl OptimizeJobRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(&self, job_id: i64, now_ms: i64) -> RepositoryResult<()> {
         validate_job_id(job_id, "finish optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -736,6 +751,11 @@ impl OptimizeJobRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail(&self, job_id: i64, now_ms: i64, message: String) -> RepositoryResult<()> {
         validate_job_id(job_id, "fail optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -2258,6 +2278,11 @@ impl MetadataMaintenanceOperationRepository {
 
     /// Atomically persists the opaque plan and changes PENDING to RUNNING.
     /// The returned record is the only state that authorizes provider execute.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn start(
         &self,
         operation_id: Uuid,
@@ -2353,6 +2378,11 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_reconcile_pending(
         &self,
         operation_id: Uuid,
@@ -2488,6 +2518,11 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(
         &self,
         operation_id: Uuid,
@@ -2535,6 +2570,11 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail(
         &self,
         operation_id: Uuid,
@@ -2576,6 +2616,11 @@ impl MetadataMaintenanceOperationRepository {
 
     /// An unresolved operation retains its table fence.  A later incarnation
     /// must not silently turn it into a current-generation operation.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_unresolved(
         &self,
         operation_id: Uuid,
@@ -4372,6 +4417,11 @@ impl DistributedRewriteOperationRepository {
     /// job. The v1 active-target index remains an external fence; this narrow
     /// path merely proves, in the same transaction, that it belongs to the
     /// running job that is creating its child rewrite operation.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn create_for_claimed_optimize_job(
         &self,
         request: DistributedRewriteOperationCreate,
@@ -4451,6 +4501,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn plan(
         &self,
         operation_id: Uuid,
@@ -4518,6 +4573,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn start_staging(
         &self,
         operation_id: Uuid,
@@ -4536,6 +4596,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn checkpoint_attempt(
         &self,
         operation_id: Uuid,
@@ -4555,6 +4620,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_abort_pending(
         &self,
         operation_id: Uuid,
@@ -4578,6 +4648,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_commit_pending(
         &self,
         operation_id: Uuid,
@@ -4596,6 +4671,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_reconcile_pending(
         &self,
         operation_id: Uuid,
@@ -4620,6 +4700,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(
         &self,
         operation_id: Uuid,
@@ -4649,6 +4734,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail(
         &self,
         operation_id: Uuid,
@@ -4674,6 +4764,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_unresolved(
         &self,
         operation_id: Uuid,
@@ -6337,6 +6432,11 @@ impl CleanupOperationRepository {
     /// Persist the provider's frozen manifest before any batch can be
     /// prepared. A zero-candidate plan is still durable and is finished by the
     /// ordinary terminal transition.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn plan(
         &self,
         operation_id: Uuid,
@@ -6402,6 +6502,11 @@ impl CleanupOperationRepository {
 
     /// Persist prepare evidence before dispatch. The returned RUNNING record
     /// is the only record that authorizes a destructive provider call.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn prepare_batch(
         &self,
         operation_id: Uuid,
@@ -6471,6 +6576,11 @@ impl CleanupOperationRepository {
     /// Atomically records the provider receipt summary and advances the exact
     /// batch ordinal. Any unknown count moves the operation to reconcile-only
     /// state; a caller may not dispatch another batch from that state.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn checkpoint_batch(
         &self,
         operation_id: Uuid,
@@ -6534,6 +6644,11 @@ impl CleanupOperationRepository {
     /// Replace the receipt for the already-dispatched batch after an exact
     /// generation reconcile. This transition never advances the ordinal and
     /// therefore cannot authorize a second delete.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn checkpoint_reconciled_batch(
         &self,
         operation_id: Uuid,
@@ -6594,6 +6709,11 @@ impl CleanupOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_reconcile_pending(
         &self,
         operation_id: Uuid,
@@ -6661,6 +6781,11 @@ impl CleanupOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn resume_running(
         &self,
         operation_id: Uuid,
@@ -6697,6 +6822,11 @@ impl CleanupOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(
         &self,
         operation_id: Uuid,
@@ -6741,6 +6871,11 @@ impl CleanupOperationRepository {
 
     /// Failure is legal only before the first prepared batch. After prepare,
     /// uncertain external effects are reconciled rather than failed closed.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail_before_dispatch(
         &self,
         operation_id: Uuid,
@@ -6787,6 +6922,11 @@ impl CleanupOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_unresolved(
         &self,
         operation_id: Uuid,
