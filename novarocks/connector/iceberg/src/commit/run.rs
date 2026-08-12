@@ -124,12 +124,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
     // fence here would produce a commit that *looks* fenced to the coordinator
     // while asserting nothing at the catalog. That is strictly worse than no
     // fence at all, because the coordinator would trust it.
-    if fence.is_some()
-        && matches!(
-            collector.op_kind,
-            CommitOpKind::Truncate | CommitOpKind::RewriteDataFiles
-        )
-    {
+    if fence.is_some() && matches!(collector.op_kind, CommitOpKind::RewriteDataFiles) {
         return Err(CommitServiceError::invalid_input(format!(
             "commit op kind {:?} cannot assert an external write fence yet; refusing to drop it",
             collector.op_kind
