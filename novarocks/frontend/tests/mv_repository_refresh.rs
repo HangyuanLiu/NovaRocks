@@ -1158,3 +1158,69 @@ fn definition_ddl_stays_outside_the_refresh_ownership_fence() {
         )
         .expect("definition DDL must not require a refresh lease");
 }
+
+/// A registry-backed fence source, exactly as production would install it.
+struct RegistryLikeSource {
+    registered: std::sync::Mutex<std::collections::HashSet<i64>>,
+}
+
+impl RegistryLikeSource {
+    fn empty() -> Self {
+        Self {
+            registered: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
+impl MvRefreshFenceSource for RegistryLikeSource {
+    fn validator_for(&self, mv_id: i64) -> Result<FenceValidator, MvRepositoryError> {
+        if !self.registered.lock().unwrap().contains(&mv_id) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!("no refresh lease registered for mv {mv_id}"),
+            ));
+        }
+        Ok(Arc::new(|_transaction| Box::pin(async { Ok(()) })))
+    }
+}
+
+/// Pins the coupling between installing the fence source and registering
+/// ownership at the refresh entry points.
+///
+/// The registry fails closed for unregistered targets, so installing it without
+/// wiring the entry points stops every refresh in the cluster. This test makes
+/// that an executable fact rather than a comment: it goes red the moment a
+/// composition installs a registry-backed source while the entry points still do
+/// not register, which is precisely the half-landed change to prevent.
+#[test]
+fn installing_a_fence_source_without_registration_stops_every_refresh() {
+    let (_temp, _runtime, _host, repository) =
+        fenced_repository(Arc::new(RegistryLikeSource::empty()));
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_fenced"),
+        )
+        .expect("create definition");
+
+    let error = repository
+        .begin_frontend_refresh_intent(fence_intent_request(definition.mv_id))
+        .expect_err("an unregistered target must not begin a refresh");
+    assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict, "{error}");
+
+    // The failure is total, not partial: no refresh can start for any target,
+    // which is what makes install-without-registration a cluster outage rather
+    // than a degraded mode.
+    let second = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("another_fenced"),
+        )
+        .expect("create second definition");
+    assert!(
+        repository
+            .begin_frontend_refresh_intent(fence_intent_request(second.mv_id))
+            .is_err(),
+        "install-without-registration must fail closed for every target"
+    );
+}
