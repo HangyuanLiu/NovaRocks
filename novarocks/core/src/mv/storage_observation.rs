@@ -536,6 +536,7 @@ pub struct MvRefreshTargetObservation {
     partition: MvPartitionContract,
     current_snapshot_id: Option<i64>,
     ref_snapshot_ids: BTreeMap<String, i64>,
+    field_ids: Vec<i32>,
     main_ancestor_snapshot_ids: Vec<i64>,
     current_snapshot_is_empty_bootstrap: bool,
     snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
@@ -560,6 +561,7 @@ impl MvRefreshTargetObservation {
         partition: MvPartitionContract,
         current_snapshot_id: Option<i64>,
         ref_snapshot_ids: BTreeMap<String, i64>,
+        field_ids: Vec<i32>,
         main_ancestor_snapshot_ids: Vec<i64>,
         current_snapshot_is_empty_bootstrap: bool,
         snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
@@ -611,10 +613,17 @@ impl MvRefreshTargetObservation {
             partition,
             current_snapshot_id,
             ref_snapshot_ids,
+            field_ids,
             main_ancestor_snapshot_ids,
             current_snapshot_is_empty_bootstrap,
             snapshot_markers,
         })
+    }
+
+    /// Target schema field IDs in schema order, positionally aligned with the
+    /// Arrow schema in the neutral metadata.
+    pub fn field_ids(&self) -> &[i32] {
+        &self.field_ids
     }
 
     /// Is the current snapshot the empty bootstrap snapshot CREATE MV
@@ -1412,6 +1421,7 @@ mod tests {
             current_snapshot_id,
             refs,
             Vec::new(),
+            Vec::new(),
             false,
             BTreeMap::new(),
             &context(4096),
@@ -1430,6 +1440,7 @@ mod tests {
             None,
             BTreeMap::new(),
             Vec::new(),
+            Vec::new(),
             false,
             BTreeMap::new(),
             &context(4096),
@@ -1447,6 +1458,7 @@ mod tests {
             partition(),
             None,
             BTreeMap::new(),
+            Vec::new(),
             Vec::new(),
             false,
             BTreeMap::new(),

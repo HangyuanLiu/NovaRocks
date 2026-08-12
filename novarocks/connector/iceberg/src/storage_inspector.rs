@@ -105,6 +105,9 @@ pub struct IcebergStorageRefreshTargetObservation {
     pub partition: IcebergStoragePartitionContract,
     pub current_snapshot_id: Option<i64>,
     pub ref_snapshot_ids: BTreeMap<String, i64>,
+    /// Target schema field IDs in schema order, positionally aligned with the
+    /// Arrow schema the neutral metadata carries.
+    pub field_ids: Vec<i32>,
     /// `main`'s snapshot chain, newest first. MV reconciliation classifies a
     /// staging snapshot by asking whether it is on this chain.
     pub main_ancestor_snapshot_ids: Vec<i64>,
@@ -306,6 +309,13 @@ fn refresh_target_observation(
         );
     }
 
+    let field_ids: Vec<i32> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+
     let current_snapshot_is_empty_bootstrap = table.current_snapshot().is_some_and(|snapshot| {
         let props = &snapshot.summary().additional_properties;
         snapshot.parent_snapshot_id().is_none()
@@ -325,6 +335,7 @@ fn refresh_target_observation(
         },
         current_snapshot_id,
         ref_snapshot_ids,
+        field_ids,
         main_ancestor_snapshot_ids,
         current_snapshot_is_empty_bootstrap,
         snapshot_markers,

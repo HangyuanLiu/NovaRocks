@@ -274,6 +274,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             mv_partition_contract(observed.partition),
             observed.current_snapshot_id,
             observed.ref_snapshot_ids,
+            observed.field_ids,
             observed.main_ancestor_snapshot_ids,
             observed.current_snapshot_is_empty_bootstrap,
             observed

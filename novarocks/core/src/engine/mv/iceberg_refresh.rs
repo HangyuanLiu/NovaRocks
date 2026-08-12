@@ -379,23 +379,17 @@ fn prepare_frontend_first_refresh_write(
         "Iceberg MV first-refresh requires a persisted schema contract".to_string()
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
-    let target_schema = target_loaded.table.metadata().current_schema();
-    let target_arrow_schema =
-        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(target_schema)
-            .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
-    let target_field_ids = target_schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| field.id)
-        .collect::<Vec<_>>();
+    let target_binding = target_binding_for(state, &target, &connector_context)?;
+    let target_arrow_schema = target_binding.arrow_schema().as_ref().clone();
+    let target_field_ids = target_binding.observation().field_ids().to_vec();
+    let observed_spec_id = target_binding.partition().target_spec_id;
     let partition_spec_id = schema_contract
         .target
         .partition
         .as_ref()
         .map(|partition| partition.target_spec_id)
-        .unwrap_or_else(|| target_loaded.table.metadata().default_partition_spec_id());
-    if target_loaded.table.metadata().default_partition_spec_id() != partition_spec_id {
+        .unwrap_or(observed_spec_id);
+    if observed_spec_id != partition_spec_id {
         return Err(
             "MV first-refresh target partition spec drifted from its persisted contract"
                 .to_string(),
