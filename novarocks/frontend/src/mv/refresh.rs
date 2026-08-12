@@ -119,6 +119,31 @@ impl FrontendMvRefreshProviderActivationPort {
             .interpret_write_commit(intent, receipt)
             .map_err(invalid)
     }
+
+    pub(super) fn sync_repartition_descriptor(
+        &self,
+        mv_id: i64,
+        partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+        committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<(), MvApplicationError> {
+        let activation = self
+            .activation
+            .read()
+            .map_err(|_| unavailable("MV refresh provider activation lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| unavailable("MV refresh provider activation is unavailable"))?;
+        activation
+            .sync_repartition_descriptor(
+                mv_id,
+                partition_spec,
+                committed_partitioning,
+                connector_context,
+            )
+            .map_err(|error| {
+                MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
+            })
+    }
 }
 
 impl MvRefreshProviderActivationSink for FrontendMvRefreshProviderActivationPort {
@@ -168,6 +193,7 @@ pub(super) fn execute(
     }
 
     let base_snapshots = required_base_snapshots(&refresh.finalize)?;
+    let base_table_uuids = refresh.finalize.base_table_uuids.clone();
     let has_external_actions = matches!(&refresh.work, PreparedMvRefreshWork::DataProducing { .. });
     let ledger = new_ledger(&refresh, &planning_lease, has_external_actions)?;
     repository
@@ -180,6 +206,7 @@ pub(super) fn execute(
             staging_branch: refresh.attempt.staging_branch.clone(),
             expected_main_snapshot_id: refresh.finalize.expected_target_snapshot_id,
             base_snapshots: base_snapshots.clone(),
+            base_table_uuids: base_table_uuids.clone(),
             marker_token: refresh.attempt.marker_token.clone(),
             prepare_external_actions: has_external_actions,
             ledger,
@@ -199,8 +226,9 @@ pub(super) fn execute(
                     refresh_id: attempt.refresh_id,
                     rows: 0,
                     base_snapshots,
-                    base_table_uuids: finalize.base_table_uuids,
+                    base_table_uuids,
                     target_snapshot_id: finalize.expected_target_snapshot_id,
+                    partition_spec: None,
                 })
                 .map_err(repository_error)?;
             Ok(MvStatementResult::Ok)
@@ -231,33 +259,59 @@ fn execute_data_refresh(
     connector_context: ConnectorRequestContext,
     execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
-    let mutation_lease = planning_lease
-        .derive_mutation_lease()
-        .map_err(|error| unavailable(error.to_string()))?;
-    let table = table_identity(&finalize, mutation_lease.descriptor().instance_id.clone());
+    let atomic_repartition = prepared
+        .publication_intent()
+        .partition_spec_replacement()
+        .is_some();
+    let mutation_lease = if atomic_repartition {
+        None
+    } else {
+        Some(
+            planning_lease
+                .derive_mutation_lease()
+                .map_err(|error| unavailable(error.to_string()))?,
+        )
+    };
+    let table = mutation_lease
+        .as_ref()
+        .map(|lease| table_identity(&finalize, lease.descriptor().instance_id.clone()));
 
-    let staged = resolve_catalog_mutation_with_lease(
-        &mutation_lease,
-        ConnectorMutationOperationId::from_bytes(attempt.staging_create_operation_id),
-        ConnectorCatalogMutationOperation::AlterRef {
-            table: table.clone(),
-            action: ConnectorRefAction::Create {
-                kind: ConnectorRefKind::Branch,
-                name: attempt.staging_branch.clone().into(),
-                snapshot_id: finalize.expected_target_snapshot_id,
-                policy: CreateOrReplacePolicy::NoOpIfExists,
+    if atomic_repartition {
+        record_proof_only_phase(
+            repository,
+            attempt.refresh_id,
+            FrontendMvRefreshActionPhase::StagingCreate,
+            attempt.staging_create_operation_id,
+            None,
+            None,
+        )?;
+    } else {
+        let mutation_lease = mutation_lease
+            .as_ref()
+            .expect("ordinary MV refresh has a mutation lease");
+        let staged = resolve_catalog_mutation_with_lease(
+            mutation_lease,
+            ConnectorMutationOperationId::from_bytes(attempt.staging_create_operation_id),
+            ConnectorCatalogMutationOperation::AlterRef {
+                table: table.clone().expect("ordinary MV refresh has a target"),
+                action: ConnectorRefAction::Create {
+                    kind: ConnectorRefKind::Branch,
+                    name: attempt.staging_branch.clone().into(),
+                    snapshot_id: finalize.expected_target_snapshot_id,
+                    policy: CreateOrReplacePolicy::NoOpIfExists,
+                },
             },
-        },
-        connector_context.clone(),
-    );
-    record_catalog_action(
-        repository,
-        attempt.refresh_id,
-        FrontendMvRefreshActionPhase::StagingCreate,
-        attempt.staging_create_operation_id,
-        staged,
-        None,
-    )?;
+            connector_context.clone(),
+        );
+        record_catalog_action(
+            repository,
+            attempt.refresh_id,
+            FrontendMvRefreshActionPhase::StagingCreate,
+            attempt.staging_create_operation_id,
+            staged,
+            None,
+        )?;
+    }
 
     let write_lease = planning_lease
         .derive_write_lease()
@@ -345,71 +399,115 @@ fn execute_data_refresh(
 
     recovery_phase_barrier("write-committed")?;
 
-    let guard = ConnectorRefreshPublicationGuard::try_new(
-        attempt.refresh_id,
-        finalize.mv_id,
-        attempt.marker_token.clone(),
-    )
-    .map_err(|error| invalid(error.to_string()))?;
-    let publication = resolve_catalog_mutation_with_lease(
-        &mutation_lease,
-        ConnectorMutationOperationId::from_bytes(attempt.publication_operation_id),
-        ConnectorCatalogMutationOperation::AlterRef {
-            table: table.clone(),
-            action: ConnectorRefAction::FastForwardBranch {
-                source_branch: attempt.staging_branch.clone().into(),
-                target_branch: "main".into(),
-                committed_version: committed_version.clone(),
-                expected_target_snapshot_id: finalize.expected_target_snapshot_id,
-                guard,
+    let publication_version = if atomic_repartition {
+        record_proof_only_phase(
+            repository,
+            attempt.refresh_id,
+            FrontendMvRefreshActionPhase::Publication,
+            attempt.publication_operation_id,
+            Some(receipt_evidence(
+                receipt.payload().as_ref(),
+                receipt.digest(),
+            )),
+            Some(write_frontend_version.clone()),
+        )?;
+        committed_version
+    } else {
+        let guard = ConnectorRefreshPublicationGuard::try_new(
+            attempt.refresh_id,
+            finalize.mv_id,
+            attempt.marker_token.clone(),
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let publication = resolve_catalog_mutation_with_lease(
+            mutation_lease
+                .as_ref()
+                .expect("ordinary MV refresh has a mutation lease"),
+            ConnectorMutationOperationId::from_bytes(attempt.publication_operation_id),
+            ConnectorCatalogMutationOperation::AlterRef {
+                table: table.clone().expect("ordinary MV refresh has a target"),
+                action: ConnectorRefAction::FastForwardBranch {
+                    source_branch: attempt.staging_branch.clone().into(),
+                    target_branch: "main".into(),
+                    committed_version: committed_version.clone(),
+                    expected_target_snapshot_id: finalize.expected_target_snapshot_id,
+                    guard,
+                },
             },
-        },
-        connector_context.clone(),
-    );
-    let publication = record_catalog_action(
-        repository,
-        attempt.refresh_id,
-        FrontendMvRefreshActionPhase::Publication,
-        attempt.publication_operation_id,
-        publication,
-        Some(write_frontend_version.clone()),
-    )?;
-    let publication_version = publication
-        .receipt
-        .committed_version()
-        .cloned()
-        // The existing persistence contract permits an AlterRef receipt without
-        // an explicit version. Preserve its write-commit fallback rather than
-        // fabricating a new provider fact at the frontend boundary.
-        .unwrap_or(committed_version);
+            connector_context.clone(),
+        );
+        let publication = record_catalog_action(
+            repository,
+            attempt.refresh_id,
+            FrontendMvRefreshActionPhase::Publication,
+            attempt.publication_operation_id,
+            publication,
+            Some(write_frontend_version.clone()),
+        )?;
+        publication
+            .receipt
+            .committed_version()
+            .cloned()
+            .unwrap_or(committed_version)
+    };
     let published =
         MvRefreshPublishedFacts::try_new(committed, publication_version).map_err(invalid)?;
     let published_frontend_version = frontend_version(published.publication_version())?;
 
     recovery_phase_barrier("publication-committed")?;
 
-    let cleanup = resolve_catalog_mutation_with_lease(
-        &mutation_lease,
-        ConnectorMutationOperationId::from_bytes(attempt.staging_drop_operation_id),
-        ConnectorCatalogMutationOperation::AlterRef {
-            table,
-            action: ConnectorRefAction::Drop {
-                kind: ConnectorRefKind::Branch,
-                name: attempt.staging_branch.clone().into(),
-                policy: DropPolicy::NoOpIfMissing,
+    if atomic_repartition {
+        record_proof_only_phase(
+            repository,
+            attempt.refresh_id,
+            FrontendMvRefreshActionPhase::StagingDrop,
+            attempt.staging_drop_operation_id,
+            None,
+            None,
+        )?;
+    } else {
+        let cleanup = resolve_catalog_mutation_with_lease(
+            mutation_lease
+                .as_ref()
+                .expect("ordinary MV refresh has a mutation lease"),
+            ConnectorMutationOperationId::from_bytes(attempt.staging_drop_operation_id),
+            ConnectorCatalogMutationOperation::AlterRef {
+                table: table.expect("ordinary MV refresh has a target"),
+                action: ConnectorRefAction::Drop {
+                    kind: ConnectorRefKind::Branch,
+                    name: attempt.staging_branch.clone().into(),
+                    policy: DropPolicy::NoOpIfMissing,
+                },
             },
-        },
-        connector_context,
-    );
-    record_catalog_action(
-        repository,
-        attempt.refresh_id,
-        FrontendMvRefreshActionPhase::StagingDrop,
-        attempt.staging_drop_operation_id,
-        cleanup,
-        None,
-    )?;
+            connector_context.clone(),
+        );
+        record_catalog_action(
+            repository,
+            attempt.refresh_id,
+            FrontendMvRefreshActionPhase::StagingDrop,
+            attempt.staging_drop_operation_id,
+            cleanup,
+            None,
+        )?;
+    }
 
+    let committed_partitioning = published.committed().committed_partitioning();
+    let partition_spec = committed_partitioning
+        .map(mv_partition_contract)
+        .transpose()?;
+    if let Some(committed_partitioning) = committed_partitioning {
+        let partition_spec = partition_spec.as_ref().ok_or_else(|| {
+            invalid("MV repartition commit is missing its application partition contract")
+        })?;
+        dependencies
+            .provider_activation
+            .sync_repartition_descriptor(
+                finalize.mv_id,
+                partition_spec.clone(),
+                committed_partitioning.clone(),
+                &connector_context,
+            )?;
+    }
     repository
         .finalize_refresh(MvRefreshFinalizeRequest {
             refresh_id: attempt.refresh_id,
@@ -417,6 +515,7 @@ fn execute_data_refresh(
             base_snapshots,
             base_table_uuids: finalize.base_table_uuids,
             target_snapshot_id: published_frontend_version.snapshot_id,
+            partition_spec,
         })
         .map_err(|error| {
             MvApplicationError::new(
@@ -743,6 +842,74 @@ fn record_action_value(
         .map_err(repository_error)
 }
 
+fn record_proof_only_phase(
+    repository: &dyn MvRepository,
+    refresh_id: i64,
+    phase: FrontendMvRefreshActionPhase,
+    operation_id: [u8; 16],
+    receipt: Option<FrontendMvRefreshEvidence>,
+    committed_version: Option<FrontendMvRefreshCommittedVersion>,
+) -> Result<(), MvApplicationError> {
+    record_action_value(
+        repository,
+        refresh_id,
+        proof_only_action(phase, operation_id, receipt, committed_version),
+    )
+}
+
+fn proof_only_action(
+    phase: FrontendMvRefreshActionPhase,
+    operation_id: [u8; 16],
+    receipt: Option<FrontendMvRefreshEvidence>,
+    committed_version: Option<FrontendMvRefreshCommittedVersion>,
+) -> FrontendMvRefreshAction {
+    FrontendMvRefreshAction {
+        phase,
+        state: FrontendMvRefreshActionState::KnownCommitted,
+        operation_id: operation_id.to_vec(),
+        receipt,
+        committed_version,
+        external_evidence: None,
+        provider_finalized: true,
+    }
+}
+
+pub(super) fn mv_partition_contract(
+    committed: &novarocks_spi::connector::ConnectorCommittedPartitioning,
+) -> Result<novarocks::mv::persistence::schema::MvPartitionContract, MvApplicationError> {
+    use novarocks::mv::persistence::schema::{
+        MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+    };
+    use novarocks_spi::connector::ConnectorManagedPartitionTransform as Transform;
+
+    let fields = committed
+        .fields()
+        .iter()
+        .map(|field| MvPartitionFieldContract {
+            partition_field_id: field.partition_field_id(),
+            partition_field_name: field.partition_field_name().to_string(),
+            source_target_field_id: field.source_field_id(),
+            source_column_name: field.source_column_name().to_string(),
+            transform: match field.transform() {
+                Transform::Identity => MvPartitionTransformContract::Identity,
+                Transform::Year => MvPartitionTransformContract::Year,
+                Transform::Month => MvPartitionTransformContract::Month,
+                Transform::Day => MvPartitionTransformContract::Day,
+                Transform::Hour => MvPartitionTransformContract::Hour,
+                Transform::Bucket { buckets } => MvPartitionTransformContract::Bucket {
+                    num_buckets: buckets,
+                },
+                Transform::Truncate { width } => MvPartitionTransformContract::Truncate { width },
+                Transform::Void => MvPartitionTransformContract::Void,
+            },
+        })
+        .collect();
+    Ok(MvPartitionContract {
+        target_spec_id: committed.spec_id(),
+        fields,
+    })
+}
+
 fn frontend_version(
     version: &novarocks_spi::connector::ConnectorCommittedVersion,
 ) -> Result<FrontendMvRefreshCommittedVersion, MvApplicationError> {
@@ -851,21 +1018,39 @@ fn repository_error(error: MvRepositoryError) -> MvApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use novarocks::mv::application::{
         MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshProviderActivationSink,
         MvRefreshPublicationIntent, PreparedMvRefreshWrite,
     };
+    use novarocks::mv::persistence::refresh::{
+        FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
+        FrontendMvRefreshCommittedVersion,
+    };
     use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
     use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_spi::connector::{
-        ConnectorControlPlanningLease, ConnectorWriteLease, ConnectorWriteReceipt,
+        ConnectorCancellation, ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
+        ConnectorControlPlanningLease, ConnectorManagedPartitionTransform, ConnectorRequestContext,
+        ConnectorWriteLease, ConnectorWriteReceipt, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
-    use super::FrontendMvRefreshProviderActivationPort;
+    use super::{FrontendMvRefreshProviderActivationPort, proof_only_action, receipt_evidence};
 
-    struct FakeActivator;
+    #[derive(Default)]
+    struct FakeActivator {
+        descriptor_projection: Mutex<
+            Option<(
+                i64,
+                novarocks::mv::persistence::schema::MvPartitionContract,
+                ConnectorCommittedPartitioning,
+            )>,
+        >,
+        failure: Option<&'static str>,
+    }
 
     impl MvRefreshProviderActivation for FakeActivator {
         fn activate_write(
@@ -885,17 +1070,161 @@ mod tests {
         ) -> Result<MvRefreshCommittedFacts, String> {
             unreachable!("the composition test never interprets a receipt")
         }
+
+        fn sync_repartition_descriptor(
+            &self,
+            mv_id: i64,
+            partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+            committed_partitioning: ConnectorCommittedPartitioning,
+            _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<(), String> {
+            *self
+                .descriptor_projection
+                .lock()
+                .expect("descriptor projection observation lock") =
+                Some((mv_id, partition_spec, committed_partitioning));
+            if let Some(failure) = self.failure {
+                return Err(failure.to_string());
+            }
+            Ok(())
+        }
+    }
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn connector_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("connector request context")
+    }
+
+    fn committed_partitioning() -> ConnectorCommittedPartitioning {
+        ConnectorCommittedPartitioning::try_new(
+            12,
+            vec![
+                ConnectorCommittedPartitionField::try_new(
+                    1_050,
+                    "id_bucket_16",
+                    10,
+                    "id",
+                    0,
+                    ConnectorManagedPartitionTransform::Bucket { buckets: 16 },
+                )
+                .expect("committed partition field"),
+            ],
+        )
+        .expect("committed partitioning")
     }
 
     #[test]
     fn provider_activation_is_bound_once_after_frontend_composition() {
         let port = FrontendMvRefreshProviderActivationPort::new();
-        port.bind_mv_refresh_provider_activation(Arc::new(FakeActivator))
+        port.bind_mv_refresh_provider_activation(Arc::new(FakeActivator::default()))
             .expect("first Core activation adapter binds");
 
         let error = port
-            .bind_mv_refresh_provider_activation(Arc::new(FakeActivator))
+            .bind_mv_refresh_provider_activation(Arc::new(FakeActivator::default()))
             .expect_err("a second Core activation adapter must fail closed");
         assert_eq!(error, "MV refresh provider activation is already bound");
+    }
+
+    #[test]
+    fn repartition_descriptor_projection_forwards_raw_committed_partitioning() {
+        let port = FrontendMvRefreshProviderActivationPort::new();
+        let activation = Arc::new(FakeActivator::default());
+        port.bind_mv_refresh_provider_activation(activation.clone())
+            .expect("bind Core activation adapter");
+        let committed_partitioning = committed_partitioning();
+        let partition_spec = super::mv_partition_contract(&committed_partitioning)
+            .expect("application partition contract");
+        let expected_partition_spec = partition_spec.clone();
+        let expected_committed_partitioning = committed_partitioning.clone();
+
+        port.sync_repartition_descriptor(
+            42,
+            partition_spec,
+            committed_partitioning,
+            &connector_context(),
+        )
+        .expect("descriptor projection");
+
+        assert_eq!(
+            *activation
+                .descriptor_projection
+                .lock()
+                .expect("descriptor projection observation lock"),
+            Some((42, expected_partition_spec, expected_committed_partitioning,))
+        );
+    }
+
+    #[test]
+    fn repartition_descriptor_projection_failure_remains_a_finalize_failure() {
+        let port = FrontendMvRefreshProviderActivationPort::new();
+        let activation = Arc::new(FakeActivator {
+            descriptor_projection: Mutex::new(None),
+            failure: Some("guarded descriptor projection conflict"),
+        });
+        port.bind_mv_refresh_provider_activation(activation)
+            .expect("bind Core activation adapter");
+        let committed_partitioning = committed_partitioning();
+        let partition_spec = super::mv_partition_contract(&committed_partitioning)
+            .expect("application partition contract");
+
+        let error = port
+            .sync_repartition_descriptor(
+                42,
+                partition_spec,
+                committed_partitioning,
+                &connector_context(),
+            )
+            .expect_err("descriptor projection conflict must retain the refresh fence");
+
+        assert_eq!(
+            error.kind(),
+            novarocks::mv::application::MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        );
+    }
+
+    #[test]
+    fn proof_only_publication_keeps_its_phase_operation_identity() {
+        let write_operation_id = [7; 16];
+        let publication_operation_id = [9; 16];
+        let write_receipt_payload = b"atomic-write-receipt";
+        let write_receipt_digest = super::sha256(write_receipt_payload);
+        let committed_version =
+            FrontendMvRefreshCommittedVersion::try_new(b"committed-version".to_vec(), Some(42))
+                .expect("committed version");
+
+        let action = proof_only_action(
+            FrontendMvRefreshActionPhase::Publication,
+            publication_operation_id,
+            Some(receipt_evidence(
+                write_receipt_payload,
+                write_receipt_digest,
+            )),
+            Some(committed_version.clone()),
+        );
+
+        assert_ne!(publication_operation_id, write_operation_id);
+        assert_eq!(action.phase, FrontendMvRefreshActionPhase::Publication);
+        assert_eq!(action.operation_id, publication_operation_id);
+        assert_eq!(action.state, FrontendMvRefreshActionState::KnownCommitted);
+        assert_eq!(action.committed_version, Some(committed_version));
+        assert_eq!(
+            action.receipt.expect("write proof").digest,
+            write_receipt_digest
+        );
+        assert!(action.external_evidence.is_none());
+        assert!(action.provider_finalized);
     }
 }

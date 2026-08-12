@@ -540,6 +540,20 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         intent: MvRefreshPublicationIntent,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, String>;
+
+    /// Project a provider-committed repartition contract into the lake-owned
+    /// MV descriptor. The atomic table commit is already durable when this is
+    /// called; a failure therefore leaves the frontend refresh fenced for
+    /// recovery and must be safe to retry. `committed_partitioning` is the
+    /// provider-produced exact CAS guard and must be forwarded unchanged, not
+    /// reconstructed from the application partition contract.
+    fn sync_repartition_descriptor(
+        &self,
+        mv_id: i64,
+        partition_spec: crate::mv::persistence::schema::MvPartitionContract,
+        committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), String>;
 }
 
 /// Frontend composition sink installed before Core opens. Core binds its

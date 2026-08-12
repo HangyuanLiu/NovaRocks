@@ -23,9 +23,9 @@ use crate::mv::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
     MvObservedMaintenancePolicy, MvObservedRefreshMarker, MvObservedSnapshot,
     MvObservedTargetField, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
-    MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
-    MvStorageObservationPort, MvTargetCreationObservation,
+    MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
+    MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
+    MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
 };
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionContract,
@@ -37,6 +37,7 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata,
 };
 
+#[cfg(test)]
 const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
 
 /// Test-only equivalent of the Server composition adapter.
@@ -151,6 +152,23 @@ impl MvStorageObservationPort for TestIcebergMvStorageObservationAdapter {
         };
         MvLakePackageObservation::try_new(metadata.identity.clone(), descriptor, publication)
             .map(Some)
+    }
+
+    fn observe_refresh_base(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvRefreshBaseObservation, ConnectorError> {
+        let observed =
+            self.inspector
+                .observe_refresh_base(exact_lease, metadata, context.clone())?;
+        MvRefreshBaseObservation::try_new(
+            metadata.identity.clone(),
+            observed.table_uuid,
+            observed.current_snapshot_id,
+            &context,
+        )
     }
 
     fn observe_refresh_target(
@@ -334,12 +352,14 @@ fn validation_partition_transform(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn current_iceberg_table_observation(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<MvSchemaValidationObservation, String> {
     current_iceberg_table_observation_with_schema(table, table.metadata().current_schema())
 }
 
+#[cfg(test)]
 fn current_iceberg_table_observation_with_schema(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
@@ -368,6 +388,7 @@ fn current_iceberg_table_observation_with_schema(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn partition_contract(
     spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
     schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
@@ -431,6 +452,7 @@ fn partition_contract(
     ))
 }
 
+#[cfg(test)]
 fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> bool {
     props
         .get(ICEBERG_ROW_LINEAGE_PROP)

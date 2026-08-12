@@ -40,23 +40,25 @@ use novarocks_spi::connector::{
     ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
-    ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
-    ConnectorMutationEffectField, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationMatchContract, ConnectorMutationOperationId, ConnectorMutationRouteInput,
-    ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorNamespaceRequest,
-    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorPrepareSplitRequest, ConnectorProviderId, ConnectorReadNamedReference,
-    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
-    ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
-    ConnectorRequestContext, ConnectorRowMutationActivationRequest,
-    ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
-    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationRoute, ConnectorRowMutationStrategy, ConnectorScalarType,
-    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanSelection, ConnectorSealedWriteCohortSet, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorListTablesRequest, ConnectorListViewsRequest,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
+    ConnectorMetadata, ConnectorMutationEffectField, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationMatchContract, ConnectorMutationOperationId,
+    ConnectorMutationRouteInput, ConnectorMutationSourceField, ConnectorMutationTargetField,
+    ConnectorNamespaceRequest, ConnectorPartitionTransform, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorProviderId,
+    ConnectorReadNamedReference, ConnectorReadPurpose, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind, ConnectorReadSelector,
+    ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
+    ConnectorRefreshPublicationGuard, ConnectorRequestContext,
+    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
+    ConnectorRowMutationEffect, ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
+    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorRowMutationRoute,
+    ConnectorRowMutationStrategy, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanSelection,
+    ConnectorSealedWriteCohortSet, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
     ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
@@ -66,14 +68,15 @@ use novarocks_spi::connector::{
     ConnectorTableColumnVisibility, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
     ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata,
-    ConnectorViewMetadataValue, ConnectorViewRequest, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteRouteId,
-    ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorViewMetadataValue, ConnectorViewRequest, ConnectorWriteActivationIntent,
+    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor,
+    ConnectorWriteCohortId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorWriteRouteId, ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy,
+    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     ExternalMutationOutcome, StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
     StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
     StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
@@ -306,7 +309,10 @@ impl IcebergControlProvider {
             Arc::new(
                 IcebergWriteControlAdapter::new_with_preparation(
                     write_key.clone(),
-                    Arc::new(RegisteredIcebergWriteControlBackend::new(services.clone())),
+                    Arc::new(
+                        RegisteredIcebergWriteControlBackend::new(services.clone())
+                            .with_control_registry(Arc::clone(&registry)),
+                    ),
                     Arc::new(prepare_iceberg_write) as Arc<IcebergWritePreparationFactory>,
                 )?
                 .with_row_mutation_preparation(Arc::new(prepare_iceberg_row_mutation)
@@ -1293,6 +1299,70 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 properties,
             );
         }
+        if let ConnectorCatalogMutationOperation::AlterProperties {
+            table,
+            changes,
+            authority,
+            expected_committed_partitioning: Some(expected),
+        } = &request.operation
+        {
+            let evidence = match self.mutation_evidence(request.operation_id, &request.operation) {
+                Ok(evidence) => evidence,
+                Err(error) => return Ok(known_uncommitted(error)),
+            };
+            if table.instance_id != self.instance_id {
+                return Ok(known_uncommitted(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "property mutation belongs to another connector instance",
+                )));
+            }
+            let entry = match self.entry(self.instance_id.as_str()) {
+                Ok(entry) => entry,
+                Err(error) => return Ok(known_uncommitted(error)),
+            };
+            let operation = match lower_property_changes(changes) {
+                Ok(operation) => operation,
+                Err(error) => return Ok(known_uncommitted(error)),
+            };
+            return match super::catalog::schema_update::alter_table_properties_on_entry(
+                &entry,
+                &table.namespace,
+                &table.table,
+                &operation,
+                *authority,
+                Some(expected),
+            ) {
+                Ok(()) => Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: self.receipt(request.operation_id, request.operation.kind(), None)?,
+                    finalization: ExternalMutationFinalization::Complete,
+                }),
+                Err(super::catalog::schema_update::AlterTablePropertiesOnEntryError::Conflict(
+                    message,
+                )) => Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        message,
+                    ),
+                }),
+                Err(super::catalog::schema_update::AlterTablePropertiesOnEntryError::Other(
+                    message,
+                )) => {
+                    let error = map_iceberg_error(message);
+                    if mutation_commit_may_be_unknown(error.kind()) {
+                        Ok(ExternalMutationOutcome::CommitUnknown {
+                            failure: ConnectorMutationFailure::new(
+                                mutation_failure_kind(error.kind()),
+                                error.to_string(),
+                            ),
+                            evidence,
+                        })
+                    } else {
+                        Ok(known_uncommitted(error))
+                    }
+                }
+            };
+        }
         let operation_kind = request.operation.kind();
         let evidence = match self.mutation_evidence(request.operation_id, &request.operation) {
             Ok(evidence) => evidence,
@@ -1635,6 +1705,7 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                     table,
                     changes,
                     authority,
+                    expected_committed_partitioning: _,
                 } => {
                     if table.instance_id != self.instance_id {
                         return Err(ConnectorError::new(
@@ -1653,9 +1724,19 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         &table.table,
                         &operation,
                         authority,
+                        None,
                     )
                     .map(|()| ExternalMutationEffect::Applied)
-                    .map_err(map_iceberg_error)
+                    .map_err(|error| {
+                        match error {
+                        super::catalog::schema_update::AlterTablePropertiesOnEntryError::Conflict(
+                            message,
+                        )
+                        | super::catalog::schema_update::AlterTablePropertiesOnEntryError::Other(
+                            message,
+                        ) => map_iceberg_error(message),
+                    }
+                    })
                 }
                 ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
                     if table.instance_id != self.instance_id {
@@ -6706,6 +6787,205 @@ pub(crate) fn register_iceberg_data_write_service_from_preparation(
     )
 }
 
+/// Activate one managed MV publication entirely inside the legacy provider
+/// generation. The application supplies only the provider-signed preparation
+/// and neutral publication intent; catalog reload, exact-target validation,
+/// writer service construction, provenance encoding and commit ownership stay
+/// behind `ConnectorWriteControl::activate_write`.
+pub(crate) fn activate_iceberg_managed_publication_write(
+    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    services: IcebergWriteServiceRegistry,
+    request: &ConnectorWriteActivationRequest,
+) -> Result<(), ConnectorError> {
+    let ConnectorWriteActivationIntent::ManagedPublication(intent) = &request.intent else {
+        return Ok(());
+    };
+    let (selected_cohort, preparation, routed_preparations, source_digest) = match &request.source {
+        ConnectorWriteActivationSource::Prepared(preparation) => (
+            ConnectorWriteCohortId::primary(request.operation_id),
+            preparation.clone(),
+            None,
+            preparation.digest(),
+        ),
+        ConnectorWriteActivationSource::RowMutation(plan) => {
+            plan.validate()?;
+            if plan.operation_id() != request.operation_id || plan.copy_on_write().is_some() {
+                return Err(invalid_iceberg_write_activation(
+                    "managed Iceberg publication requires one direct row-mutation plan",
+                ));
+            }
+            let mut routes = plan
+                .routes()
+                .iter()
+                .map(|route| (route.cohort_id(), route.preparation().clone()))
+                .collect::<Vec<_>>();
+            routes.sort_by_key(|(cohort_id, _)| *cohort_id);
+            let (selected_cohort, preparation) = routes.first().cloned().ok_or_else(|| {
+                invalid_iceberg_write_activation(
+                    "managed Iceberg row-mutation plan has no writer routes",
+                )
+            })?;
+            (selected_cohort, preparation, Some(routes), plan.digest())
+        }
+    };
+    preparation.validate()?;
+    let payload: TablePayload = decode_payload(
+        preparation.table().payload(),
+        "managed Iceberg publication target",
+    )?;
+    let target = payload.table_info.as_ref().ok_or_else(|| {
+        invalid_iceberg_write_activation(
+            "managed Iceberg publication target is missing its frozen descriptor",
+        )
+    })?;
+    if target.catalog != preparation.owner().instance_id.as_str()
+        || target.namespace != payload.namespace
+        || target.table != payload.table
+    {
+        return Err(invalid_iceberg_write_activation(
+            "managed Iceberg publication target identity drifted from its preparation",
+        ));
+    }
+    let frozen_metadata: TableMetadata =
+        serde_json::from_str(target.serialized_metadata.as_deref().ok_or_else(|| {
+            invalid_iceberg_write_activation(
+                "managed Iceberg publication target is missing frozen metadata",
+            )
+        })?)
+        .map_err(|error| {
+            invalid_iceberg_write_activation(format!(
+                "decode managed Iceberg publication metadata: {error}"
+            ))
+        })?;
+    let expected_snapshot_id =
+        iceberg_write_target_snapshot_id(&frozen_metadata, preparation.target_ref().as_str())?;
+    let entry = registry
+        .read()
+        .map_err(|error| {
+            invalid_iceberg_write_activation(format!(
+                "read Iceberg catalog registry for managed publication: {error}"
+            ))
+        })?
+        .get(&target.catalog)
+        .map_err(invalid_iceberg_write_activation)?;
+    let (commit_executor, observed_snapshot_id) =
+        super::write_commit::build_admitted_data_write_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            preparation.target_ref().as_str(),
+            preparation.intent(),
+            BTreeMap::new(),
+        )
+        .map_err(invalid_iceberg_write_activation)?;
+    let observed_metadata = commit_executor.table.metadata();
+    if observed_snapshot_id != expected_snapshot_id
+        || observed_metadata.uuid() != frozen_metadata.uuid()
+        || observed_metadata.current_schema_id() != frozen_metadata.current_schema_id()
+        || observed_metadata.default_partition_spec_id()
+            != frozen_metadata.default_partition_spec_id()
+        || observed_metadata.location() != frozen_metadata.location()
+    {
+        return Err(invalid_iceberg_write_activation(
+            "managed Iceberg publication target no longer matches its exact preparation",
+        ));
+    }
+    let provenance = novarocks_connector_iceberg::commit::MvProvenanceV1 {
+        provenance_version: novarocks_connector_iceberg::commit::MV_PROVENANCE_VERSION,
+        refresh_id: intent.refresh_id(),
+        mv_id: intent.materialization_id(),
+        token: intent.marker().to_string(),
+        technique: match intent.technique() {
+            ConnectorManagedPublicationTechnique::Full => {
+                novarocks_connector_iceberg::commit::RefreshTechnique::Full
+            }
+            ConnectorManagedPublicationTechnique::Incremental => {
+                novarocks_connector_iceberg::commit::RefreshTechnique::Incremental
+            }
+        },
+        bases: intent
+            .bases()
+            .iter()
+            .map(|base| novarocks_connector_iceberg::commit::ProvenanceBase {
+                table_fqn: base.table.to_string(),
+                uuid: base.uuid.to_string(),
+                from_snapshot: base.from_version,
+                to_snapshot: base.to_version,
+            })
+            .collect(),
+        definition_fingerprint: intent.definition_fingerprint().to_string(),
+        rows: 0,
+    };
+    let plan = IcebergFirstRefreshWritePlanPayloadV2 {
+        version: 2,
+        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+        target_ref: preparation.target_ref().as_str().to_string(),
+        expected_snapshot_id,
+        staging_path: commit_executor.collector.staging_dir.clone(),
+        provenance_properties: provenance
+            .to_summary_properties()
+            .map_err(invalid_iceberg_write_activation)?,
+    };
+    let empty_input_policy = match intent.empty_input() {
+        ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit => {
+            IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
+        }
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite => {
+            IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
+        }
+    };
+    let Some(routed_preparations) = routed_preparations else {
+        return register_iceberg_first_refresh_write_service_from_preparation(
+            services,
+            request.operation_id,
+            &preparation,
+            plan,
+            &entry,
+            commit_executor,
+            empty_input_policy,
+        );
+    };
+    let mut writer_payloads = Vec::with_capacity(routed_preparations.len());
+    for (_, route_preparation) in &routed_preparations {
+        route_preparation.validate()?;
+        if route_preparation.owner() != preparation.owner()
+            || route_preparation.table() != preparation.table()
+            || route_preparation.target_ref() != preparation.target_ref()
+            || route_preparation.base_version() != preparation.base_version()
+        {
+            return Err(invalid_iceberg_write_activation(
+                "managed Iceberg row-mutation route drifted from its exact target",
+            ));
+        }
+        let (_, payload) =
+            iceberg_route_writer_handle_payload(route_preparation, &entry, &commit_executor.table)?;
+        writer_payloads.push(payload);
+    }
+    let committer: Arc<dyn IcebergWriteReportCommitter> =
+        Arc::new(IcebergFirstRefreshWriteReportCommitter::new(
+            Arc::clone(&commit_executor),
+            plan.provenance_properties.clone(),
+            empty_input_policy,
+        )?);
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.managed-routed-publication-activation.v1\0");
+    hasher.update(request.operation_id.to_bytes());
+    hasher.update(source_digest);
+    hasher.update(plan.encode()?.as_ref());
+    let activation_digest: [u8; 32] = hasher.finalize().into();
+    let preparation_digest = preparation.digest();
+    services.register_lazy(request.operation_id, activation_digest, move || {
+        let context = IcebergWriteControlServiceContext::new_with_ordered_route_handle_payloads(
+            selected_cohort,
+            writer_payloads.clone(),
+            plan.clone(),
+            preparation_digest,
+            Arc::clone(&committer),
+        )?;
+        Ok(Arc::new(IcebergWriteControlService::new(context)))
+    })
+}
+
 /// Reserve a first-refresh writer from a sealed preparation.  The refresh
 /// adapter supplies its opaque commit seam, while this provider boundary owns
 /// the Iceberg sink/handle and the durable payload used by the control service.
@@ -6825,60 +7105,9 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
             ),
         ));
     }
-    let (mut sink_spec, equality_columns) =
-        iceberg_row_write_sink_spec_from_preparation(preparation, entry, table.metadata())?;
     validate_preparation_table_against_open_table(preparation, table.metadata())?;
-    // The preparation freezes the table metadata (including branch refs), but
-    // its table descriptor's current snapshot is necessarily `main`. Resolve
-    // the selected ref inside the provider before deriving BE-only partition
-    // and existing-DV facts.  In particular a branch COW rewrite may have
-    // introduced data files that are absent from main.
-    let snapshot_id = Some(expected_snapshot_id);
-    sink_spec
-        .set_planned_snapshot_id(snapshot_id)
-        .map_err(invalid_iceberg_write_activation)?;
-    let writer_handle_payload = match sink_spec.mode {
-        IcebergWriteSinkMode::PositionDeletes => {
-            let position_index_storage =
-                super::change_stream_write::position_delete_index_storage_config(
-                    entry,
-                    table.metadata().location(),
-                )
-                .map_err(invalid_iceberg_write_activation)?;
-            let partitions = super::sink::build_position_delete_data_file_partition_index(
-                table.metadata(),
-                snapshot_id,
-                table.metadata().location(),
-                position_index_storage.as_ref(),
-            )
-            .map_err(invalid_iceberg_write_activation)?;
-            encode_position_delete_sink_handle_payload(&sink_spec, table.metadata(), &partitions)
-                .map_err(invalid_iceberg_write_activation)?
-        }
-        IcebergWriteSinkMode::DeletionVectors => {
-            super::change_stream_write::frozen_deletion_vector_handle_payload(
-                &sink_spec,
-                &table,
-                entry,
-                snapshot_id,
-            )
-            .map_err(invalid_iceberg_write_activation)?
-        }
-        IcebergWriteSinkMode::EqualityDeletes => encode_equality_delete_sink_spec_handle_payload(
-            &sink_spec,
-            equality_columns.as_deref().ok_or_else(|| {
-                invalid_iceberg_write_activation(
-                    "equality-delete preparation is missing provider field bindings",
-                )
-            })?,
-        )
-        .map_err(invalid_iceberg_write_activation)?,
-        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
-            return Err(invalid_iceberg_write_activation(
-                "row-level Iceberg writer activation requires a row-level preparation shape",
-            ));
-        }
-    };
+    let (sink_spec, writer_handle_payload) =
+        iceberg_route_writer_handle_payload(preparation, entry, &table)?;
     register_iceberg_write_service_from_preparation_payload(
         services,
         operation_id,
@@ -6888,6 +7117,82 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
         writer_handle_payload,
         commit_executor,
     )
+}
+
+fn iceberg_route_writer_handle_payload(
+    preparation: &ConnectorWritePreparation,
+    entry: &IcebergCatalogEntry,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Result<(IcebergWriteSinkSpec, bytes::Bytes), ConnectorError> {
+    match preparation.input() {
+        ConnectorWriteInputShape::Data { .. } | ConnectorWriteInputShape::RowLineage { .. } => {
+            let sink_spec = iceberg_data_sink_spec_from_preparation(preparation, entry)?;
+            let payload = encode_data_sink_spec_handle_payload(&sink_spec)
+                .map_err(invalid_iceberg_write_activation)?;
+            Ok((sink_spec, payload))
+        }
+        ConnectorWriteInputShape::PositionDelete { .. }
+        | ConnectorWriteInputShape::DeletionVector { .. }
+        | ConnectorWriteInputShape::EqualityDelete { .. } => {
+            let (mut sink_spec, equality_columns) =
+                iceberg_row_write_sink_spec_from_preparation(preparation, entry, table.metadata())?;
+            let snapshot_id = iceberg_row_mutation_base_snapshot_from_preparation(
+                preparation,
+                preparation.target_ref().as_str(),
+            )?;
+            let snapshot_id = Some(snapshot_id);
+            sink_spec
+                .set_planned_snapshot_id(snapshot_id)
+                .map_err(invalid_iceberg_write_activation)?;
+            let payload = match sink_spec.mode {
+                IcebergWriteSinkMode::PositionDeletes => {
+                    let position_index_storage =
+                        super::change_stream_write::position_delete_index_storage_config(
+                            entry,
+                            table.metadata().location(),
+                        )
+                        .map_err(invalid_iceberg_write_activation)?;
+                    let partitions = super::sink::build_position_delete_data_file_partition_index(
+                        table.metadata(),
+                        snapshot_id,
+                        table.metadata().location(),
+                        position_index_storage.as_ref(),
+                    )
+                    .map_err(invalid_iceberg_write_activation)?;
+                    encode_position_delete_sink_handle_payload(
+                        &sink_spec,
+                        table.metadata(),
+                        &partitions,
+                    )
+                    .map_err(invalid_iceberg_write_activation)?
+                }
+                IcebergWriteSinkMode::DeletionVectors => {
+                    super::change_stream_write::frozen_deletion_vector_handle_payload(
+                        &sink_spec,
+                        table,
+                        entry,
+                        snapshot_id,
+                    )
+                    .map_err(invalid_iceberg_write_activation)?
+                }
+                IcebergWriteSinkMode::EqualityDeletes => {
+                    encode_equality_delete_sink_spec_handle_payload(
+                        &sink_spec,
+                        equality_columns.as_deref().ok_or_else(|| {
+                            invalid_iceberg_write_activation(
+                                "equality-delete preparation is missing provider field bindings",
+                            )
+                        })?,
+                    )
+                    .map_err(invalid_iceberg_write_activation)?
+                }
+                IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
+                    unreachable!("row-level preparation produced a data sink")
+                }
+            };
+            Ok((sink_spec, payload))
+        }
+    }
 }
 
 /// Provider-facing COW cohort facts.  The mutation kernel supplies only the
@@ -7860,14 +8165,13 @@ impl IcebergQueryTableMaterialization {
     }
 }
 
-/// Freeze the full and affected IMV target reads while the provider owns the
-/// Iceberg file representation.  Core receives only the two opaque read
-/// authorities; it does not inspect, filter, or encode Iceberg data files.
+/// Freeze the exact IMV target read while the provider owns the table handle.
+///
+/// Both lanes intentionally reuse the same full-table authority. Affected
+/// partition filtering is a performance optimization and must not force Core
+/// to recover provider file tuples or concrete target-table state.
 pub(crate) fn freeze_mv_target_reads(
     materialization: &IcebergQueryTableMaterialization,
-    target_runtime: &crate::mv::refresh::target_apply::IcebergMvTargetRuntimeBinding,
-    filter: &crate::mv::model::TargetPartitionFilter,
-    contract: Option<&crate::mv::persistence::schema::MvPartitionContract>,
     selector: ConnectorReadSelector,
 ) -> Result<
     (
@@ -7876,13 +8180,12 @@ pub(crate) fn freeze_mv_target_reads(
     ),
     String,
 > {
-    let files = target_runtime.data_files_at_frozen_snapshot()?;
-    let full = materialization.with_frozen_files(files.clone(), selector)?;
-    let affected = materialization.with_frozen_files(
-        filter_frozen_mv_target_state_files(files, filter, contract, 0)?,
-        selector,
-    )?;
-    Ok((full, affected))
+    let mut exact = materialization.clone();
+    exact.read_selector = selector;
+    if let ConnectorReadSelector::SnapshotId(snapshot_id) = selector {
+        exact.table.current_snapshot_id = Some(snapshot_id);
+    }
+    Ok((exact.clone(), exact))
 }
 
 pub(crate) fn filter_frozen_mv_target_state_files(
@@ -9273,6 +9576,21 @@ mod tests {
         assert!(payload.explicit_files.is_some());
         assert_eq!(payload.explicit_files.as_ref().map(Vec::len), Some(0));
         assert!(payload.prepared_files.is_empty());
+
+        let (full, affected) =
+            freeze_mv_target_reads(&materialization, ConnectorReadSelector::SnapshotId(7))
+                .expect("freeze exact MV target read lanes");
+        assert_eq!(full.read_selector, ConnectorReadSelector::SnapshotId(7));
+        assert_eq!(affected.read_selector, full.read_selector);
+        assert_eq!(affected.read_table, full.read_table);
+        assert_eq!(
+            affected.planning_lease.binding().incarnation(),
+            full.planning_lease.binding().incarnation()
+        );
+        let affected_payload: TablePayload =
+            decode_payload(affected.read_table.payload(), "affected full-table lane")
+                .expect("decode affected target read");
+        assert!(affected_payload.explicit_files.is_none());
     }
 
     #[test]
@@ -10019,6 +10337,150 @@ mod tests {
         assert_eq!(evidence.operation_kind(), "create-namespace");
         assert!(format!("{evidence:?}").contains("provider_payload_len"));
         assert!(!format!("{evidence:?}").contains("\"namespace\""));
+    }
+
+    #[test]
+    fn legacy_guarded_properties_require_exact_committed_partitioning() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let (_runtime, provider) = local_planning_provider(warehouse.path());
+        let target = ConnectorExecutionBindingKey {
+            instance_id: provider.instance_id.clone(),
+            incarnation: provider.incarnation,
+        };
+        let namespace = novarocks_spi::connector::ConnectorNamespaceIdentity {
+            instance_id: provider.instance_id.clone(),
+            namespace: Arc::from("guarded"),
+        };
+        let create_namespace = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                    namespace,
+                    policy: CreatePolicy::FailIfExists,
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("create namespace");
+        assert!(matches!(
+            create_namespace,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: provider.instance_id.clone(),
+            namespace: Arc::from("guarded"),
+            table: Arc::from("orders"),
+        };
+        let create_table = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::CreateTable {
+                    table: table.clone(),
+                    columns: vec![ConnectorColumnDefinition {
+                        name: Arc::from("id"),
+                        data_type: ConnectorDataType::BigInt,
+                        nullable: false,
+                        aggregation: None,
+                        default: None,
+                    }],
+                    key: None,
+                    partitioning: vec![ConnectorPartitionTransform::Identity {
+                        column: Arc::from("id"),
+                    }],
+                    properties: Vec::new(),
+                    policy: CreatePolicy::FailIfExists,
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("create table");
+        assert!(matches!(
+            create_table,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        let entry = provider
+            .entry(provider.instance_id.as_str())
+            .expect("entry");
+        let loaded = load_table(&entry, &table.namespace, &table.table).expect("load table");
+        let current = super::super::catalog::schema_update::canonical_committed_partitioning(
+            loaded.table.metadata(),
+        )
+        .expect("canonical partitioning");
+        let success = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: vec![novarocks_spi::connector::ConnectorPropertyChange::Set {
+                        key: Arc::from("novarocks.mv.partition"),
+                        value: Arc::from("exact"),
+                    }],
+                    authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(current.clone()),
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("guarded property success");
+        assert!(matches!(
+            success,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        let empty = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: Vec::new(),
+                    authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(current.clone()),
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("empty guarded property mutation");
+        assert!(matches!(
+            empty,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::InvalidRequest
+        ));
+        let first = current.fields().first().expect("partition field");
+        let mut mismatched_fields = current.fields().to_vec();
+        mismatched_fields[0] = novarocks_spi::connector::ConnectorCommittedPartitionField::try_new(
+            first.partition_field_id(),
+            format!("{}_changed", first.partition_field_name()),
+            first.source_field_id(),
+            first.source_column_name(),
+            first.position(),
+            first.transform(),
+        )
+        .expect("mismatched partition field");
+        let mismatched = novarocks_spi::connector::ConnectorCommittedPartitioning::try_new(
+            current.spec_id(),
+            mismatched_fields,
+        )
+        .expect("mismatched canonical guard");
+        let mismatch = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target,
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes: vec![novarocks_spi::connector::ConnectorPropertyChange::Set {
+                        key: Arc::from("novarocks.mv.partition"),
+                        value: Arc::from("stale"),
+                    }],
+                    authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(mismatched),
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("guarded property mismatch");
+        assert!(matches!(
+            mismatch,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+        ));
     }
 
     #[test]
