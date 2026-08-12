@@ -557,7 +557,7 @@ async fn execution_failure_fails_the_job_preserves_message_and_keeps_worker_runn
 
 #[tokio::test(flavor = "multi_thread")]
 async fn service_start_accepts_an_engine_exactly_once() {
-    let (_temp, store, _repository, service) = fixture().await;
+    let (_temp, _store, _repository, service) = fixture().await;
     let engine = Arc::new(FakeMaintenanceEngine::succeeding());
     let first: Arc<dyn TableMaintenanceEngine> = engine.clone();
     let second: Arc<dyn TableMaintenanceEngine> = engine.clone();
@@ -601,7 +601,7 @@ async fn shutdown_wakes_and_joins_worker_and_prevents_later_claims() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_engine_weak_reference_ends_worker_without_a_reference_cycle() {
-    let (_temp, store, _repository, service) = fixture().await;
+    let (_temp, _store, _repository, service) = fixture().await;
     let dropped = Arc::new(AtomicBool::new(false));
     let engine = Arc::new(FakeMaintenanceEngine::with_drop_flag(Arc::clone(&dropped)));
     let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
@@ -677,7 +677,7 @@ async fn explicit_wakeup_dispatches_a_submitted_job_before_polling() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_shutdown_is_idempotent() {
-    let (_temp, store, _repository, service) = fixture().await;
+    let (_temp, _store, _repository, service) = fixture().await;
     let engine = Arc::new(FakeMaintenanceEngine::succeeding());
     let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
     service

@@ -495,6 +495,7 @@ impl OptimizeJobRepository {
     /// Recovery-only takeover: finalize a job whose outcome the previous
     /// attempt already recorded. The caller proves it holds the live lease;
     /// the stale attempt bound to the record is irrelevant and is replaced.
+    #[allow(clippy::too_many_arguments)]
     pub async fn finish_recovered_fenced(
         &self,
         job_id: i64,
@@ -973,6 +974,7 @@ impl OptimizeJobRepository {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn recover_operation(
         &self,
         transaction_id: TransactionId,
@@ -1093,12 +1095,12 @@ async fn apply_create(
     request: OptimizeJobCreate,
     admission: Option<&WriteAdmission>,
 ) -> TransactionResult<OptimizeJob> {
-    if let Some(admission) = admission {
-        if let Err(error) = admission.validate_in(transaction).await {
-            return Ok(Err(RepositoryError::authority_lost(format!(
-                "maintenance write admission lost: {error}"
-            ))));
-        }
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
     }
     let active_key = match active_target_key(&request.target) {
         Ok(key) => key,
@@ -1552,17 +1554,16 @@ async fn apply_record_outcome(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    if let Some((authority, validator)) = fenced {
-        if let Err(error) = validate_bound_fenced_authority(
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
             transaction,
             job.stored.authority.as_ref(),
             authority,
             validator,
         )
         .await
-        {
-            return Ok(Err(error));
-        }
+    {
+        return Ok(Err(error));
     }
     let key = match job_key(job_id) {
         Ok(key) => key,
@@ -1596,17 +1597,16 @@ async fn apply_finish(
         Ok(job) => job,
         Err(error) => return Ok(Err(error)),
     };
-    if let Some((authority, validator)) = fenced {
-        if let Err(error) = validate_bound_fenced_authority(
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
             transaction,
             job.stored.authority.as_ref(),
             authority,
             validator,
         )
         .await
-        {
-            return Ok(Err(error));
-        }
+    {
+        return Ok(Err(error));
     }
     if job.stored.outcome.is_none() {
         return Ok(Err(RepositoryError::new(
@@ -1639,17 +1639,16 @@ async fn apply_fail(
         Ok(job) => job,
         Err(error) => return Ok(Err(error)),
     };
-    if let Some((authority, validator)) = fenced {
-        if let Err(error) = validate_bound_fenced_authority(
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
             transaction,
             job.stored.authority.as_ref(),
             authority,
             validator,
         )
         .await
-        {
-            return Ok(Err(error));
-        }
+    {
+        return Ok(Err(error));
     }
     job.stored.state = StoredOptimizeJobStateV1::Failed;
     job.stored.error_message = Some(message);
@@ -2970,6 +2969,7 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn transition_terminal_fenced(
         &self,
         operation_id: Uuid,
@@ -3158,12 +3158,12 @@ async fn apply_metadata_create(
     if let Err(error) = validate_metadata_create(&request) {
         return Ok(Err(error));
     }
-    if let Some(admission) = admission {
-        if let Err(error) = admission.validate_in(transaction).await {
-            return Ok(Err(RepositoryError::authority_lost(format!(
-                "maintenance write admission lost: {error}"
-            ))));
-        }
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
     }
     let existing = match load_metadata_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
@@ -3414,12 +3414,12 @@ async fn apply_metadata_start(
         if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
             return Ok(Err(error));
         }
-        if let Some(durable) = operation.stored.authority.as_ref() {
-            if durable != authority {
-                return Ok(Err(RepositoryError::authority_lost(
-                    "metadata maintenance durable authority does not match attempt",
-                )));
-            }
+        if let Some(durable) = operation.stored.authority.as_ref()
+            && durable != authority
+        {
+            return Ok(Err(RepositoryError::authority_lost(
+                "metadata maintenance durable authority does not match attempt",
+            )));
         }
     }
     if operation.stored.state == MetadataMaintenanceOperationState::Running
@@ -3502,17 +3502,16 @@ async fn apply_metadata_reconcile_pending(
             ),
         )));
     };
-    if let Some((authority, validator)) = fenced {
-        if let Err(error) = validate_bound_fenced_authority(
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
             transaction,
             operation.stored.authority.as_ref(),
             authority,
             validator,
         )
         .await
-        {
-            return Ok(Err(error));
-        }
+    {
+        return Ok(Err(error));
     }
     if operation.stored.state == MetadataMaintenanceOperationState::ReconcilePending
         && metadata_payload_matches(
@@ -3570,6 +3569,7 @@ async fn apply_metadata_reconcile_pending(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_metadata_terminal(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
@@ -3592,17 +3592,16 @@ async fn apply_metadata_terminal(
             ),
         )));
     };
-    if let Some((authority, validator)) = fenced {
-        if let Err(error) = validate_bound_fenced_authority(
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
             transaction,
             operation.stored.authority.as_ref(),
             authority,
             validator,
         )
         .await
-        {
-            return Ok(Err(error));
-        }
+    {
+        return Ok(Err(error));
     }
     let target_state = match action {
         StoredMetadataMaintenanceTransactionActionV2::Finish => {
@@ -3706,17 +3705,16 @@ async fn apply_metadata_unresolved(
             ),
         )));
     };
-    if let Some((authority, validator)) = fenced {
-        if let Err(error) = validate_bound_fenced_authority(
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
             transaction,
             operation.stored.authority.as_ref(),
             authority,
             validator,
         )
         .await
-        {
-            return Ok(Err(error));
-        }
+    {
+        return Ok(Err(error));
     }
     if operation.stored.state == MetadataMaintenanceOperationState::Unresolved {
         return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
@@ -5163,6 +5161,7 @@ impl DistributedRewriteOperationRepository {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_transition(
         &self,
         operation_id: Uuid,
@@ -5215,6 +5214,7 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_transition_fenced(
         &self,
         operation_id: Uuid,
@@ -5304,12 +5304,12 @@ async fn apply_rewrite_create(
     if let Err(error) = validate_rewrite_create(&request) {
         return Ok(Err(error));
     }
-    if let Some(admission) = admission {
-        if let Err(error) = admission.validate_in(transaction).await {
-            return Ok(Err(RepositoryError::authority_lost(format!(
-                "maintenance write admission lost: {error}"
-            ))));
-        }
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
     }
     let existing = match load_rewrite_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
@@ -5371,17 +5371,16 @@ async fn apply_rewrite_create(
                 "create distributed rewrite operation failed: active optimize job {active_job_id} is not the claimed running target"
             ))));
         }
-        if let Some((authority, validator)) = fenced {
-            if let Err(error) = validate_bound_fenced_authority(
+        if let Some((authority, validator)) = fenced
+            && let Err(error) = validate_bound_fenced_authority(
                 transaction,
                 active_job.authority.as_ref(),
                 authority,
                 validator,
             )
             .await
-            {
-                return Ok(Err(error));
-            }
+        {
+            return Ok(Err(error));
         }
         // Record the dispatch link in this same transaction. After a crash the
         // recovery owner reads it to know an external rewrite may already have
@@ -5500,6 +5499,7 @@ async fn apply_rewrite_create(
     Ok(Ok(DistributedRewriteOperation::from(&stored)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_rewrite_transition(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
@@ -5626,16 +5626,15 @@ async fn apply_rewrite_transition(
     if next == DistributedRewriteOperationState::Finished {
         operation.stored.finished_at_ms = Some(now_ms);
     }
-    if next == DistributedRewriteOperationState::AbortPending
+    if (next == DistributedRewriteOperationState::AbortPending
         || next == DistributedRewriteOperationState::CommitPending
         || next == DistributedRewriteOperationState::ReconcilePending
-        || next == DistributedRewriteOperationState::Staging
+        || next == DistributedRewriteOperationState::Staging)
+        && operation.stored.started_at_ms.is_none()
     {
-        if operation.stored.started_at_ms.is_none() {
-            return Ok(Err(RepositoryError::corruption(
-                "active distributed rewrite operation has no durable plan",
-            )));
-        }
+        return Ok(Err(RepositoryError::corruption(
+            "active distributed rewrite operation has no durable plan",
+        )));
     }
     operation.stored.state = next;
     rewrite_transition_state(
@@ -5651,6 +5650,7 @@ async fn apply_rewrite_transition(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_transition_state(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
@@ -6975,6 +6975,7 @@ impl CleanupOperationRepository {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn cleanup_transition_fenced(
         &self,
         operation_id: Uuid,
@@ -7133,12 +7134,12 @@ async fn apply_cleanup_create(
     if let Err(error) = validate_cleanup_create(&request) {
         return Ok(Err(error));
     }
-    if let Some(admission) = admission {
-        if let Err(error) = admission.validate_in(transaction).await {
-            return Ok(Err(RepositoryError::authority_lost(format!(
-                "maintenance write admission lost: {error}"
-            ))));
-        }
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
     }
     if let Some(existing) = load_cleanup_operation(transaction, request.operation_id).await?? {
         if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
@@ -7577,6 +7578,7 @@ async fn apply_cleanup_reconciled_checkpoint(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_cleanup_transition(
     transaction: &mut dyn WriteTransaction,
     transaction_id: OperationId,

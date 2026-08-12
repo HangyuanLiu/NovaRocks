@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use novarocks::engine::table_maintenance::MaintenanceTarget;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_spi::state_store::WriteTransaction;
 use novarocks_state_store::OperationId;
