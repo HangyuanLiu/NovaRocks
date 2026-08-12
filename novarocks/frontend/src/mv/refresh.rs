@@ -58,6 +58,9 @@ pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
     pub(super) provider_activation: Arc<FrontendMvRefreshProviderActivationPort>,
+    /// Cluster-wide refresh ownership. `None` only where a single owner is
+    /// structurally guaranteed, such as a composition without a StateStore.
+    pub(super) ownership: Option<super::coordination::MvRefreshOwnershipContext>,
 }
 
 /// Composition-owned indirection between the frontend lifecycle and the Core
@@ -191,6 +194,47 @@ pub(super) fn execute(
             "MV refresh connector generation changed after SQL preparation",
         ));
     }
+
+    // Take cluster-wide ownership before any durable refresh state exists. The
+    // process-local activity gate upstream decides fairness within this frontend;
+    // this is what arbitrates between frontends. Contention is routine in a
+    // multi-frontend deployment, so it surfaces as a retryable conflict rather
+    // than a refresh failure.
+    let _ownership = match &dependencies.ownership {
+        Some(context) => {
+            let resource = super::coordination::resolve_target_resource_for(
+                planning_lease.binding(),
+                novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(refresh.finalize.target.database.as_str()),
+                    table: Arc::from(refresh.finalize.target.name.as_str()),
+                },
+                &connector_context,
+            )
+            .map_err(|error| unavailable(error.to_string()))?;
+            Some(
+                futures::executor::block_on(super::coordination::acquire_refresh_ownership(
+                    &context.coordination,
+                    &context.registry,
+                    refresh.finalize.mv_id,
+                    resource,
+                ))
+                .map_err(|refusal| match refusal {
+                    super::coordination::OwnershipRefusal::Contended
+                    | super::coordination::OwnershipRefusal::AwaitingTakeover => {
+                        MvApplicationError::new(
+                            MvApplicationErrorKind::AlreadyActive,
+                            "another frontend currently owns this materialized view's refresh",
+                        )
+                    }
+                    super::coordination::OwnershipRefusal::Unavailable => {
+                        unavailable("MV refresh ownership coordination is unavailable")
+                    }
+                })?,
+            )
+        }
+        None => None,
+    };
 
     let base_snapshots = required_base_snapshots(&refresh.finalize)?;
     let base_table_uuids = refresh.finalize.base_table_uuids.clone();

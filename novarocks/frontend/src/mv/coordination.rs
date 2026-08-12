@@ -189,6 +189,30 @@ pub(crate) fn resolve_target_resource(
     Ok(resource)
 }
 
+/// The coordination a frontend needs to own refreshes: the lease manager and the
+/// registry the repository consults.
+///
+/// Bundled so composition passes one value and the refresh path cannot end up
+/// holding a lease manager whose grants nobody records.
+#[derive(Clone)]
+pub(crate) struct MvRefreshOwnershipContext {
+    pub(crate) coordination: MvRefreshCoordination,
+    pub(crate) registry: Arc<MvRefreshOwnershipRegistry>,
+}
+
+impl MvRefreshOwnershipContext {
+    pub(crate) async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
+        Ok(Self {
+            coordination: MvRefreshCoordination::open(store).await?,
+            registry: MvRefreshOwnershipRegistry::new(),
+        })
+    }
+
+    pub(crate) fn registry(&self) -> Arc<dyn MvRefreshFenceSource> {
+        Arc::clone(&self.registry) as Arc<dyn MvRefreshFenceSource>
+    }
+}
+
 /// Resolves a target's stable refresh resource from its catalog coordinates.
 ///
 /// Two provider calls, both side-effect free, both against the *same* control

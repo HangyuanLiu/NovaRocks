@@ -488,6 +488,25 @@ impl FrontendApplicationHost {
                     Arc::clone(port)
                         as Arc<dyn crate::mv::repository::CatalogAttachmentObservationSource>
                 });
+                // Cluster-wide refresh ownership. The registry is intentionally
+                // not yet installed as the repository's fence source: the refresh
+                // path must be registering ownership before anything consults it,
+                // or every refresh would fail closed.
+                let ownership = match crate::mv::coordination::MvRefreshOwnershipContext::open(
+                    Arc::clone(&store),
+                )
+                .await
+                {
+                    Ok(ownership) => Some(ownership),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "frontend MV refresh ownership coordination unavailable; \
+                             refreshes remain single-owner"
+                        );
+                        None
+                    }
+                };
                 match StateStoreMvRepository::open_with_catalog_attachment_observations(
                     store,
                     tokio::runtime::Handle::current(),
@@ -511,6 +530,7 @@ impl FrontendApplicationHost {
                             execution.mv_maintenance.clone(),
                             host.table_maintenance_service(),
                             execution.optimizer_query_mem_limit_bytes(),
+                            ownership,
                         ));
                         host.mv_background_engine_sink = Some(
                             FrontendMvService::background_engine_sink(Arc::clone(&service)),

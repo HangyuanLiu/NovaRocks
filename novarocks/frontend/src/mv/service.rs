@@ -105,6 +105,7 @@ impl FrontendMvService {
             dyn novarocks::engine::table_maintenance::TableMaintenanceService,
         >,
         optimizer_query_mem_limit_bytes: u64,
+        ownership: Option<super::coordination::MvRefreshOwnershipContext>,
     ) -> Self {
         Self {
             repository,
@@ -112,6 +113,7 @@ impl FrontendMvService {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
+                ownership,
             }),
             recovery: Some(recovery::FrontendMvRecoveryDependencies {
                 connector_control,

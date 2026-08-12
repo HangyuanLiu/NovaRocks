@@ -24,7 +24,7 @@ mod attempt_classification;
 // are switched onto it. The repository-side fence it feeds is already live, so
 // it lands first and is wired next rather than being held back.
 #[allow(dead_code)]
-mod coordination;
+pub(crate) mod coordination;
 // Additive lake-first enumeration. Replacing ledger-driven enumeration is a
 // separate change to startup ordering; landing both at once would make a
 // regression in either indistinguishable from a regression in the other.
