@@ -1369,6 +1369,7 @@ impl FrontendTableMaintenanceService {
             &operation.target,
             &operation.owner,
             ConnectorHistoricalMaintenanceFamily::MetadataMaintenance,
+            metadata_maintenance_kind_name(operation.kind),
             operation.operation_id,
             operation.request_digest,
             operation.plan_digest,
@@ -1480,6 +1481,7 @@ impl FrontendTableMaintenanceService {
                 &operation.target,
                 &operation.owner,
                 ConnectorHistoricalMaintenanceFamily::DistributedRewrite,
+                distributed_rewrite_kind_name(operation.kind),
                 operation.operation_id,
                 operation.request_digest,
                 operation.plan_digest,
@@ -1751,6 +1753,7 @@ impl FrontendTableMaintenanceService {
             &operation.target,
             &operation.owner,
             ConnectorHistoricalMaintenanceFamily::Cleanup,
+            novarocks_spi::connector::REMOVE_UNREFERENCED_OBJECTS_KIND,
             operation.operation_id,
             operation.request_digest,
             operation.plan_digest,
@@ -2113,6 +2116,30 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
     }
 }
 
+/// The provider's own name for a distributed rewrite operation.
+const fn distributed_rewrite_kind_name(kind: DistributedRewriteOperationKind) -> &'static str {
+    match kind {
+        DistributedRewriteOperationKind::RewriteDataFiles => {
+            novarocks_spi::connector::REWRITE_DATA_FILES_KIND
+        }
+        DistributedRewriteOperationKind::RewritePositionDeleteFiles => {
+            novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND
+        }
+    }
+}
+
+/// The provider's own name for a metadata maintenance operation.
+const fn metadata_maintenance_kind_name(kind: MetadataMaintenanceOperationKind) -> &'static str {
+    match kind {
+        MetadataMaintenanceOperationKind::RewriteMetadataLayout => {
+            novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND
+        }
+        MetadataMaintenanceOperationKind::ExpireTableVersions => {
+            novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND
+        }
+    }
+}
+
 /// Load the durable metadata-maintenance plan as a provider artifact.
 fn metadata_plan_artifact(
     service: &FrontendTableMaintenanceService,
@@ -2142,6 +2169,7 @@ fn historical_descriptor(
     target: &MaintenanceTarget,
     owner: &MetadataMaintenanceExactOwner,
     family: ConnectorHistoricalMaintenanceFamily,
+    operation_kind: &str,
     operation_id: uuid::Uuid,
     request_digest: [u8; 32],
     plan_digest: Option<[u8; 32]>,
@@ -2167,6 +2195,7 @@ fn historical_descriptor(
             table: target.table.clone().into(),
         },
         family,
+        operation_kind,
         *operation_id.as_bytes(),
         request_digest,
         plan_digest,

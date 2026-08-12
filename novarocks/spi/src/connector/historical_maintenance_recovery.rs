@@ -132,6 +132,10 @@ pub struct ConnectorHistoricalMaintenanceDescriptor {
     pub historical_binding: ConnectorExecutionBindingKey,
     pub table: ConnectorTableIdentity,
     pub family: ConnectorHistoricalMaintenanceFamily,
+    /// The provider's own name for what the operation was doing. It is part of
+    /// the operation's stable identity, so an inspector cannot recognize its
+    /// own work without it.
+    pub operation_kind: Arc<str>,
     pub operation_id: [u8; 16],
     pub request_digest: [u8; 32],
     pub plan_digest: Option<[u8; 32]>,
@@ -149,6 +153,7 @@ impl ConnectorHistoricalMaintenanceDescriptor {
         historical_binding: ConnectorExecutionBindingKey,
         table: ConnectorTableIdentity,
         family: ConnectorHistoricalMaintenanceFamily,
+        operation_kind: impl Into<Arc<str>>,
         operation_id: [u8; 16],
         request_digest: [u8; 32],
         plan_digest: Option<[u8; 32]>,
@@ -157,6 +162,10 @@ impl ConnectorHistoricalMaintenanceDescriptor {
         dispatch: ConnectorHistoricalDispatchFacts,
         recovery_attempt: [u8; 16],
     ) -> Result<Self, ConnectorError> {
+        let operation_kind = operation_kind.into();
+        if operation_kind.is_empty() {
+            return Err(invalid("historical maintenance operation kind is empty"));
+        }
         if operation_id == [0u8; 16] {
             return Err(invalid("historical maintenance operation id is empty"));
         }
@@ -179,6 +188,7 @@ impl ConnectorHistoricalMaintenanceDescriptor {
             &historical_binding,
             &table,
             family,
+            &operation_kind,
             operation_id,
             request_digest,
             plan_digest.as_ref(),
@@ -191,6 +201,7 @@ impl ConnectorHistoricalMaintenanceDescriptor {
             historical_binding,
             table,
             family,
+            operation_kind,
             operation_id,
             request_digest,
             plan_digest,
@@ -211,6 +222,7 @@ impl ConnectorHistoricalMaintenanceDescriptor {
             &self.historical_binding,
             &self.table,
             self.family,
+            &self.operation_kind,
             self.operation_id,
             self.request_digest,
             self.plan_digest.as_ref(),
@@ -678,6 +690,7 @@ fn descriptor_digest(
     binding: &ConnectorExecutionBindingKey,
     table: &ConnectorTableIdentity,
     family: ConnectorHistoricalMaintenanceFamily,
+    operation_kind: &str,
     operation_id: [u8; 16],
     request_digest: [u8; 32],
     plan_digest: Option<&[u8; 32]>,
@@ -698,6 +711,8 @@ fn descriptor_digest(
     hasher.update(table.table.as_ref().as_bytes());
     hasher.update([0u8]);
     hasher.update([family as u8]);
+    hasher.update(operation_kind.as_bytes());
+    hasher.update([0u8]);
     hasher.update(operation_id);
     hasher.update(request_digest);
     match plan_digest {
@@ -849,6 +864,7 @@ mod tests {
                 table: Arc::from("orders"),
             },
             family,
+            "rewrite-metadata-layout",
             [7; 16],
             [1; 32],
             Some([2; 32]),
@@ -925,6 +941,7 @@ mod tests {
                 table: Arc::from("orders"),
             },
             ConnectorHistoricalMaintenanceFamily::Cleanup,
+            "remove-orphan-files",
             [7; 16],
             [1; 32],
             None,
