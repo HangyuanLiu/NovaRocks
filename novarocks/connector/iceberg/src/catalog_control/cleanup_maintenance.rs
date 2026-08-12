@@ -1258,6 +1258,98 @@ fn exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message.into())
 }
 
+/// How one historical cleanup batch actually landed.
+pub(crate) struct HistoricalCleanupCounts {
+    pub deleted: u64,
+    pub already_absent: u64,
+    pub failed: u64,
+    pub unknown: u64,
+}
+
+/// Classify a batch a dead generation dispatched, without deleting anything.
+///
+/// This is a read: it stats each object in the frozen batch and reports what it
+/// finds. Nothing here plans, prepares or deletes, and the candidate set is
+/// exactly the one the old attempt froze -- the manifest digest is what proves
+/// the list read back is that same list, and the table UUID check is what stops
+/// a dropped-and-recreated table from being classified against an old manifest.
+pub(crate) fn classify_historical_cleanup_batch(
+    runtime: &IcebergControlRuntime,
+    operation_id: [u8; 16],
+    plan_payload: &[u8],
+    prepared_payload: &[u8],
+    manifest_digest: [u8; 32],
+) -> Result<HistoricalCleanupCounts, ConnectorError> {
+    let payload: PlanPayload = decode_canonical(plan_payload, "cleanup plan")?;
+    let prepared =
+        PreparedBatch::try_from_wire_v1(bytes::Bytes::copy_from_slice(prepared_payload))?;
+    let evidence: PreparedPayload =
+        decode_canonical(prepared.evidence_payload(), "cleanup prepared evidence")?;
+    if evidence.version != ARTIFACT_VERSION
+        || evidence.artifact_root != payload.artifact_root
+        || evidence.batch_ordinal != prepared.batch_ordinal()
+        || evidence.record_count == 0
+        || evidence.record_count as usize > MAX_BATCH_OBJECTS
+        || evidence.batch_digest_hex != hex_encode(prepared.batch_digest())
+    {
+        return Err(corrupt("Iceberg cleanup prepared evidence is invalid"));
+    }
+
+    runtime
+        .control_state()
+        .invalidate_table(&payload.namespace, &payload.table);
+    let physical = runtime
+        .load_table(&payload.namespace, &payload.table)
+        .map_err(unavailable)?;
+    if physical.table.metadata().uuid().to_string() != payload.table_uuid {
+        return Err(corrupt(
+            "Iceberg cleanup table incarnation no longer matches its frozen manifest",
+        ));
+    }
+    let table_location = physical.table.metadata().location().to_string();
+    let expected_prefix = format!(
+        "{table_location}/_novarocks/maintenance/v3/orphan-cleanup/{}/",
+        hex_encode(operation_id)
+    );
+    if !payload.artifact_root.starts_with(&expected_prefix) {
+        return Err(corrupt(
+            "Iceberg cleanup artifact root does not match its frozen table",
+        ));
+    }
+    let records = read_manifest(
+        runtime,
+        &physical.table.file_io().clone(),
+        &payload.artifact_root,
+        manifest_digest,
+    )?;
+    let start = evidence.first_ordinal as usize;
+    let end = start
+        .checked_add(evidence.record_count as usize)
+        .ok_or_else(|| corrupt("Iceberg cleanup batch range overflows its manifest"))?;
+    if end > records.len() {
+        return Err(corrupt("Iceberg cleanup batch exceeds its frozen manifest"));
+    }
+    let batch = &records[start..end];
+
+    let config = runtime.control_state().object_store_config();
+    let outcomes = reconcile_frozen_batch(runtime, batch, config)?;
+    let mut counts = HistoricalCleanupCounts {
+        deleted: 0,
+        already_absent: 0,
+        failed: 0,
+        unknown: 0,
+    };
+    for outcome in &outcomes {
+        match outcome.outcome {
+            ObjectOutcome::Deleted => counts.deleted += 1,
+            ObjectOutcome::AlreadyAbsent => counts.already_absent += 1,
+            ObjectOutcome::Failed => counts.failed += 1,
+            ObjectOutcome::Unknown => counts.unknown += 1,
+        }
+    }
+    Ok(counts)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

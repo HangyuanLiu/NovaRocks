@@ -937,6 +937,92 @@ fn resource_exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message.into())
 }
 
+/// What a live generation could conclude about a dead generation's marker.
+pub(crate) enum MetadataMaintenanceMarkerMatch {
+    Committed { snapshot_id: Option<i64> },
+    Undecided { reason: &'static str },
+}
+
+/// Look for the marker a dead generation would have committed under.
+///
+/// The identity is rebuilt from the descriptor's *historical* binding, because
+/// the marker embeds the incarnation that wrote it. Only an exact match on both
+/// the operation id and that identity counts: a marker for the same operation
+/// with a different identity belongs to another attempt, and one that is simply
+/// absent proves nothing, since the snapshot carrying it may have been expired.
+pub(crate) fn lookup_historical_metadata_marker(
+    runtime: &IcebergControlRuntime,
+    instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    descriptor: &novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
+) -> Result<MetadataMaintenanceMarkerMatch, ConnectorError> {
+    let Some(plan_digest) = descriptor.plan_digest else {
+        return Ok(MetadataMaintenanceMarkerMatch::Undecided {
+            reason: "operation has no durable plan digest",
+        });
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(IDENTITY_DOMAIN);
+    digest_bytes(&mut hasher, b"iceberg");
+    digest_bytes(&mut hasher, instance_id.as_str().as_bytes());
+    hasher.update(descriptor.historical_binding.incarnation.to_bytes());
+    hasher.update(descriptor.operation_id);
+    digest_bytes(&mut hasher, descriptor.operation_kind.as_bytes());
+    hasher.update(descriptor.request_digest);
+    hasher.update(plan_digest);
+    let identity: [u8; 32] = hasher.finalize().into();
+    let identity_hex = hex_encode(identity);
+    let operation_hex = hex_encode(descriptor.operation_id);
+
+    let namespace = descriptor.table.namespace.as_ref();
+    let table = descriptor.table.table.as_ref();
+    runtime
+        .control_state()
+        .invalidate_table_cache(namespace, table);
+    let loaded = runtime.load_table(namespace, table).map_err(|error| {
+        unavailable(format!(
+            "load Iceberg table for historical marker lookup: {error}"
+        ))
+    })?;
+    let metadata = loaded.table.metadata();
+    if let Some(raw) = metadata.properties().get(MARKER_PROPERTY) {
+        let stored: IcebergMetadataMaintenanceMarkerV1 =
+            decode_canonical_json(raw.as_bytes(), "Iceberg metadata maintenance marker")?;
+        if stored.operation_id_hex == operation_hex {
+            if stored.identity_digest_hex == identity_hex {
+                return Ok(MetadataMaintenanceMarkerMatch::Committed {
+                    snapshot_id: metadata.current_snapshot().map(|s| s.snapshot_id()),
+                });
+            }
+            return Ok(MetadataMaintenanceMarkerMatch::Undecided {
+                reason: "a marker for this operation carries another attempt's identity",
+            });
+        }
+    }
+    for snapshot in metadata.snapshots() {
+        if let Some(raw) = snapshot
+            .summary()
+            .additional_properties
+            .get(MARKER_PROPERTY)
+        {
+            let stored: IcebergMetadataMaintenanceMarkerV1 =
+                decode_canonical_json(raw.as_bytes(), "Iceberg metadata maintenance marker")?;
+            if stored.operation_id_hex == operation_hex {
+                if stored.identity_digest_hex == identity_hex {
+                    return Ok(MetadataMaintenanceMarkerMatch::Committed {
+                        snapshot_id: Some(snapshot.snapshot_id()),
+                    });
+                }
+                return Ok(MetadataMaintenanceMarkerMatch::Undecided {
+                    reason: "a snapshot marker for this operation carries another attempt's identity",
+                });
+            }
+        }
+    }
+    Ok(MetadataMaintenanceMarkerMatch::Undecided {
+        reason: "no marker for this operation is visible on the table",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,90 +1294,4 @@ mod tests {
         );
         assert_eq!(adapter.descriptor.instance_id, key.instance_id);
     }
-}
-
-/// What a live generation could conclude about a dead generation's marker.
-pub(crate) enum MetadataMaintenanceMarkerMatch {
-    Committed { snapshot_id: Option<i64> },
-    Undecided { reason: &'static str },
-}
-
-/// Look for the marker a dead generation would have committed under.
-///
-/// The identity is rebuilt from the descriptor's *historical* binding, because
-/// the marker embeds the incarnation that wrote it. Only an exact match on both
-/// the operation id and that identity counts: a marker for the same operation
-/// with a different identity belongs to another attempt, and one that is simply
-/// absent proves nothing, since the snapshot carrying it may have been expired.
-pub(crate) fn lookup_historical_metadata_marker(
-    runtime: &IcebergControlRuntime,
-    instance_id: &novarocks_spi::connector::ConnectorInstanceId,
-    descriptor: &novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
-) -> Result<MetadataMaintenanceMarkerMatch, ConnectorError> {
-    let Some(plan_digest) = descriptor.plan_digest else {
-        return Ok(MetadataMaintenanceMarkerMatch::Undecided {
-            reason: "operation has no durable plan digest",
-        });
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(IDENTITY_DOMAIN);
-    digest_bytes(&mut hasher, b"iceberg");
-    digest_bytes(&mut hasher, instance_id.as_str().as_bytes());
-    hasher.update(descriptor.historical_binding.incarnation.to_bytes());
-    hasher.update(descriptor.operation_id);
-    digest_bytes(&mut hasher, descriptor.operation_kind.as_bytes());
-    hasher.update(descriptor.request_digest);
-    hasher.update(plan_digest);
-    let identity: [u8; 32] = hasher.finalize().into();
-    let identity_hex = hex_encode(identity);
-    let operation_hex = hex_encode(descriptor.operation_id);
-
-    let namespace = descriptor.table.namespace.as_ref();
-    let table = descriptor.table.table.as_ref();
-    runtime
-        .control_state()
-        .invalidate_table_cache(namespace, table);
-    let loaded = runtime.load_table(namespace, table).map_err(|error| {
-        unavailable(format!(
-            "load Iceberg table for historical marker lookup: {error}"
-        ))
-    })?;
-    let metadata = loaded.table.metadata();
-    if let Some(raw) = metadata.properties().get(MARKER_PROPERTY) {
-        let stored: IcebergMetadataMaintenanceMarkerV1 =
-            decode_canonical_json(raw.as_bytes(), "Iceberg metadata maintenance marker")?;
-        if stored.operation_id_hex == operation_hex {
-            if stored.identity_digest_hex == identity_hex {
-                return Ok(MetadataMaintenanceMarkerMatch::Committed {
-                    snapshot_id: metadata.current_snapshot().map(|s| s.snapshot_id()),
-                });
-            }
-            return Ok(MetadataMaintenanceMarkerMatch::Undecided {
-                reason: "a marker for this operation carries another attempt's identity",
-            });
-        }
-    }
-    for snapshot in metadata.snapshots() {
-        if let Some(raw) = snapshot
-            .summary()
-            .additional_properties
-            .get(MARKER_PROPERTY)
-        {
-            let stored: IcebergMetadataMaintenanceMarkerV1 =
-                decode_canonical_json(raw.as_bytes(), "Iceberg metadata maintenance marker")?;
-            if stored.operation_id_hex == operation_hex {
-                if stored.identity_digest_hex == identity_hex {
-                    return Ok(MetadataMaintenanceMarkerMatch::Committed {
-                        snapshot_id: Some(snapshot.snapshot_id()),
-                    });
-                }
-                return Ok(MetadataMaintenanceMarkerMatch::Undecided {
-                    reason: "a snapshot marker for this operation carries another attempt's identity",
-                });
-            }
-        }
-    }
-    Ok(MetadataMaintenanceMarkerMatch::Undecided {
-        reason: "no marker for this operation is visible on the table",
-    })
 }

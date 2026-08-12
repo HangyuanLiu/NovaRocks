@@ -1768,18 +1768,11 @@ impl FrontendTableMaintenanceService {
                 receipt_digest: Some(checkpoint.prepared_handle_digest),
             },
             // The prepared batch is the exact, immutable set of candidates the
-            // old attempt dispatched. Recovery classifies that set and nothing
-            // wider.
-            match ConnectorHistoricalMaintenanceArtifact::try_new(
-                "cleanup-prepared-batch",
-                bytes::Bytes::from(checkpoint.prepared_handle.clone()),
-            ) {
-                Ok(artifact) => vec![artifact],
-                Err(error) => {
-                    return Ok(Some(format!(
-                        "{exact_failure}; build cleanup recovery artifact failed: {error}"
-                    )));
-                }
+            // old attempt dispatched, and the plan says where its manifest
+            // lives. Recovery classifies that set and nothing wider.
+            match cleanup_recovery_artifacts(self, repository, operation, &checkpoint) {
+                Ok(artifacts) => artifacts,
+                Err(error) => return Ok(Some(format!("{exact_failure}; {error}"))),
             },
             attempt.attempt_id(),
         ) {
@@ -2118,6 +2111,40 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         *worker = WorkerLifecycle::Stopped(result.clone());
         result
     }
+}
+
+/// The immutable inputs an inspector needs to classify one cleanup batch: the
+/// plan that says where the candidate manifest lives, and the prepared batch
+/// naming the exact candidates the old attempt dispatched.
+fn cleanup_recovery_artifacts(
+    service: &FrontendTableMaintenanceService,
+    repository: &Arc<CleanupOperationRepository>,
+    operation: &model::CleanupOperation,
+    checkpoint: &CleanupBatchCheckpoint,
+) -> Result<Vec<ConnectorHistoricalMaintenanceArtifact>, String> {
+    let stored = service
+        .block_on(repository.load_plan(operation.operation_id))
+        .map_err(|error| format!("load orphan cleanup recovery plan failed: {error}"))?
+        .ok_or_else(|| "orphan cleanup recovery plan is missing".to_string())?;
+    let plan = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "cleanup-plan",
+        bytes::Bytes::from(stored.artifact_handle),
+    )
+    .map_err(|error| format!("build cleanup recovery plan artifact failed: {error}"))?;
+    let prepared = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "cleanup-prepared-batch",
+        bytes::Bytes::from(checkpoint.prepared_handle.clone()),
+    )
+    .map_err(|error| format!("build cleanup recovery batch artifact failed: {error}"))?;
+    // The manifest digest is what lets the inspector prove it read the same
+    // candidate list the old attempt froze, rather than whatever is at that
+    // location now.
+    let manifest = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "cleanup-manifest-digest",
+        bytes::Bytes::copy_from_slice(&stored.manifest_digest),
+    )
+    .map_err(|error| format!("build cleanup recovery manifest artifact failed: {error}"))?;
+    Ok(vec![plan, prepared, manifest])
 }
 
 /// Load every cohort attempt artifact a rewrite recorded.

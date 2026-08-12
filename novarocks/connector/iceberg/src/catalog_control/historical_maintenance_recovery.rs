@@ -40,6 +40,7 @@ use novarocks_spi::connector::{
 
 use crate::control_runtime::IcebergControlRuntime;
 
+use super::cleanup_maintenance::classify_historical_cleanup_batch;
 use super::metadata_maintenance::{
     MetadataMaintenanceMarkerMatch, lookup_historical_metadata_marker,
 };
@@ -83,10 +84,12 @@ impl ConnectorHistoricalMaintenanceRecovery for IcebergHistoricalMaintenanceReco
             ConnectorHistoricalMaintenanceFamily::MetadataMaintenance => {
                 self.inspect_metadata(descriptor)
             }
-            // Distributed rewrite and orphan cleanup leave their evidence in
-            // provider artifacts rather than a single table marker. Claiming
-            // an answer here without reading them would be a guess, and this
-            // capability exists precisely so recovery never guesses.
+            ConnectorHistoricalMaintenanceFamily::Cleanup => self.inspect_cleanup(descriptor),
+            // A distributed rewrite commit writes no marker into the snapshot
+            // summary, so it cannot be classified by reading the table. Its
+            // evidence is the per-cohort attempt artifacts, which this does not
+            // read yet -- and answering without reading them would be a guess,
+            // which is the one thing this capability exists to avoid.
             family => Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 format!(
@@ -165,4 +168,72 @@ impl IcebergHistoricalMaintenanceRecovery {
             None,
         )
     }
+
+    fn inspect_cleanup(
+        &self,
+        descriptor: ConnectorHistoricalMaintenanceDescriptor,
+    ) -> Result<ConnectorHistoricalMaintenanceObservation, ConnectorError> {
+        let plan = artifact(&descriptor, "cleanup-plan")?;
+        let prepared = artifact(&descriptor, "cleanup-prepared-batch")?;
+        let manifest_digest_bytes = artifact(&descriptor, "cleanup-manifest-digest")?;
+        let manifest_digest: [u8; 32] =
+            manifest_digest_bytes.as_ref().try_into().map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "historical cleanup manifest digest is not 32 bytes",
+                )
+            })?;
+        let counts = classify_historical_cleanup_batch(
+            self.runtime.as_ref(),
+            descriptor.operation_id,
+            plan.as_ref(),
+            prepared.as_ref(),
+            manifest_digest,
+        )?;
+        // An object that could not be stated is genuinely unknown, and an
+        // unknown delete must never be retried, so it drags the whole batch to
+        // ambiguous rather than being rounded down to a failure.
+        let disposition = if counts.unknown > 0 {
+            ConnectorHistoricalMaintenanceDisposition::Ambiguous
+        } else if counts.failed > 0 {
+            ConnectorHistoricalMaintenanceDisposition::PartiallyApplied
+        } else {
+            ConnectorHistoricalMaintenanceDisposition::Applied
+        };
+        let proof = ConnectorHistoricalMaintenanceProof::try_new(bytes::Bytes::from(format!(
+            "iceberg-historical-cleanup-batch:deleted={},absent={},failed={},unknown={}",
+            counts.deleted, counts.already_absent, counts.failed, counts.unknown
+        )))?;
+        ConnectorHistoricalMaintenanceObservation::try_new(
+            &descriptor,
+            disposition,
+            ConnectorHistoricalMaintenanceOutcome::Cleanup {
+                deleted_count: counts.deleted,
+                already_absent_count: counts.already_absent,
+                skipped_count: 0,
+                failed_count: counts.failed,
+                unknown_count: counts.unknown,
+            },
+            proof,
+            None,
+        )
+    }
+}
+
+/// Pull one required artifact out of a descriptor by kind.
+fn artifact(
+    descriptor: &ConnectorHistoricalMaintenanceDescriptor,
+    kind: &str,
+) -> Result<bytes::Bytes, ConnectorError> {
+    descriptor
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind() == kind)
+        .map(|artifact| artifact.handle().clone())
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("historical maintenance descriptor carries no `{kind}` artifact"),
+            )
+        })
 }
