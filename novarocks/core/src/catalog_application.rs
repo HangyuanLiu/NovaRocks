@@ -64,16 +64,26 @@ pub enum CatalogAdmission {
 }
 
 impl CatalogAdmission {
-    pub fn require_ready(self) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+    /// Resolves the admission, naming the catalog in both failure messages.
+    ///
+    /// Operators and tests match on the catalog name, so an absent attachment
+    /// must not surface as an anonymous "not found".
+    pub fn require_ready(
+        self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
         match self {
             Self::Ready(observation) => Ok(observation),
             Self::Absent => Err(CatalogApplicationError::new(
                 CatalogApplicationErrorKind::NotFound,
-                "catalog attachment was not found",
+                format!("unknown catalog `{}`", instance_id.as_str()),
             )),
             Self::Unavailable { reason } => Err(CatalogApplicationError::new(
                 CatalogApplicationErrorKind::Unavailable,
-                reason,
+                format!(
+                    "catalog `{}` is unavailable on this frontend: {reason}",
+                    instance_id.as_str()
+                ),
             )),
         }
     }
@@ -427,25 +437,26 @@ mod tests {
 
     #[test]
     fn admission_preserves_not_found_and_unavailable_as_distinct_outcomes() {
-        assert_eq!(
-            CatalogAdmission::Absent
-                .require_ready()
-                .expect_err("absent catalog")
-                .kind(),
-            CatalogApplicationErrorKind::NotFound
-        );
-        assert_eq!(
-            CatalogAdmission::Unavailable {
-                reason: "projection is stale".to_string(),
-            }
-            .require_ready()
-            .expect_err("unavailable catalog")
-            .kind(),
-            CatalogApplicationErrorKind::Unavailable
+        let instance_id = ConnectorInstanceId::parse("warehouse").expect("instance");
+        let absent = CatalogAdmission::Absent
+            .require_ready(&instance_id)
+            .expect_err("absent catalog");
+        assert_eq!(absent.kind(), CatalogApplicationErrorKind::NotFound);
+        assert_eq!(absent.to_string(), "unknown catalog `warehouse`");
+        let unavailable = CatalogAdmission::Unavailable {
+            reason: "projection is stale".to_string(),
+        }
+        .require_ready(&instance_id)
+        .expect_err("unavailable catalog");
+        assert_eq!(unavailable.kind(), CatalogApplicationErrorKind::Unavailable);
+        assert!(
+            unavailable.to_string().contains("warehouse")
+                && unavailable.to_string().contains("projection is stale"),
+            "an unavailable catalog must name itself and keep the reason: {unavailable}"
         );
         assert_eq!(
             CatalogAdmission::Ready(observation())
-                .require_ready()
+                .require_ready(&instance_id)
                 .expect("ready catalog")
                 .generation,
             7
@@ -465,7 +476,7 @@ mod tests {
                 .lock()
                 .expect("admission lock")
                 .clone()
-                .require_ready()
+                .require_ready(&_command.instance_id)
         }
 
         fn drop_catalog(
