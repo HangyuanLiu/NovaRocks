@@ -309,6 +309,18 @@ impl DataMutationSession {
         })
     }
 
+    /// Establish this attempt's external fence before anything is dispatched.
+    ///
+    /// TRUNCATE and ADD FILES destroy or extend table content, so a superseded
+    /// owner's late execute has to be refused at the catalog rather than
+    /// merely reported afterwards.
+    pub fn establish_external_fence(
+        &self,
+        fence: novarocks_spi::connector::ConnectorExternalOperationFence,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        self.lease.establish_external_fence(fence)
+    }
+
     pub(crate) fn plan_ref(&self) -> &novarocks_spi::connector::ConnectorDataMutationPlan {
         &self.plan
     }
