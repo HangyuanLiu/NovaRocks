@@ -1313,20 +1313,132 @@ impl FrontendTableMaintenanceService {
                 })?;
                 Ok(())
             })();
+            // The ordinary reconcile above needs the exact generation that
+            // created the operation. When that generation is still alive it is
+            // the better answer, since it holds the original session. When it
+            // is gone, fall through to historical inspection rather than
+            // declaring the operation stuck forever.
             if let Err(error) = result {
-                self.block_on(repository.mark_unresolved_fenced(
-                    operation.operation_id,
+                let reason = self.converge_historical_metadata(
+                    repository,
+                    engine,
+                    &operation,
+                    &cancellation.context(),
+                    &attempt,
+                    &authority,
+                    &validator,
                     error,
-                    now_unix_millis(),
-                    authority,
-                    validator,
-                ))
-                .map_err(|store| {
-                    format!("mark metadata maintenance operation unresolved failed: {store}")
-                })?;
+                )?;
+                if let Some(reason) = reason {
+                    self.block_on(repository.mark_unresolved_fenced(
+                        operation.operation_id,
+                        reason,
+                        now_unix_millis(),
+                        authority,
+                        validator,
+                    ))
+                    .map_err(|store| {
+                        format!("mark metadata maintenance operation unresolved failed: {store}")
+                    })?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Second chance for a metadata operation whose exact generation is gone.
+    ///
+    /// Returns the reason to stay unresolved, or `None` once the operation is
+    /// finalized. The original reconcile failure is carried into every
+    /// unresolved reason: a reader needs to know both why the exact path failed
+    /// and what the historical inspection could not settle.
+    #[allow(clippy::too_many_arguments)]
+    fn converge_historical_metadata(
+        &self,
+        repository: &Arc<MetadataMaintenanceOperationRepository>,
+        engine: &dyn TableMaintenanceEngine,
+        operation: &model::MetadataMaintenanceOperation,
+        attempt_context: &novarocks::engine::table_maintenance::MaintenanceAttemptContext,
+        attempt: &MaintenanceAttemptGuard,
+        authority: &MaintenanceAuthorityV1,
+        validator: &MaintenanceFenceValidator,
+        exact_failure: String,
+    ) -> Result<Option<String>, String> {
+        let descriptor = match historical_descriptor(
+            &operation.target,
+            &operation.owner,
+            ConnectorHistoricalMaintenanceFamily::MetadataMaintenance,
+            operation.operation_id,
+            operation.request_digest,
+            operation.plan_digest,
+            Some(operation.base_state_digest),
+            // A metadata maintenance operation that reached this recovery path
+            // already had its plan committed, so the provider call may have
+            // happened. It is never continued, only classified.
+            ConnectorHistoricalDispatchFacts {
+                dispatch_started: true,
+                batch_ordinal: None,
+                receipt_digest: None,
+            },
+            attempt.attempt_id(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        let observation = match engine.inspect_historical_maintenance(
+            &operation.target,
+            descriptor,
+            attempt_context,
+        ) {
+            Ok(HistoricalMaintenanceInspection::Observed(observation)) => observation,
+            Ok(HistoricalMaintenanceInspection::Unsupported(reason)) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; no historical recovery capability: {reason}"
+                )));
+            }
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        match observation.disposition {
+            ConnectorHistoricalMaintenanceDisposition::Applied => {
+                let payload = observation.proof.payload().to_vec();
+                self.block_on(repository.finish_fenced(
+                    operation.operation_id,
+                    MetadataMaintenanceOpaquePayload {
+                        digest: metadata_maintenance_payload_digest(&payload),
+                        payload,
+                    },
+                    now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(validator),
+                ))
+                .map_err(|error| {
+                    format!("finish historically recovered metadata maintenance failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::NotApplied
+            | ConnectorHistoricalMaintenanceDisposition::NotDispatched => {
+                self.block_on(
+                    repository.fail_fenced(
+                        operation.operation_id,
+                        "metadata maintenance did not reach the table; it is safe to run again"
+                            .to_string(),
+                        now_unix_millis(),
+                        authority.clone(),
+                        Arc::clone(validator),
+                    ),
+                )
+                .map_err(|error| {
+                    format!("fail historically recovered metadata maintenance failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::PartiallyApplied
+            | ConnectorHistoricalMaintenanceDisposition::Ambiguous => Ok(Some(format!(
+                "{exact_failure}; historical inspection could not decide whether the metadata \
+                 maintenance committed"
+            ))),
+        }
     }
 
     fn recover_distributed_rewrite_operations(
