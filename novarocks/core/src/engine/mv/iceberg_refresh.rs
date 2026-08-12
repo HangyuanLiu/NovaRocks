@@ -414,10 +414,8 @@ fn prepare_frontend_first_refresh_write(
                     .ok_or_else(|| {
                         format!("MV first-refresh has no pinned snapshot for {}", base.fqn())
                     })?;
-                let uuid = load_current_iceberg_base_table(state, base)?
-                    .table
-                    .metadata()
-                    .uuid()
+                let uuid = observe_schema_validation_for_table(state, base, &connector_context)?
+                    .table_uuid()
                     .to_string();
                 let expected_uuid = base_table_uuids.get(&base.fqn()).ok_or_else(|| {
                     format!("MV first-refresh has no UUID fact for {}", base.fqn())
