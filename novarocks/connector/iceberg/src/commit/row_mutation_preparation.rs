@@ -37,10 +37,11 @@ use sha2::{Digest, Sha256};
 
 use crate::commit::validation::row_mutation_strategy_from_metadata;
 use crate::commit::write_shared::{
-    exact_requested_write_fields, snapshot_token, write_target_snapshot_id,
+    exact_requested_write_fields_at_schema, snapshot_token, write_target_schema,
+    write_target_snapshot_id,
 };
 use crate::control_provider::{IcebergTablePayload, metadata_arrow_fields};
-use crate::file_reader::execution_payload::decode_payload;
+use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 
 /// Provider-side row-mutation admission. This is intentionally independent of
@@ -147,6 +148,7 @@ pub(crate) fn prepare_row_mutation(
         )
     })?;
     let target_snapshot_id = write_target_snapshot_id(&metadata, request.target_ref.as_str())?;
+    let target_iceberg_schema = write_target_schema(&metadata, target_snapshot_id)?;
     let snapshot = snapshot_token(target_snapshot_id);
     let base_version = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
         "iceberg/row-mutation-base/v1/{table_uuid}/{}/{snapshot}",
@@ -156,8 +158,7 @@ pub(crate) fn prepare_row_mutation(
     // source identities precede target before/after values and the logical
     // effect field is last.  The source/target ordinals are the sole cross
     // layer binding; these familiar Iceberg names never become a Core rule.
-    let requested_target_fields = metadata
-        .current_schema()
+    let requested_target_fields = target_iceberg_schema
         .as_struct()
         .fields()
         .iter()
@@ -170,11 +171,40 @@ pub(crate) fn prepare_row_mutation(
         })
         .collect::<Vec<_>>();
     let target_schema = Schema::new(
-        exact_requested_write_fields(&metadata, &requested_target_fields)?
+        exact_requested_write_fields_at_schema(&target_iceberg_schema, &requested_target_fields)?
             .into_iter()
             .map(|field| Arc::new(field.field().clone()))
             .collect::<Vec<_>>(),
     );
+    // The match query must scan the exact target ref/base chosen above. The
+    // ordinary admitted table handle names the provider's default/current ref,
+    // so reusing it would silently scan main for a branch mutation. Freeze a
+    // second provider-owned handle whose `Current` selector means this exact
+    // admitted snapshot, and sign the schema that handle will produce.
+    let mut match_source_payload = payload.clone();
+    match_source_payload.prepared_files.clear();
+    match_source_payload.explicit_files = None;
+    match_source_payload.row_mutation_frozen_source = false;
+    let match_table_info = match_source_payload.table_info.as_mut().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "admitted Iceberg row-mutation table lost its frozen descriptor",
+        )
+    })?;
+    match_table_info.current_snapshot_id = target_snapshot_id;
+    match_table_info.schema_id = target_iceberg_schema.schema_id();
+    match_table_info.schema = crate::schema_facts::iceberg_schema_def(&target_iceberg_schema);
+    let mut match_source_fields = target_schema.fields().to_vec();
+    match_source_fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
+    let match_source_schema = Arc::new(Schema::new(match_source_fields));
+    let match_source = ConnectorTableHandle::try_new(
+        owner.instance_id.clone(),
+        encode_payload(
+            &match_source_payload,
+            "row-mutation match source",
+            request.context.max_handle_payload_bytes(),
+        )?,
+    )?;
     let target_start = u32::try_from(identity_fields.len()).map_err(|_| {
         ConnectorError::new(
             ConnectorErrorKind::ResourceExhausted,
@@ -233,10 +263,27 @@ pub(crate) fn prepare_row_mutation(
                 )
             })?,
     )?;
+    // `_last_updated_sequence_number` is a signed source role, but it is not
+    // part of row uniqueness.  COW rewrites bind the same token separately as
+    // the writer's forward-looking version field. Keeping it in the match
+    // tuple would make one token claim both roles and the SPI correctly
+    // rejects that ambiguous recipe.
     let uniqueness_tokens = identity_fields
         .iter()
+        .filter(|field| {
+            !field
+                .field()
+                .name()
+                .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL)
+        })
         .map(ConnectorMutationSourceField::token)
-        .collect();
+        .collect::<Vec<_>>();
+    if uniqueness_tokens.is_empty() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg row-mutation identity has no non-version uniqueness field",
+        ));
+    }
     let contract = ConnectorMutationMatchContract::try_new(
         owner.clone(),
         request.table.clone(),
@@ -257,6 +304,8 @@ pub(crate) fn prepare_row_mutation(
             owner.clone(),
             request.operation_id,
             request.table,
+            match_source,
+            match_source_schema,
             request.target_ref,
             request.intent,
             base_version,
@@ -343,8 +392,8 @@ mod tests {
         NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR,
     };
     use crate::iceberg::spec::{
-        NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema, SortOrder,
-        TableMetadataBuilder, Type,
+        NestedField, Operation, PartitionSpec, PrimitiveType, Schema as IcebergSchema, Snapshot,
+        SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Type,
     };
     use crate::metadata_batch_reader::MetadataTableType;
     use crate::scan_model::IcebergTableInfo;
@@ -420,6 +469,102 @@ mod tests {
         .metadata
     }
 
+    fn metadata_with_older_base_schema() -> TableMetadata {
+        let base_schema = Arc::new(iceberg_schema());
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(41)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("file:///tmp/row-mutation/snap-41.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: BTreeMap::new().into_iter().collect(),
+            })
+            .with_schema_id(0)
+            .with_row_range(0, 0)
+            .build();
+        let evolved = IcebergSchema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "later", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .expect("evolved schema");
+        let evolved_snapshot = Snapshot::builder()
+            .with_snapshot_id(42)
+            .with_parent_snapshot_id(Some(41))
+            .with_sequence_number(2)
+            .with_timestamp_ms(2)
+            .with_manifest_list("file:///tmp/row-mutation/snap-42.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: BTreeMap::new().into_iter().collect(),
+            })
+            .with_schema_id(2)
+            .with_row_range(0, 0)
+            .build();
+        TableMetadataBuilder::new(
+            base_schema.as_ref().clone(),
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/row-mutation".to_string(),
+            FormatVersion::V3,
+            [(ROW_LINEAGE_ON.0.to_string(), ROW_LINEAGE_ON.1.to_string())]
+                .into_iter()
+                .collect(),
+        )
+        .expect("metadata builder")
+        .add_snapshot(snapshot)
+        .expect("base snapshot")
+        .set_ref(
+            "main",
+            SnapshotReference::new(
+                41,
+                SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            ),
+        )
+        .expect("main ref")
+        .add_schema(evolved)
+        .expect("evolved schema")
+        .set_current_schema(-1)
+        .expect("current schema")
+        .add_snapshot(evolved_snapshot)
+        .expect("evolved snapshot")
+        .set_ref(
+            "main",
+            SnapshotReference::new(
+                42,
+                SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            ),
+        )
+        .expect("main ref")
+        .set_ref(
+            "dev",
+            SnapshotReference::new(
+                41,
+                SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            ),
+        )
+        .expect("dev ref")
+        .build()
+        .expect("metadata")
+        .metadata
+    }
+
     struct PayloadSpec {
         serialized_metadata: Option<String>,
         table_uuid: Option<String>,
@@ -462,6 +607,7 @@ mod tests {
                 metadata_table_type: self.metadata_table_type,
                 prepared_files: Vec::new(),
                 explicit_files: None,
+                row_mutation_frozen_source: false,
                 logical_type_columns: BTreeMap::new(),
                 hidden_columns: Vec::new(),
             };
@@ -621,6 +767,93 @@ mod tests {
             ConnectorRowMutationStrategy::PositionDelete
         );
         assert!(preparation.payload().ends_with(b"/none/PositionDelete"));
+    }
+
+    #[test]
+    fn preparation_and_frozen_source_share_the_resolved_base_snapshot_schema() {
+        let owner = owner();
+        let table_metadata = metadata_with_older_base_schema();
+        assert_eq!(
+            table_metadata.current_schema().as_struct().fields().len(),
+            3
+        );
+        let preparation = prepared(
+            prepare_row_mutation(
+                request(
+                    PayloadSpec::new(&table_metadata).handle(),
+                    "dev",
+                    ConnectorRowMutationIntent::Delete,
+                ),
+                &owner,
+            )
+            .expect("prepare"),
+        );
+        assert_eq!(preparation.base_version_ordinal(), Some(41));
+        let match_source: IcebergTablePayload = decode_payload(
+            preparation.match_source().payload(),
+            "row-mutation match source",
+        )
+        .expect("decode match source");
+        let match_info = match_source.table_info.expect("match table info");
+        assert_eq!(match_info.current_snapshot_id, Some(41));
+        assert_eq!(match_info.schema_id, 0);
+        let prepared_names = preparation
+            .match_contract()
+            .after_fields()
+            .iter()
+            .map(|field| field.field().name().as_str())
+            .collect::<Vec<_>>();
+        let frozen_schema =
+            write_target_schema(&table_metadata, Some(41)).expect("frozen source schema");
+        let frozen_names = frozen_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepared_names,
+            frozen_names.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(prepared_names, vec!["id", "name"]);
+        assert_eq!(preparation.match_source_schema().field(0).name(), "id");
+        assert_eq!(preparation.match_source_schema().field(1).name(), "name");
+        assert_eq!(preparation.match_source_schema().field(2).name(), "_file");
+    }
+
+    #[test]
+    fn written_version_identity_is_not_a_uniqueness_token() {
+        let owner = owner();
+        let table_metadata = metadata(FormatVersion::V3, &[ROW_LINEAGE_ON]);
+        let mut spec = PayloadSpec::new(&table_metadata);
+        spec.metadata_columns = vec![
+            "_file".to_string(),
+            "_pos".to_string(),
+            "_row_id".to_string(),
+            crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        ];
+        let preparation = prepared(
+            prepare_row_mutation(
+                request(spec.handle(), "main", ConnectorRowMutationIntent::Update),
+                &owner,
+            )
+            .expect("prepare"),
+        );
+        let contract = preparation.match_contract();
+        let written = contract
+            .identity_fields()
+            .iter()
+            .find(|field| {
+                field
+                    .field()
+                    .name()
+                    .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL)
+            })
+            .expect("written version identity")
+            .token();
+        assert!(!contract.uniqueness_tokens().contains(&written));
+        assert_eq!(contract.identity_fields().len(), 4);
+        assert_eq!(contract.uniqueness_tokens().len(), 3);
     }
 
     #[test]
