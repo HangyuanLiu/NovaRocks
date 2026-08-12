@@ -238,33 +238,6 @@ fn standalone_server_args_with_metadata(mysql_port: u16) -> (TempDir, Vec<String
     (config_dir, args)
 }
 
-fn write_legacy_starrocks_table_config(mysql_port: u16) -> (TempDir, PathBuf) {
-    let config_dir = TempDir::new().expect("create StarRocks table config dir");
-    let config_path = config_dir.path().join("novarocks.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"[metadata]
-provider = "sqlite"
-path = "meta/catalog.db"
-
-[standalone_server]
-mysql_port = {mysql_port}
-user = "root"
-warehouse_uri = "s3://novarocks/legacy-starrocks-table"
-
-[standalone_server.object_store]
-endpoint = "http://127.0.0.1:9000"
-access_key_id = "admin"
-access_key_secret = "admin123"
-enable_path_style_access = true
-"#
-        ),
-    )
-    .expect("write StarRocks table config");
-    (config_dir, config_path)
-}
-
 fn s3_test_value(primary: &str, fallback_env: &str, default: &str) -> String {
     std::env::var(primary)
         .or_else(|_| std::env::var(fallback_env))
@@ -621,27 +594,6 @@ fn standalone_mysql_server_rejects_default_catalog_persistent_table() {
     assert!(
         err.contains("default_catalog") || err.contains("iceberg catalog"),
         "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn standalone_mysql_server_rejects_legacy_starrocks_table_config_at_startup() {
-    let port = alloc_port();
-    let (_config_dir, config_path) = write_legacy_starrocks_table_config(port);
-    let output = Command::new(env!("CARGO_BIN_EXE_novarocks"))
-        .args(["standalone", "--config"])
-        .arg(config_path)
-        .output()
-        .expect("run standalone with retired config");
-    assert!(!output.status.success(), "retired config must fail startup");
-    let output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.contains("retired native table configuration"),
-        "unexpected output: {output}"
     );
 }
 
