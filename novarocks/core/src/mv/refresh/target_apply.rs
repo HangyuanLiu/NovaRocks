@@ -504,6 +504,7 @@ fn validate_physical_field_identity(
 
 #[cfg(test)]
 mod tests {
+    use super::{apply_key_table_column, branch_id_table_column, join_apply_key_table_column};
 
     /// Project an Iceberg fixture schema onto the neutral facts the rewrite
     /// context consumes. Mirrors what the Server observation adapter does in
@@ -1223,5 +1224,73 @@ mod tests {
             .validate_locator_scan(&scan)
             .expect_err("apply-key drift must fail");
         assert!(err.contains("apply-key column mismatch"), "got: {err}");
+    }
+
+    // Moved from engine/mv/iceberg_target_apply_oracle.rs (SPI-5I T21). These
+    // exercise production helpers in this module and never needed a real
+    // Iceberg table; they were only living in the oracle because the whole
+    // module was #[cfg(test)]-gated.
+    #[test]
+    fn apply_key_table_column_is_required_bigint() {
+        let column = apply_key_table_column();
+
+        assert_eq!(column.name, "__nova_base_row_id");
+        assert_eq!(column.data_type, novarocks_catalog::schema::SqlType::BigInt);
+        assert!(!column.nullable);
+        assert!(column.aggregation.is_none());
+        assert!(column.default.is_none());
+    }
+
+    #[test]
+    fn join_apply_key_table_column_is_required_string() {
+        let column = join_apply_key_table_column();
+
+        assert_eq!(column.name, "__nova_join_row_key");
+        assert_eq!(column.data_type, novarocks_catalog::schema::SqlType::String);
+        assert!(!column.nullable);
+        assert!(column.aggregation.is_none());
+        assert!(column.default.is_none());
+    }
+
+    #[test]
+    fn branch_id_table_column_is_required_int() {
+        let col = branch_id_table_column();
+        assert_eq!(col.name, BRANCH_ID_COLUMN_NAME);
+        assert_eq!(col.name, "__branch_id__");
+        assert!(!col.nullable);
+        assert!(matches!(
+            col.data_type,
+            novarocks_catalog::schema::SqlType::Int
+        ));
+    }
+
+    #[test]
+    fn iceberg_mv_physical_select_appends_base_row_id() {
+        let sql =
+            iceberg_mv_physical_select_sql("SELECT id, amount FROM ice.ns.orders WHERE amount > 0")
+                .expect("physical sql");
+
+        assert_eq!(
+            sql,
+            "SELECT id, amount, _row_id AS __nova_base_row_id FROM ice.ns.orders WHERE amount > 0"
+        );
+    }
+
+    #[test]
+    fn iceberg_mv_physical_select_rejects_star_projection() {
+        let err = iceberg_mv_physical_select_sql("SELECT * FROM ice.ns.orders")
+            .expect_err("star projection must fail");
+
+        assert!(err.contains("explicit projection columns"), "{err}");
+    }
+
+    #[test]
+    fn iceberg_mv_physical_select_rejects_visible_apply_key_collision() {
+        let err =
+            iceberg_mv_physical_select_sql("SELECT id AS __nova_base_row_id FROM ice.ns.orders")
+                .expect_err("reserved alias must fail");
+
+        assert!(err.contains("__nova_base_row_id"), "{err}");
+        assert!(err.contains("reserved"), "{err}");
     }
 }

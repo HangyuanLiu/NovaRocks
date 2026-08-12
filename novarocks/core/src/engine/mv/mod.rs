@@ -23,8 +23,6 @@ pub(crate) mod iceberg_backend;
 pub(crate) mod iceberg_guard;
 pub(crate) mod iceberg_join_branch;
 pub(crate) mod iceberg_refresh;
-#[cfg(test)]
-pub(crate) mod iceberg_target_apply_oracle;
 pub(crate) mod lake_rebuild;
 pub(crate) mod lifecycle;
 pub(crate) mod metadata_consistency;
@@ -32,8 +30,6 @@ pub(crate) mod partition;
 pub(crate) mod recovery;
 pub(crate) mod refresh_io;
 pub(crate) mod refresh_pin_adapter;
-#[cfg(test)]
-pub(crate) mod scan_binding_oracle;
 #[cfg(test)]
 pub(crate) mod schema_validation_adapter;
 pub(crate) mod stateless_rebuild;
