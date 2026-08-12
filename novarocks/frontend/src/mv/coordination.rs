@@ -42,7 +42,8 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
     ConnectorMvPublicationTargetRequest, ConnectorMvRefreshResourceIdentity,
-    ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
 };
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::OperationId;
@@ -186,6 +187,30 @@ pub(crate) fn resolve_target_resource(
         ));
     }
     Ok(resource)
+}
+
+/// Resolves a target's stable refresh resource from its catalog coordinates.
+///
+/// Two provider calls, both side-effect free, both against the *same* control
+/// binding: load the table to get its opaque handle, then observe the handle to
+/// get the immutable UUID. Using one binding for both matters -- resolving the
+/// table through one generation and observing it through another could pair a
+/// handle with a UUID from a different provider incarnation.
+///
+/// `StrictBaseTable` resolution is deliberate: an MV target is a real table, and
+/// a provider read alias must not be able to stand in for one when the answer
+/// becomes a cluster-wide ownership key.
+pub(crate) fn resolve_target_resource_for(
+    binding: &ConnectorControlBinding,
+    target: ConnectorTableIdentity,
+    context: &ConnectorRequestContext,
+) -> Result<ConnectorMvRefreshResourceIdentity, ConnectorError> {
+    let metadata = binding.metadata().load_table(ConnectorTableRequest {
+        table: target,
+        resolution: ConnectorTableResolution::StrictBaseTable,
+        context: context.clone(),
+    })?;
+    resolve_target_resource(binding, &metadata.table, context)
 }
 
 /// The refresh leases this process currently holds, keyed by MV.
