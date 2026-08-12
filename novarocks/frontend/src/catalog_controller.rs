@@ -291,12 +291,13 @@ impl FrontendCatalogController {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     use bytes::Bytes;
     use novarocks::catalog_application::{
         CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,
-        CatalogApplicationPort, CatalogRuntimeObservation, CatalogRuntimePublisherSink,
+        CatalogApplicationPort, CatalogCreateCommand, CatalogDropCommand,
+        CatalogRuntimeObservation, CatalogRuntimePublisherSink,
     };
     use novarocks_spi::connector::{
         ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
@@ -318,7 +319,17 @@ mod tests {
     use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
     use crate::connector::ConnectorControlHost;
 
-    struct ReadyFactory;
+    /// Mints a distinct control generation per creation, like a real provider
+    /// factory: reusing an incarnation would trip the retired-generation guard
+    /// on a same-name recreate.
+    #[derive(Default)]
+    struct ReadyFactory {
+        incarnations: AtomicU8,
+    }
+
+    /// Fails local materialization without touching durable truth, so a test
+    /// can observe the durable-first ordering of CREATE.
+    struct UnavailableFactory;
 
     struct RejectingPublisher;
 
@@ -501,11 +512,32 @@ mod tests {
             &self,
             request: ConnectorControlFactoryRequest,
         ) -> Result<ConnectorControlCreation, ConnectorError> {
+            let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
             ConnectorControlCreation::try_new(
                 &request,
-                crate::connector::control_host::tests::test_control_binding(1),
+                crate::connector::control_host::tests::test_control_binding_for(
+                    request.instance_id().clone(),
+                    incarnation,
+                ),
                 Vec::new(),
             )
+        }
+    }
+
+    impl ConnectorControlFactory for UnavailableFactory {
+        fn provider_id(&self) -> &ConnectorProviderId {
+            static PROVIDER: std::sync::OnceLock<ConnectorProviderId> = std::sync::OnceLock::new();
+            PROVIDER.get_or_init(|| ConnectorProviderId::parse("iceberg").expect("provider ID"))
+        }
+
+        fn create_control(
+            &self,
+            _request: ConnectorControlFactoryRequest,
+        ) -> Result<ConnectorControlCreation, ConnectorError> {
+            Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                "injected provider materialization failure",
+            ))
         }
     }
 
@@ -565,7 +597,7 @@ mod tests {
         Arc<FrontendCatalogApplicationPort>,
     ) {
         let control = Arc::new(
-            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory)])
+            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory::default())])
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
@@ -575,6 +607,279 @@ mod tests {
             tokio::runtime::Handle::current(),
         ));
         (control, port)
+    }
+
+    fn create_command(if_not_exists: bool) -> CatalogCreateCommand {
+        CatalogCreateCommand {
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("catalog.analytics")
+                .expect("instance ID"),
+            display_name: "catalog.analytics".to_string(),
+            properties: vec![("type".to_string(), "iceberg".to_string())],
+            if_not_exists,
+        }
+    }
+
+    /// Name uniqueness is arbitrated by the absent-precondition commit, not by a
+    /// local lock: two independent frontend hosts racing the same SQL name
+    /// produce exactly one durable attachment identity, and both converge on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_create_of_one_catalog_name_yields_a_single_attachment_identity() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let (_first_control, first_port) = projection(repository.clone());
+        let (_second_control, second_port) = projection(repository.clone());
+
+        // Plain OS threads, so each CREATE drives the port's blocking StateStore
+        // path from outside the runtime and the two commits genuinely race.
+        let (first_result, second_result) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| first_port.create_catalog(create_command(false)));
+            let second = scope.spawn(|| second_port.create_catalog(create_command(false)));
+            (
+                first.join().expect("first CREATE thread"),
+                second.join().expect("second CREATE thread"),
+            )
+        });
+
+        let attachments = repository
+            .list_with_page_size(256)
+            .await
+            .expect("list attachments");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "one SQL name must own exactly one durable attachment"
+        );
+        let winner = attachments[0].attachment.attachment_id;
+        let (winner_result, loser_result) = match (&first_result, &second_result) {
+            (Ok(_), Err(_)) => (&first_result, &second_result),
+            (Err(_), Ok(_)) => (&second_result, &first_result),
+            other => panic!("exactly one concurrent CREATE must win: {other:?}"),
+        };
+        assert_eq!(
+            winner_result
+                .as_ref()
+                .expect("winning CREATE observation")
+                .attachment_id,
+            winner
+        );
+        assert_eq!(
+            loser_result
+                .as_ref()
+                .expect_err("the losing CREATE reports the existing attachment")
+                .kind(),
+            CatalogApplicationErrorKind::AlreadyExists
+        );
+
+        // The loser converges on the winner's identity through an authoritative
+        // reread, and each host owns its own live control generation.
+        first_port
+            .reconcile_with_page_size(256, 1)
+            .await
+            .expect("first host reconcile");
+        second_port
+            .reconcile_with_page_size(256, 1)
+            .await
+            .expect("second host reconcile");
+        let instance_id = create_command(false).instance_id;
+        for port in [&first_port, &second_port] {
+            match port.admit_catalog(&instance_id) {
+                CatalogAdmission::Ready(observation) => {
+                    assert_eq!(observation.attachment_id, winner)
+                }
+                other => panic!("both hosts must admit the surviving attachment: {other:?}"),
+            }
+        }
+        assert!(
+            _first_control.observe_current_binding(&instance_id).is_ok()
+                && _second_control
+                    .observe_current_binding(&instance_id)
+                    .is_ok(),
+            "each host materializes its own local control generation"
+        );
+
+        drop(first_port);
+        drop(second_port);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// The factory validates provider input before the attachment commit, so a
+    /// provider that cannot be materialized leaves no durable trace at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn factory_preflight_failure_commits_no_attachment() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let control = Arc::new(
+            ConnectorControlHost::with_factories(vec![Arc::new(UnavailableFactory)])
+                .expect("control host"),
+        );
+        let port = Arc::new(FrontendCatalogApplicationPort::new(
+            repository.clone(),
+            control,
+            novarocks::catalog_application::CatalogRuntimeProjection::new().publisher(),
+            tokio::runtime::Handle::current(),
+        ));
+
+        assert_eq!(
+            port.create_catalog(create_command(false))
+                .expect_err("provider preflight failure must reject CREATE")
+                .kind(),
+            CatalogApplicationErrorKind::Unavailable
+        );
+        assert!(
+            repository
+                .list_with_page_size(256)
+                .await
+                .expect("list attachments")
+                .is_empty(),
+            "a preflight failure must not commit durable truth"
+        );
+
+        drop(port);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// Durable commit is the linearization point. Once it succeeds, a local
+    /// publication failure is reported as an unavailable runtime and must not
+    /// roll back the cluster-wide fact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_keeps_the_committed_attachment_when_local_publication_fails() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let control = Arc::new(
+            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory::default())])
+                .expect("control host"),
+        );
+        let port = Arc::new(FrontendCatalogApplicationPort::new(
+            repository.clone(),
+            Arc::clone(&control),
+            Arc::new(RejectingPublisher),
+            tokio::runtime::Handle::current(),
+        ));
+
+        assert_eq!(
+            port.create_catalog(create_command(false))
+                .expect_err("a failed local publication is reported to the client")
+                .kind(),
+            CatalogApplicationErrorKind::Unavailable
+        );
+        let attachments = repository
+            .list_with_page_size(256)
+            .await
+            .expect("list attachments");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the committed attachment survives a local publication failure"
+        );
+        let instance_id = create_command(false).instance_id;
+        assert!(
+            matches!(
+                port.admit_catalog(&instance_id),
+                CatalogAdmission::Unavailable { .. }
+            ),
+            "the durable attachment exists but this host cannot serve it"
+        );
+        assert!(
+            control.observe_current_binding(&instance_id).is_err(),
+            "an unpublished generation must not stay locally live"
+        );
+
+        drop(port);
+        drop(control);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// User-visible existence semantics, and the identity rule that stops a
+    /// same-name recreate from resurrecting the dropped attachment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn existence_semantics_and_recreate_mint_a_fresh_attachment_identity() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let (control, port) = projection(repository.clone());
+        let instance_id = create_command(false).instance_id;
+
+        assert_eq!(
+            port.drop_catalog(CatalogDropCommand {
+                instance_id: instance_id.clone(),
+                if_exists: false,
+            })
+            .expect_err("dropping an absent catalog is an error")
+            .kind(),
+            CatalogApplicationErrorKind::NotFound
+        );
+        port.drop_catalog(CatalogDropCommand {
+            instance_id: instance_id.clone(),
+            if_exists: true,
+        })
+        .expect("DROP IF EXISTS on an absent catalog is a no-op");
+
+        let first = port
+            .create_catalog(create_command(false))
+            .expect("first CREATE");
+        assert_eq!(
+            port.create_catalog(create_command(false))
+                .expect_err("a duplicate CREATE is rejected")
+                .kind(),
+            CatalogApplicationErrorKind::AlreadyExists
+        );
+        // IF NOT EXISTS returns the current runtime instead of minting a second
+        // lifecycle identity for the same SQL name.
+        assert_eq!(
+            port.create_catalog(create_command(true))
+                .expect("CREATE IF NOT EXISTS resolves the existing attachment")
+                .attachment_id,
+            first.attachment_id
+        );
+
+        port.drop_catalog(CatalogDropCommand {
+            instance_id: instance_id.clone(),
+            if_exists: false,
+        })
+        .expect("DROP removes the durable attachment");
+        assert!(matches!(
+            port.admit_catalog(&instance_id),
+            CatalogAdmission::Absent
+        ));
+        assert!(
+            control.observe_current_binding(&instance_id).is_err(),
+            "DROP stops local admission before the generation is gone"
+        );
+
+        let recreated = port
+            .create_catalog(create_command(false))
+            .expect("recreate the same SQL name");
+        assert_ne!(
+            recreated.attachment_id, first.attachment_id,
+            "a recreated catalog must not reuse the dropped lifecycle identity"
+        );
+
+        drop(port);
+        drop(control);
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
     }
 
     #[test]
@@ -600,7 +905,7 @@ mod tests {
             .await
             .expect("create attachment");
         let control = Arc::new(
-            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory)])
+            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory::default())])
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(

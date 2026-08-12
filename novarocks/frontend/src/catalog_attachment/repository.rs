@@ -88,6 +88,7 @@ impl fmt::Display for CatalogAttachmentError {
 
 impl std::error::Error for CatalogAttachmentError {}
 
+// Design: ADR-0064 (docs/adr/ADR-0064-state-store-catalog-attachment-authority.md)
 #[derive(Clone)]
 pub struct CatalogAttachmentRepository {
     store: Arc<dyn StateStore>,
@@ -927,6 +928,117 @@ mod tests {
                 .expect("read attachment after rejected drop"),
             Some(created)
         );
+
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// The writer-first half of the DROP/MV race closure. A DROP that commits
+    /// first must make the MV writer's frozen observation fail, and a same-name
+    /// recreate must fail it too so an ABA cannot smuggle a dangling reference
+    /// into a durable MV definition.
+    #[tokio::test]
+    async fn mv_attachment_assertion_rejects_a_dropped_or_recreated_attachment() {
+        let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
+        let registry =
+            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let mut host = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "catalog-attachment-mv-assert-test".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: directory.path().join("state-store.sqlite"),
+                            deployment_owner: "catalog-attachment-mv-assert-test".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
+                topology_revision: Bytes::from_static(b"catalog-attachment-mv-assert-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite StateStore");
+        let store = host.state_store().expect("ready StateStore");
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let observed = repository
+            .create(attachment(vec![("type".into(), "iceberg".into())]))
+            .await
+            .expect("create catalog attachment");
+
+        // A writer that still holds the live observation may proceed.
+        let mut transaction = store
+            .begin_write(
+                TransactionId::from(Uuid::now_v7()),
+                "assert live catalog attachment",
+            )
+            .await
+            .expect("begin live assertion transaction");
+        assert_attachment_versions(transaction.as_mut(), std::slice::from_ref(&observed))
+            .await
+            .expect("a live attachment admits the materialized view write");
+        transaction.abort().await.expect("abort live assertion");
+
+        repository
+            .drop_exact(observed.clone())
+            .await
+            .expect("DROP commits first");
+        let mut transaction = store
+            .begin_write(
+                TransactionId::from(Uuid::now_v7()),
+                "assert dropped catalog attachment",
+            )
+            .await
+            .expect("begin dropped assertion transaction");
+        assert_eq!(
+            assert_attachment_versions(transaction.as_mut(), std::slice::from_ref(&observed))
+                .await
+                .expect_err("a dropped attachment must reject the write")
+                .kind(),
+            StateStoreErrorKind::Conflict
+        );
+        transaction.abort().await.expect("abort dropped assertion");
+
+        // Recreating the same SQL name mints a new lifecycle identity, so the
+        // stale observation must not be accepted by version or by name.
+        let recreated = repository
+            .create(attachment(vec![("type".into(), "iceberg".into())]))
+            .await
+            .expect("recreate the same catalog name");
+        assert_ne!(
+            recreated.attachment.attachment_id,
+            observed.attachment.attachment_id
+        );
+        let mut transaction = store
+            .begin_write(
+                TransactionId::from(Uuid::now_v7()),
+                "assert recreated catalog attachment",
+            )
+            .await
+            .expect("begin recreated assertion transaction");
+        assert_eq!(
+            assert_attachment_versions(transaction.as_mut(), std::slice::from_ref(&observed))
+                .await
+                .expect_err("a recreated attachment must reject the stale observation")
+                .kind(),
+            StateStoreErrorKind::Conflict
+        );
+        transaction
+            .abort()
+            .await
+            .expect("abort recreated assertion");
 
         drop(repository);
         drop(store);

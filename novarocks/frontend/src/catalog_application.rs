@@ -78,6 +78,7 @@ impl LocalProjection {
 }
 
 /// Owns durable attachment mutation and the local Connector control projection.
+// Design: ADR-0064 (docs/adr/ADR-0064-state-store-catalog-attachment-authority.md)
 pub struct FrontendCatalogApplicationPort {
     repository: Option<CatalogAttachmentRepository>,
     control: Arc<ConnectorControlHost>,

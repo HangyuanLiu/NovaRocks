@@ -7250,13 +7250,15 @@ path = "{metadata_path}"
             .lock()
             .expect("creates")
             .first()
-            .map(|command| crate::catalog_application::CatalogRuntimeObservation {
-                attachment_id: uuid::Uuid::now_v7(),
-                instance_id: command.instance_id.clone(),
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                    .expect("provider ID"),
-                generation: 1,
-            })
+            .map(
+                |command| crate::catalog_application::CatalogRuntimeObservation {
+                    attachment_id: uuid::Uuid::now_v7(),
+                    instance_id: command.instance_id.clone(),
+                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                        .expect("provider ID"),
+                    generation: 1,
+                },
+            )
             .expect("create was routed to the application");
         crate::catalog_application::CatalogRuntimePublisherSink::publish_catalog_runtime(
             projection.as_ref(),
