@@ -868,7 +868,51 @@ pub struct ConnectorDataMutationLease {
     key: ConnectorExecutionBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     mutation: Arc<dyn ConnectorDataMutation>,
+    /// The external fence this authority established, shared across clones so
+    /// every terminal call of one direct mutation carries the same fence.
+    fence: Arc<Mutex<Option<super::ConnectorExternalOperationFence>>>,
     _release: Arc<DataMutationLeaseRelease>,
+}
+
+impl ConnectorDataMutationLease {
+    /// Establish this attempt's external fence before anything is dispatched.
+    ///
+    /// Direct mutation changes external table truth exactly like a distributed
+    /// write, so it uses the same fence value and the same "establish before
+    /// dispatch" ordering; only the execution contract differs.
+    pub fn establish_external_fence(
+        &self,
+        fence: super::ConnectorExternalOperationFence,
+    ) -> Result<(), ConnectorError> {
+        fence.validate()?;
+        let mut slot = self.fence.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector data mutation fence lock was poisoned",
+            )
+        })?;
+        if let Some(established) = slot.as_ref() {
+            fence.validate_monotonic_successor_of(established)?;
+        }
+        *slot = Some(fence);
+        Ok(())
+    }
+
+    /// The fencing decision every terminal call of this mutation must carry.
+    pub fn fencing(&self) -> Result<super::ConnectorWriteFencing, ConnectorError> {
+        let slot = self.fence.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector data mutation fence lock was poisoned",
+            )
+        })?;
+        Ok(match slot.as_ref() {
+            Some(fence) => super::ConnectorWriteFencing::Fenced(fence.clone()),
+            None => super::ConnectorWriteFencing::NotFencedByThisPhase {
+                reason: "no external fence was established for this direct mutation",
+            },
+        })
+    }
 }
 
 struct DataMutationLeaseRelease {
@@ -898,6 +942,7 @@ impl ConnectorDataMutationLease {
             key,
             metadata,
             mutation,
+            fence: Arc::new(Mutex::new(None)),
             _release: Arc::new(DataMutationLeaseRelease {
                 release: Mutex::new(Some(Box::new(release))),
             }),

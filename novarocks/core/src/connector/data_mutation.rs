@@ -337,12 +337,19 @@ impl DataMutationSession {
         }
         let request = match ConnectorDataMutationExecuteRequest::try_new(
             self.plan.clone(),
-            // The provider seam can assert a fence for TRUNCATE now, but the
-            // frontend does not yet project one for the direct-mutation
-            // family. Until it does, this states the gap rather than passing a
-            // fence nobody established.
-            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
-                reason: "direct-mutation fence projection is not wired yet",
+            // Whatever this authority established before dispatch. An
+            // operation that never established one says so; it never invents a
+            // fence at terminal time, which would look fenced while asserting
+            // nothing.
+            match self.lease.fencing() {
+                Ok(fencing) => fencing,
+                Err(error) => {
+                    self.phase = DataMutationSessionPhase::Terminal;
+                    return contract_failure(
+                        error,
+                        DataMutationDispatchState::ConfirmedNotDispatched,
+                    );
+                }
             },
             self.context.clone(),
         ) {
