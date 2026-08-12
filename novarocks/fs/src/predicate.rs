@@ -83,9 +83,18 @@ impl ScanPredicateDomain {
     /// Returns `true` when a row satisfying the domain may exist inside the
     /// bounds, i.e. the caller must keep the unit.
     ///
-    /// Fallback direction: when two values are not comparable (different
-    /// variants), `compare` yields `None` and the enclosing `is_some_and` turns
-    /// that into "does not match", so the caller prunes the unit.
+    /// Pruning must be *sound*: a unit may only be skipped when it provably
+    /// cannot produce a TRUE row. Skipping too much is a correctness bug;
+    /// keeping too much only costs I/O. Every case where the bounds cannot be
+    /// judged therefore resolves to "keep":
+    ///
+    /// - values that are not comparable (different variants -- e.g. an `Int64`
+    ///   predicate against `Int32` statistics written before an Iceberg
+    ///   `int -> long` promotion) yield `None` from `compare` and keep the unit;
+    /// - a missing bound pair is handled by the caller, which also keeps.
+    ///
+    /// An empty `DiscreteSet` / `Membership` is a different matter and still
+    /// prunes: `x IN ()` is unsatisfiable, so skipping is provably correct.
     pub fn may_match_bounds(
         &self,
         min: &MinMaxPredicateValue,
@@ -94,26 +103,26 @@ impl ScanPredicateDomain {
         match self {
             Self::Range { op, value } => match op {
                 MinMaxPredicateOp::Le => {
-                    compare(min, value).is_some_and(|order| order != Ordering::Greater)
+                    compare(min, value).is_none_or(|order| order != Ordering::Greater)
                 }
                 MinMaxPredicateOp::Lt => {
-                    compare(min, value).is_some_and(|order| order == Ordering::Less)
+                    compare(min, value).is_none_or(|order| order == Ordering::Less)
                 }
                 MinMaxPredicateOp::Ge => {
-                    compare(max, value).is_some_and(|order| order != Ordering::Less)
+                    compare(max, value).is_none_or(|order| order != Ordering::Less)
                 }
                 MinMaxPredicateOp::Gt => {
-                    compare(max, value).is_some_and(|order| order == Ordering::Greater)
+                    compare(max, value).is_none_or(|order| order == Ordering::Greater)
                 }
                 MinMaxPredicateOp::Eq => {
-                    compare(min, value).is_some_and(|order| order != Ordering::Greater)
-                        && compare(max, value).is_some_and(|order| order != Ordering::Less)
+                    compare(min, value).is_none_or(|order| order != Ordering::Greater)
+                        && compare(max, value).is_none_or(|order| order != Ordering::Less)
                 }
             },
             Self::DiscreteSet { values, .. } | Self::Membership { values } => {
                 values.iter().any(|value| {
-                    compare(min, value).is_some_and(|order| order != Ordering::Greater)
-                        && compare(max, value).is_some_and(|order| order != Ordering::Less)
+                    compare(min, value).is_none_or(|order| order != Ordering::Greater)
+                        && compare(max, value).is_none_or(|order| order != Ordering::Less)
                 })
             }
         }
@@ -193,4 +202,130 @@ pub struct PhysicalPruning {
 pub struct PhysicalPageSelection {
     pub row_group: usize,
     pub page_indices: Vec<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOUNDS: (MinMaxPredicateValue, MinMaxPredicateValue) =
+        (MinMaxPredicateValue::Int32(10), MinMaxPredicateValue::Int32(20));
+
+    const ALL_OPS: [MinMaxPredicateOp; 5] = [
+        MinMaxPredicateOp::Eq,
+        MinMaxPredicateOp::Lt,
+        MinMaxPredicateOp::Le,
+        MinMaxPredicateOp::Gt,
+        MinMaxPredicateOp::Ge,
+    ];
+
+    fn range(op: MinMaxPredicateOp, value: MinMaxPredicateValue) -> ScanPredicateDomain {
+        ScanPredicateDomain::Range { op, value }
+    }
+
+    fn discrete(values: Vec<MinMaxPredicateValue>) -> ScanPredicateDomain {
+        let min = values
+            .first()
+            .cloned()
+            .unwrap_or(MinMaxPredicateValue::Int32(0));
+        let max = values
+            .last()
+            .cloned()
+            .unwrap_or(MinMaxPredicateValue::Int32(0));
+        ScanPredicateDomain::DiscreteSet { values, min, max }
+    }
+
+    #[test]
+    fn range_ops_evaluate_against_the_correct_bound() {
+        let (min, max) = BOUNDS;
+        for (op, literal, expected) in [
+            (MinMaxPredicateOp::Eq, 12, true),
+            (MinMaxPredicateOp::Eq, 21, false),
+            (MinMaxPredicateOp::Eq, 9, false),
+            (MinMaxPredicateOp::Lt, 11, true),
+            (MinMaxPredicateOp::Lt, 10, false),
+            (MinMaxPredicateOp::Le, 10, true),
+            (MinMaxPredicateOp::Le, 9, false),
+            (MinMaxPredicateOp::Gt, 19, true),
+            (MinMaxPredicateOp::Gt, 20, false),
+            (MinMaxPredicateOp::Ge, 20, true),
+            (MinMaxPredicateOp::Ge, 21, false),
+        ] {
+            let domain = range(op, MinMaxPredicateValue::Int32(literal));
+            assert_eq!(
+                domain.may_match_bounds(&min, &max),
+                expected,
+                "bounds [10, 20] with {op:?} {literal}"
+            );
+        }
+    }
+
+    /// Iceberg `int -> long` promotion: the table schema became `long`, so the
+    /// predicate literal arrives as `Int64`, while data files written before the
+    /// promotion still publish `Int32` statistics. The pair cannot be compared,
+    /// and pruning stays sound only by keeping the unit.
+    #[test]
+    fn incomparable_variants_keep_the_unit_for_every_op() {
+        let (min, max) = BOUNDS;
+        for op in ALL_OPS {
+            let domain = range(op, MinMaxPredicateValue::Int64(12));
+            assert!(
+                domain.may_match_bounds(&min, &max),
+                "{op:?} must keep the unit when the literal cannot be compared to the bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn incomparable_discrete_set_keeps_the_unit() {
+        let (min, max) = BOUNDS;
+        // Every value is outside [10, 20] numerically, but none is comparable,
+        // so the set must not be treated as disjoint from the bounds.
+        let domain = discrete(vec![
+            MinMaxPredicateValue::Int64(1),
+            MinMaxPredicateValue::Int64(30),
+        ]);
+        assert!(domain.may_match_bounds(&min, &max));
+    }
+
+    #[test]
+    fn empty_value_set_still_prunes() {
+        let (min, max) = BOUNDS;
+        // `x IN ()` is unsatisfiable, so skipping the unit is provably correct.
+        assert!(!discrete(Vec::new()).may_match_bounds(&min, &max));
+        assert!(
+            !ScanPredicateDomain::Membership { values: Vec::new() }
+                .may_match_bounds(&min, &max)
+        );
+    }
+
+    #[test]
+    fn discrete_set_prunes_only_when_every_value_is_outside() {
+        let (min, max) = BOUNDS;
+        let disjoint = discrete(vec![
+            MinMaxPredicateValue::Int32(1),
+            MinMaxPredicateValue::Int32(30),
+        ]);
+        assert!(!disjoint.may_match_bounds(&min, &max));
+
+        let overlapping = discrete(vec![
+            MinMaxPredicateValue::Int32(1),
+            MinMaxPredicateValue::Int32(12),
+        ]);
+        assert!(overlapping.may_match_bounds(&min, &max));
+    }
+
+    #[test]
+    fn membership_follows_the_same_rule_as_discrete_set() {
+        let (min, max) = BOUNDS;
+        let disjoint = ScanPredicateDomain::Membership {
+            values: vec![MinMaxPredicateValue::Int32(30)],
+        };
+        assert!(!disjoint.may_match_bounds(&min, &max));
+
+        let overlapping = ScanPredicateDomain::Membership {
+            values: vec![MinMaxPredicateValue::Int32(12)],
+        };
+        assert!(overlapping.may_match_bounds(&min, &max));
+    }
 }

@@ -283,6 +283,52 @@ fn parquet_predicate_prunes_row_groups() {
     );
 }
 
+/// Iceberg `int -> long` promotion reaching the reader: once the table schema
+/// is promoted to `long`, predicate literals arrive as `Int64` while data files
+/// written before the promotion still publish `Int32` statistics. The two are
+/// not comparable, so pruning must keep every row group. Skipping them would
+/// silently drop rows that satisfy the predicate -- the one failure mode that
+/// pruning is never allowed to have.
+#[test]
+fn parquet_predicate_keeps_row_groups_when_literal_type_outgrew_statistics() {
+    let fixture = Fixture::parquet();
+
+    let baseline = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut reader = open_file_reader(baseline).expect("open reader");
+    let unfiltered: usize = collect(reader.as_mut())
+        .expect("read Parquet")
+        .iter()
+        .map(|batch| batch.batch.num_rows())
+        .sum();
+    assert!(
+        unfiltered > 0,
+        "fixture must produce rows for this test to mean anything"
+    );
+
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.predicates.push(ScanPredicate::new(
+        "id",
+        ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Ge,
+            // The file publishes Int32 statistics for `id`; an Int64 literal
+            // cannot be compared against them.
+            value: MinMaxPredicateValue::Int64(4),
+        },
+        ScanPredicateSource::Static,
+    ));
+    let mut reader = open_file_reader(request).expect("open reader");
+    let kept: usize = collect(reader.as_mut())
+        .expect("read Parquet")
+        .iter()
+        .map(|batch| batch.batch.num_rows())
+        .sum();
+
+    assert_eq!(
+        kept, unfiltered,
+        "an incomparable literal must not prune any row group"
+    );
+}
+
 #[test]
 fn parquet_predicate_binds_field_id_before_column_name() {
     let fixture = Fixture::parquet();
