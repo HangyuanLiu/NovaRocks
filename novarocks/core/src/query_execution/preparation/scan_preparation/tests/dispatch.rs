@@ -76,7 +76,7 @@ impl ScanBindingResolver for JoinRefreshDeltaResolver {
             return Err("join refresh fixture resolver received a non-delta scan".to_string());
         }
         Ok(Some(ResolvedScanExecution::SealedConnectorScan(
-            crate::query_execution::preparation::scan::fixture_sealed_change_scan_for_table(
+            fixture_sealed_change_scan(
                 &source.table.catalog,
                 &source.table.table,
                 match source.kind {
@@ -247,7 +247,7 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     assert_eq!(scan_tables.len(), 3, "coalesce fixture binding identities");
 
     let registry = ConnectorRegistry::new();
-    crate::connector::iceberg::provider::register_planned_files_fixture(
+    crate::connector::scan_model::register_planned_files_fixture(
         &registry,
         "ice",
         vec![data_file("s3://sqlx2-coalesce/frozen.parquet")],
@@ -373,7 +373,7 @@ fn scan_preparation_propagates_caller_cancellation() {
             .expect("cancelled request context");
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
-    let plan = plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot));
+    let plan = plan(scan_node(10));
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
     let err = match super::super::prepare_scan_bindings(
         &plan,
@@ -388,18 +388,18 @@ fn scan_preparation_propagates_caller_cancellation() {
     };
 
     assert!(
-        err.contains("Cancelled: connector request was cancelled"),
+        err.contains("Cancelled: read fixture observed caller cancellation"),
         "{err}"
     );
 }
 
 #[test]
 fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring_current() {
-    let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &root.payload else {
         panic!("fixture root must be a scan");
     };
-    let table = iceberg_table();
+    let table = fixture_table_identity();
     let source_table = scan.table.clone();
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry);
@@ -524,7 +524,7 @@ fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
     let bindings = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
         .expect("binding store");
     let error = match super::super::prepare_scan_bindings(
-        &plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot)),
+        &plan(scan_node(10)),
         &controls,
         &crate::connector::test_request_context(),
         Some(&bindings),
@@ -543,7 +543,7 @@ fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
 
 #[test]
 fn ordinary_current_snapshot_is_immutable_and_does_not_invoke_resolver() {
-    let plan = plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot));
+    let plan = plan(scan_node(10));
     let before = format!("{plan:#?}");
     let bindings = prepare_scan_bindings(
         &plan,
@@ -567,7 +567,7 @@ fn ordinary_current_snapshot_is_immutable_and_does_not_invoke_resolver() {
 
 #[test]
 fn duplicate_scan_node_defense_reports_exact_error() {
-    let root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let root = scan_node(10);
     let registry = registry(vec![data_file("s3://bucket/explicit.parquet")]);
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
@@ -614,7 +614,7 @@ fn refresh_only_sources_require_resolver_with_kind_and_node_id() {
         ),
         "SqlDelta",
     )] {
-        let mut root = scan_node(37, IcebergDataFileBinding::ExplicitFiles);
+        let mut root = scan_node(37);
         replace_scan_source(&mut root, source);
 
         let err = match prepare_scan_bindings(&plan(root), &ConnectorRegistry::new(), None) {
@@ -630,7 +630,7 @@ fn refresh_only_sources_require_resolver_with_kind_and_node_id() {
 
 #[test]
 fn resolver_error_reports_source_kind_node_id_and_cause() {
-    let mut root = scan_node(47, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(47);
     replace_scan_source(
         &mut root,
         crate::sql::planner::table::test_sql_scan_source(
@@ -655,7 +655,7 @@ fn resolver_error_reports_source_kind_node_id_and_cause() {
 
 #[test]
 fn resolver_ok_none_reports_exact_required_source_error() {
-    let mut root = scan_node(48, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(48);
     replace_scan_source(
         &mut root,
         crate::sql::planner::table::test_sql_scan_source(
@@ -680,7 +680,7 @@ fn resolver_ok_none_reports_exact_required_source_error() {
 
 #[test]
 fn resolver_failure_precedes_invalid_physical_projection() {
-    let mut root = scan_node(49, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(49);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -744,7 +744,7 @@ fn target_state_and_locator_reject_equality_deletes() {
     ];
 
     for (source, expected_kind) in sources {
-        let mut root = scan_node(39, IcebergDataFileBinding::ExplicitFiles);
+        let mut root = scan_node(39);
         let DistributedNodeKind::Scan(scan) = &mut root.payload else {
             panic!("test root must be a scan");
         };
@@ -765,14 +765,9 @@ fn target_state_and_locator_reject_equality_deletes() {
         ]);
         scan.table.source = source;
         let mut file = data_file("s3://bucket/target-data.parquet");
-        file.delete_files = vec![equality_delete_file(Vec::new(), vec![3])];
-        let controls = crate::connector::FixtureControlResolver::new(registry(vec![file.clone()]));
-        let err = match prepare_scan_bindings_with_materialized_files(
-            &plan(root),
-            &controls,
-            None,
-            vec![file],
-        ) {
+        file.deletes = vec![equality_delete_file(Vec::new(), vec![3])];
+        let controls = crate::connector::FixtureControlResolver::new(registry(vec![file]));
+        let err = match prepare_scan_bindings_with_controls(&plan(root), &controls, None) {
             Ok(_) => panic!("{expected_kind} equality-delete scan must fail"),
             Err(err) => err,
         };
@@ -784,7 +779,7 @@ fn target_state_and_locator_reject_equality_deletes() {
 
 #[test]
 fn resolver_execution_kind_must_match_semantic_source() {
-    let mut version = scan_node(41, IcebergDataFileBinding::ExplicitFiles);
+    let mut version = scan_node(41);
     replace_scan_source(
         &mut version,
         crate::sql::planner::table::test_sql_scan_source(

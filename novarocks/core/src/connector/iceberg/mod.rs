@@ -40,6 +40,12 @@ pub mod position_delete;
 /// root. The provider crate owns the external Iceberg dependency boundary;
 /// these adapters only bind frozen SPI payloads to Core's runtime.
 pub mod provider;
+/// Contract tests for the Core-owned `IcebergControlProvider` above. They live
+/// next to their subject because they assert Core-internal provider behavior
+/// (statistics version pinning, create policy, stale-split rejection) that no
+/// SQL-visible outcome can express.
+#[cfg(test)]
+mod provider_test;
 
 pub mod scan_deletes;
 pub mod schema;
@@ -62,7 +68,6 @@ pub use metadata::{
     plan_native_iceberg_metadata_read_source,
     plan_native_iceberg_metadata_read_source_with_cancellation,
 };
-pub(crate) use schema::build_projected_output_schema_from_scan_model;
 pub use schema::{
     IcebergArrowColumn, IcebergPartitionInfo, IcebergSchemaDescriptor,
     IcebergSchemaFieldDescriptor, IcebergTableColumn, IcebergTableDescriptor,

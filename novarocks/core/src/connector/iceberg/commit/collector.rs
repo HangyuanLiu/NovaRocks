@@ -193,21 +193,17 @@ impl IcebergCommitCollector {
             .push(set);
     }
 
-    /// Drain the per-file sketch sets registered via
-    /// [`inject_sketch_set`] plus any pushed through the runtime
-    /// `sink_commit` side channel for this query's fragment instance.
+    /// Drain the per-file sketch sets registered via [`inject_sketch_set`].
     /// Each call is destructive — sketches cannot be cloned, so the
     /// caller (typically `StatsAssembler::assemble`) consumes them once.
     pub fn take_sketch_sets(&self) -> Vec<FileSketchSet> {
-        let mut sets = {
+        {
             let mut guard = self
                 .sketch_sets
                 .lock()
                 .expect("collector sketch_sets lock poisoned");
             std::mem::take(&mut *guard)
-        };
-        sets.extend(crate::runtime::sink_commit::take_sketch_sets(self.finst_id));
-        sets
+        }
     }
 
     /// Cumulative `record_count` across every injected [`WrittenFile`] with
@@ -392,10 +388,10 @@ impl IcebergCommitCollector {
     ///   stats left behind for a dropped column) are skipped rather than
     ///   decoded, matching the inject path's tolerance for stale stats.
     /// - Puffin/NDV sketches are not part of `WrittenFile`; they ride the
-    ///   out-of-band sketch channel (`take_sketch_sets` /
-    ///   `runtime::sink_commit::take_sketch_sets`), which is in-process today.
-    ///   Cross-node sketch transport is required only when multi-BE append is
-    ///   cut over and is out of scope for PR-0.
+    ///   out-of-band sketch channel on this collector (`inject_sketch_set` /
+    ///   `take_sketch_sets`), which is in-process today. Cross-node sketch
+    ///   transport is required only when multi-BE append is cut over and is
+    ///   out of scope for PR-0.
     pub(crate) fn convert_writer_report(
         &self,
         report: IcebergWriterReport,

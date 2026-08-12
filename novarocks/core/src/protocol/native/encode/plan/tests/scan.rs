@@ -36,7 +36,6 @@ use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::DataPartition;
 use crate::sql::planner::table as table_model;
-use novarocks_connector_iceberg::scan_model as iceberg_scan_model;
 
 #[test]
 fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
@@ -197,7 +196,6 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
         DataType::Utf8,
         true,
     ));
-    let table = iceberg_table_info_for_test();
     scan.table.source = table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
         version: table_model::SqlTableVersionSelector::Current,
     });
@@ -211,8 +209,6 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
     bindings
         .insert_binding(file_binding_for_test(
             10,
-            table,
-            iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot,
             vec![bound_column_for_test(
                 1,
                 "order_id",
@@ -301,28 +297,10 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
         ];
         let plan = plan.seal().expect("seal refresh-source fixture");
 
-        let mut resolved_table = iceberg_table_info_for_test();
-        resolved_table.current_snapshot_id = Some(1);
-        resolved_table.location = "s3://resolved/orders".to_string();
-        resolved_table.schema.fields[0].name = "physical_order_id".to_string();
-        resolved_table
-            .schema
-            .fields
-            .push(iceberg_scan_model::IcebergSchemaFieldDef {
-                field_id: 2,
-                name: "tenant_id".to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: None,
-                write_default_json: None,
-                children: Vec::new(),
-            });
         let mut bindings = ScanExecutionBindings::default();
         bindings
             .insert_binding(file_binding_for_test(
                 10,
-                resolved_table,
-                iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
                 vec![
                     ResolvedScanColumn {
                         planner: output_column(1, "bound_order_id", DataType::Int64),
@@ -494,8 +472,6 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
     wrong_execution
         .insert_binding(file_binding_for_test(
             10,
-            iceberg_table_info_for_test(),
-            iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
             vec![bound_column_for_test(
                 1,
                 "order_id",
@@ -527,8 +503,6 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
         Default::default(),
     );
     let scan = root_scan_for_test(&mut plan);
-    let mut table = iceberg_table_info_for_test();
-    table.schema.fields[0].name = "v".to_string();
     scan.table.columns = vec![column_def_for_test("v", DataType::LargeBinary, false)];
     scan.table.source = table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
         version: table_model::SqlTableVersionSelector::Current,
@@ -558,8 +532,6 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     bindings
         .insert_binding(file_binding_for_test(
             10,
-            table,
-            iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
             vec![ResolvedScanColumn {
                 planner: output_column(1, "v", DataType::LargeBinary),
                 source: column_def_for_test("v", DataType::LargeBinary, false),
@@ -625,8 +597,6 @@ fn encoded_root_scan_for_test(plan: &plan::DistributedPlan) -> &plan::ScanNode {
 
 fn file_binding_for_test(
     node_id: i32,
-    _table: iceberg_scan_model::IcebergTableInfo,
-    _file_binding: iceberg_scan_model::IcebergDataFileBinding,
     physical_columns: Vec<ResolvedScanColumn>,
     required_reads: Vec<ResolvedReadColumn>,
 ) -> ResolvedScanBinding {
@@ -751,35 +721,5 @@ fn iceberg_delta_table_for_test() -> table_model::TableDef {
             from_snapshot_id: 1,
             to_snapshot_id: 2,
         }),
-    }
-}
-
-fn iceberg_table_info_for_test() -> iceberg_scan_model::IcebergTableInfo {
-    iceberg_scan_model::IcebergTableInfo {
-        catalog: "ice".to_string(),
-        namespace: "db".to_string(),
-        table: "orders".to_string(),
-        table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-        current_snapshot_id: Some(2),
-        schema_id: 1,
-        location: "file:///warehouse/orders".to_string(),
-        schema: iceberg_scan_model::IcebergSchemaDef {
-            fields: [(1, "order_id"), (2, "physical_order_id"), (3, "tenant_id")]
-                .into_iter()
-                .map(
-                    |(field_id, name)| iceberg_scan_model::IcebergSchemaFieldDef {
-                        field_id,
-                        name: name.to_string(),
-                        initial_default: None,
-                        write_default: None,
-                        initial_default_json: None,
-                        write_default_json: None,
-                        children: Vec::new(),
-                    },
-                )
-                .collect(),
-        },
-        serialized_metadata: None,
-        serialized_metadata_rows: None,
     }
 }

@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::DataType;
 
 use crate::connector::ConnectorRegistry;
+use crate::connector::scan_model::{FixtureDeleteFile, FixtureScanFile};
 use crate::query_execution::preparation::scan::{
     ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
@@ -38,10 +39,6 @@ use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
-    IcebergTableInfo,
-};
 
 fn prepare_scan_bindings(
     plan: &DistributedPlan,
@@ -49,26 +46,17 @@ fn prepare_scan_bindings(
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
-    prepare_scan_bindings_with_materialized_files(
-        plan,
-        &controls,
-        resolver,
-        vec![data_file("s3://bucket/explicit.parquet")],
-    )
+    prepare_scan_bindings_with_controls(plan, &controls, resolver)
 }
 
-/// Prepare a tokenized SQL scan with the exact provider facts that admission
-/// retained for this request.  This deliberately separates the connector
-/// fixture's available split set from the query-local materialization: tests
-/// that exercise frozen MV facts must provide their own materialized files.
-fn prepare_scan_bindings_with_materialized_files(
+/// Prepare a tokenized SQL scan against a caller-owned control resolver, for
+/// tests that must hold the same resolver across admission and preparation.
+fn prepare_scan_bindings_with_controls(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
     resolver: Option<&dyn ScanBindingResolver>,
-    materialized_files: Vec<IcebergDataFileInfo>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
-    let query_bindings =
-        fixture_query_table_bindings_with_materialized_files(plan, controls, materialized_files);
+    let query_bindings = fixture_query_table_bindings(plan, controls);
     super::prepare_scan_bindings(
         plan,
         controls,
@@ -80,23 +68,11 @@ fn prepare_scan_bindings_with_materialized_files(
 }
 
 /// The shared fixture deliberately allocates the same token that the SQL
-/// test scan carrier embeds. Concrete Iceberg files remain in the
-/// provider-owned opaque handle, never in `TableDef::source`.
+/// test scan carrier embeds. Concrete read units remain in the provider-owned
+/// opaque handle, never in `TableDef::source`.
 fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-) -> crate::engine::query_planning::bindings::QueryTableBindingStore {
-    fixture_query_table_bindings_with_materialized_files(
-        plan,
-        controls,
-        vec![data_file("s3://bucket/explicit.parquet")],
-    )
-}
-
-fn fixture_query_table_bindings_with_materialized_files(
-    plan: &DistributedPlan,
-    controls: &crate::connector::FixtureControlResolver,
-    _materialized_files: Vec<IcebergDataFileInfo>,
 ) -> crate::engine::query_planning::bindings::QueryTableBindingStore {
     use crate::engine::query_planning::bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
@@ -293,109 +269,42 @@ fn source_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
     }
 }
 
-fn iceberg_table() -> IcebergTableInfo {
-    IcebergTableInfo {
+/// The SQL table identity that [`crate::sql::planner::table::test_sql_scan_source`]
+/// embeds, restated so tests can admit a binding for the same three-part name
+/// without naming a provider.
+struct FixtureTableIdentity {
+    catalog: String,
+    namespace: String,
+    table: String,
+}
+
+fn fixture_table_identity() -> FixtureTableIdentity {
+    FixtureTableIdentity {
         catalog: "test_catalog".to_string(),
         namespace: "test_db".to_string(),
         table: "test_table".to_string(),
-        table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-        current_snapshot_id: Some(7),
-        schema_id: 1,
-        location: "s3://bucket/test_table".to_string(),
-        schema: IcebergSchemaDef {
-            fields: vec![
-                IcebergSchemaFieldDef {
-                    field_id: 1,
-                    name: "id".to_string(),
-                    initial_default: None,
-                    write_default: None,
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: Vec::new(),
-                },
-                IcebergSchemaFieldDef {
-                    field_id: 3,
-                    name: "category".to_string(),
-                    initial_default: None,
-                    write_default: None,
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: Vec::new(),
-                },
-            ],
-        },
-        serialized_metadata: None,
-        serialized_metadata_rows: None,
     }
 }
 
-/// Mirror the SQL table facts retained at admission in the application-owned
-/// Iceberg fixture.  Row-lineage columns stay provider metadata rather than
-/// physical table schema fields, matching the real connector contract.
-fn iceberg_table_for_planner(planner: &TableDef) -> IcebergTableInfo {
-    let mut table = iceberg_table();
-    table.schema.fields = planner
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(ordinal, column)| IcebergSchemaFieldDef {
-            field_id: match column.name.as_str() {
-                "id" => 1,
-                "category" => 3,
-                _ => i32::try_from(ordinal + 10).expect("fixture field id"),
-            },
-            name: column.name.clone(),
-            initial_default: None,
-            write_default: None,
-            initial_default_json: None,
-            write_default_json: None,
-            children: Vec::new(),
-        })
-        .collect();
-    table
-}
-
-fn data_file(path: &str) -> IcebergDataFileInfo {
-    IcebergDataFileInfo {
-        path: path.to_string(),
-        size: 128,
-        row_count: Some(10),
-        column_stats: None,
-        partition_spec_id: Some(0),
-        partition_key: Some("Struct([])".to_string()),
-        first_row_id: None,
-        data_sequence_number: Some(1),
-        ivm_change_op: None,
-        included_positions: None,
-        delete_files: Vec::new(),
-        manifest_path: None,
-        partition_values: Vec::new(),
-    }
+fn data_file(path: &str) -> FixtureScanFile {
+    let mut file = FixtureScanFile::new(path);
+    file.partition_spec_id = Some(0);
+    file.sequence_number = Some(1);
+    file
 }
 
 fn equality_delete_file(
     equality_column_names: Vec<&str>,
     equality_field_ids: Vec<i32>,
-) -> novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
-    novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
-        path: "s3://bucket/eq-delete.parquet".to_string(),
-        file_format: novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
-        file_content: novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality,
-        length: Some(1),
-        content_offset: None,
-        content_size_in_bytes: None,
-        sequence_number: Some(2),
-        partition_spec_id: Some(0),
-        partition_key: Some("Struct([])".to_string()),
-        equality_column_names: equality_column_names
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        equality_field_ids,
-    }
+) -> FixtureDeleteFile {
+    FixtureDeleteFile::equality(
+        "s3://bucket/eq-delete.parquet",
+        &equality_column_names,
+        &equality_field_ids,
+    )
 }
 
-fn scan_node(node_id: i32, _binding: IcebergDataFileBinding) -> DistributedNode {
+fn scan_node(node_id: i32) -> DistributedNode {
     let output = column(1, "id", DataType::Int32, false);
     let table = TableDef {
         name: "ice_t".to_string(),
@@ -454,9 +363,9 @@ fn plan(root: DistributedNode) -> DistributedPlan {
     }
 }
 
-fn registry(files: Vec<IcebergDataFileInfo>) -> ConnectorRegistry {
+fn registry(files: Vec<FixtureScanFile>) -> ConnectorRegistry {
     let registry = ConnectorRegistry::new();
-    crate::connector::iceberg::provider::register_planned_files_fixture(
+    crate::connector::scan_model::register_planned_files_fixture(
         &registry,
         "test_catalog",
         files,
@@ -465,12 +374,25 @@ fn registry(files: Vec<IcebergDataFileInfo>) -> ConnectorRegistry {
     registry
 }
 
+/// Register read units per table name, so a test can plan a scan against a
+/// table the fixture deliberately has no units for.
+fn registry_for_tables(files_by_table: HashMap<String, Vec<FixtureScanFile>>) -> ConnectorRegistry {
+    let registry = ConnectorRegistry::new();
+    crate::connector::scan_model::register_planned_table_files_fixture(
+        &registry,
+        "test_catalog",
+        files_by_table,
+        None,
+    );
+    registry
+}
+
 fn recording_registry(
-    files: Vec<IcebergDataFileInfo>,
+    files: Vec<FixtureScanFile>,
 ) -> (ConnectorRegistry, Arc<Mutex<Vec<Vec<usize>>>>) {
     let seen_projections = Arc::new(Mutex::new(Vec::new()));
     let registry = ConnectorRegistry::new();
-    crate::connector::iceberg::provider::register_planned_files_fixture(
+    crate::connector::scan_model::register_planned_files_fixture(
         &registry,
         "test_catalog",
         files,
@@ -479,10 +401,81 @@ fn recording_registry(
     (registry, seen_projections)
 }
 
+/// Seal a change-window scan on the neutral read fixture, the way an
+/// application does while it still holds the exact lease.
+///
+/// The scan is minted from its own binding of the same catalog. That is enough
+/// for preparation to accept it, because the fixture pins one incarnation per
+/// catalog, and it keeps the sealed handle decodable by whichever registration
+/// the test later plans against.
+fn fixture_sealed_change_scan(
+    catalog: &str,
+    table: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> novarocks_spi::connector::ConnectorScan {
+    use novarocks_spi::connector::{
+        ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorChangeWindow,
+        ConnectorControlPlanningLease, ConnectorInstanceId, ConnectorReadPurpose,
+        ConnectorScanSelection, ConnectorTableIdentity, ConnectorTableRequest,
+        ConnectorTableResolution,
+    };
+
+    let lease = ConnectorControlPlanningLease::new(
+        Arc::new(crate::connector::scan_model::planned_files_fixture_binding(
+            catalog,
+            HashMap::new(),
+            None,
+        )),
+        || {},
+    );
+    let context = crate::connector::test_request_context();
+    let metadata = lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse(catalog).expect("fixture instance ID"),
+                namespace: Arc::from("db"),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        })
+        .expect("fixture table metadata");
+    let projection = (0..metadata.schema.fields().len()).collect();
+    lease
+        .binding()
+        .planning()
+        .begin_scan(
+            &metadata.table,
+            ConnectorBeginScanRequest {
+                projection,
+                static_predicates: Vec::new(),
+                selection: ConnectorScanSelection::ChangeWindow(ConnectorChangeWindow::new(
+                    from_snapshot_id,
+                    to_snapshot_id,
+                )),
+                purpose: ConnectorReadPurpose::Query,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: std::num::NonZeroUsize::new(4096).expect("nonzero rows"),
+                    max_bytes: std::num::NonZeroUsize::new(context.max_handle_payload_bytes())
+                        .expect("nonzero bytes"),
+                },
+                context,
+            },
+        )
+        .expect("fixture change-window scan")
+}
+
 fn resolved_delta() -> ResolvedScanExecution {
-    ResolvedScanExecution::SealedConnectorScan(
-        crate::query_execution::preparation::scan::fixture_sealed_change_scan("test_catalog", 6, 7),
-    )
+    ResolvedScanExecution::SealedConnectorScan(fixture_sealed_change_scan(
+        "test_catalog",
+        "orders",
+        6,
+        7,
+    ))
 }
 
 fn resolved_data_delta() -> ResolvedScanExecution {

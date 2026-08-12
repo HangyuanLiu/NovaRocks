@@ -33,7 +33,6 @@ use crate::sql::plan_read::{
     ColumnId, ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn, PlanScanNode,
     ScanVariantColumn,
 };
-use novarocks_connector_iceberg::scan_model as iceberg_scan_model;
 use novarocks_protocol::{common, plan};
 
 pub(super) fn encode_scan_node(
@@ -513,7 +512,6 @@ fn encode_scan_source(
                     scan_output_columns.unwrap_or_default(),
                     scan_analysis_columns.unwrap_or_default(),
                     scan_required_columns.unwrap_or_default(),
-                    None,
                     scan_variant_columns,
                     binding,
                     Some(planned.scan.output_schema()),
@@ -536,7 +534,6 @@ fn encode_connector_expected_schema_ipc(
     output_columns: &[common::OutputColumn],
     analysis_columns: &[AnalysisOutputColumn],
     required_columns: &[String],
-    iceberg_schema: Option<&iceberg_scan_model::IcebergSchemaDef>,
     variant_columns: &[ScanVariantColumn],
     binding: Option<&ResolvedScanBinding>,
     provider_schema: Option<&arrow::datatypes::SchemaRef>,
@@ -621,22 +618,6 @@ fn encode_connector_expected_schema_ipc(
                 })
                 .collect::<Vec<_>>(),
         )
-    } else if let Some(iceberg_schema) = iceberg_schema {
-        let columns = selected_schema
-            .fields()
-            .iter()
-            .map(|field| crate::connector::iceberg::IcebergArrowColumn {
-                name: field.name().to_string(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-            })
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::build_projected_output_schema_from_scan_model(
-            iceberg_schema,
-            &columns,
-        )?
-        .as_ref()
-        .clone()
     } else {
         selected_schema
     };
@@ -687,7 +668,6 @@ mod tests {
                 is_internal: false,
             }],
             &[],
-            None,
             &[],
             None,
             None,
@@ -721,7 +701,6 @@ mod tests {
                 is_internal: false,
             }],
             &[],
-            None,
             &[],
             None,
             Some(&provider_schema),

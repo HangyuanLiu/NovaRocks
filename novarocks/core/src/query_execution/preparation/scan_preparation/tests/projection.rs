@@ -29,7 +29,7 @@ fn projected_required_column_merge_preserves_unicode_case_deduplication() {
 
 #[test]
 fn version_scan_without_required_columns_rejects_unmaterializable_planner_output() {
-    let mut root = scan_node(37, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(37);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -64,7 +64,7 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
         ICEBERG_ROW_POS_COL,
     };
 
-    let mut root = scan_node(37, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(37);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -146,7 +146,7 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
         ICEBERG_ROW_POS_COL,
     };
 
-    let mut root = scan_node(38, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(38);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -216,7 +216,7 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
 
 #[test]
 fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
-    let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -226,7 +226,7 @@ fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
     let plan = plan(root);
     let before = format!("{plan:#?}");
     let mut file = data_file("s3://bucket/data.parquet");
-    file.delete_files = vec![equality_delete_file(Vec::new(), vec![3])];
+    file.deletes = vec![equality_delete_file(Vec::new(), vec![3])];
 
     let (registry, seen_column_names) = recording_registry(vec![file]);
     let bindings =
@@ -247,13 +247,12 @@ fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
     let planned = bindings
         .connector_read(0, 10)
         .expect("opaque connector read");
-    let file =
-        crate::connector::iceberg::provider::planned_split_data_file_for_test(&planned.splits[0])
-            .expect("decode test Iceberg split");
-    assert_eq!(file.delete_files.len(), 1);
+    let file = crate::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
+        .expect("decode fixture split");
+    assert_eq!(file.deletes.len(), 1);
     assert_eq!(
-        file.delete_files[0].file_content,
-        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality
+        file.deletes[0].kind,
+        crate::connector::scan_model::FixtureDeleteKind::Equality
     );
     assert_eq!(
         seen_column_names
@@ -267,7 +266,7 @@ fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
 
 #[test]
 fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
-    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -313,7 +312,7 @@ fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
 
 #[test]
 fn equality_key_already_in_planner_output_keeps_column_id() {
-    let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+    let mut root = scan_node(10);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
     };
@@ -324,7 +323,7 @@ fn equality_key_already_in_planner_output_keeps_column_id() {
         .push(column(3, "category", DataType::Utf8, true));
     scan.required_columns = Some(vec!["id".to_string(), "category".to_string()]);
     let mut file = data_file("s3://bucket/data.parquet");
-    file.delete_files = vec![equality_delete_file(Vec::new(), vec![3])];
+    file.deletes = vec![equality_delete_file(Vec::new(), vec![3])];
 
     let bindings = prepare_scan_bindings(&plan(root), &registry(vec![file]), None)
         .expect("prepare equality-delete output scan");
@@ -342,19 +341,19 @@ fn equality_key_already_in_planner_output_keeps_column_id() {
 
 #[test]
 fn physical_projection_missing_type_and_nullability_mismatches_fail_fast() {
-    let mut missing = scan_node(43, IcebergDataFileBinding::ExplicitFiles);
+    let mut missing = scan_node(43);
     let DistributedNodeKind::Scan(scan) = &mut missing.payload else {
         panic!("test root must be a scan");
     };
     scan.columns[0].name = "missing".to_string();
 
-    let mut type_mismatch = scan_node(44, IcebergDataFileBinding::ExplicitFiles);
+    let mut type_mismatch = scan_node(44);
     let DistributedNodeKind::Scan(scan) = &mut type_mismatch.payload else {
         panic!("test root must be a scan");
     };
     scan.columns[0].data_type = DataType::Int64;
 
-    let mut nullability_mismatch = scan_node(45, IcebergDataFileBinding::ExplicitFiles);
+    let mut nullability_mismatch = scan_node(45);
     let DistributedNodeKind::Scan(scan) = &mut nullability_mismatch.payload else {
         panic!("test root must be a scan");
     };
@@ -375,49 +374,5 @@ fn physical_projection_missing_type_and_nullability_mismatches_fail_fast() {
         };
         assert!(err.contains(expected), "{err}");
         assert!(err.contains("node_id="), "{err}");
-    }
-}
-
-#[test]
-fn invalid_equality_identity_fails_fast_with_scan_node_context() {
-    for (delete, expected) in [
-        (
-            equality_delete_file(Vec::new(), vec![99]),
-            "unknown field id 99",
-        ),
-        (
-            equality_delete_file(Vec::new(), vec![3, 3]),
-            "duplicate equality field id 3",
-        ),
-        (
-            equality_delete_file(vec!["category", "CATEGORY"], Vec::new()),
-            "duplicate equality column name",
-        ),
-        (
-            equality_delete_file(vec!["missing"], Vec::new()),
-            "unknown equality column missing",
-        ),
-        (
-            equality_delete_file(vec!["id"], vec![3]),
-            "field id/name mismatch",
-        ),
-    ] {
-        let mut root = scan_node(46, IcebergDataFileBinding::CurrentSnapshot);
-        let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-            panic!("test root must be a scan");
-        };
-        scan.table
-            .columns
-            .push(source_column("category", DataType::Utf8, true));
-        let mut file = data_file("s3://bucket/data.parquet");
-        file.delete_files = vec![delete];
-
-        let err = match prepare_scan_bindings(&plan(root), &registry(vec![file]), None) {
-            Ok(_) => panic!("invalid equality identity must fail: {expected}"),
-            Err(err) => err,
-        };
-
-        assert!(err.contains(expected), "{err}");
-        assert!(err.contains("node_id=46"), "{err}");
     }
 }

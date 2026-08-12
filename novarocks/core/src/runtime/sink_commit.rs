@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::common::types::UniqueId;
-use novarocks_connector_iceberg::stats_assembler::FileSketchSet;
 use novarocks_execution::runtime::fragment::io::{
     FragmentCommitLease, FragmentCommitPort, FragmentCommitReport, FragmentSinkLoadStats,
     TabletCommitInfo as ExecutionTabletCommitInfo, TabletFailInfo as ExecutionTabletFailInfo,
@@ -193,13 +192,6 @@ struct SinkCommitStore {
 struct SinkCommitEntry {
     tablet_commit_infos: Vec<TabletCommitInfo>,
     tablet_fail_infos: Vec<TabletFailInfo>,
-    /// Per-file Theta sketch sets produced by the Iceberg sink for Puffin
-    /// NDV statistics. These are not Cloneable (the `ThetaSketchHandle`
-    /// holds an underlying `ThetaSketch` that does not implement `Clone`),
-    /// so callers consume them via `take_sketch_sets` — a destructive
-    /// drain — rather than `list_sketch_sets`. The pattern mirrors
-    /// `IcebergCommitCollector::take_sketch_sets`.
-    sketch_sets: Vec<FileSketchSet>,
     loaded_rows: i64,
     loaded_bytes: i64,
     filtered_rows: i64,
@@ -241,28 +233,6 @@ pub(crate) fn is_registered(finst_id: UniqueId) -> bool {
         .lock()
         .expect("sink commit store lock")
         .contains_key(&finst_id)
-}
-
-/// Push a per-file Theta sketch set produced by the Iceberg sink. Used by
-/// the pipeline-driven sink path; the standalone iceberg_writer path uses
-/// [`IcebergCommitCollector::inject_sketch_set`] directly.
-pub(crate) fn add_sketch_set(finst_id: UniqueId, set: FileSketchSet) {
-    let store = store();
-    let mut guard = store.mu.lock().expect("sink commit store lock");
-    guard.entry(finst_id).or_default().sketch_sets.push(set);
-}
-
-/// Destructively drain the per-file sketch sets registered via
-/// [`add_sketch_set`]. The sketches cannot be cloned (the underlying
-/// `ThetaSketch` from the `datasketches` crate does not implement Clone),
-/// so each finst_id can be drained exactly once.
-pub(crate) fn take_sketch_sets(finst_id: UniqueId) -> Vec<FileSketchSet> {
-    let store = store();
-    let mut guard = store.mu.lock().expect("sink commit store lock");
-    guard
-        .get_mut(&finst_id)
-        .map(|entry| std::mem::take(&mut entry.sketch_sets))
-        .unwrap_or_default()
 }
 
 pub(crate) fn add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) {
