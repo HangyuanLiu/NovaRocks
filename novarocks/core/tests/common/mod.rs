@@ -60,8 +60,6 @@ parquet_meta_cache_ttl_seconds = 3600
 parquet_page_cache_capacity = 1000
 parquet_page_cache_ttl_seconds = 3600
 
-[debug]
-exec_node_output = false
 "#;
 
         std::fs::write(&config_path, config_content)?;

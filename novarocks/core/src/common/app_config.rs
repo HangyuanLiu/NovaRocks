@@ -276,9 +276,6 @@ pub struct NovaRocksConfig {
     pub runtime: RuntimeConfig,
 
     #[serde(default)]
-    pub debug: DebugConfig,
-
-    #[serde(default)]
     pub metadata: Option<MetadataConfig>,
 
     #[serde(default)]
@@ -326,6 +323,11 @@ fn reject_fault_injection_environment() -> Result<()> {
     for name in [
         "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
         "NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR",
+        "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
+        "NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER",
+        "NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER",
+        "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
+        "NOVAROCKS_DEBUG_EXEC_NODE_OUTPUT",
     ] {
         if std::env::var_os(name).is_some() {
             bail!("{name} is only available in debug builds");
@@ -344,7 +346,6 @@ impl Default for NovaRocksConfig {
             sys_log_roll_num: default_sys_log_roll_num(),
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
-            debug: DebugConfig::default(),
             metadata: None,
             state_store: None,
             foundationdb_client: None,
@@ -1567,128 +1568,6 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct DebugConfig {
-    pub exec_node_output: bool,
-    #[cfg(debug_assertions)]
-    pub fault_inject_fetch_not_ready_count: Option<usize>,
-    #[cfg(debug_assertions)]
-    pub emit_cancel_marker: bool,
-    #[cfg(debug_assertions)]
-    pub emit_grpc_fragment_marker: bool,
-    #[cfg(debug_assertions)]
-    pub emit_connector_reader_marker: bool,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct DebugConfigToml {
-    exec_node_output: bool,
-    fault_inject_fetch_not_ready_count: Option<usize>,
-    emit_cancel_marker: bool,
-    emit_grpc_fragment_marker: bool,
-    emit_connector_reader_marker: bool,
-}
-
-#[cfg(not(debug_assertions))]
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct DebugConfigToml {
-    exec_node_output: bool,
-    fault_inject_fetch_not_ready_count: Option<usize>,
-    emit_cancel_marker: Option<bool>,
-    emit_grpc_fragment_marker: Option<bool>,
-    emit_connector_reader_marker: Option<bool>,
-}
-
-impl<'de> Deserialize<'de> for DebugConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = DebugConfigToml::deserialize(deserializer)?;
-        #[cfg(debug_assertions)]
-        {
-            Ok(Self {
-                exec_node_output: raw.exec_node_output,
-                fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
-                emit_cancel_marker: raw.emit_cancel_marker,
-                emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
-                emit_connector_reader_marker: raw.emit_connector_reader_marker,
-            })
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            if raw.fault_inject_fetch_not_ready_count.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.fault_inject_fetch_not_ready_count is only available in debug builds",
-                ));
-            }
-            if raw.emit_cancel_marker.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.emit_cancel_marker is only available in debug builds",
-                ));
-            }
-            if raw.emit_grpc_fragment_marker.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.emit_grpc_fragment_marker is only available in debug builds",
-                ));
-            }
-            if raw.emit_connector_reader_marker.is_some() {
-                return Err(serde::de::Error::custom(
-                    "debug.emit_connector_reader_marker is only available in debug builds",
-                ));
-            }
-            Ok(Self {
-                exec_node_output: raw.exec_node_output,
-            })
-        }
-    }
-}
-
-impl DebugConfig {
-    #[cfg(debug_assertions)]
-    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
-        self.fault_inject_fetch_not_ready_count
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
-        None
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn emit_cancel_marker(&self) -> bool {
-        self.emit_cancel_marker
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn emit_cancel_marker(&self) -> bool {
-        false
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn emit_grpc_fragment_marker(&self) -> bool {
-        self.emit_grpc_fragment_marker
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn emit_grpc_fragment_marker(&self) -> bool {
-        false
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn emit_connector_reader_marker(&self) -> bool {
-        self.emit_connector_reader_marker
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn emit_connector_reader_marker(&self) -> bool {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2076,74 +1955,6 @@ mysql_port = 19030
         let metadata = cfg.metadata.expect("metadata config");
         assert_eq!(metadata.provider, MetadataProviderConfig::Sqlite);
         assert_eq!(metadata.path, PathBuf::from("meta/catalog.db"));
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn test_debug_fault_injection_knobs_parse_in_debug_builds() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[debug]
-fault_inject_fetch_not_ready_count = 2
-emit_cancel_marker = true
-emit_grpc_fragment_marker = true
-emit_connector_reader_marker = true
-"#,
-        )
-        .expect("parse config");
-        assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
-        assert!(cfg.debug.emit_cancel_marker);
-        assert!(cfg.debug.emit_grpc_fragment_marker);
-        assert!(cfg.debug.emit_connector_reader_marker);
-    }
-
-    #[test]
-    #[cfg(not(debug_assertions))]
-    fn test_debug_fault_injection_knobs_are_rejected_in_release_builds() {
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-emit_cancel_marker = false
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject emit_cancel_marker knob"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("emit_cancel_marker"),
-            "unexpected parse error: {err}"
-        );
-
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-emit_grpc_fragment_marker = false
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject emit_grpc_fragment_marker knob"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("emit_grpc_fragment_marker"),
-            "unexpected parse error: {err}"
-        );
-
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[debug]
-emit_connector_reader_marker = false
-"#,
-        ) {
-            Ok(_) => panic!("release config must reject emit_connector_reader_marker knob"),
-            Err(err) => err,
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("emit_connector_reader_marker"),
-            "unexpected parse error: {err}"
-        );
     }
 
     #[test]
