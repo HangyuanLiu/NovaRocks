@@ -15,13 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Collects per-table maintenance facts from a single Iceberg metadata load:
+//! Collects per-table maintenance facts through the neutral connector surface:
 //! snapshot list, current-snapshot summary counters, typed maintenance policy
-//! facts, refs, and the downstream-consumer floor that protects incremental MV
-//! lineage.
+//! facts, references, the provider-signed compaction count, and the
+//! downstream-consumer floor that protects incremental MV lineage.
+//!
+//! Nothing here interprets a storage format. The provider signs every fact; the
+//! frontend owns every policy decision made from them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
+};
 
 use crate::engine::StandaloneState;
 use crate::mv::persistence::definition::StoredMvDefinition;
@@ -48,50 +55,15 @@ pub(crate) struct TableMaintenanceStats {
     pub(crate) expire_max_snapshot_age_ms: Option<i64>,
     pub(crate) expire_min_snapshots_to_keep: Option<u32>,
     pub(crate) target_file_size_bytes: Option<i64>,
-    pub(crate) non_main_ref_count: usize,
+    pub(crate) non_default_reference_count: usize,
     pub(crate) downstream_floor_ts_ms: Option<i64>,
     pub(crate) downstream_floor_unknown: bool,
 }
-
-/// Iceberg snapshot-summary keys (string literals: the constants in
-/// vendor/iceberg-0.9.0/src/spec/snapshot_summary.rs are private).
-const TOTAL_DATA_FILES_KEY: &str = "total-data-files";
-const TOTAL_DELETE_FILES_KEY: &str = "total-delete-files";
-const TOTAL_FILES_SIZE_KEY: &str = "total-files-size";
-const MAIN_BRANCH: &str = "main";
-
-/// Table-property keys that carry maintenance policy facts.
-const MAINTENANCE_ENABLED_PROPERTY: &str = "novarocks.maintenance.enabled";
-const EXPIRE_MAX_AGE_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
-const EXPIRE_MIN_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
-const TARGET_FILE_SIZE_PROPERTY: &str = "write.target-file-size-bytes";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DownstreamFloor {
     pub(crate) floor_ts_ms: Option<i64>,
     pub(crate) unknown: bool,
-}
-
-pub(crate) fn summary_u64(props: &HashMap<String, String>, key: &str) -> Option<u64> {
-    props.get(key).and_then(|v| v.trim().parse::<u64>().ok())
-}
-
-/// Read one typed maintenance policy fact. A missing key and a present but
-/// unparseable value are both reported as "no declared fact": this layer never
-/// substitutes a default and never clamps the declared range.
-pub(crate) fn property_parsed<T: std::str::FromStr>(
-    props: &HashMap<String, String>,
-    key: &str,
-) -> Option<T> {
-    props.get(key).and_then(|v| v.trim().parse::<T>().ok())
-}
-
-/// Read the maintenance on/off fact. Any declared value other than a
-/// case-insensitive `false` means enabled; a missing key declares nothing.
-pub(crate) fn property_enabled(props: &HashMap<String, String>, key: &str) -> Option<bool> {
-    props
-        .get(key)
-        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
 }
 
 /// Minimum consumed-snapshot timestamp across all MV definitions that read
@@ -123,8 +95,15 @@ pub(crate) fn downstream_floor(
     }
 }
 
-/// Load fresh metadata for one MV storage table and assemble stats.
+/// Read one MV storage table's maintenance facts through the neutral surface.
 /// `definitions` is the full MV list from the same pass, used for the floor.
+///
+/// The compaction observation runs first on purpose. Answering it forces the
+/// provider to discard its cached table and re-read the catalog, and the
+/// provider repopulates that cache with what it read, so the metadata load
+/// below observes the very table version the count was taken from. Reversing
+/// the two would let the projected facts describe an older table than the
+/// count, and would drop the forced refresh this pass has always performed.
 pub(crate) fn collect_table_stats(
     state: &Arc<StandaloneState>,
     catalog: &str,
@@ -132,39 +111,54 @@ pub(crate) fn collect_table_stats(
     table: &str,
     definitions: &[StoredMvDefinition],
 ) -> Result<TableMaintenanceStats, String> {
-    let (iceberg_catalog, table_ident, _object_store) =
-        crate::engine::iceberg_maintenance::resolve_maintenance_catalog(
-            state, catalog, namespace, table,
-        )?;
-    let loaded = crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
-        iceberg_catalog.load_table(&table_ident).await
-    })?
-    .map_err(|e| {
-        format!("load iceberg table {catalog}.{namespace}.{table} for maintenance failed: {e}")
-    })?;
-    let metadata = loaded.metadata();
-    let preserve_row_lineage =
-        novarocks_connector_iceberg::schema_facts::row_lineage_enabled(metadata);
-    let compaction_stats = crate::connector::iceberg::catalog::registry::block_on_iceberg(
-        crate::connector::iceberg::commit::current_live_data_file_compaction_stats(
-            &loaded,
-            loaded.file_io(),
-            preserve_row_lineage,
-        ),
-    )?
-    .map_err(|e| {
-        format!("collect iceberg table {catalog}.{namespace}.{table} compaction groups failed: {e}")
-    })?;
-    let max_compactable_data_files = u64::try_from(compaction_stats.max_compactable_data_files)
-        .map_err(|_| {
-            format!("iceberg table {catalog}.{namespace}.{table} compactable file count overflow")
+    let context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let identity = ConnectorTableIdentity {
+        instance_id: instance_id.clone(),
+        namespace: Arc::from(namespace),
+        table: Arc::from(table),
+    };
+
+    let max_compactable_data_files =
+        crate::connector::metadata_maintenance::read_max_compactable_data_files(
+            state.connector_control.as_ref(),
+            &instance_id,
+            identity,
+            context.clone(),
+        )
+        .map_err(|error| {
+            format!(
+                "observe {catalog}.{namespace}.{table} compaction groups for maintenance: {error}"
+            )
         })?;
 
-    let snapshots: Vec<SnapshotInfo> = metadata
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        context.clone(),
+        namespace,
+        table,
+        ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let observed = state
+        .mv_storage_observation
+        .observe_maintenance_metadata(&exact_lease, &metadata, context)
+        .map_err(|error| {
+            format!("observe {catalog}.{namespace}.{table} maintenance metadata: {error}")
+        })?;
+
+    let snapshots: Vec<SnapshotInfo> = observed
         .snapshots()
-        .map(|s| SnapshotInfo {
-            snapshot_id: s.snapshot_id(),
-            timestamp_ms: s.timestamp_ms(),
+        .iter()
+        .map(|snapshot| SnapshotInfo {
+            snapshot_id: snapshot.snapshot_id,
+            timestamp_ms: snapshot.timestamp_ms,
         })
         .collect();
     let snapshot_ts_by_id: BTreeMap<i64, i64> = snapshots
@@ -172,34 +166,22 @@ pub(crate) fn collect_table_stats(
         .map(|snapshot| (snapshot.snapshot_id, snapshot.timestamp_ms))
         .collect();
 
-    let summary = metadata
-        .current_snapshot()
-        .map(|s| s.summary().additional_properties.clone())
-        .unwrap_or_default();
-
     let fqn = format!("{catalog}.{namespace}.{table}");
     let floor = downstream_floor(definitions, &fqn, &snapshot_ts_by_id);
-
-    let non_main_ref_count = metadata
-        .refs()
-        .keys()
-        .filter(|name| name.as_str() != MAIN_BRANCH)
-        .count();
-
-    let properties = metadata.properties();
+    let policy = *observed.policy();
 
     Ok(TableMaintenanceStats {
-        current_snapshot_id: metadata.current_snapshot_id(),
+        current_snapshot_id: observed.current_snapshot_id(),
         snapshots,
-        total_data_files: summary_u64(&summary, TOTAL_DATA_FILES_KEY),
-        max_compactable_data_files: Some(max_compactable_data_files),
-        total_files_size_bytes: summary_u64(&summary, TOTAL_FILES_SIZE_KEY),
-        total_delete_files: summary_u64(&summary, TOTAL_DELETE_FILES_KEY),
-        maintenance_enabled: property_enabled(properties, MAINTENANCE_ENABLED_PROPERTY),
-        expire_max_snapshot_age_ms: property_parsed(properties, EXPIRE_MAX_AGE_PROPERTY),
-        expire_min_snapshots_to_keep: property_parsed(properties, EXPIRE_MIN_KEEP_PROPERTY),
-        target_file_size_bytes: property_parsed(properties, TARGET_FILE_SIZE_PROPERTY),
-        non_main_ref_count,
+        total_data_files: observed.total_data_files(),
+        max_compactable_data_files,
+        total_files_size_bytes: observed.total_files_size_bytes(),
+        total_delete_files: observed.total_delete_files(),
+        maintenance_enabled: policy.maintenance_enabled,
+        expire_max_snapshot_age_ms: policy.expire_max_snapshot_age_ms,
+        expire_min_snapshots_to_keep: policy.expire_min_snapshots_to_keep,
+        target_file_size_bytes: policy.target_file_size_bytes,
+        non_default_reference_count: observed.non_default_reference_count(),
         downstream_floor_ts_ms: floor.floor_ts_ms,
         downstream_floor_unknown: floor.unknown,
     })
@@ -320,84 +302,354 @@ mod tests {
         );
     }
 
-    #[test]
-    fn summary_u64_parses_and_rejects() {
-        let mut props = std::collections::HashMap::new();
-        props.insert("total-data-files".to_string(), "42".to_string());
-        props.insert("bad".to_string(), "x".to_string());
-        assert_eq!(summary_u64(&props, "total-data-files"), Some(42));
-        assert_eq!(summary_u64(&props, "bad"), None);
-        assert_eq!(summary_u64(&props, "absent"), None);
+    // ---------------------------------------------------------------------
+    // End-to-end evidence over a real Iceberg table.
+    //
+    // `collect_table_stats` reads nothing itself: it asks the provider for the
+    // compaction count, loads the table on a planning lease, and projects the
+    // observation. The cases below commit real snapshots through a Hadoop
+    // warehouse and assert the returned facts against the table those commits
+    // actually produced, so a projection that silently drops, defaults, or
+    // clamps a fact cannot pass.
+    // ---------------------------------------------------------------------
+
+    const TEST_CATALOG: &str = "ice";
+    const TEST_NAMESPACE: &str = "sales";
+
+    struct MaintenanceStatsFixture {
+        state: Arc<StandaloneState>,
+        _warehouse: tempfile::TempDir,
     }
 
-    #[test]
-    fn property_parsed_reports_only_declared_and_parseable_values() {
-        let mut props = HashMap::new();
-        props.insert(EXPIRE_MAX_AGE_PROPERTY.to_string(), " 3600000 ".to_string());
-        assert_eq!(
-            property_parsed::<i64>(&props, EXPIRE_MAX_AGE_PROPERTY),
-            Some(3_600_000)
-        );
-
-        // Missing key declares nothing.
-        assert_eq!(
-            property_parsed::<i64>(&props, TARGET_FILE_SIZE_PROPERTY),
-            None
-        );
-
-        // Whitespace-only and unparseable values declare nothing either; the
-        // frontend applies its own default for both.
-        props.insert(TARGET_FILE_SIZE_PROPERTY.to_string(), "   ".to_string());
-        assert_eq!(
-            property_parsed::<i64>(&props, TARGET_FILE_SIZE_PROPERTY),
-            None
-        );
-        props.insert(
-            TARGET_FILE_SIZE_PROPERTY.to_string(),
-            "not-a-number".to_string(),
-        );
-        assert_eq!(
-            property_parsed::<i64>(&props, TARGET_FILE_SIZE_PROPERTY),
-            None
-        );
-    }
-
-    #[test]
-    fn property_parsed_keeps_out_of_range_values_unclamped() {
-        let mut props = HashMap::new();
-        props.insert(EXPIRE_MAX_AGE_PROPERTY.to_string(), "-1".to_string());
-        props.insert(EXPIRE_MIN_KEEP_PROPERTY.to_string(), "-1".to_string());
-        // A negative i64 fact survives; clamping to >= 1 is frontend policy.
-        assert_eq!(
-            property_parsed::<i64>(&props, EXPIRE_MAX_AGE_PROPERTY),
-            Some(-1)
-        );
-        // A negative value simply does not parse as u32.
-        assert_eq!(
-            property_parsed::<u32>(&props, EXPIRE_MIN_KEEP_PROPERTY),
-            None
-        );
-    }
-
-    #[test]
-    fn property_enabled_treats_only_false_as_disabled() {
-        let mut props = HashMap::new();
-        assert_eq!(property_enabled(&props, MAINTENANCE_ENABLED_PROPERTY), None);
-        for (value, expected) in [
-            ("false", false),
-            ("FALSE", false),
-            (" false ", false),
-            ("true", true),
-            ("TRUE", true),
-            ("anything-else", true),
-            ("", true),
-        ] {
-            props.insert(MAINTENANCE_ENABLED_PROPERTY.to_string(), value.to_string());
-            assert_eq!(
-                property_enabled(&props, MAINTENANCE_ENABLED_PROPERTY),
-                Some(expected),
-                "value {value:?}"
-            );
+    fn open_hadoop_iceberg_fixture() -> MaintenanceStatsFixture {
+        let warehouse = tempfile::TempDir::new().expect("warehouse tempdir");
+        let state = Arc::new(StandaloneState {
+            // Every projected fact travels this port, and the Core default is
+            // fail-closed on purpose. Install the same Iceberg observation the
+            // Server composition root installs, otherwise the call fails on the
+            // missing port instead of on its own behaviour.
+            mv_storage_observation: Arc::new(
+                crate::engine::mv::schema_validation_adapter::TestIcebergMvStorageObservationAdapter::default(),
+            ),
+            ..StandaloneState::default()
+        });
+        {
+            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
+            catalogs
+                .create_catalog(
+                    TEST_CATALOG,
+                    &[
+                        ("type".to_string(), "iceberg".to_string()),
+                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                        (
+                            "iceberg.catalog.warehouse".to_string(),
+                            warehouse.path().display().to_string(),
+                        ),
+                    ],
+                )
+                .expect("create Hadoop catalog");
         }
+        let entry = catalog_entry(&state);
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, TEST_NAMESPACE)
+            .expect("create namespace");
+        crate::engine::register_iceberg_control_binding(&state, TEST_CATALOG)
+            .expect("register Iceberg control binding");
+        MaintenanceStatsFixture {
+            state,
+            _warehouse: warehouse,
+        }
+    }
+
+    fn catalog_entry(
+        state: &Arc<StandaloneState>,
+    ) -> crate::connector::iceberg::catalog::registry::IcebergCatalogEntry {
+        state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg catalogs")
+            .get(TEST_CATALOG)
+            .expect("catalog entry")
+    }
+
+    fn create_fact_table(state: &Arc<StandaloneState>, table: &str, properties: &[(&str, &str)]) {
+        let entry = catalog_entry(state);
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: novarocks_catalog::schema::SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "region".to_string(),
+                data_type: novarocks_catalog::schema::SqlType::String,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        let properties = properties
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            TEST_NAMESPACE,
+            table,
+            &columns,
+            None,
+            &[],
+            &properties,
+        )
+        .expect("create Iceberg fact table");
+    }
+
+    /// Commit one row as its own snapshot and return the snapshot it produced.
+    fn commit_one_row(state: &Arc<StandaloneState>, table: &str, id: i64, region: &str) -> i64 {
+        let entry = catalog_entry(state);
+        let rows = vec![vec![
+            crate::sql::Literal::Int(id),
+            crate::sql::Literal::String(region.to_string()),
+        ]];
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            &entry,
+            TEST_NAMESPACE,
+            table,
+            &rows,
+        )
+        .expect("commit Iceberg rows");
+        // Iceberg stamps a snapshot with wall-clock milliseconds. Separate the
+        // commits so the timestamps this test reasons about are distinguishable
+        // rather than accidentally equal.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        current_table(state, table)
+            .metadata()
+            .current_snapshot()
+            .expect("committed snapshot")
+            .snapshot_id()
+    }
+
+    /// Read the table straight from the catalog, bypassing any cached
+    /// generation, so assertions compare against what storage really holds.
+    fn current_table(
+        state: &Arc<StandaloneState>,
+        table: &str,
+    ) -> novarocks_connector_iceberg::iceberg::table::Table {
+        let entry = catalog_entry(state);
+        entry.invalidate_table_cache(TEST_NAMESPACE, table);
+        crate::connector::iceberg::catalog::registry::load_table(&entry, TEST_NAMESPACE, table)
+            .expect("load Iceberg table")
+            .into_table()
+    }
+
+    fn summary_u64(state: &Arc<StandaloneState>, table: &str, key: &str) -> Option<u64> {
+        current_table(state, table)
+            .metadata()
+            .current_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get(key)
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+            })
+    }
+
+    #[test]
+    fn collect_table_stats_reports_the_committed_snapshot_facts_of_a_real_table() {
+        let fixture = open_hadoop_iceberg_fixture();
+        let state = &fixture.state;
+        create_fact_table(state, "orders", &[]);
+        let first = commit_one_row(state, "orders", 1, "east");
+        let second = commit_one_row(state, "orders", 2, "east");
+        let third = commit_one_row(state, "orders", 3, "east");
+
+        let stats = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "orders", &[])
+            .expect("collect maintenance stats");
+
+        // 1. The current snapshot is the last commit, and it is what the table
+        //    itself reports.
+        let table = current_table(state, "orders");
+        let metadata = table.metadata();
+        assert_eq!(stats.current_snapshot_id, Some(third));
+        assert_eq!(stats.current_snapshot_id, metadata.current_snapshot_id());
+
+        // 2. One snapshot per commit, each carrying the table's own timestamp.
+        let observed: Vec<(i64, i64)> = stats
+            .snapshots
+            .iter()
+            .map(|snapshot| (snapshot.snapshot_id, snapshot.timestamp_ms))
+            .collect();
+        let mut expected: Vec<(i64, i64)> = metadata
+            .snapshots()
+            .map(|snapshot| (snapshot.snapshot_id(), snapshot.timestamp_ms()))
+            .collect();
+        expected.sort_by_key(|(snapshot_id, _)| *snapshot_id);
+        assert_eq!(expected.len(), 3);
+        assert_eq!(observed, expected);
+        let observed_ids: std::collections::BTreeSet<i64> =
+            observed.iter().map(|(id, _)| *id).collect();
+        let committed_ids: std::collections::BTreeSet<i64> =
+            [first, second, third].into_iter().collect();
+        assert_eq!(observed_ids, committed_ids);
+        let ts_by_id: BTreeMap<i64, i64> = observed.iter().copied().collect();
+        assert!(
+            ts_by_id[&first] < ts_by_id[&second] && ts_by_id[&second] < ts_by_id[&third],
+            "commit order must be visible in the observed timestamps: {ts_by_id:?}"
+        );
+
+        // 3. Summary counters come from the current snapshot summary, unread
+        //    and uninterpreted.
+        assert_eq!(
+            stats.total_data_files,
+            summary_u64(state, "orders", "total-data-files")
+        );
+        assert_eq!(
+            stats.total_delete_files,
+            summary_u64(state, "orders", "total-delete-files")
+        );
+        assert_eq!(stats.total_delete_files, Some(0));
+        let files_size = summary_u64(state, "orders", "total-files-size")
+            .expect("current snapshot summary carries total-files-size");
+        assert!(files_size > 0, "a committed data file occupies bytes");
+        assert_eq!(stats.total_files_size_bytes, Some(files_size));
+        // The `total-*` counters are the current snapshot's own summary,
+        // verbatim. This append path stamps each commit with that commit's
+        // counts instead of rolling the table totals forward, so the summary
+        // says one data file while three are live. That divergence is the
+        // point: the summary counter and the enumerated compaction count are
+        // different facts, and this layer must forward each unchanged rather
+        // than reconcile them. If the append path ever starts accumulating,
+        // the equality above still holds and only this pin needs revisiting.
+        assert_eq!(stats.total_data_files, Some(1));
+
+        // 4. The provider-signed compaction count is a live enumeration, not a
+        //    summary read: three data files sharing one compaction group
+        //    (unpartitioned, no row lineage) answer three.
+        assert_eq!(stats.max_compactable_data_files, Some(3));
+
+        // 5. A table that declares no maintenance property gets no value; the
+        //    fact layer must not invent a default.
+        assert_eq!(stats.maintenance_enabled, None);
+        assert_eq!(stats.expire_max_snapshot_age_ms, None);
+        assert_eq!(stats.expire_min_snapshots_to_keep, None);
+        assert_eq!(stats.target_file_size_bytes, None);
+
+        // 6. Only `main` exists.
+        assert_eq!(stats.non_default_reference_count, 0);
+
+        // 7. No MV consumes this table, so nothing pins retention.
+        assert_eq!(stats.downstream_floor_ts_ms, None);
+        assert!(!stats.downstream_floor_unknown);
+    }
+
+    #[test]
+    fn collect_table_stats_counts_references_other_than_the_default_branch() {
+        let fixture = open_hadoop_iceberg_fixture();
+        let state = &fixture.state;
+        create_fact_table(state, "branched", &[]);
+        let snapshot = commit_one_row(state, "branched", 1, "east");
+
+        let before = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "branched", &[])
+            .expect("collect maintenance stats");
+        assert_eq!(before.non_default_reference_count, 0, "only `main` exists");
+
+        let session = crate::engine::StandaloneSession {
+            inner: Arc::clone(state),
+        };
+        session
+            .execute_in_context(
+                &format!(
+                    "ALTER TABLE {TEST_CATALOG}.{TEST_NAMESPACE}.branched \
+                     CREATE BRANCH dev AS OF VERSION {snapshot}"
+                ),
+                None,
+                TEST_NAMESPACE,
+                None,
+            )
+            .expect("create Iceberg branch");
+
+        let after = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "branched", &[])
+            .expect("collect maintenance stats");
+        // `dev` is counted, `main` is not. The branch points at an existing
+        // snapshot, so the snapshot list itself is unchanged.
+        assert_eq!(after.non_default_reference_count, 1);
+        assert_eq!(after.snapshots, before.snapshots);
+        assert_eq!(after.current_snapshot_id, Some(snapshot));
+    }
+
+    #[test]
+    fn collect_table_stats_projects_declared_policy_without_default_or_clamp() {
+        let fixture = open_hadoop_iceberg_fixture();
+        let state = &fixture.state;
+        create_fact_table(
+            state,
+            "policy_orders",
+            &[
+                ("novarocks.maintenance.enabled", "false"),
+                ("history.expire.max-snapshot-age-ms", "3600000"),
+                ("write.target-file-size-bytes", "1048576"),
+            ],
+        );
+        commit_one_row(state, "policy_orders", 1, "east");
+
+        let stats = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "policy_orders", &[])
+            .expect("collect maintenance stats");
+
+        assert_eq!(stats.maintenance_enabled, Some(false));
+        assert_eq!(stats.expire_max_snapshot_age_ms, Some(3_600_000));
+        assert_eq!(stats.target_file_size_bytes, Some(1_048_576));
+        // Declared by nobody: still absent. A default injected here would be a
+        // policy decision made in the fact layer.
+        assert_eq!(stats.expire_min_snapshots_to_keep, None);
+    }
+
+    #[test]
+    fn collect_table_stats_floors_retention_at_the_snapshot_an_mv_consumes() {
+        let fixture = open_hadoop_iceberg_fixture();
+        let state = &fixture.state;
+        create_fact_table(state, "consumed", &[]);
+        let first = commit_one_row(state, "consumed", 1, "east");
+        commit_one_row(state, "consumed", 2, "east");
+        let third = commit_one_row(state, "consumed", 3, "east");
+        let fqn = format!("{TEST_CATALOG}.{TEST_NAMESPACE}.consumed");
+
+        // A consumer committed at the newest snapshot floors retention there,
+        // not at the oldest snapshot the table still retains.
+        let consumer = definition_with_consumed(&fqn, third);
+        let stats = collect_table_stats(
+            state,
+            TEST_CATALOG,
+            TEST_NAMESPACE,
+            "consumed",
+            std::slice::from_ref(&consumer),
+        )
+        .expect("collect maintenance stats");
+        let ts_by_id: BTreeMap<i64, i64> = stats
+            .snapshots
+            .iter()
+            .map(|snapshot| (snapshot.snapshot_id, snapshot.timestamp_ms))
+            .collect();
+        assert_eq!(stats.downstream_floor_ts_ms, Some(ts_by_id[&third]));
+        assert!(!stats.downstream_floor_unknown);
+        assert!(
+            ts_by_id[&first] < ts_by_id[&third],
+            "the floor must be discriminating: {ts_by_id:?}"
+        );
+
+        // A consumer pinned to a snapshot this table cannot resolve leaves the
+        // floor unknown, which is what blocks expire.
+        let missing = definition_with_consumed(&fqn, third.wrapping_add(1));
+        assert!(!ts_by_id.contains_key(&third.wrapping_add(1)));
+        let stats = collect_table_stats(
+            state,
+            TEST_CATALOG,
+            TEST_NAMESPACE,
+            "consumed",
+            std::slice::from_ref(&missing),
+        )
+        .expect("collect maintenance stats");
+        assert!(stats.downstream_floor_unknown);
     }
 }

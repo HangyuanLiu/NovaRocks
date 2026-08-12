@@ -15,27 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Connector-facing Iceberg table-maintenance execution.
+//! Connector-facing table-maintenance execution.
 //!
 //! SQL parsing, application dispatch, and result encoding belong to
-//! `novarocks-frontend`. This module retains live catalog, snapshot, file,
-//! commit, cache, row-lineage, and MV snapshot-adoption truth.
+//! `novarocks-frontend`. Catalog, snapshot, file and commit truth belongs to
+//! the Connector; this module only routes maintenance intents to it and shapes
+//! the neutral outcome the frontend reports.
 
 use std::sync::Arc;
 
-use novarocks_connector_iceberg::iceberg::Catalog;
-use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
-
-use crate::connector::iceberg::catalog::registry::build_iceberg_catalog;
 use crate::engine::StandaloneState;
 use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
 };
-use novarocks_fs::ObjectStoreConfig;
-
-/// Connector handles shared by synchronous and worker-driven maintenance.
-pub(crate) type MaintenanceCatalogTriple =
-    (Arc<dyn Catalog>, TableIdent, Option<ObjectStoreConfig>);
 
 pub(crate) fn execute_action(
     state: &Arc<StandaloneState>,
@@ -176,53 +168,6 @@ fn run_expire_snapshots_action(
         deleted_manifest_lists_count: None,
         deleted_statistics_files_count: None,
     })
-}
-
-/// Resolve a registered Iceberg catalog into an executable connector handle.
-pub(crate) fn resolve_maintenance_catalog(
-    state: &Arc<StandaloneState>,
-    catalog_name: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<MaintenanceCatalogTriple, String> {
-    let resolved_table = resolve_maintenance_table_name(state, catalog_name, namespace, table)?;
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?;
-        registry.get(catalog_name)?
-    };
-    entry.invalidate_table_cache(namespace, table);
-    if resolved_table != table {
-        entry.invalidate_table_cache(namespace, &resolved_table);
-    }
-    let object_store_config = entry.object_store_config().cloned();
-    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(NamespaceIdent::new(namespace.to_string()), resolved_table);
-    Ok((catalog, table_ident, object_store_config))
-}
-
-fn resolve_maintenance_table_name(
-    state: &Arc<StandaloneState>,
-    catalog_name: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<String, String> {
-    let (resolved, _) = {
-        crate::connector::metadata_load_table(
-            state.connector_control.as_ref(),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
-            catalog_name,
-            namespace,
-            table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )?
-    };
-    Ok(resolved.table)
 }
 
 fn action_target(target: &MaintenanceTarget) -> String {

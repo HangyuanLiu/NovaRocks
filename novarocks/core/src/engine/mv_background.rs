@@ -203,7 +203,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
                 .map(|snapshot| snapshot.timestamp_ms)
                 .min(),
             snapshot_count: stats.snapshots.len(),
-            non_main_ref_count: stats.non_main_ref_count,
+            non_default_reference_count: stats.non_default_reference_count,
             downstream_floor_ts_ms: stats.downstream_floor_ts_ms,
             downstream_floor_unknown: stats.downstream_floor_unknown,
             maintenance_enabled: stats.maintenance_enabled,

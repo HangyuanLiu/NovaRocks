@@ -102,7 +102,7 @@ impl AutomaticMaintenanceAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MaintenanceSkipReason {
     Disabled,
-    NonMainRefs,
+    NonDefaultRefs,
     DownstreamFloorUnknown,
     NothingToExpire,
     SnapshotUnchanged,
@@ -575,8 +575,8 @@ fn plan_expire(
     policy: &TablePolicy,
     now_ms: i64,
 ) -> Result<AutomaticMaintenanceAction, MaintenanceSkipReason> {
-    if facts.non_main_ref_count > 0 {
-        return Err(MaintenanceSkipReason::NonMainRefs);
+    if facts.non_default_reference_count > 0 {
+        return Err(MaintenanceSkipReason::NonDefaultRefs);
     }
     if facts.downstream_floor_unknown {
         return Err(MaintenanceSkipReason::DownstreamFloorUnknown);

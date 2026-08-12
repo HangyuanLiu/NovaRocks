@@ -89,7 +89,7 @@ pub struct MvMaintenanceFacts {
     pub total_files_size_bytes: Option<i64>,
     pub oldest_snapshot_timestamp_ms: Option<i64>,
     pub snapshot_count: usize,
-    pub non_main_ref_count: usize,
+    pub non_default_reference_count: usize,
     pub downstream_floor_ts_ms: Option<i64>,
     pub downstream_floor_unknown: bool,
     /// Typed maintenance policy facts declared by the table. `None` means the
