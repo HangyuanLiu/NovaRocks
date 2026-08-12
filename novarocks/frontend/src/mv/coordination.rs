@@ -39,7 +39,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
-use novarocks_spi::connector::ConnectorMvRefreshResourceIdentity;
+use novarocks_spi::connector::{
+    ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
+    ConnectorMvPublicationTargetRequest, ConnectorMvRefreshResourceIdentity,
+    ConnectorRequestContext, ConnectorTableHandle,
+};
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::OperationId;
 use novarocks_state_store::coordination::{
@@ -141,6 +145,47 @@ impl MvRefreshCoordination {
     ) -> Result<FenceValidator, CoordinationError> {
         Ok(current.validator_with_admission(self.write_admission().await?))
     }
+}
+
+/// Resolves the stable refresh resource for a target through its provider.
+///
+/// This is the one place the frontend learns a target's immutable table UUID, and
+/// it deliberately has no fallback. A provider that does not offer the fencing
+/// capability cannot take part in fenced refresh at all, so the absence is an
+/// error rather than a cue to derive an identity from a display name or a numeric
+/// `mv_id` -- deriving one would silently reintroduce exactly the unstable key the
+/// fence domain exists to avoid.
+///
+/// The observation is side-effect free, so it is safe to call before ownership has
+/// been acquired. That ordering matters: the resource identity is what the lease
+/// is keyed by, so it must be known first.
+pub(crate) fn resolve_target_resource(
+    binding: &ConnectorControlBinding,
+    table: &ConnectorTableHandle,
+    context: &ConnectorRequestContext,
+) -> Result<ConnectorMvRefreshResourceIdentity, ConnectorError> {
+    let fencing = binding.mv_publication_fencing().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not support MV publication fencing, so its targets cannot be \
+             refreshed under cluster-wide ownership",
+        )
+    })?;
+    let observation = fencing.observe_target(ConnectorMvPublicationTargetRequest {
+        table: table.clone(),
+        context: context.clone(),
+    })?;
+    let resource = observation.resource().clone();
+    // The provider signs the identity; validating it here means a malformed
+    // observation cannot become a lease key.
+    resource.validate()?;
+    if resource.provider_id() != &binding.descriptor().provider_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "MV target observation returned another provider's resource identity",
+        ));
+    }
+    Ok(resource)
 }
 
 /// The refresh leases this process currently holds, keyed by MV.
