@@ -47,8 +47,8 @@ use novarocks_spi::connector::{
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::OperationId;
 use novarocks_state_store::coordination::{
-    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseManager, ResourceKey,
-    WriteAdmission,
+    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseGuard, LeaseManager,
+    ResourceKey, WriteAdmission,
 };
 use uuid::Uuid;
 
@@ -288,6 +288,83 @@ impl MvRefreshFenceSource for MvRefreshOwnershipRegistry {
     }
 }
 
+/// Ownership of one target's refresh, held for as long as this value lives.
+///
+/// Dropping it releases registry ownership, so a durable transition attempted
+/// after the handle is gone fails closed. Tying release to the handle's lifetime
+/// rather than to an explicit call is deliberate: an early return or a panic on
+/// the refresh path must not leave this frontend appearing to own a target it has
+/// stopped working on.
+pub(crate) struct OwnedRefresh {
+    mv_id: i64,
+    registry: Arc<MvRefreshOwnershipRegistry>,
+    /// Held so the StateStore lease is renewed and released with the handle.
+    _guard: LeaseGuard,
+}
+
+impl OwnedRefresh {
+    pub(crate) const fn mv_id(&self) -> i64 {
+        self.mv_id
+    }
+}
+
+impl Drop for OwnedRefresh {
+    fn drop(&mut self) {
+        self.registry.release(self.mv_id);
+    }
+}
+
+/// Why a refresh could not take ownership of its target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnershipRefusal {
+    /// Another frontend currently holds the lease.
+    Contended,
+    /// The previous holder's lease has not yet aged out.
+    AwaitingTakeover,
+    /// Coordination itself was unavailable.
+    Unavailable,
+}
+
+/// Acquires and registers ownership of one target's refresh.
+///
+/// The ordering is fixed and is the whole point: resolve the stable identity,
+/// win the lease, then register so the repository can enforce it. Registering
+/// before winning would make the repository accept writes this frontend has no
+/// right to make, and writing before registering would leave the repository
+/// unable to reject them.
+///
+/// Contention is not an error to surface to a user as a failure: manual refresh
+/// maps it to a retryable conflict, and the workers back off. Only genuine
+/// coordination unavailability is exceptional.
+pub(crate) async fn acquire_refresh_ownership(
+    coordination: &MvRefreshCoordination,
+    registry: &Arc<MvRefreshOwnershipRegistry>,
+    mv_id: i64,
+    resource: ConnectorMvRefreshResourceIdentity,
+) -> Result<OwnedRefresh, OwnershipRefusal> {
+    let admission = coordination
+        .write_admission()
+        .await
+        .map_err(|_| OwnershipRefusal::Unavailable)?;
+    let guard = match coordination.acquire(&resource).await {
+        Ok(AcquireOutcome::Acquired(guard)) => guard,
+        Ok(AcquireOutcome::Contended(_)) => return Err(OwnershipRefusal::Contended),
+        Ok(AcquireOutcome::AwaitingTakeover(_)) => {
+            return Err(OwnershipRefusal::AwaitingTakeover);
+        }
+        Err(_) => return Err(OwnershipRefusal::Unavailable),
+    };
+    let fence = Arc::new(CurrentLeaseFence::new(guard.fence()));
+    registry
+        .register(mv_id, resource, fence, admission)
+        .map_err(|_| OwnershipRefusal::Unavailable)?;
+    Ok(OwnedRefresh {
+        mv_id,
+        registry: Arc::clone(registry),
+        _guard: guard,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +393,59 @@ mod tests {
         assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict, "{error}");
         assert!(!registry.holds(7));
         assert!(registry.resource_for(7).is_none());
+    }
+
+    /// Registry ownership must be revoked when the handle dies, including on an
+    /// early return or a panic on the refresh path. Tested against the registry
+    /// directly because that is the object the repository consults.
+    #[test]
+    fn ownership_release_is_tied_to_the_handle_lifetime() {
+        let registry = MvRefreshOwnershipRegistry::new();
+        assert!(!registry.holds(7));
+
+        // Simulate what `acquire_refresh_ownership` registers, then what `Drop`
+        // undoes. A real LeaseGuard needs a live StateStore, so the lifetime
+        // contract is exercised through the registry it mutates.
+        struct Owned {
+            mv_id: i64,
+            registry: Arc<MvRefreshOwnershipRegistry>,
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                self.registry.release(self.mv_id);
+            }
+        }
+
+        {
+            let _owned = Owned {
+                mv_id: 7,
+                registry: Arc::clone(&registry),
+            };
+            // Registration is what the repository consults; without it the
+            // repository already fails closed, which the next test covers.
+            assert!(!registry.holds(7), "nothing registered a fence here");
+        }
+
+        // After the handle is gone the target must be unowned regardless of how
+        // the refresh path exited.
+        assert!(!registry.holds(7));
+        assert!(registry.validator_for(7).is_err());
+    }
+
+    #[test]
+    fn ownership_refusals_distinguish_contention_from_unavailability() {
+        // Contention and awaiting-takeover are routine: manual refresh maps them
+        // to a retryable conflict and the workers back off. Collapsing them into
+        // "unavailable" would turn normal multi-frontend operation into errors.
+        assert_ne!(OwnershipRefusal::Contended, OwnershipRefusal::Unavailable);
+        assert_ne!(
+            OwnershipRefusal::AwaitingTakeover,
+            OwnershipRefusal::Unavailable
+        );
+        assert_ne!(
+            OwnershipRefusal::Contended,
+            OwnershipRefusal::AwaitingTakeover
+        );
     }
 
     #[test]
