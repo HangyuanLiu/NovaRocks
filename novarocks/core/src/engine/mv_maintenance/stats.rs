@@ -303,353 +303,536 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // End-to-end evidence over a real Iceberg table.
+    // Consumption-side evidence over an injected fake provider.
     //
-    // `collect_table_stats` reads nothing itself: it asks the provider for the
-    // compaction count, loads the table on a planning lease, and projects the
-    // observation. The cases below commit real snapshots through a Hadoop
-    // warehouse and assert the returned facts against the table those commits
-    // actually produced, so a projection that silently drops, defaults, or
-    // clamps a fact cannot pass.
+    // `collect_table_stats` reads no storage format itself: it asks the
+    // provider for the compaction scalar, loads the table on a planning lease,
+    // and projects the injected observation. All three inputs are injectable,
+    // so these cases drive them directly and assert the wiring this layer
+    // actually owns — verbatim projection, scalar wiring, call order, floor
+    // derivation, and fail-closed propagation.
+    //
+    // Whether a real provider derives those facts correctly is proven where
+    // that provider lives: the maintenance projection cases in
+    // `novarocks/connector/iceberg/src/storage_inspector.rs` and the compaction
+    // parity cases in `novarocks/core/src/connector/iceberg/metadata_maintenance.rs`.
+    // Re-deriving them here would only retest the provider through a longer
+    // path.
     // ---------------------------------------------------------------------
+
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlRegistry,
+        ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+        ConnectorInstanceIncarnation, ConnectorMaxCompactableDataFiles,
+        ConnectorMaxCompactableDataFilesRequest, ConnectorMetadata, ConnectorMetadataMaintenance,
+        ConnectorProviderId, ConnectorRequestContext, ConnectorScanPlanning, ConnectorTableHandle,
+        ConnectorTableMetadata, ConnectorTableRequest,
+    };
+
+    use crate::mv::storage_observation::{
+        MvLakePackageObservation, MvMaintenanceMetadataObservation, MvObservedMaintenancePolicy,
+        MvObservedSnapshot, MvRefreshTargetObservation, MvSchemaValidationObservation,
+        MvStorageObservationPort, MvTargetCreationObservation,
+    };
 
     const TEST_CATALOG: &str = "ice";
     const TEST_NAMESPACE: &str = "sales";
+    const TEST_TABLE: &str = "orders";
 
-    struct MaintenanceStatsFixture {
-        state: Arc<StandaloneState>,
-        _warehouse: tempfile::TempDir,
+    /// One provider round trip, recorded in the order the pass made it.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProviderCall {
+        LoadTable,
+        ReadMaxCompactableDataFiles,
     }
 
-    fn open_hadoop_iceberg_fixture() -> MaintenanceStatsFixture {
-        let warehouse = tempfile::TempDir::new().expect("warehouse tempdir");
+    #[derive(Default)]
+    struct CallLog(std::sync::Mutex<Vec<ProviderCall>>);
+
+    impl CallLog {
+        fn record(&self, call: ProviderCall) {
+            self.0.lock().expect("provider call log").push(call);
+        }
+
+        fn calls(&self) -> Vec<ProviderCall> {
+            self.0.lock().expect("provider call log").clone()
+        }
+    }
+
+    /// What the fake provider answers for the compaction scalar.
+    #[derive(Clone, Copy, Debug)]
+    enum CompactionAnswer {
+        /// The provider signs a value. `None` means it exposes no such
+        /// observation for this table; it is not a zero.
+        Signed(Option<u64>),
+        /// The provider cannot answer at all.
+        Unsupported,
+    }
+
+    /// Answers exactly the two provider calls this pass makes, records their
+    /// order, and refuses everything else.
+    struct FakeProvider {
+        descriptor: ConnectorInstanceDescriptor,
+        key: ConnectorExecutionBindingKey,
+        compaction: CompactionAnswer,
+        calls: Arc<CallLog>,
+    }
+
+    impl ConnectorMetadata for FakeProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+
+        fn namespace_exists(
+            &self,
+            _request: novarocks_spi::connector::ConnectorNamespaceRequest,
+        ) -> Result<bool, ConnectorError> {
+            unreachable!("a maintenance fact pass does not probe namespaces")
+        }
+
+        fn table_exists(&self, _request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            unreachable!("a maintenance fact pass does not probe table existence")
+        }
+
+        fn list_tables(
+            &self,
+            _request: novarocks_spi::connector::ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            unreachable!("a maintenance fact pass does not enumerate tables")
+        }
+
+        fn load_table(
+            &self,
+            request: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            self.calls.record(ProviderCall::LoadTable);
+            assert_eq!(
+                request.resolution,
+                ConnectorTableResolution::StrictBaseTable,
+                "maintenance must read the base table, never a provider read alias"
+            );
+            Ok(ConnectorTableMetadata {
+                identity: request.table.clone(),
+                schema: Arc::new(arrow::datatypes::Schema::empty()),
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(
+                    self.descriptor.instance_id.clone(),
+                    Bytes::from_static(b"fake maintenance table"),
+                )?,
+            })
+        }
+    }
+
+    impl ConnectorScanPlanning for FakeProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+
+        fn begin_scan(
+            &self,
+            _table: &ConnectorTableHandle,
+            _request: novarocks_spi::connector::ConnectorBeginScanRequest,
+        ) -> Result<novarocks_spi::connector::ConnectorScan, ConnectorError> {
+            unreachable!("a maintenance fact pass does not plan scans")
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &novarocks_spi::connector::ConnectorScanHandle,
+            _request: novarocks_spi::connector::ConnectorSplitPlanningRequest,
+        ) -> Result<novarocks_spi::connector::ConnectorSplitPlanningResult, ConnectorError>
+        {
+            unreachable!("a maintenance fact pass does not plan scans")
+        }
+    }
+
+    impl ConnectorExecutionDistribution for FakeProvider {
+        fn declaration(
+            &self,
+            _context: &ConnectorRequestContext,
+        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+            unreachable!("maintenance facts never cross the execution boundary")
+        }
+    }
+
+    impl ConnectorMetadataMaintenance for FakeProvider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.key
+        }
+
+        fn plan_maintenance(
+            &self,
+            _request: novarocks_spi::connector::ConnectorMetadataMaintenancePlanningRequest,
+        ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenancePlan, ConnectorError>
+        {
+            unreachable!("an observation must not plan")
+        }
+
+        fn execute(
+            &self,
+            _request: novarocks_spi::connector::ConnectorMetadataMaintenanceExecuteRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorMetadataMaintenanceReceipt,
+            >,
+            ConnectorError,
+        > {
+            unreachable!("an observation must not execute")
+        }
+
+        fn reconcile(
+            &self,
+            _request: novarocks_spi::connector::ConnectorMetadataMaintenanceReconcileRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorMetadataMaintenanceReceipt,
+            >,
+            ConnectorError,
+        > {
+            unreachable!("an observation must not reconcile")
+        }
+
+        fn read_max_compactable_data_files(
+            &self,
+            request: ConnectorMaxCompactableDataFilesRequest,
+        ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
+            self.calls.record(ProviderCall::ReadMaxCompactableDataFiles);
+            assert_eq!(request.table.owner(), &self.descriptor.instance_id);
+            match self.compaction {
+                CompactionAnswer::Signed(value) => Ok(ConnectorMaxCompactableDataFiles::new(value)),
+                CompactionAnswer::Unsupported => Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "fake provider observes no compactable data file groups",
+                )),
+            }
+        }
+    }
+
+    /// The exact facts the injected observation hands back, so a projection
+    /// that silently drops, defaults, or clamps one cannot pass.
+    #[derive(Clone, Debug, Default)]
+    struct FakeObservation {
+        current_snapshot_id: Option<i64>,
+        snapshots: Vec<MvObservedSnapshot>,
+        non_default_reference_count: usize,
+        total_data_files: Option<u64>,
+        total_delete_files: Option<u64>,
+        total_files_size_bytes: Option<u64>,
+        policy: MvObservedMaintenancePolicy,
+    }
+
+    impl MvStorageObservationPort for FakeObservation {
+        fn observe_created_target(
+            &self,
+            _exact_lease: &ConnectorControlPlanningLease,
+            _metadata: &ConnectorTableMetadata,
+            _context: ConnectorRequestContext,
+        ) -> Result<MvTargetCreationObservation, ConnectorError> {
+            unreachable!("a maintenance fact pass observes maintenance metadata only")
+        }
+
+        fn observe_schema_validation(
+            &self,
+            _exact_lease: &ConnectorControlPlanningLease,
+            _metadata: &ConnectorTableMetadata,
+            _context: ConnectorRequestContext,
+        ) -> Result<MvSchemaValidationObservation, ConnectorError> {
+            unreachable!("a maintenance fact pass observes maintenance metadata only")
+        }
+
+        fn observe_lake_package(
+            &self,
+            _exact_lease: &ConnectorControlPlanningLease,
+            _metadata: &ConnectorTableMetadata,
+            _context: ConnectorRequestContext,
+        ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
+            unreachable!("a maintenance fact pass observes maintenance metadata only")
+        }
+
+        fn observe_refresh_target(
+            &self,
+            _exact_lease: &ConnectorControlPlanningLease,
+            _metadata: &ConnectorTableMetadata,
+            _context: ConnectorRequestContext,
+        ) -> Result<MvRefreshTargetObservation, ConnectorError> {
+            unreachable!("a maintenance fact pass observes maintenance metadata only")
+        }
+
+        fn observe_maintenance_metadata(
+            &self,
+            _exact_lease: &ConnectorControlPlanningLease,
+            _metadata: &ConnectorTableMetadata,
+            context: ConnectorRequestContext,
+        ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {
+            MvMaintenanceMetadataObservation::try_new(
+                self.current_snapshot_id,
+                self.snapshots.clone(),
+                self.non_default_reference_count,
+                self.total_data_files,
+                self.total_delete_files,
+                self.total_files_size_bytes,
+                self.policy,
+                &context,
+            )
+        }
+    }
+
+    /// Compose a state whose provider and storage observation are both fakes,
+    /// and hand back the shared log both fakes write their call order into.
+    fn fixture(
+        observation: FakeObservation,
+        compaction: CompactionAnswer,
+    ) -> (Arc<StandaloneState>, Arc<CallLog>) {
+        let instance_id = ConnectorInstanceId::parse(TEST_CATALOG).expect("fixture instance ID");
+        let incarnation = ConnectorInstanceIncarnation::from_bytes([9; 16]);
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("mv-maintenance-fixture")
+                .expect("fixture provider ID"),
+            instance_id: instance_id.clone(),
+        };
+        let calls = Arc::new(CallLog::default());
+        let provider = Arc::new(FakeProvider {
+            descriptor: descriptor.clone(),
+            key: ConnectorExecutionBindingKey {
+                instance_id,
+                incarnation,
+            },
+            compaction,
+            calls: Arc::clone(&calls),
+        });
+        let binding =
+            ConnectorControlBinding::try_new_with_all_capabilities_and_metadata_maintenance(
+                descriptor,
+                incarnation,
+                provider.clone(),
+                provider.clone(),
+                provider.clone(),
+                None,
+                None,
+                Some(provider),
+                None,
+                None,
+            )
+            .expect("fake control binding");
+        let control = Arc::new(crate::engine::TestConnectorControlRegistry::default());
+        control.register(binding).expect("register fake binding");
         let state = Arc::new(StandaloneState {
-            // Every projected fact travels this port, and the Core default is
-            // fail-closed on purpose. Install the same Iceberg observation the
-            // Server composition root installs, otherwise the call fails on the
-            // missing port instead of on its own behaviour.
-            mv_storage_observation: Arc::new(
-                crate::engine::mv::schema_validation_adapter::TestIcebergMvStorageObservationAdapter::default(),
-            ),
+            connector_control: control,
+            mv_storage_observation: Arc::new(observation),
             ..StandaloneState::default()
         });
-        {
-            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
-            catalogs
-                .create_catalog(
-                    TEST_CATALOG,
-                    &[
-                        ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                        (
-                            "iceberg.catalog.warehouse".to_string(),
-                            warehouse.path().display().to_string(),
-                        ),
-                    ],
-                )
-                .expect("create Hadoop catalog");
-        }
-        let entry = catalog_entry(&state);
-        crate::connector::iceberg::catalog::registry::create_namespace(&entry, TEST_NAMESPACE)
-            .expect("create namespace");
-        crate::engine::register_iceberg_control_binding(&state, TEST_CATALOG)
-            .expect("register Iceberg control binding");
-        MaintenanceStatsFixture {
-            state,
-            _warehouse: warehouse,
-        }
-    }
-
-    fn catalog_entry(
-        state: &Arc<StandaloneState>,
-    ) -> crate::connector::iceberg::catalog::registry::IcebergCatalogEntry {
-        state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg catalogs")
-            .get(TEST_CATALOG)
-            .expect("catalog entry")
-    }
-
-    fn create_fact_table(state: &Arc<StandaloneState>, table: &str, properties: &[(&str, &str)]) {
-        let entry = catalog_entry(state);
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::BigInt,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "region".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        let properties = properties
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            TEST_NAMESPACE,
-            table,
-            &columns,
-            None,
-            &[],
-            &properties,
-        )
-        .expect("create Iceberg fact table");
-    }
-
-    /// Commit one row as its own snapshot and return the snapshot it produced.
-    fn commit_one_row(state: &Arc<StandaloneState>, table: &str, id: i64, region: &str) -> i64 {
-        let entry = catalog_entry(state);
-        let rows = vec![vec![
-            crate::sql::Literal::Int(id),
-            crate::sql::Literal::String(region.to_string()),
-        ]];
-        crate::connector::iceberg::catalog::registry::insert_rows(
-            &entry,
-            TEST_NAMESPACE,
-            table,
-            &rows,
-        )
-        .expect("commit Iceberg rows");
-        // Iceberg stamps a snapshot with wall-clock milliseconds. Separate the
-        // commits so the timestamps this test reasons about are distinguishable
-        // rather than accidentally equal.
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        current_table(state, table)
-            .metadata()
-            .current_snapshot()
-            .expect("committed snapshot")
-            .snapshot_id()
-    }
-
-    /// Read the table straight from the catalog, bypassing any cached
-    /// generation, so assertions compare against what storage really holds.
-    fn current_table(
-        state: &Arc<StandaloneState>,
-        table: &str,
-    ) -> novarocks_connector_iceberg::iceberg::table::Table {
-        let entry = catalog_entry(state);
-        entry.invalidate_table_cache(TEST_NAMESPACE, table);
-        crate::connector::iceberg::catalog::registry::load_table(&entry, TEST_NAMESPACE, table)
-            .expect("load Iceberg table")
-            .into_table()
-    }
-
-    fn summary_u64(state: &Arc<StandaloneState>, table: &str, key: &str) -> Option<u64> {
-        current_table(state, table)
-            .metadata()
-            .current_snapshot()
-            .and_then(|snapshot| {
-                snapshot
-                    .summary()
-                    .additional_properties
-                    .get(key)
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-            })
+        (state, calls)
     }
 
     #[test]
-    fn collect_table_stats_reports_the_committed_snapshot_facts_of_a_real_table() {
-        let fixture = open_hadoop_iceberg_fixture();
-        let state = &fixture.state;
-        create_fact_table(state, "orders", &[]);
-        let first = commit_one_row(state, "orders", 1, "east");
-        let second = commit_one_row(state, "orders", 2, "east");
-        let third = commit_one_row(state, "orders", 3, "east");
+    fn collect_table_stats_projects_every_observed_fact_verbatim() {
+        let (state, _calls) = fixture(
+            FakeObservation {
+                current_snapshot_id: Some(20),
+                snapshots: vec![
+                    MvObservedSnapshot {
+                        snapshot_id: 10,
+                        timestamp_ms: 1_000,
+                    },
+                    MvObservedSnapshot {
+                        snapshot_id: 20,
+                        timestamp_ms: 7_000,
+                    },
+                ],
+                non_default_reference_count: 3,
+                total_data_files: Some(11),
+                total_delete_files: Some(2),
+                total_files_size_bytes: Some(4_096),
+                policy: MvObservedMaintenancePolicy {
+                    maintenance_enabled: Some(false),
+                    expire_max_snapshot_age_ms: Some(3_600_000),
+                    expire_min_snapshots_to_keep: Some(4),
+                    target_file_size_bytes: Some(1_048_576),
+                },
+            },
+            CompactionAnswer::Signed(Some(9)),
+        );
 
-        let stats = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "orders", &[])
+        let stats = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
             .expect("collect maintenance stats");
 
-        // 1. The current snapshot is the last commit, and it is what the table
-        //    itself reports.
-        let table = current_table(state, "orders");
-        let metadata = table.metadata();
-        assert_eq!(stats.current_snapshot_id, Some(third));
-        assert_eq!(stats.current_snapshot_id, metadata.current_snapshot_id());
-
-        // 2. One snapshot per commit, each carrying the table's own timestamp.
-        let observed: Vec<(i64, i64)> = stats
-            .snapshots
-            .iter()
-            .map(|snapshot| (snapshot.snapshot_id, snapshot.timestamp_ms))
-            .collect();
-        let mut expected: Vec<(i64, i64)> = metadata
-            .snapshots()
-            .map(|snapshot| (snapshot.snapshot_id(), snapshot.timestamp_ms()))
-            .collect();
-        expected.sort_by_key(|(snapshot_id, _)| *snapshot_id);
-        assert_eq!(expected.len(), 3);
-        assert_eq!(observed, expected);
-        let observed_ids: std::collections::BTreeSet<i64> =
-            observed.iter().map(|(id, _)| *id).collect();
-        let committed_ids: std::collections::BTreeSet<i64> =
-            [first, second, third].into_iter().collect();
-        assert_eq!(observed_ids, committed_ids);
-        let ts_by_id: BTreeMap<i64, i64> = observed.iter().copied().collect();
-        assert!(
-            ts_by_id[&first] < ts_by_id[&second] && ts_by_id[&second] < ts_by_id[&third],
-            "commit order must be visible in the observed timestamps: {ts_by_id:?}"
-        );
-
-        // 3. Summary counters come from the current snapshot summary, unread
-        //    and uninterpreted.
+        assert_eq!(stats.current_snapshot_id, Some(20));
         assert_eq!(
-            stats.total_data_files,
-            summary_u64(state, "orders", "total-data-files")
+            stats.snapshots,
+            vec![
+                SnapshotInfo {
+                    snapshot_id: 10,
+                    timestamp_ms: 1_000,
+                },
+                SnapshotInfo {
+                    snapshot_id: 20,
+                    timestamp_ms: 7_000,
+                },
+            ]
         );
-        assert_eq!(
-            stats.total_delete_files,
-            summary_u64(state, "orders", "total-delete-files")
-        );
-        assert_eq!(stats.total_delete_files, Some(0));
-        let files_size = summary_u64(state, "orders", "total-files-size")
-            .expect("current snapshot summary carries total-files-size");
-        assert!(files_size > 0, "a committed data file occupies bytes");
-        assert_eq!(stats.total_files_size_bytes, Some(files_size));
-        // The `total-*` counters are the current snapshot's own summary,
-        // verbatim. This append path stamps each commit with that commit's
-        // counts instead of rolling the table totals forward, so the summary
-        // says one data file while three are live. That divergence is the
-        // point: the summary counter and the enumerated compaction count are
-        // different facts, and this layer must forward each unchanged rather
-        // than reconcile them. If the append path ever starts accumulating,
-        // the equality above still holds and only this pin needs revisiting.
-        assert_eq!(stats.total_data_files, Some(1));
-
-        // 4. The provider-signed compaction count is a live enumeration, not a
-        //    summary read: three data files sharing one compaction group
-        //    (unpartitioned, no row lineage) answer three.
-        assert_eq!(stats.max_compactable_data_files, Some(3));
-
-        // 5. A table that declares no maintenance property gets no value; the
-        //    fact layer must not invent a default.
-        assert_eq!(stats.maintenance_enabled, None);
-        assert_eq!(stats.expire_max_snapshot_age_ms, None);
-        assert_eq!(stats.expire_min_snapshots_to_keep, None);
-        assert_eq!(stats.target_file_size_bytes, None);
-
-        // 6. Only `main` exists.
-        assert_eq!(stats.non_default_reference_count, 0);
-
-        // 7. No MV consumes this table, so nothing pins retention.
+        assert_eq!(stats.non_default_reference_count, 3);
+        assert_eq!(stats.total_data_files, Some(11));
+        assert_eq!(stats.total_delete_files, Some(2));
+        assert_eq!(stats.total_files_size_bytes, Some(4_096));
+        assert_eq!(stats.maintenance_enabled, Some(false));
+        assert_eq!(stats.expire_max_snapshot_age_ms, Some(3_600_000));
+        assert_eq!(stats.expire_min_snapshots_to_keep, Some(4));
+        assert_eq!(stats.target_file_size_bytes, Some(1_048_576));
+        // The provider-signed scalar and the summary counter are different
+        // facts. Each must arrive unchanged, and neither may be reconciled
+        // against the other: the values here deliberately disagree.
+        assert_eq!(stats.max_compactable_data_files, Some(9));
+        assert_ne!(stats.max_compactable_data_files, stats.total_data_files);
+        // No MV consumes this table, so nothing pins retention.
         assert_eq!(stats.downstream_floor_ts_ms, None);
         assert!(!stats.downstream_floor_unknown);
     }
 
     #[test]
-    fn collect_table_stats_counts_references_other_than_the_default_branch() {
-        let fixture = open_hadoop_iceberg_fixture();
-        let state = &fixture.state;
-        create_fact_table(state, "branched", &[]);
-        let snapshot = commit_one_row(state, "branched", 1, "east");
+    fn collect_table_stats_keeps_undeclared_facts_absent() {
+        // A table that declares nothing and a provider that exposes no
+        // compaction observation. Every value must stay absent: a default or a
+        // zero injected here would be a policy decision made in a fact layer.
+        let (state, _calls) = fixture(FakeObservation::default(), CompactionAnswer::Signed(None));
 
-        let before = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "branched", &[])
+        let stats = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
             .expect("collect maintenance stats");
-        assert_eq!(before.non_default_reference_count, 0, "only `main` exists");
 
-        let session = crate::engine::StandaloneSession {
-            inner: Arc::clone(state),
-        };
-        session
-            .execute_in_context(
-                &format!(
-                    "ALTER TABLE {TEST_CATALOG}.{TEST_NAMESPACE}.branched \
-                     CREATE BRANCH dev AS OF VERSION {snapshot}"
-                ),
-                None,
-                TEST_NAMESPACE,
-                None,
-            )
-            .expect("create Iceberg branch");
-
-        let after = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "branched", &[])
-            .expect("collect maintenance stats");
-        // `dev` is counted, `main` is not. The branch points at an existing
-        // snapshot, so the snapshot list itself is unchanged.
-        assert_eq!(after.non_default_reference_count, 1);
-        assert_eq!(after.snapshots, before.snapshots);
-        assert_eq!(after.current_snapshot_id, Some(snapshot));
+        assert_eq!(stats.current_snapshot_id, None);
+        assert!(stats.snapshots.is_empty());
+        assert_eq!(stats.total_data_files, None);
+        assert_eq!(stats.total_delete_files, None);
+        assert_eq!(stats.total_files_size_bytes, None);
+        assert_eq!(stats.max_compactable_data_files, None);
+        assert_eq!(stats.maintenance_enabled, None);
+        assert_eq!(stats.expire_max_snapshot_age_ms, None);
+        assert_eq!(stats.expire_min_snapshots_to_keep, None);
+        assert_eq!(stats.target_file_size_bytes, None);
+        assert_eq!(stats.non_default_reference_count, 0);
     }
 
     #[test]
-    fn collect_table_stats_projects_declared_policy_without_default_or_clamp() {
-        let fixture = open_hadoop_iceberg_fixture();
-        let state = &fixture.state;
-        create_fact_table(
-            state,
-            "policy_orders",
-            &[
-                ("novarocks.maintenance.enabled", "false"),
-                ("history.expire.max-snapshot-age-ms", "3600000"),
-                ("write.target-file-size-bytes", "1048576"),
-            ],
+    fn collect_table_stats_observes_compaction_before_the_projected_metadata_load() {
+        let (state, calls) = fixture(
+            FakeObservation::default(),
+            CompactionAnswer::Signed(Some(2)),
         );
-        commit_one_row(state, "policy_orders", 1, "east");
 
-        let stats = collect_table_stats(state, TEST_CATALOG, TEST_NAMESPACE, "policy_orders", &[])
+        let stats = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
             .expect("collect maintenance stats");
+        assert_eq!(stats.max_compactable_data_files, Some(2));
 
-        assert_eq!(stats.maintenance_enabled, Some(false));
-        assert_eq!(stats.expire_max_snapshot_age_ms, Some(3_600_000));
-        assert_eq!(stats.target_file_size_bytes, Some(1_048_576));
-        // Declared by nobody: still absent. A default injected here would be a
-        // policy decision made in the fact layer.
-        assert_eq!(stats.expire_min_snapshots_to_keep, None);
+        // Answering the observation forces the provider to discard its cached
+        // table and re-read the catalog, and it repopulates that cache with
+        // what it read. The metadata load that feeds every projected fact must
+        // therefore come after it; reversing the two would let the facts
+        // describe an older table than the count.
+        let calls = calls.calls();
+        assert_eq!(
+            calls,
+            vec![
+                // Resolving the table handle the observation needs.
+                ProviderCall::LoadTable,
+                ProviderCall::ReadMaxCompactableDataFiles,
+                // The planning-lease load whose metadata is projected.
+                ProviderCall::LoadTable,
+            ]
+        );
+        let observed = calls
+            .iter()
+            .position(|call| *call == ProviderCall::ReadMaxCompactableDataFiles)
+            .expect("the compaction observation ran");
+        let projected = calls
+            .iter()
+            .rposition(|call| *call == ProviderCall::LoadTable)
+            .expect("the planning-lease load ran");
+        assert!(
+            observed < projected,
+            "the compaction observation must precede the projected metadata load: {calls:?}"
+        );
     }
 
     #[test]
     fn collect_table_stats_floors_retention_at_the_snapshot_an_mv_consumes() {
-        let fixture = open_hadoop_iceberg_fixture();
-        let state = &fixture.state;
-        create_fact_table(state, "consumed", &[]);
-        let first = commit_one_row(state, "consumed", 1, "east");
-        commit_one_row(state, "consumed", 2, "east");
-        let third = commit_one_row(state, "consumed", 3, "east");
-        let fqn = format!("{TEST_CATALOG}.{TEST_NAMESPACE}.consumed");
+        // The two snapshots carry different timestamps, so a floor that
+        // reported the oldest retained snapshot instead of the consumed one
+        // would fail here rather than pass by coincidence.
+        let observation = FakeObservation {
+            current_snapshot_id: Some(20),
+            snapshots: vec![
+                MvObservedSnapshot {
+                    snapshot_id: 10,
+                    timestamp_ms: 1_000,
+                },
+                MvObservedSnapshot {
+                    snapshot_id: 20,
+                    timestamp_ms: 7_000,
+                },
+            ],
+            ..FakeObservation::default()
+        };
+        let fqn = format!("{TEST_CATALOG}.{TEST_NAMESPACE}.{TEST_TABLE}");
 
         // A consumer committed at the newest snapshot floors retention there,
         // not at the oldest snapshot the table still retains.
-        let consumer = definition_with_consumed(&fqn, third);
+        let (state, _calls) = fixture(observation.clone(), CompactionAnswer::Signed(None));
+        let consumer = definition_with_consumed(&fqn, 20);
         let stats = collect_table_stats(
-            state,
+            &state,
             TEST_CATALOG,
             TEST_NAMESPACE,
-            "consumed",
+            TEST_TABLE,
             std::slice::from_ref(&consumer),
         )
         .expect("collect maintenance stats");
-        let ts_by_id: BTreeMap<i64, i64> = stats
-            .snapshots
-            .iter()
-            .map(|snapshot| (snapshot.snapshot_id, snapshot.timestamp_ms))
-            .collect();
-        assert_eq!(stats.downstream_floor_ts_ms, Some(ts_by_id[&third]));
+        assert_eq!(stats.downstream_floor_ts_ms, Some(7_000));
         assert!(!stats.downstream_floor_unknown);
-        assert!(
-            ts_by_id[&first] < ts_by_id[&third],
-            "the floor must be discriminating: {ts_by_id:?}"
-        );
 
         // A consumer pinned to a snapshot this table cannot resolve leaves the
         // floor unknown, which is what blocks expire.
-        let missing = definition_with_consumed(&fqn, third.wrapping_add(1));
-        assert!(!ts_by_id.contains_key(&third.wrapping_add(1)));
+        let (state, _calls) = fixture(observation, CompactionAnswer::Signed(None));
+        let missing = definition_with_consumed(&fqn, 99);
         let stats = collect_table_stats(
-            state,
+            &state,
             TEST_CATALOG,
             TEST_NAMESPACE,
-            "consumed",
+            TEST_TABLE,
             std::slice::from_ref(&missing),
         )
         .expect("collect maintenance stats");
         assert!(stats.downstream_floor_unknown);
+        assert_eq!(stats.downstream_floor_ts_ms, None);
+    }
+
+    #[test]
+    fn collect_table_stats_fails_closed_when_the_provider_cannot_sign_the_scalar() {
+        let (state, calls) = fixture(FakeObservation::default(), CompactionAnswer::Unsupported);
+
+        let error = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
+            .expect_err("an unanswerable observation must not be downgraded to a fact");
+
+        assert!(
+            error.contains("compaction groups for maintenance"),
+            "unexpected error: {error}"
+        );
+        // The pass stops at the failure. It never reaches the planning-lease
+        // load, so it cannot report the remaining facts with a silently absent
+        // `max_compactable_data_files`.
+        assert_eq!(
+            calls.calls(),
+            vec![
+                ProviderCall::LoadTable,
+                ProviderCall::ReadMaxCompactableDataFiles,
+            ]
+        );
     }
 }
