@@ -488,10 +488,10 @@ impl FrontendApplicationHost {
                     Arc::clone(port)
                         as Arc<dyn crate::mv::repository::CatalogAttachmentObservationSource>
                 });
-                // Cluster-wide refresh ownership. The registry is intentionally
-                // not yet installed as the repository's fence source: the refresh
-                // path must be registering ownership before anything consults it,
-                // or every refresh would fail closed.
+                // Cluster-wide refresh ownership. The refresh path registers with
+                // this registry before creating durable state, so installing it as
+                // the repository's fence source below makes every durable refresh
+                // transition prove ownership inside its own transaction.
                 let ownership = match crate::mv::coordination::MvRefreshOwnershipContext::open(
                     Arc::clone(&store),
                 )
@@ -507,10 +507,12 @@ impl FrontendApplicationHost {
                         None
                     }
                 };
-                match StateStoreMvRepository::open_with_catalog_attachment_observations(
+                let refresh_fence = ownership.as_ref().map(|context| context.registry());
+                match StateStoreMvRepository::open_with_observations_and_refresh_fence(
                     store,
                     tokio::runtime::Handle::current(),
                     attachment_observations,
+                    refresh_fence,
                 )
                 .await
                 {
