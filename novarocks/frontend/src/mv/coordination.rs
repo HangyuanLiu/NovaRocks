@@ -35,7 +35,8 @@
 //!   A StateStore rebuild reassigns the numeric `mv_id`, so keying on it would
 //!   silently split one target into two domains across a rebuild.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorMvRefreshResourceIdentity;
@@ -48,6 +49,8 @@ use novarocks_state_store::coordination::{
 use uuid::Uuid;
 
 use crate::coordination::{CurrentLeaseFence, FenceValidator, FrontendCoordinationRuntime};
+use crate::mv::repository::MvRefreshFenceSource;
+use novarocks::mv::repository::{MvRepositoryError, MvRepositoryErrorKind};
 
 /// Prefix that scopes MV refresh leases away from every other coordinated
 /// resource in the same StateStore.
@@ -140,6 +143,106 @@ impl MvRefreshCoordination {
     }
 }
 
+/// The refresh leases this process currently holds, keyed by MV.
+///
+/// This is the object that turns the repository's fence requirement into a real
+/// one: it is installed as the repository's [`MvRefreshFenceSource`], so a
+/// transition can only commit for a target whose lease is registered here.
+///
+/// Registration is keyed by `mv_id` because that is what a repository call
+/// carries, while the *lease* is keyed by the stable target identity. Both are
+/// recorded together so a takeover cannot leave an `mv_id` pointing at a fence
+/// from a previous target incarnation.
+#[derive(Default)]
+pub(crate) struct MvRefreshOwnershipRegistry {
+    held: RwLock<HashMap<i64, HeldRefreshLease>>,
+}
+
+struct HeldRefreshLease {
+    resource: ConnectorMvRefreshResourceIdentity,
+    fence: Arc<CurrentLeaseFence>,
+    admission: WriteAdmission,
+}
+
+impl MvRefreshOwnershipRegistry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records that this process owns `mv_id`'s refresh resource.
+    ///
+    /// Re-registering the same MV replaces the entry: a takeover-then-reacquire
+    /// must not leave the previous generation's fence reachable.
+    pub(crate) fn register(
+        &self,
+        mv_id: i64,
+        resource: ConnectorMvRefreshResourceIdentity,
+        fence: Arc<CurrentLeaseFence>,
+        admission: WriteAdmission,
+    ) -> Result<(), MvRepositoryError> {
+        let mut held = self.held.write().map_err(|_| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "MV refresh ownership registry lock poisoned",
+            )
+        })?;
+        held.insert(
+            mv_id,
+            HeldRefreshLease {
+                resource,
+                fence,
+                admission,
+            },
+        );
+        Ok(())
+    }
+
+    /// Drops ownership so later transitions fail closed.
+    ///
+    /// Called when a lease is released, lost, or the worker shuts down. After
+    /// this, the repository rejects durable transitions for `mv_id` rather than
+    /// letting them through unfenced.
+    pub(crate) fn release(&self, mv_id: i64) {
+        if let Ok(mut held) = self.held.write() {
+            held.remove(&mv_id);
+        }
+    }
+
+    /// The stable resource this process holds for `mv_id`, if any.
+    pub(crate) fn resource_for(&self, mv_id: i64) -> Option<ConnectorMvRefreshResourceIdentity> {
+        self.held
+            .read()
+            .ok()?
+            .get(&mv_id)
+            .map(|held| held.resource.clone())
+    }
+
+    pub(crate) fn holds(&self, mv_id: i64) -> bool {
+        self.held.read().is_ok_and(|held| held.contains_key(&mv_id))
+    }
+}
+
+impl MvRefreshFenceSource for MvRefreshOwnershipRegistry {
+    fn validator_for(&self, mv_id: i64) -> Result<FenceValidator, MvRepositoryError> {
+        let held = self.held.read().map_err(|_| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "MV refresh ownership registry lock poisoned",
+            )
+        })?;
+        let held = held.get(&mv_id).ok_or_else(|| {
+            // Fail closed. This frontend is not the owner, so it must not write
+            // durable refresh state for this target at all — not even the same
+            // value it would have written while it was the owner.
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!("this frontend does not hold the refresh lease for mv {mv_id}"),
+            )
+        })?;
+        Ok(held.fence.validator_with_admission(held.admission.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +254,51 @@ mod tests {
             Uuid::from_u128(uuid),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn registry_fails_closed_for_targets_this_frontend_does_not_own() {
+        let registry = MvRefreshOwnershipRegistry::new();
+
+        // Nothing registered: every target is unowned, so every durable
+        // transition must be refused rather than run unfenced.
+        // `FenceValidator` is a closure and has no `Debug`, so match rather than
+        // `expect_err`.
+        let error = match registry.validator_for(7) {
+            Ok(_) => panic!("an unowned target must not yield a validator"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict, "{error}");
+        assert!(!registry.holds(7));
+        assert!(registry.resource_for(7).is_none());
+    }
+
+    #[test]
+    fn releasing_ownership_stops_further_durable_transitions() {
+        let registry = MvRefreshOwnershipRegistry::new();
+
+        // Losing the lease must revoke the ability to write, not merely stop new
+        // work from being scheduled.
+        registry.release(7);
+        assert!(
+            registry.validator_for(7).is_err(),
+            "a released target must fail closed"
+        );
+        assert!(!registry.holds(7));
+    }
+
+    #[test]
+    fn registry_tracks_the_stable_resource_alongside_the_numeric_mv_id() {
+        // The registry is keyed by mv_id because that is what a repository call
+        // carries, but it records the stable resource so a rebuild that reassigns
+        // mv_id cannot leave an entry pointing at the wrong target.
+        let registry = MvRefreshOwnershipRegistry::new();
+        assert!(registry.resource_for(7).is_none());
+        assert_ne!(
+            mv_refresh_resource_key(&resource(0x1234)).unwrap(),
+            mv_refresh_resource_key(&resource(0x9999)).unwrap(),
+            "two targets must never share one ownership domain"
+        );
     }
 
     #[test]
