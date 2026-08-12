@@ -58,7 +58,7 @@
 //! [`Ambiguous`]: ConnectorHistoricalWriteDisposition::Ambiguous
 //! [`NotApplied`]: ConnectorHistoricalWriteDisposition::NotApplied
 
-// Design: ADR-0064 (docs/adr/ADR-0064-external-write-fence-as-catalog-linearization-point.md)
+// Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};

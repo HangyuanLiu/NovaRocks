@@ -1711,7 +1711,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
     /// fence reuses the existing marker; a lower generation, another operation's
     /// marker, or an uninterpretable marker all refuse.
     ///
-    /// Design: ADR-0064 (docs/adr/ADR-0064-external-write-fence-as-catalog-linearization-point.md)
+    /// Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
     fn establish_external_fence(
         &self,
         request: ConnectorExternalFenceRequest,

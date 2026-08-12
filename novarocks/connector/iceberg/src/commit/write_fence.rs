@@ -54,7 +54,7 @@
 //! This also makes the "different operations must not reuse a marker"
 //! invariant structural rather than merely checked.
 
-// Design: ADR-0064 (docs/adr/ADR-0064-external-write-fence-as-catalog-linearization-point.md)
+// Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
 
 use std::collections::HashMap;
 
