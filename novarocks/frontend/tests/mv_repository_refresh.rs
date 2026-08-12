@@ -1327,3 +1327,25 @@ fn two_frontends_competing_for_one_target_yield_a_single_owner() {
     drop(winner);
     assert!(!first.registry.holds(42));
 }
+
+/// Guards that installing ownership is a deliberate choice, not a default.
+///
+/// The unfenced constructor still exists because a composition without a
+/// StateStore has a structurally single owner. This pins that the difference is
+/// explicit: a repository is fenced exactly when a fence source was passed, so a
+/// composition that forgets to install ownership is detectable rather than
+/// quietly unfenced.
+#[test]
+fn a_repository_is_fenced_exactly_when_a_fence_source_is_installed() {
+    let (_temp, _runtime, _host, fenced) = fenced_repository(Arc::new(SupersededOwner));
+    assert!(
+        fenced.has_refresh_fence(),
+        "installing a fence source must make refresh transitions fenced"
+    );
+
+    let (_temp2, _runtime2, _host2, unfenced) = repository();
+    assert!(
+        !unfenced.has_refresh_fence(),
+        "the unfenced constructor must remain visibly unfenced, not accidentally fenced"
+    );
+}

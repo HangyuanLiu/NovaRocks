@@ -161,6 +161,15 @@ impl StateStoreMvRepository {
         Ok(repository)
     }
 
+    /// Whether durable refresh transitions are fenced at all.
+    ///
+    /// Exists so a composition can be asserted to have installed ownership rather
+    /// than silently running unfenced. An unfenced repository is only correct
+    /// where a single owner is structurally guaranteed.
+    pub fn has_refresh_fence(&self) -> bool {
+        self.refresh_fence.is_some()
+    }
+
     /// Resolves the fence this process must prove for `mv_id`'s next durable
     /// refresh transition.
     ///
