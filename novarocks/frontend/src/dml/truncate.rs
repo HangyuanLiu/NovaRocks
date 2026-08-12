@@ -207,6 +207,36 @@ fn execute_truncate_operation(
     )?;
 
     active.check_before_dispatch()?;
+
+    // Establish the external fence before the destructive execute. TRUNCATE
+    // removes table content, so a superseded owner's late execute has to be
+    // refused at the catalog rather than reported after the fact. The frontend
+    // seals it because only it holds the resource identity a fence binds; the
+    // plan facts carry exactly the identity the provider signed.
+    let fence = active
+        .external_fence()?
+        .seal(
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
+                prepared.facts.mutation_operation_id,
+            ),
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                    prepared.facts.instance_id.as_str(),
+                )
+                .map_err(DmlError::executor)?,
+                namespace: std::sync::Arc::from(prepared.facts.namespace.as_str()),
+                table: std::sync::Arc::from(prepared.facts.table.as_str()),
+            },
+            novarocks_spi::connector::ConnectorWriteTargetRef::parse(
+                prepared.facts.target_ref.as_str(),
+            )
+            .map_err(DmlError::executor)?,
+        )
+        .map_err(DmlError::executor)?;
+    engine
+        .establish_truncate_external_fence(prepared.handle.as_ref(), fence)
+        .map_err(DmlError::executor)?;
+
     finish_outcome(
         engine,
         active,
