@@ -38,9 +38,10 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome, PreparedBatch,
 };
 use novarocks_spi::connector::{
-    ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceDescriptor,
-    ConnectorHistoricalMaintenanceDisposition, ConnectorHistoricalMaintenanceFamily,
-    ConnectorHistoricalMaintenanceObservation, ConnectorHistoricalMaintenanceOutcome,
+    ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceArtifact,
+    ConnectorHistoricalMaintenanceDescriptor, ConnectorHistoricalMaintenanceDisposition,
+    ConnectorHistoricalMaintenanceFamily, ConnectorHistoricalMaintenanceObservation,
+    ConnectorHistoricalMaintenanceOutcome,
 };
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::coordination::WriteAdmission;
@@ -1380,6 +1381,10 @@ impl FrontendTableMaintenanceService {
                 batch_ordinal: None,
                 receipt_digest: None,
             },
+            // The provider needs the immutable plan it wrote to recompute the
+            // marker it would have committed under. Without it there is nothing
+            // to look for in the table.
+            metadata_plan_artifact(self, repository, operation.operation_id)?,
             attempt.attempt_id(),
         ) {
             Ok(descriptor) => descriptor,
@@ -1480,6 +1485,7 @@ impl FrontendTableMaintenanceService {
                 operation.plan_digest,
                 Some(operation.base_state_digest),
                 rewrite_dispatch_facts(operation.state),
+                Vec::new(),
                 attempt.attempt_id(),
             )
             .and_then(|descriptor| {
@@ -1753,6 +1759,20 @@ impl FrontendTableMaintenanceService {
                 dispatch_started: true,
                 batch_ordinal: Some(u32::from(checkpoint.ordinal)),
                 receipt_digest: Some(checkpoint.prepared_handle_digest),
+            },
+            // The prepared batch is the exact, immutable set of candidates the
+            // old attempt dispatched. Recovery classifies that set and nothing
+            // wider.
+            match ConnectorHistoricalMaintenanceArtifact::try_new(
+                "cleanup-prepared-batch",
+                bytes::Bytes::from(checkpoint.prepared_handle.clone()),
+            ) {
+                Ok(artifact) => vec![artifact],
+                Err(error) => {
+                    return Ok(Some(format!(
+                        "{exact_failure}; build cleanup recovery artifact failed: {error}"
+                    )));
+                }
             },
             attempt.attempt_id(),
         ) {
@@ -2093,6 +2113,26 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
     }
 }
 
+/// Load the durable metadata-maintenance plan as a provider artifact.
+fn metadata_plan_artifact(
+    service: &FrontendTableMaintenanceService,
+    repository: &Arc<MetadataMaintenanceOperationRepository>,
+    operation_id: uuid::Uuid,
+) -> Result<Vec<ConnectorHistoricalMaintenanceArtifact>, String> {
+    let Some(stored) = service
+        .block_on(repository.load_plan(operation_id))
+        .map_err(|error| format!("load metadata maintenance recovery plan failed: {error}"))?
+    else {
+        return Ok(Vec::new());
+    };
+    let artifact = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "metadata-maintenance-plan",
+        bytes::Bytes::from(stored.payload),
+    )
+    .map_err(|error| format!("build metadata maintenance recovery artifact failed: {error}"))?;
+    Ok(vec![artifact])
+}
+
 /// Build the neutral descriptor that names one historical operation.
 ///
 /// The old owner is recorded as the binding that did the work; it is evidence,
@@ -2107,6 +2147,7 @@ fn historical_descriptor(
     plan_digest: Option<[u8; 32]>,
     base_state_digest: Option<[u8; 32]>,
     dispatch: ConnectorHistoricalDispatchFacts,
+    artifacts: Vec<ConnectorHistoricalMaintenanceArtifact>,
     recovery_attempt: uuid::Uuid,
 ) -> Result<ConnectorHistoricalMaintenanceDescriptor, String> {
     let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
@@ -2130,7 +2171,7 @@ fn historical_descriptor(
         request_digest,
         plan_digest,
         base_state_digest,
-        Vec::new(),
+        artifacts,
         dispatch,
         *recovery_attempt.as_bytes(),
     )
