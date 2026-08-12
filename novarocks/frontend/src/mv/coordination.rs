@@ -112,7 +112,9 @@ impl MvRefreshCoordination {
             .await
         {
             Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                self.manager.recover_acquire(key, attempt, operation_id).await
+                self.manager
+                    .recover_acquire(key, attempt, operation_id)
+                    .await
             }
             result => result,
         }

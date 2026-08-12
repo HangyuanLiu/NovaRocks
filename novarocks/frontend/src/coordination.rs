@@ -117,6 +117,7 @@ impl CurrentLeaseFence {
         Ok(())
     }
 
+    #[allow(dead_code)] // Consumed by the refresh worker's renewal loop (CP-5B T3).
     pub(crate) fn fence(&self) -> Result<LeaseFence, String> {
         self.fence
             .read()

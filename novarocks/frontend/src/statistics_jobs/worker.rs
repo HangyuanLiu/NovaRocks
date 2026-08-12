@@ -822,4 +822,3 @@ impl StatisticsAnalyzeWorkerCoordination {
         })
     }
 }
-
