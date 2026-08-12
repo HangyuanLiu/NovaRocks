@@ -42,11 +42,6 @@ const SMALL_FILE_RATIO_DENOMINATOR: i64 = 4;
 const FAILURE_BACKOFF_BASE_MS: i64 = 60_000;
 const FAILURE_BACKOFF_MAX_MS: i64 = 1_800_000;
 
-const MAINTENANCE_ENABLED_PROPERTY: &str = "novarocks.maintenance.enabled";
-const EXPIRE_MAX_AGE_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
-const EXPIRE_MIN_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
-const TARGET_FILE_SIZE_PROPERTY: &str = "write.target-file-size-bytes";
-
 /// Existing `[standalone_server]` values projected into the frontend owner.
 /// `max_concurrent` is a real attempt limit: one admitted attempt includes a
 /// complete policy evaluation and all of its actions for one MV.
@@ -433,7 +428,7 @@ impl MaintenanceCoordinator {
         facts: &MvMaintenanceFacts,
         now_ms: i64,
     ) -> MaintenanceEvaluation {
-        let policy = TablePolicy::resolve(&self.config, &facts.properties);
+        let policy = TablePolicy::resolve(&self.config, facts);
         let state = self.runtime_entry(mv_id).clone();
         evaluate_facts(facts, &policy, &state, &self.config, now_ms)
     }
@@ -450,43 +445,24 @@ struct TablePolicy {
 }
 
 impl TablePolicy {
-    fn resolve(
-        config: &MaintenanceCoordinatorConfig,
-        properties: &BTreeMap<String, String>,
-    ) -> Self {
-        fn parse_or<T: std::str::FromStr>(
-            properties: &BTreeMap<String, String>,
-            key: &str,
-            default: T,
-        ) -> T {
-            properties
-                .get(key)
-                .and_then(|value| value.trim().parse().ok())
-                .unwrap_or(default)
-        }
+    /// Apply frontend-owned defaults and clamps on top of the typed policy
+    /// facts. An absent fact means the table declared nothing usable, so the
+    /// default applies; a declared fact is still clamped to a workable range.
+    fn resolve(config: &MaintenanceCoordinatorConfig, facts: &MvMaintenanceFacts) -> Self {
         Self {
-            enabled: properties
-                .get(MAINTENANCE_ENABLED_PROPERTY)
-                .map(|value| !value.trim().eq_ignore_ascii_case("false"))
-                .unwrap_or(true),
-            expire_max_age_ms: parse_or(
-                properties,
-                EXPIRE_MAX_AGE_PROPERTY,
-                DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS,
-            )
-            .max(1),
-            expire_min_keep: parse_or(
-                properties,
-                EXPIRE_MIN_KEEP_PROPERTY,
-                DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP,
-            )
-            .max(1),
-            target_file_size_bytes: parse_or(
-                properties,
-                TARGET_FILE_SIZE_PROPERTY,
-                DEFAULT_TARGET_FILE_SIZE_BYTES,
-            )
-            .max(1),
+            enabled: facts.maintenance_enabled.unwrap_or(true),
+            expire_max_age_ms: facts
+                .expire_max_snapshot_age_ms
+                .unwrap_or(DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS)
+                .max(1),
+            expire_min_keep: facts
+                .expire_min_snapshots_to_keep
+                .unwrap_or(DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP)
+                .max(1),
+            target_file_size_bytes: facts
+                .target_file_size_bytes
+                .unwrap_or(DEFAULT_TARGET_FILE_SIZE_BYTES)
+                .max(1),
             compaction_min_data_files: config.compaction_min_data_files,
             dv_min_delete_files: config.dv_min_delete_files,
         }
@@ -854,6 +830,159 @@ mod tests {
             NOW + 1,
         );
         assert!(report.is_noop());
+    }
+
+    #[test]
+    fn absent_typed_facts_fall_back_to_frontend_defaults() {
+        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &facts());
+        assert!(policy.enabled);
+        assert_eq!(policy.expire_max_age_ms, DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS);
+        assert_eq!(policy.expire_min_keep, DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP);
+        assert_eq!(
+            policy.target_file_size_bytes,
+            DEFAULT_TARGET_FILE_SIZE_BYTES
+        );
+    }
+
+    #[test]
+    fn declared_typed_facts_override_frontend_defaults() {
+        let mut current = facts();
+        current.maintenance_enabled = Some(true);
+        current.expire_max_snapshot_age_ms = Some(7_200_000);
+        current.expire_min_snapshots_to_keep = Some(5);
+        current.target_file_size_bytes = Some(64 * 1024 * 1024);
+        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &current);
+        assert!(policy.enabled);
+        assert_eq!(policy.expire_max_age_ms, 7_200_000);
+        assert_eq!(policy.expire_min_keep, 5);
+        assert_eq!(policy.target_file_size_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn non_positive_typed_facts_are_clamped_to_one() {
+        let mut zero = facts();
+        zero.expire_max_snapshot_age_ms = Some(0);
+        zero.expire_min_snapshots_to_keep = Some(0);
+        zero.target_file_size_bytes = Some(0);
+        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &zero);
+        assert_eq!(policy.expire_max_age_ms, 1);
+        assert_eq!(policy.expire_min_keep, 1);
+        assert_eq!(policy.target_file_size_bytes, 1);
+
+        let mut negative = facts();
+        negative.expire_max_snapshot_age_ms = Some(-1);
+        negative.target_file_size_bytes = Some(-1);
+        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &negative);
+        assert_eq!(policy.expire_max_age_ms, 1);
+        assert_eq!(policy.target_file_size_bytes, 1);
+    }
+
+    #[test]
+    fn disabled_typed_fact_skips_every_action() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = facts();
+        current.maintenance_enabled = Some(false);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().actions.is_empty());
+        for kind in [
+            MaintenanceActionKind::Expire,
+            MaintenanceActionKind::RewritePositionDeletes,
+            MaintenanceActionKind::Optimize,
+        ] {
+            assert!(
+                attempt
+                    .evaluation()
+                    .skips
+                    .contains(&(kind, MaintenanceSkipReason::Disabled)),
+                "missing Disabled skip for {kind:?}"
+            );
+        }
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn explicitly_enabled_typed_fact_evaluates_normally() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = facts();
+        current.maintenance_enabled = Some(true);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(
+            attempt
+                .evaluation()
+                .actions
+                .contains(&AutomaticMaintenanceAction::Optimize)
+        );
+        assert!(
+            !attempt
+                .evaluation()
+                .skips
+                .iter()
+                .any(|(_, reason)| *reason == MaintenanceSkipReason::Disabled)
+        );
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn declared_min_snapshots_to_keep_blocks_expire() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = facts();
+        current.expire_min_snapshots_to_keep = Some(5);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().skips.contains(&(
+            MaintenanceActionKind::Expire,
+            MaintenanceSkipReason::NothingToExpire,
+        )));
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn declared_target_file_size_drives_the_small_file_ratio() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        // The fixture's 1 MiB average file is "small" against the 512 MiB
+        // default, but not against a 1-byte declared target.
+        let mut current = facts();
+        current.target_file_size_bytes = Some(1);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().skips.contains(&(
+            MaintenanceActionKind::Optimize,
+            MaintenanceSkipReason::BelowThreshold,
+        )));
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn declared_expire_max_age_keeps_recent_snapshots() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = facts();
+        current.oldest_snapshot_timestamp_ms = Some(NOW - 1_000);
+        current.expire_max_snapshot_age_ms = Some(10_000);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().skips.contains(&(
+            MaintenanceActionKind::Expire,
+            MaintenanceSkipReason::NothingToExpire,
+        )));
+        coordinator.cancel_attempt(attempt);
+
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        current.expire_max_snapshot_age_ms = Some(100);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().actions.iter().any(|action| matches!(
+            action,
+            AutomaticMaintenanceAction::ExpireSnapshots { retain_last, .. } if *retain_last == 1
+        )));
+        coordinator.cancel_attempt(attempt);
     }
 
     #[test]

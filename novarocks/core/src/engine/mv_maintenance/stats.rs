@@ -16,8 +16,9 @@
 // under the License.
 
 //! Collects per-table maintenance facts from a single Iceberg metadata load:
-//! snapshot list, current-snapshot summary counters, table properties, refs,
-//! and the downstream-consumer floor that protects incremental MV lineage.
+//! snapshot list, current-snapshot summary counters, typed maintenance policy
+//! facts, refs, and the downstream-consumer floor that protects incremental MV
+//! lineage.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -40,7 +41,13 @@ pub(crate) struct TableMaintenanceStats {
     pub(crate) max_compactable_data_files: Option<u64>,
     pub(crate) total_files_size_bytes: Option<u64>,
     pub(crate) total_delete_files: Option<u64>,
-    pub(crate) properties: HashMap<String, String>,
+    /// Typed maintenance policy facts declared by the table. `None` means the
+    /// table declares no usable value for that key; defaults and clamping are
+    /// policy and belong to the frontend, never to this fact layer.
+    pub(crate) maintenance_enabled: Option<bool>,
+    pub(crate) expire_max_snapshot_age_ms: Option<i64>,
+    pub(crate) expire_min_snapshots_to_keep: Option<u32>,
+    pub(crate) target_file_size_bytes: Option<i64>,
     pub(crate) non_main_ref_count: usize,
     pub(crate) downstream_floor_ts_ms: Option<i64>,
     pub(crate) downstream_floor_unknown: bool,
@@ -53,6 +60,12 @@ const TOTAL_DELETE_FILES_KEY: &str = "total-delete-files";
 const TOTAL_FILES_SIZE_KEY: &str = "total-files-size";
 const MAIN_BRANCH: &str = "main";
 
+/// Table-property keys that carry maintenance policy facts.
+const MAINTENANCE_ENABLED_PROPERTY: &str = "novarocks.maintenance.enabled";
+const EXPIRE_MAX_AGE_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
+const EXPIRE_MIN_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
+const TARGET_FILE_SIZE_PROPERTY: &str = "write.target-file-size-bytes";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DownstreamFloor {
     pub(crate) floor_ts_ms: Option<i64>,
@@ -61,6 +74,24 @@ pub(crate) struct DownstreamFloor {
 
 pub(crate) fn summary_u64(props: &HashMap<String, String>, key: &str) -> Option<u64> {
     props.get(key).and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Read one typed maintenance policy fact. A missing key and a present but
+/// unparseable value are both reported as "no declared fact": this layer never
+/// substitutes a default and never clamps the declared range.
+pub(crate) fn property_parsed<T: std::str::FromStr>(
+    props: &HashMap<String, String>,
+    key: &str,
+) -> Option<T> {
+    props.get(key).and_then(|v| v.trim().parse::<T>().ok())
+}
+
+/// Read the maintenance on/off fact. Any declared value other than a
+/// case-insensitive `false` means enabled; a missing key declares nothing.
+pub(crate) fn property_enabled(props: &HashMap<String, String>, key: &str) -> Option<bool> {
+    props
+        .get(key)
+        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
 }
 
 /// Minimum consumed-snapshot timestamp across all MV definitions that read
@@ -155,6 +186,8 @@ pub(crate) fn collect_table_stats(
         .filter(|name| name.as_str() != MAIN_BRANCH)
         .count();
 
+    let properties = metadata.properties();
+
     Ok(TableMaintenanceStats {
         current_snapshot_id: metadata.current_snapshot_id(),
         snapshots,
@@ -162,7 +195,10 @@ pub(crate) fn collect_table_stats(
         max_compactable_data_files: Some(max_compactable_data_files),
         total_files_size_bytes: summary_u64(&summary, TOTAL_FILES_SIZE_KEY),
         total_delete_files: summary_u64(&summary, TOTAL_DELETE_FILES_KEY),
-        properties: metadata.properties().clone(),
+        maintenance_enabled: property_enabled(properties, MAINTENANCE_ENABLED_PROPERTY),
+        expire_max_snapshot_age_ms: property_parsed(properties, EXPIRE_MAX_AGE_PROPERTY),
+        expire_min_snapshots_to_keep: property_parsed(properties, EXPIRE_MIN_KEEP_PROPERTY),
+        target_file_size_bytes: property_parsed(properties, TARGET_FILE_SIZE_PROPERTY),
         non_main_ref_count,
         downstream_floor_ts_ms: floor.floor_ts_ms,
         downstream_floor_unknown: floor.unknown,
@@ -292,5 +328,76 @@ mod tests {
         assert_eq!(summary_u64(&props, "total-data-files"), Some(42));
         assert_eq!(summary_u64(&props, "bad"), None);
         assert_eq!(summary_u64(&props, "absent"), None);
+    }
+
+    #[test]
+    fn property_parsed_reports_only_declared_and_parseable_values() {
+        let mut props = HashMap::new();
+        props.insert(EXPIRE_MAX_AGE_PROPERTY.to_string(), " 3600000 ".to_string());
+        assert_eq!(
+            property_parsed::<i64>(&props, EXPIRE_MAX_AGE_PROPERTY),
+            Some(3_600_000)
+        );
+
+        // Missing key declares nothing.
+        assert_eq!(
+            property_parsed::<i64>(&props, TARGET_FILE_SIZE_PROPERTY),
+            None
+        );
+
+        // Whitespace-only and unparseable values declare nothing either; the
+        // frontend applies its own default for both.
+        props.insert(TARGET_FILE_SIZE_PROPERTY.to_string(), "   ".to_string());
+        assert_eq!(
+            property_parsed::<i64>(&props, TARGET_FILE_SIZE_PROPERTY),
+            None
+        );
+        props.insert(
+            TARGET_FILE_SIZE_PROPERTY.to_string(),
+            "not-a-number".to_string(),
+        );
+        assert_eq!(
+            property_parsed::<i64>(&props, TARGET_FILE_SIZE_PROPERTY),
+            None
+        );
+    }
+
+    #[test]
+    fn property_parsed_keeps_out_of_range_values_unclamped() {
+        let mut props = HashMap::new();
+        props.insert(EXPIRE_MAX_AGE_PROPERTY.to_string(), "-1".to_string());
+        props.insert(EXPIRE_MIN_KEEP_PROPERTY.to_string(), "-1".to_string());
+        // A negative i64 fact survives; clamping to >= 1 is frontend policy.
+        assert_eq!(
+            property_parsed::<i64>(&props, EXPIRE_MAX_AGE_PROPERTY),
+            Some(-1)
+        );
+        // A negative value simply does not parse as u32.
+        assert_eq!(
+            property_parsed::<u32>(&props, EXPIRE_MIN_KEEP_PROPERTY),
+            None
+        );
+    }
+
+    #[test]
+    fn property_enabled_treats_only_false_as_disabled() {
+        let mut props = HashMap::new();
+        assert_eq!(property_enabled(&props, MAINTENANCE_ENABLED_PROPERTY), None);
+        for (value, expected) in [
+            ("false", false),
+            ("FALSE", false),
+            (" false ", false),
+            ("true", true),
+            ("TRUE", true),
+            ("anything-else", true),
+            ("", true),
+        ] {
+            props.insert(MAINTENANCE_ENABLED_PROPERTY.to_string(), value.to_string());
+            assert_eq!(
+                property_enabled(&props, MAINTENANCE_ENABLED_PROPERTY),
+                Some(expected),
+                "value {value:?}"
+            );
+        }
     }
 }
