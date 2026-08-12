@@ -196,6 +196,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（active）
 - ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
 - ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（active）
+- ADR-0065 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
+- ADR-0066 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
 
 #### 历史
 
