@@ -193,3 +193,13 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 - ADR-0009 — 表维护为何由 frontend 拥有 application/lifecycle，并通过 core domain port 调用 connector truth（active）
 - ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（active）
 - ADR-0057 — MV 维护事实为何按「是否需要 provider runtime IO」切成观测口投影与 SPI capability 两条通道（active）
+
+### crate-boundary
+
+领域哲学：架构隔离由 crate 依赖图强制——一个 crate 不能命名它没有依赖的 crate，
+这条约束由编译器保证，不会因目录改名或模块搬迁而静默失效。当一条隔离约束只能靠扫描
+源码形状表达时，正确的反应是把边界物理化成 crate，而不是写扫描器：扫描器描述的是当前
+文件布局，crate 图描述的是依赖事实。迁移期的临时检查随迁移完成一并删除，不留作完成态
+永久 guard。
+
+- ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）

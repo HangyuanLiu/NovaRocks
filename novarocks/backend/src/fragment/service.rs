@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use novarocks::common::app_config;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::novarocks_logging::error;
 #[cfg(test)]

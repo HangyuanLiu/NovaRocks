@@ -11,8 +11,7 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeBinaryBuilder,
     StructArray,
 };
-use arrow::datatypes::DataType;
-use novarocks_types::value::variant::{VariantValue, is_variant_struct_data_type};
+use novarocks_types::value::variant::VariantValue;
 use parquet::variant::{VariantArray, unshred_variant};
 
 fn binary_value_at_any(array: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String> {

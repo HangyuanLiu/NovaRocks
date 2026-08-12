@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::novarocks_config::config as novarocks_app_config;
-use std::path::PathBuf;
 
 /// Debug and test switches are supplied by the process environment, not the
 /// application config.
