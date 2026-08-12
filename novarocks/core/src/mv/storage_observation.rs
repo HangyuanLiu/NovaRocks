@@ -22,7 +22,7 @@
 //! then receive only validated neutral values.  It is not a Connector SPI
 //! capability and must not expose concrete table handles or catalog entries.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
@@ -508,6 +508,179 @@ pub enum MvPublishedRefreshTechnique {
     MetadataOnly,
 }
 
+/// Maximum number of named refs carried by one refresh-target observation.
+///
+/// MV apply only ever consults `main` plus the refresh staging branches, so a
+/// table whose ref count exceeds this bound is reported as corrupt rather than
+/// silently truncated.
+const MAX_MV_REFRESH_TARGET_REFS: usize = 1_024;
+
+/// Exact refresh-time target facts consumed by the MV target apply path.
+///
+/// This is deliberately a distinct use case from `observe_schema_validation`:
+/// apply needs snapshot and ref identity, which contract validation does not,
+/// and does not need the per-field schema payload, which contract validation
+/// does. Keeping them separate stops either observation from growing into a
+/// general-purpose provider metadata dump.
+///
+/// Core owns MV watermark and staging-branch semantics, so snapshot and ref
+/// identity are legitimate neutral facts. Storage layout facts that only the
+/// physical writer needs — table location, sequence numbers, partition spec
+/// objects — are deliberately absent: they belong to the Provider's own write
+/// preparation, not to a Core-visible observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshTargetObservation {
+    table: ConnectorTableIdentity,
+    table_uuid: String,
+    schema_id: i32,
+    partition: MvPartitionContract,
+    current_snapshot_id: Option<i64>,
+    ref_snapshot_ids: BTreeMap<String, i64>,
+    field_ids: Vec<i32>,
+    main_ancestor_snapshot_ids: Vec<i64>,
+    current_snapshot_is_empty_bootstrap: bool,
+    snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
+}
+
+/// The MV refresh identity a target snapshot records.
+///
+/// The Provider decodes it from its own provenance encoding; Core only ever
+/// compares it against the identity in its own refresh ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvObservedRefreshMarker {
+    pub refresh_id: i64,
+    pub mv_id: i64,
+    pub token: String,
+}
+
+impl MvRefreshTargetObservation {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        table_uuid: String,
+        schema_id: i32,
+        partition: MvPartitionContract,
+        current_snapshot_id: Option<i64>,
+        ref_snapshot_ids: BTreeMap<String, i64>,
+        field_ids: Vec<i32>,
+        main_ancestor_snapshot_ids: Vec<i64>,
+        current_snapshot_is_empty_bootstrap: bool,
+        snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        validate_request_context(context)?;
+        validate_table_identity(&table, "MV refresh target")?;
+        require_non_empty(&table_uuid, "MV refresh target UUID")?;
+        if schema_id < 0 {
+            return corrupt("MV refresh target observation has a negative schema ID");
+        }
+        if ref_snapshot_ids.len() > MAX_MV_REFRESH_TARGET_REFS {
+            return corrupt(format!(
+                "MV refresh target observation carries {} refs, exceeding the {} bound",
+                ref_snapshot_ids.len(),
+                MAX_MV_REFRESH_TARGET_REFS
+            ));
+        }
+        for (name, snapshot_id) in &ref_snapshot_ids {
+            require_non_empty(name, "MV refresh target ref name")?;
+            if *snapshot_id < 0 {
+                return corrupt(format!(
+                    "MV refresh target ref `{name}` has a negative snapshot ID"
+                ));
+            }
+        }
+        if let Some(snapshot_id) = current_snapshot_id
+            && snapshot_id < 0
+        {
+            return corrupt("MV refresh target observation has a negative current snapshot ID");
+        }
+
+        for snapshot_id in main_ancestor_snapshot_ids.iter().copied() {
+            if snapshot_id < 0 {
+                return corrupt("MV refresh target lineage has a negative snapshot ID");
+            }
+        }
+        for (snapshot_id, marker) in &snapshot_markers {
+            if *snapshot_id < 0 {
+                return corrupt("MV refresh target marker has a negative snapshot ID");
+            }
+            require_non_empty(&marker.token, "MV refresh target marker token")?;
+        }
+
+        Ok(Self {
+            table,
+            table_uuid,
+            schema_id,
+            partition,
+            current_snapshot_id,
+            ref_snapshot_ids,
+            field_ids,
+            main_ancestor_snapshot_ids,
+            current_snapshot_is_empty_bootstrap,
+            snapshot_markers,
+        })
+    }
+
+    /// Target schema field IDs in schema order, positionally aligned with the
+    /// Arrow schema in the neutral metadata.
+    pub fn field_ids(&self) -> &[i32] {
+        &self.field_ids
+    }
+
+    /// Is the current snapshot the empty bootstrap snapshot CREATE MV
+    /// establishes before the first refresh publishes data?
+    pub const fn current_snapshot_is_empty_bootstrap(&self) -> bool {
+        self.current_snapshot_is_empty_bootstrap
+    }
+
+    /// `main`'s snapshot chain, newest first.
+    pub fn main_ancestor_snapshot_ids(&self) -> &[i64] {
+        &self.main_ancestor_snapshot_ids
+    }
+
+    /// Marker recorded by `snapshot_id`, if that snapshot carries one.
+    pub fn snapshot_marker(&self, snapshot_id: i64) -> Option<&MvObservedRefreshMarker> {
+        self.snapshot_markers.get(&snapshot_id)
+    }
+
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+
+    pub fn table_uuid(&self) -> &str {
+        &self.table_uuid
+    }
+
+    pub const fn schema_id(&self) -> i32 {
+        self.schema_id
+    }
+
+    pub const fn partition(&self) -> &MvPartitionContract {
+        &self.partition
+    }
+
+    pub const fn current_snapshot_id(&self) -> Option<i64> {
+        self.current_snapshot_id
+    }
+
+    /// Snapshot pinned by `ref_name`.
+    ///
+    /// `main` deliberately falls back to the current snapshot: a table whose
+    /// `main` ref has not been materialized still has a current snapshot, and
+    /// the MV apply path treats those as the same fact. Any other missing ref
+    /// is reported as absent rather than silently resolved to `main`.
+    pub fn snapshot_id_for_ref(&self, ref_name: &str) -> Option<i64> {
+        self.ref_snapshot_ids.get(ref_name).copied().or_else(|| {
+            (ref_name == "main")
+                .then_some(self.current_snapshot_id)
+                .flatten()
+        })
+    }
+
+    pub fn ref_snapshot_ids(&self) -> &BTreeMap<String, i64> {
+        &self.ref_snapshot_ids
+    }
+}
+
 /// Observation port implemented by a composition-injected storage inspector.
 ///
 /// The Core application loads metadata through the retained exact lease, then
@@ -535,6 +708,18 @@ pub trait MvStorageObservationPort: Send + Sync {
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<Option<MvLakePackageObservation>, ConnectorError>;
+
+    /// Observe the refresh-time facts of an MV target.
+    ///
+    /// Called on the same exact generation that loaded `metadata`, so the
+    /// returned snapshot and ref identity are consistent with the Arrow schema
+    /// and opaque handle the caller already holds.
+    fn observe_refresh_target(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvRefreshTargetObservation, ConnectorError>;
 }
 
 /// Fail-closed default used until the Server composition root installs the
@@ -576,6 +761,18 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "MV storage observation port is not installed",
+        ))
+    }
+
+    fn observe_refresh_target(
+        &self,
+        _exact_lease: &ConnectorControlPlanningLease,
+        _metadata: &ConnectorTableMetadata,
+        _context: ConnectorRequestContext,
+    ) -> Result<MvRefreshTargetObservation, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "MV refresh target observation port is not installed",
         ))
     }
 }
@@ -922,9 +1119,9 @@ mod tests {
     };
 
     use super::{
-        MvLakePackageObservation, MvLakePublication, MvObservedTargetField, MvPublishedBaseFact,
-        MvPublishedLakeFacts, MvPublishedRefreshTechnique, MvSchemaValidationObservation,
-        MvTargetCreationObservation,
+        BTreeMap, MvLakePackageObservation, MvLakePublication, MvObservedTargetField,
+        MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+        MvRefreshTargetObservation, MvSchemaValidationObservation, MvTargetCreationObservation,
     };
     use crate::mv::persistence::{
         descriptor::MvDescriptorV1,
@@ -1203,5 +1400,110 @@ mod tests {
             err.kind(),
             novarocks_spi::connector::ConnectorErrorKind::CorruptData
         );
+    }
+
+    fn partition() -> MvPartitionContract {
+        MvPartitionContract {
+            target_spec_id: 0,
+            fields: vec![],
+        }
+    }
+
+    fn refresh_target(
+        current_snapshot_id: Option<i64>,
+        refs: BTreeMap<String, i64>,
+    ) -> Result<MvRefreshTargetObservation, novarocks_spi::connector::ConnectorError> {
+        MvRefreshTargetObservation::try_new(
+            table(),
+            "uuid-1".to_string(),
+            3,
+            partition(),
+            current_snapshot_id,
+            refs,
+            Vec::new(),
+            Vec::new(),
+            false,
+            BTreeMap::new(),
+            &context(4096),
+        )
+    }
+
+    #[test]
+    fn refresh_target_observation_rejects_corrupt_identity_and_snapshot_facts() {
+        assert!(refresh_target(Some(7), BTreeMap::new()).is_ok());
+
+        let err = MvRefreshTargetObservation::try_new(
+            table(),
+            String::new(),
+            3,
+            partition(),
+            None,
+            BTreeMap::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            BTreeMap::new(),
+            &context(4096),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let err = MvRefreshTargetObservation::try_new(
+            table(),
+            "uuid-1".to_string(),
+            -1,
+            partition(),
+            None,
+            BTreeMap::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            BTreeMap::new(),
+            &context(4096),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let err = refresh_target(Some(-5), BTreeMap::new()).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let err =
+            refresh_target(Some(7), BTreeMap::from([("staging".to_string(), -1)])).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let err = refresh_target(Some(7), BTreeMap::from([(String::new(), 9)])).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn refresh_target_ref_lookup_falls_back_to_current_snapshot_only_for_main() {
+        let observed =
+            refresh_target(Some(7), BTreeMap::from([("mv_staging_42".to_string(), 11)])).unwrap();
+
+        // An explicit ref wins.
+        assert_eq!(observed.snapshot_id_for_ref("mv_staging_42"), Some(11));
+        // `main` is not materialized as a ref here, so it resolves to current.
+        assert_eq!(observed.snapshot_id_for_ref("main"), Some(7));
+        // Any other missing ref stays absent rather than silently becoming main.
+        assert_eq!(observed.snapshot_id_for_ref("mv_staging_99"), None);
+
+        // A table with no current snapshot reports `main` as absent too.
+        let empty = refresh_target(None, BTreeMap::new()).unwrap();
+        assert_eq!(empty.snapshot_id_for_ref("main"), None);
     }
 }

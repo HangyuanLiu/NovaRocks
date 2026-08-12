@@ -22,7 +22,6 @@ use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 use crate::mv::persistence::schema::{
     ExpressionKind, MvPartitionTransformContract, MvSchemaContract,
 };
-use novarocks_connector_iceberg::delta::{ChangePartitionFieldValue, ChangePartitionValue};
 
 pub(crate) fn map_connector_partition_to_mv_key(
     contract: &MvSchemaContract,
@@ -152,152 +151,6 @@ fn connector_transform_matches_contract(
     }
 }
 
-pub(crate) fn map_file_partition_to_mv_key(
-    contract: &MvSchemaContract,
-    file_spec_id: i32,
-    file_partition_values: &[ChangePartitionFieldValue],
-) -> Result<Option<MvPartitionKey>, String> {
-    let Some(partition) = &contract.target.partition else {
-        return Ok(None);
-    };
-
-    let mut mapped_fields = Vec::with_capacity(partition.fields.len());
-    for partition_field in &partition.fields {
-        let expected_transform_text = contract_transform_manifest_text(&partition_field.transform)
-            .ok_or_else(|| {
-                format!(
-                    "MV partition field {} uses unsupported transform {}",
-                    partition_field.partition_field_name,
-                    partition_transform_name(&partition_field.transform)
-                )
-            })?;
-
-        let output_index = contract
-            .target
-            .visible_columns
-            .iter()
-            .position(|column| column.target_field_id == partition_field.source_target_field_id)
-            .ok_or_else(|| {
-                format!(
-                    "MV partition field {} references missing target field {}",
-                    partition_field.partition_field_name, partition_field.source_target_field_id
-                )
-            })?;
-        let output_lineage = contract.output.columns.get(output_index).ok_or_else(|| {
-            format!(
-                "MV partition field {} requires row-evaluation fallback",
-                partition_field.partition_field_name
-            )
-        })?;
-
-        if output_lineage.expression.kind != ExpressionKind::Column
-            || output_lineage.expression.referenced_base_field_ids.len() != 1
-        {
-            return Err(format!(
-                "MV partition field {} requires row-evaluation fallback",
-                partition_field.partition_field_name
-            ));
-        }
-
-        let base_field_id = output_lineage.expression.referenced_base_field_ids[0];
-
-        let mut matched_by_id_count = 0;
-        let mut transform_mismatch: Option<&str> = None;
-        let file_partition_value = file_partition_values
-            .iter()
-            .find(|value| {
-                if value.source_field_id != base_field_id {
-                    return false;
-                }
-                matched_by_id_count += 1;
-                if value.transform.eq_ignore_ascii_case(&expected_transform_text) {
-                    true
-                } else {
-                    transform_mismatch = Some(value.transform.as_str());
-                    false
-                }
-            })
-            .ok_or_else(|| {
-                if matched_by_id_count == 0 {
-                    format!(
-                        "MV partition field {} cannot be proven from Iceberg file partition metadata for file spec {}",
-                        partition_field.partition_field_name, file_spec_id
-                    )
-                } else {
-                    format!(
-                        "MV partition field {} file metadata transform {} mismatches contract transform {}",
-                        partition_field.partition_field_name,
-                        transform_mismatch.unwrap_or("<unknown>"),
-                        expected_transform_text
-                    )
-                }
-            })?;
-
-        let value = match &file_partition_value.value {
-            ChangePartitionValue::Primitive(value) => MvPartitionValue::String(value.clone()),
-            ChangePartitionValue::Null => MvPartitionValue::Null,
-            ChangePartitionValue::Unsupported(reason) => {
-                return Err(format!(
-                    "MV partition field {} has unsupported partition value: {}",
-                    partition_field.partition_field_name, reason
-                ));
-            }
-        };
-        mapped_fields.push(MvPartitionKeyField::new(
-            partition_field.partition_field_name.clone(),
-            value,
-        ));
-    }
-
-    Ok(Some(MvPartitionKey::new(
-        partition.target_spec_id,
-        mapped_fields,
-    )))
-}
-
-/// Convert a single `ChangePartitionValue` to an `MvPartitionValue`,
-/// returning an error string describing the file context when the value is
-/// `Unsupported`. Used by callers that bypass `map_file_partition_to_mv_key` —
-/// notably the iceberg MV target locator, which derives the key field-by-field
-/// rather than through the schema contract.
-pub(crate) fn change_partition_value_to_mv_value(
-    file_path: &str,
-    value: &ChangePartitionValue,
-) -> Result<MvPartitionValue, String> {
-    match value {
-        ChangePartitionValue::Primitive(v) => Ok(MvPartitionValue::String(v.clone())),
-        ChangePartitionValue::Null => Ok(MvPartitionValue::Null),
-        ChangePartitionValue::Unsupported(reason) => Err(format!(
-            "iceberg file `{file_path}` has unsupported partition value: {reason}"
-        )),
-    }
-}
-
-/// Maps a contract transform to the manifest text produced by
-/// `novarocks_connector_iceberg::delta::change_partition_transform_name`,
-/// which uses `{:?}` (Rust Debug) on `novarocks_connector_iceberg::iceberg::spec::Transform` and lowercases
-/// the result. This gives `bucket(8)` / `truncate(16)` with round parens,
-/// NOT the `bucket[8]` form from Iceberg's `Display` impl. Returns `None` for
-/// `Void` — void partitions carry no useful pruning information.
-fn contract_transform_manifest_text(transform: &MvPartitionTransformContract) -> Option<String> {
-    match transform {
-        MvPartitionTransformContract::Identity => Some("identity".to_string()),
-        MvPartitionTransformContract::Year => Some("year".to_string()),
-        MvPartitionTransformContract::Month => Some("month".to_string()),
-        MvPartitionTransformContract::Day => Some("day".to_string()),
-        MvPartitionTransformContract::Hour => Some("hour".to_string()),
-        MvPartitionTransformContract::Bucket { num_buckets } => {
-            Some(format!("bucket({num_buckets})"))
-        }
-        MvPartitionTransformContract::Truncate { width } => Some(format!("truncate({width})")),
-        MvPartitionTransformContract::Void => None,
-    }
-}
-
-fn partition_transform_name(transform: &MvPartitionTransformContract) -> String {
-    contract_transform_manifest_text(transform).unwrap_or_else(|| "Void".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,17 +172,43 @@ mod tests {
         contract
     }
 
-    fn partition_value(
-        transform_text: &str,
-        value: ChangePartitionValue,
-    ) -> ChangePartitionFieldValue {
-        ChangePartitionFieldValue {
-            source_field_id: 1,
-            source_column: Some("id".to_string()),
-            field_name: "id".to_string(),
-            transform: transform_text.to_string(),
-            value,
-        }
+    /// Neutral observation fixture: the mapper matches the contract's base by
+    /// observed table UUID, and reads the source column names from its fields.
+    fn observation() -> crate::mv::storage_observation::MvSchemaValidationObservation {
+        crate::mv::storage_observation::MvSchemaValidationObservation::try_new_with_maximum_payload(
+            "base-uuid".to_string(),
+            0,
+            true,
+            true,
+            vec![crate::mv::storage_observation::MvObservedTargetField {
+                field_id: 1,
+                name: "id".to_string(),
+                type_signature: "int".to_string(),
+                nullable: false,
+            }],
+            crate::mv::storage_observation::MvSchemaValidationPartitionContract::new(7, Vec::new()),
+        )
+        .expect("observation fixture")
+    }
+
+    fn connector_partition(
+        transform: novarocks_spi::connector::ConnectorChangePartitionTransform,
+        value: novarocks_spi::connector::ConnectorChangePartitionValue,
+    ) -> novarocks_spi::connector::ConnectorChangePartition {
+        novarocks_spi::connector::ConnectorChangePartition::try_new(vec![
+            novarocks_spi::connector::ConnectorChangePartitionField::try_new(
+                "id", transform, value,
+            )
+            .expect("partition field fixture"),
+        ])
+        .expect("partition fixture")
+    }
+
+    fn map(
+        contract: &MvSchemaContract,
+        partition: &novarocks_spi::connector::ConnectorChangePartition,
+    ) -> Result<Option<MvPartitionKey>, String> {
+        map_connector_partition_to_mv_key(contract, &observation(), partition)
     }
 
     fn contract_with_identity_partition() -> MvSchemaContract {
@@ -392,26 +271,123 @@ mod tests {
         }
     }
 
+    use novarocks_spi::connector::{
+        ConnectorChangePartitionTransform as CT, ConnectorChangePartitionValue as CV,
+    };
+    use std::num::NonZeroU32;
+
+    fn key(value: &str) -> Option<MvPartitionKey> {
+        Some(MvPartitionKey::new(
+            7,
+            vec![MvPartitionKeyField::new(
+                "id".to_string(),
+                MvPartitionValue::String(value.to_string()),
+            )],
+        ))
+    }
+
     #[test]
     fn maps_identity_partition_value_to_mv_key() {
         let contract = contract_with_identity_partition();
-        let file_partition_values = vec![ChangePartitionFieldValue {
-            source_field_id: 1,
-            source_column: None,
-            field_name: "renamed_id".to_string(),
-            transform: "identity".to_string(),
-            value: ChangePartitionValue::Primitive("42".to_string()),
-        }];
+        let partition = connector_partition(CT::Identity, CV::String("42".into()));
 
-        let mapped = map_file_partition_to_mv_key(&contract, 5, &file_partition_values).unwrap();
+        assert_eq!(map(&contract, &partition).unwrap(), key("42"));
+    }
+
+    #[test]
+    fn maps_year_transform_to_mv_key() {
+        let contract = contract_with_partition(MvPartitionTransformContract::Year);
+        let partition = connector_partition(CT::Year, CV::String("2026".into()));
+
+        assert_eq!(map(&contract, &partition).unwrap(), key("2026"));
+    }
+
+    #[test]
+    fn maps_month_day_hour_transforms() {
+        for (contracted, connector, value) in [
+            (MvPartitionTransformContract::Month, CT::Month, "2026-08"),
+            (MvPartitionTransformContract::Day, CT::Day, "2026-08-12"),
+            (
+                MvPartitionTransformContract::Hour,
+                CT::Hour,
+                "2026-08-12-07",
+            ),
+        ] {
+            let contract = contract_with_partition(contracted);
+            let partition = connector_partition(connector, CV::String(value.into()));
+
+            assert_eq!(map(&contract, &partition).unwrap(), key(value));
+        }
+    }
+
+    #[test]
+    fn maps_bucket_transform_with_matching_arity() {
+        let contract =
+            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
+        let partition = connector_partition(
+            CT::Bucket {
+                buckets: NonZeroU32::new(8).expect("nonzero"),
+            },
+            CV::String("3".into()),
+        );
+
+        assert_eq!(map(&contract, &partition).unwrap(), key("3"));
+    }
+
+    #[test]
+    fn rejects_bucket_transform_arity_mismatch() {
+        let contract =
+            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
+        let partition = connector_partition(
+            CT::Bucket {
+                buckets: NonZeroU32::new(16).expect("nonzero"),
+            },
+            CV::String("3".into()),
+        );
+
+        let err = map(&contract, &partition).unwrap_err();
+        assert!(err.contains("transform"), "err={err}");
+    }
+
+    #[test]
+    fn maps_truncate_transform_with_matching_width() {
+        let contract = contract_with_partition(MvPartitionTransformContract::Truncate { width: 4 });
+        let partition = connector_partition(
+            CT::Truncate {
+                width: NonZeroU32::new(4).expect("nonzero"),
+            },
+            CV::String("abcd".into()),
+        );
+
+        assert_eq!(map(&contract, &partition).unwrap(), key("abcd"));
+    }
+
+    #[test]
+    fn rejects_truncate_transform_width_mismatch() {
+        let contract = contract_with_partition(MvPartitionTransformContract::Truncate { width: 4 });
+        let partition = connector_partition(
+            CT::Truncate {
+                width: NonZeroU32::new(16).expect("nonzero"),
+            },
+            CV::String("abcd".into()),
+        );
+
+        let err = map(&contract, &partition).unwrap_err();
+        assert!(err.contains("transform"), "err={err}");
+    }
+
+    #[test]
+    fn null_partition_value_renders_as_mv_null() {
+        let contract = contract_with_identity_partition();
+        let partition = connector_partition(CT::Identity, CV::Null);
 
         assert_eq!(
-            mapped,
+            map(&contract, &partition).unwrap(),
             Some(MvPartitionKey::new(
                 7,
                 vec![MvPartitionKeyField::new(
                     "id".to_string(),
-                    MvPartitionValue::String("42".to_string()),
+                    MvPartitionValue::Null,
                 )],
             ))
         );
@@ -421,184 +397,13 @@ mod tests {
     fn returns_none_for_unpartitioned_contract() {
         let mut contract = contract_with_identity_partition();
         contract.target.partition = None;
+        let partition = connector_partition(CT::Identity, CV::String("42".into()));
 
-        let mapped = map_file_partition_to_mv_key(&contract, 5, &[]).unwrap();
-
-        assert_eq!(mapped, None);
+        assert_eq!(map(&contract, &partition).unwrap(), None);
     }
 
-    #[test]
-    fn unsupported_partition_value_requires_unknown_mapping() {
-        let contract = contract_with_identity_partition();
-        let file_partition_values = vec![ChangePartitionFieldValue {
-            source_field_id: 1,
-            source_column: Some("id".to_string()),
-            field_name: "id".to_string(),
-            transform: "identity".to_string(),
-            value: ChangePartitionValue::Unsupported("binary partition value".to_string()),
-        }];
-
-        let err = map_file_partition_to_mv_key(&contract, 5, &file_partition_values).unwrap_err();
-
-        assert!(err.contains("unsupported partition value"));
-        assert!(err.contains("binary partition value"));
-    }
-
-    #[test]
-    fn maps_year_transform_to_mv_key() {
-        let contract = contract_with_partition(MvPartitionTransformContract::Year);
-        let mapped = map_file_partition_to_mv_key(
-            &contract,
-            7,
-            &[partition_value(
-                "year",
-                ChangePartitionValue::Primitive("55".to_string()),
-            )],
-        )
-        .unwrap();
-
-        assert_eq!(
-            mapped.unwrap().fields[0].value,
-            MvPartitionValue::String("55".to_string())
-        );
-    }
-
-    #[test]
-    fn maps_month_day_hour_transforms() {
-        for (contract_transform, manifest_text, value) in [
-            (MvPartitionTransformContract::Month, "month", "660"),
-            (MvPartitionTransformContract::Day, "day", "20000"),
-            (MvPartitionTransformContract::Hour, "hour", "480000"),
-        ] {
-            let contract = contract_with_partition(contract_transform.clone());
-            let mapped = map_file_partition_to_mv_key(
-                &contract,
-                7,
-                &[partition_value(
-                    manifest_text,
-                    ChangePartitionValue::Primitive(value.to_string()),
-                )],
-            )
-            .unwrap();
-            assert_eq!(
-                mapped.unwrap().fields[0].value,
-                MvPartitionValue::String(value.to_string()),
-                "transform {contract_transform:?} did not round-trip"
-            );
-        }
-    }
-
-    #[test]
-    fn maps_bucket_transform_with_matching_arity() {
-        let contract =
-            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
-        let mapped = map_file_partition_to_mv_key(
-            &contract,
-            7,
-            &[partition_value(
-                "bucket(8)",
-                ChangePartitionValue::Primitive("3".to_string()),
-            )],
-        )
-        .unwrap();
-        assert_eq!(
-            mapped.unwrap().fields[0].value,
-            MvPartitionValue::String("3".to_string())
-        );
-    }
-
-    #[test]
-    fn rejects_bucket_transform_arity_mismatch() {
-        let contract =
-            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
-        let err = map_file_partition_to_mv_key(
-            &contract,
-            7,
-            &[partition_value(
-                "bucket(16)",
-                ChangePartitionValue::Primitive("3".to_string()),
-            )],
-        )
-        .unwrap_err();
-        assert!(err.contains("file metadata transform"), "{err}");
-        assert!(err.contains("bucket(16)"), "{err}");
-        assert!(err.contains("bucket(8)"), "{err}");
-    }
-
-    #[test]
-    fn rejects_truncate_transform_width_mismatch() {
-        let contract =
-            contract_with_partition(MvPartitionTransformContract::Truncate { width: 16 });
-        let err = map_file_partition_to_mv_key(
-            &contract,
-            7,
-            &[partition_value(
-                "truncate(32)",
-                ChangePartitionValue::Primitive("ho".to_string()),
-            )],
-        )
-        .unwrap_err();
-        assert!(err.contains("file metadata transform"), "{err}");
-        assert!(err.contains("truncate(32)"), "{err}");
-        assert!(err.contains("truncate(16)"), "{err}");
-    }
-
-    #[test]
-    fn maps_truncate_transform_with_matching_width() {
-        let contract =
-            contract_with_partition(MvPartitionTransformContract::Truncate { width: 16 });
-        let mapped = map_file_partition_to_mv_key(
-            &contract,
-            7,
-            &[partition_value(
-                "truncate(16)",
-                ChangePartitionValue::Primitive("ho".to_string()),
-            )],
-        )
-        .unwrap();
-        assert_eq!(
-            mapped.unwrap().fields[0].value,
-            MvPartitionValue::String("ho".to_string())
-        );
-    }
-
-    #[test]
-    fn rejects_void_transform() {
-        let contract = contract_with_partition(MvPartitionTransformContract::Void);
-        let err = map_file_partition_to_mv_key(
-            &contract,
-            7,
-            &[partition_value("void", ChangePartitionValue::Null)],
-        )
-        .unwrap_err();
-        assert!(err.contains("Void"), "{err}");
-    }
-
-    #[test]
-    fn null_partition_value_renders_as_mv_null() {
-        let contract = contract_with_partition(MvPartitionTransformContract::Day);
-        let mapped = map_file_partition_to_mv_key(
-            &contract,
-            7,
-            &[partition_value("day", ChangePartitionValue::Null)],
-        )
-        .unwrap();
-        assert_eq!(mapped.unwrap().fields[0].value, MvPartitionValue::Null);
-    }
-
-    #[test]
-    fn change_partition_field_values_is_reachable_for_mv_partition_module() {
-        use novarocks_connector_iceberg::delta::change_partition_field_values;
-        // We do not need to drive Iceberg metadata in a unit test — just make
-        // sure the symbol is visible at the call site. If this fn ever becomes
-        // private again, this test will fail to compile.
-        let _fn_ptr: fn(
-            &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-            i32,
-            &novarocks_connector_iceberg::iceberg::spec::Struct,
-        ) -> Result<
-            Vec<novarocks_connector_iceberg::delta::ChangePartitionFieldValue>,
-            novarocks_connector_iceberg::delta::ChangeError,
-        > = change_partition_field_values;
-    }
+    // `rejects_void_transform` and `unsupported_partition_value_requires_unknown_mapping`
+    // are not ported: ConnectorChangePartitionTransform has no Void variant and
+    // ConnectorChangePartitionValue has no Unsupported variant, so both states
+    // are unrepresentable rather than rejected at runtime.
 }

@@ -18,6 +18,7 @@ use crate::mv::refresh::change_stream_write::{
     ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
     execute_and_collect_change_stream_write,
 };
+use crate::mv::refresh::contract::MvTargetWriteEffect;
 use crate::mv::refresh::join_first_refresh::{
     JoinFirstRefreshLogicalInput, JoinFirstRefreshLogicalPlan,
     build_join_first_refresh_logical_plan,
@@ -29,7 +30,6 @@ use crate::mv::refresh::projection_first_refresh::{
 use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use novarocks_catalog::identifier::TableIdentity;
-use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_execution::exec::chunk::Chunk;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,8 +162,9 @@ pub(crate) async fn write_repartition_chunk_payload(
     })
 }
 
-fn join_repartition_commit_kind() -> CommitOpKind {
-    CommitOpKind::Overwrite
+fn join_repartition_write_effect() -> MvTargetWriteEffect {
+    // A join repartition rewrites the whole target ref in its new layout.
+    MvTargetWriteEffect::Overwrite
 }
 
 fn execute_prepared_join_repartition_write<T, F>(
@@ -180,7 +181,7 @@ where
         table,
         ident,
         target_ref,
-        join_repartition_commit_kind(),
+        join_repartition_write_effect(),
         || execute(logical),
     )
 }
@@ -525,8 +526,8 @@ mod tests {
         };
 
         assert_eq!(
-            join_repartition_commit_kind(),
-            novarocks_connector_iceberg::commit::CommitOpKind::Overwrite
+            join_repartition_write_effect(),
+            MvTargetWriteEffect::Overwrite
         );
         assert_eq!(calls.get(), 1);
         assert_eq!(

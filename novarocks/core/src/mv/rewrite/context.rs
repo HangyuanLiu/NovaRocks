@@ -27,8 +27,7 @@ use crate::sql::planner::vocabulary::ApplyKeySource;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
-use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
@@ -75,7 +74,15 @@ pub(crate) struct IcebergMvRewriteContext {
     // ---- Target table inputs (extracted from target_table.metadata()) ----
     pub target_snapshot_id: Option<i64>,
     pub target_table_uuid: String,
-    pub target_schema: Arc<Schema>,
+    /// Arrow schema of the MV target, in target field order.
+    ///
+    /// Before SPI-5I this held an Iceberg `spec::Schema` that Core converted to
+    /// Arrow at every use. The conversion is the Provider's job; Core only ever
+    /// needed the Arrow types plus the field IDs to line contract columns up
+    /// with schema positions, so it now carries exactly those two facts.
+    pub target_arrow_schema: SchemaRef,
+    /// Target field IDs, aligned positionally with `target_arrow_schema`.
+    pub target_field_ids: Arc<[i32]>,
 
     // ---- Contracts ----
     pub schema_contract: Arc<MvSchemaContract>,
@@ -123,7 +130,8 @@ impl IcebergMvRewriteContext {
         previous_table_uuids: BTreeMap<String, String>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
-        target_schema: Arc<Schema>,
+        target_arrow_schema: SchemaRef,
+        target_field_ids: Arc<[i32]>,
         schema_contract: Option<Arc<MvSchemaContract>>,
     ) -> Result<Self, String> {
         let target_fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
@@ -178,13 +186,7 @@ impl IcebergMvRewriteContext {
         // field id can coincide with a visible column (when the apply-key
         // aliases an existing user column) or be a distinct field (the
         // common case, e.g. `__nova_base_row_id` / `__row_id__`).
-        let schema_field_ids: BTreeSet<i32> = target_schema
-            .as_ref()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|f| f.id)
-            .collect();
+        let schema_field_ids: BTreeSet<i32> = target_field_ids.iter().copied().collect();
         let mut contract_field_ids: BTreeSet<i32> = schema_contract
             .target
             .visible_columns
@@ -208,12 +210,10 @@ impl IcebergMvRewriteContext {
         }
 
         let apply_key_name = &schema_contract.target.hidden_apply_key.column_name;
-        let apply_key_in_schema = target_schema
-            .as_ref()
-            .as_struct()
+        let apply_key_in_schema = target_arrow_schema
             .fields()
             .iter()
-            .any(|f| &f.name == apply_key_name);
+            .any(|field| field.name() == apply_key_name);
         if !apply_key_in_schema {
             return Err(err(format!(
                 "target apply-key column {apply_key_name} not present in target schema"
@@ -233,7 +233,8 @@ impl IcebergMvRewriteContext {
             previous_table_uuids,
             target_snapshot_id,
             target_table_uuid,
-            target_schema,
+            target_arrow_schema,
+            target_field_ids,
             schema_contract,
         })
     }
@@ -253,7 +254,8 @@ impl IcebergMvRewriteContext {
         pin: Arc<RefreshSnapshotPin>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
-        target_schema: Arc<Schema>,
+        target_arrow_schema: SchemaRef,
+        target_field_ids: Arc<[i32]>,
         schema_contract: Option<Arc<MvSchemaContract>>,
     ) -> Result<Self, String> {
         let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
@@ -271,7 +273,8 @@ impl IcebergMvRewriteContext {
             previous_table_uuids,
             target_snapshot_id,
             target_table_uuid,
-            target_schema,
+            target_arrow_schema,
+            target_field_ids,
             schema_contract,
         )
     }
@@ -338,17 +341,14 @@ impl IcebergMvRewriteContext {
             )
             .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
 
-        let arrow_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
-            self.target_schema.as_ref(),
-        )
-        .map_err(|e| format!("convert target iceberg schema to arrow schema: {e}"))?;
-        let iceberg_fields = self.target_schema.as_ref().as_struct().fields();
+        let arrow_schema = self.target_arrow_schema.as_ref();
+        let target_field_ids = self.target_field_ids.as_ref();
         let mut output_columns =
             Vec::with_capacity(self.schema_contract.target.visible_columns.len());
         for visible in &self.schema_contract.target.visible_columns {
-            let field_idx = iceberg_fields
+            let field_idx = target_field_ids
                 .iter()
-                .position(|field| field.id == visible.target_field_id)
+                .position(|field_id| *field_id == visible.target_field_id)
                 .ok_or_else(|| {
                     format!(
                         "target visible column {} field id {} is missing from target schema",
@@ -409,7 +409,7 @@ impl IcebergMvRewriteContext {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         );
-        let target_columns = sql_target_columns(self.target_schema.as_ref())?;
+        let target_columns = sql_target_columns(self.target_arrow_schema.as_ref());
         let aggregate_execution =
             if self.schema_contract.aggregate.is_some() {
                 let (calls, layout) = self.aggregate_shape_and_layout_for_execution().map_err(|e| {
@@ -487,112 +487,21 @@ impl IcebergMvRewriteContext {
 }
 
 fn sql_target_columns(
-    target_schema: &Schema,
-) -> Result<Arc<[novarocks_catalog::schema::ColumnDef]>, String> {
-    Ok(Arc::from(
+    target_schema: &arrow::datatypes::Schema,
+) -> Arc<[novarocks_catalog::schema::ColumnDef]> {
+    Arc::from(
         target_schema
-            .as_struct()
             .fields()
             .iter()
-            .map(|field| sql_target_column_from_field(field.as_ref()))
-            .collect::<Result<Vec<_>, String>>()?,
-    ))
-}
-
-fn sql_target_column_from_field(
-    field: &NestedField,
-) -> Result<novarocks_catalog::schema::ColumnDef, String> {
-    Ok(novarocks_catalog::schema::ColumnDef {
-        name: field.name.clone(),
-        data_type: sql_iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
-        nullable: !field.required,
-        write_default: None,
-        logical_type: None,
-    })
-}
-
-fn sql_iceberg_type_to_arrow(ty: &Type, column_name: &str) -> Result<DataType, String> {
-    Ok(match ty {
-        Type::Primitive(primitive) => sql_primitive_type_to_arrow(primitive, column_name)?,
-        Type::Struct(struct_ty) => {
-            let fields = struct_ty
-                .fields()
-                .iter()
-                .map(|field| {
-                    Ok(Arc::new(Field::new(
-                        field.name.clone(),
-                        sql_iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
-                        !field.required,
-                    )))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            DataType::Struct(fields.into())
-        }
-        Type::List(list_ty) => {
-            let element = list_ty.element_field.as_ref();
-            DataType::List(Arc::new(Field::new(
-                element.name.clone(),
-                sql_iceberg_type_to_arrow(element.field_type.as_ref(), &element.name)?,
-                !element.required,
-            )))
-        }
-        Type::Map(map_ty) => {
-            let key = map_ty.key_field.as_ref();
-            let value = map_ty.value_field.as_ref();
-            let entries = DataType::Struct(
-                vec![
-                    Arc::new(Field::new(
-                        key.name.clone(),
-                        sql_iceberg_type_to_arrow(key.field_type.as_ref(), &key.name)?,
-                        !key.required,
-                    )),
-                    Arc::new(Field::new(
-                        value.name.clone(),
-                        sql_iceberg_type_to_arrow(value.field_type.as_ref(), &value.name)?,
-                        !value.required,
-                    )),
-                ]
-                .into(),
-            );
-            DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
-        }
-    })
-}
-
-fn sql_primitive_type_to_arrow(
-    primitive: &PrimitiveType,
-    column_name: &str,
-) -> Result<DataType, String> {
-    Ok(match primitive {
-        PrimitiveType::Boolean => DataType::Boolean,
-        PrimitiveType::Int => DataType::Int32,
-        PrimitiveType::Long => DataType::Int64,
-        PrimitiveType::Float => DataType::Float32,
-        PrimitiveType::Double => DataType::Float64,
-        PrimitiveType::Decimal { precision, scale } => {
-            let precision = u8::try_from(*precision).map_err(|_| {
-                format!(
-                    "IMV target column {column_name} has out-of-range decimal precision {precision}"
-                )
-            })?;
-            let scale = i8::try_from(*scale).map_err(|_| {
-                format!("IMV target column {column_name} has out-of-range decimal scale {scale}")
-            })?;
-            DataType::Decimal128(precision, scale)
-        }
-        PrimitiveType::Date => DataType::Date32,
-        PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
-        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        PrimitiveType::String => DataType::Utf8,
-        PrimitiveType::Binary => DataType::Binary,
-        other => {
-            return Err(format!(
-                "IMV target column {column_name} has unsupported Iceberg type {other:?}"
-            ));
-        }
-    })
+            .map(|field| novarocks_catalog::schema::ColumnDef {
+                name: field.name().clone(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                write_default: None,
+                logical_type: None,
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContract, String> {
@@ -1016,7 +925,15 @@ pub(crate) mod tests_support {
         RefreshSnapshotPin::from_entries_for_tests(entries)
     }
 
-    pub(crate) fn make_target_schema() -> Arc<Schema> {
+    /// Iceberg-typed fixture used only where a test must build a real
+    /// `TableMetadata` for a fixture table. It is provider scaffolding, not a
+    /// rewrite-context input, and retires with the rest of the MV test
+    /// scaffolding in T20/T21.
+    pub(crate) fn make_target_iceberg_schema()
+    -> Arc<novarocks_connector_iceberg::iceberg::spec::Schema> {
+        use novarocks_connector_iceberg::iceberg::spec::{
+            NestedField, PrimitiveType, Schema, Type,
+        };
         Arc::new(
             Schema::builder()
                 .with_schema_id(7)
@@ -1034,6 +951,18 @@ pub(crate) mod tests_support {
                 ])
                 .build()
                 .expect("build schema"),
+        )
+    }
+
+    /// Neutral target-schema fixture: the Arrow types plus the positionally
+    /// aligned field IDs, exactly what the rewrite context consumes.
+    pub(crate) fn make_target_schema() -> (SchemaRef, Arc<[i32]>) {
+        (
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, true),
+            ])),
+            Arc::from(vec![100, 101]),
         )
     }
 
@@ -1171,7 +1100,7 @@ pub(crate) mod tests_support {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
         Arc::new(
@@ -1187,6 +1116,7 @@ pub(crate) mod tests_support {
                 Some(99),
                 "uuid-tgt".to_string(),
                 schema,
+                Arc::clone(&field_ids),
                 Some(contract),
             )
             .expect("dummy_rewrite_context: from_parts must succeed on canonical fixture"),
@@ -1239,29 +1169,12 @@ pub(crate) mod tests_support {
         });
         contract.aggregate = None;
         mv_def.schema_contract = Some(contract.clone());
-        let target_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        JOIN_APPLY_KEY_COLUMN_NAME,
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                ])
-                .build()
-                .expect("build join projection target schema"),
-        );
+        let target_schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new(JOIN_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false),
+        ]));
+        let target_field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999]);
         Arc::new(
             IcebergMvRewriteContext::from_definition_parts(
                 make_target(),
@@ -1280,6 +1193,7 @@ pub(crate) mod tests_support {
                 Some(99),
                 "uuid-tgt".to_string(),
                 target_schema,
+                Arc::clone(&target_field_ids),
                 Some(Arc::new(contract)),
             )
             .expect("join projection mv context must build"),
@@ -1344,7 +1258,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
         let ctx = IcebergMvRewriteContext::from_definition_parts(
@@ -1359,6 +1273,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema.clone(),
+            Arc::clone(&field_ids),
             Some(contract.clone()),
         )
         .expect("constructor should succeed on happy path");
@@ -1381,7 +1296,8 @@ mod tests {
         );
         assert_eq!(ctx.target_snapshot_id, Some(99));
         assert_eq!(ctx.target_table_uuid, "uuid-tgt");
-        assert!(Arc::ptr_eq(&ctx.target_schema, &schema));
+        assert!(Arc::ptr_eq(&ctx.target_arrow_schema, &schema));
+        assert_eq!(ctx.target_field_ids.as_ref(), field_ids.as_ref());
         assert!(Arc::ptr_eq(&ctx.schema_contract, &contract));
     }
 
@@ -1392,7 +1308,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
 
         let err_msg = IcebergMvRewriteContext::from_definition_parts(
             target,
@@ -1406,6 +1322,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             None,
         )
         .expect_err("missing schema contract must fail");
@@ -1422,7 +1339,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(Vec::<TableIdentity>::new());
         let pin = Arc::new(RefreshSnapshotPin::default());
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
         let err = IcebergMvRewriteContext::from_definition_parts(
@@ -1437,6 +1354,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect_err("empty base_refs must fail");
@@ -1451,7 +1369,7 @@ mod tests {
         let base_refs: Arc<[TableIdentity]> =
             Arc::from(vec![make_ref("ice", "db", "b"), make_ref("ice", "db", "c")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
         let err = IcebergMvRewriteContext::from_definition_parts(
@@ -1466,6 +1384,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect_err("pin coverage mismatch must fail");
@@ -1480,7 +1399,7 @@ mod tests {
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         // Pin has the right count but the entry is for a different fqn.
         let pin = Arc::new(make_pin(&[("ice.db.OTHER", 22, "uuid-x")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
         let err = IcebergMvRewriteContext::from_definition_parts(
@@ -1495,6 +1414,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect_err("missing pin uuid must fail");
@@ -1514,7 +1434,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-NEW")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
         let err = IcebergMvRewriteContext::from_definition_parts(
@@ -1529,6 +1449,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect_err("identity drift must fail");
@@ -1545,7 +1466,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
         let ctx = IcebergMvRewriteContext::from_definition_parts(
@@ -1560,6 +1481,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect("first refresh must succeed");
@@ -1574,7 +1496,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let mut contract = make_schema_contract();
         contract.target.visible_columns.pop();
         let contract = Arc::new(contract);
@@ -1591,6 +1513,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect_err("schema/contract mismatch must fail");
@@ -1607,7 +1530,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         // Contract has two columns (matching schema count) but one has a wrong
         // target_field_id (schema has 100/101; contract claims 100/999).
         let mut contract = make_schema_contract();
@@ -1626,6 +1549,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect_err("field-id set mismatch must fail even when counts match");
@@ -1650,7 +1574,7 @@ mod tests {
             ("ice.db.c", 50, "uuid-c"),
             ("ice.db.b", 20, "uuid-b"),
         ]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let mut def_for_three_bases = make_mv_definition();
         def_for_three_bases.last_refresh_snapshots.clear();
         def_for_three_bases
@@ -1681,6 +1605,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect("ctx happy path");
@@ -1721,7 +1646,7 @@ mod tests {
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
+        let (schema, field_ids) = make_target_schema();
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "nonexistent".to_string();
         let contract = Arc::new(contract);
@@ -1738,6 +1663,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect_err("apply-key absence must fail");
@@ -1755,29 +1681,12 @@ mod tests {
         // Three-field target schema: 100=k (visible), 101=v (visible),
         // 999=__nova_apply_key (hidden — present in schema but NOT in
         // visible_columns).
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__nova_apply_key",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("__nova_apply_key", DataType::Int64, false),
+        ]));
+        let field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999]);
 
         // Contract: visible columns are 100/101; hidden apply key is 999.
         let mut contract = make_schema_contract();
@@ -1797,6 +1706,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect("ctx must succeed when apply-key is a distinct hidden schema field");
@@ -1810,34 +1720,13 @@ mod tests {
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__nova_apply_key",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        4242,
-                        BRANCH_ID_COLUMN_NAME,
-                        Type::Primitive(PrimitiveType::Int),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("__nova_apply_key", DataType::Int64, false),
+            Field::new(BRANCH_ID_COLUMN_NAME, DataType::Int32, false),
+        ]));
+        let field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999, 4242]);
 
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__nova_apply_key".to_string();
@@ -1864,6 +1753,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect("ctx must accept branch id field in target schema");
@@ -1881,39 +1771,14 @@ mod tests {
         // apply key 999=__row_id__, and aggregate-state columns
         // 200=__agg_state_c, 201=__agg_state_s. All must be accepted by
         // from_parts.
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__row_id__",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                    Arc::new(NestedField::optional(
-                        200,
-                        "__agg_state_c",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        201,
-                        "__agg_state_s",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("__row_id__", DataType::Utf8, false),
+            Field::new("__agg_state_c", DataType::Int64, true),
+            Field::new("__agg_state_s", DataType::Int64, true),
+        ]));
+        let field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999, 200, 201]);
 
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
@@ -1953,6 +1818,7 @@ mod tests {
             Some(99),
             "uuid-tgt".to_string(),
             schema,
+            Arc::clone(&field_ids),
             Some(contract),
         )
         .expect("ctx must accept aggregate state columns in target schema");
@@ -1960,17 +1826,14 @@ mod tests {
 
     #[test]
     fn sqlx2_binary_target_column_remains_binary() {
-        let schema = Schema::builder()
-            .with_schema_id(7)
-            .with_fields(vec![Arc::new(NestedField::required(
-                200,
-                "__agg_state_v",
-                Type::Primitive(PrimitiveType::Binary),
-            ))])
-            .build()
-            .expect("build schema");
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "__agg_state_v",
+            DataType::Binary,
+            false,
+        )]));
+        let field_ids: Arc<[i32]> = Arc::from(vec![200]);
 
-        let columns = sql_target_columns(&schema).expect("project SQL target columns");
+        let columns = sql_target_columns(&schema);
 
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "__agg_state_v");

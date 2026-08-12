@@ -20,14 +20,16 @@ use crate::mv::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
 use crate::mv::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvObservedTargetField, MvPublishedBaseFact,
-    MvPublishedLakeFacts, MvPublishedRefreshTechnique, MvSchemaValidationObservation,
-    MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
-    MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
+    MvLakePackageObservation, MvLakePublication, MvObservedRefreshMarker, MvObservedTargetField,
+    MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
+    MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
+    MvStorageObservationPort, MvTargetCreationObservation,
 };
 use novarocks_connector_iceberg::storage_inspector::{
-    IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionTransform,
-    IcebergStorageRefreshTechnique, IcebergStorageTargetObservation,
+    IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionContract,
+    IcebergStoragePartitionTransform, IcebergStorageRefreshTechnique,
+    IcebergStorageTargetObservation,
 };
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
@@ -148,6 +150,60 @@ impl MvStorageObservationPort for TestIcebergMvStorageObservationAdapter {
         };
         MvLakePackageObservation::try_new(metadata.identity.clone(), descriptor, publication)
             .map(Some)
+    }
+
+    fn observe_refresh_target(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvRefreshTargetObservation, ConnectorError> {
+        let observed =
+            self.inspector
+                .observe_refresh_target(exact_lease, metadata, context.clone())?;
+        MvRefreshTargetObservation::try_new(
+            metadata.identity.clone(),
+            observed.table_uuid,
+            observed.schema_id,
+            refresh_partition_contract(&observed.partition),
+            observed.current_snapshot_id,
+            observed.ref_snapshot_ids,
+            observed.field_ids,
+            observed.main_ancestor_snapshot_ids,
+            observed.current_snapshot_is_empty_bootstrap,
+            observed
+                .snapshot_markers
+                .into_iter()
+                .map(|(snapshot_id, marker)| {
+                    (
+                        snapshot_id,
+                        MvObservedRefreshMarker {
+                            refresh_id: marker.refresh_id,
+                            mv_id: marker.mv_id,
+                            token: marker.token,
+                        },
+                    )
+                })
+                .collect(),
+            &context,
+        )
+    }
+}
+
+fn refresh_partition_contract(observed: &IcebergStoragePartitionContract) -> MvPartitionContract {
+    MvPartitionContract {
+        target_spec_id: observed.target_spec_id,
+        fields: observed
+            .fields
+            .iter()
+            .map(|field| MvPartitionFieldContract {
+                partition_field_id: field.partition_field_id,
+                partition_field_name: field.partition_field_name.clone(),
+                source_target_field_id: field.source_target_field_id,
+                source_column_name: field.source_column_name.clone(),
+                transform: created_partition_transform(field.transform.clone()),
+            })
+            .collect(),
     }
 }
 

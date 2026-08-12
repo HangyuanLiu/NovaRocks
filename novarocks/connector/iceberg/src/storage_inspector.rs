@@ -31,6 +31,7 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata,
 };
 
+use crate::commit::mv_refresh_ref::{MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP};
 use crate::commit::{MvProvenanceV1, RefreshTechnique};
 use crate::iceberg::spec::{FormatVersion, TableMetadata, Transform};
 use crate::scan_model::IcebergTableInfo;
@@ -40,6 +41,10 @@ const MV_DESCRIPTOR_HASH_PROP: &str = "novarocks.mv.descriptor.hash";
 const MV_DESCRIPTOR_INLINE_PROP: &str = "novarocks.mv.descriptor.inline";
 const MAX_TARGET_FIELDS: usize = 4_096;
 const MAX_PARTITION_FIELDS: usize = 4_096;
+const MAX_TARGET_REFS: usize = 1_024;
+const MAX_MAIN_ANCESTORS: usize = 100_000;
+const MV_BOOTSTRAP_PROP: &str = "novarocks.mv.bootstrap";
+const MV_BOOTSTRAP_OPERATION_ID_PROP: &str = "novarocks.bootstrap.empty.operation-id";
 const MAX_PROVENANCE_BASES: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +90,42 @@ pub enum IcebergStoragePartitionTransform {
     Bucket { num_buckets: u32 },
     Truncate { width: u32 },
     Void,
+}
+
+/// Refresh-time facts of an MV target.
+///
+/// Distinct from [`IcebergStorageTargetObservation`]: apply needs snapshot and
+/// ref identity but not the per-field schema payload. Storage layout facts the
+/// physical writer needs — location, sequence numbers, partition spec objects —
+/// stay inside this crate's write preparation and are deliberately absent here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageRefreshTargetObservation {
+    pub table_uuid: String,
+    pub schema_id: i32,
+    pub partition: IcebergStoragePartitionContract,
+    pub current_snapshot_id: Option<i64>,
+    pub ref_snapshot_ids: BTreeMap<String, i64>,
+    /// Target schema field IDs in schema order, positionally aligned with the
+    /// Arrow schema the neutral metadata carries.
+    pub field_ids: Vec<i32>,
+    /// `main`'s snapshot chain, newest first. MV reconciliation classifies a
+    /// staging snapshot by asking whether it is on this chain.
+    pub main_ancestor_snapshot_ids: Vec<i64>,
+    /// Is the current snapshot the empty bootstrap snapshot CREATE MV
+    /// establishes before any refresh publishes data?
+    pub current_snapshot_is_empty_bootstrap: bool,
+    /// MV refresh marker carried by the current snapshot and by each ref tip,
+    /// decoded from provider-private provenance. Snapshots without a marker are
+    /// absent rather than present-and-empty.
+    pub snapshot_markers: BTreeMap<i64, IcebergStorageRefreshMarker>,
+}
+
+/// The MV refresh identity a snapshot's provenance records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageRefreshMarker {
+    pub refresh_id: i64,
+    pub mv_id: i64,
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,6 +193,153 @@ impl IcebergStorageInspector {
         let table = decoded_table(exact_lease, metadata, &context)?;
         lake_package_observation(&table, &context)
     }
+
+    pub fn observe_refresh_target(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<IcebergStorageRefreshTargetObservation, ConnectorError> {
+        let table = decoded_table(exact_lease, metadata, &context)?;
+        refresh_target_observation(&table, &context)
+    }
+}
+
+fn refresh_target_observation(
+    table: &TableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageRefreshTargetObservation, ConnectorError> {
+    let schema = table.current_schema();
+    let spec = table.default_partition_spec();
+    if spec.fields().len() > MAX_PARTITION_FIELDS {
+        return Err(exhausted(
+            "Iceberg MV refresh target partition spec exceeds the inspection field limit",
+        ));
+    }
+    let mut budget = 0_usize;
+    let mut partition_fields = Vec::with_capacity(spec.fields().len());
+    for field in spec.fields() {
+        let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+            corrupt(format!(
+                "Iceberg MV refresh target partition field {} references missing target field ID {}",
+                field.name, field.source_id
+            ))
+        })?;
+        reserve(context, &mut budget, &field.name)?;
+        reserve(context, &mut budget, &source.name)?;
+        partition_fields.push(IcebergStoragePartitionField {
+            partition_field_id: field.field_id,
+            partition_field_name: field.name.clone(),
+            source_target_field_id: field.source_id,
+            source_column_name: source.name.clone(),
+            transform: partition_transform(&field.transform)?,
+        });
+    }
+
+    let refs = table.refs();
+    if refs.len() > MAX_TARGET_REFS {
+        return Err(exhausted(
+            "Iceberg MV refresh target exceeds the inspection ref limit",
+        ));
+    }
+    let mut ref_snapshot_ids = BTreeMap::new();
+    for (name, reference) in refs.iter() {
+        reserve(context, &mut budget, name)?;
+        ref_snapshot_ids.insert(name.clone(), reference.snapshot_id);
+    }
+
+    let current_snapshot_id = table
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id());
+
+    // `main`'s parent chain, newest first. Bounded so a pathological history
+    // cannot produce an unbounded observation.
+    let mut main_ancestor_snapshot_ids = Vec::new();
+    let mut cursor = current_snapshot_id;
+    while let Some(snapshot_id) = cursor {
+        if main_ancestor_snapshot_ids.len() >= MAX_MAIN_ANCESTORS {
+            return Err(exhausted(
+                "Iceberg MV refresh target snapshot history exceeds the inspection limit",
+            ));
+        }
+        main_ancestor_snapshot_ids.push(snapshot_id);
+        cursor = table
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+
+    // Markers for the snapshots MV reconciliation can reach: `main`'s current
+    // snapshot and every ref tip. Core compares these identities against its own
+    // ledger; it never parses the provider's provenance encoding.
+    let mut snapshot_markers = BTreeMap::new();
+    for snapshot_id in current_snapshot_id
+        .into_iter()
+        .chain(ref_snapshot_ids.values().copied())
+    {
+        if snapshot_markers.contains_key(&snapshot_id) {
+            continue;
+        }
+        let Some(snapshot) = table.snapshot_by_id(snapshot_id) else {
+            continue;
+        };
+        // The refresh marker is three discrete snapshot-summary properties, a
+        // different encoding from the MvProvenanceV1 blob that publication facts
+        // use. A staging snapshot carries the marker before it ever carries full
+        // provenance, so decoding the wrong one silently loses the match.
+        let props = &snapshot.summary().additional_properties;
+        let (Some(refresh_id), Some(mv_id), Some(token)) = (
+            props
+                .get(MV_REFRESH_ID_PROP)
+                .and_then(|value| value.parse::<i64>().ok()),
+            props
+                .get(MV_ID_PROP)
+                .and_then(|value| value.parse::<i64>().ok()),
+            props.get(MV_REFRESH_TOKEN_PROP),
+        ) else {
+            continue;
+        };
+        reserve(context, &mut budget, token)?;
+        snapshot_markers.insert(
+            snapshot_id,
+            IcebergStorageRefreshMarker {
+                refresh_id,
+                mv_id,
+                token: token.clone(),
+            },
+        );
+    }
+
+    let field_ids: Vec<i32> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+
+    let current_snapshot_is_empty_bootstrap = table.current_snapshot().is_some_and(|snapshot| {
+        let props = &snapshot.summary().additional_properties;
+        snapshot.parent_snapshot_id().is_none()
+            && props.get(MV_BOOTSTRAP_PROP).map(String::as_str) == Some("true")
+            && props.contains_key(MV_BOOTSTRAP_OPERATION_ID_PROP)
+    });
+
+    let table_uuid = table.uuid().to_string();
+    reserve(context, &mut budget, &table_uuid)?;
+    validate_context(context)?;
+    Ok(IcebergStorageRefreshTargetObservation {
+        table_uuid,
+        schema_id: table.current_schema_id(),
+        partition: IcebergStoragePartitionContract {
+            target_spec_id: spec.spec_id(),
+            fields: partition_fields,
+        },
+        current_snapshot_id,
+        ref_snapshot_ids,
+        field_ids,
+        main_ancestor_snapshot_ids,
+        current_snapshot_is_empty_bootstrap,
+        snapshot_markers,
+    })
 }
 
 fn target_observation(

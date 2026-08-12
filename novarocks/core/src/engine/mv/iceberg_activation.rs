@@ -28,9 +28,9 @@ use crate::mv::application::{
     MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
     MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite, PreparedMvRefreshWrite,
 };
+use crate::mv::refresh::contract::MvTargetWriteEffect;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
-use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_connector_iceberg::write_payload::IcebergFirstRefreshWritePlanPayloadV2;
 
 /// Core-side provider adapter installed into the frontend composition. It
@@ -166,9 +166,9 @@ pub(crate) fn activate_first_refresh_connector_write(
         &ident,
         prepared.staging_branch(),
         match prepared.write_mode() {
-            crate::mv::application::MvStagedRefreshWriteMode::Append => CommitOpKind::FastAppend,
+            crate::mv::application::MvStagedRefreshWriteMode::Append => MvTargetWriteEffect::Append,
             crate::mv::application::MvStagedRefreshWriteMode::FullOverwrite => {
-                CommitOpKind::Overwrite
+                MvTargetWriteEffect::Overwrite
             }
         },
     );

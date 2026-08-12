@@ -15,11 +15,11 @@ use crate::mv::refresh::change_stream_write::{
     ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
     execute_and_collect_change_stream_write,
 };
+use crate::mv::refresh::contract::MvTargetWriteEffect;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::logical::LogicalPlanNode;
-use novarocks_connector_iceberg::commit::CommitOpKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinIncrementalRefreshMode {
@@ -38,10 +38,10 @@ pub(crate) fn select_join_incremental_refresh_mode(
     }
 }
 
-fn commit_op_kind(mode: JoinIncrementalRefreshMode) -> CommitOpKind {
+fn write_effect(mode: JoinIncrementalRefreshMode) -> MvTargetWriteEffect {
     match mode {
-        JoinIncrementalRefreshMode::AppendOnly => CommitOpKind::FastAppend,
-        JoinIncrementalRefreshMode::Coalesce => CommitOpKind::RowDeltaDvFromFiles,
+        JoinIncrementalRefreshMode::AppendOnly => MvTargetWriteEffect::Append,
+        JoinIncrementalRefreshMode::Coalesce => MvTargetWriteEffect::DeltaRetractingStagedFiles,
     }
 }
 
@@ -141,7 +141,7 @@ pub(crate) fn execute_join_incremental_refresh_write<F>(
 where
     F: FnOnce(JoinIncrementalLogicalPlan) -> Result<ExecutedChangeStreamWrite, String>,
 {
-    execute_and_collect_change_stream_write(table, ident, target_ref, commit_op_kind(mode), || {
+    execute_and_collect_change_stream_write(table, ident, target_ref, write_effect(mode), || {
         execute(logical)
     })
 }
@@ -328,14 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn mode_owns_commit_kind() {
+    fn mode_owns_write_effect() {
         assert_eq!(
-            commit_op_kind(JoinIncrementalRefreshMode::AppendOnly),
-            CommitOpKind::FastAppend
+            write_effect(JoinIncrementalRefreshMode::AppendOnly),
+            MvTargetWriteEffect::Append
         );
         assert_eq!(
-            commit_op_kind(JoinIncrementalRefreshMode::Coalesce),
-            CommitOpKind::RowDeltaDvFromFiles
+            write_effect(JoinIncrementalRefreshMode::Coalesce),
+            MvTargetWriteEffect::DeltaRetractingStagedFiles
         );
     }
 

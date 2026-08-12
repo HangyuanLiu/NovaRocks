@@ -261,7 +261,19 @@ impl IcebergMvRefreshContext {
         pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
-        let target_schema = metadata.current_schema().clone();
+        // Provider-owned schema projection: Core consumes only the Arrow types
+        // and the positionally-aligned field IDs (SPI-5I).
+        let iceberg_schema = metadata.current_schema();
+        let target_arrow_schema = std::sync::Arc::new(
+            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+                .map_err(|error| format!("convert MV target schema to Arrow: {error}"))?,
+        );
+        let target_field_ids: Arc<[i32]> = iceberg_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.id)
+            .collect();
         let schema_contract = mv_definition.schema_contract.clone().map(Arc::new);
 
         let rewrite = IcebergMvRewriteContext::from_parts(
@@ -277,7 +289,8 @@ impl IcebergMvRefreshContext {
             previous_table_uuids,
             target_snapshot_id,
             target_table_uuid,
-            target_schema,
+            target_arrow_schema,
+            target_field_ids,
             schema_contract,
         )?;
         let base_catalog_entries = collect_base_catalog_entries(iceberg_catalogs, &base_refs)?;
@@ -708,6 +721,25 @@ fn data_file_with_stats_to_info(
 
 #[cfg(test)]
 pub(crate) mod tests_support {
+    /// Project an Iceberg fixture schema onto the neutral facts the rewrite
+    /// context consumes. Mirrors what the Server observation adapter does in
+    /// production.
+    pub(crate) fn neutral_target_schema(
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> (arrow::datatypes::SchemaRef, Arc<[i32]>) {
+        let arrow_schema = Arc::new(
+            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
+                .expect("convert fixture target schema to Arrow"),
+        );
+        let field_ids: Arc<[i32]> = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.id)
+            .collect();
+        (arrow_schema, field_ids)
+    }
+
     use std::sync::Arc;
 
     use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -826,6 +858,7 @@ pub(crate) mod tests_support {
     ) -> Arc<IcebergMvRewriteContext> {
         let metadata = target_table.metadata();
         let target_schema = metadata.current_schema().clone();
+        let (target_arrow_schema, target_field_ids) = neutral_target_schema(&target_schema);
         let mut contract = make_schema_contract();
         let k_id = target_field_id(target_schema.as_ref(), "k");
         let v_id = target_field_id(target_schema.as_ref(), "v");
@@ -852,7 +885,8 @@ pub(crate) mod tests_support {
                 pin,
                 target_snapshot_id,
                 metadata.uuid().to_string(),
-                target_schema,
+                target_arrow_schema,
+                Arc::clone(&target_field_ids),
                 Some(Arc::new(contract)),
             )
             .expect("target fixture rewrite context"),
@@ -981,6 +1015,7 @@ pub(crate) mod tests_support {
         .metadata;
         let target_uuid = metadata.uuid().to_string();
         let target_schema = metadata.current_schema().clone();
+        let (target_arrow_schema, target_field_ids) = neutral_target_schema(&target_schema);
         let target_schema_id = metadata.current_schema_id();
         let target_table = novarocks_connector_iceberg::iceberg::table::Table::builder()
             .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
@@ -1027,7 +1062,8 @@ pub(crate) mod tests_support {
                 Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
                 None,
                 target_uuid.clone(),
-                target_schema,
+                target_arrow_schema,
+                Arc::clone(&target_field_ids),
                 Some(Arc::new(contract)),
             )
             .expect("aggregate rewrite context"),
@@ -1211,6 +1247,7 @@ pub(crate) mod tests_support {
         .collect();
         let mut schema_contract = (*base.schema_contract).clone();
         let target_schema = loaded.table.metadata().current_schema().clone();
+        let (target_arrow_schema, target_field_ids) = neutral_target_schema(&target_schema);
         let target_uuid = loaded.table.metadata().uuid().to_string();
         schema_contract.target.table_uuid = target_uuid.clone();
         schema_contract.target.schema_id_at_create = loaded.table.metadata().current_schema_id();
@@ -1253,7 +1290,8 @@ pub(crate) mod tests_support {
                 Arc::new(pin),
                 Some(target_snapshot_id),
                 target_uuid,
-                target_schema,
+                target_arrow_schema,
+                Arc::clone(&target_field_ids),
                 Some(Arc::new(schema_contract)),
             )
             .expect("join projection refresh rewrite context"),
@@ -1349,8 +1387,8 @@ mod tests {
     use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::rewrite::context::tests_support::{
-        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target_schema,
-        parse_query,
+        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target_iceberg_schema,
+        make_target_schema, parse_query,
     };
 
     use super::tests_support::*;
@@ -1443,6 +1481,7 @@ mod tests {
         contract.target.table_uuid = target_metadata.uuid().to_string();
         contract.target.schema_id_at_create = target_metadata.current_schema_id();
         let target_schema = target_metadata.current_schema();
+        let (target_arrow_schema, target_field_ids) = neutral_target_schema(&target_schema);
         let field_id = |name: &str| {
             target_schema
                 .as_struct()
@@ -1608,7 +1647,7 @@ mod tests {
             crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&target_entry)
                 .expect("build hadoop catalog"),
         );
-        let schema = make_target_schema();
+        let schema = make_target_iceberg_schema();
         let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema.as_ref().clone(),
             novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec()

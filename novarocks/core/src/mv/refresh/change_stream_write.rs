@@ -13,8 +13,25 @@ use crate::connector::iceberg::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterRoutingError,
 };
 use crate::connector::iceberg::commit::IcebergCommitCollector;
+use crate::mv::refresh::contract::MvTargetWriteEffect;
 use crate::query_execution::write::WriteCommitInput;
 use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
+
+/// The single point in the MV lane that turns a logical write effect into
+/// Iceberg commit vocabulary.
+///
+/// Every MV refresh site now states its effect and stops here; SPI-5J moves
+/// this mapping out of Core together with the rest of the provider-specific MV
+/// write body. Concentrating it means a new refresh shape cannot quietly
+/// invent a fifth spelling of an existing effect.
+pub(crate) const fn iceberg_commit_op_kind(effect: MvTargetWriteEffect) -> CommitOpKind {
+    match effect {
+        MvTargetWriteEffect::Append => CommitOpKind::FastAppend,
+        MvTargetWriteEffect::Overwrite => CommitOpKind::Overwrite,
+        MvTargetWriteEffect::DeltaRetractingStagedFiles => CommitOpKind::RowDeltaDvFromFiles,
+        MvTargetWriteEffect::DeltaRetractingExplicitPositions => CommitOpKind::RowDeltaDv,
+    }
+}
 
 pub(crate) struct ExecutedChangeStreamWrite {
     pub(crate) write_commit: Option<WriteCommitInput>,
@@ -60,7 +77,7 @@ pub(crate) fn execute_and_collect_change_stream_write<F>(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
     execute: F,
 ) -> Result<PopulatedChangeStreamWrite, ChangeStreamWriteError>
 where
@@ -99,8 +116,9 @@ pub(crate) fn new_iceberg_mv_commit_collector(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
 ) -> Arc<IcebergCommitCollector> {
+    let op_kind = iceberg_commit_op_kind(effect);
     let metadata = table.metadata();
     let staging_dir = format!(
         "{}/data/_staging/{}",
@@ -220,7 +238,7 @@ mod tests {
             &table,
             &test_ident(),
             "main",
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
             || {
                 calls.set(calls.get() + 1);
                 Ok(executed_write(&table, Vec::new()))
@@ -240,7 +258,7 @@ mod tests {
             &table,
             &test_ident(),
             "main",
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
         );
         let outcome = CommitOutcome {
             new_snapshot_id: 42,
@@ -251,7 +269,7 @@ mod tests {
             &table,
             &test_ident(),
             "main",
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
             || {
                 Ok(ExecutedChangeStreamWrite {
                     write_commit: None,
@@ -278,7 +296,7 @@ mod tests {
             &table,
             &test_ident(),
             "main",
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
             || {
                 Ok(executed_write(
                     &table,
@@ -299,7 +317,7 @@ mod tests {
             &table,
             &test_ident(),
             "main",
-            CommitOpKind::RowDeltaDvFromFiles,
+            MvTargetWriteEffect::DeltaRetractingStagedFiles,
             || {
                 Ok(executed_write(
                     &table,
@@ -324,7 +342,7 @@ mod tests {
             &table,
             &test_ident(),
             "main",
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
             || {
                 calls.set(calls.get() + 1);
                 Err("writer failed".to_string())
@@ -346,7 +364,7 @@ mod tests {
             &table,
             &test_ident(),
             "main",
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
             || {
                 Ok(executed_write(
                     &table,

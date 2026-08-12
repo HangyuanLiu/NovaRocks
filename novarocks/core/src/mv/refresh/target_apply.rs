@@ -28,9 +28,7 @@ use crate::sql::planner::vocabulary::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 use novarocks_catalog::identifier::TableIdentity;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-};
+use novarocks_connector_iceberg::scan_model::{IcebergDataFileInfo, IcebergTableInfo};
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
@@ -297,7 +295,7 @@ impl IcebergMvTargetRuntimeBinding {
         .map(|files| {
             files
                 .into_iter()
-                .map(data_file_with_stats_to_info)
+                .map(novarocks_connector_iceberg::manifest::data_file_with_stats_to_iceberg_data_file_info)
                 .collect()
         })
     }
@@ -312,7 +310,9 @@ impl IcebergMvTargetRuntimeBinding {
             current_snapshot_id: metadata.current_snapshot_id(),
             schema_id: metadata.current_schema_id(),
             location: metadata.location().to_string(),
-            schema: iceberg_schema_def(metadata.current_schema()),
+            schema: novarocks_connector_iceberg::schema_facts::iceberg_schema_def(
+                metadata.current_schema(),
+            ),
             serialized_metadata: Some(
                 serde_json::to_string(metadata).map_err(|err| {
                     format!("serialize iceberg target table metadata failed: {err}")
@@ -502,89 +502,28 @@ fn validate_physical_field_identity(
     Ok(())
 }
 
-fn data_file_with_stats_to_info(
-    file: novarocks_connector_iceberg::manifest::DataFileWithStats,
-) -> IcebergDataFileInfo {
-    IcebergDataFileInfo {
-        path: file.path,
-        size: file.size,
-        row_count: file.record_count,
-        column_stats: file.column_stats,
-        partition_spec_id: file.partition_spec_id,
-        partition_key: file.partition_key,
-        first_row_id: file.first_row_id,
-        data_sequence_number: file.data_sequence_number,
-        ivm_change_op: None,
-        included_positions: None,
-        delete_files: file.delete_files,
-        manifest_path: file.manifest_path,
-        partition_values: file.partition_field_values,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::{apply_key_table_column, branch_id_table_column, join_apply_key_table_column};
 
-fn iceberg_schema_def(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
-) -> IcebergSchemaDef {
-    IcebergSchemaDef {
-        fields: schema
+    /// Project an Iceberg fixture schema onto the neutral facts the rewrite
+    /// context consumes. Mirrors what the Server observation adapter does in
+    /// production.
+    fn neutral_target_schema(
+        schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> (arrow::datatypes::SchemaRef, Arc<[i32]>) {
+        let arrow_schema = Arc::new(
+            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
+                .expect("convert fixture target schema to Arrow"),
+        );
+        let field_ids: Arc<[i32]> = schema
             .as_struct()
             .fields()
             .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
+            .map(|field| field.id)
+            .collect();
+        (arrow_schema, field_ids)
     }
-}
-
-fn iceberg_field_def(
-    field: &novarocks_connector_iceberg::iceberg::spec::NestedField,
-) -> IcebergSchemaFieldDef {
-    let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    let write_default_json = field.write_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    IcebergSchemaFieldDef {
-        field_id: field.id,
-        name: field.name.clone(),
-        initial_default: field.initial_default.clone(),
-        write_default: field.write_default.clone(),
-        initial_default_json,
-        write_default_json,
-        children: iceberg_type_children(field.field_type.as_ref()),
-    }
-}
-
-fn iceberg_type_children(
-    ty: &novarocks_connector_iceberg::iceberg::spec::Type,
-) -> Vec<IcebergSchemaFieldDef> {
-    match ty {
-        novarocks_connector_iceberg::iceberg::spec::Type::Struct(struct_ty) => struct_ty
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-        novarocks_connector_iceberg::iceberg::spec::Type::List(list_ty) => {
-            vec![iceberg_field_def(list_ty.element_field.as_ref())]
-        }
-        novarocks_connector_iceberg::iceberg::spec::Type::Map(map_ty) => vec![
-            iceberg_field_def(map_ty.key_field.as_ref()),
-            iceberg_field_def(map_ty.value_field.as_ref()),
-        ],
-        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(_) => vec![],
-    }
-}
-
-#[cfg(test)]
-mod tests {
     use std::sync::Arc;
 
     use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
@@ -799,6 +738,8 @@ mod tests {
             });
         }
         mutate_contract(&mut contract);
+        let (target_arrow_schema, target_field_ids) =
+            neutral_target_schema(metadata.current_schema());
 
         IcebergMvRewriteContext::from_definition_parts(
             make_target(),
@@ -811,7 +752,8 @@ mod tests {
             Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
             target_snapshot_id,
             metadata.uuid().to_string(),
-            metadata.current_schema().clone(),
+            target_arrow_schema,
+            target_field_ids,
             Some(Arc::new(contract)),
         )
         .expect("rewrite context")
@@ -1282,5 +1224,73 @@ mod tests {
             .validate_locator_scan(&scan)
             .expect_err("apply-key drift must fail");
         assert!(err.contains("apply-key column mismatch"), "got: {err}");
+    }
+
+    // Moved from engine/mv/iceberg_target_apply_oracle.rs (SPI-5I T21). These
+    // exercise production helpers in this module and never needed a real
+    // Iceberg table; they were only living in the oracle because the whole
+    // module was #[cfg(test)]-gated.
+    #[test]
+    fn apply_key_table_column_is_required_bigint() {
+        let column = apply_key_table_column();
+
+        assert_eq!(column.name, "__nova_base_row_id");
+        assert_eq!(column.data_type, novarocks_catalog::schema::SqlType::BigInt);
+        assert!(!column.nullable);
+        assert!(column.aggregation.is_none());
+        assert!(column.default.is_none());
+    }
+
+    #[test]
+    fn join_apply_key_table_column_is_required_string() {
+        let column = join_apply_key_table_column();
+
+        assert_eq!(column.name, "__nova_join_row_key");
+        assert_eq!(column.data_type, novarocks_catalog::schema::SqlType::String);
+        assert!(!column.nullable);
+        assert!(column.aggregation.is_none());
+        assert!(column.default.is_none());
+    }
+
+    #[test]
+    fn branch_id_table_column_is_required_int() {
+        let col = branch_id_table_column();
+        assert_eq!(col.name, BRANCH_ID_COLUMN_NAME);
+        assert_eq!(col.name, "__branch_id__");
+        assert!(!col.nullable);
+        assert!(matches!(
+            col.data_type,
+            novarocks_catalog::schema::SqlType::Int
+        ));
+    }
+
+    #[test]
+    fn iceberg_mv_physical_select_appends_base_row_id() {
+        let sql =
+            iceberg_mv_physical_select_sql("SELECT id, amount FROM ice.ns.orders WHERE amount > 0")
+                .expect("physical sql");
+
+        assert_eq!(
+            sql,
+            "SELECT id, amount, _row_id AS __nova_base_row_id FROM ice.ns.orders WHERE amount > 0"
+        );
+    }
+
+    #[test]
+    fn iceberg_mv_physical_select_rejects_star_projection() {
+        let err = iceberg_mv_physical_select_sql("SELECT * FROM ice.ns.orders")
+            .expect_err("star projection must fail");
+
+        assert!(err.contains("explicit projection columns"), "{err}");
+    }
+
+    #[test]
+    fn iceberg_mv_physical_select_rejects_visible_apply_key_collision() {
+        let err =
+            iceberg_mv_physical_select_sql("SELECT id AS __nova_base_row_id FROM ice.ns.orders")
+                .expect_err("reserved alias must fail");
+
+        assert!(err.contains("__nova_base_row_id"), "{err}");
+        assert!(err.contains("reserved"), "{err}");
     }
 }

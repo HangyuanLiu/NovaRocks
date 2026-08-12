@@ -117,7 +117,7 @@ use crate::mv::refresh::aggregate_first_refresh::{
 };
 use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
-use crate::mv::refresh::contract::ImvRefreshContract;
+use crate::mv::refresh::contract::{ImvRefreshContract, MvTargetWriteEffect};
 use crate::mv::refresh::execution::{
     RefreshExecutionObservation, ValidatedRefreshExecution, dispatch_refresh_decision,
     validate_refresh_execution,
@@ -181,8 +181,8 @@ use crate::sql::planner::vocabulary::{
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_connector_iceberg::commit::CommitOutcome;
 use novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files;
-use novarocks_connector_iceberg::commit::{CommitOpKind, CommitOutcome};
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
@@ -257,8 +257,8 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             .base_refs
             .iter()
             .map(|base| {
-                load_current_iceberg_base_table(self.state, base)
-                    .map(|loaded| (base.fqn(), loaded.table.metadata().uuid().to_string()))
+                observe_schema_validation_for_table(self.state, base, self.connector_context)
+                    .map(|observed| (base.fqn(), observed.table_uuid().to_string()))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let expected_target_snapshot_id = match &plan.contract.state_baseline {
@@ -379,23 +379,17 @@ fn prepare_frontend_first_refresh_write(
         "Iceberg MV first-refresh requires a persisted schema contract".to_string()
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
-    let target_schema = target_loaded.table.metadata().current_schema();
-    let target_arrow_schema =
-        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(target_schema)
-            .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
-    let target_field_ids = target_schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| field.id)
-        .collect::<Vec<_>>();
+    let target_binding = target_binding_for(state, &target, &connector_context)?;
+    let target_arrow_schema = target_binding.arrow_schema().as_ref().clone();
+    let target_field_ids = target_binding.observation().field_ids().to_vec();
+    let observed_spec_id = target_binding.partition().target_spec_id;
     let partition_spec_id = schema_contract
         .target
         .partition
         .as_ref()
         .map(|partition| partition.target_spec_id)
-        .unwrap_or_else(|| target_loaded.table.metadata().default_partition_spec_id());
-    if target_loaded.table.metadata().default_partition_spec_id() != partition_spec_id {
+        .unwrap_or(observed_spec_id);
+    if observed_spec_id != partition_spec_id {
         return Err(
             "MV first-refresh target partition spec drifted from its persisted contract"
                 .to_string(),
@@ -809,17 +803,14 @@ fn prepare_frontend_incremental_write(
                             base.fqn()
                         )
                     })?;
-                let loaded = load_current_iceberg_base_table(state, base)?;
-                Ok::<_, String>((
-                    base.clone(),
-                    snapshot_id,
-                    loaded.table.metadata().uuid().to_string(),
-                ))
+                let observed =
+                    observe_schema_validation_for_table(state, base, &connector_context)?;
+                Ok::<_, String>((base.clone(), snapshot_id, observed.table_uuid().to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    if target_loaded.table.metadata().uuid().to_string() != *target_table_uuid {
+    if target_binding_for(state, &target, &connector_context)?.table_uuid() != *target_table_uuid {
         return Err("MV incremental refresh target UUID drifted after planning".to_string());
     }
     let actual_target_snapshot_id = target_loaded
@@ -1058,8 +1049,8 @@ fn prepare_frontend_incremental_write(
                     base.fqn()
                 )
             })?;
-            let loaded = load_current_iceberg_base_table(state, base)?;
-            if loaded.table.metadata().uuid().to_string() != current_table_uuid {
+            let observed = observe_schema_validation_for_table(state, base, &connector_context)?;
+            if observed.table_uuid() != current_table_uuid {
                 return Err(format!(
                     "MV incremental refresh base table identity changed after planning for {}",
                     base.fqn()
@@ -1377,6 +1368,10 @@ struct IcebergMvCreatePreparation {
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )>,
+    base_field_observations: std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
     expected_apply_key_field_id: i32,
     created_at_ms: i64,
     columns: Vec<crate::sql::parser::ast::TableColumnDef>,
@@ -1697,6 +1692,7 @@ impl MvEngine for StandaloneMvEngine {
             &prepared.canonical_select_query,
             &prepared.analysis,
             &prepared.loaded_bases,
+            &prepared.base_field_observations,
             &prepared.target,
             &target_observation,
             actual_apply_key_field_id,
@@ -1713,12 +1709,21 @@ impl MvEngine for StandaloneMvEngine {
         _target: &CreatedMvTarget,
         definition: &StoredMvDefinition,
     ) -> Result<(), MvEngineError> {
+        // Reached from the MV engine trait, which carries no request context.
+        // Use the same bounded, non-cancellable context other context-free
+        // connector paths use.
+        let connector_context = crate::connector::connector_request_context(
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))?;
         sync_iceberg_mv_descriptor(
             &self.state,
             definition,
             &definition.refresh_policy,
             definition.refresh_paused,
             definition.refresh_interval_ms,
+            &connector_context,
         )
         .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
     }
@@ -2045,6 +2050,11 @@ fn prepare_iceberg_mv_create(
     })?;
     let property = derive_fragment_property(&analysis.resolved_query)?;
     let loaded_bases = load_all_bases_with_row_lineage(state, &resolved_dependencies.base_refs)?;
+    // Neutral base-schema facts, observed once through the exact-generation
+    // observation port. The contract builders consume these instead of reading
+    // provider metadata off `loaded_bases`.
+    let base_field_observations =
+        observe_base_fields_for_refs(state, &resolved_dependencies.base_refs, connector_context)?;
     if let Some(pk_cols) = stmt.primary_key.as_deref() {
         match &property.identity {
             TargetIdentity::BaseRowId => validate_ivm_primary_key(pk_cols, &descriptor_from_loaded(&loaded_bases[0].1)).map_err(|e| e.to_string())?,
@@ -2160,6 +2170,7 @@ fn prepare_iceberg_mv_create(
         base_refs: resolved_dependencies.base_refs,
         dependencies: resolved_dependencies.dependencies,
         loaded_bases,
+        base_field_observations,
         expected_apply_key_field_id,
         columns,
         partition_fields,
@@ -2272,314 +2283,6 @@ fn legacy_cleanup_created_target(
 ) -> String {
     let cleanup = engine.drop_created_target(target);
     format!("{primary}; target cleanup={cleanup:?}")
-}
-
-#[cfg(test)]
-fn create_iceberg_mv_legacy_inline(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &CreateMaterializedViewStmt,
-) -> Result<StatementResult, String> {
-    let connector_context = crate::connector::test_request_context();
-    crate::connector::validate_request_context(&connector_context)?;
-    if !state.mv_repository.availability().is_available() {
-        return Err("materialized view service requires [state_store]".to_string());
-    }
-    let target = resolve_iceberg_mv_target(state, current_catalog, current_database, stmt)?;
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&target.catalog)?
-    };
-    if iceberg_mv_target_exists(&entry, &target.namespace, &target.table)? {
-        return Err(format!(
-            "Iceberg MV target table {}.{}.{} already exists",
-            target.catalog, target.namespace, target.table
-        ));
-    }
-    // 1. Analyze and classify shape.
-    let canonical_select_query =
-        canonicalize_iceberg_mv_select_query(&stmt.select_query, current_catalog, current_database);
-    let analysis = analyze_mv_select_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        &canonical_select_query,
-        &connector_context,
-    )?;
-    let refresh_contract = derive_imv_refresh_contract(&analysis)?;
-    validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
-    let created_at_ms = now_ms();
-    let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
-        state,
-        &analysis.resolved_refs,
-        created_at_ms,
-    )?;
-    let dependency_target = crate::mv::dependency::model::iceberg_mv_dependency_ref(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    );
-    // Defensive: this check runs after the `iceberg_mv_target_exists` guard
-    // above, so user-facing CREATE statements can't reach it (a brand-new MV
-    // target has no inbound edges, while an already-existing target fails on
-    // existence first). Kept as a safety net for future paths that bypass the
-    // existence check — e.g. ALTER MATERIALIZED VIEW rewriting a SELECT, or
-    // racy metadata writes. Canonical cycle algorithm coverage lives in
-    // crate::mv::dependency::graph::tests.
-    crate::engine::mv::dependency::validate_no_create_cycle(
-        state,
-        &dependency_target,
-        &resolved_dependencies.dependencies,
-    )
-    .map_err(|e| {
-        format!(
-            "cannot create materialized view {}.{}.{}: {e}",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-    let base_refs = resolved_dependencies.base_refs;
-    let resolved_dependency_requests = resolved_dependencies.dependencies;
-    // Drive CREATE off the synthesized capability property + identity instead
-    // of the legacy flat shape classifier. The contract was already derived
-    // from this same property (`derive_imv_refresh_contract`), so a successful
-    // contract guarantees the property is one of the representable shapes; the
-    // identity selects target columns, gating, and the schema-contract build.
-    let property = derive_fragment_property(&analysis.resolved_query)?;
-    let loaded_bases = load_all_bases_with_row_lineage(state, &base_refs)?;
-
-    // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
-    // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
-    // unchanged. Reuses the same descriptor + validator as the StarRocks table
-    // lake-stored path in mv_ddl::create_mv. PRIMARY KEY is only supported on
-    // the projection/filter-over-single-scan shape (`BaseRowId` + stateless);
-    // every other identity is rejected, matching the legacy per-shape gating.
-    if let Some(pk_cols) = stmt.primary_key.as_deref() {
-        match &property.identity {
-            TargetIdentity::BaseRowId => {
-                let descriptor = descriptor_from_loaded(&loaded_bases[0].1);
-                validate_ivm_primary_key(pk_cols, &descriptor).map_err(|e| e.to_string())?;
-            }
-            TargetIdentity::JoinRowKey(_, _) => {
-                return Err(
-                    "iceberg-backed join materialized views do not support PRIMARY KEY in this phase"
-                        .to_string(),
-                );
-            }
-            TargetIdentity::BranchScoped(_) => {
-                return Err(
-                    "iceberg-backed UNION ALL materialized views do not support PRIMARY KEY in this phase"
-                        .to_string(),
-                );
-            }
-            TargetIdentity::GroupRowId(_) => {
-                return Err(
-                    "iceberg-backed aggregate materialized views do not support PRIMARY KEY"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    if matches!(stmt.partition_by.as_deref(), Some(fields) if !fields.is_empty())
-        && property.is_composed_aggregate_schema_contract_fallback()
-    {
-        return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
-    }
-
-    // 2. Create the empty Iceberg v3 target table in the current catalog.
-    let apply_key_column_name = refresh_contract.apply_key.column_name;
-    let apply_key_source_property = create_apply_key_source_property(&refresh_contract.apply_key);
-    if analysis
-        .output_columns
-        .iter()
-        .any(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
-    {
-        return Err(format!(
-            "Iceberg MV output column name {apply_key_column_name} is reserved for internal apply key"
-        ));
-    }
-    if identity_needs_branch_id_column(&property.identity)
-        && analysis
-            .output_columns
-            .iter()
-            .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
-    {
-        return Err(format!(
-            "Iceberg MV output column name {BRANCH_ID_COLUMN_NAME} is reserved for internal branch id"
-        ));
-    }
-    let mut columns =
-        create_target_columns_from_property(&property, &canonical_select_query, &analysis)?;
-    if identity_needs_physical_apply_key_column(&property.identity) {
-        columns.push(create_apply_key_table_column(&refresh_contract.apply_key)?);
-    }
-    if identity_needs_branch_id_column(&property.identity) {
-        columns.push(branch_id_table_column());
-    }
-    let expected_apply_key_field_id = columns
-        .iter()
-        .position(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
-        .and_then(|idx| i32::try_from(idx + 1).ok())
-        .ok_or_else(|| {
-            format!(
-                "Iceberg MV target columns are missing apply-key column {apply_key_column_name}"
-            )
-        })?;
-    let partition_fields = stmt.partition_by.as_deref().unwrap_or(&[]);
-    let aggregate_state_hidden_columns = aggregate_state_hidden_columns_from_property(
-        &property,
-        &canonical_select_query,
-        &analysis,
-    )?;
-    let mut descriptor_hidden_columns = Vec::new();
-    if identity_needs_physical_apply_key_column(&property.identity) {
-        descriptor_hidden_columns.push(apply_key_column_name.to_string());
-    }
-    if identity_needs_branch_id_column(&property.identity) {
-        descriptor_hidden_columns.push(BRANCH_ID_COLUMN_NAME.to_string());
-    }
-    descriptor_hidden_columns.extend(aggregate_state_hidden_columns.iter().cloned());
-    let descriptor = MvDescriptorV1 {
-        descriptor_version: MV_DESCRIPTOR_VERSION,
-        package_id: format!("{}.{}", target.namespace, target.table),
-        logical_sql: canonical_select_query.to_string(),
-        dialect: "starrocks".to_string(),
-        visible_columns: analysis
-            .output_columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect(),
-        hidden_columns: descriptor_hidden_columns,
-        base_dependencies: resolved_dependency_requests
-            .iter()
-            .map(descriptor_dependency_from_request)
-            .collect(),
-        schema_contract: None,
-        refresh_contract: Some(refresh_policy_descriptor_json(&stmt.refresh_policy, false)),
-        created_at_ms,
-    };
-    let mut target_properties = vec![
-        ("format-version".to_string(), "3".to_string()),
-        ("write.row-lineage".to_string(), "true".to_string()),
-        (
-            APPLY_KEY_COLUMN_PROPERTY.to_string(),
-            apply_key_column_name.to_string(),
-        ),
-        (
-            APPLY_KEY_SOURCE_PROPERTY.to_string(),
-            apply_key_source_property.to_string(),
-        ),
-        (
-            APPLY_KEY_FIELD_ID_PROPERTY.to_string(),
-            expected_apply_key_field_id.to_string(),
-        ),
-    ];
-    if !aggregate_state_hidden_columns.is_empty() {
-        target_properties.push((
-            HIDDEN_COLUMNS_PROPERTY.to_string(),
-            aggregate_state_hidden_columns.join(","),
-        ));
-    }
-    target_properties.extend(descriptor.to_storage_properties()?);
-    crate::connector::iceberg::catalog::registry::create_table(
-        &entry,
-        &target.namespace,
-        &target.table,
-        &columns,
-        None,
-        partition_fields,
-        &target_properties,
-    )?;
-    #[cfg(test)]
-    run_after_create_target_hook();
-    let post_create = (|| {
-        entry.invalidate_table_cache(&target.namespace, &target.table);
-        let target_loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )?;
-        let target_observation = target_observation_from_loaded_for_test(&target, &target_loaded)?;
-        let actual_apply_key_field_id =
-            target_field_id_by_column(&target_observation, apply_key_column_name)?;
-        if actual_apply_key_field_id != expected_apply_key_field_id {
-            return Err(format!(
-                "Iceberg MV target apply-key field id mismatch: expected {expected_apply_key_field_id}, got {actual_apply_key_field_id}"
-            ));
-        }
-
-        // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
-        let schema_contract = build_iceberg_mv_schema_contract(
-            &refresh_contract,
-            &property,
-            &canonical_select_query,
-            &analysis,
-            &loaded_bases,
-            &target,
-            &target_observation,
-            actual_apply_key_field_id,
-        )?;
-
-        // 4. Persist MV metadata in the repository.
-        let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
-        let _mv_definition = state
-            .mv_repository
-            .create(
-                uuid::Uuid::new_v4(),
-                crate::mv::repository::CreateMvRepositoryRequest {
-                    definition: CreateMvDefinitionRequest {
-                        select_sql: canonical_select_query.to_string(),
-                        base_table_refs: base_refs.iter().map(TableIdentity::fqn).collect(),
-                        primary_key_columns: primary_key_columns.clone(),
-                        storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
-                        target_catalog: Some(target.catalog.clone()),
-                        target_namespace: Some(target.namespace.clone()),
-                        target_table: Some(target.table.clone()),
-                        schema_contract: Some(schema_contract.clone()),
-                        partition_spec: schema_contract.target.partition.clone(),
-                        created_at_ms,
-                    },
-                    refresh: crate::engine::mv_flow::initial_refresh_configuration_for_create(
-                        &stmt.refresh_policy,
-                    ),
-                    dependencies: resolved_dependency_requests.clone(),
-                },
-            )
-            .map_err(|e| format!("create iceberg MV repository metadata failed: {e}"))?;
-        // W2: push the freshly-persisted schema contract into the MV target
-        // table descriptor. sync_iceberg_mv_descriptor_for_target reloads the
-        // definition
-        // from the metadata store (contract present) and rewrites the descriptor
-        // properties; the descriptor written by create_table above carried
-        // schema_contract=None because the contract needs the created table's
-        // field-ids, so this second property update is required.
-        sync_iceberg_mv_descriptor_for_target(state, &target)?;
-        Ok::<(), String>(())
-    })();
-    if let Err(err) = post_create {
-        return Err(cleanup_created_iceberg_mv_target_after_failure(
-            &entry, &target, err,
-        ));
-    }
-    register_iceberg_mv_target_in_catalog(state, &target)?;
-
-    Ok(StatementResult::Ok)
-}
-
-fn cleanup_created_iceberg_mv_target_after_failure(
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    target: &IcebergMvTarget,
-    err: String,
-) -> String {
-    let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
-        entry,
-        &target.namespace,
-        &target.table,
-    );
-    format!("{err}; target cleanup={drop_result:?}")
 }
 
 fn resolve_iceberg_mv_target(
@@ -3133,6 +2836,26 @@ fn first_union_branch_ast_query(
     Ok(branch)
 }
 
+/// Observe neutral schema fields for every base, keyed by table FQN.
+fn observe_base_fields_for_refs(
+    state: &Arc<StandaloneState>,
+    base_refs: &[TableIdentity],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
+    String,
+> {
+    let mut observed = std::collections::BTreeMap::new();
+    for base_ref in base_refs {
+        let observation = observe_schema_validation_for_table(state, base_ref, connector_context)?;
+        observed.insert(base_ref.fqn(), observation);
+    }
+    Ok(observed)
+}
+
 fn load_all_bases_with_row_lineage(
     state: &Arc<StandaloneState>,
     base_refs: &[TableIdentity],
@@ -3261,6 +2984,7 @@ pub(crate) fn sync_iceberg_mv_descriptor(
     refresh_policy: &StoredMvRefreshPolicy,
     refresh_paused: bool,
     refresh_interval_ms: Option<i64>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     if definition.storage_engine != MvStorageEngine::Iceberg.as_sql_str() {
         return Ok(());
@@ -3303,26 +3027,41 @@ pub(crate) fn sync_iceberg_mv_descriptor(
         descriptor.set_schema_contract(contract)?;
     }
     let descriptor_properties = descriptor.to_storage_properties()?;
-    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-    let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&loaded.table);
-    let mut action = tx.update_table_properties();
-    for (key, value) in descriptor_properties {
-        action = action.set(key, value);
-    }
-    let tx = action
-        .apply(tx)
-        .map_err(|e| format!("apply MV descriptor property update failed: {e}"))?;
-    crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-        tx.commit(catalog.as_ref()).await
-    })
-    .map_err(|e| format!("sync MV descriptor properties runtime failed: {e}"))?
-    .map_err(|e| format!("sync MV descriptor properties failed: {e}"))?;
+    // The MV descriptor lives in the target's engine-owned property namespace.
+    // Writing it is a catalog property mutation, not a reason for the MV path to
+    // open an Iceberg transaction of its own (SPI-5I F6).
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
+        .map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(namespace),
+                table: Arc::from(target_table_name),
+            },
+            changes: descriptor_properties
+                .into_iter()
+                .map(
+                    |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
+                        key: Arc::from(key.as_str()),
+                        value: Arc::from(value.as_str()),
+                    },
+                )
+                .collect(),
+            authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+        },
+        connector_context.clone(),
+    )
+    .map_err(|error| format!("sync MV descriptor properties failed: {error}"))?;
     entry.invalidate_table_cache(namespace, target_table_name);
     Ok(())
 }
 
 fn sync_iceberg_mv_descriptor_for_target(
     state: &Arc<StandaloneState>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
     let definition = load_iceberg_mv_definition_by_target(state, target)?;
@@ -3332,6 +3071,7 @@ fn sync_iceberg_mv_descriptor_for_target(
         &definition.refresh_policy,
         definition.refresh_paused,
         definition.refresh_interval_ms,
+        connector_context,
     )
 }
 
@@ -3487,6 +3227,10 @@ fn build_iceberg_mv_schema_contract(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
     target: &IcebergMvTarget,
     target_observation: &MvTargetCreationObservation,
     actual_apply_key_field_id: i32,
@@ -3510,6 +3254,7 @@ fn build_iceberg_mv_schema_contract(
             canonical_query,
             analysis,
             loaded_bases,
+            base_field_observations,
             target_observation,
             target_contract,
         )?,
@@ -3520,6 +3265,7 @@ fn build_iceberg_mv_schema_contract(
             &analysis.resolved_query,
             analysis,
             loaded_bases,
+            base_field_observations,
             target_observation,
             target_contract,
         )?,
@@ -3557,6 +3303,10 @@ fn build_non_branch_schema_contract(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
     target_observation: &MvTargetCreationObservation,
     target: mv_schema::TargetContract,
 ) -> Result<mv_schema::MvSchemaContract, String> {
@@ -3566,6 +3316,7 @@ fn build_non_branch_schema_contract(
         resolved_query,
         analysis,
         loaded_bases,
+        base_field_observations,
         target_observation,
     )?;
     let base = core.bases.first().cloned().ok_or_else(|| {
@@ -3603,6 +3354,10 @@ fn build_non_branch_contract_core(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<NonBranchContractCore, String> {
     match identity {
@@ -3616,14 +3371,14 @@ fn build_non_branch_contract_core(
             };
             let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
                 resolved_query,
-                &sql_mv_lineage_schema(loaded_base.table.metadata().current_schema()),
+                &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
             )?;
             let (base_fields, output) = persist_sql_mv_lineage(lineage);
             Ok(NonBranchContractCore {
                 contract_version: 1,
                 bases: vec![base_contract(
                     base_ref,
-                    loaded_base,
+                    observed_base(base_field_observations, base_ref)?,
                     None,
                     base_fields,
                 )],
@@ -3642,7 +3397,12 @@ fn build_non_branch_contract_core(
                     query,
                 )?;
             let (left_contract, right_contract, output, join) =
-                build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
+                build_join_base_contracts_and_lineage(
+                    &join_aliases,
+                    resolved_query,
+                    loaded_bases,
+                    base_field_observations,
+                )?;
             Ok(NonBranchContractCore {
                 contract_version: 2,
                 bases: vec![left_contract, right_contract],
@@ -3654,7 +3414,14 @@ fn build_non_branch_contract_core(
         // Aggregate group row, dispatched by what it sits over (legacy
         // SingleAggregate / JoinAggregate / FanInAggregate).
         TargetIdentity::GroupRowId(_) => {
-            build_aggregate_contract_core(query, resolved_query, analysis, loaded_bases, target_observation)
+            build_aggregate_contract_core(
+                query,
+                resolved_query,
+                analysis,
+                loaded_bases,
+                base_field_observations,
+                target_observation,
+            )
         }
         // `build_non_branch_contract_core` is only called for non-branch
         // identities (the branch top is handled separately).
@@ -3810,6 +3577,10 @@ fn build_aggregate_contract_core(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<NonBranchContractCore, String> {
     // Aggregate-call surface (group keys, aggregates, visible-output ordering)
@@ -3837,8 +3608,12 @@ fn build_aggregate_contract_core(
         let join_aliases =
             crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(query)?;
         // Aggregate over a two-table inner equi-join (legacy JoinAggregate).
-        let (left_contract, right_contract, output, join) =
-            build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
+        let (left_contract, right_contract, output, join) = build_join_base_contracts_and_lineage(
+            &join_aliases,
+            resolved_query,
+            loaded_bases,
+            base_field_observations,
+        )?;
         return Ok(NonBranchContractCore {
             contract_version: 3,
             bases: vec![left_contract, right_contract],
@@ -3869,14 +3644,17 @@ fn build_aggregate_contract_core(
         let bases = loaded_bases
             .iter()
             .map(|(base_ref, loaded_base)| {
-                base_contract(
+                Ok(base_contract(
                     base_ref,
-                    loaded_base,
+                    observed_base(base_field_observations, base_ref)?,
                     None,
-                    base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
-                )
+                    base_fields_from_observation(observed_base_fields(
+                        base_field_observations,
+                        base_ref,
+                    )?),
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(NonBranchContractCore {
             contract_version: 3,
             bases,
@@ -3905,14 +3683,17 @@ fn build_aggregate_contract_core(
         let bases = loaded_bases
             .iter()
             .map(|(base_ref, loaded_base)| {
-                base_contract(
+                Ok(base_contract(
                     base_ref,
-                    loaded_base,
+                    observed_base(base_field_observations, base_ref)?,
                     None,
-                    base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
-                )
+                    base_fields_from_observation(observed_base_fields(
+                        base_field_observations,
+                        base_ref,
+                    )?),
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(NonBranchContractCore {
             contract_version: 3,
             bases,
@@ -3929,12 +3710,17 @@ fn build_aggregate_contract_core(
         };
         let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
             resolved_query,
-            &sql_mv_lineage_schema(loaded_base.table.metadata().current_schema()),
+            &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
         )?;
         let (base_fields, output) = persist_sql_mv_lineage(lineage);
         Ok(NonBranchContractCore {
             contract_version: 3,
-            bases: vec![base_contract(base_ref, loaded_base, None, base_fields)],
+            bases: vec![base_contract(
+                base_ref,
+                observed_base(base_field_observations, base_ref)?,
+                None,
+                base_fields,
+            )],
             output,
             join: None,
             aggregate: Some(aggregate_contract(&layout, target_observation)?),
@@ -3953,6 +3739,10 @@ fn build_join_base_contracts_and_lineage(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
 ) -> Result<
     (
         mv_schema::BaseContract,
@@ -3966,8 +3756,10 @@ fn build_join_base_contracts_and_lineage(
         loaded_base_for_table_fqn(loaded_bases, &join_aliases.left_table)?;
     let (right_ref, right_loaded) =
         loaded_base_for_table_fqn(loaded_bases, &join_aliases.right_table)?;
-    let left_schema = sql_mv_lineage_schema(left_loaded.table.metadata().current_schema());
-    let right_schema = sql_mv_lineage_schema(right_loaded.table.metadata().current_schema());
+    let left_schema =
+        sql_mv_lineage_schema(observed_base_fields(base_field_observations, left_ref)?);
+    let right_schema =
+        sql_mv_lineage_schema(observed_base_fields(base_field_observations, right_ref)?);
     let left_fqn = left_ref.fqn();
     let right_fqn = right_ref.fqn();
     // The join predicate field-ids, output-column lineage, filter lineage, and
@@ -3994,13 +3786,13 @@ fn build_join_base_contracts_and_lineage(
         .unwrap_or_default();
     let left_contract = base_contract(
         left_ref,
-        left_loaded,
+        observed_base(base_field_observations, left_ref)?,
         Some(join_aliases.left_alias.clone()),
         persist_sql_mv_base_fields(left_fields),
     );
     let right_contract = base_contract(
         right_ref,
-        right_loaded,
+        observed_base(base_field_observations, right_ref)?,
         Some(join_aliases.right_alias.clone()),
         persist_sql_mv_base_fields(right_fields),
     );
@@ -4025,6 +3817,10 @@ fn build_branch_union_schema_contract(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
+    base_field_observations: &std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
     target_observation: &MvTargetCreationObservation,
     target: mv_schema::TargetContract,
 ) -> Result<mv_schema::MvSchemaContract, String> {
@@ -4036,14 +3832,17 @@ fn build_branch_union_schema_contract(
     let all_bases = loaded_bases
         .iter()
         .map(|(base_ref, loaded_base)| {
-            base_contract(
+            Ok(base_contract(
                 base_ref,
-                loaded_base,
+                observed_base(base_field_observations, base_ref)?,
                 None,
-                base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
-            )
+                base_fields_from_observation(observed_base_fields(
+                    base_field_observations,
+                    base_ref,
+                )?),
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     if all_bases.is_empty() {
         return Err("UNION ALL iceberg MV schema contract requires loaded bases".to_string());
     }
@@ -4066,10 +3865,12 @@ fn build_branch_union_schema_contract(
                 crate::mv::aggregate_state::aggregate_sql_calls::extract_single_scan_table_fqn(
                     &first_branch_ast,
                 )?;
-            let (_, first_loaded_base) =
+            let (first_base_ref, _) =
                 loaded_base_for_table_fqn(loaded_bases, &first_branch_base_table)?;
-            let first_schema = first_loaded_base.table.metadata().current_schema();
-            let first_schema = sql_mv_lineage_schema(first_schema);
+            let first_schema = sql_mv_lineage_schema(observed_base_fields(
+                base_field_observations,
+                first_base_ref,
+            )?);
             let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
                 &analysis.resolved_query,
                 &first_schema,
@@ -4122,6 +3923,7 @@ fn build_branch_union_schema_contract(
                 first_branch_resolved,
                 analysis,
                 &first_branch_loaded,
+                base_field_observations,
                 target_observation,
             )?;
             let bases = overlay_narrowed_bases(all_bases, core.bases);
@@ -4329,52 +4131,77 @@ fn loaded_base_for_table_fqn<'a>(
 
 fn base_contract(
     base_ref: &TableIdentity,
-    loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
+    observation: &crate::mv::storage_observation::MvSchemaValidationObservation,
     alias_at_create: Option<String>,
     fields: Vec<mv_schema::BaseFieldRecord>,
 ) -> mv_schema::BaseContract {
     mv_schema::BaseContract {
         table_fqn: base_ref.fqn(),
-        table_uuid: loaded_base.table.metadata().uuid().to_string(),
+        table_uuid: observation.table_uuid().to_string(),
         alias_at_create,
-        schema_id_at_create: loaded_base.table.metadata().current_schema_id(),
+        schema_id_at_create: observation.schema_id(),
         schema_at_create: mv_schema::BaseSchemaSnapshot { fields },
     }
 }
 
-fn base_fields_from_current_schema(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+fn base_fields_from_observation(
+    fields: &[crate::mv::storage_observation::MvObservedTargetField],
 ) -> Vec<mv_schema::BaseFieldRecord> {
-    schema
-        .as_struct()
-        .fields()
+    fields
         .iter()
         .map(|field| mv_schema::BaseFieldRecord {
-            field_id: field.id,
+            field_id: field.field_id,
             name_at_create: field.name.clone(),
-            type_signature: format!("{}", field.field_type),
-            required: field.required,
+            type_signature: field.type_signature.clone(),
+            required: !field.nullable,
         })
         .collect()
+}
+
+/// Neutral schema observation for `base_ref`.
+///
+/// Fails closed: a base the caller did not observe is a programming error, not
+/// a reason to fall back to reading provider metadata.
+fn observed_base<'a>(
+    base_field_observations: &'a std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
+    base_ref: &TableIdentity,
+) -> Result<&'a crate::mv::storage_observation::MvSchemaValidationObservation, String> {
+    base_field_observations.get(&base_ref.fqn()).ok_or_else(|| {
+        format!(
+            "MV base {} was not observed before contract build",
+            base_ref.fqn()
+        )
+    })
+}
+
+fn observed_base_fields<'a>(
+    base_field_observations: &'a std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
+    base_ref: &TableIdentity,
+) -> Result<&'a [crate::mv::storage_observation::MvObservedTargetField], String> {
+    Ok(observed_base(base_field_observations, base_ref)?.fields())
 }
 
 /// Project provider schema metadata into the SQL-owned lineage vocabulary at
 /// the application boundary. The SQL analyzer never retains the provider
 /// schema object or consults it after this conversion.
 fn sql_mv_lineage_schema(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    fields: &[crate::mv::storage_observation::MvObservedTargetField],
 ) -> crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
     crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
-        fields: schema
-            .as_struct()
-            .fields()
+        fields: fields
             .iter()
             .map(
                 |field| crate::sql::analyzer::mv_lineage::SqlMvLineageField {
-                    field_id: field.id,
+                    field_id: field.field_id,
                     name_at_create: field.name.clone(),
-                    type_signature: format!("{}", field.field_type),
-                    required: field.required,
+                    type_signature: field.type_signature.clone(),
+                    required: !field.nullable,
                 },
             )
             .collect(),
@@ -4519,7 +4346,7 @@ fn target_observation_from_loaded_for_test(
         metadata.uuid().to_string(),
         metadata.current_schema_id(),
         fields,
-        target_partition_contract_from_table(&loaded.table)?,
+        test_partition_contract_from_table(&loaded.table)?,
     )
     .map_err(|error| error.to_string())
 }
@@ -4579,7 +4406,14 @@ fn target_contract(
     })
 }
 
-fn target_partition_contract_from_table(
+/// Test-only projection of a live Iceberg partition spec onto the MV contract.
+///
+/// Production reads this from the neutral observation; the Provider owns the
+/// projection and rejects unknown transforms (spec D4). Fixtures that build a
+/// table by hand still need the same mapping, and it retires with the rest of
+/// the MV test scaffolding in T20/T21.
+#[cfg(test)]
+fn test_partition_contract_from_table(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<mv_schema::MvPartitionContract, String> {
     let metadata = table.metadata();
@@ -4607,6 +4441,7 @@ fn target_partition_contract_from_table(
     })
 }
 
+#[cfg(test)]
 fn mv_partition_transform_contract(
     transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
 ) -> Result<mv_schema::MvPartitionTransformContract, String> {
@@ -4784,6 +4619,15 @@ fn recover_one_iceberg_mv_refresh(
                 .ok_or_else(|| format!("mv refresh {} missing target table", refresh.refresh_id))?,
         };
     let (entry, catalog, loaded) = load_iceberg_mv_target(state, &target)?;
+    let binding = crate::mv::refresh::target_binding::load_mv_target_binding(
+        state,
+        &novarocks_catalog::identifier::TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        connector_context,
+    )?;
     reconcile_iceberg_mv_refresh(
         state,
         refresh,
@@ -4791,6 +4635,7 @@ fn recover_one_iceberg_mv_refresh(
         &entry,
         &catalog,
         &loaded.table,
+        &binding,
         connector_context,
     )
 }
@@ -4851,42 +4696,42 @@ fn iceberg_mv_table_ident(target: &IcebergMvTarget) -> Result<TableIdent, String
         .map_err(|e| format!("build mv iceberg ident failed: {e}"))
 }
 
+/// Resolve the MV target's neutral binding for a validation-only read.
+///
+/// Callers that already hold a binding should pass it through instead; this is
+/// for sites that still load the target the legacy way and only need facts.
+fn target_binding_for(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::mv::refresh::target_binding::MvTargetBinding, String> {
+    crate::mv::refresh::target_binding::load_mv_target_binding(
+        state,
+        &novarocks_catalog::identifier::TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        connector_context,
+    )
+}
+
 fn validate_target_snapshot(
     target: &IcebergMvTarget,
     mv_definition: &StoredMvDefinition,
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
 ) -> Result<(), String> {
-    let actual = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let actual = binding.current_snapshot_id();
     let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
-    if actual != expected && !(expected.is_none() && is_empty_target_bootstrap_snapshot(table)) {
+    if actual != expected
+        && !(expected.is_none() && binding.observation().current_snapshot_is_empty_bootstrap())
+    {
         return Err(format!(
             "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
             target.catalog, target.namespace, target.table, expected, actual
         ));
     }
     Ok(())
-}
-
-/// CREATE MV establishes this provider-owned initial snapshot before any MV
-/// definition is durable. It is a staging-branch base, not a completed MV
-/// refresh, so the definition deliberately continues to record no refreshed
-/// target snapshot until first refresh publishes data.
-fn is_empty_target_bootstrap_snapshot(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> bool {
-    table.metadata().current_snapshot().is_some_and(|snapshot| {
-        snapshot.parent_snapshot_id().is_none()
-            && snapshot
-                .summary()
-                .additional_properties
-                .get("novarocks.mv.bootstrap")
-                .map(String::as_str)
-                == Some("true")
-            && snapshot
-                .summary()
-                .additional_properties
-                .contains_key("novarocks.bootstrap.empty.operation-id")
-    })
 }
 
 fn recorded_target_snapshot_id(
@@ -5001,7 +4846,11 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
     })?;
 
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
+    validate_target_snapshot(
+        &target,
+        &mv_definition,
+        &target_binding_for(state, &target, connector_context)?,
+    )?;
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     validate_repartition_schema_contract(
         state,
@@ -5049,12 +4898,9 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
     let pin = capture_refresh_snapshot_pin(state, &base_refs)?;
     validate_repartition_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
-    let expected_main_snapshot_id = target_loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id());
-    let old_default_spec_id = target_loaded.table.metadata().default_partition_spec_id();
+    let pre_repartition = target_binding_for(state, &target, connector_context)?;
+    let expected_main_snapshot_id = pre_repartition.current_snapshot_id();
+    let old_default_spec_id = pre_repartition.partition().target_spec_id;
     let previous_partition_contract = mv_definition
         .partition_spec
         .as_ref()
@@ -5197,21 +5043,34 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
                 return Err(err);
             }
         };
-    let new_default_spec_id = updated_table.metadata().default_partition_spec_id();
-    let new_partition_contract = match target_partition_contract_from_table(&updated_table) {
-        Ok(contract) => contract,
-        Err(err) => {
-            return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
-                state,
-                refresh_id,
-                &target_entry,
-                &target,
-                new_default_spec_id,
-                old_default_spec_id,
-                err,
-            ));
-        }
-    };
+    // Re-observe after the partition-spec mutation: the new default spec and
+    // its contract are facts of the *updated* generation, not the one we
+    // planned against.
+    //
+    // Observation can still fail -- the Provider rejects an unknown partition
+    // transform rather than projecting it -- and that failure must keep
+    // restoring the old default spec, exactly as reading the contract off the
+    // updated table used to.
+    let (new_default_spec_id, new_partition_contract) =
+        match target_binding_for(state, &target, connector_context) {
+            Ok(post_repartition) => (
+                post_repartition.partition().target_spec_id,
+                post_repartition.partition().clone(),
+            ),
+            Err(err) => {
+                return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
+                    state,
+                    refresh_id,
+                    &target_entry,
+                    &target,
+                    // Tied to the CAS above, which still returns the updated
+                    // table; retires with that call (spec D6).
+                    updated_table.metadata().default_partition_spec_id(),
+                    old_default_spec_id,
+                    err,
+                ));
+            }
+        };
     let repartition_restore = RepartitionDefaultSpecRestore {
         new_default_spec_id,
         old_default_spec_id,
@@ -5292,7 +5151,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
             repartition_restore,
         );
         result.map_err(IcebergMvRefreshExecutionError::into_message)?;
-        sync_iceberg_mv_descriptor_for_target(state, &target)
+        sync_iceberg_mv_descriptor_for_target(state, connector_context, &target)
             .map_err(|e| format!("sync Iceberg MV descriptor after repartition failed: {e}"))?;
         register_iceberg_mv_target_in_catalog(state, &target)?;
         return Ok(StatementResult::Ok);
@@ -5327,7 +5186,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
         connector_context,
     );
     result.map_err(IcebergMvRefreshExecutionError::into_message)?;
-    sync_iceberg_mv_descriptor_for_target(state, &target)
+    sync_iceberg_mv_descriptor_for_target(state, connector_context, &target)
         .map_err(|e| format!("sync Iceberg MV descriptor after repartition failed: {e}"))?;
     register_iceberg_mv_target_in_catalog(state, &target)?;
     Ok(StatementResult::Ok)
@@ -5438,37 +5297,30 @@ fn refresh_iceberg_mv_with_planned_partitions(
     // W2: verify the lake descriptor carries the same schema contract the store
     // has — the descriptor is the authoritative home at refresh time.
     {
-        let entry = {
-            let catalogs = state
-                .iceberg_catalogs
-                .read()
-                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-            catalogs.get(&target.catalog)?
-        };
-        entry.invalidate_table_cache(&target.namespace, &target.table);
-        let loaded = crate::connector::iceberg::catalog::registry::load_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )?;
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
-        let descriptor_contract = descriptor.schema_contract_typed()?;
+        // The lake package carries both facts this check needs: the descriptor
+        // the target stores, and the publication provenance of its current
+        // snapshot. Neither is read off provider metadata here.
+        let package = observe_mv_lake_package(state, &target, connector_context)?.ok_or_else(|| {
+            format!(
+                "iceberg MV target {}.{}.{} carries no MV descriptor; rebuild or recreate the MV",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+        let descriptor_contract = package.descriptor.schema_contract_typed()?;
         crate::engine::mv::metadata_consistency::ensure_descriptor_schema_contract_matches(
             descriptor_contract.as_ref(),
             dispatch_schema_contract,
         )?;
         // W3a: verify the watermark recorded in the MV table's current
-        // snapshot provenance matches the store. First refresh (no current
-        // snapshot, or a snapshot without provenance) has no watermark yet —
-        // skip.
-        if let Some(current) = loaded.table.metadata().current_snapshot() {
-            if let Some(prov) = MvProvenanceV1::from_snapshot_summary(current)? {
-                crate::engine::mv::metadata_consistency::ensure_summary_watermark_matches_store(
-                    &prov.bases,
-                    &mv_definition.last_refresh_snapshots,
-                )?;
-            }
+        // snapshot provenance matches the store. First refresh (never
+        // published) has no watermark yet — skip.
+        if let crate::mv::storage_observation::MvLakePublication::Published(facts) =
+            &package.publication
+        {
+            crate::engine::mv::metadata_consistency::ensure_summary_watermark_matches_store(
+                &facts.bases,
+                &mv_definition.last_refresh_snapshots,
+            )?;
         }
     }
     let caps = RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?;
@@ -5859,6 +5711,35 @@ fn refresh_iceberg_mv_with_planned_partitions(
             )
         },
     )
+}
+
+/// Observe the MV lake package (descriptor + publication provenance) for a
+/// target through one exact generation.
+fn observe_mv_lake_package(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Option<crate::mv::storage_observation::MvLakePackageObservation>, String> {
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    state
+        .mv_storage_observation
+        .observe_lake_package(&exact_lease, &metadata, connector_context.clone())
+        .map_err(|error| {
+            format!(
+                "observe MV lake package for {}.{}.{}: {error}",
+                target.catalog, target.namespace, target.table
+            )
+        })
 }
 
 fn observe_schema_validation_for_table(
@@ -7456,15 +7337,15 @@ fn refresh_execution_definition_fingerprint(
 
 fn build_refresh_state_baseline(
     mv_definition: &StoredMvDefinition,
-    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    target: &crate::mv::refresh::target_binding::MvTargetBinding,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<RefreshStateBaseline, String> {
     Ok(RefreshStateBaseline::SnapshotBacked {
         previous_snapshot_ids: mv_definition.last_refresh_snapshots.clone(),
         previous_table_uuids: mv_definition.last_refresh_table_uuids.clone(),
-        target_snapshot_id: expected_main_snapshot_id_from_table(target_table),
-        target_table_uuid: target_table.metadata().uuid().to_string(),
+        target_snapshot_id: target.current_snapshot_id(),
+        target_table_uuid: target.table_uuid().to_string(),
         definition_fingerprint: refresh_execution_definition_fingerprint(
             mv_definition,
             current_catalog,
@@ -7520,8 +7401,13 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
         namespace: iceberg_target.namespace.clone(),
         table: iceberg_target.table.clone(),
     };
-    validate_target_snapshot(&iceberg_target, &mv_definition, &target_loaded.table)
-        .map_err(RefreshError::user)?;
+    validate_target_snapshot(
+        &iceberg_target,
+        &mv_definition,
+        &target_binding_for(state, &iceberg_target, connector_context)
+            .map_err(RefreshError::user)?,
+    )
+    .map_err(RefreshError::user)?;
 
     let base_refs =
         parse_iceberg_table_refs(&mv_definition.base_table_refs).map_err(RefreshError::user)?;
@@ -7536,7 +7422,8 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
     .map_err(RefreshError::user)?;
     let refresh_state_baseline = build_refresh_state_baseline(
         &mv_definition,
-        &target_loaded.table,
+        &target_binding_for(state, &iceberg_target, connector_context)
+            .map_err(RefreshError::user)?,
         current_catalog,
         current_database,
     )
@@ -7994,7 +7881,11 @@ fn plan_iceberg_union_projection_mv_refresh(
                         iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
                     ))
                 })?;
-                let current_uuid = loaded.table.metadata().uuid().to_string();
+                let current_uuid =
+                    observe_schema_validation_for_table(state, base_ref, connector_context)
+                        .map_err(RefreshError::user)?
+                        .table_uuid()
+                        .to_string();
                 if previous_uuid != &current_uuid {
                     return Err(RefreshError::user(format!(
                         "iceberg MV base table identity changed for {fqn}; incremental refresh is unsafe, rebuild or recreate the MV"
@@ -8036,7 +7927,8 @@ fn plan_iceberg_union_projection_mv_refresh(
     log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
     let state_baseline = build_refresh_state_baseline(
         mv_definition,
-        target_table,
+        &target_binding_for(state, iceberg_target, connector_context)
+            .map_err(RefreshError::user)?,
         current_catalog,
         current_database,
     )
@@ -8217,7 +8109,8 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         decision.refresh,
         build_refresh_state_baseline(
             mv_definition,
-            target_table,
+            &target_binding_for(state, iceberg_target, connector_context)
+                .map_err(RefreshError::user)?,
             current_catalog,
             current_database,
         )
@@ -8338,7 +8231,8 @@ fn plan_iceberg_aggregate_mv_refresh(
                 decision.refresh,
                 build_refresh_state_baseline(
                     mv_definition,
-                    target_table,
+                    &target_binding_for(state, iceberg_target, connector_context)
+                        .map_err(RefreshError::user)?,
                     current_catalog,
                     current_database,
                 )
@@ -8466,7 +8360,8 @@ fn plan_iceberg_aggregate_mv_refresh(
                 decision.refresh,
                 build_refresh_state_baseline(
                     mv_definition,
-                    target_table,
+                    &target_binding_for(state, iceberg_target, connector_context)
+                        .map_err(RefreshError::user)?,
                     current_catalog,
                     current_database,
                 )
@@ -9010,13 +8905,19 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
         .map_err(RefreshError::pre_commit)?;
     let (target_entry, iceberg_catalog, target_loaded) =
         load_iceberg_mv_target(state, &contract_target).map_err(RefreshError::pre_commit)?;
-    validate_target_snapshot(&contract_target, &mv_definition, &target_loaded.table)
-        .map_err(RefreshError::pre_commit)?;
+    validate_target_snapshot(
+        &contract_target,
+        &mv_definition,
+        &target_binding_for(state, &contract_target, connector_context)
+            .map_err(RefreshError::user)?,
+    )
+    .map_err(RefreshError::pre_commit)?;
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)
         .map_err(RefreshError::pre_commit)?;
     let observed_baseline = build_refresh_state_baseline(
         &mv_definition,
-        &target_loaded.table,
+        &target_binding_for(state, &contract_target, connector_context)
+            .map_err(RefreshError::pre_commit)?,
         plan.current_catalog.as_deref(),
         &plan.current_database,
     )
@@ -9525,7 +9426,11 @@ fn commit_unknown_error_from_refresh(
         message,
         RecoveryEvidence {
             table_ident,
-            op_kind: CommitOpKind::FastAppend,
+            // Recovery evidence describes an append-shaped MV refresh; state
+            // the effect and let the single mapping point spell it.
+            op_kind: crate::mv::refresh::change_stream_write::iceberg_commit_op_kind(
+                MvTargetWriteEffect::Append,
+            ),
             base_snapshot_id: refresh.expected_main_snapshot_id,
             base_sequence_number: 0,
             staging_dir: refresh.staging_branch.clone().unwrap_or_default(),
@@ -10015,20 +9920,6 @@ fn restore_repartition_default_spec_from_recovery_intent(
 /// [`crate::engine::mv::recovery::classify_staging_branch`]: the storage
 /// table's own parent chain is the source of truth for whether a staging
 /// snapshot was ever published, independent of any SQLite ledger state.
-fn main_ancestor_snapshot_ids(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> Vec<i64> {
-    let metadata = table.metadata();
-    let mut ancestors = Vec::new();
-    let mut cursor = metadata.current_snapshot().map(|s| s.snapshot_id());
-    while let Some(snapshot_id) = cursor {
-        ancestors.push(snapshot_id);
-        cursor = metadata
-            .snapshot_by_id(snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id());
-    }
-    ancestors
-}
 
 /// Converge a single unfinished MV refresh against the MV table's lake
 /// state, using the staging-branch snapshot's lineage — NOT the SQLite
@@ -10073,6 +9964,7 @@ fn reconcile_iceberg_mv_refresh(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     _catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
     table: &novarocks_connector_iceberg::iceberg::table::Table,
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     if matches!(
@@ -10086,17 +9978,19 @@ fn reconcile_iceberg_mv_refresh(
         .staging_branch
         .as_deref()
         .ok_or_else(|| format!("mv refresh {} missing staging branch", refresh.refresh_id))?;
-    let staging_snapshot_id = table
-        .metadata()
-        .refs()
+    // Exact parity with the previous `refs().get(..)` lookup: a staging branch
+    // is never `main`, so no fallback applies.
+    let staging_snapshot_id = binding
+        .observation()
+        .ref_snapshot_ids()
         .get(staging_branch)
-        .map(|r| r.snapshot_id);
+        .copied();
 
     match staging_snapshot_id {
         Some(staging_snapshot_id) => {
-            let main_ancestors = main_ancestor_snapshot_ids(table);
+            let main_ancestors = binding.observation().main_ancestor_snapshot_ids().to_vec();
             let marker_matches =
-                snapshot_id_matches_refresh_marker(table, staging_snapshot_id, &refresh)?;
+                observed_snapshot_matches_refresh_marker(binding, staging_snapshot_id, &refresh);
             match classify_staging_branch(&main_ancestors, staging_snapshot_id, marker_matches) {
                 Ok(StagingDisposition::PublishedCurrent | StagingDisposition::Superseded) => {
                     converge_published_iceberg_mv_staging_branch(
@@ -10131,7 +10025,7 @@ fn reconcile_iceberg_mv_refresh(
             }
         }
         None => converge_iceberg_mv_refresh_without_staging_branch(
-            state, &refresh, target, entry, table,
+            state, &refresh, target, entry, table, binding,
         ),
     }
 }
@@ -10223,11 +10117,12 @@ fn converge_iceberg_mv_refresh_without_staging_branch(
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     table: &novarocks_connector_iceberg::iceberg::table::Table,
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
 ) -> Result<(), String> {
-    let main = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let main = binding.current_snapshot_id();
     let main_carries_refresh = match main {
         Some(main_snapshot_id) => {
-            snapshot_id_matches_refresh_marker(table, main_snapshot_id, refresh)?
+            observed_snapshot_matches_refresh_marker(binding, main_snapshot_id, refresh)
         }
         None => false,
     };
@@ -10246,23 +10141,25 @@ fn converge_iceberg_mv_refresh_without_staging_branch(
     }
 }
 
-fn snapshot_id_matches_refresh_marker(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
+/// Does `snapshot_id` carry this refresh's marker?
+///
+/// The Provider decoded the marker identity into the observation; Core only
+/// compares it against its own ledger entry. A refresh with no recorded marker
+/// never matches, exactly as before.
+fn observed_snapshot_matches_refresh_marker(
+    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
     snapshot_id: i64,
     refresh: &StoredMvRefresh,
-) -> Result<bool, String> {
-    let Some(marker) = refresh.marker.as_ref() else {
-        return Ok(false);
+) -> bool {
+    let Some(expected) = refresh.marker.as_ref() else {
+        return false;
     };
-    let marker = MvRefreshSnapshotMarker {
-        refresh_id: marker.refresh_id,
-        mv_id: marker.mv_id,
-        token: marker.token.clone(),
+    let Some(observed) = binding.observation().snapshot_marker(snapshot_id) else {
+        return false;
     };
-    let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) else {
-        return Ok(false);
-    };
-    Ok(snapshot_matches_refresh_marker(snapshot, &marker))
+    observed.refresh_id == expected.refresh_id
+        && observed.mv_id == expected.mv_id
+        && observed.token == expected.token
 }
 
 fn recovered_published_snapshot_id(refresh: &StoredMvRefresh) -> Option<i64> {
@@ -11553,7 +11450,7 @@ fn commit_first_refresh_iceberg_mv(
                 iceberg_catalog,
                 target_entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 data_files,
                 staging_branch,
                 marker,
@@ -11861,7 +11758,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
                 iceberg_catalog,
                 target_entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 data_files,
                 staging_branch,
                 marker,
@@ -12596,7 +12493,7 @@ async fn commit_overwrite_iceberg_mv_with_ref(
         catalog,
         entry,
         ident,
-        CommitOpKind::Overwrite,
+        MvTargetWriteEffect::Overwrite,
         data_files,
         target_ref,
         snapshot_properties,
@@ -12610,7 +12507,7 @@ async fn commit_iceberg_mv_target_files(
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
     data_files: Vec<DataFile>,
 ) -> Result<CommitOutcome, CommitServiceError> {
     commit_iceberg_mv_target_files_with_ref(
@@ -12618,7 +12515,7 @@ async fn commit_iceberg_mv_target_files(
         catalog,
         entry,
         ident,
-        op_kind,
+        effect,
         data_files,
         "main",
         BTreeMap::new(),
@@ -12632,39 +12529,14 @@ async fn commit_iceberg_mv_target_files_with_ref(
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
     data_files: Vec<DataFile>,
     target_ref: &str,
     snapshot_properties: BTreeMap<String, String>,
 ) -> Result<CommitOutcome, CommitServiceError> {
     let metadata = table.metadata();
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            op_kind,
-            ident.clone(),
-            metadata
-                .refs()
-                .get(target_ref)
-                .map(|r| r.snapshot_id)
-                .or_else(|| {
-                    if target_ref == "main" {
-                        metadata.current_snapshot().map(|s| s.snapshot_id())
-                    } else {
-                        None
-                    }
-                }),
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
+    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
+        table, ident, target_ref, effect,
     );
     inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)
         .map_err(CommitServiceError::invalid_input)?;
@@ -12701,8 +12573,8 @@ async fn commit_iceberg_mv_target_files_with_ref(
 /// the caller can share the collector with the sink.
 ///
 /// The collector's `op_kind` must be set by the caller before any inject
-/// calls — typically `CommitOpKind::RowDeltaDvFromFiles` when the change batch
-/// has any DELETE-side rows, `CommitOpKind::FastAppend` otherwise.
+/// calls — typically `MvTargetWriteEffect::DeltaRetractingStagedFiles` when the
+/// change batch has any DELETE-side rows, `MvTargetWriteEffect::Append` otherwise.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) async fn commit_iceberg_mv_with_populated_collector(
@@ -12755,7 +12627,7 @@ async fn commit_iceberg_mv_apply_with_ref(
             catalog,
             entry,
             ident,
-            CommitOpKind::FastAppend,
+            MvTargetWriteEffect::Append,
             data_files,
             target_ref,
             snapshot_properties,
@@ -12764,33 +12636,11 @@ async fn commit_iceberg_mv_apply_with_ref(
     }
 
     let metadata = table.metadata();
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::RowDeltaDv,
-            ident.clone(),
-            metadata
-                .refs()
-                .get(target_ref)
-                .map(|r| r.snapshot_id)
-                .or_else(|| {
-                    if target_ref == "main" {
-                        metadata.current_snapshot().map(|s| s.snapshot_id())
-                    } else {
-                        None
-                    }
-                }),
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
+    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
+        table,
+        ident,
+        target_ref,
+        MvTargetWriteEffect::DeltaRetractingExplicitPositions,
     );
     inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)
         .map_err(CommitServiceError::invalid_input)?;
@@ -13773,7 +13623,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     )?,
                 },
                 staging_branch,
-                Some(CommitOpKind::Overwrite),
+                Some(MvTargetWriteEffect::Overwrite),
             )
         },
     )
@@ -15533,7 +15383,11 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
+    validate_target_snapshot(
+        &target,
+        &mv_definition,
+        &target_binding_for(state, &target, connector_context)?,
+    )?;
 
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
@@ -16490,13 +16344,33 @@ fn imv_change_stream_writer_abort_result_for_test(
     }
 }
 
+/// A change stream that carries any deletion route retracts previously
+/// materialized rows; otherwise the refresh only adds rows.
+///
+/// Both change-stream entrypoints derived this independently before SPI-5I,
+/// so a future producer route added to one and not the other would have
+/// silently changed only half the refresh paths.
+fn deletion_route_write_effect(
+    refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
+) -> MvTargetWriteEffect {
+    if refresh_plan
+        .producer_branches
+        .iter()
+        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
+    {
+        MvTargetWriteEffect::DeltaRetractingStagedFiles
+    } else {
+        MvTargetWriteEffect::Append
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_imv_change_stream_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     table: novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
-    op_kind: CommitOpKind,
+    effect: MvTargetWriteEffect,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
 ) -> Result<
@@ -16507,7 +16381,7 @@ fn execute_imv_change_stream_write(
         &table,
         ident,
         target_ref,
-        op_kind,
+        effect,
         || {
             execute_imv_change_stream_writer(
                 state,
@@ -16516,7 +16390,7 @@ fn execute_imv_change_stream_write(
                 ident,
                 refresh_plan,
                 target_ref,
-                Some(op_kind),
+                Some(effect),
             )
         },
     )
@@ -16529,7 +16403,7 @@ fn execute_imv_change_stream_writer(
     ident: &TableIdent,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
-    commit_op_kind: Option<CommitOpKind>,
+    write_effect: Option<MvTargetWriteEffect>,
 ) -> Result<crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite, String> {
     let (refresh_plan, effect_output_ordinal) = ensure_imv_change_stream_effect(refresh_plan)?;
     let entry = state
@@ -16585,19 +16459,9 @@ fn execute_imv_change_stream_writer(
             )?,
         );
     }
-    let op_kind = commit_op_kind.unwrap_or_else(|| {
-        if refresh_plan
-            .producer_branches
-            .iter()
-            .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
-        {
-            CommitOpKind::RowDeltaDvFromFiles
-        } else {
-            CommitOpKind::FastAppend
-        }
-    });
+    let effect = write_effect.unwrap_or_else(|| deletion_route_write_effect(&refresh_plan));
     let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
-        table, ident, target_ref, op_kind,
+        table, ident, target_ref, effect,
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
@@ -16762,17 +16626,9 @@ fn prepare_imv_change_stream_writer(
             None,
             connector_context,
         )?;
-    let op_kind = if refresh_plan
-        .producer_branches
-        .iter()
-        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
-    {
-        CommitOpKind::RowDeltaDvFromFiles
-    } else {
-        CommitOpKind::FastAppend
-    };
+    let effect = deletion_route_write_effect(&refresh_plan);
     let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
-        table, ident, target_ref, op_kind,
+        table, ident, target_ref, effect,
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
@@ -18018,10 +17874,10 @@ fn incremental_refresh_iceberg_mv_with_changes(
     // 6. Build the shared commit collector. The change-stream write DAG routes
     // writer reports back into this collector; the commit driver below consumes
     // the populated collector.
-    let op_kind = if can_emit_delete_rows {
-        CommitOpKind::RowDeltaDvFromFiles
+    let effect = if can_emit_delete_rows {
+        MvTargetWriteEffect::DeltaRetractingStagedFiles
     } else {
-        CommitOpKind::FastAppend
+        MvTargetWriteEffect::Append
     };
     let target_planning_materialization =
         crate::connector::iceberg::provider::load_schema_materialization_with_lease(
@@ -18134,7 +17990,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         &target_backend,
         target_table.clone(),
         &ident,
-        op_kind,
+        effect,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
             table_bindings: planned_query.table_bindings,
@@ -22545,7 +22401,7 @@ mod tests {
                 &iceberg_catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 &staging_branch,
                 marker,
@@ -22612,7 +22468,7 @@ mod tests {
                 &iceberg_catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 "main",
                 BTreeMap::new(),
@@ -24093,7 +23949,7 @@ mod tests {
             .expect("replace default partition spec");
         let new_default_spec_id = updated_table.metadata().default_partition_spec_id();
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
 
         advance_target_main_without_refresh_marker(&env.state, "ice", "analytics", "mv_orders");
 
@@ -24386,7 +24242,7 @@ mod tests {
             )
             .expect("replace default partition spec");
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
         assert_ne!(new_partition_contract.target_spec_id, old_default_spec_id);
         assert_eq!(
             updated_table.metadata().default_partition_spec().fields()[0].name,
@@ -24534,7 +24390,7 @@ mod tests {
             )
             .expect("replace default partition spec");
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
         assert_eq!(
             new_partition_contract.fields[0].partition_field_name,
             "name_truncate_2"
@@ -24565,7 +24421,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 &staging_branch,
                 marker,
@@ -25475,6 +25331,12 @@ mod tests {
             &query,
             &analysis,
             &loaded_bases,
+            &observe_base_fields_for_refs(
+                &env.state,
+                &resolved_dependencies.base_refs,
+                &crate::connector::test_request_context(),
+            )
+            .expect("base field observations"),
             &target,
             &target_observation,
             actual_apply_key_field_id,
@@ -27663,7 +27525,7 @@ mod tests {
             "connection reset by peer".to_string(),
             crate::connector::iceberg::commit::RecoveryEvidence {
                 table_ident: "ice.analytics.mv_orders".to_string(),
-                op_kind: CommitOpKind::FastAppend,
+                op_kind: novarocks_connector_iceberg::commit::CommitOpKind::FastAppend,
                 base_snapshot_id: Some(10),
                 base_sequence_number: 22,
                 staging_dir: "s3://warehouse/mv_orders/_staging/typed-unknown".to_string(),
@@ -27871,7 +27733,7 @@ mod tests {
                 "target ref is not visible after catalog commit".to_string(),
                 crate::connector::iceberg::commit::RecoveryEvidence {
                     table_ident: "ice.analytics.mv_orders".to_string(),
-                    op_kind: CommitOpKind::FastAppend,
+                    op_kind: novarocks_connector_iceberg::commit::CommitOpKind::FastAppend,
                     base_snapshot_id: Some(10),
                     base_sequence_number: 22,
                     staging_dir: "s3://warehouse/mv_orders/_staging/finalize".to_string(),
@@ -28317,7 +28179,7 @@ mod tests {
             )
             .expect("replace default partition spec");
         let new_partition_contract =
-            target_partition_contract_from_table(&updated_table).expect("new partition contract");
+            test_partition_contract_from_table(&updated_table).expect("new partition contract");
         assert_eq!(
             new_partition_contract.fields[0].partition_field_name,
             "name_truncate_2"
@@ -28352,7 +28214,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 &staging_branch,
                 marker,
@@ -28468,7 +28330,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28597,7 +28459,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28727,7 +28589,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28843,7 +28705,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -28974,7 +28836,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker,
@@ -29058,7 +28920,7 @@ mod tests {
             "commit result unknown".to_string(),
             crate::connector::iceberg::commit::RecoveryEvidence {
                 table_ident: "ice.analytics.mv_orders".to_string(),
-                op_kind: CommitOpKind::FastAppend,
+                op_kind: novarocks_connector_iceberg::commit::CommitOpKind::FastAppend,
                 base_snapshot_id: None,
                 base_sequence_number: 0,
                 staging_dir: "__nova_mv_refresh_test_unknown".to_string(),
@@ -29360,7 +29222,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
             )
             .await
@@ -29445,7 +29307,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 initial_written,
             )
             .await
@@ -29488,7 +29350,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
                 staging_branch,
                 marker.to_summary_properties(),
@@ -29664,7 +29526,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 initial_written,
             )
             .await
@@ -29787,7 +29649,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 vec![bad_file],
             )
             .await
@@ -29912,7 +29774,7 @@ mod tests {
                 &catalog,
                 &entry,
                 &ident,
-                CommitOpKind::FastAppend,
+                MvTargetWriteEffect::Append,
                 written,
             )
             .await

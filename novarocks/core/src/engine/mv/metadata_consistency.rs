@@ -19,7 +19,7 @@
 use crate::sql::planner::vocabulary::ApplyKeySource;
 
 use crate::mv::persistence::schema::MvSchemaContract;
-use novarocks_connector_iceberg::commit::ProvenanceBase;
+use crate::mv::storage_observation::MvPublishedBaseFact;
 
 /// Assert the lake descriptor's schema contract matches the store's contract.
 /// Fail-loud: the descriptor is the authoritative home (W2); a missing or
@@ -47,7 +47,7 @@ pub(crate) fn ensure_descriptor_schema_contract_matches(
 /// summary) matches the metadata store's last_refresh_snapshots. Fail-loud on
 /// drift — the summary is the authoritative watermark home (W3a).
 pub(crate) fn ensure_summary_watermark_matches_store(
-    provenance_bases: &[ProvenanceBase],
+    provenance_bases: &[MvPublishedBaseFact],
     store_last_refresh_snapshots: &std::collections::BTreeMap<String, i64>,
 ) -> Result<(), String> {
     for base in provenance_bases {
@@ -163,10 +163,10 @@ mod tests {
         assert!(err.contains("drifted"), "err={err}");
     }
 
-    fn provenance_base(table_fqn: &str, to_snapshot: i64) -> ProvenanceBase {
-        ProvenanceBase {
+    fn provenance_base(table_fqn: &str, to_snapshot: i64) -> MvPublishedBaseFact {
+        MvPublishedBaseFact {
             table_fqn: table_fqn.to_string(),
-            uuid: format!("uuid-{table_fqn}"),
+            table_uuid: format!("uuid-{table_fqn}"),
             from_snapshot: None,
             to_snapshot,
         }
