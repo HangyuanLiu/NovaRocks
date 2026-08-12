@@ -32,7 +32,9 @@
 //! than working with a partial list.
 
 use novarocks_spi::connector::{
-    ConnectorMvAttemptPage, ConnectorMvAttemptScanLimit, ConnectorMvAttemptSummary,
+    ConnectorControlBinding, ConnectorMvAttemptDiscoveryRequest, ConnectorMvAttemptPage,
+    ConnectorMvAttemptScanLimit, ConnectorMvAttemptSummary, ConnectorMvRefreshResourceIdentity,
+    ConnectorRequestContext, ConnectorTableHandle,
 };
 
 /// Upper bound on pages fetched for one target in a single sweep.
@@ -113,6 +115,43 @@ where
     TargetSweep::Unreconciled {
         reason: UnreconciledReason::PageBudgetExhausted,
     }
+}
+
+/// Sweeps one target through the provider's discovery capability.
+///
+/// This is the production path: it adapts the capability's paged calls to
+/// [`sweep_target`], so the loop's rules -- bounded pages, non-exhaustive means
+/// unreconciled, dedup by identity -- apply to real provider output rather than
+/// only to fixtures.
+///
+/// A provider without the capability yields `ProviderUnavailable` rather than an
+/// empty sweep. "This provider cannot enumerate attempts" and "this target has no
+/// attempts" must never produce the same answer, since only the latter is safe to
+/// act on.
+pub(super) fn sweep_target_through_provider(
+    binding: &ConnectorControlBinding,
+    table: &ConnectorTableHandle,
+    resource: &ConnectorMvRefreshResourceIdentity,
+    context: &ConnectorRequestContext,
+    page_size: usize,
+) -> TargetSweep {
+    let Some(discovery) = binding.mv_attempt_discovery() else {
+        return TargetSweep::Unreconciled {
+            reason: UnreconciledReason::ProviderUnavailable,
+        };
+    };
+    sweep_target(|previous| {
+        let continuation = previous.and_then(|page| page.continuation().cloned());
+        discovery
+            .discover_attempts(ConnectorMvAttemptDiscoveryRequest {
+                table: table.clone(),
+                resource: resource.clone(),
+                page_size,
+                continuation,
+                context: context.clone(),
+            })
+            .ok()
+    })
 }
 
 #[cfg(test)]
