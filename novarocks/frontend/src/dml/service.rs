@@ -70,7 +70,13 @@ impl DmlService {
         }
     }
 
-    pub(crate) fn compose_with_coordination(
+    /// Compose with real coordination.
+    ///
+    /// Hidden from the public API but reachable from integration tests, so a
+    /// route test can exercise the fenced dispatch path instead of the
+    /// unfenced focused-test seam.
+    #[doc(hidden)]
+    pub fn compose_with_coordination(
         journal: Option<Arc<dyn OperationJournal>>,
         statistics: Arc<dyn StatisticsService>,
         frontend: Arc<FrontendCoordinationRuntime>,

@@ -134,7 +134,14 @@ pub(crate) const FRONTEND_MAX_CLOCK_SKEW: Duration = Duration::from_secs(1);
 pub(crate) const FRONTEND_TAKEOVER_OBSERVATION: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
-pub(crate) struct FrontendCoordinationRuntime {
+/// Real frontend coordination: incarnation gate, lease manager and holder.
+///
+/// Exposed (hidden from the public API) so integration tests can drive the
+/// genuine coordination path against a real StateStore. This is deliberately
+/// *not* the same as exposing a way to mint a fence without a lease: everything
+/// here still requires a bootstrapped store and a live lease.
+#[doc(hidden)]
+pub struct FrontendCoordinationRuntime {
     store: Arc<dyn StateStore>,
     gate: Arc<IncarnationGate>,
     manager: LeaseManager,
@@ -142,7 +149,7 @@ pub(crate) struct FrontendCoordinationRuntime {
 }
 
 impl FrontendCoordinationRuntime {
-    pub(crate) async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
+    pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
         Self::open_with_clock(store, Arc::new(SystemFrontendLeaseClock::default())).await
     }
 

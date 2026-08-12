@@ -17,4 +17,5 @@
 
 //! Shared fixtures for the frontend integration tests.
 
+pub mod coordination_fixture;
 pub mod fence_fixture;
