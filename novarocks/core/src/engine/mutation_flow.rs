@@ -853,6 +853,14 @@ pub(crate) fn stage_prepared_update_mutation(
                     novarocks_spi::connector::ConnectorRowMutationIntent::Update,
                     connector_context.clone(),
                 )?;
+            // Capture the signed written version before the preparation is
+            // consumed by activation: the COW rewrite stamps it on the files it
+            // produces, and it must not be re-derived from a concrete table.
+            let written_version = row_mutation_preparation
+                .written_version_ordinal()
+                .ok_or_else(|| {
+                    "COW UPDATE requires a provider-signed written version".to_string()
+                })?;
             let selection = cow_selection_from_matched_update(
                 &matched,
                 &row_mutation_preparation,
@@ -889,6 +897,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 &matched,
                 &target_columns,
                 base_snapshot_id,
+                written_version,
                 &target_ref,
                 planning_lease,
                 &connector_context,
@@ -2141,6 +2150,7 @@ fn build_cow_update_distributed_write(
     matched: &MatchedUpdateBatch,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     base_snapshot_id: Option<i64>,
+    written_version: i64,
     target_ref: &str,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -2185,7 +2195,13 @@ fn build_cow_update_distributed_write(
             .push(idx);
     }
 
-    let new_sequence_number = table.metadata().last_sequence_number() + 1;
+    // The sequence number the rewritten files are stamped with, signed at
+    // admission rather than re-derived here. The provider signs exactly
+    // `last_sequence_number() + 1` for this field (pinned by its own
+    // row-mutation preparation test), so this is the same number the COW path
+    // used to compute off a concrete table -- read from the admitted generation
+    // instead of from a table that may have moved since.
+    let new_sequence_number = written_version;
     let mut file_plans = Vec::with_capacity(matched_rows_by_file.len());
     for (old_file, matched_indices) in matched_rows_by_file {
         let data_file = data_file_by_path.get(&old_file).cloned().ok_or_else(|| {
@@ -3479,6 +3495,13 @@ pub(crate) fn stage_prepared_merge_mutation(
                             intent,
                             connector_context.clone(),
                         )?;
+                    // See the UPDATE path: capture the signed written version
+                    // before activation consumes the preparation.
+                    let written_version = row_mutation_preparation
+                        .written_version_ordinal()
+                        .ok_or_else(|| {
+                            "COW MERGE requires a provider-signed written version".to_string()
+                        })?;
                     let selection = cow_selection_from_matched_and_insert(
                         &matched,
                         insert_selection_batch,
@@ -3519,6 +3542,7 @@ pub(crate) fn stage_prepared_merge_mutation(
                         // on a MERGE that UPDATE would have completed correctly,
                         // plus two base-snapshot sources inside one statement.
                         admitted_base_snapshot_id,
+                        written_version,
                         "main",
                         planning_lease.clone(),
                         &connector_context,
