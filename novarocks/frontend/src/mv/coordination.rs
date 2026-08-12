@@ -189,6 +189,56 @@ pub(crate) fn resolve_target_resource(
     Ok(resource)
 }
 
+/// What a refresh is about to do that the outside world would notice.
+///
+/// Enumerated so losing ownership can be answered once, for every action, rather
+/// than by remembering to check at each call site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshSideEffect {
+    /// Create the staging branch a result will be written to.
+    CreateStagingRef,
+    /// Commit distributed write output.
+    CommitDistributedWrite,
+    /// Establish a new external publication fence.
+    EstablishFence,
+    /// Advance the target under a fence.
+    Publish,
+    /// Delete staging artifacts.
+    Cleanup,
+    /// Ask the provider what happened to an operation already issued.
+    InspectIssuedOperation,
+}
+
+/// Whether this frontend still owns the refresh it is executing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshOwnershipState {
+    Held,
+    /// Renewal failed, the incarnation gate closed, or another frontend took over.
+    Lost,
+    /// This frontend is shutting down.
+    ShuttingDown,
+}
+
+/// Decides whether a side effect may still be started.
+///
+/// Losing a lease stops *new* external side effects immediately. It deliberately
+/// does not stop inspection: an operation already issued has an outcome in the
+/// lake whether or not this frontend still owns the target, and reading it is how
+/// the attempt gets classified rather than stranded. Inspection is also the one
+/// action that cannot make things worse -- it writes nothing.
+///
+/// Nothing here is a retry decision. An operation whose outcome is unknown is
+/// never re-issued by a frontend that lost ownership; the next owner resolves it
+/// from lake evidence under a higher fence.
+pub fn permits_side_effect(state: RefreshOwnershipState, effect: RefreshSideEffect) -> bool {
+    match state {
+        RefreshOwnershipState::Held => true,
+        RefreshOwnershipState::Lost | RefreshOwnershipState::ShuttingDown => {
+            matches!(effect, RefreshSideEffect::InspectIssuedOperation)
+        }
+    }
+}
+
 /// The coordination a frontend needs to own refreshes: the lease manager and the
 /// registry the repository consults.
 ///
@@ -437,6 +487,64 @@ mod tests {
             Uuid::from_u128(uuid),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn losing_ownership_stops_every_new_side_effect() {
+        use RefreshSideEffect::*;
+
+        // While owned, nothing is withheld.
+        for effect in [
+            CreateStagingRef,
+            CommitDistributedWrite,
+            EstablishFence,
+            Publish,
+            Cleanup,
+            InspectIssuedOperation,
+        ] {
+            assert!(
+                permits_side_effect(RefreshOwnershipState::Held, effect),
+                "{effect:?} must be allowed while ownership is held"
+            );
+        }
+
+        // Losing the lease and shutting down are the same answer: no new
+        // external effect. Publishing or cleaning up here is what would let a
+        // superseded owner corrupt a target another frontend now owns.
+        for state in [
+            RefreshOwnershipState::Lost,
+            RefreshOwnershipState::ShuttingDown,
+        ] {
+            for effect in [
+                CreateStagingRef,
+                CommitDistributedWrite,
+                EstablishFence,
+                Publish,
+                Cleanup,
+            ] {
+                assert!(
+                    !permits_side_effect(state, effect),
+                    "{effect:?} must be refused once ownership is {state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inspection_survives_losing_ownership() {
+        // An operation already issued has an outcome in the lake whether or not
+        // this frontend still owns the target. Reading it writes nothing and is
+        // how the attempt gets classified instead of stranded, so it is the one
+        // action that must not be withheld.
+        for state in [
+            RefreshOwnershipState::Lost,
+            RefreshOwnershipState::ShuttingDown,
+        ] {
+            assert!(permits_side_effect(
+                state,
+                RefreshSideEffect::InspectIssuedOperation
+            ));
+        }
     }
 
     #[test]
