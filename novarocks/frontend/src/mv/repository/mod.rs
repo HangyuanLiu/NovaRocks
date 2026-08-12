@@ -95,6 +95,8 @@ pub struct StateStoreMvRepository {
 /// A source returns an error for a target this process does not currently own.
 /// That is the fail-closed path: losing the lease must stop durable writes, not
 /// downgrade them to unfenced ones.
+///
+/// Design: ADR-0065 (docs/adr/ADR-0065-mv-refresh-ownership-fencing.md)
 pub trait MvRefreshFenceSource: Send + Sync {
     /// The validator for the current owner of this MV's refresh resource.
     fn validator_for(&self, mv_id: i64) -> Result<FenceValidator, MvRepositoryError>;

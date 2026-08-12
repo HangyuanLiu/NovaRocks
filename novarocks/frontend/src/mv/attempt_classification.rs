@@ -113,6 +113,8 @@ pub(crate) struct AttemptEvidence {
 
 /// Classifies one attempt from lake evidence.
 ///
+/// Design: ADR-0066 (docs/adr/ADR-0066-mv-attempt-discovery-and-conservative-classification.md)
+///
 /// Ordering between generations is delegated to the fencing contract, so
 /// "superseded" means the same thing here as it does at the external commit
 /// point. A comparison the contract refuses — cross-cluster, or one epoch with
