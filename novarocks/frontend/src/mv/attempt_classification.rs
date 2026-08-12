@@ -184,6 +184,81 @@ pub(crate) fn classify_attempt(evidence: &AttemptEvidence) -> MvAttemptDispositi
     }
 }
 
+/// What a cleanup must prove before it may delete an attempt's artifacts.
+///
+/// Cleanup is the only irreversible step in recovery, so its authorization is a
+/// separate, explicit record rather than an implication of the classification.
+/// A disposition says *what an attempt is*; this says *whether this frontend, right
+/// now, is entitled to act on it*.
+#[derive(Clone, Debug)]
+pub(crate) struct CleanupAuthorization {
+    /// The disposition reached from lake evidence.
+    pub disposition: MvAttemptDisposition,
+    /// `true` when this frontend currently holds the target's refresh lease.
+    pub holds_current_ownership: bool,
+    /// `true` when the generation acting is the one that owns the fence.
+    pub acts_under_established_fence: bool,
+    /// `true` when the observation being acted on is byte-identical to the one
+    /// that produced the disposition.
+    pub observation_digest_matches: bool,
+    /// `true` when the artifact is still referenced by the target's visible state
+    /// or its ancestry.
+    pub still_referenced_by_target: bool,
+    /// `true` when the artifact is the target's current publication fence.
+    pub is_current_fence_artifact: bool,
+}
+
+/// Why a cleanup was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanupRefusal {
+    /// The disposition does not settle the attempt's fate.
+    DispositionNotTerminal,
+    /// This frontend is not the current owner.
+    NotOwner,
+    /// The acting generation does not own the fence.
+    NotFenced,
+    /// The observation changed since it was classified.
+    StaleObservation,
+    /// Deleting it would remove data the target still depends on.
+    StillReferenced,
+    /// It is the fence that arbitrates publication.
+    IsCurrentFence,
+}
+
+/// Decides whether a cleanup may proceed.
+///
+/// Every condition is independent, and all must hold. In particular a correct
+/// disposition is not sufficient: it was computed at some earlier moment, and by
+/// the time cleanup runs this frontend may have lost the lease or the lake may
+/// have moved. Requiring live ownership and a matching observation is what keeps a
+/// stale classification from authorizing a delete.
+pub(crate) fn authorize_cleanup(
+    authorization: &CleanupAuthorization,
+) -> Result<(), CleanupRefusal> {
+    if !authorization.disposition.permits_artifact_reclaim() {
+        return Err(CleanupRefusal::DispositionNotTerminal);
+    }
+    if !authorization.holds_current_ownership {
+        return Err(CleanupRefusal::NotOwner);
+    }
+    if !authorization.acts_under_established_fence {
+        return Err(CleanupRefusal::NotFenced);
+    }
+    if !authorization.observation_digest_matches {
+        return Err(CleanupRefusal::StaleObservation);
+    }
+    // These two are checked last so their refusals are never masked by a
+    // permission problem: they are facts about the artifact, and a reviewer
+    // reading a log wants to see them distinctly.
+    if authorization.still_referenced_by_target {
+        return Err(CleanupRefusal::StillReferenced);
+    }
+    if authorization.is_current_fence_artifact {
+        return Err(CleanupRefusal::IsCurrentFence);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +418,86 @@ mod tests {
             ..base()
         };
         assert_eq!(classify_attempt(&evidence), MvAttemptDisposition::Ambiguous);
+    }
+
+    fn authorized() -> CleanupAuthorization {
+        CleanupAuthorization {
+            disposition: MvAttemptDisposition::Superseded,
+            holds_current_ownership: true,
+            acts_under_established_fence: true,
+            observation_digest_matches: true,
+            still_referenced_by_target: false,
+            is_current_fence_artifact: false,
+        }
+    }
+
+    #[test]
+    fn cleanup_requires_every_condition_independently() {
+        authorize_cleanup(&authorized()).unwrap();
+
+        // A stale classification must not authorize a delete: by now this
+        // frontend may have lost the lease, or the lake may have moved.
+        assert_eq!(
+            authorize_cleanup(&CleanupAuthorization {
+                holds_current_ownership: false,
+                ..authorized()
+            }),
+            Err(CleanupRefusal::NotOwner)
+        );
+        assert_eq!(
+            authorize_cleanup(&CleanupAuthorization {
+                acts_under_established_fence: false,
+                ..authorized()
+            }),
+            Err(CleanupRefusal::NotFenced)
+        );
+        assert_eq!(
+            authorize_cleanup(&CleanupAuthorization {
+                observation_digest_matches: false,
+                ..authorized()
+            }),
+            Err(CleanupRefusal::StaleObservation)
+        );
+    }
+
+    #[test]
+    fn no_disposition_short_of_settled_authorizes_a_delete() {
+        for disposition in [
+            MvAttemptDisposition::Staged,
+            MvAttemptDisposition::Published,
+            MvAttemptDisposition::CleanupPending,
+            MvAttemptDisposition::Ambiguous,
+        ] {
+            assert_eq!(
+                authorize_cleanup(&CleanupAuthorization {
+                    disposition,
+                    ..authorized()
+                }),
+                Err(CleanupRefusal::DispositionNotTerminal),
+                "{disposition:?} must not authorize deleting artifacts"
+            );
+        }
+    }
+
+    #[test]
+    fn referenced_data_and_the_current_fence_are_never_deletable() {
+        // Even a fully authorized owner acting on a settled attempt may not
+        // remove data the target still depends on.
+        assert_eq!(
+            authorize_cleanup(&CleanupAuthorization {
+                still_referenced_by_target: true,
+                ..authorized()
+            }),
+            Err(CleanupRefusal::StillReferenced)
+        );
+        // Deleting the fence would remove the ref that arbitrates publication.
+        assert_eq!(
+            authorize_cleanup(&CleanupAuthorization {
+                is_current_fence_artifact: true,
+                ..authorized()
+            }),
+            Err(CleanupRefusal::IsCurrentFence)
+        );
     }
 
     #[test]
