@@ -24,8 +24,10 @@ mod distribution;
 mod domain_facts;
 mod error;
 mod execution;
+mod external_write_fence;
 mod handle;
 mod historical_maintenance_recovery;
+mod historical_write_recovery;
 mod identity;
 mod metadata;
 mod metadata_maintenance;
@@ -99,12 +101,18 @@ pub use domain_facts::{
     MAX_CONNECTOR_SCAN_UNIT_FACT_COLUMNS, MAX_CONNECTOR_SCAN_UNIT_FACT_PAYLOAD_BYTES,
     MAX_CONNECTOR_SCAN_UNIT_FACT_VARIABLE_VALUE_BYTES,
 };
-pub use error::{ConnectorError, ConnectorErrorKind};
+pub use error::{ConnectorError, ConnectorErrorKind, ConnectorExternalFenceFailure};
 pub use execution::{
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionInstaller,
     ConnectorExecutionResolver, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
     ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorReadExecution,
     MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
+};
+pub use external_write_fence::{
+    ConnectorClusterIdentity, ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,
+    ConnectorExternalFenceRequest, ConnectorExternalOperationFence,
+    MAX_CONNECTOR_EXTERNAL_FENCE_CLUSTER_ID_BYTES, MAX_CONNECTOR_EXTERNAL_FENCE_IDENTITY_BYTES,
+    MAX_CONNECTOR_EXTERNAL_FENCE_RECEIPT_BYTES,
 };
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
@@ -123,6 +131,18 @@ pub use historical_maintenance_recovery::{
     MAX_CONNECTOR_HISTORICAL_MAINTENANCE_CONTINUATION_BYTES,
     MAX_CONNECTOR_HISTORICAL_MAINTENANCE_PROOF_BYTES,
     validate_historical_maintenance_recovery_owner,
+};
+pub use historical_write_recovery::{
+    ConnectorHistoricalWriteApplication, ConnectorHistoricalWriteCheckpoint,
+    ConnectorHistoricalWriteCleanupReceipt, ConnectorHistoricalWriteCleanupRequest,
+    ConnectorHistoricalWriteContinuation, ConnectorHistoricalWriteDescriptor,
+    ConnectorHistoricalWriteDispatchState, ConnectorHistoricalWriteDisposition,
+    ConnectorHistoricalWriteFence, ConnectorHistoricalWriteFenceFacts,
+    ConnectorHistoricalWriteFenceRaiseRequest, ConnectorHistoricalWriteIdentity,
+    ConnectorHistoricalWriteObservation, ConnectorHistoricalWriteOutcomeFacts,
+    ConnectorHistoricalWritePhase, ConnectorHistoricalWriteProof, ConnectorHistoricalWriteRecovery,
+    MAX_CONNECTOR_HISTORICAL_WRITE_CHECKPOINTS, MAX_CONNECTOR_HISTORICAL_WRITE_CONTINUATION_BYTES,
+    MAX_CONNECTOR_HISTORICAL_WRITE_PROOF_BYTES, validate_historical_write_recovery_owner,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
 pub use metadata::{
@@ -265,25 +285,25 @@ pub use view_metadata::{
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorActivatedWriteCohort, ConnectorBatchWriter,
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
-    ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
-    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionSpecReplacementId,
-    ConnectorManagedPartitionSpecReplacementTarget, ConnectorManagedPartitionTransform,
-    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
-    ConnectorManagedPublicationTechnique, ConnectorOpenWriterRequest,
-    ConnectorSealedWriteCohortSet, ConnectorStagedReport, ConnectorStagedReportFrame,
-    ConnectorStagedReportSummary, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
-    ConnectorWriteActivationSource, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
-    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
-    ConnectorWriteControl, ConnectorWriteExecution, ConnectorWriteExecutionId,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
-    ConnectorWriteReconcileRequest, ConnectorWriteTargetRef, ConnectorWriterHandle,
-    ConnectorWriterIdentity, ConnectorWriterTerminalState,
+    ConnectorEstablishedWriteFence, ConnectorManagedPartitionField,
+    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
+    ConnectorManagedPartitionSpecReplacementId, ConnectorManagedPartitionSpecReplacementTarget,
+    ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
+    ConnectorManagedPublicationIntent, ConnectorManagedPublicationTechnique,
+    ConnectorOpenWriterRequest, ConnectorSealedWriteCohortSet, ConnectorStagedReport,
+    ConnectorStagedReportFrame, ConnectorStagedReportSummary, ConnectorWriteAbortOutcome,
+    ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
+    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
+    ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
+    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecution,
+    ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
+    ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriteTargetRef,
+    ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
     MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
     MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
     MAX_CONNECTOR_STAGED_REPORT_PARTS, MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES,

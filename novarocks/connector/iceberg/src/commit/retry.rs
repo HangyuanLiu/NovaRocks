@@ -24,12 +24,23 @@
 /// Whether an iceberg-rust commit error represents a transient table-requirement
 /// conflict that warrants a retry (after re-loading the table). Network / IO /
 /// data-invalid / programmer errors are non-retryable.
+///
+/// A failed assertion on a provider-owned *write fence* ref is never retryable,
+/// whatever else the error looks like: it means another owner took the
+/// operation over, and re-staging would rebuild the write under an authority we
+/// no longer hold. Callers that carry a fence assertion classify the outcome
+/// authoritatively by re-observing the fence ref
+/// (`commit::helpers::submit_fenced_action`); this text check is the backstop
+/// that keeps every *other* retry loop from spinning on a fence.
 pub fn is_retryable_commit_conflict(err: &crate::iceberg::Error) -> bool {
     use crate::iceberg::ErrorKind;
+    let msg = format!("{err}").to_ascii_lowercase();
+    if msg.contains(&crate::commit::write_fence::WRITE_FENCE_REF_PREFIX.to_ascii_lowercase()) {
+        return false;
+    }
     match err.kind() {
         ErrorKind::CatalogCommitConflicts => true,
         ErrorKind::PreconditionFailed => {
-            let msg = format!("{err}").to_ascii_lowercase();
             msg.contains("assertcurrentschemaidmatch")
                 || msg.contains("assertlastassignedfieldidmatch")
                 || msg.contains("assertrefsnapshotidmatch")

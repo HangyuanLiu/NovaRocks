@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorSealedWriteCohortSet, ConnectorWriteAbortOutcome,
+    ConnectorError, ConnectorErrorKind, ConnectorEstablishedWriteFence,
+    ConnectorExternalOperationFence, ConnectorSealedWriteCohortSet, ConnectorWriteAbortOutcome,
     ConnectorWriteAbortRequest, ConnectorWriteAttemptCompletion, ConnectorWriteCohortCompletion,
     ConnectorWriteCohortId, ConnectorWriteCommitRequest, ConnectorWriteExecutionId,
     ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
@@ -138,6 +139,40 @@ impl ConnectorWriteOperationSession {
         &self.inner.context
     }
 
+    /// Establish the external operation fence of this coordination attempt.
+    ///
+    /// The control-plane owner must call this before any writer or commit
+    /// dispatch that can produce an irreversible external effect: `commit`,
+    /// `abort`, `reconcile` and the known-empty release all fail closed until it
+    /// succeeds. Repeating the identical fence is idempotent; a generation
+    /// behind the established one is rejected as a typed stale fence before the
+    /// provider is contacted. The fence is recorded on the exact write authority
+    /// this session holds, so the same fence also covers the pre-registration
+    /// abort of an already activated authority.
+    pub fn establish_external_fence(
+        &self,
+        fence: ConnectorExternalOperationFence,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
+        fence.validate_for_operation(self.inner.operation_id)?;
+        self.inner.lease.establish_external_fence(fence, context)
+    }
+
+    /// The established external fence and its provider receipt, if any. The
+    /// frontend persists their digests in its fenced journal.
+    pub fn established_external_fence(
+        &self,
+    ) -> Result<Option<ConnectorEstablishedWriteFence>, ConnectorError> {
+        self.inner.lease.established_external_fence()
+    }
+
+    /// The fence every terminal provider call of this operation must carry.
+    fn require_external_fence(&self) -> Result<ConnectorExternalOperationFence, ConnectorError> {
+        let fence = self.inner.lease.require_external_fence()?;
+        fence.validate_for_operation(self.inner.operation_id)?;
+        Ok(fence)
+    }
+
     /// Return the Provider-signed preparation for one sealed cohort.  SQL may
     /// project only its tagged Arrow layout and field tokens; the provider
     /// payload remains opaque.
@@ -191,6 +226,7 @@ impl ConnectorWriteOperationSession {
                 self.inner.owner.clone(),
                 self.inner.sealed.clone(),
                 Vec::new(),
+                self.require_external_fence()?,
                 self.inner.context.clone(),
             )?;
             match state.terminal {
@@ -462,7 +498,7 @@ impl ConnectorWriteOperationSession {
         &self,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let completion = {
+        let (completion, fence) = {
             let mut state = self.lock_state()?;
             if state.recovery_only {
                 return Err(invalid(
@@ -477,6 +513,7 @@ impl ConnectorWriteOperationSession {
                     "connector write operation already has another terminal decision",
                 ));
             }
+            let fence = self.require_external_fence()?;
             let completion = self.operation_completion(&state)?;
             match state.terminal {
                 Some(TerminalDecision::Commit(digest))
@@ -490,15 +527,15 @@ impl ConnectorWriteOperationSession {
                     state.terminal = Some(TerminalDecision::Commit(completion.aggregate_digest()));
                 }
             }
-            completion
+            (completion, fence)
         };
-        self.inner
-            .lease
-            .control()
-            .commit(ConnectorWriteCommitRequest {
-                completion,
-                context,
-            })
+        let request = ConnectorWriteCommitRequest {
+            completion,
+            fence,
+            context,
+        };
+        request.validate_fence()?;
+        self.inner.lease.control().commit(request)
     }
 
     pub fn abort(
@@ -520,6 +557,7 @@ impl ConnectorWriteOperationSession {
                 self.inner.owner.clone(),
                 self.inner.sealed.clone(),
                 cohorts,
+                self.require_external_fence()?,
                 context,
             )?;
             match state.terminal {
@@ -543,25 +581,29 @@ impl ConnectorWriteOperationSession {
         evidence: ExternalMutationEvidence,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let aggregate_digest = match self.lock_state()?.terminal {
-            Some(TerminalDecision::Commit(digest)) => digest,
-            _ => {
-                return Err(invalid(
-                    "connector write reconcile requires a prior aggregate commit decision",
-                ));
-            }
+        let (aggregate_digest, fence) = {
+            let state = self.lock_state()?;
+            let aggregate_digest = match state.terminal {
+                Some(TerminalDecision::Commit(digest)) => digest,
+                _ => {
+                    return Err(invalid(
+                        "connector write reconcile requires a prior aggregate commit decision",
+                    ));
+                }
+            };
+            (aggregate_digest, self.require_external_fence()?)
         };
-        self.inner
-            .lease
-            .control()
-            .reconcile(ConnectorWriteReconcileRequest {
-                owner: self.inner.owner.clone(),
-                operation_id: self.inner.operation_id,
-                cohort_set_digest: self.inner.sealed.digest(),
-                aggregate_digest,
-                evidence,
-                context,
-            })
+        let request = ConnectorWriteReconcileRequest {
+            owner: self.inner.owner.clone(),
+            operation_id: self.inner.operation_id,
+            cohort_set_digest: self.inner.sealed.digest(),
+            aggregate_digest,
+            fence,
+            evidence,
+            context,
+        };
+        request.validate_fence()?;
+        self.inner.lease.control().reconcile(request)
     }
 
     /// Restore an opaque provider-durable attempt solely so operation-wide
@@ -752,15 +794,18 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
-        ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
-        ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteControl,
+        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorClusterIdentity,
+        ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+        ConnectorExecutionDistribution, ConnectorExternalFenceFailure,
+        ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,
+        ConnectorExternalFenceRequest, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
+        ConnectorTableIdentity, ConnectorWriteBaseVersion, ConnectorWriteControl,
         ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
         ConnectorWriteIntent, ConnectorWritePlan, ConnectorWritePlanningRequest,
-        ConnectorWritePreparation, ConnectorWriterHandle, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState, ExternalMutationFinalization,
+        ConnectorWritePreparation, ConnectorWriteTargetRef, ConnectorWriterHandle,
+        ConnectorWriterIdentity, ConnectorWriterTerminalState, ExternalMutationFinalization,
     };
 
     use super::*;
@@ -807,11 +852,24 @@ mod tests {
         plan_calls: Arc<AtomicUsize>,
         commit_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
+        fence_calls: Arc<AtomicUsize>,
     }
 
     impl ConnectorWriteControl for TestControl {
         fn binding_key(&self) -> &ConnectorExecutionBindingKey {
             &self.key
+        }
+
+        fn establish_external_fence(
+            &self,
+            request: ConnectorExternalFenceRequest,
+        ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
+            self.fence_calls.fetch_add(1, Ordering::SeqCst);
+            request.validate(&self.key)?;
+            ConnectorExternalFenceReceipt::try_new(
+                &request.fence,
+                Bytes::from_static(b"session-test-fence-marker"),
+            )
         }
 
         fn plan_write(
@@ -950,12 +1008,29 @@ mod tests {
         commit_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
     ) -> ConnectorWriteLease {
+        lease_with_fence_calls(
+            release_calls,
+            plan_calls,
+            commit_calls,
+            abort_calls,
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    fn lease_with_fence_calls(
+        release_calls: Arc<AtomicUsize>,
+        plan_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
+        abort_calls: Arc<AtomicUsize>,
+        fence_calls: Arc<AtomicUsize>,
+    ) -> ConnectorWriteLease {
         let key = owner();
         let control: Arc<dyn ConnectorWriteControl> = Arc::new(TestControl {
             key: key.clone(),
             plan_calls,
             commit_calls,
             abort_calls,
+            fence_calls,
         });
         ConnectorWriteLease::new_with_execution_distribution(
             key.clone(),
@@ -966,6 +1041,32 @@ mod tests {
             },
         )
         .expect("exact write lease")
+    }
+
+    fn fence(
+        operation_id: ConnectorWriteOperationId,
+        epoch: u64,
+        attempt: u64,
+    ) -> ConnectorExternalOperationFence {
+        ConnectorExternalOperationFence::try_new(
+            ConnectorClusterIdentity::derive("session-test-cluster").expect("cluster identity"),
+            ConnectorExternalFenceGeneration::try_new(1, epoch, attempt).expect("generation"),
+            operation_id,
+            [4; 16],
+            ConnectorTableIdentity {
+                instance_id: owner().instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            ConnectorWriteTargetRef::main(),
+        )
+        .expect("external operation fence")
+    }
+
+    fn establish_fence(session: &ConnectorWriteOperationSession) {
+        session
+            .establish_external_fence(fence(session.operation_id(), 1, 1), context())
+            .expect("establish the external operation fence before dispatch");
     }
 
     fn execution(attempt: u64) -> QueryExecutionId {
@@ -1537,6 +1638,7 @@ mod tests {
         .expect("two cohorts");
         let session = ConnectorWriteOperationSession::try_begin(registration, exact_lease)
             .expect("sealed operation session");
+        establish_fence(&session);
 
         let commit_error = session
             .commit(context())
@@ -1592,6 +1694,7 @@ mod tests {
             exact_lease,
         )
         .expect("sealed operation session");
+        establish_fence(&session);
 
         session
             .finish_known_empty_noop()
@@ -1680,5 +1783,190 @@ mod tests {
                 .to_string()
                 .contains("accepted or superseded")
         );
+    }
+
+    #[test]
+    fn unfenced_operation_cannot_reach_any_provider_terminal_path() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([13; 16]);
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let commit_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&commit_calls),
+            Arc::clone(&abort_calls),
+        );
+        let session = ConnectorWriteOperationSession::try_begin(
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                exact_lease.clone(),
+            )),
+            exact_lease,
+        )
+        .expect("sealed operation session");
+        assert!(
+            session
+                .established_external_fence()
+                .expect("fence state")
+                .is_none()
+        );
+
+        // A recovery session restored from a durable commit decision is the
+        // only shape that can reach `reconcile`, so it needs its own session.
+        let recovery_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&commit_calls),
+            Arc::clone(&abort_calls),
+        );
+        let recovery = ConnectorWriteOperationSession::try_begin(
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                recovery_lease.clone(),
+            )),
+            recovery_lease,
+        )
+        .expect("sealed recovery session");
+        recovery
+            .restore_for_reconcile([0x88; 32])
+            .expect("durable aggregate decision");
+
+        for error in [
+            session.commit(context()).expect_err("unfenced commit"),
+            session.abort(context()).expect_err("unfenced abort"),
+            session
+                .finish_known_empty_noop()
+                .expect_err("unfenced known-empty abort"),
+            recovery
+                .reconcile(evidence(), context())
+                .expect_err("unfenced reconcile"),
+        ] {
+            assert_eq!(
+                error.external_fence_failure(),
+                Some(ConnectorExternalFenceFailure::NotEstablished),
+                "unexpected unfenced terminal error: {error}"
+            );
+            assert!(!error.retryable_before_progress());
+        }
+        assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fence_establishment_is_idempotent_monotonic_and_rejects_a_foreign_operation() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([14; 16]);
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let fence_calls = Arc::new(AtomicUsize::new(0));
+        let exact_lease = lease_with_fence_calls(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&fence_calls),
+        );
+        let session = ConnectorWriteOperationSession::try_begin(
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                exact_lease.clone(),
+            )),
+            exact_lease,
+        )
+        .expect("sealed operation session");
+
+        let established = fence(operation_id, 2, 1);
+        let acknowledged = session
+            .establish_external_fence(established.clone(), context())
+            .expect("establish the external fence");
+        assert_eq!(acknowledged.fence(), &established);
+        assert!(acknowledged.receipt().matches(&established));
+        let replay = session
+            .establish_external_fence(established.clone(), context())
+            .expect("the identical fence replay is idempotent");
+        assert_eq!(replay, acknowledged);
+        assert_eq!(fence_calls.load(Ordering::SeqCst), 2);
+
+        let stale = session
+            .establish_external_fence(fence(operation_id, 1, 1), context())
+            .expect_err("a lower generation cannot replace an established fence");
+        assert_eq!(
+            stale.external_fence_failure(),
+            Some(ConnectorExternalFenceFailure::Stale)
+        );
+        assert!(!stale.retryable_before_progress());
+        assert_eq!(
+            fence_calls.load(Ordering::SeqCst),
+            2,
+            "a stale fence must be rejected before the provider is contacted"
+        );
+
+        let foreign = session
+            .establish_external_fence(
+                fence(ConnectorWriteOperationId::from_bytes([15; 16]), 9, 9),
+                context(),
+            )
+            .expect_err("a fence for another operation is refused");
+        assert_eq!(
+            foreign.external_fence_failure(),
+            Some(ConnectorExternalFenceFailure::ForeignOperation)
+        );
+
+        let raised = fence(operation_id, 3, 1);
+        session
+            .establish_external_fence(raised.clone(), context())
+            .expect("a strictly higher generation supersedes");
+        let stored = session
+            .established_external_fence()
+            .expect("fence state")
+            .expect("an established fence");
+        assert_eq!(stored.fence(), &raised);
+        assert!(stored.receipt().matches(&raised));
+    }
+
+    #[test]
+    fn fenced_abort_carries_the_established_fence_to_the_provider() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([16; 16]);
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&abort_calls),
+        );
+        let session = ConnectorWriteOperationSession::try_begin(
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                exact_lease.clone(),
+            )),
+            exact_lease,
+        )
+        .expect("sealed operation session");
+        establish_fence(&session);
+
+        assert!(matches!(
+            session.abort(context()).expect("fenced abort"),
+            ConnectorWriteAbortOutcome::KnownUncommitted { .. }
+        ));
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn evidence() -> ExternalMutationEvidence {
+        ExternalMutationEvidence::try_new(
+            1,
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("session-test").expect("provider id"),
+                instance_id: owner().instance_id,
+            },
+            owner().incarnation,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            "write",
+            Bytes::from_static(b"evidence"),
+        )
+        .expect("external mutation evidence")
     }
 }

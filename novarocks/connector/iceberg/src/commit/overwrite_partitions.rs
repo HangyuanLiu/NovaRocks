@@ -40,9 +40,7 @@ use crate::iceberg::spec::{
     SnapshotRetention, Struct, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -51,8 +49,9 @@ use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_prope
 use super::data_file::clone_data_file_with_first_row_id;
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
+    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_fenced_action,
+    target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{
     write_added_data_manifest, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
@@ -114,7 +113,7 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
         })?;
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let action = OverwritePartitionsTxnAction {
+        let action = Arc::new(OverwritePartitionsTxnAction {
             written,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
@@ -126,48 +125,62 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
             row_lineage_added_rows,
             target_ref: ctx.target_ref.to_string(),
             snapshot_properties: ctx.snapshot_properties.clone(),
-        };
+        });
 
         let sketch_sets = ctx.collector.take_sketch_sets();
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-
-        let tx = Transaction::new(ctx.table);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("OverwritePartitions apply failed: {e}"))?;
-        let table_after = tx
-            .commit(ctx.catalog)
-            .await
-            .map_err(|e| format!("OverwritePartitions commit failed: {e}"))?;
-        let new_snapshot_id = match required_target_ref_snapshot_id(
-            table_after.metadata(),
-            ctx.target_ref,
-            "OverwritePartitions",
-        ) {
-            Ok(snapshot_id) => snapshot_id,
-            Err(err) if prev_snapshot_id.is_none() => 0,
-            Err(err) => return Err(err),
+        let written_manifest_paths = || {
+            manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .clone()
         };
-        let new_sequence_number = table_after.metadata().last_sequence_number();
-        register_puffin_stats(
-            &table_after,
+
+        match submit_fenced_action(
             ctx.catalog,
-            ctx.file_io,
-            CommitType::Overwrite,
-            sketch_sets,
-            new_snapshot_id,
-            new_sequence_number,
-            prev_snapshot_id,
+            ctx.table,
+            action,
+            ctx.fence,
+            "OverwritePartitions",
         )
-        .await;
-        let written_manifest_paths = manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .clone();
-        Ok(CommitOutcome {
-            new_snapshot_id,
-            written_manifest_paths,
-        })
+        .await
+        {
+            Ok(FencedSubmit::Committed(table_after)) => {
+                let new_snapshot_id = match required_target_ref_snapshot_id(
+                    table_after.metadata(),
+                    ctx.target_ref,
+                    "OverwritePartitions",
+                ) {
+                    Ok(snapshot_id) => snapshot_id,
+                    Err(_) if prev_snapshot_id.is_none() => 0,
+                    Err(err) => return Err(err),
+                };
+                let new_sequence_number = table_after.metadata().last_sequence_number();
+                register_puffin_stats(
+                    &table_after,
+                    ctx.catalog,
+                    ctx.file_io,
+                    CommitType::Overwrite,
+                    sketch_sets,
+                    new_snapshot_id,
+                    new_sequence_number,
+                    prev_snapshot_id,
+                )
+                .await;
+                Ok(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: written_manifest_paths(),
+                })
+            }
+            // The action always stages a snapshot, so this arm reports the same
+            // outcome an unchanged target ref has: the previous snapshot id, or
+            // 0 when the ref does not exist yet.
+            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+                new_snapshot_id: prev_snapshot_id.unwrap_or(0),
+                written_manifest_paths: written_manifest_paths(),
+            }),
+            Err(error) => Err(error.into_detail()),
+        }
     }
 }
 

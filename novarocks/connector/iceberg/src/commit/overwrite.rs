@@ -46,9 +46,7 @@ use crate::iceberg::spec::{
     SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -56,8 +54,9 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
+    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_fenced_action,
+    target_ref_snapshot_id, write_manifest_list,
 };
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -68,92 +67,76 @@ pub struct OverwriteCommit;
 #[async_trait]
 impl IcebergCommitAction for OverwriteCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
-        let written = ctx.collector.take_written_files()?;
-        for f in &written {
-            if f.content != DataContentType::Data {
-                return Err(format!(
-                    "OverwriteCommit received {:?} content; expected Data only",
-                    f.content
-                ));
-            }
-        }
-        let row_lineage_first_row_id = match crate::commit::classify_iceberg_write_mode(ctx.table) {
-            IcebergWriteMode::RowLineageV3 => Some(effective_next_row_id(ctx.table.metadata())?),
-            IcebergWriteMode::LegacyPositionDeletes => None,
-        };
-        let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
-            sum.checked_add(f.record_count)
-                .ok_or_else(|| "row-lineage added row count overflow".to_string())
-        })?;
-        let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let action = OverwriteTxnAction {
-            written,
-            commit_uuid: ctx.commit_uuid,
-            file_io: ctx.file_io.clone(),
-            partition_spec: ctx.collector.partition_spec.clone(),
-            schema_id: ctx.table.metadata().current_schema_id(),
-            abort_handle: ctx.abort_handle.clone(),
-            manifest_paths_out: manifest_paths_out.clone(),
-            row_lineage_first_row_id,
-            row_lineage_added_rows,
-            target_ref: ctx.target_ref.to_string(),
-            snapshot_properties: ctx.snapshot_properties.clone(),
-        };
+        let staged = prepare_overwrite_action(&ctx)?;
         let sketch_sets = ctx.collector.take_sketch_sets();
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        let tx = Transaction::new(ctx.table);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("Overwrite apply failed: {e}"))?;
-        let table_after = tx
-            .commit(ctx.catalog)
-            .await
-            .map_err(|e| format!("Overwrite commit failed: {e}"))?;
-        let new_snapshot_id = match required_target_ref_snapshot_id(
-            table_after.metadata(),
-            ctx.target_ref,
-            "Overwrite",
-        ) {
-            Ok(snapshot_id) => snapshot_id,
-            Err(err) if prev_snapshot_id.is_none() => 0,
-            Err(err) => return Err(err),
-        };
-        let new_sequence_number = table_after.metadata().last_sequence_number();
-        register_puffin_stats(
-            &table_after,
+        match submit_fenced_action(
             ctx.catalog,
-            ctx.file_io,
-            CommitType::Overwrite,
-            sketch_sets,
-            new_snapshot_id,
-            new_sequence_number,
-            prev_snapshot_id,
+            ctx.table,
+            Arc::clone(&staged.action),
+            ctx.fence,
+            "Overwrite",
         )
-        .await;
-        let written_manifest_paths = manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .clone();
-        Ok(CommitOutcome {
-            new_snapshot_id,
-            written_manifest_paths,
-        })
+        .await
+        {
+            Ok(FencedSubmit::Committed(table_after)) => {
+                let new_snapshot_id = match required_target_ref_snapshot_id(
+                    table_after.metadata(),
+                    ctx.target_ref,
+                    "Overwrite",
+                ) {
+                    Ok(snapshot_id) => snapshot_id,
+                    Err(_) if prev_snapshot_id.is_none() => 0,
+                    Err(err) => return Err(err),
+                };
+                let new_sequence_number = table_after.metadata().last_sequence_number();
+                register_puffin_stats(
+                    &table_after,
+                    ctx.catalog,
+                    ctx.file_io,
+                    CommitType::Overwrite,
+                    sketch_sets,
+                    new_snapshot_id,
+                    new_sequence_number,
+                    prev_snapshot_id,
+                )
+                .await;
+                Ok(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: staged.written_manifest_paths(),
+                })
+            }
+            // Empty input over an empty base with no provider properties: the
+            // action proved there is nothing to publish, so the target ref
+            // stays where it was (0 when it does not exist yet).
+            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+                new_snapshot_id: prev_snapshot_id.unwrap_or(0),
+                written_manifest_paths: staged.written_manifest_paths(),
+            }),
+            Err(error) => Err(error.into_detail()),
+        }
     }
 }
 
-/// Provider-owned overwrite changes prepared without submitting a catalog
-/// update. Atomic managed repartition prepends its partition-spec updates and
-/// submits this snapshot action in the same `TableCommit`.
-pub(crate) struct StagedOverwriteAction<'a> {
-    pub action: ActionCommit,
-    pub outcome: CommitOutcome,
-    pub table_ident: crate::iceberg::TableIdent,
-    pub catalog: &'a dyn crate::iceberg::Catalog,
+/// One overwrite snapshot staged against `ctx`, not yet submitted.
+struct PreparedOverwriteAction {
+    action: Arc<OverwriteTxnAction>,
+    manifest_paths_out: Arc<Mutex<Vec<String>>>,
 }
 
-pub(crate) async fn build_staged_overwrite_action(
-    ctx: CommitCtx<'_>,
-) -> Result<StagedOverwriteAction<'_>, String> {
+impl PreparedOverwriteAction {
+    fn written_manifest_paths(&self) -> Vec<String> {
+        self.manifest_paths_out
+            .lock()
+            .expect("manifest_paths_out poisoned")
+            .clone()
+    }
+}
+
+/// Build the overwrite action for `ctx`. Shared by the ordinary overwrite
+/// commit and by atomic managed repartition, which submits the same action
+/// inside its own `TableCommit`.
+fn prepare_overwrite_action(ctx: &CommitCtx<'_>) -> Result<PreparedOverwriteAction, String> {
     let written = ctx.collector.take_written_files()?;
     for f in &written {
         if f.content != DataContentType::Data {
@@ -171,9 +154,8 @@ pub(crate) async fn build_staged_overwrite_action(
         sum.checked_add(f.record_count)
             .ok_or_else(|| "row-lineage added row count overflow".to_string())
     })?;
-
     let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let action = OverwriteTxnAction {
+    let action = Arc::new(OverwriteTxnAction {
         written,
         commit_uuid: ctx.commit_uuid,
         file_io: ctx.file_io.clone(),
@@ -185,9 +167,28 @@ pub(crate) async fn build_staged_overwrite_action(
         row_lineage_added_rows,
         target_ref: ctx.target_ref.to_string(),
         snapshot_properties: ctx.snapshot_properties.clone(),
-    };
+    });
+    Ok(PreparedOverwriteAction {
+        action,
+        manifest_paths_out,
+    })
+}
 
-    let mut staged = Arc::new(action)
+/// Provider-owned overwrite changes prepared without submitting a catalog
+/// update. Atomic managed repartition prepends its partition-spec updates and
+/// submits this snapshot action in the same `TableCommit`.
+pub(crate) struct StagedOverwriteAction<'a> {
+    pub action: ActionCommit,
+    pub outcome: CommitOutcome,
+    pub table_ident: crate::iceberg::TableIdent,
+    pub catalog: &'a dyn crate::iceberg::Catalog,
+}
+
+pub(crate) async fn build_staged_overwrite_action(
+    ctx: CommitCtx<'_>,
+) -> Result<StagedOverwriteAction<'_>, String> {
+    let prepared = prepare_overwrite_action(&ctx)?;
+    let mut staged = Arc::clone(&prepared.action)
         .commit(ctx.table)
         .await
         .map_err(|e| format!("Overwrite apply failed: {e}"))?;
@@ -200,10 +201,7 @@ pub(crate) async fn build_staged_overwrite_action(
             _ => None,
         })
         .ok_or_else(|| "staged overwrite did not build an add-snapshot update".to_string())?;
-    let written_manifest_paths = manifest_paths_out
-        .lock()
-        .expect("manifest_paths_out poisoned")
-        .clone();
+    let written_manifest_paths = prepared.written_manifest_paths();
     Ok(StagedOverwriteAction {
         action: ActionCommit::new(updates, requirements),
         outcome: CommitOutcome {
@@ -792,4 +790,207 @@ fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
 #[allow(dead_code)]
 fn _check_status_variant_referenced() {
     let _ = ManifestStatus::Deleted;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use super::*;
+    use crate::commit::CommitOpKind;
+    use crate::commit::collector::IcebergCommitCollector;
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, PrimitiveType, Schema, Type as IcebergType,
+    };
+    use crate::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+
+    struct LocalTableFixture {
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+        _warehouse: tempfile::TempDir,
+    }
+
+    async fn empty_local_table(format_version: FormatVersion) -> LocalTableFixture {
+        let warehouse = tempfile::tempdir().expect("warehouse tempdir");
+        let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
+        let catalog: Arc<dyn Catalog> =
+            Arc::new(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
+                crate::fs_io::build_file_io_for_location(&warehouse_uri, None),
+                warehouse_uri,
+            ));
+        let namespace = NamespaceIdent::new("db".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                IcebergType::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("build schema");
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .format_version(format_version)
+                    .build(),
+            )
+            .await
+            .expect("create table");
+        LocalTableFixture {
+            catalog,
+            table_ident: TableIdent::new(namespace, "t".to_string()),
+            _warehouse: warehouse,
+        }
+    }
+
+    /// An overwrite with no written files over an empty base stages no updates
+    /// at all. `submit_action_commit` recognises that as a proven no-op and
+    /// never reaches the catalog, so the reported snapshot id must stay the
+    /// unchanged target ref — 0 while `main` does not exist yet — exactly as it
+    /// was before the fenced-submit cut-over.
+    #[tokio::test]
+    async fn empty_overwrite_over_an_empty_base_reports_snapshot_zero_without_committing() {
+        let fixture = empty_local_table(FormatVersion::V2).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table");
+        let metadata = table.metadata().clone();
+        assert!(
+            metadata.current_snapshot().is_none(),
+            "fixture must start with no snapshot"
+        );
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::Overwrite,
+            fixture.table_ident.clone(),
+            None,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/data/_staging/test", metadata.location()),
+        );
+        let snapshot_properties = BTreeMap::new();
+        let abort_handle = collector.abort_log.clone();
+        let outcome = OverwriteCommit
+            .commit(CommitCtx {
+                collector: &collector,
+                table: &table,
+                catalog: fixture.catalog.as_ref(),
+                file_io: table.file_io(),
+                commit_uuid: Uuid::now_v7(),
+                abort_handle,
+                target_ref: "main",
+                snapshot_properties: &snapshot_properties,
+                fence: None,
+            })
+            .await
+            .expect("empty overwrite must succeed as a no-op");
+
+        assert_eq!(
+            outcome.new_snapshot_id, 0,
+            "a no-op overwrite over a ref that does not exist reports snapshot id 0"
+        );
+        assert!(
+            outcome.written_manifest_paths.is_empty(),
+            "a no-op overwrite writes no manifests, got {:?}",
+            outcome.written_manifest_paths
+        );
+        let reloaded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload table");
+        assert!(
+            reloaded.metadata().current_snapshot().is_none(),
+            "a no-op overwrite must not publish a snapshot"
+        );
+    }
+
+    /// The same no-op over a base that already has a snapshot reports that
+    /// snapshot id back, unchanged.
+    #[tokio::test]
+    async fn empty_overwrite_over_a_populated_base_reports_the_previous_snapshot_id() {
+        let fixture = empty_local_table(FormatVersion::V2).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table");
+        let metadata = table.metadata().clone();
+        // Publish one data-free snapshot so `main` exists and the overwrite has
+        // a previous snapshot id to report back.
+        let marker_collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            fixture.table_ident.clone(),
+            None,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/data/_staging/test", metadata.location()),
+        );
+        let marker_properties =
+            BTreeMap::from([("novarocks.test.marker".to_string(), "true".to_string())]);
+        let marker_abort = marker_collector.abort_log.clone();
+        let marker = super::super::fast_append::commit_empty_iceberg_mv_snapshot(CommitCtx {
+            collector: &marker_collector,
+            table: &table,
+            catalog: fixture.catalog.as_ref(),
+            file_io: table.file_io(),
+            commit_uuid: Uuid::now_v7(),
+            abort_handle: marker_abort,
+            target_ref: "main",
+            snapshot_properties: &marker_properties,
+            fence: None,
+        })
+        .await
+        .expect("publish the marker snapshot");
+        assert_ne!(marker.new_snapshot_id, 0);
+
+        let table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload table after marker");
+        let metadata = table.metadata().clone();
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::Overwrite,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/data/_staging/test", metadata.location()),
+        );
+        let snapshot_properties = BTreeMap::new();
+        let abort_handle = collector.abort_log.clone();
+        let outcome = OverwriteCommit
+            .commit(CommitCtx {
+                collector: &collector,
+                table: &table,
+                catalog: fixture.catalog.as_ref(),
+                file_io: table.file_io(),
+                commit_uuid: Uuid::now_v7(),
+                abort_handle,
+                target_ref: "main",
+                snapshot_properties: &snapshot_properties,
+                fence: None,
+            })
+            .await
+            .expect("empty overwrite over a populated base must succeed");
+
+        // The base is not empty here, so the action stages a real overwrite
+        // snapshot rather than short-circuiting; either way the commit must
+        // report a visible target-ref snapshot, never 0.
+        assert_ne!(
+            outcome.new_snapshot_id, 0,
+            "an overwrite over an existing ref never reports snapshot id 0"
+        );
+    }
 }

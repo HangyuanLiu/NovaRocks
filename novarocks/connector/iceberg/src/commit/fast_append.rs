@@ -15,10 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `Transaction::fast_append` wrapper for INSERT INTO. V2 tables delegate to
-//! iceberg-rust's built-in fast append action; V3 row-lineage tables use a
-//! custom action so manifest-list `first_row_id` and snapshot row ranges are
-//! populated for subsequent `_row_id` scans and deletion-vector commits.
+//! Self-assembled fast-append action for INSERT INTO.
+//!
+//! Every append — v2 and v3 — is staged by `FastAppendV3TxnAction` and
+//! submitted through `helpers::submit_fenced_action`. iceberg-rust's built-in
+//! `Transaction::fast_append` is deliberately unused: `Transaction::commit`
+//! re-runs every action against the base it just reloaded and therefore
+//! recomputes each requirement from the value it is about to assert, which can
+//! never reject a stale writer carrying an external write fence. V3
+//! row-lineage tables additionally need the custom action so manifest-list
+//! `first_row_id` and snapshot row ranges are populated for subsequent
+//! `_row_id` scans and deletion-vector commits; v2 tables pass
+//! `row_lineage: None` and stay free of every row-lineage field.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -29,19 +37,17 @@ use crate::iceberg::spec::{
     SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::data_file::written_file_to_iceberg_data_file;
 use super::helpers::{
-    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    read_snapshot_manifest_list, required_target_ref_snapshot_id, snapshot_summary,
-    snapshot_total_records, target_ref_snapshot_id, write_manifest_list,
+    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
+    snapshot_summary, snapshot_total_records, submit_fenced_action, target_ref_snapshot_id,
+    write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -77,27 +83,15 @@ pub(crate) async fn commit_empty_iceberg_mv_snapshot(
         ));
     }
 
-    let tx = Transaction::new(ctx.table);
-    let action = tx
-        .fast_append()
-        .set_commit_uuid(ctx.commit_uuid)
-        .set_snapshot_properties(ctx.snapshot_properties.clone().into_iter().collect());
-    let tx = action
-        .apply(tx)
-        .map_err(|e| format!("empty MV fast_append apply failed: {e}"))?;
-    let table_after = tx
-        .commit(ctx.catalog)
-        .await
-        .map_err(|e| format!("empty MV fast_append commit failed: {e}"))?;
-    let new_snapshot_id = table_after
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id())
-        .ok_or_else(|| "empty MV fast_append produced no current snapshot".to_string())?;
-    Ok(CommitOutcome {
-        new_snapshot_id,
-        written_manifest_paths: vec![],
-    })
+    let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
+    commit_self_assembled_append(
+        ctx,
+        Vec::new(),
+        None,
+        prev_snapshot_id,
+        "empty MV fast_append",
+    )
+    .await
 }
 
 #[async_trait]
@@ -136,52 +130,10 @@ impl IcebergCommitAction for FastAppendCommit {
             ));
         }
 
-        let data_files: Vec<crate::iceberg::spec::DataFile> = written
-            .iter()
-            .map(|f| written_file_to_iceberg_data_file(f, ctx.collector))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let sketch_sets = ctx.collector.take_sketch_sets();
+        // V2 tables carry no row lineage at all: `row_lineage: None` keeps the
+        // manifest list and snapshot free of `first_row_id` / row-range fields.
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-
-        let tx = Transaction::new(ctx.table);
-        let action = tx
-            .fast_append()
-            .add_data_files(data_files)
-            .set_commit_uuid(ctx.commit_uuid)
-            .set_snapshot_properties(ctx.snapshot_properties.clone().into_iter().collect());
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("fast_append apply failed: {e}"))?;
-        let table_after = tx
-            .commit(ctx.catalog)
-            .await
-            .map_err(|e| format!("fast_append commit failed: {e}"))?;
-        let new_snapshot_id = table_after
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            .ok_or_else(|| "fast_append committed but new snapshot not visible".to_string())?;
-        let new_sequence_number = table_after.metadata().last_sequence_number();
-        // Best-effort Puffin NDV registration; failure must not abort the
-        // commit because data is already published.
-        register_puffin_stats(
-            &table_after,
-            ctx.catalog,
-            ctx.file_io,
-            CommitType::Append,
-            sketch_sets,
-            new_snapshot_id,
-            new_sequence_number,
-            prev_snapshot_id,
-        )
-        .await;
-        Ok(CommitOutcome {
-            new_snapshot_id,
-            // FastAppendAction owns its manifest lifecycle; nothing for us
-            // to clean up on later abort.
-            written_manifest_paths: vec![],
-        })
+        commit_self_assembled_append(ctx, written, None, prev_snapshot_id, "fast_append").await
     }
 }
 
@@ -282,8 +234,38 @@ async fn commit_v3_row_lineage_append(
         sum.checked_add(f.record_count)
             .ok_or_else(|| "row-lineage added row count overflow".to_string())
     })?;
+    let prev_snapshot_id = ctx
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+    commit_self_assembled_append(
+        ctx,
+        written,
+        Some((row_lineage_first_row_id, row_lineage_added_rows)),
+        prev_snapshot_id,
+        "fast_append v3",
+    )
+    .await
+}
+
+/// Stage one self-assembled append against the live base and submit it under
+/// this attempt's external write fence.
+///
+/// `row_lineage` is `Some` only for v3 row-lineage tables; v2 passes `None` and
+/// therefore produces no row-lineage fields at all. `prev_snapshot_id` is the
+/// Puffin-statistics predecessor each caller already resolves, so the two
+/// callers keep their existing (and deliberately different) notion of
+/// "previous snapshot".
+async fn commit_self_assembled_append(
+    ctx: CommitCtx<'_>,
+    written: Vec<WrittenFile>,
+    row_lineage: Option<(u64, u64)>,
+    prev_snapshot_id: Option<i64>,
+    label: &str,
+) -> Result<CommitOutcome, String> {
     let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let action = FastAppendV3TxnAction {
+    let action = Arc::new(FastAppendV3TxnAction {
         written,
         commit_uuid: ctx.commit_uuid,
         file_io: ctx.file_io.clone(),
@@ -292,50 +274,55 @@ async fn commit_v3_row_lineage_append(
         schema_id: ctx.table.metadata().current_schema_id(),
         abort_handle: ctx.abort_handle.clone(),
         manifest_paths_out: manifest_paths_out.clone(),
-        row_lineage: Some((row_lineage_first_row_id, row_lineage_added_rows)),
+        row_lineage,
         target_ref: ctx.target_ref.to_string(),
         snapshot_properties: ctx.snapshot_properties.clone(),
         #[cfg(test)]
         fail_before_manifest_list_write: false,
-    };
+    });
 
     let sketch_sets = ctx.collector.take_sketch_sets();
-    let prev_snapshot_id = ctx
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
 
-    let tx = Transaction::new(ctx.table);
-    let tx = action
-        .apply(tx)
-        .map_err(|e| format!("fast_append v3 apply failed: {e}"))?;
-    let table_after = tx
-        .commit(ctx.catalog)
-        .await
-        .map_err(|e| format!("fast_append v3 commit failed: {e}"))?;
-    let new_snapshot_id =
-        required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, "fast_append v3")?;
-    let new_sequence_number = table_after.metadata().last_sequence_number();
-    register_puffin_stats(
-        &table_after,
-        ctx.catalog,
-        ctx.file_io,
-        CommitType::Append,
-        sketch_sets,
-        new_snapshot_id,
-        new_sequence_number,
-        prev_snapshot_id,
-    )
-    .await;
-    let written_manifest_paths = manifest_paths_out
+    match submit_fenced_action(ctx.catalog, ctx.table, action, ctx.fence, label).await {
+        Ok(FencedSubmit::Committed(table_after)) => {
+            let new_snapshot_id =
+                required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, label)?;
+            let new_sequence_number = table_after.metadata().last_sequence_number();
+            // Best-effort Puffin NDV registration; failure must not abort the
+            // commit because data is already published.
+            register_puffin_stats(
+                &table_after,
+                ctx.catalog,
+                ctx.file_io,
+                CommitType::Append,
+                sketch_sets,
+                new_snapshot_id,
+                new_sequence_number,
+                prev_snapshot_id,
+            )
+            .await;
+            Ok(CommitOutcome {
+                new_snapshot_id,
+                written_manifest_paths: collected_manifest_paths(&manifest_paths_out),
+            })
+        }
+        // An append always stages `AddSnapshot` + `SetSnapshotRef`, so it never
+        // proves itself a no-op. Report the same outcome an empty append input
+        // reports at the entry points above rather than inventing a new one.
+        Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+            new_snapshot_id: target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref)
+                .unwrap_or(0),
+            written_manifest_paths: collected_manifest_paths(&manifest_paths_out),
+        }),
+        Err(error) => Err(error.into_detail()),
+    }
+}
+
+fn collected_manifest_paths(manifest_paths_out: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    manifest_paths_out
         .lock()
         .expect("manifest_paths_out poisoned")
-        .clone();
-    Ok(CommitOutcome {
-        new_snapshot_id,
-        written_manifest_paths,
-    })
+        .clone()
 }
 
 /// Snapshot changes built against an invisible staged table. The caller owns

@@ -443,6 +443,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     target_ref,
                     snapshot_properties,
                     atomic_partition_replacement: None,
+                    fence: None,
                 })
                 .await
             })

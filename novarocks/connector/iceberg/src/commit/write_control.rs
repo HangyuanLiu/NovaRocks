@@ -68,10 +68,17 @@ use crate::write_codec::{
 };
 use crate::write_payload::{IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1};
 
+use super::write_fence::{
+    FenceError, IcebergFenceAssertion, IcebergWriteFenceFacts, derive_established_assertion,
+    establish_fence, fence_facts_from_spi,
+};
 use super::{
     CommitOpKind, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
     DeletionVector, EqualityDeleteColumn, IcebergCommitCollector, RecoveryEvidence, RunInput,
     WrittenFile, run_iceberg_commit,
+};
+use novarocks_spi::connector::{
+    ConnectorExternalFenceFailure, ConnectorExternalFenceReceipt, ConnectorExternalFenceRequest,
 };
 
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;
@@ -1099,6 +1106,29 @@ impl IcebergWriteControl {
         }
     }
 
+    /// Load the fenced resource named by the fence itself.
+    ///
+    /// The fence carries its own resource identity, so establishing a fence does
+    /// not require an activated operation: a recovering owner must be able to
+    /// raise a fence for an operation whose runtime state it never had.
+    /// Deliberately does *not* go through `load_exact_commit_table`: that helper
+    /// asserts the table still matches an exact sealed preparation, which a
+    /// recovering owner does not have and must not need in order to fence.
+    fn load_fence_table(
+        &self,
+        facts: &IcebergWriteFenceFacts,
+    ) -> Result<crate::iceberg::table::Table, ConnectorError> {
+        self.runtime
+            .control_state()
+            .physical_table_cache()
+            .invalidate(&facts.namespace, &facts.table_name);
+        Ok(self
+            .runtime
+            .load_table(&facts.namespace, &facts.table_name)
+            .map_err(unavailable)?
+            .table)
+    }
+
     fn load_exact_commit_table(
         &self,
         target: &ActiveTarget,
@@ -1202,10 +1232,9 @@ impl IcebergWriteControl {
         &self,
         request: &ConnectorWriteCommitRequest,
         active: &ActiveOperation,
+        table: crate::iceberg::table::Table,
+        fence: IcebergFenceAssertion,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, CommitServiceError> {
-        let table = self
-            .load_exact_commit_table(&active.target)
-            .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
         let metadata = table.metadata().clone();
         let commit_metadata = active
             .partition_replacement
@@ -1341,6 +1370,7 @@ impl IcebergWriteControl {
                 })
                 .transpose()
                 .map_err(CommitServiceError::invalid_input)?,
+            fence: Some(fence),
         };
         let result = self
             .runtime
@@ -1665,6 +1695,46 @@ impl ConnectorWriteControl for IcebergWriteControl {
         &self.key
     }
 
+    /// Publish this attempt's fence marker so that a later commit can assert it
+    /// atomically.
+    ///
+    /// The marker is published on a provider-private ref derived from the stable
+    /// write operation id, so establishing a fence never contends with an
+    /// unrelated concurrent operation on the same table. Replaying the identical
+    /// fence reuses the existing marker; a lower generation, another operation's
+    /// marker, or an uninterpretable marker all refuse.
+    ///
+    /// Design: ADR-0064 (docs/adr/ADR-0064-external-write-fence-as-catalog-linearization-point.md)
+    fn establish_external_fence(
+        &self,
+        request: ConnectorExternalFenceRequest,
+    ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
+        validate_context(&request.context)?;
+        self.ensure_owner(&request.owner)?;
+        request.validate(&self.key)?;
+
+        let facts = fence_facts_from_spi(&request.fence);
+        let table = self
+            .load_fence_table(&facts)
+            .map_err(|error| invalid(error.to_string()))?;
+        let file_io = table.file_io().clone();
+        let catalog = Arc::clone(self.runtime.catalog());
+        let established = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(
+                async move { establish_fence(catalog.as_ref(), &table, &file_io, &facts).await },
+            )
+            .map_err(|error| internal(format!("Iceberg fence establishment: {error}")))?
+            .map_err(fence_failure_to_connector_error)?;
+
+        ConnectorExternalFenceReceipt::try_new(
+            &request.fence,
+            encode_fence_receipt_payload(&established.assertion),
+        )
+    }
+
     fn prepare_write(
         &self,
         request: ConnectorWritePreparationRequest,
@@ -1888,83 +1958,121 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 }
             }
         };
-        let (outcome, known_uncommitted_finalization) = match self.execute_commit(&request, &active)
-        {
-            Ok(outcome) => (outcome, None),
-            Err(CommitServiceError::InvalidInput { message }) => {
-                let mut operations = self.operations.lock().map_err(operation_lock_error)?;
-                if matches!(
-                    operations.get(&operation_id),
-                    Some(OperationState::Committing(record))
-                        if record.cohort_set_digest == request.sealed().digest()
-                            && record.aggregate_digest == request.aggregate_digest()
-                ) {
-                    operations.insert(operation_id, OperationState::Active(active.clone()));
-                }
-                return Err(invalid(message));
+        // Restore the operation to Active when a pre-dispatch check refuses the
+        // commit, so a refused attempt does not strand the operation in
+        // Committing.
+        let restore_active = || -> Result<(), ConnectorError> {
+            let mut operations = self.operations.lock().map_err(operation_lock_error)?;
+            if matches!(
+                operations.get(&operation_id),
+                Some(OperationState::Committing(record))
+                    if record.cohort_set_digest == request.sealed().digest()
+                        && record.aggregate_digest == request.aggregate_digest()
+            ) {
+                operations.insert(operation_id, OperationState::Active(active.clone()));
             }
-            Err(CommitServiceError::KnownUncommitted { message, cleanup }) => (
-                ExternalMutationOutcome::KnownUncommitted {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Conflict,
-                        format!(
-                            "{message}; staged cleanup attempted={}, errors={}",
-                            cleanup.attempted, cleanup.error_count
+            Ok(())
+        };
+
+        // The fence must already exist in external truth before this commit is
+        // allowed to touch the table. Deriving it here, at the SPI boundary,
+        // is what lets a lost fence surface as a typed stale failure instead of
+        // being laundered into an ambiguous commit-unknown outcome.
+        let table = match self.load_exact_commit_table(&active.target) {
+            Ok(table) => table,
+            Err(error) => {
+                restore_active()?;
+                return Err(invalid(error.to_string()));
+            }
+        };
+        let fence_facts = fence_facts_from_spi(&request.fence);
+        let fence_assertion = match derive_established_assertion(table.metadata(), &fence_facts) {
+            Ok(assertion) => assertion,
+            Err(error) => {
+                restore_active()?;
+                return Err(fence_failure_to_connector_error(error));
+            }
+        };
+
+        let (outcome, known_uncommitted_finalization) =
+            match self.execute_commit(&request, &active, table, fence_assertion) {
+                Ok(outcome) => (outcome, None),
+                Err(CommitServiceError::InvalidInput { message }) => {
+                    let mut operations = self.operations.lock().map_err(operation_lock_error)?;
+                    if matches!(
+                        operations.get(&operation_id),
+                        Some(OperationState::Committing(record))
+                            if record.cohort_set_digest == request.sealed().digest()
+                                && record.aggregate_digest == request.aggregate_digest()
+                    ) {
+                        operations.insert(operation_id, OperationState::Active(active.clone()));
+                    }
+                    return Err(invalid(message));
+                }
+                Err(CommitServiceError::KnownUncommitted { message, cleanup }) => (
+                    ExternalMutationOutcome::KnownUncommitted {
+                        failure: ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Conflict,
+                            format!(
+                                "{message}; staged cleanup attempted={}, errors={}",
+                                cleanup.attempted, cleanup.error_count
+                            ),
                         ),
-                    ),
-                },
-                Some(cleanup_finalization(&cleanup)),
-            ),
-            Err(CommitServiceError::Unknown { message, evidence }) => (
-                ExternalMutationOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        message,
-                    ),
-                    evidence: self.encode_commit_unknown_evidence(&request, &active, evidence)?,
-                },
-                None,
-            ),
-            Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                outcome: Some(committed),
-                finalize_error,
-                ..
-            }) => (
-                ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt: crate::write_codec::connector_write_receipt_with_partitioning(
-                        committed.new_snapshot_id,
-                        None,
-                        active
-                            .partition_replacement
-                            .as_ref()
-                            .map(|replacement| replacement.committed.clone()),
-                    )
-                    .map_err(internal)?,
-                    finalization: ExternalMutationFinalization::Failed(
-                        ConnectorMutationFailure::new(
+                    },
+                    Some(cleanup_finalization(&cleanup)),
+                ),
+                Err(CommitServiceError::Unknown { message, evidence }) => (
+                    ExternalMutationOutcome::CommitUnknown {
+                        failure: ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Unavailable,
+                            message,
+                        ),
+                        evidence: self
+                            .encode_commit_unknown_evidence(&request, &active, evidence)?,
+                    },
+                    None,
+                ),
+                Err(CommitServiceError::FinalizeFailedKnownCommitted {
+                    outcome: Some(committed),
+                    finalize_error,
+                    ..
+                }) => (
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        receipt: crate::write_codec::connector_write_receipt_with_partitioning(
+                            committed.new_snapshot_id,
+                            None,
+                            active
+                                .partition_replacement
+                                .as_ref()
+                                .map(|replacement| replacement.committed.clone()),
+                        )
+                        .map_err(internal)?,
+                        finalization: ExternalMutationFinalization::Failed(
+                            ConnectorMutationFailure::new(
+                                ConnectorMutationFailureKind::Internal,
+                                finalize_error,
+                            ),
+                        ),
+                    },
+                    None,
+                ),
+                Err(CommitServiceError::FinalizeFailedKnownCommitted {
+                    outcome: None,
+                    finalize_error,
+                    evidence,
+                }) => (
+                    ExternalMutationOutcome::CommitUnknown {
+                        failure: ConnectorMutationFailure::new(
                             ConnectorMutationFailureKind::Internal,
                             finalize_error,
                         ),
-                    ),
-                },
-                None,
-            ),
-            Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                outcome: None,
-                finalize_error,
-                evidence,
-            }) => (
-                ExternalMutationOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Internal,
-                        finalize_error,
-                    ),
-                    evidence: self.encode_commit_unknown_evidence(&request, &active, evidence)?,
-                },
-                None,
-            ),
-        };
+                        evidence: self
+                            .encode_commit_unknown_evidence(&request, &active, evidence)?,
+                    },
+                    None,
+                ),
+            };
         self.invalidate_target_caches(&active.target);
         let mut operations = self.operations.lock().map_err(operation_lock_error)?;
         let state = match &outcome {
@@ -3596,6 +3704,51 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message).with_retryable_before_progress()
 }
 
+const ICEBERG_FENCE_RECEIPT_VERSION: u8 = 1;
+
+/// Encode the provider-private half of a fence receipt.
+///
+/// The frontend stores these bytes opaquely and never decodes them; only a later
+/// generation of this provider reads them back, to name the marker an earlier
+/// attempt published without having to re-derive the ref naming rules.
+fn encode_fence_receipt_payload(assertion: &IcebergFenceAssertion) -> Bytes {
+    let mut payload = Vec::new();
+    payload.push(ICEBERG_FENCE_RECEIPT_VERSION);
+    payload.extend_from_slice(&assertion.fence_snapshot_id().to_be_bytes());
+    let fence_ref = assertion.fence_ref().as_bytes();
+    payload.extend_from_slice(&(fence_ref.len() as u32).to_be_bytes());
+    payload.extend_from_slice(fence_ref);
+    Bytes::from(payload)
+}
+
+/// Map a fence failure onto the typed SPI failure.
+///
+/// Every arm that represents "another owner holds this operation" must reach
+/// `ConnectorError::external_fence`. Mapping any of them to `Unavailable` would
+/// invite a retry under an authority we no longer hold, and mapping them to
+/// `Unsupported` would invite an unfenced fallback — the two failure modes the
+/// external fence exists to prevent.
+///
+/// `Ambiguous` and `Failed` are deliberately *not* fence failures: they mean we
+/// could not determine the fence state, which must stay a plain error so the
+/// caller keeps the operation unresolved instead of concluding anything.
+fn fence_failure_to_connector_error(error: FenceError) -> ConnectorError {
+    let message = error.to_string();
+    match error {
+        FenceError::Superseded { .. } => {
+            ConnectorError::external_fence(ConnectorExternalFenceFailure::Superseded, message)
+        }
+        FenceError::NotEstablished { .. } => {
+            ConnectorError::external_fence(ConnectorExternalFenceFailure::NotEstablished, message)
+        }
+        FenceError::MarkerConflict { .. } => {
+            ConnectorError::external_fence(ConnectorExternalFenceFailure::ForeignOperation, message)
+        }
+        FenceError::Ambiguous { .. } => corrupt(message),
+        FenceError::Failed { .. } => internal(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
@@ -3644,6 +3797,28 @@ mod tests {
             4 * 1024 * 1024,
         )
         .expect("context")
+    }
+
+    fn fence(
+        operation_id: ConnectorWriteOperationId,
+    ) -> novarocks_spi::connector::ConnectorExternalOperationFence {
+        novarocks_spi::connector::ConnectorExternalOperationFence::try_new(
+            novarocks_spi::connector::ConnectorClusterIdentity::derive(
+                "iceberg-write-test-cluster",
+            )
+            .expect("cluster identity"),
+            novarocks_spi::connector::ConnectorExternalFenceGeneration::try_new(1, 1, 1)
+                .expect("fence generation"),
+            operation_id,
+            [8; 16],
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+            ConnectorWriteTargetRef::main(),
+        )
+        .expect("external operation fence")
     }
 
     fn control() -> (tokio::runtime::Runtime, IcebergWriteControl) {
@@ -4148,9 +4323,14 @@ mod tests {
             )],
         )
         .expect("sealed");
-        let request =
-            ConnectorWriteAbortRequest::try_new(owner.clone(), sealed, Vec::new(), context())
-                .expect("abort request");
+        let request = ConnectorWriteAbortRequest::try_new(
+            owner.clone(),
+            sealed,
+            Vec::new(),
+            fence(operation_id),
+            context(),
+        )
+        .expect("abort request");
         let first = control.abort(request.clone()).expect("abort");
         let replay = control.abort(request).expect("abort replay");
         assert_eq!(first, replay);
@@ -4466,6 +4646,7 @@ mod tests {
         .expect("operation completion");
         let request = ConnectorWriteCommitRequest {
             completion,
+            fence: fence(operation_id),
             context: context(),
         };
         let active = {
@@ -4565,6 +4746,7 @@ mod tests {
                 operation_id,
                 cohort_set_digest,
                 aggregate_digest,
+                fence: fence(operation_id),
                 evidence,
                 context: context(),
             })
@@ -4747,9 +4929,21 @@ mod tests {
         )
         .expect("operation completion");
         let aggregate_digest = completion.aggregate_digest();
+        // Publish the fence marker first: a commit derives its assertion from
+        // external truth, so an attempt that never established a fence is
+        // refused before it reaches the table.
+        let commit_fence = fence(operation_id);
+        control
+            .establish_external_fence(ConnectorExternalFenceRequest {
+                owner: owner.clone(),
+                fence: commit_fence.clone(),
+                context: context(),
+            })
+            .expect("establish external fence");
         let outcome = control
             .commit(ConnectorWriteCommitRequest {
                 completion,
+                fence: commit_fence,
                 context: context(),
             })
             .expect("commit empty overwrite");
@@ -4782,7 +4976,19 @@ mod tests {
             loaded.table.metadata().default_partition_spec_id(),
             committed_partitioning.spec_id()
         );
-        assert_eq!(loaded.table.metadata().snapshots().count(), 1);
+        // The fence marker is itself a snapshot on the provider-private fence
+        // ref, so count only data snapshots: this assertion is about the
+        // managed repartition committing exactly once, not about how many
+        // snapshots the metadata holds in total.
+        let data_snapshots = loaded
+            .table
+            .metadata()
+            .snapshots()
+            .filter(|snapshot| {
+                !crate::commit::write_fence::is_fence_marker_snapshot(snapshot.summary())
+            })
+            .count();
+        assert_eq!(data_snapshots, 1);
         let marker = operation_marker_from_snapshot(snapshot)
             .expect("decode operation marker")
             .expect("operation marker");

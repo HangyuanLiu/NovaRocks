@@ -51,9 +51,7 @@ use crate::iceberg::spec::{
     SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -63,9 +61,9 @@ use super::fast_append::{
     carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot, register_puffin_stats,
 };
 use super::helpers::{
-    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
-    target_ref_snapshot_id, write_manifest_list,
+    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary,
+    snapshot_total_records, submit_fenced_action, target_ref_snapshot_id, write_manifest_list,
 };
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_with_dv_merge, dv_summary, dv_total_records,
@@ -97,7 +95,7 @@ impl IcebergCommitAction for RowDeltaDvCommit {
         }
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let action = RowDeltaDvTxnAction {
+        let action = Arc::new(RowDeltaDvTxnAction {
             groups,
             written,
             commit_uuid: ctx.commit_uuid,
@@ -109,49 +107,60 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             manifest_paths_out: manifest_paths_out.clone(),
             target_ref: ctx.target_ref.to_string(),
             snapshot_properties: ctx.snapshot_properties.clone(),
-        };
+        });
 
         let sketch_sets = ctx.collector.take_sketch_sets();
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
         let has_new_data_files = !sketch_sets.is_empty();
+        let written_manifest_paths = || {
+            manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .clone()
+        };
 
-        let tx = Transaction::new(ctx.table);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("RowDeltaDv apply failed: {e}"))?;
-        let table_after = tx
-            .commit(ctx.catalog)
-            .await
-            .map_err(|e| format!("RowDeltaDv commit failed: {e}"))?;
-        let new_snapshot_id =
-            required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, "RowDeltaDv")?;
-        let new_sequence_number = table_after.metadata().last_sequence_number();
-        // MOR UPDATE writes new data files alongside the DV; treat as Append
-        // so the new NDV reflects both the carried-forward sketches and the
-        // new file sketches. Pure DELETE has no new files — carry forward.
-        if has_new_data_files {
-            register_puffin_stats(
-                &table_after,
-                ctx.catalog,
-                ctx.file_io,
-                CommitType::Append,
-                sketch_sets,
-                new_snapshot_id,
-                new_sequence_number,
-                prev_snapshot_id,
-            )
-            .await;
-        } else if let Some(prev) = prev_snapshot_id {
-            carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev).await;
+        match submit_fenced_action(ctx.catalog, ctx.table, action, ctx.fence, "RowDeltaDv").await {
+            Ok(FencedSubmit::Committed(table_after)) => {
+                let new_snapshot_id = required_target_ref_snapshot_id(
+                    table_after.metadata(),
+                    ctx.target_ref,
+                    "RowDeltaDv",
+                )?;
+                let new_sequence_number = table_after.metadata().last_sequence_number();
+                // MOR UPDATE writes new data files alongside the DV; treat as Append
+                // so the new NDV reflects both the carried-forward sketches and the
+                // new file sketches. Pure DELETE has no new files — carry forward.
+                if has_new_data_files {
+                    register_puffin_stats(
+                        &table_after,
+                        ctx.catalog,
+                        ctx.file_io,
+                        CommitType::Append,
+                        sketch_sets,
+                        new_snapshot_id,
+                        new_sequence_number,
+                        prev_snapshot_id,
+                    )
+                    .await;
+                } else if let Some(prev) = prev_snapshot_id {
+                    carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev)
+                        .await;
+                }
+                Ok(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: written_manifest_paths(),
+                })
+            }
+            // Fully empty input already returned through
+            // `commit_empty_iceberg_mv_snapshot` above, and the action always
+            // stages a snapshot, so this arm reports the same value that path
+            // reports for an empty change set.
+            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+                new_snapshot_id: prev_snapshot_id.unwrap_or(0),
+                written_manifest_paths: written_manifest_paths(),
+            }),
+            Err(error) => Err(error.into_detail()),
         }
-        let written_manifest_paths = manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .clone();
-        Ok(CommitOutcome {
-            new_snapshot_id,
-            written_manifest_paths,
-        })
     }
 }
 

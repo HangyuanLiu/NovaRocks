@@ -14,13 +14,14 @@ use std::collections::{BTreeSet, HashSet};
 use crate::iceberg::spec::{
     FormatVersion, Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
-use crate::iceberg::{TableCommit, TableRequirement, TableUpdate};
+use crate::iceberg::transaction::ActionCommit;
+use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
     effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    snapshot_summary, target_ref_snapshot_id, write_manifest_list,
+    snapshot_summary, submit_action_commit, target_ref_snapshot_id, write_manifest_list,
 };
 use super::row_delta_dv_from_files::dv_descriptor_from_written;
 use super::row_delta_dv_metadata::{
@@ -28,6 +29,7 @@ use super::row_delta_dv_metadata::{
     group_written_dvs_by_partition_spec, partition_spec_by_id, write_added_dv_manifest,
     write_existing_delete_manifest,
 };
+use super::write_fence::IcebergFenceAssertion;
 use crate::commit::CommitOutcome;
 
 #[derive(Clone, Debug, Default)]
@@ -289,9 +291,8 @@ impl SelectedRewriteCommit {
             .with_schema_id(metadata.current_schema_id())
             .with_row_range(row_id, 0)
             .build();
-        let commit = TableCommit::builder()
-            .ident(ctx.collector.table_ident.clone())
-            .updates(vec![
+        let staged = ActionCommit::new(
+            vec![
                 TableUpdate::AddSnapshot { snapshot },
                 TableUpdate::SetSnapshotRef {
                     ref_name: target_ref.to_string(),
@@ -304,8 +305,8 @@ impl SelectedRewriteCommit {
                         },
                     },
                 },
-            ])
-            .requirements(vec![
+            ],
+            vec![
                 TableRequirement::CurrentSchemaIdMatch {
                     current_schema_id: metadata.current_schema_id(),
                 },
@@ -316,12 +317,31 @@ impl SelectedRewriteCommit {
                     r#ref: target_ref.to_string(),
                     snapshot_id: base_snapshot_id,
                 },
-            ])
-            .build();
-        ctx.catalog
-            .update_table(commit)
-            .await
-            .map_err(|error| format!("selected position-delete rewrite commit failed: {error}"))?;
+            ],
+        );
+        // A rewrite replaces a frozen file set and must therefore be rejected —
+        // not re-staged — when the base moves, so this action deliberately keeps
+        // its single conditional submission instead of taking
+        // `submit_fenced_action`'s re-stage loop. The fence assertion still
+        // travels in that same atomic update: `submit_action_commit` appends it
+        // to the requirements computed against the base this action observed.
+        let fence_requirements = ctx
+            .fence
+            .map(IcebergFenceAssertion::requirements)
+            .unwrap_or_default();
+        let submitted = submit_action_commit(
+            ctx.catalog,
+            ctx.collector.table_ident.clone(),
+            staged,
+            fence_requirements,
+        )
+        .await
+        .map_err(|error| format!("selected position-delete rewrite commit failed: {error}"))?;
+        if submitted.is_none() {
+            return Err(
+                "selected position-delete rewrite built no table updates to submit".to_string(),
+            );
+        }
         Ok(CommitOutcome {
             new_snapshot_id,
             written_manifest_paths: manifest_paths,

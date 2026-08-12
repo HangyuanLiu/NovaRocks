@@ -24,14 +24,14 @@ use super::{
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
-    ConnectorMvAttemptDiscovery, ConnectorMvPublicationFencing, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorViewMetadata,
-    ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorHistoricalWriteRecovery, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
+    ConnectorMetadataMaintenanceResolver, ConnectorMvAttemptDiscovery,
+    ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
+    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -240,6 +240,7 @@ pub struct ConnectorControlBinding {
     historical_maintenance_recovery: Option<Arc<dyn ConnectorHistoricalMaintenanceRecovery>>,
     mv_publication_fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
     mv_attempt_discovery: Option<Arc<dyn ConnectorMvAttemptDiscovery>>,
+    historical_write_recovery: Option<Arc<dyn ConnectorHistoricalWriteRecovery>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
@@ -427,6 +428,7 @@ impl ConnectorControlBinding {
             historical_maintenance_recovery: None,
             mv_publication_fencing: None,
             mv_attempt_discovery: None,
+            historical_write_recovery: None,
             view_metadata: None,
         })
     }
@@ -793,6 +795,31 @@ impl ConnectorControlBinding {
 
     pub fn mv_attempt_discovery(&self) -> Option<&Arc<dyn ConnectorMvAttemptDiscovery>> {
         self.mv_attempt_discovery.as_ref()
+    }
+
+    /// Installs the provider-owned historical distributed-write inspector.
+    ///
+    /// It is installed separately from the ordinary write capability on
+    /// purpose: an ordinary execution path must never be able to reach this
+    /// facet as a fallback, and a provider may own ordinary writes without
+    /// owning historical recovery.
+    pub fn try_with_historical_write_recovery(
+        mut self,
+        recovery: Option<Arc<dyn ConnectorHistoricalWriteRecovery>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(recovery) = &recovery {
+            super::historical_write_recovery::validate_historical_write_recovery_owner(
+                &self.descriptor,
+                self.incarnation,
+                recovery.as_ref(),
+            )?;
+        }
+        self.historical_write_recovery = recovery;
+        Ok(self)
+    }
+
+    pub fn historical_write_recovery(&self) -> Option<&Arc<dyn ConnectorHistoricalWriteRecovery>> {
+        self.historical_write_recovery.as_ref()
     }
 
     pub fn execution_declaration(
