@@ -257,8 +257,8 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             .base_refs
             .iter()
             .map(|base| {
-                load_current_iceberg_base_table(self.state, base)
-                    .map(|loaded| (base.fqn(), loaded.table.metadata().uuid().to_string()))
+                observe_schema_validation_for_table(self.state, base, self.connector_context)
+                    .map(|observed| (base.fqn(), observed.table_uuid().to_string()))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let expected_target_snapshot_id = match &plan.contract.state_baseline {
@@ -803,17 +803,14 @@ fn prepare_frontend_incremental_write(
                             base.fqn()
                         )
                     })?;
-                let loaded = load_current_iceberg_base_table(state, base)?;
-                Ok::<_, String>((
-                    base.clone(),
-                    snapshot_id,
-                    loaded.table.metadata().uuid().to_string(),
-                ))
+                let observed =
+                    observe_schema_validation_for_table(state, base, &connector_context)?;
+                Ok::<_, String>((base.clone(), snapshot_id, observed.table_uuid().to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    if target_loaded.table.metadata().uuid().to_string() != *target_table_uuid {
+    if target_binding_for(state, &target, &connector_context)?.table_uuid() != *target_table_uuid {
         return Err("MV incremental refresh target UUID drifted after planning".to_string());
     }
     let actual_target_snapshot_id = target_loaded
@@ -1052,8 +1049,8 @@ fn prepare_frontend_incremental_write(
                     base.fqn()
                 )
             })?;
-            let loaded = load_current_iceberg_base_table(state, base)?;
-            if loaded.table.metadata().uuid().to_string() != current_table_uuid {
+            let observed = observe_schema_validation_for_table(state, base, &connector_context)?;
+            if observed.table_uuid() != current_table_uuid {
                 return Err(format!(
                     "MV incremental refresh base table identity changed after planning for {}",
                     base.fqn()
@@ -7818,7 +7815,11 @@ fn plan_iceberg_union_projection_mv_refresh(
                         iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
                     ))
                 })?;
-                let current_uuid = loaded.table.metadata().uuid().to_string();
+                let current_uuid =
+                    observe_schema_validation_for_table(state, base_ref, connector_context)
+                        .map_err(RefreshError::user)?
+                        .table_uuid()
+                        .to_string();
                 if previous_uuid != &current_uuid {
                     return Err(RefreshError::user(format!(
                         "iceberg MV base table identity changed for {fqn}; incremental refresh is unsafe, rebuild or recreate the MV"
