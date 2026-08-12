@@ -179,6 +179,9 @@ impl ConnectorControlFactory for IcebergControlFactory {
                 Some(provider.clone()),
             )?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
+            .try_with_mv_publication_fencing(Some(Arc::new(
+                crate::mv_publication_fencing::IcebergMvPublicationFencing::new(provider.clone()),
+            )))?
             .try_with_view_metadata(Some(provider))?;
         ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
     }

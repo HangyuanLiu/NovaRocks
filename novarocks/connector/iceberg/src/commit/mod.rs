@@ -71,13 +71,15 @@ pub use mv_provenance::{
 };
 pub use mv_publication_fence::{
     MV_PUBLICATION_FENCE_MARKER_PROP, MV_PUBLICATION_FENCE_REF, MV_PUBLICATION_FENCE_VERSION,
-    MvPublicationFenceDecision, MvPublicationFenceMarker, MvPublicationFenceOutcome,
-    MvPublicationFencePlan, ObservedFence, build_fence_commit, decide_fence_establishment,
+    MvPublicationError, MvPublicationFenceDecision, MvPublicationFenceMarker,
+    MvPublicationFenceOutcome, MvPublicationFencePlan, MvPublicationOperationStatus, ObservedFence,
+    build_fence_commit, classify_fence_operation, decide_fence_establishment,
     establish_publication_fence, observe_fence,
 };
 pub use mv_refresh_ref::{
     MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
     MvRefreshPublishPlan, MvRefreshPublishV2Plan, MvRefreshSnapshotMarker,
+    ObservedPublicationState, decide_v2_publication, observe_publication_state,
     publish_staging_branch_to_main, publish_staging_branch_to_main_v2,
     snapshot_matches_refresh_marker,
 };

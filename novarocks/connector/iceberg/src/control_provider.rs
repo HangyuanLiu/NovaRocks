@@ -117,7 +117,7 @@ impl IcebergControlProvider {
         &self.runtime
     }
 
-    fn validate_context(
+    pub(crate) fn validate_context(
         &self,
         context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<(), ConnectorError> {
@@ -1221,7 +1221,7 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
     }
 }
 
-fn staged_publication_target_ancestors(
+pub(crate) fn staged_publication_target_ancestors(
     metadata: &crate::iceberg::spec::TableMetadata,
     target_snapshot_id: Option<i64>,
 ) -> Vec<i64> {

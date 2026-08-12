@@ -24,7 +24,9 @@ use crate::iceberg::spec::{Snapshot, SnapshotReference, SnapshotRetention};
 use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
 use super::mv_provenance::{MvProvenanceV2, MvPublicationV2Identity};
-use super::mv_publication_fence::{MV_PUBLICATION_FENCE_REF, observe_fence};
+use super::mv_publication_fence::{
+    MV_PUBLICATION_FENCE_REF, MvPublicationError, ObservedFence, observe_fence,
+};
 
 pub const MV_REFRESH_ID_PROP: &str = "novarocks.mv.refresh_id";
 pub const MV_ID_PROP: &str = "novarocks.mv.id";
@@ -190,6 +192,129 @@ pub struct MvRefreshPublishV2Plan {
     pub expected_fence_snapshot_id: i64,
 }
 
+/// The externally observed state a V2 publication is checked against.
+///
+/// Extracted as plain data so the guard below is decidable — and therefore
+/// testable — without a live catalog.
+#[derive(Clone, Debug)]
+pub struct ObservedPublicationState {
+    pub table_uuid: Uuid,
+    pub main_snapshot_id: Option<i64>,
+    /// `None` when the staging branch is absent.
+    pub staging_snapshot_id: Option<i64>,
+    pub staging_is_branch: bool,
+    pub fence: Option<ObservedFence>,
+    /// V2 identity carried by the staged snapshot, `None` when it has no V2
+    /// provenance or the snapshot is missing.
+    pub staged_identity: Option<MvPublicationV2Identity>,
+}
+
+/// Decides whether a staged result may be published, from observed state alone.
+///
+/// This encodes the same four facts the commit requires, plus the V2 marker
+/// assertion. Pre-checking here turns a doomed commit into a definite
+/// `KnownUncommitted` instead of an ambiguous failure; the commit requirements
+/// remain the real linearization point.
+pub fn decide_v2_publication(
+    plan: &MvRefreshPublishV2Plan,
+    observed: &ObservedPublicationState,
+) -> Result<(), String> {
+    let resource = plan.permit.resource();
+    if observed.table_uuid != resource.target_table_uuid() {
+        return Err(format!(
+            "iceberg mv publish v2: table {}.{} has UUID {}, expected {}",
+            plan.namespace,
+            plan.table,
+            observed.table_uuid,
+            resource.target_table_uuid()
+        ));
+    }
+    if observed.main_snapshot_id != plan.expected_main_snapshot_id {
+        return Err(format!(
+            "iceberg mv publish v2: main snapshot mismatch for {}.{}: expected {:?}, current {:?}",
+            plan.namespace, plan.table, plan.expected_main_snapshot_id, observed.main_snapshot_id
+        ));
+    }
+    let Some(staging_snapshot_id) = observed.staging_snapshot_id else {
+        return Err(format!(
+            "iceberg mv publish v2: staging branch {} does not exist",
+            plan.staging_branch
+        ));
+    };
+    if !observed.staging_is_branch {
+        return Err(format!(
+            "iceberg mv publish: staging ref {} is a tag, expected branch",
+            plan.staging_branch
+        ));
+    }
+    if staging_snapshot_id != plan.staging_snapshot_id {
+        return Err(format!(
+            "iceberg mv publish v2: staging branch {} points to {}, expected {}",
+            plan.staging_branch, staging_snapshot_id, plan.staging_snapshot_id
+        ));
+    }
+
+    let Some(fence) = &observed.fence else {
+        return Err(format!(
+            "iceberg mv publish v2: {MV_PUBLICATION_FENCE_REF} is absent, so no generation owns publication"
+        ));
+    };
+    if fence.snapshot_id != plan.expected_fence_snapshot_id {
+        return Err(format!(
+            "iceberg mv publish v2: {MV_PUBLICATION_FENCE_REF} points to {}, expected {}; this generation has been superseded",
+            fence.snapshot_id, plan.expected_fence_snapshot_id
+        ));
+    }
+    if &fence.marker.generation()? != plan.permit.generation() {
+        return Err(format!(
+            "iceberg mv publish v2: {MV_PUBLICATION_FENCE_REF} snapshot {} names a different generation than the permit",
+            fence.snapshot_id
+        ));
+    }
+    if !fence.marker.matches_resource(resource) {
+        return Err(format!(
+            "iceberg mv publish v2: fence snapshot {} belongs to a different target",
+            fence.snapshot_id
+        ));
+    }
+
+    let Some(identity) = &observed.staged_identity else {
+        return Err(format!(
+            "iceberg mv publish v2: staging snapshot {} carries no v2 provenance",
+            plan.staging_snapshot_id
+        ));
+    };
+    if identity != &MvPublicationV2Identity::from_permit(&plan.permit) {
+        return Err(format!(
+            "iceberg mv publish v2: staging snapshot {} v2 identity does not match the permit",
+            plan.staging_snapshot_id
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the publication-relevant state out of loaded table metadata.
+pub fn observe_publication_state(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    plan: &MvRefreshPublishV2Plan,
+) -> Result<ObservedPublicationState, String> {
+    let staging_ref = metadata.refs().get(&plan.staging_branch);
+    let staged_identity = match metadata.snapshot_by_id(plan.staging_snapshot_id) {
+        Some(snapshot) => {
+            MvProvenanceV2::from_snapshot_summary(snapshot)?.map(|provenance| provenance.identity())
+        }
+        None => None,
+    };
+    Ok(ObservedPublicationState {
+        table_uuid: metadata.uuid(),
+        main_snapshot_id: metadata.current_snapshot().map(|s| s.snapshot_id()),
+        staging_snapshot_id: staging_ref.map(|reference| reference.snapshot_id),
+        staging_is_branch: staging_ref.is_none_or(SnapshotReference::is_branch),
+        fence: observe_fence(metadata)?,
+        staged_identity,
+    })
+}
+
 /// Publishes a staged result under an established external fence.
 ///
 /// Four facts must hold *in the commit itself*, not merely at pre-check time:
@@ -207,100 +332,27 @@ pub struct MvRefreshPublishV2Plan {
 pub async fn publish_staging_branch_to_main_v2(
     catalog: &dyn Catalog,
     plan: &MvRefreshPublishV2Plan,
-) -> Result<MvRefreshPublishOutcome, String> {
-    let resource = plan.permit.resource();
-    let ident = TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()])
-        .map_err(|e| format!("iceberg mv publish v2: invalid table identifier: {e}"))?;
+) -> Result<MvRefreshPublishOutcome, MvPublicationError> {
+    let precondition = MvPublicationError::Precondition;
+    let ident =
+        TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()]).map_err(|e| {
+            precondition(format!(
+                "iceberg mv publish v2: invalid table identifier: {e}"
+            ))
+        })?;
     let table = catalog
         .load_table(&ident)
         .await
-        .map_err(|e| format!("iceberg mv publish v2: load table failed: {e}"))?;
+        .map_err(|e| precondition(format!("iceberg mv publish v2: load table failed: {e}")))?;
     let metadata = table.metadata();
 
-    if metadata.uuid() != resource.target_table_uuid() {
-        return Err(format!(
-            "iceberg mv publish v2: table {}.{} has UUID {}, expected {}",
-            plan.namespace,
-            plan.table,
-            metadata.uuid(),
-            resource.target_table_uuid()
-        ));
-    }
+    let observed = observe_publication_state(metadata, plan).map_err(precondition)?;
+    decide_v2_publication(plan, &observed).map_err(precondition)?;
 
-    let main_snapshot = metadata.current_snapshot().map(|s| s.snapshot_id());
-    if main_snapshot != plan.expected_main_snapshot_id {
-        return Err(format!(
-            "iceberg mv publish v2: main snapshot mismatch for {}.{}: expected {:?}, current {:?}",
-            plan.namespace, plan.table, plan.expected_main_snapshot_id, main_snapshot
-        ));
-    }
-
-    let staging_ref = metadata.refs().get(&plan.staging_branch).ok_or_else(|| {
-        format!(
-            "iceberg mv publish v2: staging branch {} does not exist",
-            plan.staging_branch
-        )
+    let commit = build_publish_commit_v2(ident, plan.permit.resource().target_table_uuid(), plan);
+    catalog.update_table(commit).await.map_err(|e| {
+        MvPublicationError::CommitUnknown(format!("iceberg mv publish v2: commit failed: {e}"))
     })?;
-    ensure_staging_ref_is_branch(&plan.staging_branch, staging_ref)?;
-    if staging_ref.snapshot_id != plan.staging_snapshot_id {
-        return Err(format!(
-            "iceberg mv publish v2: staging branch {} points to {}, expected {}",
-            plan.staging_branch, staging_ref.snapshot_id, plan.staging_snapshot_id
-        ));
-    }
-
-    let observed_fence = observe_fence(metadata)?.ok_or_else(|| {
-        format!(
-            "iceberg mv publish v2: {MV_PUBLICATION_FENCE_REF} is absent, so no generation owns publication"
-        )
-    })?;
-    if observed_fence.snapshot_id != plan.expected_fence_snapshot_id {
-        return Err(format!(
-            "iceberg mv publish v2: {MV_PUBLICATION_FENCE_REF} points to {}, expected {}; this generation has been superseded",
-            observed_fence.snapshot_id, plan.expected_fence_snapshot_id
-        ));
-    }
-    let fence_generation = observed_fence.marker.generation()?;
-    if &fence_generation != plan.permit.generation() {
-        return Err(format!(
-            "iceberg mv publish v2: {MV_PUBLICATION_FENCE_REF} snapshot {} names a different generation than the permit",
-            observed_fence.snapshot_id
-        ));
-    }
-    if !observed_fence.marker.matches_resource(resource) {
-        return Err(format!(
-            "iceberg mv publish v2: fence snapshot {} belongs to a different target",
-            observed_fence.snapshot_id
-        ));
-    }
-
-    let staging_snapshot = metadata
-        .snapshot_by_id(plan.staging_snapshot_id)
-        .ok_or_else(|| {
-            format!(
-                "iceberg mv publish v2: staging snapshot {} not found",
-                plan.staging_snapshot_id
-            )
-        })?;
-    let provenance = MvProvenanceV2::from_snapshot_summary(staging_snapshot)?.ok_or_else(|| {
-        format!(
-            "iceberg mv publish v2: staging snapshot {} carries no v2 provenance",
-            plan.staging_snapshot_id
-        )
-    })?;
-    let expected_identity = MvPublicationV2Identity::from_permit(&plan.permit);
-    if provenance.identity() != expected_identity {
-        return Err(format!(
-            "iceberg mv publish v2: staging snapshot {} v2 identity does not match the permit",
-            plan.staging_snapshot_id
-        ));
-    }
-
-    let commit = build_publish_commit_v2(ident, resource.target_table_uuid(), plan);
-    catalog
-        .update_table(commit)
-        .await
-        .map_err(|e| format!("iceberg mv publish v2: commit failed: {e}"))?;
     Ok(MvRefreshPublishOutcome {
         published_snapshot_id: plan.staging_snapshot_id,
     })
@@ -631,6 +683,136 @@ mod tests {
             None
         );
         assert!(snapshot_matches_refresh_marker(&v1_snapshot, &v1_marker));
+    }
+
+    fn observed_state(
+        plan: &MvRefreshPublishV2Plan,
+        fence_generation: &ConnectorMvPublicationFenceGeneration,
+        fence_snapshot_id: i64,
+    ) -> ObservedPublicationState {
+        ObservedPublicationState {
+            table_uuid: Uuid::from_u128(0x1234),
+            main_snapshot_id: Some(100),
+            staging_snapshot_id: Some(300),
+            staging_is_branch: true,
+            fence: Some(super::super::mv_publication_fence::ObservedFence {
+                snapshot_id: fence_snapshot_id,
+                marker: super::super::mv_publication_fence::MvPublicationFenceMarker::new(
+                    &v2_resource(),
+                    fence_generation,
+                    [9; 16],
+                ),
+            }),
+            staged_identity: Some(MvPublicationV2Identity::from_permit(&plan.permit)),
+        }
+    }
+
+    #[test]
+    fn v2_publication_succeeds_only_while_its_own_generation_owns_the_fence() {
+        let permit = v2_permit(1, 1);
+        let plan = v2_plan(permit.clone());
+        let ours = v2_generation(1, 1);
+
+        decide_v2_publication(&plan, &observed_state(&plan, &ours, 500)).unwrap();
+
+        // Takeover linearized first: the fence ref moved, so this generation
+        // cannot publish even though its frozen main expectation still holds.
+        let taken_over = ObservedPublicationState {
+            fence: Some(super::super::mv_publication_fence::ObservedFence {
+                snapshot_id: 600,
+                marker: super::super::mv_publication_fence::MvPublicationFenceMarker::new(
+                    &v2_resource(),
+                    &v2_generation(2, 1),
+                    [10; 16],
+                ),
+            }),
+            ..observed_state(&plan, &ours, 500)
+        };
+        let err = decide_v2_publication(&plan, &taken_over).unwrap_err();
+        assert!(err.contains("has been superseded"), "{err}");
+        assert_eq!(
+            taken_over.main_snapshot_id, plan.expected_main_snapshot_id,
+            "the point of this case is that main is still exactly what we froze"
+        );
+
+        // Same fence snapshot id, different generation: a fence ref that was
+        // rebuilt by another owner must not be mistaken for ours.
+        let impostor = observed_state(&plan, &v2_generation(1, 2), 500);
+        let err = decide_v2_publication(&plan, &impostor).unwrap_err();
+        assert!(
+            err.contains("different generation than the permit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn v2_publication_refuses_after_an_older_publication_already_advanced_main() {
+        let plan = v2_plan(v2_permit(1, 1));
+        let ours = v2_generation(1, 1);
+
+        // The other owner's publication linearized first, so main is no longer
+        // the snapshot we froze. The new owner must reconcile against committed
+        // lake truth rather than publish over it.
+        let advanced = ObservedPublicationState {
+            main_snapshot_id: Some(250),
+            ..observed_state(&plan, &ours, 500)
+        };
+        let err = decide_v2_publication(&plan, &advanced).unwrap_err();
+        assert!(err.contains("main snapshot mismatch"), "{err}");
+    }
+
+    #[test]
+    fn v2_publication_rejects_foreign_target_absent_fence_and_wrong_staged_identity() {
+        let plan = v2_plan(v2_permit(1, 1));
+        let ours = v2_generation(1, 1);
+
+        // External DROP/recreate: same name, new table UUID, new fence domain.
+        let recreated = ObservedPublicationState {
+            table_uuid: Uuid::from_u128(0x9999),
+            ..observed_state(&plan, &ours, 500)
+        };
+        assert!(
+            decide_v2_publication(&plan, &recreated)
+                .unwrap_err()
+                .contains("expected"),
+        );
+
+        let unfenced = ObservedPublicationState {
+            fence: None,
+            ..observed_state(&plan, &ours, 500)
+        };
+        let err = decide_v2_publication(&plan, &unfenced).unwrap_err();
+        assert!(err.contains("is absent"), "{err}");
+
+        // A staged snapshot produced by a different attempt is not publishable
+        // under this permit.
+        let foreign_stage = ObservedPublicationState {
+            staged_identity: Some(MvPublicationV2Identity::from_permit(&v2_permit(1, 1))),
+            ..observed_state(&plan, &ours, 500)
+        };
+        let err = decide_v2_publication(&plan, &foreign_stage).unwrap_err();
+        assert!(err.contains("does not match the permit"), "{err}");
+
+        let no_provenance = ObservedPublicationState {
+            staged_identity: None,
+            ..observed_state(&plan, &ours, 500)
+        };
+        let err = decide_v2_publication(&plan, &no_provenance).unwrap_err();
+        assert!(err.contains("carries no v2 provenance"), "{err}");
+
+        let moved_stage = ObservedPublicationState {
+            staging_snapshot_id: Some(301),
+            ..observed_state(&plan, &ours, 500)
+        };
+        let err = decide_v2_publication(&plan, &moved_stage).unwrap_err();
+        assert!(err.contains("points to 301"), "{err}");
+
+        let tag_stage = ObservedPublicationState {
+            staging_is_branch: false,
+            ..observed_state(&plan, &ours, 500)
+        };
+        let err = decide_v2_publication(&plan, &tag_stage).unwrap_err();
+        assert!(err.contains("is a tag"), "{err}");
     }
 
     #[test]

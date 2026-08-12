@@ -191,6 +191,38 @@ pub struct ObservedFence {
     pub marker: MvPublicationFenceMarker,
 }
 
+/// Why a fenced operation did not report success.
+///
+/// The distinction is load-bearing, not cosmetic. `Precondition` means no
+/// external write was attempted, so the caller may safely abandon the attempt.
+/// `CommitUnknown` means the catalog call was made and its outcome is genuinely
+/// unknown, so the caller must resolve it by inspecting lake truth under the
+/// same operation ID. Collapsing the two would either strand a committed
+/// publication or, worse, let a caller retry one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvPublicationError {
+    Precondition(String),
+    CommitUnknown(String),
+}
+
+impl MvPublicationError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Precondition(message) | Self::CommitUnknown(message) => message,
+        }
+    }
+
+    pub const fn is_commit_unknown(&self) -> bool {
+        matches!(self, Self::CommitUnknown(_))
+    }
+}
+
+impl std::fmt::Display for MvPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
 /// What [`establish_publication_fence`] should do after comparing generations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MvPublicationFenceDecision {
@@ -375,37 +407,41 @@ pub fn build_fence_commit(
 }
 
 /// Establishes (or idempotently re-establishes) this generation's lake fence.
+///
+/// Everything up to `update_table` is a precondition check, so a rejection is
+/// definitively uncommitted. Only the catalog commit itself can be ambiguous.
 pub async fn establish_publication_fence(
     catalog: &dyn Catalog,
     plan: &MvPublicationFencePlan,
-) -> Result<MvPublicationFenceOutcome, String> {
+) -> Result<MvPublicationFenceOutcome, MvPublicationError> {
+    let precondition = MvPublicationError::Precondition;
     let ident = TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()])
-        .map_err(|e| format!("iceberg mv fence: invalid table identifier: {e}"))?;
+        .map_err(|e| precondition(format!("iceberg mv fence: invalid table identifier: {e}")))?;
     let table = catalog
         .load_table(&ident)
         .await
-        .map_err(|e| format!("iceberg mv fence: load table failed: {e}"))?;
+        .map_err(|e| precondition(format!("iceberg mv fence: load table failed: {e}")))?;
     let metadata = table.metadata();
 
     if metadata.uuid() != plan.resource.target_table_uuid() {
-        return Err(format!(
+        return Err(precondition(format!(
             "iceberg mv fence: table {}.{} has UUID {}, expected {}",
             plan.namespace,
             plan.table,
             metadata.uuid(),
             plan.resource.target_table_uuid()
-        ));
+        )));
     }
     let current_main = metadata.current_snapshot().map(|s| s.snapshot_id());
     if current_main != plan.observed_main_snapshot_id {
-        return Err(format!(
+        return Err(precondition(format!(
             "iceberg mv fence: main snapshot moved for {}.{}: observed {:?}, current {:?}",
             plan.namespace, plan.table, plan.observed_main_snapshot_id, current_main
-        ));
+        )));
     }
 
-    let observed = observe_fence(metadata)?;
-    let decision = decide_fence_establishment(plan, observed.as_ref())?;
+    let observed = observe_fence(metadata).map_err(precondition)?;
+    let decision = decide_fence_establishment(plan, observed.as_ref()).map_err(precondition)?;
     let expected_fence_snapshot_id = match decision {
         MvPublicationFenceDecision::AlreadyEstablished { fence_snapshot_id } => {
             return Ok(MvPublicationFenceOutcome {
@@ -419,13 +455,16 @@ pub async fn establish_publication_fence(
     };
 
     let marker = MvPublicationFenceMarker::new(&plan.resource, &plan.generation, plan.operation_id);
+    // Writing the manifest list is an orphan-safe object-store write: if it
+    // fails, or the commit below never lands, the file is simply unreferenced.
     let snapshot = build_fence_snapshot(
         &table,
         &marker,
         plan.observed_main_snapshot_id,
         metadata.format_version(),
     )
-    .await?;
+    .await
+    .map_err(precondition)?;
 
     let commit = build_fence_commit(
         ident,
@@ -434,14 +473,64 @@ pub async fn establish_publication_fence(
         plan.observed_main_snapshot_id,
         expected_fence_snapshot_id,
     );
-    catalog
-        .update_table(commit)
-        .await
-        .map_err(|e| format!("iceberg mv fence: commit failed: {e}"))?;
+    catalog.update_table(commit).await.map_err(|e| {
+        MvPublicationError::CommitUnknown(format!("iceberg mv fence: commit failed: {e}"))
+    })?;
     Ok(MvPublicationFenceOutcome {
         fence_snapshot_id: snapshot.snapshot_id(),
         established: true,
     })
+}
+
+/// Resolves whether a previously issued fence establishment committed.
+///
+/// It answers strictly from lake truth under the operation ID the caller
+/// already used: a fence snapshot on the ref bearing that operation ID means
+/// committed. Anything else is reported as undecided rather than guessed, and
+/// the operation is never re-issued.
+pub fn classify_fence_operation(
+    observed: Option<&ObservedFence>,
+    resource: &ConnectorMvRefreshResourceIdentity,
+    generation: &ConnectorMvPublicationFenceGeneration,
+    operation_id: [u8; 16],
+) -> Result<MvPublicationOperationStatus, String> {
+    let Some(observed) = observed else {
+        return Ok(MvPublicationOperationStatus::Unresolved);
+    };
+    if !observed.marker.matches_resource(resource) {
+        return Ok(MvPublicationOperationStatus::Unresolved);
+    }
+    let observed_generation = observed.marker.generation()?;
+    if &observed_generation != generation {
+        // A different generation owns the fence now. If it is strictly newer,
+        // this operation definitively lost; otherwise the evidence is not ours
+        // to interpret.
+        return match generation.try_order(&observed_generation) {
+            Ok(ConnectorMvPublicationFenceOrder::Superseded) => {
+                Ok(MvPublicationOperationStatus::KnownUncommitted)
+            }
+            _ => Ok(MvPublicationOperationStatus::Unresolved),
+        };
+    }
+    if observed.marker.operation_id == hex_encode(&operation_id) {
+        return Ok(MvPublicationOperationStatus::KnownCommitted {
+            snapshot_id: observed.snapshot_id,
+        });
+    }
+    // Our generation owns the fence, but a different operation established it.
+    // The generation is fenced either way, so the caller may proceed; this
+    // specific operation, however, did not produce the current fence.
+    Ok(MvPublicationOperationStatus::KnownCommitted {
+        snapshot_id: observed.snapshot_id,
+    })
+}
+
+/// Terminal status of an inspected fenced operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvPublicationOperationStatus {
+    KnownCommitted { snapshot_id: i64 },
+    KnownUncommitted,
+    Unresolved,
 }
 
 /// Writes the data-free fence snapshot's manifest list and builds the snapshot.
@@ -724,6 +813,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("different tokens"), "{err}");
+    }
+
+    #[test]
+    fn classification_resolves_from_lake_truth_and_never_guesses() {
+        let ours = generation(1, 1, 7);
+
+        // Our generation still owns the fence and this operation established it.
+        assert_eq!(
+            classify_fence_operation(
+                Some(&observed(&ours, 3, 500)),
+                &resource(0x1234),
+                &ours,
+                [3; 16],
+            )
+            .unwrap(),
+            MvPublicationOperationStatus::KnownCommitted { snapshot_id: 500 }
+        );
+
+        // A strictly newer generation owns the fence: this operation lost, and
+        // that is a definite answer rather than an unresolved one.
+        assert_eq!(
+            classify_fence_operation(
+                Some(&observed(&generation(2, 1, 9), 4, 600)),
+                &resource(0x1234),
+                &ours,
+                [3; 16],
+            )
+            .unwrap(),
+            MvPublicationOperationStatus::KnownUncommitted
+        );
+
+        // No fence at all, a foreign target, and an incomparable generation all
+        // leave the question open. Guessing here is what CP-5A forbids.
+        assert_eq!(
+            classify_fence_operation(None, &resource(0x1234), &ours, [3; 16]).unwrap(),
+            MvPublicationOperationStatus::Unresolved
+        );
+        assert_eq!(
+            classify_fence_operation(
+                Some(&ObservedFence {
+                    snapshot_id: 500,
+                    marker: MvPublicationFenceMarker::new(&resource(0x9999), &ours, [3; 16]),
+                }),
+                &resource(0x1234),
+                &ours,
+                [3; 16],
+            )
+            .unwrap(),
+            MvPublicationOperationStatus::Unresolved
+        );
+        let other_cluster =
+            ConnectorMvPublicationFenceGeneration::try_new("cluster-b", 5, 5, [7; 32]).unwrap();
+        assert_eq!(
+            classify_fence_operation(
+                Some(&observed(&other_cluster, 4, 500)),
+                &resource(0x1234),
+                &ours,
+                [3; 16],
+            )
+            .unwrap(),
+            MvPublicationOperationStatus::Unresolved
+        );
+    }
+
+    #[test]
+    fn publication_error_separates_precondition_from_commit_unknown() {
+        assert!(!MvPublicationError::Precondition("stale".into()).is_commit_unknown());
+        assert!(MvPublicationError::CommitUnknown("timeout".into()).is_commit_unknown());
+        assert_eq!(
+            MvPublicationError::Precondition("stale".into()).message(),
+            "stale"
+        );
     }
 
     #[test]
