@@ -186,6 +186,27 @@ pub(crate) fn classify_attempt(evidence: &AttemptEvidence) -> MvAttemptDispositi
     }
 }
 
+/// Whether a new owner may publish a staged result produced by another
+/// generation.
+///
+/// The answer is always no when the generations differ, and it is worth stating
+/// as its own rule rather than leaving implicit. After a takeover the staged
+/// output is tempting: it exists, it looks finished, and republishing it would
+/// avoid recomputation. But the previous owner's result was validated against
+/// bases and a definition *it* observed. Re-authorizing that output under a
+/// higher generation would silently move ownership of freshness and validation
+/// to a frontend that never checked either.
+///
+/// A takeover therefore supersedes and recomputes. Reusing a prior generation's
+/// staged result would need its own design, because it changes who is
+/// accountable for the result being correct.
+pub(crate) fn may_publish_foreign_generation_output(
+    staged_by: &ConnectorMvPublicationFenceGeneration,
+    publishing_as: &ConnectorMvPublicationFenceGeneration,
+) -> bool {
+    staged_by == publishing_as
+}
+
 /// What a cleanup must prove before it may delete an attempt's artifacts.
 ///
 /// Cleanup is the only irreversible step in recovery, so its authorization is a
@@ -281,6 +302,28 @@ mod tests {
             operation: AttemptOperationEvidence::Absent,
             cleanup_outstanding: false,
         }
+    }
+
+    #[test]
+    fn a_takeover_never_republishes_the_previous_generations_output() {
+        let previous = generation(1, 1);
+        let taking_over = generation(2, 1);
+
+        // Its own output, yes.
+        assert!(may_publish_foreign_generation_output(&previous, &previous));
+
+        // Another generation's, never -- not even a strictly newer one, which is
+        // the case that looks safe and is not: the staged result was validated
+        // against bases and a definition the previous owner observed.
+        assert!(!may_publish_foreign_generation_output(
+            &previous,
+            &taking_over
+        ));
+        // And not in the other direction either.
+        assert!(!may_publish_foreign_generation_output(
+            &taking_over,
+            &previous
+        ));
     }
 
     #[test]
