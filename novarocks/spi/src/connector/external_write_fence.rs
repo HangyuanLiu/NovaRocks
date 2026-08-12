@@ -658,3 +658,46 @@ pub(super) mod tests {
         assert!(corrupted.validate().is_err());
     }
 }
+
+/// How one terminal write request is fenced.
+///
+/// This is an explicit two-state contract rather than an optional fence,
+/// because "no fence" must be a decision a caller states, not a value it can
+/// forget to set. A write family that this phase does not fence has to name
+/// itself, and the provider can then refuse the combination that would be
+/// unsafe (a fenced family arriving unfenced).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteFencing {
+    /// The caller established an external fence before dispatch, and this is
+    /// the fence every terminal call of the operation must carry.
+    Fenced(ConnectorExternalOperationFence),
+    /// The caller belongs to a write family that this phase does not fence.
+    ///
+    /// Such a family is arbitrated by whatever linearization it already owns
+    /// (materialized-view publication fencing, or ordinary base-state CAS for
+    /// rewrite). The reason is carried so an operator reading a log or an
+    /// error can tell a deliberate exemption from a missing fence.
+    NotFencedByThisPhase { reason: &'static str },
+}
+
+impl ConnectorWriteFencing {
+    pub const fn fence(&self) -> Option<&ConnectorExternalOperationFence> {
+        match self {
+            Self::Fenced(fence) => Some(fence),
+            Self::NotFencedByThisPhase { .. } => None,
+        }
+    }
+
+    /// Fail closed unless a carried fence seals exactly this operation.
+    ///
+    /// An exempt family validates trivially; it made no claim to check.
+    pub fn validate_for_operation(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+    ) -> Result<(), ConnectorError> {
+        match self {
+            Self::Fenced(fence) => fence.validate_for_operation(operation_id),
+            Self::NotFencedByThisPhase { .. } => Ok(()),
+        }
+    }
+}

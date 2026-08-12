@@ -1240,7 +1240,7 @@ impl IcebergWriteControl {
         request: &ConnectorWriteCommitRequest,
         active: &ActiveOperation,
         table: crate::iceberg::table::Table,
-        fence: IcebergFenceAssertion,
+        fence: Option<IcebergFenceAssertion>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, CommitServiceError> {
         let metadata = table.metadata().clone();
         let commit_metadata = active
@@ -1377,7 +1377,7 @@ impl IcebergWriteControl {
                 })
                 .transpose()
                 .map_err(CommitServiceError::invalid_input)?,
-            fence: Some(fence),
+            fence,
         };
         let result = self
             .runtime
@@ -1992,13 +1992,22 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 return Err(invalid(error.to_string()));
             }
         };
-        let fence_facts = fence_facts_from_spi(&request.fence);
-        let fence_assertion = match derive_established_assertion(table.metadata(), &fence_facts) {
-            Ok(assertion) => assertion,
-            Err(error) => {
-                restore_active()?;
-                return Err(fence_failure_to_connector_error(error));
+        // A fenced family derives its assertion from external truth here; a
+        // family this phase does not fence carries none, and `run` refuses any
+        // op kind that cannot actually assert one, so an exemption can never
+        // silently become a dropped fence.
+        let fence_assertion = match request.fence.fence() {
+            Some(spi_fence) => {
+                let fence_facts = fence_facts_from_spi(spi_fence);
+                match derive_established_assertion(table.metadata(), &fence_facts) {
+                    Ok(assertion) => Some(assertion),
+                    Err(error) => {
+                        restore_active()?;
+                        return Err(fence_failure_to_connector_error(error));
+                    }
+                }
             }
+            None => None,
         };
 
         let (outcome, known_uncommitted_finalization) =
@@ -4583,7 +4592,7 @@ mod tests {
             owner.clone(),
             sealed,
             Vec::new(),
-            fence(operation_id),
+            novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence(operation_id)),
             context(),
         )
         .expect("abort request");
@@ -4902,7 +4911,7 @@ mod tests {
         .expect("operation completion");
         let request = ConnectorWriteCommitRequest {
             completion,
-            fence: fence(operation_id),
+            fence: novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence(operation_id)),
             context: context(),
         };
         let active = {
@@ -5002,7 +5011,7 @@ mod tests {
                 operation_id,
                 cohort_set_digest,
                 aggregate_digest,
-                fence: fence(operation_id),
+                fence: novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence(operation_id)),
                 evidence,
                 context: context(),
             })
@@ -5199,7 +5208,7 @@ mod tests {
         let outcome = control
             .commit(ConnectorWriteCommitRequest {
                 completion,
-                fence: commit_fence,
+                fence: novarocks_spi::connector::ConnectorWriteFencing::Fenced(commit_fence),
                 context: context(),
             })
             .expect("commit empty overwrite");

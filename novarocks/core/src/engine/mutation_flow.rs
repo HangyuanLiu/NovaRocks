@@ -2301,7 +2301,7 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
                         self.write_lease.binding_key().clone(),
                         self.activated_sealed.clone(),
                         Vec::new(),
-                        fence,
+                        novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
                         self.connector_context.clone(),
                     )
                 })
@@ -2416,7 +2416,7 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
                         self.write_lease.binding_key().clone(),
                         self.activated_sealed.clone(),
                         Vec::new(),
-                        fence,
+                        novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
                         self.connector_context.clone(),
                     )
                 })
@@ -3102,7 +3102,7 @@ fn build_cow_update_distributed_execution(
                         write_lease.binding_key().clone(),
                         sealed,
                         Vec::new(),
-                        fence,
+                        novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
                         connector_context.clone(),
                     )
                 })
@@ -5770,7 +5770,7 @@ mod tests {
             lease.binding_key().clone(),
             failed.sealed_cohorts,
             Vec::new(),
-            fence,
+            novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
             connector_context_for_test(),
         )
         .and_then(|request| lease.control().abort(request))

@@ -110,7 +110,7 @@ pub use execution::{
 };
 pub use external_write_fence::{
     ConnectorClusterIdentity, ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,
-    ConnectorExternalFenceRequest, ConnectorExternalOperationFence,
+    ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorWriteFencing,
     MAX_CONNECTOR_EXTERNAL_FENCE_CLUSTER_ID_BYTES, MAX_CONNECTOR_EXTERNAL_FENCE_IDENTITY_BYTES,
     MAX_CONNECTOR_EXTERNAL_FENCE_RECEIPT_BYTES,
 };

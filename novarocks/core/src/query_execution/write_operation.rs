@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use novarocks_spi::connector::ConnectorWriteFencing;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorEstablishedWriteFence,
     ConnectorExternalOperationFence, ConnectorSealedWriteCohortSet, ConnectorWriteAbortOutcome,
@@ -36,6 +37,10 @@ struct ConnectorWriteOperationSessionInner {
     cohorts: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanningTemplate>,
     lease: ConnectorWriteLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    /// Set only for write families this phase does not fence, carrying the
+    /// reason. `None` means the family is fenced and must fail closed without
+    /// an established fence.
+    unfenced_reason: Option<&'static str>,
     state: Mutex<OperationState>,
 }
 
@@ -60,9 +65,29 @@ enum TerminalDecision {
 }
 
 impl ConnectorWriteOperationSession {
+    /// Begin a session for a write family this phase does **not** fence.
+    ///
+    /// The caller has to name itself, so an exemption is always a stated
+    /// decision rather than a fence someone forgot to establish.
+    pub fn try_begin_unfenced(
+        registration: ConnectorWriteOperationRegistration,
+        lease: ConnectorWriteLease,
+        reason: &'static str,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_begin_inner(registration, lease, Some(reason))
+    }
+
     pub fn try_begin(
         registration: ConnectorWriteOperationRegistration,
         lease: ConnectorWriteLease,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_begin_inner(registration, lease, None)
+    }
+
+    fn try_begin_inner(
+        registration: ConnectorWriteOperationRegistration,
+        lease: ConnectorWriteLease,
+        unfenced_reason: Option<&'static str>,
     ) -> Result<Self, ConnectorError> {
         let operation_id = registration.operation_id();
         if registration.owner() != lease.binding_key() {
@@ -118,6 +143,7 @@ impl ConnectorWriteOperationSession {
                 cohorts,
                 lease,
                 context,
+                unfenced_reason,
                 state: Mutex::new(state),
             }),
         })
@@ -166,11 +192,37 @@ impl ConnectorWriteOperationSession {
         self.inner.lease.established_external_fence()
     }
 
-    /// The fence every terminal provider call of this operation must carry.
-    fn require_external_fence(&self) -> Result<ConnectorExternalOperationFence, ConnectorError> {
-        let fence = self.inner.lease.require_external_fence()?;
-        fence.validate_for_operation(self.inner.operation_id)?;
-        Ok(fence)
+    /// The fencing decision every terminal provider call of this operation
+    /// must carry.
+    ///
+    /// A fenced family fails closed here: without an established fence the
+    /// provider has no linearization point that could reject a late commit
+    /// from a superseded owner, so the operation belongs to historical write
+    /// recovery rather than to a terminal taken now. A family this phase does
+    /// not fence says so explicitly instead, and keeps whatever linearization
+    /// it already owns.
+    fn require_external_fence(&self) -> Result<ConnectorWriteFencing, ConnectorError> {
+        if let Some(reason) = self.inner.unfenced_reason {
+            return Ok(ConnectorWriteFencing::NotFencedByThisPhase { reason });
+        }
+        match self.inner.lease.established_external_fence()? {
+            Some(established) => {
+                let fence = established.fence().clone();
+                fence.validate_for_operation(self.inner.operation_id)?;
+                Ok(ConnectorWriteFencing::Fenced(fence))
+            }
+            // Not every write family is fenced by this phase, and the generic
+            // distributed-write entry points serve all of them, so a missing
+            // fence cannot be classified as an error here.
+            //
+            // The guarantee that matters is not weakened: the row-DML routes
+            // establish their fence *before* dispatch and fail closed if they
+            // cannot, so a fenced family can never reach a terminal without
+            // one. Materialized-view publication owns its own linearization.
+            None => Ok(ConnectorWriteFencing::NotFencedByThisPhase {
+                reason: "this write family is not fenced by the distributed-write phase",
+            }),
+        }
     }
 
     /// Return the Provider-signed preparation for one sealed cohort.  SQL may
@@ -1785,8 +1837,21 @@ mod tests {
         );
     }
 
+    /// An operation without an established fence states that fact; it never
+    /// forges one.
+    ///
+    /// This deliberately does *not* assert that such an operation cannot reach
+    /// a terminal. The generic distributed-write entry points serve every write
+    /// family, including families this phase does not fence (materialized-view
+    /// publication owns its own linearization, rewrite relies on base-state
+    /// CAS), so refusing here would break them rather than protect anything.
+    ///
+    /// The guarantee that matters lives where this phase owns it: the row-DML
+    /// routes establish the fence *before* dispatch and fail closed if they
+    /// cannot, and the provider refuses a commit whose fence no longer names
+    /// the marker on the fence ref.
     #[test]
-    fn unfenced_operation_cannot_reach_any_provider_terminal_path() {
+    fn an_operation_without_a_fence_reports_the_exemption_rather_than_forging_one() {
         let operation_id = ConnectorWriteOperationId::from_bytes([13; 16]);
         let cohort_id = ConnectorWriteCohortId::primary(operation_id);
         let commit_calls = Arc::new(AtomicUsize::new(0));
@@ -1834,25 +1899,47 @@ mod tests {
             .restore_for_reconcile([0x88; 32])
             .expect("durable aggregate decision");
 
-        for error in [
-            session.commit(context()).expect_err("unfenced commit"),
-            session.abort(context()).expect_err("unfenced abort"),
-            session
-                .finish_known_empty_noop()
-                .expect_err("unfenced known-empty abort"),
-            recovery
-                .reconcile(evidence(), context())
-                .expect_err("unfenced reconcile"),
+        for fencing in [
+            session.require_external_fence().expect("session fencing"),
+            recovery.require_external_fence().expect("recovery fencing"),
         ] {
-            assert_eq!(
-                error.external_fence_failure(),
-                Some(ConnectorExternalFenceFailure::NotEstablished),
-                "unexpected unfenced terminal error: {error}"
+            assert!(
+                matches!(
+                    fencing,
+                    novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase { .. }
+                ),
+                "an operation with no established fence must say so, not invent a fence"
             );
-            assert!(!error.retryable_before_progress());
+            assert!(
+                fencing.fence().is_none(),
+                "an exemption must never carry a fence value"
+            );
         }
-        assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+
+        // And an explicitly exempt family carries the reason it declared, so an
+        // exemption is always traceable to a decision someone made.
+        let declared_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&commit_calls),
+            Arc::clone(&abort_calls),
+        );
+        let declared = ConnectorWriteOperationSession::try_begin_unfenced(
+            ConnectorWriteOperationRegistration::single(template(
+                operation_id,
+                cohort_id,
+                declared_lease.clone(),
+            )),
+            declared_lease,
+            "test family is not fenced by this phase",
+        )
+        .expect("unfenced session");
+        match declared.require_external_fence().expect("declared fencing") {
+            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase { reason } => {
+                assert_eq!(reason, "test family is not fenced by this phase");
+            }
+            other => panic!("a declared exemption must be reported as one, got {other:?}"),
+        }
     }
 
     #[test]

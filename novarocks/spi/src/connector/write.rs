@@ -34,7 +34,7 @@ use super::{
     ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExternalFenceReceipt,
     ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorMutationFailure,
-    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteFencing, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
@@ -2783,7 +2783,7 @@ pub struct ConnectorOpenWriterRequest {
 #[derive(Clone)]
 pub struct ConnectorWriteCommitRequest {
     pub completion: ConnectorWriteOperationCompletion,
-    pub fence: ConnectorExternalOperationFence,
+    pub fence: ConnectorWriteFencing,
     pub context: ConnectorRequestContext,
 }
 
@@ -2808,7 +2808,7 @@ impl ConnectorWriteCommitRequest {
         self.completion.aggregate_digest()
     }
 
-    pub fn fence(&self) -> &ConnectorExternalOperationFence {
+    pub fn fence(&self) -> &ConnectorWriteFencing {
         &self.fence
     }
 
@@ -2824,7 +2824,7 @@ pub struct ConnectorWriteAbortRequest {
     pub sealed: ConnectorSealedWriteCohortSet,
     pub cohorts: Vec<ConnectorWriteCohortCompletion>,
     pub aggregate_digest: [u8; 32],
-    pub fence: ConnectorExternalOperationFence,
+    pub fence: ConnectorWriteFencing,
     pub context: ConnectorRequestContext,
 }
 
@@ -2833,7 +2833,7 @@ impl ConnectorWriteAbortRequest {
         owner: ConnectorExecutionBindingKey,
         sealed: ConnectorSealedWriteCohortSet,
         cohorts: Vec<ConnectorWriteCohortCompletion>,
-        fence: ConnectorExternalOperationFence,
+        fence: ConnectorWriteFencing,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_operation_cohorts(&owner, &sealed, &cohorts, false)?;
@@ -2853,7 +2853,7 @@ impl ConnectorWriteAbortRequest {
         self.sealed.operation_id
     }
 
-    pub fn fence(&self) -> &ConnectorExternalOperationFence {
+    pub fn fence(&self) -> &ConnectorWriteFencing {
         &self.fence
     }
 }
@@ -2864,13 +2864,13 @@ pub struct ConnectorWriteReconcileRequest {
     pub operation_id: ConnectorWriteOperationId,
     pub cohort_set_digest: [u8; 32],
     pub aggregate_digest: [u8; 32],
-    pub fence: ConnectorExternalOperationFence,
+    pub fence: ConnectorWriteFencing,
     pub evidence: ExternalMutationEvidence,
     pub context: ConnectorRequestContext,
 }
 
 impl ConnectorWriteReconcileRequest {
-    pub fn fence(&self) -> &ConnectorExternalOperationFence {
+    pub fn fence(&self) -> &ConnectorWriteFencing {
         &self.fence
     }
 

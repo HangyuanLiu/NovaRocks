@@ -171,9 +171,11 @@ impl ConnectorDistributedRewriteSession {
                 .collect::<Result<Vec<_>, _>>()?;
             let registration = ConnectorWriteOperationRegistration::try_new(templates)
                 .map_err(|error| invalid(format!("register rewrite cohorts: {error}")))?;
-            Some(ConnectorWriteOperationSession::try_begin(
+            Some(ConnectorWriteOperationSession::try_begin_unfenced(
                 registration,
                 write_lease,
+                "distributed rewrite is arbitrated by ordinary Iceberg base-state CAS, \
+                 not by the distributed-write external fence",
             )?)
         };
 
