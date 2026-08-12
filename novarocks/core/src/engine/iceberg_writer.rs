@@ -1199,6 +1199,17 @@ fn insert_columns_from_connector_metadata(
         .fields()
         .iter()
         .enumerate()
+        // The neutral schema is the read schema: it carries the Iceberg
+        // metadata columns (`_file`, `_pos`, row-lineage) that a scan exposes
+        // but that are not part of the table's declared column list. SQL column
+        // binding must see only declared columns, so drop the ones the provider
+        // marked as system columns. Hidden-but-declared columns (the IMV apply
+        // key, aggregate-state columns) are `Ordinary` and stay.
+        .filter(|(ordinal, _)| {
+            column_facts.get(*ordinal).is_none_or(|fact| {
+                fact.role() != novarocks_spi::connector::ConnectorTableColumnRole::RowLineageSystem
+            })
+        })
         .map(|(ordinal, field)| ColumnDef {
             name: field.name().clone(),
             data_type: column_facts
