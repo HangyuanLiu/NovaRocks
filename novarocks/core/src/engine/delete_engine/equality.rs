@@ -18,17 +18,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
-use arrow::record_batch::RecordBatch;
-use novarocks_connector_iceberg::iceberg::Catalog;
-use novarocks_connector_iceberg::iceberg::spec::{FormatVersion, PrimitiveType, Type};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::ensure_equality_delete_single_partition_spec;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::delete_engine::{
@@ -44,7 +35,6 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_connector_iceberg::commit::EqualityDeleteColumn;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,
@@ -71,20 +61,6 @@ pub(crate) fn prepare_equality_delete_statement(
         &target.catalog,
     )?;
 
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
-    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
-        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
     // Reject a managed materialized view from neutral metadata under an exact
     // generation, the same way INSERT, TRUNCATE and ADD FILES already do. This
     // check cannot move into row-mutation admission: incremental MV refresh
@@ -97,28 +73,38 @@ pub(crate) fn prepare_equality_delete_statement(
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;
 
-    let metadata = table.metadata();
-    if metadata.format_version() == FormatVersion::V1 {
-        return Err("ADD EQUALITY DELETE requires an Iceberg v2 or v3 table".to_string());
-    }
-    ensure_equality_delete_single_partition_spec(&table)?;
-    if !metadata.default_partition_spec().fields().is_empty() {
-        return Err(
-            "ADD EQUALITY DELETE currently supports only unpartitioned iceberg tables".to_string(),
-        );
-    }
-
-    let (delete_columns, batch) = build_equality_delete_batch(
-        metadata.current_schema().as_ref(),
-        &stmt.columns,
-        &stmt.rows,
+    // The three table-shape gates this entry point used to answer -- Iceberg v1,
+    // an evolved partition spec, and a partitioned target -- are Iceberg facts,
+    // so they now run inside `ConnectorWriteControl::prepare_write` against the
+    // frozen admitted metadata (keyed on the equality-delete input shape, which
+    // no other row-delta write declares). Their messages are unchanged; they now
+    // arrive with the `Iceberg write admission denied:` prefix the SPI `Denied`
+    // outcome adds, and they fire after column and literal validation rather
+    // than before it.
+    let table_metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &planning_lease,
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
-    if batch.num_rows() == 0 {
+
+    let delete_columns = equality_delete_key_columns(&table_metadata, &stmt.columns, &stmt.rows)?;
+    if stmt.rows.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one row".to_string());
     }
     let values_query = build_equality_delete_sink_query(&delete_columns, &stmt.rows)?;
 
-    let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
+    // The durable operation journal records the snapshot this attempt is based
+    // on. It is read through the same planning lease rather than a concrete
+    // table, so this entry point no longer opens an Iceberg catalog.
+    let current_snapshot_id = crate::connector::metadata_read_reference_facts_with_planning_lease(
+        planning_lease.clone(),
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+    )?
+    .current_snapshot_id();
     // Route non-empty input through the distributed sink transaction.
     prepare_equality_delete_distributed_write(
         state,
@@ -192,7 +178,7 @@ fn prepare_equality_delete_distributed_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     current_snapshot_id: Option<i64>,
-    delete_columns: &[EqualityDeleteColumn],
+    delete_columns: &[Field],
     values_query: sqlparser::ast::Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -210,13 +196,7 @@ fn prepare_equality_delete_distributed_write(
         ConnectorWriteInputRequest::EqualityDelete {
             equality_fields: delete_columns
                 .iter()
-                .map(|column| {
-                    ConnectorWriteFieldRequest::new(Field::new(
-                        &column.name,
-                        column.data_type.clone(),
-                        column.nullable,
-                    ))
-                })
+                .map(|column| ConnectorWriteFieldRequest::new(column.clone()))
                 .collect(),
         },
         ConnectorWriteAdmissionPurpose::OrdinaryDml,
@@ -279,7 +259,7 @@ fn prepare_equality_delete_distributed_write(
 }
 
 fn build_equality_delete_sink_query(
-    delete_columns: &[EqualityDeleteColumn],
+    delete_columns: &[Field],
     rows: &[Vec<Literal>],
 ) -> Result<sqlparser::ast::Query, String> {
     if delete_columns.is_empty() {
@@ -345,13 +325,13 @@ fn build_equality_delete_sink_query(
     parse_generated_query(&sql, "ADD EQUALITY DELETE sink")
 }
 
-fn equality_delete_target_columns(delete_columns: &[EqualityDeleteColumn]) -> Vec<ColumnDef> {
+fn equality_delete_target_columns(delete_columns: &[Field]) -> Vec<ColumnDef> {
     delete_columns
         .iter()
         .map(|column| ColumnDef {
-            name: column.name.clone(),
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            name: column.name().clone(),
+            data_type: column.data_type().clone(),
+            nullable: column.is_nullable(),
             write_default: None,
             logical_type: None,
         })
@@ -373,11 +353,26 @@ fn sql_identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-fn build_equality_delete_batch(
-    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+/// Resolve the declared equality key columns from neutral connector metadata,
+/// then validate every literal against them.
+///
+/// This used to build an Arrow `RecordBatch` from the same literals. Nothing
+/// consumed that batch: the values reach the writer as the SQL `VALUES` list
+/// [`build_equality_delete_sink_query`] renders, and the only thing the caller
+/// read off the batch was `num_rows() == 0`. What the array builder did
+/// contribute was literal validation, so that is all this keeps.
+///
+/// The column set comes from `ConnectorTableMetadata` rather than the provider's
+/// Iceberg schema, the same substitution `insert_columns_from_connector_metadata`
+/// makes for INSERT: `schema` is the full physical Arrow schema with hidden
+/// columns marked rather than removed, and `write_target_type` is the
+/// provider-signed DML write type for the columns whose write encoding differs
+/// from their read encoding (ADR-0055 decision 5).
+fn equality_delete_key_columns(
+    table_metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     column_names: &[String],
     rows: &[Vec<Literal>],
-) -> Result<(Vec<EqualityDeleteColumn>, RecordBatch), String> {
+) -> Result<Vec<Field>, String> {
     if column_names.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
     }
@@ -400,284 +395,218 @@ fn build_equality_delete_batch(
         }
     }
 
+    let column_facts = table_metadata.planning_facts.column_facts();
     let mut delete_columns = Vec::with_capacity(column_names.len());
     for column_name in column_names {
-        let field = schema
-            .as_struct()
+        let (ordinal, field) = table_metadata
+            .schema
             .fields()
             .iter()
-            .find(|field| field.name.eq_ignore_ascii_case(column_name))
+            .enumerate()
+            .find(|(_, field)| field.name().eq_ignore_ascii_case(column_name))
             .ok_or_else(|| format!("column `{column_name}` not found in iceberg table schema"))?;
-        let primitive = match &*field.field_type {
-            Type::Primitive(primitive) => primitive,
-            other => {
-                return Err(format!(
-                    "ADD EQUALITY DELETE only supports primitive equality columns; column `{}` is {other:?}",
-                    field.name
-                ));
-            }
-        };
-        delete_columns.push(EqualityDeleteColumn {
-            name: field.name.clone(),
-            field_id: field.id,
-            data_type: primitive_to_arrow_type(primitive, &field.name)?,
-            nullable: !field.required,
-        });
+        let data_type = column_facts
+            .get(ordinal)
+            .and_then(|fact| fact.write_target_type())
+            .cloned()
+            .unwrap_or_else(|| field.data_type().clone());
+        ensure_supported_equality_key_type(&data_type, field.name())?;
+        delete_columns.push(Field::new(
+            field.name().clone(),
+            data_type,
+            field.is_nullable(),
+        ));
     }
 
-    let mut arrays = Vec::with_capacity(delete_columns.len());
-    for (col_idx, column) in delete_columns.iter().enumerate() {
-        let values = rows.iter().map(|row| &row[col_idx]).collect::<Vec<_>>();
-        arrays.push(build_literal_array_for_equality(column, &values)?);
+    for (ordinal, column) in delete_columns.iter().enumerate() {
+        let values = rows.iter().map(|row| &row[ordinal]).collect::<Vec<_>>();
+        validate_equality_literals(column, &values)?;
     }
-    let arrow_schema = Arc::new(ArrowSchema::new(
-        delete_columns
-            .iter()
-            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-            .collect::<Vec<_>>(),
-    ));
-    let batch = RecordBatch::try_new(arrow_schema, arrays)
-        .map_err(|e| format!("build equality-delete batch failed: {e}"))?;
-    Ok((delete_columns, batch))
+    Ok(delete_columns)
 }
 
-fn primitive_to_arrow_type(
-    primitive: &PrimitiveType,
+/// Reject an equality key column whose write type this statement cannot encode.
+///
+/// The two rejections the Iceberg-typed predecessor produced here are kept:
+/// variant columns, which are never equality-delete keys, and every type the
+/// literal validator below has no rule for. `LargeBinary` is the write-target
+/// Arrow type the provider signs for an Iceberg variant column, the same
+/// spelling `arrow_data_type_to_sql_type` maps to `SqlType::Variant`.
+fn ensure_supported_equality_key_type(
+    data_type: &DataType,
     column_name: &str,
-) -> Result<DataType, String> {
-    Ok(match primitive {
-        PrimitiveType::Boolean => DataType::Boolean,
-        PrimitiveType::Int => DataType::Int32,
-        PrimitiveType::Long => DataType::Int64,
-        PrimitiveType::Float => DataType::Float32,
-        PrimitiveType::Double => DataType::Float64,
-        PrimitiveType::Decimal { precision, scale } => {
-            let precision = u8::try_from(*precision).map_err(|_| {
-                format!("DECIMAL precision {precision} is out of range for column `{column_name}`")
-            })?;
-            let scale = i8::try_from(*scale).map_err(|_| {
-                format!("DECIMAL scale {scale} is out of range for column `{column_name}`")
-            })?;
-            DataType::Decimal128(precision, scale)
-        }
-        PrimitiveType::Date => DataType::Date32,
-        PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
-        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        PrimitiveType::String => DataType::Utf8,
-        PrimitiveType::Variant => {
-            return Err(format!(
-                "ADD EQUALITY DELETE column `{column_name}` is variant; variant columns cannot be equality-delete keys"
-            ));
-        }
-        other => {
-            return Err(format!(
-                "ADD EQUALITY DELETE does not yet support equality column `{column_name}` with type {other:?}"
-            ));
-        }
-    })
+) -> Result<(), String> {
+    if matches!(data_type, DataType::LargeBinary) {
+        return Err(format!(
+            "ADD EQUALITY DELETE column `{column_name}` is variant; variant columns cannot be equality-delete keys"
+        ));
+    }
+    if !matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Time64(TimeUnit::Microsecond)
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
+    ) {
+        return Err(unsupported_equality_key_type(data_type, column_name));
+    }
+    Ok(())
 }
 
-fn build_literal_array_for_equality(
-    column: &EqualityDeleteColumn,
-    values: &[&Literal],
-) -> Result<ArrayRef, String> {
+fn unsupported_equality_key_type(data_type: &DataType, column_name: &str) -> String {
+    format!(
+        "ADD EQUALITY DELETE does not yet support equality column `{column_name}` with arrow type {data_type:?}"
+    )
+}
+
+/// Every rejection the discarded Arrow array builder produced, with none of the
+/// arrays. The accepted literal set per column type is unchanged.
+fn validate_equality_literals(column: &Field, values: &[&Literal]) -> Result<(), String> {
     ensure_nullability(column, values)?;
-    match &column.data_type {
-        DataType::Boolean => Ok(Arc::new(BooleanArray::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::Bool(v) => Ok(Some(*v)),
-                    other => Err(format!(
-                        "literal {:?} is not valid for BOOLEAN equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Int32 => Ok(Arc::new(Int32Array::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::Int(v) => i32::try_from(*v).map(Some).map_err(|_| {
-                        format!(
-                            "literal {v} is out of range for INT equality column `{}`",
-                            column.name
-                        )
-                    }),
-                    Literal::String(v) => v.trim().parse::<i32>().map(Some).map_err(|_| {
-                        format!(
-                            "literal `{v}` is not valid for INT equality column `{}`",
-                            column.name
-                        )
-                    }),
-                    other => Err(format!(
-                        "literal {:?} is not valid for INT equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Int64 => Ok(Arc::new(Int64Array::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::Int(v) => Ok(Some(*v)),
-                    Literal::String(v) => v.trim().parse::<i64>().map(Some).map_err(|_| {
-                        format!(
-                            "literal `{v}` is not valid for LONG equality column `{}`",
-                            column.name
-                        )
-                    }),
-                    other => Err(format!(
-                        "literal {:?} is not valid for LONG equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Float32 => Ok(Arc::new(Float32Array::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::Int(v) => Ok(Some(*v as f32)),
-                    Literal::Float(v) => Ok(Some(*v as f32)),
-                    Literal::String(v) => v.trim().parse::<f32>().map(Some).map_err(|_| {
-                        format!(
-                            "literal `{v}` is not valid for FLOAT equality column `{}`",
-                            column.name
-                        )
-                    }),
-                    other => Err(format!(
-                        "literal {:?} is not valid for FLOAT equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Float64 => Ok(Arc::new(Float64Array::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::Int(v) => Ok(Some(*v as f64)),
-                    Literal::Float(v) => Ok(Some(*v)),
-                    Literal::String(v) => v.trim().parse::<f64>().map(Some).map_err(|_| {
-                        format!(
-                            "literal `{v}` is not valid for DOUBLE equality column `{}`",
-                            column.name
-                        )
-                    }),
-                    other => Err(format!(
-                        "literal {:?} is not valid for DOUBLE equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Decimal128(precision, scale) => {
-            let values = values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::Int(v) => scale_i128_decimal(i128::from(*v), *scale).map(Some),
-                    Literal::Float(v) => {
-                        parse_decimal_literal_to_i128(&v.to_string(), *scale).map(Some)
-                    }
-                    Literal::String(v) => parse_decimal_literal_to_i128(v, *scale).map(Some),
-                    other => Err(format!(
-                        "literal {:?} is not valid for DECIMAL equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let array = Decimal128Array::from(values)
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| {
-                    format!(
-                        "build DECIMAL equality array for column `{}` failed: {e}",
-                        column.name
-                    )
-                })?;
-            Ok(Arc::new(array))
+    match column.data_type() {
+        DataType::Boolean => values.iter().try_for_each(|value| match value {
+            Literal::Null | Literal::Bool(_) => Ok(()),
+            other => Err(format!(
+                "literal {:?} is not valid for BOOLEAN equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Int32 => values.iter().try_for_each(|value| match value {
+            Literal::Null => Ok(()),
+            Literal::Int(v) => i32::try_from(*v).map(|_| ()).map_err(|_| {
+                format!(
+                    "literal {v} is out of range for INT equality column `{}`",
+                    column.name()
+                )
+            }),
+            Literal::String(v) => v.trim().parse::<i32>().map(|_| ()).map_err(|_| {
+                format!(
+                    "literal `{v}` is not valid for INT equality column `{}`",
+                    column.name()
+                )
+            }),
+            other => Err(format!(
+                "literal {:?} is not valid for INT equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Int64 => values.iter().try_for_each(|value| match value {
+            Literal::Null | Literal::Int(_) => Ok(()),
+            Literal::String(v) => v.trim().parse::<i64>().map(|_| ()).map_err(|_| {
+                format!(
+                    "literal `{v}` is not valid for LONG equality column `{}`",
+                    column.name()
+                )
+            }),
+            other => Err(format!(
+                "literal {:?} is not valid for LONG equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Float32 => values.iter().try_for_each(|value| match value {
+            Literal::Null | Literal::Int(_) | Literal::Float(_) => Ok(()),
+            Literal::String(v) => v.trim().parse::<f32>().map(|_| ()).map_err(|_| {
+                format!(
+                    "literal `{v}` is not valid for FLOAT equality column `{}`",
+                    column.name()
+                )
+            }),
+            other => Err(format!(
+                "literal {:?} is not valid for FLOAT equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Float64 => values.iter().try_for_each(|value| match value {
+            Literal::Null | Literal::Int(_) | Literal::Float(_) => Ok(()),
+            Literal::String(v) => v.trim().parse::<f64>().map(|_| ()).map_err(|_| {
+                format!(
+                    "literal `{v}` is not valid for DOUBLE equality column `{}`",
+                    column.name()
+                )
+            }),
+            other => Err(format!(
+                "literal {:?} is not valid for DOUBLE equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Decimal128(_, scale) => values.iter().try_for_each(|value| match value {
+            Literal::Null => Ok(()),
+            Literal::Int(v) => scale_i128_decimal(i128::from(*v), *scale).map(|_| ()),
+            Literal::Float(v) => parse_decimal_literal_to_i128(&v.to_string(), *scale).map(|_| ()),
+            Literal::String(v) => parse_decimal_literal_to_i128(v, *scale).map(|_| ()),
+            other => Err(format!(
+                "literal {:?} is not valid for DECIMAL equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Utf8 => values.iter().try_for_each(|value| match value {
+            Literal::Null | Literal::String(_) | Literal::Date(_) => Ok(()),
+            other => Err(format!(
+                "literal {:?} is not valid for STRING equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Date32 => values.iter().try_for_each(|value| match value {
+            Literal::Null => Ok(()),
+            Literal::Date(v) | Literal::String(v) => parse_date_string_to_days(v).map(|_| ()),
+            other => Err(format!(
+                "literal {:?} is not valid for DATE equality column `{}`",
+                other,
+                column.name()
+            )),
+        }),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            values.iter().try_for_each(|value| match value {
+                Literal::Null => Ok(()),
+                Literal::String(v) => parse_time_literal_to_micros(v).map(|_| ()),
+                other => Err(format!(
+                    "literal {:?} is not valid for TIME equality column `{}`",
+                    other,
+                    column.name()
+                )),
+            })
         }
-        DataType::Utf8 => Ok(Arc::new(StringArray::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::String(v) | Literal::Date(v) => Ok(Some(v.clone())),
-                    other => Err(format!(
-                        "literal {:?} is not valid for STRING equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Date32 => Ok(Arc::new(Date32Array::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::Date(v) | Literal::String(v) => parse_date_string_to_days(v).map(Some),
-                    other => Err(format!(
-                        "literal {:?} is not valid for DATE equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Time64(TimeUnit::Microsecond) => Ok(Arc::new(Time64MicrosecondArray::from(
-            values
-                .iter()
-                .map(|value| match value {
-                    Literal::Null => Ok(None),
-                    Literal::String(v) => parse_time_literal_to_micros(v).map(Some),
-                    other => Err(format!(
-                        "literal {:?} is not valid for TIME equality column `{}`",
-                        other, column.name
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            Ok(Arc::new(TimestampMicrosecondArray::from(
-                values
-                    .iter()
-                    .map(|value| match value {
-                        Literal::Null => Ok(None),
-                        Literal::Date(v) | Literal::String(v) => {
-                            parse_datetime_string_to_micros(v).map(Some)
-                        }
-                        other => Err(format!(
-                            "literal {:?} is not valid for TIMESTAMP equality column `{}`",
-                            other, column.name
-                        )),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )))
+            values.iter().try_for_each(|value| match value {
+                Literal::Null => Ok(()),
+                Literal::Date(v) | Literal::String(v) => {
+                    parse_datetime_string_to_micros(v).map(|_| ())
+                }
+                other => Err(format!(
+                    "literal {:?} is not valid for TIMESTAMP equality column `{}`",
+                    other,
+                    column.name()
+                )),
+            })
         }
-        other => Err(format!(
-            "ADD EQUALITY DELETE does not yet support equality column `{}` with arrow type {:?}",
-            column.name, other
-        )),
+        // Unreachable: `ensure_supported_equality_key_type` already rejected
+        // every type without a rule above. Kept so the two lists cannot drift
+        // apart silently.
+        other => Err(unsupported_equality_key_type(other, column.name())),
     }
 }
 
-fn ensure_nullability(column: &EqualityDeleteColumn, values: &[&Literal]) -> Result<(), String> {
-    if column.nullable {
+fn ensure_nullability(column: &Field, values: &[&Literal]) -> Result<(), String> {
+    if column.is_nullable() {
         return Ok(());
     }
     if values.iter().any(|value| matches!(value, Literal::Null)) {
         return Err(format!(
             "NULL is not valid for required equality column `{}`",
-            column.name
+            column.name()
         ));
     }
     Ok(())
@@ -746,87 +675,147 @@ fn parse_decimal_literal_to_i128(value: &str, scale: i8) -> Result<i128, String>
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use arrow::array::{Array, Int32Array, StringArray};
-    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
+        ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+        ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
+        ConnectorTableMetadata, ConnectorTablePlanningFacts,
+    };
 
     use crate::sql::parser::ast::Literal;
 
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(60),
+            Arc::new(NeverCancelled),
+            64 * 1_024,
+            64 * 1_024,
+        )
+        .expect("request context")
+    }
+
+    /// A neutral `ConnectorTableMetadata` shaped the way the Iceberg provider
+    /// reports one: the full physical Arrow schema plus per-column planning
+    /// facts, where `write_target_type` carries the provider-signed DML write
+    /// type for the columns whose write encoding differs from the read one.
+    fn loaded_table(fields: Vec<(Field, Option<DataType>)>) -> ConnectorTableMetadata {
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let schema = Arc::new(ArrowSchema::new(
+            fields
+                .iter()
+                .map(|(field, _)| field.clone())
+                .collect::<Vec<_>>(),
+        ));
+        let column_facts = fields
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (_, write_target_type))| {
+                ConnectorTableColumnPlanningFact::new(
+                    u32::try_from(ordinal).expect("ordinal"),
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::None,
+                    ConnectorTableColumnRole::Ordinary,
+                )
+                .with_write_target_type(write_target_type.clone())
+            })
+            .collect();
+        let planning_facts = ConnectorTablePlanningFacts::try_new(
+            &schema,
+            column_facts,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &request_context(),
+        )
+        .expect("planning facts");
+        ConnectorTableMetadata {
+            identity: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+            schema,
+            planning_facts,
+            definition_facts: ConnectorTableDefinitionFacts::empty(),
+            version: None,
+            statistics_data_version: None,
+            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
+                .expect("table handle"),
+        }
+    }
+
+    /// `id INT NOT NULL`, `category STRING NULL`, `amount BIGINT NULL`.
+    fn plain_table() -> ConnectorTableMetadata {
+        loaded_table(vec![
+            (Field::new("id", DataType::Int32, false), None),
+            (Field::new("category", DataType::Utf8, true), None),
+            (Field::new("amount", DataType::Int64, true), None),
+        ])
+    }
+
     #[test]
-    fn build_equality_delete_batch_projects_key_columns_with_field_ids() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )),
-                Arc::new(NestedField::optional(
-                    2,
-                    "category",
-                    Type::Primitive(PrimitiveType::String),
-                )),
-                Arc::new(NestedField::optional(
-                    3,
-                    "amount",
-                    Type::Primitive(PrimitiveType::Long),
-                )),
-            ])
-            .build()
-            .expect("schema");
+    fn equality_delete_key_columns_project_the_declared_columns_from_connector_metadata() {
+        let table = plain_table();
         let columns = vec!["id".to_string(), "category".to_string()];
         let rows = vec![
             vec![Literal::Int(2), Literal::String("B".to_string())],
             vec![Literal::Int(4), Literal::Null],
         ];
 
-        let (delete_columns, batch) =
-            super::build_equality_delete_batch(&schema, &columns, &rows).expect("batch");
+        let delete_columns =
+            super::equality_delete_key_columns(&table, &columns, &rows).expect("columns");
 
+        // Name, Arrow write type and nullability, in declaration order. The
+        // Iceberg field ID the predecessor also returned had no production
+        // reader: the writer's own columns are rebuilt inside the provider from
+        // the signed field bindings and the frozen schema.
         assert_eq!(
-            delete_columns
-                .iter()
-                .map(|c| c.field_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
+            delete_columns,
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("category", DataType::Utf8, true),
+            ]
         );
-        assert_eq!(batch.num_rows(), 2);
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("id column");
-        assert_eq!(ids.values(), &[2, 4]);
-        let categories = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("category column");
-        assert_eq!(categories.value(0), "B");
-        assert!(categories.is_null(1));
     }
 
     #[test]
-    fn build_equality_delete_batch_rejects_variant_key_column() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )),
-                Arc::new(NestedField::optional(
-                    2,
+    fn equality_delete_key_columns_reject_a_variant_key_column() {
+        // A variant column reads as a two-leaf struct and writes as the
+        // engine's encoded `LargeBinary`; the provider signs the write type.
+        let table = loaded_table(vec![
+            (Field::new("id", DataType::Int32, false), None),
+            (
+                Field::new(
                     "payload",
-                    Type::Primitive(PrimitiveType::Variant),
-                )),
-            ])
-            .build()
-            .expect("schema");
+                    DataType::Struct(
+                        vec![
+                            Field::new("metadata", DataType::Binary, false),
+                            Field::new("value", DataType::Binary, false),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+                Some(DataType::LargeBinary),
+            ),
+        ]);
         let columns = vec!["payload".to_string()];
         let rows = vec![vec![Literal::Null]];
 
-        let err = super::build_equality_delete_batch(&schema, &columns, &rows)
+        let err = super::equality_delete_key_columns(&table, &columns, &rows)
             .expect_err("variant equality key must be rejected");
 
         assert!(
@@ -836,29 +825,143 @@ mod tests {
     }
 
     #[test]
+    fn equality_delete_key_columns_reject_an_unsupported_key_type() {
+        let table = loaded_table(vec![(
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            None,
+        )]);
+        let columns = vec!["tags".to_string()];
+        let rows = vec![vec![Literal::Null]];
+
+        let err = super::equality_delete_key_columns(&table, &columns, &rows)
+            .expect_err("non-scalar equality key must be rejected");
+
+        assert!(
+            err.starts_with("ADD EQUALITY DELETE does not yet support equality column `tags`"),
+            "{err}"
+        );
+    }
+
+    /// The literal rejections the discarded Arrow array builder produced must
+    /// still be produced, now without building any array.
+    #[test]
+    fn equality_delete_key_columns_reject_the_literals_the_array_builder_rejected() {
+        let table = plain_table();
+
+        let out_of_range = super::equality_delete_key_columns(
+            &table,
+            &["id".to_string()],
+            &[vec![Literal::Int(i64::from(i32::MAX) + 1)]],
+        )
+        .expect_err("out-of-range INT literal must be rejected");
+        assert_eq!(
+            out_of_range,
+            "literal 2147483648 is out of range for INT equality column `id`"
+        );
+
+        let wrong_type = super::equality_delete_key_columns(
+            &table,
+            &["category".to_string()],
+            &[vec![Literal::Bool(true)]],
+        )
+        .expect_err("boolean literal must be rejected for a STRING key");
+        assert_eq!(
+            wrong_type,
+            "literal Bool(true) is not valid for STRING equality column `category`"
+        );
+
+        let required_null =
+            super::equality_delete_key_columns(&table, &["id".to_string()], &[vec![Literal::Null]])
+                .expect_err("NULL must be rejected for a required key");
+        assert_eq!(
+            required_null,
+            "NULL is not valid for required equality column `id`"
+        );
+
+        let unknown = super::equality_delete_key_columns(
+            &table,
+            &["absent".to_string()],
+            &[vec![Literal::Int(1)]],
+        )
+        .expect_err("unknown column must be rejected");
+        assert_eq!(unknown, "column `absent` not found in iceberg table schema");
+
+        let duplicate = super::equality_delete_key_columns(
+            &table,
+            &["id".to_string(), "ID".to_string()],
+            &[vec![Literal::Int(1), Literal::Int(1)]],
+        )
+        .expect_err("duplicate column must be rejected");
+        assert_eq!(
+            duplicate,
+            "ADD EQUALITY DELETE has duplicate equality column `ID`"
+        );
+
+        let arity = super::equality_delete_key_columns(
+            &table,
+            &["id".to_string()],
+            &[vec![Literal::Int(1), Literal::Int(2)]],
+        )
+        .expect_err("row arity mismatch must be rejected");
+        assert_eq!(arity, "ADD EQUALITY DELETE row has 2 values, expected 1");
+
+        let no_columns = super::equality_delete_key_columns(&table, &[], &[])
+            .expect_err("empty column list must be rejected");
+        assert_eq!(
+            no_columns,
+            "ADD EQUALITY DELETE requires at least one equality column"
+        );
+    }
+
+    /// A `timestamptz` key column reads as a UTC-stamped Arrow timestamp. The
+    /// predecessor flattened the zone away when it derived the Arrow type from
+    /// the Iceberg primitive; the neutral schema keeps it, so the validator has
+    /// to accept either spelling.
+    #[test]
+    fn equality_delete_key_columns_accept_a_zone_stamped_microsecond_timestamp() {
+        let table = loaded_table(vec![(
+            Field::new(
+                "event_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                true,
+            ),
+            None,
+        )]);
+
+        let delete_columns = super::equality_delete_key_columns(
+            &table,
+            &["event_at".to_string()],
+            &[vec![Literal::String("2024-01-02 03:04:05".to_string())]],
+        )
+        .expect("zone-stamped timestamp key");
+        assert_eq!(delete_columns.len(), 1);
+
+        let err = super::equality_delete_key_columns(
+            &table,
+            &["event_at".to_string()],
+            &[vec![Literal::Int(7)]],
+        )
+        .expect_err("integer literal must be rejected for a TIMESTAMP key");
+        assert_eq!(
+            err,
+            "literal Int(7) is not valid for TIMESTAMP equality column `event_at`"
+        );
+    }
+
+    #[test]
     fn build_equality_delete_sink_query_projects_typed_values() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )),
-                Arc::new(NestedField::optional(
-                    2,
-                    "category",
-                    Type::Primitive(PrimitiveType::String),
-                )),
-            ])
-            .build()
-            .expect("schema");
+        let table = plain_table();
         let columns = vec!["id".to_string(), "category".to_string()];
         let rows = vec![
             vec![Literal::Int(2), Literal::String("B".to_string())],
             vec![Literal::Int(4), Literal::Null],
         ];
-        let (delete_columns, _) =
-            super::build_equality_delete_batch(&schema, &columns, &rows).expect("batch");
+        let delete_columns =
+            super::equality_delete_key_columns(&table, &columns, &rows).expect("columns");
 
         let query = super::build_equality_delete_sink_query(&delete_columns, &rows).expect("query");
         let sql = query.to_string();
