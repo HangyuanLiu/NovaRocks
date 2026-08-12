@@ -9846,6 +9846,7 @@ mod tests {
             column_stats: Some(HashMap::from([(
                 column.to_string(),
                 novarocks_connector_iceberg::scan_model::IcebergColumnStats {
+                    field_id: None,
                     null_count,
                     value_count: Some(4),
                     column_size: Some(32),
