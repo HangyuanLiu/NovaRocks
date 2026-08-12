@@ -929,11 +929,20 @@ mod spi_5n_provider_parity_tests {
     ) -> bool {
         let core = core_keeps(file, predicates);
         let provider = provider_keeps(file, predicates);
-        assert_eq!(core, provider, "{case}: Core kept {core}, provider {provider}");
+        assert_eq!(
+            core, provider,
+            "{case}: Core kept {core}, provider {provider}"
+        );
         core
     }
 
-    fn stats_file(path: &str, column: &str, field_id: Option<i32>, min: i32, max: i32) -> IcebergDataFileInfo {
+    fn stats_file(
+        path: &str,
+        column: &str,
+        field_id: Option<i32>,
+        min: i32,
+        max: i32,
+    ) -> IcebergDataFileInfo {
         let mut file = IcebergDataFileInfo::for_test(path, 128, 10);
         file.column_stats = Some(HashMap::from([(
             column.to_string(),
@@ -949,7 +958,11 @@ mod spi_5n_provider_parity_tests {
         file
     }
 
-    fn eq(column: &str, field_id: i32, value: IcebergPhysicalPredicateValue) -> IcebergPhysicalPredicate {
+    fn eq(
+        column: &str,
+        field_id: i32,
+        value: IcebergPhysicalPredicateValue,
+    ) -> IcebergPhysicalPredicate {
         IcebergPhysicalPredicate {
             column: column.to_string(),
             field_id,
@@ -1025,7 +1038,9 @@ mod spi_5n_provider_parity_tests {
     #[test]
     fn identity_partitions_agree() {
         let mut file = IcebergDataFileInfo::for_test("e", 128, 10);
-        file.partition_values = vec![IcebergPartitionFieldValue::identity_int64_for_test("id", 12)];
+        file.partition_values = vec![IcebergPartitionFieldValue::identity_int64_for_test(
+            "id", 12,
+        )];
         assert!(assert_same(
             "partition hit",
             &file,

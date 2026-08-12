@@ -205,7 +205,12 @@ mod tests {
         IcebergPhysicalPredicateValue,
     };
 
-    fn file_with_i32_stats(column: &str, field_id: Option<i32>, min: i32, max: i32) -> IcebergDataFileInfo {
+    fn file_with_i32_stats(
+        column: &str,
+        field_id: Option<i32>,
+        min: i32,
+        max: i32,
+    ) -> IcebergDataFileInfo {
         let mut file = IcebergDataFileInfo::for_test("s3://bucket/f.parquet", 128, 10);
         file.column_stats = Some(HashMap::from([(
             column.to_string(),
@@ -229,7 +234,11 @@ mod tests {
         file
     }
 
-    fn eq(column: &str, field_id: i32, value: IcebergPhysicalPredicateValue) -> IcebergPhysicalPredicate {
+    fn eq(
+        column: &str,
+        field_id: i32,
+        value: IcebergPhysicalPredicateValue,
+    ) -> IcebergPhysicalPredicate {
         IcebergPhysicalPredicate {
             column: column.to_string(),
             field_id,
@@ -442,8 +451,7 @@ mod tests {
             std::slice::from_ref(&predicate)
         ));
 
-        let mut string_partition =
-            IcebergDataFileInfo::for_test("s3://bucket/s.parquet", 128, 10);
+        let mut string_partition = IcebergDataFileInfo::for_test("s3://bucket/s.parquet", 128, 10);
         string_partition.partition_values = vec![IcebergPartitionFieldValue {
             source_column: "id".to_string(),
             field_name: "id".to_string(),

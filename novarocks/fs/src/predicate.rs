@@ -95,11 +95,7 @@ impl ScanPredicateDomain {
     ///
     /// An empty `DiscreteSet` / `Membership` is a different matter and still
     /// prunes: `x IN ()` is unsatisfiable, so skipping is provably correct.
-    pub fn may_match_bounds(
-        &self,
-        min: &MinMaxPredicateValue,
-        max: &MinMaxPredicateValue,
-    ) -> bool {
+    pub fn may_match_bounds(&self, min: &MinMaxPredicateValue, max: &MinMaxPredicateValue) -> bool {
         match self {
             Self::Range { op, value } => match op {
                 MinMaxPredicateOp::Le => {
@@ -208,8 +204,10 @@ pub struct PhysicalPageSelection {
 mod tests {
     use super::*;
 
-    const BOUNDS: (MinMaxPredicateValue, MinMaxPredicateValue) =
-        (MinMaxPredicateValue::Int32(10), MinMaxPredicateValue::Int32(20));
+    const BOUNDS: (MinMaxPredicateValue, MinMaxPredicateValue) = (
+        MinMaxPredicateValue::Int32(10),
+        MinMaxPredicateValue::Int32(20),
+    );
 
     const ALL_OPS: [MinMaxPredicateOp; 5] = [
         MinMaxPredicateOp::Eq,
@@ -294,8 +292,7 @@ mod tests {
         // `x IN ()` is unsatisfiable, so skipping the unit is provably correct.
         assert!(!discrete(Vec::new()).may_match_bounds(&min, &max));
         assert!(
-            !ScanPredicateDomain::Membership { values: Vec::new() }
-                .may_match_bounds(&min, &max)
+            !ScanPredicateDomain::Membership { values: Vec::new() }.may_match_bounds(&min, &max)
         );
     }
 
