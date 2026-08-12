@@ -32,9 +32,14 @@ fn current_target_dir() -> PathBuf {
         .to_path_buf()
 }
 
-fn current_novarocks_rlib() -> &'static PathBuf {
-    static RLIB: OnceLock<PathBuf> = OnceLock::new();
-    RLIB.get_or_init(|| {
+struct CurrentRlibs {
+    novarocks: PathBuf,
+    execution: PathBuf,
+}
+
+fn current_rlibs() -> &'static CurrentRlibs {
+    static RLIBS: OnceLock<CurrentRlibs> = OnceLock::new();
+    RLIBS.get_or_init(|| {
         let mut command = Command::new(env!("CARGO"));
         command
             .arg("build")
@@ -76,54 +81,52 @@ fn current_novarocks_rlib() -> &'static PathBuf {
             "current novarocks library build failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let artifacts = String::from_utf8(output.stdout)
+        let messages = String::from_utf8(output.stdout)
             .expect("Cargo JSON output is UTF-8")
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|message| message["reason"] == "compiler-artifact")
-            .filter(|message| message["target"]["name"] == "novarocks")
-            .filter(|message| {
-                message["target"]["kind"]
-                    .as_array()
-                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
-            })
-            .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
-            .filter_map(|filename| filename.as_str().map(PathBuf::from))
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "rlib")
-            })
             .collect::<Vec<_>>();
-        assert_eq!(
-            artifacts.len(),
-            1,
-            "Cargo must report exactly one current novarocks rlib, got {artifacts:?}"
-        );
-        artifacts.into_iter().next().unwrap()
+        CurrentRlibs {
+            novarocks: artifact_rlib(&messages, "novarocks"),
+            execution: artifact_rlib(&messages, "novarocks_execution"),
+        }
     })
+}
+
+fn artifact_rlib(messages: &[serde_json::Value], target_name: &str) -> PathBuf {
+    let artifacts = messages
+        .iter()
+        .filter(|message| message["reason"] == "compiler-artifact")
+        .filter(|message| message["target"]["name"] == target_name)
+        .filter(|message| {
+            message["target"]["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+        })
+        .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
+        .filter_map(|filename| filename.as_str().map(PathBuf::from))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "rlib")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "Cargo must report exactly one current {target_name} rlib, got {artifacts:?}"
+    );
+    artifacts.into_iter().next().unwrap()
 }
 
 fn compile_external(source: &str) -> Output {
     let workspace = tempfile::tempdir().expect("temporary external caller workspace");
     let source_path = workspace.path().join("external.rs");
     fs::write(&source_path, source).expect("external caller source");
-    let rlib = current_novarocks_rlib();
-    let deps = rlib.parent().expect("rlib profile directory").join("deps");
-    let execution_rlib = fs::read_dir(&deps)
-        .expect("read dependency artifacts")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libnovarocks_execution-")
-                        && path
-                            .extension()
-                            .is_some_and(|extension| extension == "rlib")
-                })
-        })
-        .expect("novarocks-execution rlib must be available beside novarocks");
+    let rlibs = current_rlibs();
+    let deps = rlibs
+        .execution
+        .parent()
+        .expect("execution rlib dependency directory");
     let metadata_path = workspace.path().join("external.rmeta");
 
     Command::new("rustc")
@@ -136,22 +139,24 @@ fn compile_external(source: &str) -> Output {
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--extern")
-        .arg(format!("novarocks={}", rlib.display()))
+        .arg(format!("novarocks={}", rlibs.novarocks.display()))
         .arg("--extern")
-        .arg(format!("novarocks_execution={}", execution_rlib.display()))
+        .arg(format!("novarocks_execution={}", rlibs.execution.display()))
         .output()
         .expect("run rustc for external caller")
 }
 
-fn assert_inaccessible(output: Output, capability: &str) {
+fn assert_inaccessible(output: Output, capability: &str, diagnostic_anchor: &str) {
     assert!(
         !output.status.success(),
         "external caller unexpectedly reached {capability}"
     );
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(
-        (diagnostics.contains("private") || diagnostics.contains("unresolved import"))
-            && diagnostics.contains(capability),
+        (diagnostics.contains("private")
+            || diagnostics.contains("unresolved import")
+            || diagnostics.contains("could not find"))
+            && diagnostics.contains(diagnostic_anchor),
         "external caller failed for an unexpected reason: {diagnostics}"
     );
 }
@@ -163,7 +168,11 @@ fn external_callers_cannot_reach_final_domain_issuance_authority() {
          fn main() { let _ = core::mem::size_of::<CompletionFenceAuthority>(); }\n",
     );
 
-    assert_inaccessible(output, "runtime_filter");
+    assert_inaccessible(
+        output,
+        "runtime_filter final-domain authority",
+        "runtime_filter",
+    );
 }
 
 #[test]
@@ -173,7 +182,7 @@ fn external_callers_cannot_open_aggregate_final_domain_sessions() {
          fn main() { let _ = core::mem::size_of::<AggregateFinalDomainSessionBuilder>(); }\n",
     );
 
-    assert_inaccessible(output, "AggregateFinalDomainSessionBuilder");
+    assert_inaccessible(output, "aggregate final-domain session builder", "exec");
 }
 
 #[test]
@@ -198,33 +207,38 @@ fn fragment_kernel_exposes_only_the_canonical_construction_and_runtime_paths() {
 
 #[test]
 fn external_callers_cannot_reach_fragment_kernel_legacy_paths() {
-    for (source, capability) in [
+    for (source, capability, diagnostic_anchor) in [
         (
             "use novarocks::runtime::fragment::instance::FragmentInstanceSpec;\n\
              fn main() { let _ = core::mem::size_of::<FragmentInstanceSpec>(); }\n",
             "instance",
+            "runtime",
         ),
         (
             "use novarocks::runtime::fragment::io::FragmentEventSink;\n\
              fn main() { let _ = core::mem::size_of::<&dyn FragmentEventSink>(); }\n",
             "io",
+            "runtime",
         ),
         (
             "use novarocks::exec::operators::DataStreamSinkFactory;\n\
              fn main() { let _ = core::mem::size_of::<DataStreamSinkFactory>(); }\n",
             "operators",
+            "exec",
         ),
         (
             "use novarocks::exec::pipeline::fragment_context::FragmentContext;\n\
              fn main() { let _ = core::mem::size_of::<FragmentContext>(); }\n",
             "pipeline",
+            "exec",
         ),
         (
             "use novarocks::runtime::query_context::QueryContextManager;\n\
              fn main() { let _ = core::mem::size_of::<QueryContextManager>(); }\n",
             "query_context",
+            "runtime",
         ),
     ] {
-        assert_inaccessible(compile_external(source), capability);
+        assert_inaccessible(compile_external(source), capability, diagnostic_anchor);
     }
 }

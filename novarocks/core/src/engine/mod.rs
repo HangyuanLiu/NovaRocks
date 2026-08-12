@@ -6441,6 +6441,26 @@ mod tests {
         ) -> Result<Option<crate::mv::application::MvStatementResult>, MvApplicationError> {
             Ok(None)
         }
+
+        fn prepare_and_execute_refresh(
+            &self,
+            _preparation: &dyn crate::mv::application::MvRefreshPreparationService,
+            _statement: MvApplicationStatement,
+            _target: MvTarget,
+            connector_context: novarocks_spi::connector::ConnectorRequestContext,
+            _execution: &crate::query_execution::request_context::QueryExecutionContext,
+        ) -> Result<crate::mv::application::MvStatementResult, MvApplicationError> {
+            if connector_context.cancellation().is_cancelled() {
+                return Err(MvApplicationError::new(
+                    MvApplicationErrorKind::ShutdownCancelled,
+                    "connector request was cancelled",
+                ));
+            }
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Unavailable,
+                "frontend MV refresh lifecycle is unavailable",
+            ))
+        }
     }
 
     #[derive(Clone)]
@@ -8268,7 +8288,11 @@ mysql_port = 47892
 
     #[test]
     fn materialized_view_dispatch_observes_cancellation_after_entry() {
-        let state = Arc::new(StandaloneState::default());
+        let state = Arc::new(StandaloneState {
+            mv_repository: super::test_mv_repository(),
+            mv_application_service: Arc::new(PassthroughMvApplicationService),
+            ..Default::default()
+        });
         register_connector_backends(&state);
 
         let error = dispatch_statement(

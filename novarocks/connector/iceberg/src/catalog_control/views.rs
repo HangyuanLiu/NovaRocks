@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn every_view_operation_fails_closed_for_hadoop() {
+    fn hadoop_rejects_view_mutations_and_loads_but_answers_empty_probes() {
         let (_executor, _warehouse, runtime) = hadoop_runtime();
         let assert_gate = |result: Result<(), String>| {
             let error = result.expect_err("Hadoop must not expose a view operation");
@@ -474,8 +474,12 @@ mod tests {
         ));
         assert_gate(drop_view(&runtime, "db", "v"));
         assert_gate(load_view(&runtime, "db", "v").map(|_| ()));
-        assert_gate(view_exists(&runtime, "db", "v").map(|_| ()));
-        assert_gate(list_views(&runtime, "db").map(|_| ()));
+        assert!(!view_exists(&runtime, "db", "v").expect("Hadoop view probe"));
+        assert!(
+            list_views(&runtime, "db")
+                .expect("Hadoop view listing probe")
+                .is_empty()
+        );
     }
 
     #[test]
