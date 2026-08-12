@@ -502,6 +502,105 @@ mod tests {
         );
     }
 
+    /// Walks the whole recovery decision as a pipeline: evidence in, disposition,
+    /// then the cleanup gate. The value of testing it end to end is that the two
+    /// halves have separate failure modes and a correct classifier paired with a
+    /// permissive gate would still delete live data.
+    #[test]
+    fn the_recovery_pipeline_only_reclaims_provably_settled_attempts() {
+        struct Case {
+            name: &'static str,
+            evidence: AttemptEvidence,
+            expect: MvAttemptDisposition,
+            reclaimable: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "live attempt under its own fence",
+                evidence: base(),
+                expect: MvAttemptDisposition::Staged,
+                reclaimable: false,
+            },
+            Case {
+                name: "superseded by a higher generation",
+                evidence: AttemptEvidence {
+                    established_generation: Some(generation(2, 1)),
+                    ..base()
+                },
+                expect: MvAttemptDisposition::Superseded,
+                reclaimable: true,
+            },
+            Case {
+                name: "provably never committed",
+                evidence: AttemptEvidence {
+                    operation: AttemptOperationEvidence::KnownUncommitted,
+                    ..base()
+                },
+                expect: MvAttemptDisposition::KnownUncommitted,
+                reclaimable: true,
+            },
+            Case {
+                name: "published: its result is the target",
+                evidence: AttemptEvidence {
+                    is_target_current: true,
+                    ..base()
+                },
+                expect: MvAttemptDisposition::Published,
+                reclaimable: false,
+            },
+            Case {
+                name: "staging vanished with nothing to prove why",
+                evidence: AttemptEvidence {
+                    staging_present: false,
+                    ..base()
+                },
+                expect: MvAttemptDisposition::Ambiguous,
+                reclaimable: false,
+            },
+        ];
+
+        for case in cases {
+            let disposition = classify_attempt(&case.evidence);
+            assert_eq!(disposition, case.expect, "classifying: {}", case.name);
+
+            let authorization = CleanupAuthorization {
+                disposition,
+                ..authorized()
+            };
+            let permitted = authorize_cleanup(&authorization).is_ok();
+            assert_eq!(
+                permitted, case.reclaimable,
+                "cleanup gate disagreed for: {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn losing_ownership_mid_recovery_blocks_a_cleanup_already_decided() {
+        // The realistic failure: classification happened while we owned the
+        // target, then another frontend took over before cleanup ran. The
+        // disposition is still correct and still settled -- and the delete must
+        // still be refused.
+        let disposition = classify_attempt(&AttemptEvidence {
+            established_generation: Some(generation(2, 1)),
+            ..base()
+        });
+        assert_eq!(disposition, MvAttemptDisposition::Superseded);
+        assert!(disposition.permits_artifact_reclaim());
+
+        assert_eq!(
+            authorize_cleanup(&CleanupAuthorization {
+                disposition,
+                holds_current_ownership: false,
+                ..authorized()
+            }),
+            Err(CleanupRefusal::NotOwner),
+            "a settled disposition must not outlive the ownership that produced it"
+        );
+    }
+
     #[test]
     fn ambiguity_halts_automatic_refresh_and_nothing_else_does() {
         assert!(MvAttemptDisposition::Ambiguous.halts_automatic_refresh());
