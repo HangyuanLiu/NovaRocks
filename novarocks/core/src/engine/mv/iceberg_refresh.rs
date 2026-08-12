@@ -4864,12 +4864,9 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
     let pin = capture_refresh_snapshot_pin(state, &base_refs)?;
     validate_repartition_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
-    let expected_main_snapshot_id = target_loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id());
-    let old_default_spec_id = target_loaded.table.metadata().default_partition_spec_id();
+    let pre_repartition = target_binding_for(state, &target, connector_context)?;
+    let expected_main_snapshot_id = pre_repartition.current_snapshot_id();
+    let old_default_spec_id = pre_repartition.partition().target_spec_id;
     let previous_partition_contract = mv_definition
         .partition_spec
         .as_ref()
@@ -5012,21 +5009,34 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
                 return Err(err);
             }
         };
-    let new_default_spec_id = updated_table.metadata().default_partition_spec_id();
-    let new_partition_contract = match target_partition_contract_from_table(&updated_table) {
-        Ok(contract) => contract,
-        Err(err) => {
-            return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
-                state,
-                refresh_id,
-                &target_entry,
-                &target,
-                new_default_spec_id,
-                old_default_spec_id,
-                err,
-            ));
-        }
-    };
+    // Re-observe after the partition-spec mutation: the new default spec and
+    // its contract are facts of the *updated* generation, not the one we
+    // planned against.
+    //
+    // Observation can still fail -- the Provider rejects an unknown partition
+    // transform rather than projecting it -- and that failure must keep
+    // restoring the old default spec, exactly as reading the contract off the
+    // updated table used to.
+    let (new_default_spec_id, new_partition_contract) =
+        match target_binding_for(state, &target, connector_context) {
+            Ok(post_repartition) => (
+                post_repartition.partition().target_spec_id,
+                post_repartition.partition().clone(),
+            ),
+            Err(err) => {
+                return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
+                    state,
+                    refresh_id,
+                    &target_entry,
+                    &target,
+                    // Tied to the CAS above, which still returns the updated
+                    // table; retires with that call (spec D6).
+                    updated_table.metadata().default_partition_spec_id(),
+                    old_default_spec_id,
+                    err,
+                ));
+            }
+        };
     let repartition_restore = RepartitionDefaultSpecRestore {
         new_default_spec_id,
         old_default_spec_id,
