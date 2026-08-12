@@ -380,7 +380,7 @@ fn prepare_frontend_first_refresh_write(
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
     let target_binding = target_binding_for(state, &target, &connector_context)?;
-    let target_arrow_schema = target_binding.arrow_schema().as_ref().clone();
+    let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
     let target_field_ids = target_binding.observation().field_ids().to_vec();
     let observed_spec_id = target_binding.partition().target_spec_id;
     let partition_spec_id = schema_contract
