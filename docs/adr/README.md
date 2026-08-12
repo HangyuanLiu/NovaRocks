@@ -184,6 +184,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0036 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（active）
 - ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（active）
 - ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
+- ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（active）
 
 #### 历史
 

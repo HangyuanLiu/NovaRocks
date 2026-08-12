@@ -215,6 +215,8 @@ pub struct ObservedPublicationState {
 /// assertion. Pre-checking here turns a doomed commit into a definite
 /// `KnownUncommitted` instead of an ambiguous failure; the commit requirements
 /// remain the real linearization point.
+///
+/// Design: ADR-0064 (docs/adr/ADR-0064-external-mv-publication-fencing.md)
 pub fn decide_v2_publication(
     plan: &MvRefreshPublishV2Plan,
     observed: &ObservedPublicationState,
