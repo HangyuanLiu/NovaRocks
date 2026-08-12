@@ -47,7 +47,7 @@ ALTER TABLE people MODIFY COLUMN address.postal_code BIGINT;
 ALTER TABLE people DROP COLUMN address.city;
 
 -- query 6
--- @expect_error=column path 'address.city' not found
+-- @expect_error=Iceberg column `city` does not exist
 ALTER TABLE people DROP COLUMN address.city;
 
 -- query 7

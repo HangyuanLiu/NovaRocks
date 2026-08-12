@@ -23,7 +23,6 @@
 //! contract and every physical choice stays inside the Iceberg provider.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, Int8Array, Int64Array, StringArray};
@@ -1106,22 +1105,6 @@ fn freeze_iceberg_cow_source(
             format!("resolve Iceberg COW snapshot schema: {error}"),
         )
     })?;
-    let mut fields = crate::iceberg::arrow::schema_to_arrow_schema(&snapshot_schema)
-        .map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("convert Iceberg COW snapshot schema: {error}"),
-            )
-        })?
-        .fields()
-        .to_vec();
-    let metadata_fields =
-        crate::control_provider::metadata_arrow_fields(&frozen.table_payload.metadata_columns)?
-            .into_iter()
-            .map(|field| Arc::new(field.as_ref().clone().with_nullable(false)));
-    fields.extend(metadata_fields);
-    let scan_schema = Arc::new(Schema::new(fields));
-
     let mut source_payload = frozen.table_payload.clone();
     source_payload.prepared_files.clear();
     let explicit_file = data_file_with_stats_to_iceberg_data_file_info(data_file);
@@ -1137,6 +1120,11 @@ fn freeze_iceberg_cow_source(
     table_info.current_snapshot_id = Some(frozen.snapshot_id);
     table_info.schema_id = snapshot_schema.schema_id();
     table_info.schema = crate::schema_facts::iceberg_schema_def(&snapshot_schema);
+    // The frozen source's admitted schema is what `begin_scan` will return for
+    // this very handle, so it is resolved through that one composition instead
+    // of being rebuilt here: a frozen read refuses a scan whose output schema
+    // differs by so much as one field annotation.
+    let scan_schema = crate::control_provider::projected_schema(&source_payload, &[])?;
     let encoded = serde_json::to_vec(&source_payload).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::Internal,

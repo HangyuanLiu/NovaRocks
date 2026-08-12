@@ -1823,7 +1823,7 @@ impl From<ConnectorReadPurpose> for IcebergReadPurposeV1 {
     }
 }
 
-fn projected_schema(
+pub(crate) fn projected_schema(
     table: &IcebergTablePayload,
     projection: &[usize],
 ) -> Result<SchemaRef, ConnectorError> {

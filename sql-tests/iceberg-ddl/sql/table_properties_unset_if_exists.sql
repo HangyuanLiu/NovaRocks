@@ -30,7 +30,7 @@ SELECT count(*) FROM p;
 
 -- query 3
 -- Strict: missing key fails.
--- @expect_error=UNSET TBLPROPERTIES key 'c' does not exist
+-- @expect_error=Iceberg table property `c` does not exist
 ALTER TABLE p UNSET TBLPROPERTIES ('a', 'c');
 
 -- query 4

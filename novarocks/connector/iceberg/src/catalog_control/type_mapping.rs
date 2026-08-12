@@ -137,10 +137,32 @@ fn allocate_id(next_id: &mut i32) -> Result<i32, String> {
     Ok(id)
 }
 
+/// An empty-collection default arrives as the literal text the statement wrote,
+/// because the neutral default vocabulary has no collection variant. Only the
+/// empty collection is admitted, matching what the read path can materialize.
+fn empty_collection_default(text: &str, field_type: &Type) -> Result<Option<Literal>, String> {
+    let trimmed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    match field_type {
+        Type::List(_) if trimmed == "[]" => Ok(Some(Literal::List(Vec::new()))),
+        Type::Map(_) if trimmed == "{}" => {
+            Ok(Some(Literal::Map(crate::iceberg::spec::Map::default())))
+        }
+        Type::List(_) | Type::Map(_) => Err(format!(
+            "only an empty collection default is supported for Iceberg type {field_type}"
+        )),
+        _ => Ok(None),
+    }
+}
+
 pub(crate) fn default_literal(
     value: &ConnectorDefaultValue,
     field_type: &Type,
 ) -> Result<Option<Literal>, String> {
+    if let ConnectorDefaultValue::String(text) = value
+        && matches!(field_type, Type::List(_) | Type::Map(_))
+    {
+        return empty_collection_default(text, field_type);
+    }
     let primitive = match (value, field_type) {
         (ConnectorDefaultValue::Null, _) => return Ok(None),
         (ConnectorDefaultValue::Bool(value), Type::Primitive(PrimitiveType::Boolean)) => {

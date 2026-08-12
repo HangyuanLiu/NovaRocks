@@ -295,17 +295,65 @@ fn object_store_config(
     object_store_config_from_aws_s3_catalog_properties(&properties)
 }
 
+/// Reconcile the credentials a catalog statement supplies with the
+/// server-composed binding.
+///
+/// The binding is authoritative for every value it states, so a statement may
+/// not contradict it. Silence is not contradiction: catalog statements state
+/// only what they need, and the composition root cannot express every optional
+/// knob, so a value only one side states is kept rather than dropped.
+fn merge_object_store_config(
+    supplied: &ObjectStoreConfig,
+    injected: &ObjectStoreConfig,
+) -> Result<ObjectStoreConfig, String> {
+    fn conflict() -> String {
+        "Iceberg catalog object-store credentials do not match the server-composed binding"
+            .to_string()
+    }
+    fn merge<T: Clone + PartialEq>(
+        supplied: &Option<T>,
+        injected: &Option<T>,
+    ) -> Result<Option<T>, String> {
+        match (supplied, injected) {
+            (Some(supplied), Some(injected)) if supplied != injected => Err(conflict()),
+            (_, Some(injected)) => Ok(Some(injected.clone())),
+            (supplied, None) => Ok(supplied.clone()),
+        }
+    }
+
+    if supplied.endpoint != injected.endpoint
+        || supplied.access_key_id != injected.access_key_id
+        || supplied.access_key_secret != injected.access_key_secret
+    {
+        return Err(conflict());
+    }
+    Ok(ObjectStoreConfig {
+        endpoint: injected.endpoint.clone(),
+        access_key_id: injected.access_key_id.clone(),
+        access_key_secret: injected.access_key_secret.clone(),
+        session_token: merge(&supplied.session_token, &injected.session_token)?,
+        enable_path_style_access: merge(
+            &supplied.enable_path_style_access,
+            &injected.enable_path_style_access,
+        )?,
+        region: merge(&supplied.region, &injected.region)?,
+        retry_max_times: merge(&supplied.retry_max_times, &injected.retry_max_times)?,
+        retry_min_delay_ms: merge(&supplied.retry_min_delay_ms, &injected.retry_min_delay_ms)?,
+        retry_max_delay_ms: merge(&supplied.retry_max_delay_ms, &injected.retry_max_delay_ms)?,
+        timeout_ms: merge(&supplied.timeout_ms, &injected.timeout_ms)?,
+        io_timeout_ms: merge(&supplied.io_timeout_ms, &injected.io_timeout_ms)?,
+    })
+}
+
 fn resolve_object_store_config(
     properties: &HashMap<String, String>,
     injected: Option<&ObjectStoreConfig>,
 ) -> Result<Option<ObjectStoreConfig>, String> {
     let supplied = object_store_config(properties)?;
     match (supplied, injected) {
-        (Some(supplied), Some(injected)) if supplied != *injected => Err(
-            "Iceberg catalog object-store credentials do not match the server-composed binding"
-                .to_string(),
-        ),
-        (Some(_), Some(injected)) => Ok(Some(injected.clone())),
+        (Some(supplied), Some(injected)) => {
+            Ok(Some(merge_object_store_config(&supplied, injected)?))
+        }
         // The legacy parser remains useful to provider unit tests and tools
         // that only construct a catalog configuration. Production factory
         // construction performs the stronger role-resource check after
@@ -392,6 +440,86 @@ mod tests {
         let debug = format!("{configuration:?}");
         assert!(!debug.contains("super-sensitive-access"));
         assert!(!debug.contains("top-secret"));
+    }
+
+    fn object_store_binding() -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            access_key_id: "admin".to_string(),
+            access_key_secret: "admin123".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: None,
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
+
+    fn catalog_properties(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut properties = HashMap::from([
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://127.0.0.1:9000".to_string(),
+            ),
+            ("aws.s3.access_key".to_string(), "admin".to_string()),
+            ("aws.s3.secret_key".to_string(), "admin123".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        properties.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
+        properties
+    }
+
+    #[test]
+    fn object_store_binding_keeps_a_value_only_one_side_states() {
+        let binding = object_store_binding();
+        let statement_only = resolve_object_store_config(
+            &catalog_properties(&[("aws.s3.region", "us-east-1")]),
+            Some(&binding),
+        )
+        .expect("statement region is additive")
+        .expect("resolved binding");
+        assert_eq!(statement_only.region.as_deref(), Some("us-east-1"));
+
+        let binding_only = resolve_object_store_config(&catalog_properties(&[]), Some(&binding))
+            .expect("an omitted region is not a conflict")
+            .expect("resolved binding");
+        assert_eq!(binding_only.region, None);
+
+        let mut regional = object_store_binding();
+        regional.region = Some("us-east-1".to_string());
+        let agreed = resolve_object_store_config(&catalog_properties(&[]), Some(&regional))
+            .expect("silence never contradicts the binding")
+            .expect("resolved binding");
+        assert_eq!(agreed.region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn object_store_binding_rejects_a_contradicted_value() {
+        let mut regional = object_store_binding();
+        regional.region = Some("us-east-1".to_string());
+        let error = resolve_object_store_config(
+            &catalog_properties(&[("aws.s3.region", "eu-west-1")]),
+            Some(&regional),
+        )
+        .expect_err("a stated region cannot be overridden");
+        assert!(error.contains("do not match the server-composed binding"));
+
+        let error = resolve_object_store_config(
+            &catalog_properties(&[("aws.s3.access_key", "other")]),
+            Some(&object_store_binding()),
+        )
+        .expect_err("a stated credential cannot be overridden");
+        assert!(error.contains("do not match the server-composed binding"));
     }
 
     #[test]
