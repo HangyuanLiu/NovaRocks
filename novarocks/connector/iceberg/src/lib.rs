@@ -42,6 +42,7 @@ pub mod delete_file;
 pub mod delta;
 pub mod distributed_rewrite;
 pub mod execution_declaration;
+pub mod file_pruning;
 pub mod file_reader;
 pub mod fs_io;
 pub mod hadoop_catalog;
