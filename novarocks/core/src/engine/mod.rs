@@ -1337,6 +1337,14 @@ pub struct StandaloneOpenServices {
     /// durable and external refresh transition.
     pub mv_refresh_provider_activation_sink:
         Option<std::sync::Arc<dyn crate::mv::application::MvRefreshProviderActivationSink>>,
+    /// Frontend-owned MV startup restore. When installed, the engine runs the
+    /// application's implementation instead of its own, which is how startup
+    /// orchestration stops being an aggregate-Core responsibility.
+    ///
+    /// Optional so a composition without a frontend still restores; the ordering
+    /// contract is the same either way because both go through the same runner.
+    pub mv_startup_restore:
+        Option<std::sync::Arc<dyn crate::mv::startup_restore::MvStartupRestore>>,
     /// Receives the provider-neutral MV background adapter after restore and
     /// table-maintenance recovery. The frontend owns all worker lifecycle.
     pub mv_background_engine_sink:
@@ -1407,6 +1415,7 @@ impl StandaloneOpenServices {
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
             mv_refresh_provider_activation_sink: None,
+            mv_startup_restore: None,
             mv_background_engine_sink: None,
             connector_control,
             connector_control_factory_resolver,
@@ -1582,6 +1591,7 @@ impl StandaloneNovaRocks {
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
             mv_refresh_provider_activation_sink,
+            mv_startup_restore,
             mv_background_engine_sink,
             connector_control,
             connector_control_factory_resolver,
@@ -1651,7 +1661,7 @@ impl StandaloneNovaRocks {
                 ),
             ))?;
         }
-        restore_metadata_if_needed(&inner)?;
+        restore_metadata_if_needed(&inner, mv_startup_restore.as_ref())?;
         let engine = Self { inner };
         if let Some(sink) = statistics_target_resolver_sink {
             sink.bind_statistics_target_resolver(engine.statistics_target_resolver())?;
@@ -3882,10 +3892,22 @@ impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_>
     }
 }
 
-fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
+fn restore_metadata_if_needed(
+    state: &Arc<StandaloneState>,
+    installed: Option<&Arc<dyn crate::mv::startup_restore::MvStartupRestore>>,
+) -> Result<(), String> {
     // Catalog attachments are restored by the Frontend controller from
     // StateStore before the engine opens; Core has no attachment reader.
-    crate::mv::startup_restore::run_mv_startup_restore(&EngineMvStartupRestore { state })
+    //
+    // An installed implementation wins: the engine's own is the fallback for a
+    // composition that has no frontend to own startup orchestration. Both run
+    // through the same runner, so the step ordering cannot differ between them.
+    match installed {
+        Some(restore) => crate::mv::startup_restore::run_mv_startup_restore(restore.as_ref()),
+        None => {
+            crate::mv::startup_restore::run_mv_startup_restore(&EngineMvStartupRestore { state })
+        }
+    }
 }
 
 /// The engine's only catalog authority.
