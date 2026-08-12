@@ -428,6 +428,7 @@ pub trait TableMaintenanceEngine: Send + Sync {
         self.plan_distributed_rewrite(target, operation_id, intent)
     }
 
+    // Design: ADR-0067 (docs/adr/ADR-0067-historical-maintenance-recovery-is-a-separate-capability.md)
     /// Ask the *live* connector generation what it can prove about work a dead
     /// generation left behind.
     ///

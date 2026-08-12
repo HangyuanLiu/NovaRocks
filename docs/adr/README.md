@@ -212,6 +212,7 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 - ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（active）
 - ADR-0057 — MV 维护事实为何按「是否需要 provider runtime IO」切成观测口投影与 SPI capability 两条通道（active）
 - ADR-0065 — 同一张表的维护为何以单个 per-table lease attempt 为唯一派发权威、并在同事务内校验 fence（active）
+- ADR-0067 — 收敛已死 generation 的维护为何是独立 provider capability，而不是放宽 exact-generation reconcile（active）
 
 ### crate-boundary
 

@@ -522,6 +522,7 @@ pub struct ConnectorHistoricalMaintenanceCleanupReceipt {
 /// capabilities. A provider that does not implement it makes the frontend keep
 /// the operation unresolved; there is no fallback to ordinary reconcile, since
 /// that path requires the exact generation which by definition is gone.
+// Design: ADR-0067 (docs/adr/ADR-0067-historical-maintenance-recovery-is-a-separate-capability.md)
 pub trait ConnectorHistoricalMaintenanceRecovery: Send + Sync {
     /// The *current* binding this capability speaks for.
     fn binding_key(&self) -> &ConnectorExecutionBindingKey;

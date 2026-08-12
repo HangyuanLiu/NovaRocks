@@ -44,6 +44,7 @@ use super::metadata_maintenance::{
     MetadataMaintenanceMarkerMatch, lookup_historical_metadata_marker,
 };
 
+// Design: ADR-0067 (docs/adr/ADR-0067-historical-maintenance-recovery-is-a-separate-capability.md)
 pub struct IcebergHistoricalMaintenanceRecovery {
     key: ConnectorExecutionBindingKey,
     #[allow(dead_code)]
