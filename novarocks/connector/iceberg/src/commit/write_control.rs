@@ -3865,6 +3865,255 @@ mod tests {
         (executor, control)
     }
 
+    /// Same fence as `fence`, but at an explicit generation.
+    fn fence_at(
+        operation_id: ConnectorWriteOperationId,
+        incarnation: u64,
+        epoch: u64,
+        attempt: u64,
+    ) -> novarocks_spi::connector::ConnectorExternalOperationFence {
+        novarocks_spi::connector::ConnectorExternalOperationFence::try_new(
+            novarocks_spi::connector::ConnectorClusterIdentity::derive(
+                "iceberg-write-test-cluster",
+            )
+            .expect("cluster identity"),
+            novarocks_spi::connector::ConnectorExternalFenceGeneration::try_new(
+                incarnation,
+                epoch,
+                attempt,
+            )
+            .expect("fence generation"),
+            operation_id,
+            [8; 16],
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+            ConnectorWriteTargetRef::main(),
+        )
+        .expect("external operation fence")
+    }
+
+    // ---------------------------------------------------------------------
+    // External write fence race matrix
+    //
+    // These assert the property the whole design exists for: once a later
+    // owner raises the fence, an older attempt's commit fails *at the
+    // catalog*, and the table is left untouched. Proving only that the old
+    // holder cannot write control-plane state would prove nothing about the
+    // external effect it may still be holding.
+    // ---------------------------------------------------------------------
+
+    /// Count data snapshots, ignoring the provider-private fence markers.
+    fn data_snapshot_count(table: &crate::iceberg::table::Table) -> usize {
+        table
+            .metadata()
+            .snapshots()
+            .filter(|snapshot| {
+                !crate::commit::write_fence::is_fence_marker_snapshot(snapshot.summary())
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_raised_fence_makes_an_older_attempt_fail_at_the_catalog() {
+        let (executor, _warehouse, control, table) = control_with_empty_table();
+        let operation_id = ConnectorWriteOperationId::from_bytes([21; 16]);
+        let catalog = Arc::clone(control.runtime.catalog());
+        let file_io = table.file_io().clone();
+
+        let older =
+            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
+        let newer =
+            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 2));
+
+        let (older_assertion, table_after_raise) = executor.block_on(async {
+            let established = crate::commit::write_fence::establish_fence(
+                catalog.as_ref(),
+                &table,
+                &file_io,
+                &older,
+            )
+            .await
+            .expect("establish the older fence");
+            let reloaded = catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload after establish");
+            crate::commit::write_fence::raise_fence(catalog.as_ref(), &reloaded, &file_io, &newer)
+                .await
+                .expect("raise the fence");
+            let reloaded = catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload after raise");
+            (established.assertion, reloaded)
+        });
+
+        // The older attempt still holds a perfectly well-formed assertion. It
+        // just no longer names the marker the fence ref points at.
+        let error = crate::commit::write_fence::derive_established_assertion(
+            table_after_raise.metadata(),
+            &older,
+        )
+        .expect_err("an older generation must not be able to derive an assertion");
+        assert!(
+            matches!(
+                error,
+                crate::commit::write_fence::FenceError::Superseded { .. }
+            ),
+            "a raised fence must report the older attempt as superseded, got {error:?}"
+        );
+
+        // And the catalog itself refuses the older attempt's conditional
+        // update, which is the property that actually stops a late commit.
+        let stale_commit = crate::iceberg::TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(older_assertion.requirements())
+            .updates(vec![crate::iceberg::TableUpdate::SetProperties {
+                updates: HashMap::from([("novarocks.race.probe".to_string(), "1".to_string())]),
+            }])
+            .build();
+        let outcome = executor.block_on(async { catalog.update_table(stale_commit).await });
+        assert!(
+            outcome.is_err(),
+            "the catalog must reject a commit pinned to a superseded fence marker"
+        );
+
+        let final_table = executor
+            .block_on(async { catalog.load_table(table.identifier()).await })
+            .expect("reload after the refused commit");
+        assert_eq!(
+            data_snapshot_count(&final_table),
+            0,
+            "a fenced-out attempt must leave zero data snapshots behind"
+        );
+        assert!(
+            !final_table
+                .metadata()
+                .properties()
+                .contains_key("novarocks.race.probe"),
+            "the refused commit must not have applied any part of its update"
+        );
+    }
+
+    #[test]
+    fn replaying_the_identical_fence_reuses_the_same_marker() {
+        let (executor, _warehouse, control, table) = control_with_empty_table();
+        let operation_id = ConnectorWriteOperationId::from_bytes([22; 16]);
+        let catalog = Arc::clone(control.runtime.catalog());
+        let file_io = table.file_io().clone();
+        let facts =
+            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
+
+        let (first, second) = executor.block_on(async {
+            let first = crate::commit::write_fence::establish_fence(
+                catalog.as_ref(),
+                &table,
+                &file_io,
+                &facts,
+            )
+            .await
+            .expect("first establish");
+            let reloaded = catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload");
+            let second = crate::commit::write_fence::establish_fence(
+                catalog.as_ref(),
+                &reloaded,
+                &file_io,
+                &facts,
+            )
+            .await
+            .expect("replayed establish");
+            (first, second)
+        });
+        assert!(
+            second.reused,
+            "an identical replay must reuse the marker rather than publish a second one"
+        );
+        assert_eq!(
+            first.assertion.fence_snapshot_id(),
+            second.assertion.fence_snapshot_id(),
+            "a replay must yield the same assertion"
+        );
+    }
+
+    #[test]
+    fn a_foreign_operation_cannot_reuse_another_operations_marker() {
+        let (executor, _warehouse, control, table) = control_with_empty_table();
+        let catalog = Arc::clone(control.runtime.catalog());
+        let file_io = table.file_io().clone();
+        let mine = crate::commit::write_fence::fence_facts_from_spi(&fence_at(
+            ConnectorWriteOperationId::from_bytes([23; 16]),
+            1,
+            1,
+            1,
+        ));
+        // Same fence ref, different operation: only reachable by forging the
+        // ref name, which is exactly what the check must catch.
+        let mut foreign = crate::commit::write_fence::fence_facts_from_spi(&fence_at(
+            ConnectorWriteOperationId::from_bytes([24; 16]),
+            1,
+            1,
+            5,
+        ));
+        foreign.write_operation_id = mine.write_operation_id.clone();
+        foreign.fence_digest = "0".repeat(64);
+
+        let error = executor.block_on(async {
+            crate::commit::write_fence::establish_fence(catalog.as_ref(), &table, &file_io, &mine)
+                .await
+                .expect("establish mine");
+            let reloaded = catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload");
+            crate::commit::write_fence::derive_established_assertion(reloaded.metadata(), &foreign)
+                .expect_err("a foreign fence value must not derive an assertion")
+        });
+        assert!(
+            matches!(
+                error,
+                crate::commit::write_fence::FenceError::MarkerConflict { .. }
+                    | crate::commit::write_fence::FenceError::Superseded { .. }
+            ),
+            "a foreign fence value must be refused, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_raise_that_does_not_strictly_supersede_is_refused() {
+        let (executor, _warehouse, control, table) = control_with_empty_table();
+        let operation_id = ConnectorWriteOperationId::from_bytes([25; 16]);
+        let catalog = Arc::clone(control.runtime.catalog());
+        let file_io = table.file_io().clone();
+        let facts =
+            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
+
+        let error = executor.block_on(async {
+            crate::commit::write_fence::establish_fence(catalog.as_ref(), &table, &file_io, &facts)
+                .await
+                .expect("establish");
+            let reloaded = catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload");
+            crate::commit::write_fence::raise_fence(catalog.as_ref(), &reloaded, &file_io, &facts)
+                .await
+                .expect_err("an equal generation does not close the old authority")
+        });
+        assert!(
+            matches!(
+                error,
+                crate::commit::write_fence::FenceError::Superseded { .. }
+            ),
+            "an equal-generation raise must be refused, got {error:?}"
+        );
+    }
+
     fn control_with_empty_table() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
