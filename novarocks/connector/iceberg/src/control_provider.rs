@@ -644,6 +644,20 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         }
         crate::planning_facts::validate_planned_files(scan.table.table_info.as_ref(), &files)?;
         let candidate_units_considered = u64::try_from(files.len()).unwrap_or(u64::MAX);
+        // Prune only once the pinned snapshot is fully assembled. Delete-file
+        // applicability was resolved above and must never be derived from a
+        // predicate-selected view of the snapshot.
+        let files = files
+            .into_iter()
+            .filter(|file| {
+                crate::file_pruning::file_may_satisfy_physical_predicates(
+                    file,
+                    &scan.physical_predicates,
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidate_units_pruned = candidate_units_considered
+            .saturating_sub(u64::try_from(files.len()).unwrap_or(u64::MAX));
         let name_mapping = split_name_mapping(&scan.table)?;
         let mut remaining = scan.limit;
         let mut leaves = Vec::new();
@@ -764,7 +778,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             splits,
             ConnectorSplitPlanningMetrics {
                 candidate_units_considered,
-                candidate_units_pruned: 0,
+                candidate_units_pruned,
                 composite_splits_planned,
                 scan_units_planned,
             },
@@ -2369,5 +2383,230 @@ mod staged_publication_recovery_tests {
             })
             .expect_err("malformed proof");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+}
+
+#[cfg(test)]
+mod plan_splits_pruning_tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorSplitPlanningMetrics,
+    };
+
+    use super::*;
+    use crate::access_binding::IcebergReadBinding;
+    use crate::catalog_control::IcebergCatalogControlState;
+    use crate::resources::IcebergControlResources;
+    use crate::scan_model::{
+        IcebergColumnStats, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
+        IcebergPhysicalPredicateValue,
+    };
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            256 * 1024,
+            1024 * 1024,
+        )
+        .expect("request context")
+    }
+
+    fn provider() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        IcebergControlProvider,
+    ) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+        );
+        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let runtime = Arc::new(
+            IcebergControlRuntime::try_new(
+                IcebergCatalogControlState::new(configuration),
+                resources,
+            )
+            .expect("control runtime"),
+        );
+        let provider = IcebergControlProvider::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            },
+            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            runtime,
+        );
+        (executor, warehouse, provider)
+    }
+
+    /// ORC rather than Parquet so split materialization does not try to read a
+    /// footer that this fixture has no file for. Pruning reads the manifest, not
+    /// the data file, so the physical format is irrelevant to what is tested.
+    fn file_with_bounds(path: &str, min: i32, max: i32) -> IcebergDataFileInfo {
+        let mut file = IcebergDataFileInfo::for_test(path, 128, 10);
+        file.column_stats = Some(HashMap::from([(
+            "id".to_string(),
+            IcebergColumnStats {
+                field_id: Some(7),
+                null_count: Some(0),
+                value_count: Some(10),
+                column_size: None,
+                lower_bound: Some(min.to_le_bytes().to_vec()),
+                upper_bound: Some(max.to_le_bytes().to_vec()),
+            },
+        )]));
+        file
+    }
+
+    fn id_eq(value: i32) -> IcebergPhysicalPredicate {
+        IcebergPhysicalPredicate {
+            column: "id".to_string(),
+            field_id: 7,
+            domain: IcebergPhysicalPredicateDomain::Range {
+                op: IcebergPhysicalPredicateOp::Eq,
+                value: IcebergPhysicalPredicateValue::Int32(value),
+            },
+        }
+    }
+
+    fn plan(
+        provider: &IcebergControlProvider,
+        files: Vec<IcebergDataFileInfo>,
+        predicates: Vec<IcebergPhysicalPredicate>,
+    ) -> ConnectorSplitPlanningMetrics {
+        let payload = IcebergScanPayload {
+            table: IcebergTablePayload {
+                namespace: "ns".to_string(),
+                table: "t".to_string(),
+                table_info: None,
+                metadata_columns: Vec::new(),
+                metadata_table_type: None,
+                prepared_files: Vec::new(),
+                explicit_files: Some(files),
+                logical_type_columns: BTreeMap::new(),
+                hidden_columns: Vec::new(),
+            },
+            snapshot_id: None,
+            table_uuid: None,
+            projection: vec![0],
+            limit: None,
+            purpose: IcebergReadPurposeV1::Query,
+            fact_columns: Vec::new(),
+            physical_predicates: predicates,
+            mode: IcebergScanModeV1::Snapshot,
+        };
+        let context = context();
+        let handle = ConnectorScanHandle::try_new(
+            ConnectorInstanceId::parse("ice").expect("instance"),
+            encode_payload(&payload, "scan handle", context.max_handle_payload_bytes())
+                .expect("encode scan handle"),
+        )
+        .expect("scan handle");
+        provider
+            .plan_splits(
+                &handle,
+                ConnectorSplitPlanningRequest {
+                    target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
+                    max_split_bytes: None,
+                    context,
+                },
+            )
+            .expect("plan splits")
+            .metrics
+    }
+
+    #[test]
+    fn planning_reports_the_files_it_pruned() {
+        let (_executor, _warehouse, provider) = provider();
+        let metrics = plan(
+            &provider,
+            vec![
+                file_with_bounds("s3://bucket/a.orc", 1, 5),
+                file_with_bounds("s3://bucket/b.orc", 10, 20),
+                file_with_bounds("s3://bucket/c.orc", 100, 200),
+            ],
+            vec![id_eq(12)],
+        );
+        assert_eq!(metrics.candidate_units_considered, 3);
+        assert_eq!(metrics.candidate_units_pruned, 2);
+        assert_eq!(metrics.scan_units_planned, 1);
+    }
+
+    /// A zero count must mean "nothing was prunable", never "pruning did not
+    /// run" -- otherwise the metric cannot be read at all.
+    #[test]
+    fn planning_reports_zero_pruned_when_every_file_may_match() {
+        let (_executor, _warehouse, provider) = provider();
+        let metrics = plan(
+            &provider,
+            vec![
+                file_with_bounds("s3://bucket/a.orc", 10, 20),
+                file_with_bounds("s3://bucket/b.orc", 11, 13),
+            ],
+            vec![id_eq(12)],
+        );
+        assert_eq!(metrics.candidate_units_considered, 2);
+        assert_eq!(metrics.candidate_units_pruned, 0);
+        assert_eq!(metrics.scan_units_planned, 2);
+    }
+
+    #[test]
+    fn planning_without_predicates_prunes_nothing() {
+        let (_executor, _warehouse, provider) = provider();
+        let metrics = plan(
+            &provider,
+            vec![
+                file_with_bounds("s3://bucket/a.orc", 1, 5),
+                file_with_bounds("s3://bucket/b.orc", 100, 200),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(metrics.candidate_units_considered, 2);
+        assert_eq!(metrics.candidate_units_pruned, 0);
+        assert_eq!(metrics.scan_units_planned, 2);
+    }
+
+    /// `candidate_units_considered` counts the pinned snapshot, so it must not
+    /// shrink when pruning removes every file.
+    #[test]
+    fn considered_counts_the_snapshot_even_when_everything_is_pruned() {
+        let (_executor, _warehouse, provider) = provider();
+        let metrics = plan(
+            &provider,
+            vec![
+                file_with_bounds("s3://bucket/a.orc", 1, 5),
+                file_with_bounds("s3://bucket/b.orc", 100, 200),
+            ],
+            vec![id_eq(12)],
+        );
+        assert_eq!(metrics.candidate_units_considered, 2);
+        assert_eq!(metrics.candidate_units_pruned, 2);
+        assert_eq!(metrics.scan_units_planned, 0);
     }
 }

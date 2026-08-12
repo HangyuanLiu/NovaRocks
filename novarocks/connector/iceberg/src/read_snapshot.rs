@@ -245,6 +245,7 @@ pub async fn build_read_snapshot_at(
                         stats_map.insert(
                             column_name.clone(),
                             IcebergColumnStats {
+                                field_id: Some(field_id),
                                 null_count: null_counts
                                     .get(&field_id)
                                     .map(|&value| i64::try_from(value).unwrap_or(i64::MAX)),

@@ -59,6 +59,22 @@ pub enum IcebergPhysicalPredicateValue {
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct IcebergColumnStats {
+    /// Iceberg field id this entry was published under.
+    ///
+    /// Manifest statistics are keyed by field id at the source. The surrounding
+    /// map is keyed by the column's current name for lookup convenience, which
+    /// alone cannot survive a rename -- so consumers bind through this id first
+    /// and fall back to the map key, matching how the Parquet reader binds
+    /// row-group statistics. `None` only for synthetic entries that never came
+    /// from a manifest.
+    ///
+    /// `#[serde(default)]` rather than a split version bump: the encoding and
+    /// decoding ends share this very struct, so the shape moves in lockstep,
+    /// and a payload produced before this field existed simply decodes to
+    /// `None` and falls back to name binding -- which is the intended fallback
+    /// anyway.
+    #[serde(default)]
+    pub field_id: Option<i32>,
     pub null_count: Option<i64>,
     /// Total value count (including nulls) from manifest `value_counts`. The
     /// optimizer treats this as an upper bound on NDV when no precise Puffin
