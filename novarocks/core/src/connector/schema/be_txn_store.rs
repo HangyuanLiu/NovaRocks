@@ -17,7 +17,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
-use crate::common::config;
 use crate::common::types::format_uuid;
 
 use super::SchemaScanContext;
@@ -74,12 +73,23 @@ fn trim_history(history: &mut VecDeque<BeTxnEntry>) {
     }
 }
 
+/// BE-local txn history bound, installed once by the Backend application.
+///
+/// Like the write-log store, this sits behind free functions callable from any
+/// BE code path, so it holds the resolved bound rather than reading a
+/// process-global configuration per call.
+static HISTORY_SIZE: OnceLock<Mutex<usize>> = OnceLock::new();
+
+fn history_size_slot() -> &'static Mutex<usize> {
+    HISTORY_SIZE.get_or_init(|| Mutex::new(20_000))
+}
+
+pub(crate) fn install_history_size(size: usize) {
+    *history_size_slot().lock().expect("txn history size lock") = size.max(1);
+}
+
 fn be_txn_info_history_size() -> usize {
-    #[cfg(test)]
-    if let Some(size) = history_size_override_for_test() {
-        return size.max(1);
-    }
-    config::be_txn_info_history_size().max(1)
+    *history_size_slot().lock().expect("txn history size lock")
 }
 
 fn load_id_to_string(hi: Option<i64>, lo: Option<i64>) -> String {
@@ -203,34 +213,12 @@ pub(crate) fn clear_for_test() {
     let mut guard = store().lock().expect("be txn store lock");
     guard.active.clear();
     guard.history.clear();
-    set_history_size_override_for_test(None);
-}
-
-#[cfg(test)]
-static TEST_HISTORY_SIZE: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
-
-#[cfg(test)]
-fn history_size_override_store() -> &'static Mutex<Option<usize>> {
-    TEST_HISTORY_SIZE.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
-fn history_size_override_for_test() -> Option<usize> {
-    *history_size_override_store()
-        .lock()
-        .expect("be txn history override lock")
-}
-
-#[cfg(test)]
-fn set_history_size_override_for_test(value: Option<usize>) {
-    *history_size_override_store()
-        .lock()
-        .expect("be txn history override lock") = value;
+    install_history_size(20_000);
 }
 
 #[cfg(test)]
 pub(crate) fn set_history_size_for_test(size: usize) {
-    set_history_size_override_for_test(Some(size.max(1)));
+    install_history_size(size);
 }
 
 #[cfg(test)]

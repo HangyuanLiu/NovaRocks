@@ -374,6 +374,11 @@ impl BackendApplicationHost {
             execution_installers,
         } = config;
         app_config::install_preloaded_config(config.clone());
+        novarocks::connector::schema::install_be_store_settings(
+            config.runtime.enable_tablet_write_log,
+            config.runtime.tablet_write_log_buffer_size,
+            config.runtime.be_txn_info_history_size,
+        );
 
         let advertise_endpoint = network::standalone_advertise_endpoint_for_config(&config)
             .map_err(|error| {

@@ -17,8 +17,6 @@
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 
-use crate::common::config;
-
 use super::SchemaScanContext;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,20 +91,53 @@ fn store() -> &'static Mutex<BeTabletWriteLogStore> {
     STORE.get_or_init(|| Mutex::new(BeTabletWriteLogStore::default()))
 }
 
-fn enable_tablet_write_log() -> bool {
-    #[cfg(test)]
-    if let Some(options) = test_options() {
-        return options.enable;
+/// BE-local write-log policy, installed once by the Backend application.
+///
+/// The values come from `[runtime]`, but this store sits behind free functions
+/// that any BE code may call, so it holds the resolved policy rather than
+/// reaching for a process-global configuration on every call.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BeTabletWriteLogSettings {
+    pub(crate) enable: bool,
+    pub(crate) buffer_size: usize,
+}
+
+impl Default for BeTabletWriteLogSettings {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            buffer_size: 100_000,
+        }
     }
-    config::enable_tablet_write_log()
+}
+
+static SETTINGS: OnceLock<Mutex<BeTabletWriteLogSettings>> = OnceLock::new();
+
+fn settings_slot() -> &'static Mutex<BeTabletWriteLogSettings> {
+    SETTINGS.get_or_init(|| Mutex::new(BeTabletWriteLogSettings::default()))
+}
+
+pub(crate) fn install_settings(settings: BeTabletWriteLogSettings) {
+    *settings_slot()
+        .lock()
+        .expect("tablet write log settings lock") = BeTabletWriteLogSettings {
+        enable: settings.enable,
+        buffer_size: settings.buffer_size.max(1),
+    };
+}
+
+fn settings() -> BeTabletWriteLogSettings {
+    *settings_slot()
+        .lock()
+        .expect("tablet write log settings lock")
+}
+
+fn enable_tablet_write_log() -> bool {
+    settings().enable
 }
 
 fn tablet_write_log_buffer_size() -> usize {
-    #[cfg(test)]
-    if let Some(options) = test_options() {
-        return options.buffer_size.max(1);
-    }
-    config::tablet_write_log_buffer_size().max(1)
+    settings().buffer_size.max(1)
 }
 
 fn trim_to_capacity(entries: &mut VecDeque<BeTabletWriteLogEntry>) {
@@ -199,45 +230,15 @@ pub(crate) fn snapshot(ctx: &SchemaScanContext) -> Vec<BeTabletWriteLogEntry> {
 pub(crate) fn clear_for_test() {
     let mut guard = store().lock().expect("tablet write log store lock");
     guard.entries.clear();
-    set_test_options(None);
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct TestOptions {
-    enable: bool,
-    buffer_size: usize,
-}
-
-#[cfg(test)]
-static TEST_OPTIONS: OnceLock<Mutex<Option<TestOptions>>> = OnceLock::new();
-
-#[cfg(test)]
-fn test_options_store() -> &'static Mutex<Option<TestOptions>> {
-    TEST_OPTIONS.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
-fn test_options() -> Option<TestOptions> {
-    test_options_store()
-        .lock()
-        .expect("tablet write log test options lock")
-        .clone()
-}
-
-#[cfg(test)]
-fn set_test_options(options: Option<TestOptions>) {
-    *test_options_store()
-        .lock()
-        .expect("tablet write log test options lock") = options;
+    install_settings(BeTabletWriteLogSettings::default());
 }
 
 #[cfg(test)]
 pub(crate) fn set_options_for_test(enable: bool, buffer_size: usize) {
-    set_test_options(Some(TestOptions {
+    install_settings(BeTabletWriteLogSettings {
         enable,
-        buffer_size: buffer_size.max(1),
-    }));
+        buffer_size,
+    });
 }
 
 #[cfg(test)]

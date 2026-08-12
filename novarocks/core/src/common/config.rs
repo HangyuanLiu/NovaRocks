@@ -84,27 +84,6 @@ pub(crate) fn optimizer_query_mem_limit_bytes() -> u64 {
         .unwrap_or(2 * 1024 * 1024 * 1024)
 }
 
-pub(crate) fn enable_tablet_write_log() -> bool {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.enable_tablet_write_log)
-        .unwrap_or(false)
-}
-
-pub(crate) fn tablet_write_log_buffer_size() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.tablet_write_log_buffer_size.max(1))
-        .unwrap_or(100_000)
-}
-
-pub(crate) fn be_txn_info_history_size() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.be_txn_info_history_size.max(1))
-        .unwrap_or(20_000)
-}
-
 pub(crate) fn data_runtime_worker_threads() -> usize {
     novarocks_app_config()
         .ok()
