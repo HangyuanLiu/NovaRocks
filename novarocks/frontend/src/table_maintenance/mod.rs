@@ -26,16 +26,21 @@ use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
 use novarocks::engine::table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceAttemptCancellationSource,
-    MaintenanceRequestContext, MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission,
-    TableMaintenanceEngine, TableMaintenanceService,
+    HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
+    MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
+    MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_spi::connector::{
     BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
-    ConnectorMutationOperationId, ConnectorWriteOperationId, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, PreparedBatch,
+    ConnectorMutationOperationId, ConnectorTableIdentity, ConnectorWriteOperationId,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome, PreparedBatch,
+};
+use novarocks_spi::connector::{
+    ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceDescriptor,
+    ConnectorHistoricalMaintenanceDisposition, ConnectorHistoricalMaintenanceFamily,
+    ConnectorHistoricalMaintenanceObservation,
 };
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::coordination::WriteAdmission;
@@ -1324,14 +1329,18 @@ impl FrontendTableMaintenanceService {
         Ok(())
     }
 
-    fn recover_distributed_rewrite_operations(&self) -> Result<(), String> {
+    fn recover_distributed_rewrite_operations(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+    ) -> Result<(), String> {
         let Some(repository) = &self.distributed_rewrite_repository else {
             return Ok(());
         };
-        // A rewrite lease is generation-fenced. After a frontend restart the
-        // old incarnation is intentionally unavailable, so this owner must
-        // not substitute the current binding or resubmit staged work. Keep
-        // the durable fence visible for an exact-generation recovery design.
+        // A rewrite lease is generation-fenced, and after a frontend restart
+        // the incarnation that held it is gone for good. This owner therefore
+        // never substitutes the current binding for the old one: it asks the
+        // live generation what it can prove about what the dead one did, and
+        // converges only on that proof.
         for operation in self
             .block_on(repository.list_recovery_candidates())
             .map_err(|error| {
@@ -1348,16 +1357,118 @@ impl FrontendTableMaintenanceService {
                 Arc::clone(&validator),
             ))
             .map_err(|error| format!("adopt distributed rewrite operation failed: {error}"))?;
-            self.block_on(repository.mark_unresolved_fenced(
+            let cancellation = self.attempt_cancellation(&attempt);
+
+            let inspection = historical_descriptor(
+                &operation.target,
+                &operation.owner,
+                ConnectorHistoricalMaintenanceFamily::DistributedRewrite,
                 operation.operation_id,
-                "distributed rewrite requires its original exact connector generation after frontend restart".to_string(),
-                now_unix_millis(),
-                authority,
-                validator,
-            ))
-            .map_err(|error| format!("mark distributed rewrite operation unresolved failed: {error}"))?;
+                operation.request_digest,
+                operation.plan_digest,
+                Some(operation.base_state_digest),
+                rewrite_dispatch_facts(operation.state),
+                attempt.attempt_id(),
+            )
+            .and_then(|descriptor| {
+                engine.inspect_historical_maintenance(
+                    &operation.target,
+                    descriptor,
+                    &cancellation.context(),
+                )
+            });
+
+            let unresolved_reason = match inspection {
+                Err(reason) => Some(reason),
+                Ok(HistoricalMaintenanceInspection::Unsupported(reason)) => Some(format!(
+                    "distributed rewrite has no historical recovery capability: {reason}"
+                )),
+                Ok(HistoricalMaintenanceInspection::Observed(observation)) => self
+                    .converge_historical_rewrite(
+                        repository,
+                        &operation,
+                        observation.as_ref(),
+                        &authority,
+                        &validator,
+                    )?,
+            };
+            if let Some(reason) = unresolved_reason {
+                self.block_on(repository.mark_unresolved_fenced(
+                    operation.operation_id,
+                    reason,
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("mark distributed rewrite operation unresolved failed: {error}")
+                })?;
+            }
         }
         Ok(())
+    }
+
+    /// Turn a proven historical observation into a durable terminal state.
+    ///
+    /// Returns the reason to stay unresolved, or `None` once the operation has
+    /// been finalized. Only `Applied` and `NotApplied` are terminal: everything
+    /// else means the evidence did not decide, and guessing here would either
+    /// lose a committed rewrite or replay one.
+    fn converge_historical_rewrite(
+        &self,
+        repository: &Arc<DistributedRewriteOperationRepository>,
+        operation: &model::DistributedRewriteOperation,
+        observation: &ConnectorHistoricalMaintenanceObservation,
+        authority: &MaintenanceAuthorityV1,
+        validator: &MaintenanceFenceValidator,
+    ) -> Result<Option<String>, String> {
+        match observation.disposition {
+            ConnectorHistoricalMaintenanceDisposition::Applied => {
+                // The provider's own proof becomes the durable receipt, so a
+                // later reader sees why this operation was declared finished
+                // without the generation that ran it.
+                let payload = observation.proof.payload().to_vec();
+                self.block_on(repository.finish_fenced(
+                    operation.operation_id,
+                    DistributedRewriteOpaquePayload {
+                        digest: distributed_rewrite_payload_digest(&payload),
+                        payload,
+                    },
+                    now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(validator),
+                ))
+                .map_err(|error| {
+                    format!("finish historically recovered distributed rewrite failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::NotApplied
+            | ConnectorHistoricalMaintenanceDisposition::NotDispatched => {
+                self.block_on(
+                    repository.fail_fenced(
+                        operation.operation_id,
+                        "distributed rewrite did not reach the table; it is safe to run again"
+                            .to_string(),
+                        now_unix_millis(),
+                        authority.clone(),
+                        Arc::clone(validator),
+                    ),
+                )
+                .map_err(|error| {
+                    format!("fail historically recovered distributed rewrite failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::PartiallyApplied => Ok(Some(
+                "distributed rewrite is partially applied; it needs an operator decision"
+                    .to_string(),
+            )),
+            ConnectorHistoricalMaintenanceDisposition::Ambiguous => Ok(Some(
+                "historical inspection could not decide whether the distributed rewrite committed"
+                    .to_string(),
+            )),
+        }
     }
 
     fn recover_cleanup_operations(
@@ -1471,7 +1582,7 @@ impl FrontendTableMaintenanceService {
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
         self.recover_metadata_operations(engine.as_ref())?;
-        self.recover_distributed_rewrite_operations()?;
+        self.recover_distributed_rewrite_operations(engine.as_ref())?;
         self.recover_cleanup_operations(engine.as_ref())?;
         let mut worker = self
             .worker
@@ -1710,6 +1821,68 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
         *worker = WorkerLifecycle::Stopped(result.clone());
         result
+    }
+}
+
+/// Build the neutral descriptor that names one historical operation.
+///
+/// The old owner is recorded as the binding that did the work; it is evidence,
+/// never something to resolve or revive.
+#[allow(clippy::too_many_arguments)]
+fn historical_descriptor(
+    target: &MaintenanceTarget,
+    owner: &MetadataMaintenanceExactOwner,
+    family: ConnectorHistoricalMaintenanceFamily,
+    operation_id: uuid::Uuid,
+    request_digest: [u8; 32],
+    plan_digest: Option<[u8; 32]>,
+    base_state_digest: Option<[u8; 32]>,
+    dispatch: ConnectorHistoricalDispatchFacts,
+    recovery_attempt: uuid::Uuid,
+) -> Result<ConnectorHistoricalMaintenanceDescriptor, String> {
+    let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+        format!("historical maintenance target names an invalid connector instance: {error}")
+    })?;
+    let historical_instance = ConnectorInstanceId::parse(&owner.instance_id).map_err(|error| {
+        format!("historical maintenance owner names an invalid connector instance: {error}")
+    })?;
+    ConnectorHistoricalMaintenanceDescriptor::try_new(
+        ConnectorExecutionBindingKey {
+            instance_id: historical_instance,
+            incarnation: ConnectorInstanceIncarnation::from_bytes(*owner.incarnation_id.as_bytes()),
+        },
+        ConnectorTableIdentity {
+            instance_id,
+            namespace: target.namespace.clone().into(),
+            table: target.table.clone().into(),
+        },
+        family,
+        *operation_id.as_bytes(),
+        request_digest,
+        plan_digest,
+        base_state_digest,
+        Vec::new(),
+        dispatch,
+        *recovery_attempt.as_bytes(),
+    )
+    .map_err(|error| format!("build historical maintenance descriptor failed: {error}"))
+}
+
+/// Whether a rewrite in this state can still have been invisible to the table.
+///
+/// Everything from staging onward may have reached the connector, so it is
+/// reported as dispatched and can never be continued, only classified.
+const fn rewrite_dispatch_facts(
+    state: model::DistributedRewriteOperationState,
+) -> ConnectorHistoricalDispatchFacts {
+    ConnectorHistoricalDispatchFacts {
+        dispatch_started: !matches!(
+            state,
+            model::DistributedRewriteOperationState::Pending
+                | model::DistributedRewriteOperationState::Planned
+        ),
+        batch_ordinal: None,
+        receipt_digest: None,
     }
 }
 
