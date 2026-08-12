@@ -2020,9 +2020,14 @@ mod legacy {
                             database,
                         })
                     } else {
-                        Err(format!("unknown database `{schema}`"))
+                        Err(CatalogContextResolutionError::bad_database(format!(
+                            "unknown database `{schema}`"
+                        )))
                     }
-                } else if engine.database_exists(&database)? {
+                } else if engine
+                    .database_exists(&database)
+                    .map_err(CatalogContextResolutionError::bad_database)?
+                {
                     Ok(SessionDatabaseContext {
                         catalog: None,
                         database,
