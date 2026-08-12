@@ -51,18 +51,22 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
     /// The reverse port does not expose that authority yet, so this route fails
     /// closed: no writer and no commit may run without a fence the provider can
     /// compare at its external linearization point.
+    /// Predicate and equality DELETE both activate their write generation during
+    /// preparation, so the authority already exists here — before anything is
+    /// dispatched. The route only supplies the sealing closure; the resource
+    /// identity comes from the activated template.
     fn establish_external_fence(
         &self,
         _spec: &WriteTransactionSpec,
-        _proposal: &DmlExternalFenceProposal,
+        proposal: &DmlExternalFenceProposal,
     ) -> Result<
         novarocks_spi::connector::ConnectorEstablishedWriteFence,
         novarocks_spi::connector::ConnectorError,
     > {
-        Err(novarocks_spi::connector::ConnectorError::external_fence(
-            novarocks_spi::connector::ConnectorExternalFenceFailure::NotEstablished,
-            "DELETE engine does not expose an external operation fence authority",
-        ))
+        self.engine.establish_delete_external_fence(
+            self.prepared.handle.as_ref(),
+            &|operation_id, table, target_ref| proposal.seal(operation_id, table, target_ref),
+        )
     }
 
     fn run_coordinated_write(

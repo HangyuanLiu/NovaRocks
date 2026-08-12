@@ -130,6 +130,24 @@ struct DistributedEqualityDeleteWriteExecutor {
 }
 
 impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
+    /// Equality DELETE activates its write generation during preparation, so the
+    /// authority already exists before anything is dispatched.
+    fn external_fence_authority(
+        &self,
+    ) -> Result<
+        crate::engine::external_write_fence::ExternalWriteFenceAuthority,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        crate::engine::external_write_fence::ExternalWriteFenceAuthority::try_new(
+            self.connector_write.lease(),
+            self.connector_write.operation_id(),
+            &self.target.namespace,
+            &self.target.table,
+            self.connector_write.preparation().target_ref().clone(),
+            self.connector_context.clone(),
+        )
+    }
+
     fn run(&self) -> Result<QueryExecutionResult, String> {
         let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
