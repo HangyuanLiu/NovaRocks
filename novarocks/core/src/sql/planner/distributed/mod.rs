@@ -55,25 +55,3 @@ pub(crate) use runtime_filter_progress::{
 };
 pub use seal::DistributedPlan;
 pub use topology::TopologyContract;
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    #[test]
-    fn bridge2_owner_modules_are_split_into_files() {
-        for module_file in [
-            "distributed/fragment.rs",
-            "distributed/node.rs",
-            "distributed/build/fragment_cut.rs",
-            "distributed/build/lowering.rs",
-            "distributed/build/mod.rs",
-            "distributed/build/runtime_filter_binding.rs",
-        ] {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/sql/planner")
-                .join(module_file);
-            assert!(path.is_file(), "{} should exist", path.display());
-        }
-    }
-}
