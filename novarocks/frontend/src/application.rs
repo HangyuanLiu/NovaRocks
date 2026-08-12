@@ -462,7 +462,20 @@ impl FrontendApplicationHost {
         }
         match host.state_store() {
             Some(store) => {
-                match StateStoreMvRepository::open(store, tokio::runtime::Handle::current()).await {
+                // The MV repository must observe the exact attachment version an
+                // admitted catalog was resolved from, so a durable MV definition
+                // can never outlive the attachment it references.
+                let attachment_observations = host.catalog_application_port.as_ref().map(|port| {
+                    Arc::clone(port)
+                        as Arc<dyn crate::mv::repository::CatalogAttachmentObservationSource>
+                });
+                match StateStoreMvRepository::open_with_catalog_attachment_observations(
+                    store,
+                    tokio::runtime::Handle::current(),
+                    attachment_observations,
+                )
+                .await
+                {
                     Ok(repository) => {
                         let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
                             repository;
@@ -606,6 +619,17 @@ impl FrontendApplicationHost {
             as Arc<dyn novarocks::catalog_application::CatalogApplicationPort>;
         self.catalog_runtime_projection
             .bind_application(application)
+    }
+
+    /// The publication set Core binds its query catalog registry to.
+    ///
+    /// It is handed out alongside `catalog_application_port` so a durable
+    /// attachment only becomes a resolvable SQL name after this process
+    /// published its exact local runtime generation.
+    pub fn catalog_runtime_projection(
+        &self,
+    ) -> Arc<novarocks::catalog_application::CatalogRuntimeProjection> {
+        Arc::clone(&self.catalog_runtime_projection)
     }
 
     pub fn table_maintenance_service(

@@ -132,33 +132,24 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
 
     let context =
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
-    let read = state
-        .metadata_provider
-        .as_ref()
-        .expect("metadata provider checked above")
-        .begin_read()
-        .map_err(|error| format!("open catalog attachment read transaction failed: {error}"))?;
-    let instance_ids = state
-        .catalog_attachment_repo
-        .list(read.as_ref())
-        .map_err(|error| format!("list catalog attachments for MV rebuild failed: {error}"))?
+    // Only catalogs this process currently admits can be scanned: the durable
+    // attachment record belongs to the Frontend controller, and an Unavailable
+    // projection has no lease to enumerate namespaces with.
+    let Some(projection) = state.catalog_runtime_projection.as_ref() else {
+        return Ok(());
+    };
+    let instance_ids = projection
+        .published_observations()
+        .map_err(|error| format!("list admitted catalogs for MV rebuild failed: {error}"))?
         .into_iter()
-        .filter(|attachment| {
-            attachment.properties.properties.iter().any(|(key, value)| {
-                key.eq_ignore_ascii_case("type") && value.eq_ignore_ascii_case("iceberg")
-            })
+        .filter(|observation| {
+            observation
+                .provider_id
+                .as_str()
+                .eq_ignore_ascii_case("iceberg")
         })
-        .map(|attachment| {
-            novarocks_spi::connector::ConnectorInstanceId::parse(&attachment.catalog).map_err(
-                |error| {
-                    format!(
-                        "parse Iceberg catalog attachment `{}` for MV rebuild: {error}",
-                        attachment.catalog
-                    )
-                },
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|observation| observation.instance_id)
+        .collect::<Vec<_>>();
     let packages = discover_mv_lake_packages(
         state.connector_control.as_ref(),
         instance_ids,

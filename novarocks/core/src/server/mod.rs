@@ -1971,30 +1971,18 @@ mod legacy {
         if normalized == DEFAULT_CATALOG {
             return Ok(None);
         }
-        if engine.catalog_application_is_configured() {
-            engine
-                .require_external_catalog_ready(&normalized)
-                .map_err(|error| {
-                    if error.kind()
-                        == crate::catalog_application::CatalogApplicationErrorKind::Unavailable
-                    {
-                        CatalogContextResolutionError::unavailable(error.to_string())
-                    } else {
-                        CatalogContextResolutionError::bad_database(error.to_string())
-                    }
-                })?;
-            return Ok(Some(normalized));
-        }
-        if engine
-            .iceberg_catalog_exists(&normalized)
-            .map_err(CatalogContextResolutionError::bad_database)?
-        {
-            Ok(Some(normalized))
-        } else {
-            Err(CatalogContextResolutionError::bad_database(format!(
-                "unknown catalog `{catalog_name}`"
-            )))
-        }
+        engine
+            .require_external_catalog_ready(&normalized)
+            .map_err(|error| {
+                if error.kind()
+                    == crate::catalog_application::CatalogApplicationErrorKind::Unavailable
+                {
+                    CatalogContextResolutionError::unavailable(error.to_string())
+                } else {
+                    CatalogContextResolutionError::bad_database(error.to_string())
+                }
+            })?;
+        Ok(Some(normalized))
     }
 
     fn resolve_database_context(

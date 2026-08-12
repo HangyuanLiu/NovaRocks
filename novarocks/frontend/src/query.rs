@@ -757,17 +757,21 @@ fn resolve_catalog_name(
     if normalized == DEFAULT_CATALOG {
         return Ok(None);
     }
-    if engine
-        .iceberg_catalog_exists(&normalized)
-        .map_err(classify_engine_error)?
-    {
-        Ok(Some(normalized))
-    } else {
-        Err(QueryServiceError::new(
-            QueryServiceErrorKind::BadDatabase,
-            format!("unknown catalog `{catalog}`"),
-        ))
-    }
+    // Session catalog context is an admission decision, not a local binding
+    // lookup: a catalog whose durable attachment is absent is unknown, while one
+    // this process has not materialized yet is unavailable.
+    engine
+        .require_external_catalog_ready(&normalized)
+        .map_err(|error| {
+            let kind = match error.kind() {
+                novarocks::catalog_application::CatalogApplicationErrorKind::Unavailable => {
+                    QueryServiceErrorKind::Unavailable
+                }
+                _ => QueryServiceErrorKind::BadDatabase,
+            };
+            QueryServiceError::new(kind, error.to_string())
+        })?;
+    Ok(Some(normalized))
 }
 
 fn resolve_database_context(

@@ -18,7 +18,6 @@
 mod tests;
 
 pub mod catalog_application;
-pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;
 pub mod engine;

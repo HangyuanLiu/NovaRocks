@@ -685,6 +685,7 @@ pub(crate) fn analyze_visible_query(
         state.connector_control.as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let (resolved, _cte_registry, _factory) =
         crate::sql::analyzer::analyze(&query, &provider, current_database)

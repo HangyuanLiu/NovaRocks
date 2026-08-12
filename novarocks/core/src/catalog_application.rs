@@ -147,6 +147,31 @@ pub trait CatalogRuntimePublisherSink: Send + Sync {
     ) -> Result<(), CatalogApplicationError>;
 }
 
+/// The query catalog registry this projection publishes admitted runtimes into.
+///
+/// Frontend opens its catalog controller before the engine exists, so the
+/// registry arrives later and any observation published in the meantime is
+/// replayed under the same lock that guards the publication set.
+struct QueryCatalogBinding {
+    service: Arc<crate::engine::query_planning::catalog_runtime::QueryCatalogService>,
+    controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+}
+
+impl QueryCatalogBinding {
+    fn register(&self, observation: &CatalogRuntimeObservation) {
+        self.service.register_catalog(
+            crate::engine::query_planning::catalog_runtime::build_connector_catalog(
+                observation.instance_id.as_str(),
+                Arc::clone(&self.controls),
+            ),
+        );
+    }
+
+    fn unregister(&self, instance_id: &ConnectorInstanceId) {
+        self.service.unregister_catalog(instance_id.as_str());
+    }
+}
+
 /// Core-owned exact runtime publication set.
 ///
 /// Frontend publishes only after a local Connector control generation is
@@ -155,13 +180,49 @@ pub trait CatalogRuntimePublisherSink: Send + Sync {
 /// projection can never be admitted into query materialization.
 pub struct CatalogRuntimeProjection {
     published: Mutex<BTreeMap<ConnectorInstanceId, CatalogRuntimeObservation>>,
+    query_catalog: Mutex<Option<QueryCatalogBinding>>,
 }
 
 impl CatalogRuntimeProjection {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             published: Mutex::new(BTreeMap::new()),
+            query_catalog: Mutex::new(None),
         })
+    }
+
+    /// Binds the engine's query catalog registry and replays every runtime the
+    /// Frontend controller already published. Engine open calls this once; a
+    /// second bind is rejected so two engines cannot share one publication set.
+    pub(crate) fn bind_query_catalog(
+        &self,
+        service: Arc<crate::engine::query_planning::catalog_runtime::QueryCatalogService>,
+        controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+    ) -> Result<(), CatalogApplicationError> {
+        let published = self.published.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime publication lock is poisoned",
+            )
+        })?;
+        let mut binding = self.query_catalog.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime query catalog lock is poisoned",
+            )
+        })?;
+        if binding.is_some() {
+            return Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Conflict,
+                "catalog runtime projection is already bound to a query catalog",
+            ));
+        }
+        let bound = QueryCatalogBinding { service, controls };
+        for observation in published.values() {
+            bound.register(observation);
+        }
+        *binding = Some(bound);
+        Ok(())
     }
 
     pub fn publisher(self: &Arc<Self>) -> Arc<dyn CatalogRuntimePublisherSink> {
@@ -176,6 +237,23 @@ impl CatalogRuntimeProjection {
             application,
             projection: Arc::clone(self),
         })
+    }
+
+    /// Every catalog runtime this process currently admits.
+    ///
+    /// Startup rediscovery consumes this instead of a durable scan: the
+    /// attachment record lives in StateStore and only the Frontend controller
+    /// may read it.
+    pub(crate) fn published_observations(
+        &self,
+    ) -> Result<Vec<CatalogRuntimeObservation>, CatalogApplicationError> {
+        let published = self.published.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime publication lock is poisoned",
+            )
+        })?;
+        Ok(published.values().cloned().collect())
     }
 
     fn require_exact(
@@ -220,6 +298,22 @@ impl CatalogRuntimePublisherSink for CatalogRuntimeProjection {
                 "catalog runtime must be unpublished before publishing another generation",
             )),
             None => {
+                // The SQL name only becomes resolvable after the local control
+                // generation is registered, so query admission can never see a
+                // catalog without a binding.
+                if let Some(binding) = self
+                    .query_catalog
+                    .lock()
+                    .map_err(|_| {
+                        CatalogApplicationError::new(
+                            CatalogApplicationErrorKind::Internal,
+                            "catalog runtime query catalog lock is poisoned",
+                        )
+                    })?
+                    .as_ref()
+                {
+                    binding.register(&observation);
+                }
                 published.insert(observation.instance_id.clone(), observation);
                 Ok(())
             }
@@ -242,6 +336,21 @@ impl CatalogRuntimePublisherSink for CatalogRuntimeProjection {
             .is_some_and(|current| current.generation == generation)
         {
             published.remove(instance_id);
+            // Revoking the SQL name before the caller retires its local
+            // generation is what stops new admission for a dropped catalog.
+            if let Some(binding) = self
+                .query_catalog
+                .lock()
+                .map_err(|_| {
+                    CatalogApplicationError::new(
+                        CatalogApplicationErrorKind::Internal,
+                        "catalog runtime query catalog lock is poisoned",
+                    )
+                })?
+                .as_ref()
+            {
+                binding.unregister(instance_id);
+            }
         }
         Ok(())
     }
@@ -404,5 +513,68 @@ mod tests {
             bound.admit_catalog(&current.instance_id),
             CatalogAdmission::Unavailable { .. }
         ));
+    }
+
+    fn test_controls() -> Arc<dyn novarocks_spi::connector::ConnectorControlResolver> {
+        Arc::new(crate::engine::TestConnectorControlRegistry::default())
+            as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>
+    }
+
+    #[test]
+    fn binding_a_query_catalog_replays_publications_and_revokes_on_unpublish() {
+        let projection = CatalogRuntimeProjection::new();
+        let replayed = observation();
+        projection
+            .publish_catalog_runtime(replayed.clone())
+            .expect("publish before the engine exists");
+
+        let service =
+            Arc::new(crate::engine::query_planning::catalog_runtime::new_query_catalog_service());
+        projection
+            .bind_query_catalog(Arc::clone(&service), test_controls())
+            .expect("bind the engine query catalog");
+        // A catalog published before engine open must still resolve afterwards.
+        service
+            .invalidate_table(replayed.instance_id.as_str(), "ns", "orders")
+            .expect("replayed catalog is registered");
+
+        let later = CatalogRuntimeObservation {
+            attachment_id: Uuid::now_v7(),
+            instance_id: ConnectorInstanceId::parse("later").expect("instance"),
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            generation: 1,
+        };
+        projection
+            .publish_catalog_runtime(later.clone())
+            .expect("publish after bind");
+        service
+            .invalidate_table(later.instance_id.as_str(), "ns", "orders")
+            .expect("later catalog is registered");
+
+        // A stale generation must not revoke the live SQL name.
+        projection
+            .unpublish_catalog_runtime(&later.instance_id, later.generation + 1)
+            .expect("ignore stale unpublish");
+        service
+            .invalidate_table(later.instance_id.as_str(), "ns", "orders")
+            .expect("live catalog survives a stale unpublish");
+
+        projection
+            .unpublish_catalog_runtime(&later.instance_id, later.generation)
+            .expect("unpublish the live generation");
+        assert!(
+            service
+                .invalidate_table(later.instance_id.as_str(), "ns", "orders")
+                .is_err(),
+            "unpublishing must revoke the SQL catalog name"
+        );
+
+        assert_eq!(
+            projection
+                .bind_query_catalog(service, test_controls())
+                .expect_err("one publication set serves exactly one engine")
+                .kind(),
+            CatalogApplicationErrorKind::Conflict
+        );
     }
 }

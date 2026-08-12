@@ -104,13 +104,17 @@ impl Catalog<CatalogRuntimeMetadata> for InternalCatalog {
     }
 }
 
-struct IcebergCatalog {
+/// Registry entry for one admitted external catalog runtime.
+///
+/// It holds no provider concrete: every schema fact is materialized through the
+/// exact connector control lease the Frontend published for this SQL name.
+struct ConnectorCatalog {
     name: String,
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
     cache: SchemaCache<CatalogRuntimeMetadata>,
 }
 
-impl IcebergCatalog {
+impl ConnectorCatalog {
     fn new(
         name: &str,
         controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
@@ -123,7 +127,7 @@ impl IcebergCatalog {
     }
 }
 
-impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
+impl Catalog<CatalogRuntimeMetadata> for ConnectorCatalog {
     fn name(&self) -> &str {
         &self.name
     }
@@ -167,11 +171,11 @@ pub(crate) fn new_query_catalog_service() -> QueryCatalogService {
     service
 }
 
-pub(crate) fn build_iceberg_catalog(
+pub(crate) fn build_connector_catalog(
     name: &str,
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
 ) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
-    Arc::new(IcebergCatalog::new(name, controls))
+    Arc::new(ConnectorCatalog::new(name, controls))
 }
 
 #[cfg(test)]

@@ -276,6 +276,7 @@ pub(crate) fn analyze_mv_select_with_connector_context(
         state.connector_control.as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let (resolved, _, _) =
         crate::sql::analyzer::analyze(prepared.query_for_analysis(), &provider, current_database)?;

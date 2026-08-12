@@ -1463,8 +1463,24 @@ pub(crate) mod tests {
     }
 
     fn binding(incarnation: u8) -> ConnectorControlBinding {
+        test_control_binding_for(
+            ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
+            incarnation,
+        )
+    }
+
+    pub(crate) fn test_control_binding(incarnation: u8) -> ConnectorControlBinding {
+        binding(incarnation)
+    }
+
+    /// A control binding for an arbitrary instance ID, so a factory fixture can
+    /// answer whichever catalog name the request carries.
+    pub(crate) fn test_control_binding_for(
+        instance_id: ConnectorInstanceId,
+        incarnation: u8,
+    ) -> ConnectorControlBinding {
         let provider = Arc::new(TestControl {
-            instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
+            instance_id,
             incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
         });
         ConnectorControlBinding::try_new(
@@ -1479,10 +1495,6 @@ pub(crate) mod tests {
             None,
         )
         .expect("control binding")
-    }
-
-    pub(crate) fn test_control_binding(incarnation: u8) -> ConnectorControlBinding {
-        binding(incarnation)
     }
 
     #[test]
