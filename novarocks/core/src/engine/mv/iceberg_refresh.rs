@@ -1373,7 +1373,7 @@ struct IcebergMvCreatePreparation {
     )>,
     base_field_observations: std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
     expected_apply_key_field_id: i32,
     created_at_ms: i64,
@@ -2836,13 +2836,16 @@ fn observe_base_fields_for_refs(
     base_refs: &[TableIdentity],
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<
-    std::collections::BTreeMap<String, Vec<crate::mv::storage_observation::MvObservedTargetField>>,
+    std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
     String,
 > {
     let mut observed = std::collections::BTreeMap::new();
     for base_ref in base_refs {
         let observation = observe_schema_validation_for_table(state, base_ref, connector_context)?;
-        observed.insert(base_ref.fqn(), observation.fields().to_vec());
+        observed.insert(base_ref.fqn(), observation);
     }
     Ok(observed)
 }
@@ -3203,7 +3206,7 @@ fn build_iceberg_mv_schema_contract(
     )],
     base_field_observations: &std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
     target: &IcebergMvTarget,
     target_observation: &MvTargetCreationObservation,
@@ -3279,7 +3282,7 @@ fn build_non_branch_schema_contract(
     )],
     base_field_observations: &std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
     target_observation: &MvTargetCreationObservation,
     target: mv_schema::TargetContract,
@@ -3330,7 +3333,7 @@ fn build_non_branch_contract_core(
     )],
     base_field_observations: &std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<NonBranchContractCore, String> {
@@ -3352,7 +3355,7 @@ fn build_non_branch_contract_core(
                 contract_version: 1,
                 bases: vec![base_contract(
                     base_ref,
-                    loaded_base,
+                    observed_base(base_field_observations, base_ref)?,
                     None,
                     base_fields,
                 )],
@@ -3553,7 +3556,7 @@ fn build_aggregate_contract_core(
     )],
     base_field_observations: &std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<NonBranchContractCore, String> {
@@ -3620,7 +3623,7 @@ fn build_aggregate_contract_core(
             .map(|(base_ref, loaded_base)| {
                 Ok(base_contract(
                     base_ref,
-                    loaded_base,
+                    observed_base(base_field_observations, base_ref)?,
                     None,
                     base_fields_from_observation(observed_base_fields(
                         base_field_observations,
@@ -3659,7 +3662,7 @@ fn build_aggregate_contract_core(
             .map(|(base_ref, loaded_base)| {
                 Ok(base_contract(
                     base_ref,
-                    loaded_base,
+                    observed_base(base_field_observations, base_ref)?,
                     None,
                     base_fields_from_observation(observed_base_fields(
                         base_field_observations,
@@ -3689,7 +3692,12 @@ fn build_aggregate_contract_core(
         let (base_fields, output) = persist_sql_mv_lineage(lineage);
         Ok(NonBranchContractCore {
             contract_version: 3,
-            bases: vec![base_contract(base_ref, loaded_base, None, base_fields)],
+            bases: vec![base_contract(
+                base_ref,
+                observed_base(base_field_observations, base_ref)?,
+                None,
+                base_fields,
+            )],
             output,
             join: None,
             aggregate: Some(aggregate_contract(&layout, target_observation)?),
@@ -3710,7 +3718,7 @@ fn build_join_base_contracts_and_lineage(
     )],
     base_field_observations: &std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
 ) -> Result<
     (
@@ -3755,13 +3763,13 @@ fn build_join_base_contracts_and_lineage(
         .unwrap_or_default();
     let left_contract = base_contract(
         left_ref,
-        left_loaded,
+        observed_base(base_field_observations, left_ref)?,
         Some(join_aliases.left_alias.clone()),
         persist_sql_mv_base_fields(left_fields),
     );
     let right_contract = base_contract(
         right_ref,
-        right_loaded,
+        observed_base(base_field_observations, right_ref)?,
         Some(join_aliases.right_alias.clone()),
         persist_sql_mv_base_fields(right_fields),
     );
@@ -3788,7 +3796,7 @@ fn build_branch_union_schema_contract(
     )],
     base_field_observations: &std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
     target_observation: &MvTargetCreationObservation,
     target: mv_schema::TargetContract,
@@ -3803,7 +3811,7 @@ fn build_branch_union_schema_contract(
         .map(|(base_ref, loaded_base)| {
             Ok(base_contract(
                 base_ref,
-                loaded_base,
+                observed_base(base_field_observations, base_ref)?,
                 None,
                 base_fields_from_observation(observed_base_fields(
                     base_field_observations,
@@ -4100,15 +4108,15 @@ fn loaded_base_for_table_fqn<'a>(
 
 fn base_contract(
     base_ref: &TableIdentity,
-    loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
+    observation: &crate::mv::storage_observation::MvSchemaValidationObservation,
     alias_at_create: Option<String>,
     fields: Vec<mv_schema::BaseFieldRecord>,
 ) -> mv_schema::BaseContract {
     mv_schema::BaseContract {
         table_fqn: base_ref.fqn(),
-        table_uuid: loaded_base.table.metadata().uuid().to_string(),
+        table_uuid: observation.table_uuid().to_string(),
         alias_at_create,
-        schema_id_at_create: loaded_base.table.metadata().current_schema_id(),
+        schema_id_at_create: observation.schema_id(),
         schema_at_create: mv_schema::BaseSchemaSnapshot { fields },
     }
 }
@@ -4127,26 +4135,33 @@ fn base_fields_from_observation(
         .collect()
 }
 
-/// Neutral base-schema fields observed for `base_ref`.
+/// Neutral schema observation for `base_ref`.
 ///
 /// Fails closed: a base the caller did not observe is a programming error, not
 /// a reason to fall back to reading provider metadata.
+fn observed_base<'a>(
+    base_field_observations: &'a std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
+    base_ref: &TableIdentity,
+) -> Result<&'a crate::mv::storage_observation::MvSchemaValidationObservation, String> {
+    base_field_observations.get(&base_ref.fqn()).ok_or_else(|| {
+        format!(
+            "MV base {} was not observed before contract build",
+            base_ref.fqn()
+        )
+    })
+}
+
 fn observed_base_fields<'a>(
     base_field_observations: &'a std::collections::BTreeMap<
         String,
-        Vec<crate::mv::storage_observation::MvObservedTargetField>,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
     >,
     base_ref: &TableIdentity,
 ) -> Result<&'a [crate::mv::storage_observation::MvObservedTargetField], String> {
-    base_field_observations
-        .get(&base_ref.fqn())
-        .map(Vec::as_slice)
-        .ok_or_else(|| {
-            format!(
-                "MV base {} was not observed before contract build",
-                base_ref.fqn()
-            )
-        })
+    Ok(observed_base(base_field_observations, base_ref)?.fields())
 }
 
 /// Project provider schema metadata into the SQL-owned lineage vocabulary at
