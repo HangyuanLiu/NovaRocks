@@ -25,15 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Field;
 use novarocks_connector_iceberg::iceberg::spec::DataFile;
-use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::registry::{
-    IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
-};
-use crate::connector::iceberg::commit::{
-    IcebergCommitCollector, build_abort_cleanup_for_catalog_entry,
-};
+use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_service::IcebergWriteReportCommitter;
 use crate::engine::StandaloneState;
@@ -604,51 +598,15 @@ pub(crate) fn register_iceberg_row_delete_write_service(
             .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
         registry.get(&target.catalog)?
     };
-    let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|error| format!("load iceberg table {}: {error}", &table_ident))?;
-
-    let metadata = table.metadata();
-    let base_snapshot_id = if target_ref == "main" {
-        metadata.current_snapshot_id()
-    } else {
-        novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
-            metadata, target_ref,
-        )?
-    };
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            iceberg_commit_op_for_strategy(strategy),
-            table_ident,
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table: table.clone(),
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
+    let (commit_executor, table) =
+        crate::connector::iceberg::write_commit::build_admitted_row_mutation_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            target_ref,
+            strategy,
+            crate::connector::iceberg::write_commit::RowMutationCommitBase::RefHead,
+        )?;
     register_iceberg_row_connector_write(
         state,
         target_ref,
@@ -662,30 +620,6 @@ pub(crate) fn register_iceberg_row_delete_write_service(
     )
 }
 
-/// Map a provider-signed row-mutation strategy onto the Iceberg commit operation
-/// that realizes it.
-///
-/// This is the only place the mapping exists. Row DML carries the neutral
-/// strategy and never names a commit operation kind.
-fn iceberg_commit_op_for_strategy(
-    strategy: novarocks_spi::connector::ConnectorRowMutationStrategy,
-) -> novarocks_connector_iceberg::commit::CommitOpKind {
-    use novarocks_connector_iceberg::commit::CommitOpKind;
-    use novarocks_spi::connector::ConnectorRowMutationStrategy;
-
-    match strategy {
-        // Deletion vectors and merge-on-read both land as a row delta assembled
-        // from the touched data files.
-        ConnectorRowMutationStrategy::DeletionVector
-        | ConnectorRowMutationStrategy::MergeOnRead => CommitOpKind::RowDeltaDvFromFiles,
-        // Position deletes and equality deletes differ in the delete file each
-        // writer produces, not in how the snapshot is assembled.
-        ConnectorRowMutationStrategy::PositionDelete
-        | ConnectorRowMutationStrategy::EqualityDelete => CommitOpKind::RowDelta,
-        ConnectorRowMutationStrategy::CopyOnWrite => CommitOpKind::CowUpdate,
-    }
-}
-
 /// Build the commit executor for a row mutation from its target, the signed
 /// strategy and the base version admission signed.
 ///
@@ -694,6 +628,11 @@ fn iceberg_commit_op_for_strategy(
 /// implementation, so a row-DML entry point hands over a target and a base
 /// version and nothing else. It disappears with the Core Iceberg
 /// implementation.
+/// Reserve the row-mutation commit driver for a Provider-signed route.
+///
+/// The caller passes the neutral strategy the provider signed and nothing else
+/// about the table. Everything Iceberg-shaped is built by the provider; this
+/// layer only resolves the catalog entry, which the final factory cut owns.
 pub(crate) fn build_iceberg_row_commit_executor(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
@@ -714,42 +653,17 @@ pub(crate) fn build_iceberg_row_commit_executor(
             .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
         registry.get(&target.catalog)?
     };
-    let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = TableIdent::new(
-        NamespaceIdent::new(target.namespace.clone()),
-        target.table.clone(),
-    );
-    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-        .map_err(|error| format!("load iceberg table {}: {error}", &table_ident))?;
-    let metadata = table.metadata();
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            iceberg_commit_op_for_strategy(strategy),
-            table_ident,
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            format!(
-                "{}/data/_staging/{}",
-                metadata.location(),
-                uuid::Uuid::new_v4()
+    let (commit_executor, _table) =
+        crate::connector::iceberg::write_commit::build_admitted_row_mutation_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            target_ref,
+            strategy,
+            crate::connector::iceberg::write_commit::RowMutationCommitBase::Signed(
+                base_snapshot_id,
             ),
-            novarocks_types::UniqueId::new(0, 0),
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        catalog,
-        table,
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
-    });
+        )?;
     Ok((commit_executor, entry))
 }
 
@@ -1638,20 +1552,6 @@ fn operation_kind_for_overwrite_mode(overwrite_mode: IcebergWriteMode) -> Iceber
     }
 }
 
-fn write_base_snapshot_id(
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    target_ref: &str,
-) -> Result<Option<i64>, String> {
-    if target_ref == "main" {
-        return Ok(metadata.current_snapshot().map(|s| s.snapshot_id()));
-    }
-    metadata
-        .refs()
-        .get(target_ref)
-        .map(|snapshot_ref| Some(snapshot_ref.snapshot_id))
-        .ok_or_else(|| format!("iceberg ref: branch '{target_ref}' not found in table metadata"))
-}
-
 pub(crate) fn invalidate_iceberg_caches(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
@@ -1778,23 +1678,6 @@ mod tests {
                 .map(|(name, data_type)| Arc::new(Field::new(name, data_type, true)))
                 .collect::<Vec<_>>(),
         ))
-    }
-
-    #[test]
-    fn branch_write_uses_the_branch_head_as_its_base_snapshot() {
-        let metadata = crate::connector::iceberg::test_metadata::metadata_with_two_snapshots()
-            .into_builder(None)
-            .set_ref(
-                "dev",
-                SnapshotReference::new(1, SnapshotRetention::branch(None, None, None)),
-            )
-            .expect("add dev branch")
-            .build()
-            .expect("build metadata with dev branch")
-            .metadata;
-
-        assert_eq!(write_base_snapshot_id(&metadata, "main").unwrap(), Some(2));
-        assert_eq!(write_base_snapshot_id(&metadata, "dev").unwrap(), Some(1));
     }
 
     #[test]
