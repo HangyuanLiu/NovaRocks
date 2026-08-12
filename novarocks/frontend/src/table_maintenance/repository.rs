@@ -1293,6 +1293,7 @@ async fn validate_fenced_authority(
     })
 }
 
+// Design: ADR-0064 (docs/adr/ADR-0064-per-table-maintenance-lease-attempt-authority.md)
 async fn validate_bound_fenced_authority(
     transaction: &mut dyn WriteTransaction,
     durable: Option<&MaintenanceAuthorityV1>,
