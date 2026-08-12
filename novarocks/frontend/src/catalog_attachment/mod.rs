@@ -14,25 +14,19 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#[cfg(test)]
-mod tests;
 
-pub mod catalog_application;
-pub mod common;
-pub mod connector;
-pub mod engine;
-pub mod meta;
-pub mod mv;
-pub mod protocol;
-pub mod query_execution;
-pub mod runtime;
-pub mod server;
-pub mod service;
-pub mod sql;
-pub use novarocks_version as version;
-// StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
-pub use common::app_config as novarocks_config;
-pub use common::logging as novarocks_logging;
-pub use connector as novarocks_connectors;
+//! Frontend-owned durable catalog attachment facts.
+//!
+//! A catalog attachment is a StateStore fact.  Process-local Connector
+//! bindings, health, leases, retries and BE installation never appear here.
 
-pub use common::types::FetchResult;
+mod codec;
+mod key;
+mod repository;
+
+pub use key::{attachment_key, attachment_prefix};
+pub(crate) use repository::assert_attachment_versions;
+pub use repository::{
+    CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
+    CatalogAttachmentRepository, CatalogAttachmentVersioned,
+};

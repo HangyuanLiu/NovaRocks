@@ -54,15 +54,18 @@ use novarocks_spi::state_store::{
 use novarocks_state_store::metrics::StateStoreMetrics;
 use uuid::Uuid;
 
+use crate::catalog_attachment::{CatalogAttachmentVersioned, assert_attachment_versions};
+
 use self::codec::{
     DecodedMvRecord, MvRecordKind, MvSequence, decode_definition, decode_record, encode_definition,
     encode_record,
 };
 use self::key::{
     definition_by_id_key, definition_prefix, dependency_by_downstream_key,
-    dependency_by_downstream_prefix, dependency_by_upstream_key, dependency_by_upstream_prefix,
-    mv_prefix, partition_by_mv_key, partition_by_mv_prefix, refresh_by_id_key, refresh_prefix,
-    sequence_key, target_lookup_key,
+    dependency_by_downstream_prefix, dependency_by_upstream_catalog_prefixes,
+    dependency_by_upstream_key, dependency_by_upstream_prefix, mv_prefix, partition_by_mv_key,
+    partition_by_mv_prefix, refresh_by_id_key, refresh_prefix, sequence_key,
+    target_lookup_catalog_prefix, target_lookup_key,
 };
 
 /// The sole MV StateStore repository. It keeps provider transactions private
@@ -71,6 +74,18 @@ pub struct StateStoreMvRepository {
     store: Arc<dyn StateStore>,
     runtime: tokio::runtime::Handle,
     runner_metrics: StateStoreMetrics,
+    catalog_attachment_observations: Option<Arc<dyn CatalogAttachmentObservationSource>>,
+}
+
+/// Supplies the Ready attachment observations that an application admitted
+/// while resolving an MV command.  The repository revalidates these facts in
+/// its own write transaction; this source never exposes a StateStore
+/// transaction to Core.
+pub trait CatalogAttachmentObservationSource: Send + Sync {
+    fn capture(
+        &self,
+        catalogs: &BTreeSet<String>,
+    ) -> Result<Vec<CatalogAttachmentVersioned>, MvRepositoryError>;
 }
 
 pub use novarocks::mv::repository::BeginFrontendMvRefreshIntentRequest;
@@ -80,15 +95,50 @@ impl StateStoreMvRepository {
         store: Arc<dyn StateStore>,
         runtime: tokio::runtime::Handle,
     ) -> Result<Arc<Self>, MvRepositoryError> {
+        Self::open_with_catalog_attachment_observations(store, runtime, None).await
+    }
+
+    pub async fn open_with_catalog_attachment_observations(
+        store: Arc<dyn StateStore>,
+        runtime: tokio::runtime::Handle,
+        catalog_attachment_observations: Option<Arc<dyn CatalogAttachmentObservationSource>>,
+    ) -> Result<Arc<Self>, MvRepositoryError> {
         let repository = Arc::new(Self {
             runner_metrics: StateStoreMetrics::new(
                 novarocks_spi::state_store::StateStoreProviderId::new("frontend-mv"),
             ),
             store,
             runtime,
+            catalog_attachment_observations,
         });
         repository.validate_open_state().await?;
         Ok(repository)
+    }
+
+    fn capture_catalog_attachment_observations(
+        &self,
+        catalogs: BTreeSet<String>,
+    ) -> Result<Vec<CatalogAttachmentVersioned>, MvRepositoryError> {
+        if catalogs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(source) = &self.catalog_attachment_observations else {
+            // T6 makes the source mandatory for production composition.  The
+            // optional constructor preserves existing pre-cutover callers.
+            return Ok(Vec::new());
+        };
+        let observations = source.capture(&catalogs)?;
+        let observed = observations
+            .iter()
+            .map(|observation| observation.attachment.instance_id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        if observed != catalogs || observations.len() != observed.len() {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "materialized view catalog attachment observations are incomplete",
+            ));
+        }
+        Ok(observations)
     }
 
     fn blocking<T>(
@@ -384,6 +434,8 @@ impl StateStoreMvRepository {
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         validate_create_request(&request)?;
         prevalidate_create_operation(operation_id, explicit_id, &request)?;
+        let attachment_observations =
+            self.capture_catalog_attachment_observations(catalog_references_for_create(&request))?;
         let recovery_request = request.clone();
         let store = Arc::clone(&self.store);
         let metrics = &self.runner_metrics;
@@ -395,7 +447,9 @@ impl StateStoreMvRepository {
                 "create materialized view",
                 move |transaction| {
                     let request = request.clone();
+                    let attachment_observations = attachment_observations.clone();
                     Box::pin(async move {
+                        assert_attachment_versions(transaction, &attachment_observations).await?;
                         let sequence_key = sequence_key().map_err(invalid_state_store)?;
                         let sequence_record = transaction.get(&sequence_key).await?;
                         let sequence = match &sequence_record {
@@ -787,6 +841,9 @@ impl StateStoreMvRepository {
         if mv_id <= 0 {
             return Err(invalid("mv definition id must be positive"));
         }
+        let attachment_observations = self.capture_catalog_attachment_observations(
+            catalog_references_for_dependencies(&requests),
+        )?;
         let operation_id = Uuid::now_v7();
         let page_size = self.store.limits().max_page_size;
         let store = Arc::clone(&self.store);
@@ -797,7 +854,9 @@ impl StateStoreMvRepository {
             "replace materialized view dependencies",
             move |transaction| {
                 let requests = requests.clone();
+                let attachment_observations = attachment_observations.clone();
                 Box::pin(async move {
+                    assert_attachment_versions(transaction, &attachment_observations).await?;
                     let prefix =
                         dependency_by_downstream_prefix(mv_id).map_err(invalid_state_store)?;
                     let existing = range_transaction(transaction, prefix, page_size).await?;
@@ -2971,6 +3030,22 @@ fn prevalidate_create_operation(
     Ok(())
 }
 
+fn catalog_references_for_create(request: &CreateMvRepositoryRequest) -> BTreeSet<String> {
+    let mut catalogs = catalog_references_for_dependencies(&request.dependencies);
+    if let Some(catalog) = request.definition.target_catalog.as_deref() {
+        catalogs.insert(catalog.to_ascii_lowercase());
+    }
+    catalogs
+}
+
+fn catalog_references_for_dependencies(requests: &[CreateMvDependencyRequest]) -> BTreeSet<String> {
+    requests
+        .iter()
+        .filter_map(|request| request.upstream.catalog.as_deref())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 fn definition_target(
     definition: &StoredMvDefinition,
 ) -> Result<Option<MvTarget>, MvRepositoryError> {
@@ -3050,6 +3125,41 @@ async fn range_transaction(
             return Ok(records);
         }
     }
+}
+
+/// Reject a catalog attachment delete when the same serializable transaction
+/// observes any NovaRocks-owned MV target or upstream dependency in that
+/// catalog.  Catalog attachment code calls this before its exact-version
+/// delete; MV writers use the inverse attachment assertion before creating the
+/// records scanned here.
+pub(crate) async fn ensure_no_catalog_references_transaction(
+    transaction: &mut dyn WriteTransaction,
+    catalog: &str,
+    page_size: usize,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    // Existing target lookup keys use SQL identifiers, a strict subset of
+    // ConnectorInstanceId. Attachments such as `warehouse-main` have no
+    // representable target prefix in that legacy key layout, but can still be
+    // referenced by dependency keys below.
+    if let Ok(target_prefix) = target_lookup_catalog_prefix(catalog) {
+        let target_records = range_transaction(transaction, target_prefix, page_size).await?;
+        if !target_records.is_empty() {
+            return Err(conflict_state_store(
+                "catalog has a materialized view target",
+            ));
+        }
+    }
+    for prefix in dependency_by_upstream_catalog_prefixes(catalog).map_err(invalid_state_store)? {
+        if !range_transaction(transaction, prefix, page_size)
+            .await?
+            .is_empty()
+        {
+            return Err(conflict_state_store(
+                "catalog has materialized view dependencies",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn load_definition_transaction(

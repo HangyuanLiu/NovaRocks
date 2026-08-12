@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, RwLock, Weak};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,6 @@ use crate::runtime::query_result::{
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 
-use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
@@ -112,12 +111,19 @@ pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> QueryCat
     )
 }
 
+/// Builds the request-local SQL materializer behind the Frontend-owned catalog
+/// admission gate.
+///
+/// Every analyzer entry point passes the state's application port: an external
+/// table can only be materialized while its attachment is `Ready` in this
+/// process, and there is no ungated variant to fall back to.
 pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a QueryCatalogService,
     controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
 ) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     build_catalog_service_provider_with_query_local_overlays(
         current_catalog,
@@ -126,6 +132,7 @@ pub(crate) fn build_catalog_service_provider<'a>(
         connector_context,
         _lookup_mode,
         Vec::new(),
+        catalog_application,
     )
 }
 
@@ -140,6 +147,7 @@ pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
     overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
 ) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     let bindings = Arc::new(
         crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
@@ -152,6 +160,7 @@ pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
         connector_context,
         bindings,
         overlays,
+        catalog_application,
     )
 }
 
@@ -162,6 +171,7 @@ pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overl
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
 ) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     let loader = query_stats::iceberg_table_binding_loader(controls, connector_context);
     crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
@@ -171,6 +181,7 @@ pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overl
         loader,
         overlays,
     )
+    .with_catalog_application(catalog_application)
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +352,16 @@ pub(crate) struct StandaloneState {
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned durable application boundary for typed statistics commands.
     pub(crate) statistics_application: Arc<dyn statistics_application::StatisticsApplicationPort>,
+    /// Frontend-owned catalog attachment control plane, and the sole catalog
+    /// authority this engine has. A composition that leaves it absent cannot
+    /// create, drop, restore or admit an external catalog.
+    pub(crate) catalog_application:
+        Option<Arc<dyn crate::catalog_application::CatalogApplicationPort>>,
+    /// Runtime publication set shared with the Frontend catalog controller.
+    /// It is the only thing that turns a durable attachment into a registered
+    /// SQL catalog name in this process.
+    pub(crate) catalog_runtime_projection:
+        Option<Arc<crate::catalog_application::CatalogRuntimeProjection>>,
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
@@ -367,12 +388,6 @@ pub(crate) struct StandaloneState {
     /// Server-composed exact-generation storage observation boundary.
     pub(crate) mv_storage_observation:
         Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
-    pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
-    /// Serializes durable attachment and exact control-generation lifecycle
-    /// transitions. Provider construction is intentionally performed outside
-    /// this lock; only persistence, publication, retirement, and SQL catalog
-    /// projection transitions are fenced here.
-    pub(crate) catalog_attachment_lifecycle: Mutex<()>,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) exchange_port: u16,
@@ -416,6 +431,8 @@ impl Default for StandaloneState {
             statistics_application: Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
+            catalog_application: None,
+            catalog_runtime_projection: None,
             connector_control: Arc::clone(&connector_control)
                 as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
             connector_control_factory_resolver: connector_control
@@ -432,8 +449,6 @@ impl Default for StandaloneState {
             mv_storage_observation: Arc::new(
                 crate::mv::storage_observation::UnavailableMvStorageObservationPort,
             ),
-            catalog_attachment_repo: CatalogAttachmentRepository,
-            catalog_attachment_lifecycle: Mutex::new(()),
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
             exchange_port: 0,
@@ -460,7 +475,7 @@ impl Default for StandaloneState {
 }
 
 #[cfg(test)]
-struct TestConnectorControlRegistry {
+pub(crate) struct TestConnectorControlRegistry {
     active: std::sync::Mutex<
         std::collections::HashMap<
             novarocks_spi::connector::ConnectorInstanceId,
@@ -1269,6 +1284,16 @@ pub struct StandaloneOpenServices {
     /// unavailable implementation so non-frontend compositions fail closed.
     pub statistics_application:
         std::sync::Arc<dyn statistics_application::StatisticsApplicationPort>,
+    /// Frontend-owned catalog attachment command and admission boundary.
+    /// Production composition must install it: without it the engine has no
+    /// catalog authority at all and every catalog statement fails closed.
+    pub catalog_application:
+        Option<std::sync::Arc<dyn crate::catalog_application::CatalogApplicationPort>>,
+    /// The publication set the Frontend controller projects admitted runtimes
+    /// into. Engine open binds its query catalog registry to it, which is how a
+    /// durable attachment becomes a resolvable SQL name.
+    pub catalog_runtime_projection:
+        Option<std::sync::Arc<crate::catalog_application::CatalogRuntimeProjection>>,
     /// Receives the Core-owned target resolver once connector control is
     /// ready. It is intentionally distinct from command dispatch.
     pub statistics_target_resolver_sink:
@@ -1351,6 +1376,8 @@ impl StandaloneOpenServices {
             statistics_application: std::sync::Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
+            catalog_application: None,
+            catalog_runtime_projection: None,
             statistics_target_resolver_sink: None,
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
@@ -1388,6 +1415,21 @@ impl StandaloneOpenServices {
         >,
     ) -> Self {
         self.statistics_application = statistics_application;
+        self
+    }
+
+    /// Installs the Frontend catalog authority. The application port and the
+    /// publication set arrive together because an admitted observation is only
+    /// meaningful while its exact runtime is published into this engine.
+    pub fn with_catalog_application(
+        mut self,
+        catalog_application: std::sync::Arc<dyn crate::catalog_application::CatalogApplicationPort>,
+        catalog_runtime_projection: std::sync::Arc<
+            crate::catalog_application::CatalogRuntimeProjection,
+        >,
+    ) -> Self {
+        self.catalog_application = Some(catalog_application);
+        self.catalog_runtime_projection = Some(catalog_runtime_projection);
         self
     }
 
@@ -1509,6 +1551,8 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             statistics_application,
+            catalog_application,
+            catalog_runtime_projection,
             statistics_target_resolver_sink,
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
@@ -1538,14 +1582,14 @@ impl StandaloneNovaRocks {
             mv_repository,
             mv_application_service,
             mv_storage_observation,
-            catalog_attachment_repo: CatalogAttachmentRepository,
-            catalog_attachment_lifecycle: Mutex::new(()),
             job_repo: JobMetaRepository,
             exchange_port,
             system_catalog,
             view_service,
             statistics_service,
             statistics_application,
+            catalog_application,
+            catalog_runtime_projection,
             connector_control,
             connector_control_factory_resolver,
             unified_statistics: Arc::new(
@@ -1563,6 +1607,18 @@ impl StandaloneNovaRocks {
             iceberg_operation_repo: IcebergOperationRepository,
         });
         register_connector_backends(&inner);
+        // Bind before restore: the Frontend controller may already have
+        // published runtimes while bootstrapping, and startup rediscovery below
+        // resolves external tables through this registry.
+        if let Some(projection) = &inner.catalog_runtime_projection {
+            projection
+                .bind_query_catalog(
+                    Arc::clone(&inner.catalog_service),
+                    Arc::clone(&inner.connector_control)
+                        as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+                )
+                .map_err(|error| format!("bind catalog runtime projection failed: {error}"))?;
+        }
         if let Some(sink) = &mv_refresh_provider_activation_sink {
             sink.bind_mv_refresh_provider_activation(Arc::new(
                 crate::engine::mv::iceberg_activation::StandaloneMvRefreshProviderActivation::new(
@@ -1720,22 +1776,32 @@ impl StandaloneNovaRocks {
         guard.database_exists(database_name)
     }
 
-    pub fn iceberg_catalog_exists(&self, catalog_name: &str) -> Result<bool, String> {
+    /// Admits an external catalog through the frontend control plane.
+    ///
+    /// `Absent` and `Unavailable` stay distinct so a dropped catalog reports
+    /// "unknown" while a locally unmaterialized one reports "unavailable"
+    /// instead of silently looking absent.
+    pub fn require_external_catalog_ready(
+        &self,
+        catalog_name: &str,
+    ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+        let Some(application) = &self.inner.catalog_application else {
+            return Err(crate::catalog_application::CatalogApplicationError::new(
+                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+                "external catalogs require a configured frontend catalog application",
+            ));
+        };
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
-            .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-        match self
-            .inner
-            .connector_control
-            .observe_current_binding(&instance_id)
-        {
-            Ok(_) => Ok(true),
-            Err(error)
-                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(format!("resolve Iceberg catalog `{catalog_name}`: {error}")),
-        }
+            .map_err(|error| {
+                crate::catalog_application::CatalogApplicationError::new(
+                    crate::catalog_application::CatalogApplicationErrorKind::InvalidRequest,
+                    format!("invalid catalog connector instance ID: {error}"),
+                )
+            })?;
+        application
+            .admit_catalog(&instance_id)
+            .require_ready()
+            .map(|_| ())
     }
 
     pub fn iceberg_namespace_exists(
@@ -1909,6 +1975,7 @@ impl StandaloneSession {
                     self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
+                    self.inner.catalog_application.as_deref(),
                 );
                 let result = explain_query_with_sql_compiler_kernel(
                     &prepared,
@@ -1977,6 +2044,7 @@ impl StandaloneSession {
                     self.inner.connector_control.as_ref(),
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
+                    self.inner.catalog_application.as_deref(),
                 );
                 let (request, _, _) = prepare_query_with_sql_compiler_kernel(
                     &prepared,
@@ -2026,6 +2094,7 @@ impl StandaloneSession {
             self.inner.connector_control.as_ref(),
             connector_context.clone(),
             TableLookupMode::ExplainStats,
+            self.inner.catalog_application.as_deref(),
         );
         let planning_start = std::time::Instant::now();
         let (request, distributed_plan, connector_static_planning) =
@@ -2803,52 +2872,26 @@ impl StandaloneSession {
     }
 
     /// Handle CREATE CATALOG result.
+    ///
+    /// The durable StateStore attachment commit owned by the Frontend
+    /// application is the linearization point. Core neither persists the
+    /// attachment nor constructs a provider runtime.
     fn handle_create_catalog(
         &self,
         stmt: crate::sql::parser::ast::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
-        let _lifecycle = self
-            .inner
-            .catalog_attachment_lifecycle
-            .lock()
-            .map_err(|error| format!("catalog attachment lifecycle lock: {error}"))?;
         let normalized_catalog = normalize_identifier(&stmt.name)?;
+        let application = require_catalog_application(&self.inner)?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&normalized_catalog)
-            .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-        match self
-            .inner
-            .connector_control
-            .observe_current_binding(&instance_id)
-        {
-            Ok(_) => return Ok(StatementResult::Ok),
-            Err(error)
-                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "resolve Iceberg catalog `{normalized_catalog}` before create: {error}"
-                ));
-            }
-        }
-        let persisted_properties =
-            create_iceberg_control_binding(&self.inner, &normalized_catalog, stmt.properties)?;
-        self.inner.catalog_service.register_catalog(
-            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
-                &stmt.name,
-                Arc::clone(&self.inner.connector_control)
-                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ),
-        );
-        if let Err(error) = persist_catalog_attachment_if_needed(
-            &self.inner,
-            &normalized_catalog,
-            &persisted_properties,
-        ) {
-            retire_iceberg_control_binding(&self.inner, &normalized_catalog)?;
-            self.inner
-                .catalog_service
-                .unregister_catalog(&normalized_catalog);
-            return Err(error);
-        }
+            .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+        application
+            .create_catalog(crate::catalog_application::CatalogCreateCommand {
+                instance_id,
+                display_name: stmt.name,
+                properties: stmt.properties,
+                if_not_exists: stmt.if_not_exists,
+            })
+            .map_err(|error| error.to_string())?;
         Ok(StatementResult::Ok)
     }
 
@@ -3783,7 +3826,8 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 }
 
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
-    restore_connector_catalogs(state)?;
+    // Catalog attachments are restored by the Frontend controller from
+    // StateStore before the engine opens; Core has no attachment reader.
     // W4 statelessness: rediscover lake-native Iceberg MV packages that are
     // present on the lake but missing from a fresh `[metadata]` (SQLite) cache,
     // and persist their rebuilt definitions.
@@ -3799,118 +3843,17 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
     Ok(())
 }
 
-fn restore_connector_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(());
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
-    let catalogs = state
-        .catalog_attachment_repo
-        .list(read.as_ref())
-        .map_err(|e| format!("load catalog attachment metadata failed: {e}"))?;
-    for catalog in &catalogs {
-        let normalized_catalog = normalize_identifier(&catalog.catalog)?;
-        create_iceberg_control_binding(
-            state,
-            &normalized_catalog,
-            catalog.properties.properties.clone(),
-        )?;
-        state.catalog_service.register_catalog(
-            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
-                &catalog.catalog,
-                Arc::clone(&state.connector_control)
-                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ),
-        );
-    }
-
-    Ok(())
-}
-
-fn create_iceberg_control_binding(
-    state: &Arc<StandaloneState>,
-    normalized_catalog: &str,
-    properties: Vec<(String, String)>,
-) -> Result<Vec<(String, String)>, String> {
-    let provider_id = novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-        .map_err(|error| format!("invalid Iceberg connector provider ID: {error}"))?;
-    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let request = novarocks_spi::connector::ConnectorControlFactoryRequest::try_new(
-        provider_id,
-        instance_id,
-        properties,
-    )
-    .map_err(|error| format!("prepare Iceberg connector control factory request: {error}"))?;
-    let creation = state
-        .connector_control_factory_resolver
-        .create_control(request)
-        .map_err(|error| format!("create Iceberg connector control binding: {error}"))?;
-    let (binding, durable_properties) = creation.into_parts();
-    state
-        .connector_control
-        .register(binding)
-        .map_err(|error| format!("register Iceberg connector control binding: {error}"))?;
-    Ok(durable_properties)
-}
-
-fn retire_iceberg_control_binding(
-    state: &Arc<StandaloneState>,
-    normalized_catalog: &str,
-) -> Result<(), String> {
-    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    state
-        .connector_control
-        .retire_current(&instance_id)
-        .map_err(|error| format!("retire Iceberg connector control binding: {error}"))
-}
-
-pub(crate) fn persist_catalog_attachment_if_needed(
-    state: &Arc<StandaloneState>,
-    catalog_name: &str,
-    properties: &[(String, String)],
-) -> Result<(), String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(());
-    };
-    let mut txn = provider
-        .begin_write("persist catalog attachment")
-        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
-    state
-        .catalog_attachment_repo
-        .create(
-            txn.as_mut(),
-            catalog_name,
-            CatalogAttachmentProperties {
-                properties: properties.to_vec(),
-            },
-        )
-        .map_err(|e| format!("persist catalog attachment metadata failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit catalog attachment metadata failed: {e}"))?;
-    Ok(())
-}
-
-pub(crate) fn delete_catalog_attachment_if_needed(
-    state: &Arc<StandaloneState>,
-    catalog_name: &str,
-) -> Result<(), String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(());
-    };
-    let mut txn = provider
-        .begin_write("delete catalog attachment")
-        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
-    state
-        .catalog_attachment_repo
-        .delete_current(txn.as_mut(), catalog_name)
-        .map_err(|e| format!("delete catalog attachment metadata failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit catalog attachment metadata failed: {e}"))?;
-    Ok(())
+/// The engine's only catalog authority.
+///
+/// A composition without it has no way to reach the durable attachment
+/// keyspace, so catalog statements fail closed rather than falling back to a
+/// process-local registry.
+pub(crate) fn require_catalog_application(
+    state: &StandaloneState,
+) -> Result<&Arc<dyn crate::catalog_application::CatalogApplicationPort>, String> {
+    state.catalog_application.as_ref().ok_or_else(|| {
+        "catalog statements require a configured frontend catalog application".to_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4177,6 +4120,7 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
         state.connector_control.as_ref(),
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let execution = capture_maintenance_execution(state)?;
     let (request, _, _) = prepare_query_with_sql_compiler_kernel(
@@ -4215,6 +4159,7 @@ pub(crate) fn execute_query_with_catalog_service_with_execution(
         state.connector_control.as_ref(),
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let (request, _, _) = prepare_query_with_sql_compiler_kernel(
         query,
@@ -4254,6 +4199,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
         state.connector_control.as_ref(),
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let maintenance_execution = capture_maintenance_execution(state)?;
     let (request, _, _) = prepare_query_with_sql_compiler_kernel(
@@ -4652,6 +4598,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         connector_context.clone(),
         Arc::clone(&table_bindings),
         query_local_overlays.to_vec(),
+        state.catalog_application.as_deref(),
     );
 
     let resolved_bindings = analyzer_provider.query_table_bindings();
@@ -4760,6 +4707,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         connector_context.clone(),
         Arc::clone(&table_bindings),
         Vec::new(),
+        state.catalog_application.as_deref(),
     );
     let resolved_bindings = analyzer_provider.query_table_bindings();
     if !Arc::ptr_eq(&table_bindings, &resolved_bindings) {
@@ -6163,6 +6111,10 @@ mod tests {
         StandaloneSession, StandaloneState, StatementResult, dispatch_statement,
         register_connector_backends,
     };
+    use crate::catalog_application::{
+        CatalogAdmission, CatalogApplicationError, CatalogApplicationPort, CatalogCreateCommand,
+        CatalogDropCommand, CatalogRuntimeObservation,
+    };
     use crate::engine::statistics::{
         CatalogTableStatistics, StatisticsEngine, StatisticsInsertObservation,
         StatisticsRequestContext, StatisticsService, StatisticsStatementResult,
@@ -6196,6 +6148,42 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct RecordingCatalogApplication {
+        creates: Mutex<Vec<CatalogCreateCommand>>,
+        drops: Mutex<Vec<CatalogDropCommand>>,
+    }
+
+    impl CatalogApplicationPort for RecordingCatalogApplication {
+        fn create_catalog(
+            &self,
+            command: CatalogCreateCommand,
+        ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+            let observation = CatalogRuntimeObservation {
+                attachment_id: Uuid::now_v7(),
+                instance_id: command.instance_id.clone(),
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("provider"),
+                generation: 1,
+            };
+            self.creates.lock().expect("creates").push(command);
+            Ok(observation)
+        }
+
+        fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError> {
+            self.drops.lock().expect("drops").push(command);
+            Ok(())
+        }
+
+        fn admit_catalog(
+            &self,
+            _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        ) -> CatalogAdmission {
+            CatalogAdmission::Absent
+        }
+    }
 
     #[derive(Default)]
     struct RecordingStatisticsApplicationPort {
@@ -6705,6 +6693,98 @@ mod tests {
     }
 
     #[test]
+    fn catalog_create_and_drop_route_through_the_injected_application_port() {
+        let application = Arc::new(RecordingCatalogApplication::default());
+        let state = Arc::new(StandaloneState {
+            catalog_application: Some(Arc::clone(&application) as Arc<dyn CatalogApplicationPort>),
+            ..Default::default()
+        });
+        let session = StandaloneSession {
+            inner: Arc::clone(&state),
+        };
+
+        session
+            .handle_create_catalog(crate::sql::parser::ast::CreateCatalogStmt {
+                name: "Warehouse".to_string(),
+                properties: vec![("type".to_string(), "iceberg".to_string())],
+                if_not_exists: true,
+            })
+            .expect("frontend catalog application accepts create");
+        super::execute_drop_catalog_statement(&state, "WAREHOUSE", true)
+            .expect("frontend catalog application accepts drop");
+
+        let creates = application.creates.lock().expect("creates");
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].instance_id.as_str(), "warehouse");
+        assert_eq!(creates[0].display_name, "Warehouse");
+        assert!(creates[0].if_not_exists);
+        drop(creates);
+        let drops = application.drops.lock().expect("drops");
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].instance_id.as_str(), "warehouse");
+        assert!(drops[0].if_exists);
+    }
+
+    #[test]
+    fn configured_catalog_application_fails_closed_for_session_catalog_admission() {
+        let application = Arc::new(RecordingCatalogApplication::default());
+        let engine = StandaloneNovaRocks {
+            inner: Arc::new(StandaloneState {
+                catalog_application: Some(
+                    Arc::clone(&application) as Arc<dyn CatalogApplicationPort>
+                ),
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(
+            engine
+                .require_external_catalog_ready("warehouse")
+                .expect_err("absent attachment must not enter session context")
+                .kind(),
+            crate::catalog_application::CatalogApplicationErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn catalog_statements_fail_closed_without_a_frontend_catalog_application() {
+        let state = Arc::new(StandaloneState::default());
+        let session = StandaloneSession {
+            inner: Arc::clone(&state),
+        };
+        let engine = StandaloneNovaRocks {
+            inner: Arc::clone(&state),
+        };
+
+        // No StateStore-backed authority means no attachment keyspace at all;
+        // the engine must never fall back to a process-local catalog registry.
+        let create_error = session
+            .handle_create_catalog(crate::sql::parser::ast::CreateCatalogStmt {
+                name: "warehouse".to_string(),
+                properties: vec![("type".to_string(), "iceberg".to_string())],
+                if_not_exists: false,
+            })
+            .expect_err("CREATE CATALOG must not run without a catalog application");
+        assert!(
+            create_error.contains("require a configured frontend catalog application"),
+            "unexpected create error: {create_error}"
+        );
+        let drop_error = super::execute_drop_catalog_statement(&state, "warehouse", true)
+            .expect_err("DROP CATALOG must not run without a catalog application");
+        assert!(
+            drop_error.contains("require a configured frontend catalog application"),
+            "unexpected drop error: {drop_error}"
+        );
+        assert_eq!(
+            engine
+                .require_external_catalog_ready("warehouse")
+                .expect_err("catalog admission must fail closed")
+                .kind(),
+            crate::catalog_application::CatalogApplicationErrorKind::Unavailable
+        );
+    }
+
+    #[test]
     fn compiler_prepares_once_and_frontend_can_submit_once() {
         let calls = Arc::new(AtomicUsize::new(0));
         let state = Arc::new(StandaloneState {
@@ -7123,32 +7203,78 @@ path = "{metadata_path}"
         assert_eq!(string_cell(&result, 0, 4), "0");
     }
 
+    /// Core must never publish a catalog name on its own. `CREATE CATALOG` only
+    /// hands the command to the frontend application; the SQL name appears when
+    /// that application publishes an exact local runtime generation, so a query
+    /// can never resolve a catalog whose control binding is not installed.
     #[test]
-    fn create_catalog_registers_catalog_service_entry() {
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
-            .expect("open");
-        let warehouse = TempDir::new().expect("warehouse");
-        let sql = format!(
-            r#"CREATE EXTERNAL CATALOG ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        engine.session().execute(&sql).expect("create catalog");
-        engine
-            .session()
-            .execute(&sql.replacen(
-                "CREATE EXTERNAL CATALOG",
-                "CREATE EXTERNAL CATALOG IF NOT EXISTS",
-                1,
-            ))
-            .expect("CREATE CATALOG IF NOT EXISTS must keep the active control binding");
+    fn create_catalog_publishes_no_catalog_name_until_a_runtime_is_projected() {
+        let application = Arc::new(RecordingCatalogApplication::default());
+        let projection = crate::catalog_application::CatalogRuntimeProjection::new();
+        let state = Arc::new(StandaloneState {
+            catalog_application: Some(Arc::clone(&application) as Arc<dyn CatalogApplicationPort>),
+            catalog_runtime_projection: Some(Arc::clone(&projection)),
+            ..Default::default()
+        });
+        projection
+            .bind_query_catalog(
+                Arc::clone(&state.catalog_service),
+                Arc::clone(&state.connector_control)
+                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+            )
+            .expect("bind query catalog");
+        let session = StandaloneSession {
+            inner: Arc::clone(&state),
+        };
 
-        let registry = engine
-            .inner
-            .catalog_service
-            .registry()
-            .read()
-            .expect("catalog service registry");
-        assert!(registry.get_catalog("ice").is_ok());
+        session
+            .handle_create_catalog(crate::sql::parser::ast::CreateCatalogStmt {
+                name: "ice".to_string(),
+                properties: vec![("type".to_string(), "iceberg".to_string())],
+                if_not_exists: false,
+            })
+            .expect("frontend catalog application accepts create");
+        assert!(
+            state
+                .catalog_service
+                .registry()
+                .read()
+                .expect("catalog service registry")
+                .get_catalog("ice")
+                .is_err(),
+            "Core must not register a catalog name by itself"
+        );
+
+        let observation = application
+            .creates
+            .lock()
+            .expect("creates")
+            .first()
+            .map(
+                |command| crate::catalog_application::CatalogRuntimeObservation {
+                    attachment_id: uuid::Uuid::now_v7(),
+                    instance_id: command.instance_id.clone(),
+                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                        .expect("provider ID"),
+                    generation: 1,
+                },
+            )
+            .expect("create was routed to the application");
+        crate::catalog_application::CatalogRuntimePublisherSink::publish_catalog_runtime(
+            projection.as_ref(),
+            observation,
+        )
+        .expect("publish the local runtime generation");
+        assert!(
+            state
+                .catalog_service
+                .registry()
+                .read()
+                .expect("catalog service registry")
+                .get_catalog("ice")
+                .is_ok(),
+            "publishing the local runtime must expose the SQL catalog name"
+        );
     }
 
     #[test]

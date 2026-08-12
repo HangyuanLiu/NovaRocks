@@ -603,6 +603,7 @@ fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
         QueryServiceErrorKind::Interrupted => ErrorKind::ER_QUERY_INTERRUPTED,
         QueryServiceErrorKind::Timeout => ErrorKind::ER_UNKNOWN_ERROR,
         QueryServiceErrorKind::InvalidValue => ErrorKind::ER_WRONG_VALUE,
+        QueryServiceErrorKind::Unavailable => ErrorKind::ER_UNKNOWN_ERROR,
         QueryServiceErrorKind::Internal => ErrorKind::ER_UNKNOWN_ERROR,
     }
 }
@@ -617,6 +618,10 @@ fn query_service_error_mapping_keeps_wire_concerns_in_core() {
     assert_eq!(
         map_query_service_error(QueryServiceErrorKind::Interrupted),
         ErrorKind::ER_QUERY_INTERRUPTED
+    );
+    assert_eq!(
+        map_query_service_error(QueryServiceErrorKind::Unavailable),
+        ErrorKind::ER_UNKNOWN_ERROR
     );
 }
 
@@ -948,11 +953,7 @@ mod legacy {
                     self.current_db = context.database;
                     writer.ok().await
                 }
-                Err(err) => {
-                    writer
-                        .error(ErrorKind::ER_BAD_DB_ERROR, err.as_bytes())
-                        .await
-                }
+                Err(err) => writer.error(err.kind, err.message.as_bytes()).await,
             }
         }
 
@@ -1541,25 +1542,62 @@ mod legacy {
         database: String,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CatalogContextResolutionError {
+        kind: ErrorKind,
+        message: String,
+    }
+
+    impl CatalogContextResolutionError {
+        fn bad_database(message: impl Into<String>) -> Self {
+            Self {
+                kind: ErrorKind::ER_BAD_DB_ERROR,
+                message: message.into(),
+            }
+        }
+
+        fn unavailable(message: impl Into<String>) -> Self {
+            Self {
+                kind: ErrorKind::ER_UNKNOWN_ERROR,
+                message: message.into(),
+            }
+        }
+
+        fn internal(message: impl Into<String>) -> Self {
+            Self {
+                kind: ErrorKind::ER_UNKNOWN_ERROR,
+                message: message.into(),
+            }
+        }
+    }
+
     async fn resolve_catalog_name_in_worker(
         engine: StandaloneNovaRocks,
         catalog_name: String,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, CatalogContextResolutionError> {
         task::spawn_blocking(move || resolve_catalog_name(&engine, &catalog_name))
             .await
-            .map_err(|err| format!("standalone catalog resolver worker failed: {err}"))?
+            .map_err(|err| {
+                CatalogContextResolutionError::internal(format!(
+                    "standalone catalog resolver worker failed: {err}"
+                ))
+            })?
     }
 
     async fn resolve_database_context_in_worker(
         engine: StandaloneNovaRocks,
         current_catalog: Option<String>,
         schema: String,
-    ) -> Result<SessionDatabaseContext, String> {
+    ) -> Result<SessionDatabaseContext, CatalogContextResolutionError> {
         task::spawn_blocking(move || {
             resolve_database_context(&engine, current_catalog.as_deref(), &schema)
         })
         .await
-        .map_err(|err| format!("standalone database resolver worker failed: {err}"))?
+        .map_err(|err| {
+            CatalogContextResolutionError::internal(format!(
+                "standalone database resolver worker failed: {err}"
+            ))
+        })?
     }
 
     async fn execute_statement_text(
@@ -1598,7 +1636,7 @@ mod legacy {
             let catalog =
                 resolve_catalog_name_in_worker(shim.engine.clone(), catalog_name.to_string())
                     .await
-                    .map_err(|err| (ErrorKind::ER_BAD_DB_ERROR, err))?;
+                    .map_err(|err| (err.kind, err.message))?;
             shim.current_catalog = catalog;
             if shim.current_catalog.is_none()
                 && !shim
@@ -1745,7 +1783,7 @@ mod legacy {
                 schema.to_string(),
             )
             .await
-            .map_err(|err| (ErrorKind::ER_BAD_DB_ERROR, err))?;
+            .map_err(|err| (err.kind, err.message))?;
             shim.current_catalog = context.catalog;
             shim.current_db = context.database;
             return Ok(StatementResult::Ok);
@@ -1927,74 +1965,107 @@ mod legacy {
     fn resolve_catalog_name(
         engine: &StandaloneNovaRocks,
         catalog_name: &str,
-    ) -> Result<Option<String>, String> {
-        let normalized = normalize_identifier(catalog_name)?;
+    ) -> Result<Option<String>, CatalogContextResolutionError> {
+        let normalized = normalize_identifier(catalog_name)
+            .map_err(CatalogContextResolutionError::bad_database)?;
         if normalized == DEFAULT_CATALOG {
             return Ok(None);
         }
-        if engine.iceberg_catalog_exists(&normalized)? {
-            Ok(Some(normalized))
-        } else {
-            Err(format!("unknown catalog `{catalog_name}`"))
-        }
+        engine
+            .require_external_catalog_ready(&normalized)
+            .map_err(|error| {
+                if error.kind()
+                    == crate::catalog_application::CatalogApplicationErrorKind::Unavailable
+                {
+                    CatalogContextResolutionError::unavailable(error.to_string())
+                } else {
+                    CatalogContextResolutionError::bad_database(error.to_string())
+                }
+            })?;
+        Ok(Some(normalized))
     }
 
     fn resolve_database_context(
         engine: &StandaloneNovaRocks,
         current_catalog: Option<&str>,
         schema: &str,
-    ) -> Result<SessionDatabaseContext, String> {
-        let parts = parse_object_name(schema)?;
+    ) -> Result<SessionDatabaseContext, CatalogContextResolutionError> {
+        let parts =
+            parse_object_name(schema).map_err(CatalogContextResolutionError::bad_database)?;
         match parts.as_slice() {
             [database] => {
-                let database = normalize_identifier(database)?;
-                if let Some(catalog) = normalize_current_catalog(current_catalog)? {
-                    if engine.iceberg_namespace_exists(&catalog, &database)? {
+                let database = normalize_identifier(database)
+                    .map_err(CatalogContextResolutionError::bad_database)?;
+                if let Some(catalog) = normalize_current_catalog(current_catalog)
+                    .map_err(CatalogContextResolutionError::bad_database)?
+                {
+                    if engine
+                        .iceberg_namespace_exists(&catalog, &database)
+                        .map_err(CatalogContextResolutionError::bad_database)?
+                    {
                         Ok(SessionDatabaseContext {
                             catalog: Some(catalog),
                             database,
                         })
                     } else {
-                        Err(format!("unknown database `{schema}`"))
+                        Err(CatalogContextResolutionError::bad_database(format!(
+                            "unknown database `{schema}`"
+                        )))
                     }
-                } else if engine.database_exists(&database)? {
+                } else if engine
+                    .database_exists(&database)
+                    .map_err(CatalogContextResolutionError::bad_database)?
+                {
                     Ok(SessionDatabaseContext {
                         catalog: None,
                         database,
                     })
                 } else {
-                    Err(format!("unknown database `{schema}`"))
+                    Err(CatalogContextResolutionError::bad_database(format!(
+                        "unknown database `{schema}`"
+                    )))
                 }
             }
             [catalog_name, database_name] => {
                 let catalog = resolve_catalog_name(engine, catalog_name)?;
-                let database = normalize_identifier(database_name)?;
+                let database = normalize_identifier(database_name)
+                    .map_err(CatalogContextResolutionError::bad_database)?;
                 match catalog {
                     Some(catalog) => {
-                        if engine.iceberg_namespace_exists(&catalog, &database)? {
+                        if engine
+                            .iceberg_namespace_exists(&catalog, &database)
+                            .map_err(CatalogContextResolutionError::bad_database)?
+                        {
                             Ok(SessionDatabaseContext {
                                 catalog: Some(catalog),
                                 database,
                             })
                         } else {
-                            Err(format!("unknown database `{schema}`"))
+                            Err(CatalogContextResolutionError::bad_database(format!(
+                                "unknown database `{schema}`"
+                            )))
                         }
                     }
                     None => {
-                        if engine.database_exists(&database)? {
+                        if engine
+                            .database_exists(&database)
+                            .map_err(CatalogContextResolutionError::bad_database)?
+                        {
                             Ok(SessionDatabaseContext {
                                 catalog: None,
                                 database,
                             })
                         } else {
-                            Err(format!("unknown database `{schema}`"))
+                            Err(CatalogContextResolutionError::bad_database(format!(
+                                "unknown database `{schema}`"
+                            )))
                         }
                     }
                 }
             }
-            _ => Err(format!(
+            _ => Err(CatalogContextResolutionError::bad_database(format!(
                 "unknown database `{schema}`; expected `<database>` or `<catalog>.<database>`"
-            )),
+            ))),
         }
     }
 
@@ -3127,6 +3198,18 @@ mod legacy {
                     .expect_err("connection id must fit u32")
                     .0,
                 ErrorKind::ER_WRONG_VALUE
+            );
+        }
+
+        #[test]
+        fn catalog_context_preserves_unavailable_wire_mapping() {
+            assert_eq!(
+                CatalogContextResolutionError::bad_database("absent attachment").kind,
+                ErrorKind::ER_BAD_DB_ERROR
+            );
+            assert_eq!(
+                CatalogContextResolutionError::unavailable("projection is stale").kind,
+                ErrorKind::ER_UNKNOWN_ERROR
             );
         }
     }

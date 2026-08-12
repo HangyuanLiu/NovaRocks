@@ -36,8 +36,7 @@ pub(crate) fn parse_create_catalog_statement(
     }
     parser.next_token(); // consume CATALOG
 
-    // Skip optional IF NOT EXISTS
-    let _ = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
 
     let name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
 
@@ -58,7 +57,11 @@ pub(crate) fn parse_create_catalog_statement(
         vec![]
     };
 
-    Ok(CreateCatalogStmt { name, properties })
+    Ok(CreateCatalogStmt {
+        name,
+        properties,
+        if_not_exists,
+    })
 }
 
 fn parse_properties(parser: &mut Parser<'_>) -> Result<Vec<(String, String)>, String> {
@@ -92,5 +95,24 @@ fn parse_string_value(parser: &mut Parser<'_>) -> Result<String, String> {
         Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => Ok(s),
         Token::Word(w) => Ok(w.value),
         other => Err(format!("expected string or identifier, got {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::parser::dialect::StarRocksDialect;
+
+    #[test]
+    fn retains_if_not_exists_for_catalog_application_admission() {
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(
+                "CREATE EXTERNAL CATALOG IF NOT EXISTS warehouse PROPERTIES ('type'='iceberg')",
+            )
+            .expect("parser");
+        let statement = parse_create_catalog_statement(&mut parser).expect("catalog statement");
+        assert_eq!(statement.name, "warehouse");
+        assert!(statement.if_not_exists);
     }
 }

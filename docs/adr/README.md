@@ -157,6 +157,17 @@ seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来�
 
 - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（active）
 
+### catalog-attachment
+
+领域哲学：「集群挂了哪些外部 catalog」是 StateStore 里的单一权威事实，frontend 是它唯一的 owner；每个 FE
+把同一份 durable 记录派生成自己的只读运行时投影，查询热路径只读内存、绝不逐次访问共享存储。change hint 只是
+唤醒信号，拿到提示后一律重读权威记录，丢通知与 retention gap 都退化为有界全量重建。DDL 以 durable commit /
+exact-version delete 为线性化点，发布本地 control generation 才让 SQL catalog 名可解析、撤销发布先于退役
+generation；`Absent`（未知）与 `Unavailable`（本机未物化）永远分开，store 不可用时 DDL 与超预算的 read
+admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。
+
+- ADR-0064 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
+
 ### frontend-dml
 
 领域哲学：frontend 拥有 DML 的 statement application flow、durable operation lifecycle 与 production routing；

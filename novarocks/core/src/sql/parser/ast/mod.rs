@@ -26,6 +26,7 @@ use novarocks_catalog::schema::SqlType;
 pub(crate) struct CreateCatalogStmt {
     pub name: String,
     pub properties: Vec<(String, String)>,
+    pub if_not_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

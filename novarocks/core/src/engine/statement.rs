@@ -23,10 +23,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::{
-    StandaloneState, StatementResult, delete_catalog_attachment_if_needed,
-    retire_iceberg_control_binding,
-};
+use crate::engine::{StandaloneState, StatementResult};
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use bytes::Bytes;
@@ -941,44 +938,19 @@ pub(crate) fn execute_drop_catalog_statement(
     catalog_name: &str,
     if_exists: bool,
 ) -> Result<StatementResult, String> {
-    let _lifecycle = state
-        .catalog_attachment_lifecycle
-        .lock()
-        .map_err(|error| format!("catalog attachment lifecycle lock: {error}"))?;
     let normalized_catalog = normalize_identifier(catalog_name)?;
+    let application = crate::engine::require_catalog_application(state)?;
     let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
-        .map_err(|error| format!("invalid connector instance ID: {error}"))?;
-    match state
-        .connector_control
-        .observe_current_binding(&instance_id)
-    {
-        Ok(_) => {}
-        Err(error)
-            if if_exists
-                && error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
-        {
-            return Ok(StatementResult::Ok);
-        }
-        Err(error) => return Err(format!("resolve catalog `{normalized_catalog}`: {error}")),
-    }
-    // The catalog name passed in by the user may carry quoting/case the
-    // dependency graph normalizes away; the MV drop-scope guards already do
-    // case-insensitive matching, so pass the user-typed value straight through.
-    crate::engine::mv::dependency::ensure_no_iceberg_mv_targets_in_scope(
-        state,
-        catalog_name,
-        None,
-    )?;
-    crate::engine::mv::dependency::ensure_no_external_iceberg_dependents(
-        state,
-        catalog_name,
-        None,
-    )?;
-    retire_iceberg_control_binding(state, &normalized_catalog)?;
-    delete_catalog_attachment_if_needed(state, &normalized_catalog)?;
-    state
-        .catalog_service
-        .unregister_catalog(&normalized_catalog);
+        .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+    // The Frontend application owns the exact-version delete and the MV
+    // dependency scan that fences it, both inside one serializable StateStore
+    // transaction. Core must not pre-check dependencies outside that fence.
+    application
+        .drop_catalog(crate::catalog_application::CatalogDropCommand {
+            instance_id,
+            if_exists,
+        })
+        .map_err(|error| error.to_string())?;
     Ok(StatementResult::Ok)
 }
 

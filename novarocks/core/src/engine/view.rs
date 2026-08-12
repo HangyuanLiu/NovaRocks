@@ -419,6 +419,7 @@ impl ViewEngine for StandaloneState {
             self.connector_control.as_ref(),
             context.clone(),
             crate::sql::catalog::TableLookupMode::SchemaOnly,
+            self.catalog_application.as_deref(),
         );
         let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, database)
             .map_err(|error| format!("analyze view definition failed: {error}"))?;

@@ -303,6 +303,7 @@ fn plan_query_for_ctas_source(
         state.connector_control.as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
     let statistics =

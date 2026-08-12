@@ -67,7 +67,7 @@ fn reject_default_catalog_reference(
 }
 
 pub(crate) fn resolve_table_target(
-    _state: &Arc<StandaloneState>,
+    state: &Arc<StandaloneState>,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -79,6 +79,7 @@ pub(crate) fn resolve_table_target(
 
     let resolved =
         resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
+    require_catalog_admission(state, &resolved.catalog)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -88,7 +89,7 @@ pub(crate) fn resolve_table_target(
 }
 
 pub(crate) fn resolve_existing_table_target(
-    _state: &Arc<StandaloneState>,
+    state: &Arc<StandaloneState>,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -100,6 +101,7 @@ pub(crate) fn resolve_existing_table_target(
 
     let resolved =
         resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
+    require_catalog_admission(state, &resolved.catalog)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -109,7 +111,7 @@ pub(crate) fn resolve_existing_table_target(
 }
 
 pub(crate) fn resolve_namespace_target(
-    _state: &Arc<StandaloneState>,
+    state: &Arc<StandaloneState>,
     name: &ObjectName,
     current_catalog: Option<&str>,
 ) -> Result<TargetBackend, String> {
@@ -119,10 +121,87 @@ pub(crate) fn resolve_namespace_target(
     }
 
     let resolved = resolve_catalog_namespace_name(name.parts.as_slice(), current_catalog)?;
+    require_catalog_admission(state, &resolved.catalog)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
         namespace: resolved.namespace,
         table: String::new(),
     })
+}
+
+fn require_catalog_admission(state: &StandaloneState, catalog: &str) -> Result<(), String> {
+    let Some(application) = &state.catalog_application else {
+        return Ok(());
+    };
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
+        .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+    application
+        .admit_catalog(&instance_id)
+        .require_ready()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog_application::{
+        CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,
+        CatalogApplicationPort, CatalogCreateCommand, CatalogDropCommand,
+        CatalogRuntimeObservation,
+    };
+
+    struct AbsentCatalogApplication;
+
+    impl CatalogApplicationPort for AbsentCatalogApplication {
+        fn create_catalog(
+            &self,
+            _command: CatalogCreateCommand,
+        ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+            Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "not used by backend resolver test",
+            ))
+        }
+
+        fn drop_catalog(
+            &self,
+            _command: CatalogDropCommand,
+        ) -> Result<(), CatalogApplicationError> {
+            Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "not used by backend resolver test",
+            ))
+        }
+
+        fn admit_catalog(
+            &self,
+            _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        ) -> CatalogAdmission {
+            CatalogAdmission::Absent
+        }
+    }
+
+    #[test]
+    fn external_table_target_requires_catalog_admission_when_port_is_configured() {
+        let state = Arc::new(StandaloneState {
+            catalog_application: Some(Arc::new(AbsentCatalogApplication)),
+            ..Default::default()
+        });
+        let error = resolve_existing_table_target(
+            &state,
+            &ObjectName {
+                parts: vec![
+                    "warehouse".to_string(),
+                    "sales".to_string(),
+                    "orders".to_string(),
+                ],
+            },
+            None,
+            "default_db",
+        )
+        .expect_err("absent attachment must block an external table target");
+        assert!(error.contains("was not found"));
+    }
 }

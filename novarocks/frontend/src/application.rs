@@ -27,6 +27,9 @@ use novarocks_state_store::{
     StateStoreHost, StateStoreHostConfig, builtin_state_store_provider_registry,
 };
 
+use crate::catalog_application::FrontendCatalogApplicationPort;
+use crate::catalog_attachment::CatalogAttachmentRepository;
+use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::connector::ConnectorControlHost;
 use crate::coordination::FrontendCoordinationRuntime;
 use crate::coordinator::{BackendQueryActivity, FrontendDistributedQueryCoordinator};
@@ -61,6 +64,8 @@ pub enum FrontendApplicationErrorKind {
     TableMaintenanceServiceOpen,
     MvServiceOpen,
     StatisticsApplicationServiceOpen,
+    CatalogApplicationServiceOpen,
+    CatalogControllerOpen,
     ConnectorControlHost,
     ClusterBackendOpen,
     CoordinatorOpen,
@@ -107,11 +112,14 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
+    catalog_runtime_projection: Arc<novarocks::catalog_application::CatalogRuntimeProjection>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
     dml_recovery_controller: Option<DmlRecoveryController>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
+    catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
+    catalog_controller: Option<Arc<FrontendCatalogController>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     table_maintenance_service:
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
@@ -182,6 +190,7 @@ pub struct FrontendExecutionConfig {
     /// Query-control timeouts frozen from `[runtime]` and handed to the
     /// coordinator, which validates them once at startup instead of per query.
     query_control_timeouts: FrontendQueryControlTimeouts,
+    catalog_projection: CatalogProjectionConfig,
 }
 
 impl FrontendExecutionConfig {
@@ -198,6 +207,7 @@ impl FrontendExecutionConfig {
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
+            catalog_projection: CatalogProjectionConfig::default(),
         }
     }
 
@@ -227,6 +237,14 @@ impl FrontendExecutionConfig {
         self.mv_maintenance = config;
         self
     }
+
+    pub(crate) fn with_catalog_projection_config(
+        mut self,
+        config: CatalogProjectionConfig,
+    ) -> Self {
+        self.catalog_projection = config;
+        self
+    }
 }
 
 impl FrontendApplicationHost {
@@ -244,6 +262,8 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
     ) -> Result<Self, FrontendApplicationError> {
+        let catalog_runtime_projection =
+            novarocks::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
             connector_control: Arc::new(
                 ConnectorControlHost::with_factories(connector_factories).map_err(|error| {
@@ -253,11 +273,14 @@ impl FrontendApplicationHost {
                     )
                 })?,
             ),
+            catalog_runtime_projection,
             statistics_service: None,
             dml_service: None,
             dml_recovery_controller: None,
             statistics_application_service: None,
             statistics_application_port: None,
+            catalog_application_port: None,
+            catalog_controller: None,
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
@@ -292,6 +315,67 @@ impl FrontendApplicationHost {
                         .await);
                 }
             }
+        }
+        host.catalog_application_port = match host.state_store() {
+            Some(store) => match CatalogAttachmentRepository::open(store).await {
+                Ok(repository) => Some(Arc::new(FrontendCatalogApplicationPort::new(
+                    repository,
+                    Arc::clone(&host.connector_control),
+                    host.catalog_runtime_projection.publisher(),
+                    tokio::runtime::Handle::current(),
+                ))),
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                            error,
+                        ))
+                        .await);
+                }
+            },
+            None => Some(Arc::new(FrontendCatalogApplicationPort::unavailable(
+                Arc::clone(&host.connector_control),
+                host.catalog_runtime_projection.publisher(),
+                tokio::runtime::Handle::current(),
+            ))),
+        };
+        if let Some(store) = host.state_store() {
+            let controller = match FrontendCatalogController::new(
+                store,
+                Arc::clone(
+                    host.catalog_application_port
+                        .as_ref()
+                        .expect("catalog application port is installed"),
+                ),
+                execution.catalog_projection.clone(),
+            ) {
+                Ok(controller) => controller,
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CatalogControllerOpen,
+                            error,
+                        ))
+                        .await);
+                }
+            };
+            if let Err(error) = controller.bootstrap().await {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CatalogControllerOpen,
+                        error,
+                    ))
+                    .await);
+            }
+            if let Err(error) = controller.start() {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CatalogControllerOpen,
+                        error,
+                    ))
+                    .await);
+            }
+            host.catalog_controller = Some(controller);
         }
         match ClusterBackendService::open(
             backend,
@@ -378,7 +462,20 @@ impl FrontendApplicationHost {
         }
         match host.state_store() {
             Some(store) => {
-                match StateStoreMvRepository::open(store, tokio::runtime::Handle::current()).await {
+                // The MV repository must observe the exact attachment version an
+                // admitted catalog was resolved from, so a durable MV definition
+                // can never outlive the attachment it references.
+                let attachment_observations = host.catalog_application_port.as_ref().map(|port| {
+                    Arc::clone(port)
+                        as Arc<dyn crate::mv::repository::CatalogAttachmentObservationSource>
+                });
+                match StateStoreMvRepository::open_with_catalog_attachment_observations(
+                    store,
+                    tokio::runtime::Handle::current(),
+                    attachment_observations,
+                )
+                .await
+                {
                     Ok(repository) => {
                         let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
                             repository;
@@ -509,6 +606,30 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .expect("statistics application port is installed before host open returns"),
         )
+    }
+
+    pub fn catalog_application_port(
+        &self,
+    ) -> Arc<dyn novarocks::catalog_application::CatalogApplicationPort> {
+        let application = Arc::clone(
+            self.catalog_application_port
+                .as_ref()
+                .expect("catalog application port is installed before host open returns"),
+        )
+            as Arc<dyn novarocks::catalog_application::CatalogApplicationPort>;
+        self.catalog_runtime_projection
+            .bind_application(application)
+    }
+
+    /// The publication set Core binds its query catalog registry to.
+    ///
+    /// It is handed out alongside `catalog_application_port` so a durable
+    /// attachment only becomes a resolvable SQL name after this process
+    /// published its exact local runtime generation.
+    pub fn catalog_runtime_projection(
+        &self,
+    ) -> Arc<novarocks::catalog_application::CatalogRuntimeProjection> {
+        Arc::clone(&self.catalog_runtime_projection)
     }
 
     pub fn table_maintenance_service(
@@ -826,6 +947,11 @@ impl FrontendApplicationHost {
         // its deployment lock.
         self.statistics_application_port.take();
         self.statistics_application_service.take();
+        let catalog_controller_error = match self.catalog_controller.take() {
+            Some(controller) => controller.shutdown().await.err(),
+            None => None,
+        };
+        self.catalog_application_port.take();
         self.view_service.take();
         self.mv_application_service.take();
         self.mv_service.take();
@@ -833,6 +959,14 @@ impl FrontendApplicationHost {
         self.mv_background_engine_sink.take();
         self.mv_repository.take();
         self.coordination.take();
+        if let Some(catalog_controller_error) = catalog_controller_error {
+            let error = format!("shutdown catalog controller failed: {catalog_controller_error}");
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {error}"));
+            } else {
+                primary_error = Some(error);
+            }
+        }
         if let Some(host) = self.state_store_host.as_mut() {
             if let Err(error) = host
                 .shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
@@ -874,7 +1008,10 @@ mod tests {
         StateStoreProviderRegistration, StateStoreProviderRegistry,
     };
 
-    use super::{FrontendApplicationError, FrontendApplicationErrorKind};
+    use super::{
+        FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+        FrontendExecutionConfig,
+    };
 
     const SECRET_CONFIG_VALUE: &str = "client-secret-must-not-leak";
     const DESCRIPTOR: StateStoreProviderDescriptor =
@@ -955,5 +1092,53 @@ mod tests {
         assert!(diagnostic.contains("injected provider primary failure"));
         assert!(diagnostic.contains("injected provider cleanup failure"));
         assert!(!diagnostic.contains(SECRET_CONFIG_VALUE));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_bootstraps_and_stops_catalog_projection_with_state_store() {
+        let temp = tempfile::tempdir().expect("temporary catalog controller directory");
+        let state_store = StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: StateStoreConfig {
+                    cluster_id: "catalog-controller-host-test".to_string(),
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: temp.path().join("state-store.sqlite"),
+                        deployment_owner: "catalog-controller-host-test".to_string(),
+                    },
+                },
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        };
+        let backend = crate::topology::ClusterBackendOpenConfig::new(
+            novarocks::common::app_config::ClusterRole::AllInOne,
+            Vec::new(),
+            Duration::from_secs(1),
+            1,
+            Duration::from_secs(1),
+        )
+        .expect("valid all-in-one backend config");
+        let host = FrontendApplicationHost::open(
+            Some(state_store),
+            FrontendExecutionConfig::new(
+                "127.0.0.1",
+                0,
+                NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+            ),
+            backend,
+        )
+        .await
+        .expect("host opens with the catalog controller");
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance id");
+        assert!(matches!(
+            novarocks::catalog_application::CatalogApplicationPort::admit_catalog(
+                host.catalog_application_port().as_ref(),
+                &instance_id,
+            ),
+            novarocks::catalog_application::CatalogAdmission::Absent
+        ));
+        host.shutdown().await.expect("host shutdown");
     }
 }

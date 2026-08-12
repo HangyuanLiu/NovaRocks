@@ -16,6 +16,9 @@
 // under the License.
 
 pub mod application;
+pub mod catalog_application;
+pub mod catalog_attachment;
+pub mod catalog_controller;
 pub mod connector;
 mod coordination;
 pub mod coordinator;

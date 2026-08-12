@@ -1413,6 +1413,7 @@ fn build_update_mor_change_stream_write_plan(
         state.connector_control.as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
     // This admission uses the exact lease and table facts selected above.  It
@@ -3295,6 +3296,7 @@ fn execute_exact_cow_match_query(
             connector_context.clone(),
             Arc::clone(&table_bindings),
             vec![overlay],
+            state.catalog_application.as_deref(),
         );
     let statistics =
         crate::engine::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
@@ -4495,6 +4497,7 @@ fn build_merge_mor_change_stream_write_plan(
         state.connector_control.as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
+        state.catalog_application.as_deref(),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
     let effect_set = DmlRowMutationEffectSet::Merge {

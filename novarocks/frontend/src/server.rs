@@ -74,6 +74,10 @@ fn standalone_open_services(
         host.connector_control_factory_resolver(),
         0,
     )
+    .with_catalog_application(
+        host.catalog_application_port(),
+        host.catalog_runtime_projection(),
+    )
     .with_statistics_application(host.statistics_application_port())
     .with_statistics_target_resolver_sink(host.statistics_application_port())
     .with_statistics_table_reader_sink(host.statistics_application_port())
@@ -632,6 +636,161 @@ mod tests {
             ),
             state_store_host_config: None,
         }
+    }
+
+    /// Answers whichever catalog instance the factory request carries, so the
+    /// cutover test exercises the real create path without an object store.
+    struct EchoingControlFactory;
+
+    impl novarocks_spi::connector::ConnectorControlFactory for EchoingControlFactory {
+        fn provider_id(&self) -> &novarocks_spi::connector::ConnectorProviderId {
+            static PROVIDER: std::sync::OnceLock<novarocks_spi::connector::ConnectorProviderId> =
+                std::sync::OnceLock::new();
+            PROVIDER.get_or_init(|| {
+                novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("provider ID")
+            })
+        }
+
+        fn create_control(
+            &self,
+            request: novarocks_spi::connector::ConnectorControlFactoryRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorControlCreation,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            let binding = crate::connector::control_host::tests::test_control_binding_for(
+                request.instance_id().clone(),
+                1,
+            );
+            novarocks_spi::connector::ConnectorControlCreation::try_new(
+                &request,
+                binding,
+                Vec::new(),
+            )
+        }
+    }
+
+    /// CP-2 cutover gate: the StateStore attachment is the only catalog
+    /// authority the production composition installs, and Core reaches it only
+    /// through the frontend application port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
+        let temp = tempfile::tempdir().expect("temporary cutover directory");
+        let mut config = novarocks::common::app_config::NovaRocksConfig::default();
+        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
+        let state_store = StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: StateStoreConfig {
+                    cluster_id: "cp2-cutover".to_string(),
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: temp.path().join("state-store.sqlite"),
+                        deployment_owner: "cp2-cutover".to_string(),
+                    },
+                },
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        };
+        let host = FrontendApplicationHost::open_with_factories(
+            Some(state_store),
+            FrontendExecutionConfig::new(
+                "127.0.0.1",
+                0,
+                std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+            ),
+            super::cluster_backend_open_config(&config).expect("valid all-in-one backend config"),
+            vec![Arc::new(EchoingControlFactory)],
+        )
+        .await
+        .expect("open frontend application host");
+        let store = host.state_store().expect("frontend StateStore");
+        let attachments =
+            crate::catalog_attachment::CatalogAttachmentRepository::open(Arc::clone(&store))
+                .await
+                .expect("open catalog attachment repository");
+
+        let services = standalone_open_services(
+            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            &host,
+            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+        );
+        assert!(
+            services.catalog_application.is_some(),
+            "production composition must install the frontend catalog application"
+        );
+        assert!(
+            services.catalog_runtime_projection.is_some(),
+            "production composition must install the catalog runtime projection"
+        );
+        let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
+            novarocks::engine::StandaloneOptions::default(),
+            config,
+            services,
+        )
+        .expect("open engine with the frontend catalog authority");
+
+        let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
+        let context = novarocks::query_execution::request_context::RequestContext::admit(
+            novarocks::query_execution::request_context::RequestAdmission::new(
+                None,
+                "db1".to_string(),
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks::query_execution::backend::BackendTopologySnapshot::empty(1),
+                None,
+                cancellation.view(),
+                novarocks::query_execution::request_context::SessionOptimizerSettings::default(),
+            ),
+        );
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
+
+        engine
+            .command_executor()
+            .execute(
+                r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#,
+                &context,
+                None,
+            )
+            .expect("CREATE CATALOG commits a durable StateStore attachment");
+        let created = attachments
+            .get(&instance_id)
+            .await
+            .expect("read attachment")
+            .expect("CREATE CATALOG must commit to the StateStore attachment keyspace");
+        assert_eq!(created.attachment.provider_id.as_str(), "iceberg");
+        assert_eq!(created.attachment.display_name, "warehouse");
+        engine
+            .require_external_catalog_ready("warehouse")
+            .expect("the committed attachment is admitted by this frontend");
+
+        engine
+            .command_executor()
+            .execute("DROP CATALOG warehouse", &context, None)
+            .expect("DROP CATALOG deletes the durable StateStore attachment");
+        assert!(
+            attachments
+                .get(&instance_id)
+                .await
+                .expect("read attachment")
+                .is_none(),
+            "DROP CATALOG must remove the durable attachment"
+        );
+        assert_eq!(
+            engine
+                .require_external_catalog_ready("warehouse")
+                .expect_err("a dropped catalog stops being admitted")
+                .kind(),
+            novarocks::catalog_application::CatalogApplicationErrorKind::NotFound
+        );
+
+        // The engine and this test's probe both hold StateStore references; the
+        // host owns closing the deployment lock, so release them first.
+        drop(attachments);
+        drop(store);
+        drop(engine);
+        host.shutdown().await.expect("host shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
