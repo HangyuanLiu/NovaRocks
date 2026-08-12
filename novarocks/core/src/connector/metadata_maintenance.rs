@@ -25,15 +25,15 @@ use std::fmt;
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceLease,
-    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
-    ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
-    ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity,
-    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenanceExecuteRequest,
+    ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceOperation,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanningRequest,
+    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReconcileRequest,
+    ConnectorMetadataMaintenanceResolver, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTablePlanningFacts, ConnectorTableRequest,
+    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use crate::common::engine_error::EngineError;
@@ -281,6 +281,44 @@ fn resolved_error_message(value: ResolvedMetadataMaintenance) -> String {
             "metadata maintenance planning unexpectedly committed".to_string()
         }
     }
+}
+
+/// Read one provider-owned maintenance observation on a current lease.
+///
+/// This deliberately does not reuse [`MetadataMaintenanceSession`]: an
+/// observation has no operation id, no plan, no receipt and no cache
+/// finalization, so it must not travel the durable operation path. The lease is
+/// held only long enough to resolve the table handle and ask the provider.
+///
+/// The call is expensive by contract — the provider enumerates live table
+/// state to answer it — so it belongs to background maintenance policy only,
+/// never to SQL planning.
+pub fn read_max_compactable_data_files(
+    resolver: &dyn ConnectorMetadataMaintenanceResolver,
+    instance_id: &ConnectorInstanceId,
+    table: ConnectorTableIdentity,
+    context: ConnectorRequestContext,
+) -> Result<Option<u64>, ConnectorError> {
+    if &table.instance_id != instance_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector maintenance observation table does not belong to requested instance",
+        ));
+    }
+    let lease = resolver.acquire_current_metadata_maintenance(instance_id)?;
+    let metadata = lease.metadata().load_table(ConnectorTableRequest {
+        table: table.clone(),
+        resolution: ConnectorTableResolution::StrictBaseTable,
+        context: context.clone(),
+    })?;
+    if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector metadata returned a table handle for a different exact owner",
+        ));
+    }
+    let request = ConnectorMaxCompactableDataFilesRequest::try_new(metadata.table, context)?;
+    Ok(lease.read_max_compactable_data_files(request)?.value())
 }
 
 /// Plan and execute one operation using a newly acquired current lease.
@@ -585,8 +623,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-        ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
+        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMaxCompactableDataFiles,
+        ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
         ConnectorMetadataMaintenanceReceiptSummary, ConnectorNamespaceRequest, ConnectorProviderId,
         ConnectorTableMetadata,
     };
@@ -926,6 +964,163 @@ mod tests {
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A provider that only answers the read-only observation. Everything a
+    /// mutation would need stays unreachable, which is exactly the point: the
+    /// observation must not travel the operation path.
+    struct ObservingProvider {
+        inner: Arc<FakeProvider>,
+        observation: Option<u64>,
+    }
+
+    impl ConnectorMetadata for ObservingProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            self.inner.instance_id()
+        }
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
+        }
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
+        }
+        fn list_tables(
+            &self,
+            _: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            unreachable!()
+        }
+        fn load_table(
+            &self,
+            request: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            assert_eq!(
+                request.resolution,
+                ConnectorTableResolution::StrictBaseTable
+            );
+            self.inner.load_table(request)
+        }
+    }
+
+    impl ConnectorMetadataMaintenance for ObservingProvider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.inner.descriptor
+        }
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.inner.key
+        }
+        fn plan_maintenance(
+            &self,
+            _: ConnectorMetadataMaintenancePlanningRequest,
+        ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
+            unreachable!("observation must not plan")
+        }
+        fn execute(
+            &self,
+            _: ConnectorMetadataMaintenanceExecuteRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
+        {
+            unreachable!("observation must not execute")
+        }
+        fn reconcile(
+            &self,
+            _: ConnectorMetadataMaintenanceReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
+        {
+            unreachable!("observation must not reconcile")
+        }
+        fn read_max_compactable_data_files(
+            &self,
+            request: novarocks_spi::connector::ConnectorMaxCompactableDataFilesRequest,
+        ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
+            assert_eq!(request.table.owner(), &self.inner.descriptor.instance_id);
+            Ok(ConnectorMaxCompactableDataFiles::new(self.observation))
+        }
+    }
+
+    struct ObservingResolver {
+        provider: Arc<ObservingProvider>,
+    }
+    impl ConnectorMetadataMaintenanceResolver for ObservingResolver {
+        fn acquire_current_metadata_maintenance(
+            &self,
+            _: &ConnectorInstanceId,
+        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+            ConnectorMetadataMaintenanceLease::new(
+                self.provider.inner.descriptor.clone(),
+                self.provider.inner.key.clone(),
+                self.provider.clone(),
+                self.provider.clone(),
+                || {},
+            )
+        }
+        fn acquire_exact_metadata_maintenance(
+            &self,
+            _: &ConnectorExecutionBindingKey,
+        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+            unreachable!("observation only uses the current generation")
+        }
+    }
+
+    #[test]
+    fn observation_reads_the_provider_scalar_without_planning() {
+        let inner = FakeProvider::new(Mode::Committed);
+        let instance_id = inner.descriptor.instance_id.clone();
+        let resolver = ObservingResolver {
+            provider: Arc::new(ObservingProvider {
+                inner: inner.clone(),
+                observation: Some(7),
+            }),
+        };
+
+        let observed = read_max_compactable_data_files(
+            &resolver,
+            &instance_id,
+            table(&instance_id),
+            context(),
+        )
+        .expect("observation");
+
+        assert_eq!(observed, Some(7));
+        assert_eq!(inner.metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.plan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn observation_is_unsupported_when_the_provider_does_not_implement_it() {
+        let provider = FakeProvider::new(Mode::Committed);
+        let resolver = Resolver::new(provider.clone());
+
+        let error = read_max_compactable_data_files(
+            &resolver,
+            &provider.descriptor.instance_id,
+            table(&provider.descriptor.instance_id),
+            context(),
+        )
+        .expect_err("default observation must fail closed");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn observation_rejects_a_table_from_another_instance() {
+        let provider = FakeProvider::new(Mode::Committed);
+        let resolver = Resolver::new(provider.clone());
+        let foreign = ConnectorInstanceId::parse("catalog.other").unwrap();
+
+        let error = read_max_compactable_data_files(
+            &resolver,
+            &provider.descriptor.instance_id,
+            table(&foreign),
+            context(),
+        )
+        .expect_err("foreign instance must fail closed");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    ConnectorMaxCompactableDataFiles, ConnectorMaxCompactableDataFilesRequest,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
     ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
@@ -167,16 +168,7 @@ impl IcebergMetadataMaintenanceAdapter {
         ),
         ConnectorError,
     > {
-        let target: IcebergTablePayload =
-            serde_json::from_slice(request.operation().table().payload()).map_err(|error| {
-                invalid(format!("decode Iceberg maintenance table handle: {error}"))
-            })?;
-        if target.metadata_table_type.is_some() {
-            return Err(invalid(
-                "Iceberg metadata maintenance requires a base table handle",
-            ));
-        }
-        let (namespace, table_name) = (target.namespace, target.table);
+        let (namespace, table_name) = decode_base_table_target(request.operation().table())?;
         self.runtime
             .control_state()
             .invalidate_table_cache(&namespace, &table_name);
@@ -607,6 +599,49 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         Ok(outcome)
     }
 
+    fn read_max_compactable_data_files(
+        &self,
+        request: ConnectorMaxCompactableDataFilesRequest,
+    ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
+        let (namespace, table_name) = decode_base_table_target(&request.table)?;
+        // The observation feeds a maintenance decision, so it must see the
+        // current table state rather than a cached generation snapshot.
+        self.runtime
+            .control_state()
+            .invalidate_table_cache(&namespace, &table_name);
+        let physical = self
+            .runtime
+            .load_table(&namespace, &table_name)
+            .map_err(|error| unavailable(format!("load Iceberg table for observation: {error}")))?;
+        let preserve_row_lineage =
+            crate::schema_facts::row_lineage_enabled(physical.table.metadata());
+        let table = physical.into_table();
+        let stats = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                crate::commit::current_live_data_file_compaction_stats(
+                    &table,
+                    table.file_io(),
+                    preserve_row_lineage,
+                )
+                .await
+            })
+            .map_err(unavailable)?
+            .map_err(|error| {
+                unavailable(format!(
+                    "observe Iceberg table {namespace}.{table_name} compaction groups: {error}"
+                ))
+            })?;
+        let value = u64::try_from(stats.max_compactable_data_files).map_err(|_| {
+            internal(format!(
+                "Iceberg table {namespace}.{table_name} compactable file count overflow"
+            ))
+        })?;
+        Ok(ConnectorMaxCompactableDataFiles::new(Some(value)))
+    }
+
     fn reconcile(
         &self,
         request: ConnectorMetadataMaintenanceReconcileRequest,
@@ -681,6 +716,19 @@ enum MarkerLookup {
 enum ExecFailure {
     KnownUncommitted(ConnectorError),
     Unknown(ConnectorError),
+}
+
+fn decode_base_table_target(
+    handle: &novarocks_spi::connector::ConnectorTableHandle,
+) -> Result<(String, String), ConnectorError> {
+    let target: IcebergTablePayload = serde_json::from_slice(handle.payload())
+        .map_err(|error| invalid(format!("decode Iceberg maintenance table handle: {error}")))?;
+    if target.metadata_table_type.is_some() {
+        return Err(invalid(
+            "Iceberg metadata maintenance requires a base table handle",
+        ));
+    }
+    Ok((target.namespace, target.table))
 }
 
 fn validate_payload_for_plan(

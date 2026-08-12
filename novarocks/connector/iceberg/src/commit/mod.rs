@@ -87,6 +87,9 @@ pub use retry::{
     COMMIT_RETRY_BACKOFF_MS, COMMIT_RETRY_MAX_ATTEMPTS, commit_with_retry,
     is_retryable_commit_conflict,
 };
+pub use rewrite_data_files::{
+    LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
+};
 pub use service::{
     CleanupAttempt, CommitFailureKind, CommitRecoverySource, CommitServiceError,
     CommitServiceOutcome, RecoveryEvidence, classify_commit_error,

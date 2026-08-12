@@ -127,7 +127,8 @@ pub use metadata::{
     MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
 };
 pub use metadata_maintenance::{
-    CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMetadataMaintenance,
+    CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMaxCompactableDataFiles,
+    ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceLease,
     ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
