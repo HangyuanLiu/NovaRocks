@@ -203,3 +203,12 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 永久 guard。
 
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
+
+### configuration
+
+领域哲学：配置由组合根加载并按值注入，不存在进程级 `config()` 单例。深层执行/连接器代码
+接收构造时传入的字段，配置校验尽量前移到启动而不是首次使用；debug/test 开关归启动进程的
+环境变量，不进配置文件。真正的进程单例（如 data runtime）保留单例形态，但其配置尺寸由
+组合根显式安装，且安装晚于首次使用时启动失败而非静默降级。
+
+- ADR-0059 — 配置为何由组合根注入，而不从进程全局读取（active）
