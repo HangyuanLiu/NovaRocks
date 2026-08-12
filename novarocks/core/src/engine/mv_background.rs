@@ -203,10 +203,13 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
                 .map(|snapshot| snapshot.timestamp_ms)
                 .min(),
             snapshot_count: stats.snapshots.len(),
-            non_main_ref_count: stats.non_main_ref_count,
+            non_default_reference_count: stats.non_default_reference_count,
             downstream_floor_ts_ms: stats.downstream_floor_ts_ms,
             downstream_floor_unknown: stats.downstream_floor_unknown,
-            properties: stats.properties.into_iter().collect(),
+            maintenance_enabled: stats.maintenance_enabled,
+            expire_max_snapshot_age_ms: stats.expire_max_snapshot_age_ms,
+            expire_min_snapshots_to_keep: stats.expire_min_snapshots_to_keep,
+            target_file_size_bytes: stats.target_file_size_bytes,
         })
     }
 }

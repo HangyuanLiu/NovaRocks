@@ -89,10 +89,17 @@ pub struct MvMaintenanceFacts {
     pub total_files_size_bytes: Option<i64>,
     pub oldest_snapshot_timestamp_ms: Option<i64>,
     pub snapshot_count: usize,
-    pub non_main_ref_count: usize,
+    pub non_default_reference_count: usize,
     pub downstream_floor_ts_ms: Option<i64>,
     pub downstream_floor_unknown: bool,
-    pub properties: BTreeMap<String, String>,
+    /// Typed maintenance policy facts declared by the table. `None` means the
+    /// table declares no usable value; the frontend owns every default and
+    /// every clamp. These four fields are the only way maintenance policy
+    /// crosses this boundary — there is deliberately no property map fallback.
+    pub maintenance_enabled: Option<bool>,
+    pub expire_max_snapshot_age_ms: Option<i64>,
+    pub expire_min_snapshots_to_keep: Option<u32>,
+    pub target_file_size_bytes: Option<i64>,
 }
 
 /// Side-effect-free discovery and preparation capability consumed by

@@ -20,8 +20,9 @@ use crate::mv::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
 use crate::mv::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvObservedRefreshMarker, MvObservedTargetField,
-    MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+    MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
+    MvObservedMaintenancePolicy, MvObservedRefreshMarker, MvObservedSnapshot,
+    MvObservedTargetField, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     MvRefreshTargetObservation, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
     MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
     MvStorageObservationPort, MvTargetCreationObservation,
@@ -185,6 +186,39 @@ impl MvStorageObservationPort for TestIcebergMvStorageObservationAdapter {
                     )
                 })
                 .collect(),
+            &context,
+        )
+    }
+
+    fn observe_maintenance_metadata(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {
+        let observed =
+            self.inspector
+                .observe_maintenance_metadata(exact_lease, metadata, context.clone())?;
+        MvMaintenanceMetadataObservation::try_new(
+            observed.current_snapshot_id,
+            observed
+                .snapshots
+                .into_iter()
+                .map(|snapshot| MvObservedSnapshot {
+                    snapshot_id: snapshot.snapshot_id,
+                    timestamp_ms: snapshot.timestamp_ms,
+                })
+                .collect(),
+            observed.non_default_reference_count,
+            observed.total_data_files,
+            observed.total_delete_files,
+            observed.total_files_size_bytes,
+            MvObservedMaintenancePolicy {
+                maintenance_enabled: observed.policy.maintenance_enabled,
+                expire_max_snapshot_age_ms: observed.policy.expire_max_snapshot_age_ms,
+                expire_min_snapshots_to_keep: observed.policy.expire_min_snapshots_to_keep,
+                target_file_size_bytes: observed.policy.target_file_size_bytes,
+            },
             &context,
         )
     }

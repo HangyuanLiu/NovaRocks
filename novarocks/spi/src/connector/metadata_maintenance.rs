@@ -536,6 +536,50 @@ impl ConnectorMetadataMaintenanceReconcileRequest {
     }
 }
 
+/// Read-only observation request for one base table.
+///
+/// This request deliberately carries no operation id: the observation is not a
+/// mutation attempt, so it never joins the durable maintenance lifecycle and
+/// never produces a plan, a receipt or a marker.
+#[derive(Clone)]
+pub struct ConnectorMaxCompactableDataFilesRequest {
+    pub table: ConnectorTableHandle,
+    pub context: ConnectorRequestContext,
+}
+
+impl ConnectorMaxCompactableDataFilesRequest {
+    pub fn try_new(
+        table: ConnectorTableHandle,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self { table, context })
+    }
+}
+
+impl fmt::Debug for ConnectorMaxCompactableDataFilesRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectorMaxCompactableDataFilesRequest")
+            .field("owner", self.table.owner())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Provider-neutral scalar answer. `None` means the provider exposes no such
+/// observation for this table; it is not a zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorMaxCompactableDataFiles {
+    value: Option<u64>,
+}
+
+impl ConnectorMaxCompactableDataFiles {
+    pub const fn new(value: Option<u64>) -> Self {
+        Self { value }
+    }
+    pub const fn value(self) -> Option<u64> {
+        self.value
+    }
+}
+
 pub trait ConnectorMetadataMaintenance: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorExecutionBindingKey;
@@ -551,6 +595,23 @@ pub trait ConnectorMetadataMaintenance: Send + Sync {
         &self,
         request: ConnectorMetadataMaintenanceReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>;
+    /// Reads the largest number of data files the provider would place into one
+    /// of its own rewrite groups for this table. The grouping rule stays
+    /// provider-private; only the resulting scalar crosses this boundary.
+    ///
+    /// This call is explicitly expensive: answering it requires the provider to
+    /// enumerate the table's live manifests. It is reserved for background
+    /// maintenance policy and must never be placed on a SQL planning path.
+    fn read_max_compactable_data_files(
+        &self,
+        request: ConnectorMaxCompactableDataFilesRequest,
+    ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
+        let _ = request;
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not observe compactable data file groups",
+        ))
+    }
 }
 
 pub trait ConnectorMetadataMaintenanceResolver: Send + Sync {
@@ -663,6 +724,22 @@ impl ConnectorMetadataMaintenanceLease {
         let outcome = self.maintenance.reconcile(request)?;
         self.validate_outcome(&plan, &outcome)?;
         Ok(outcome)
+    }
+    /// Read-only passthrough. It shares the maintenance lease because the
+    /// observation needs the provider's own runtime and file access, but it
+    /// deliberately validates nothing beyond exact handle ownership: there is
+    /// no plan, no operation id and no outcome to reconcile.
+    pub fn read_max_compactable_data_files(
+        &self,
+        request: ConnectorMaxCompactableDataFilesRequest,
+    ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
+        if request.table.owner() != &self.key.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "metadata maintenance observation table does not match lease",
+            ));
+        }
+        self.maintenance.read_max_compactable_data_files(request)
     }
     fn validate_plan(&self, plan: &ConnectorMetadataMaintenancePlan) -> Result<(), ConnectorError> {
         plan.validate()?;

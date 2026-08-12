@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    ConnectorMaxCompactableDataFiles, ConnectorMaxCompactableDataFilesRequest,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
     ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
@@ -593,6 +594,39 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         Ok(outcome)
     }
 
+    fn read_max_compactable_data_files(
+        &self,
+        request: ConnectorMaxCompactableDataFilesRequest,
+    ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
+        let (namespace, table_name) = decode_data_mutation_table_target(&request.table)?;
+        let entry = self.entry()?;
+        // The observation feeds a maintenance decision, so it must see the
+        // current table state rather than a cached generation snapshot.
+        entry.invalidate_table_cache(&namespace, &table_name);
+        let loaded = load_table(&entry, &namespace, &table_name)
+            .map_err(|error| unavailable(format!("load Iceberg table for observation: {error}")))?;
+        let table = loaded.into_table();
+        let preserve_row_lineage =
+            novarocks_connector_iceberg::schema_facts::row_lineage_enabled(table.metadata());
+        let stats = block_on_iceberg(super::commit::current_live_data_file_compaction_stats(
+            &table,
+            table.file_io(),
+            preserve_row_lineage,
+        ))
+        .map_err(unavailable)?
+        .map_err(|error| {
+            unavailable(format!(
+                "observe Iceberg table {namespace}.{table_name} compaction groups: {error}"
+            ))
+        })?;
+        let value = u64::try_from(stats.max_compactable_data_files).map_err(|_| {
+            internal(format!(
+                "Iceberg table {namespace}.{table_name} compactable file count overflow"
+            ))
+        })?;
+        Ok(ConnectorMaxCompactableDataFiles::new(Some(value)))
+    }
+
     fn reconcile(
         &self,
         request: ConnectorMetadataMaintenanceReconcileRequest,
@@ -847,4 +881,308 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 
 fn resource_exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message.into())
+}
+
+/// Parity fixture for the one maintenance fact that needs provider runtime IO.
+///
+/// The legacy core rewrite action and the provider rewrite action each own a
+/// copy of the live-data-file grouping rule. Both answers are read by the same
+/// SPI observation, so they must agree file-for-file. These tests write one
+/// synthetic set of manifests and feed the very same table to both.
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use novarocks_connector_iceberg::iceberg::TableIdent;
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
+        ManifestListWriter, ManifestWriterBuilder, NestedField, Operation, PartitionSpec,
+        PrimitiveLiteral, PrimitiveType, Schema, Snapshot, SnapshotReference, SnapshotRetention,
+        SortOrder, Struct, Summary, TableMetadataBuilder, Transform, Type,
+    };
+    use novarocks_connector_iceberg::iceberg::table::Table;
+
+    const SNAPSHOT_ID: i64 = 100;
+    const SNAPSHOT_SEQUENCE_NUMBER: i64 = 12;
+
+    /// One synthetic live data manifest: `data_files` files that all share a
+    /// partition spec id, a partition value and a data sequence number.
+    struct ManifestPlan {
+        partition_spec_id: i32,
+        partition_value: i32,
+        data_files: usize,
+        sequence_number: i64,
+    }
+
+    #[tokio::test]
+    async fn compaction_stats_parity_single_partition_counts_every_data_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = table_with_live_data_files(
+            dir.path(),
+            &[ManifestPlan {
+                partition_spec_id: 1,
+                partition_value: 1,
+                data_files: 3,
+                sequence_number: 10,
+            }],
+        )
+        .await;
+
+        assert_parity(&table, false, 3).await;
+        assert_parity(&table, true, 3).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_stats_parity_reports_largest_partition_not_total() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = table_with_live_data_files(
+            dir.path(),
+            &[
+                ManifestPlan {
+                    partition_spec_id: 1,
+                    partition_value: 1,
+                    data_files: 3,
+                    sequence_number: 10,
+                },
+                ManifestPlan {
+                    partition_spec_id: 1,
+                    partition_value: 2,
+                    data_files: 2,
+                    sequence_number: 10,
+                },
+            ],
+        )
+        .await;
+
+        assert_parity(&table, false, 3).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_stats_parity_keeps_partition_spec_ids_separate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = table_with_live_data_files(
+            dir.path(),
+            &[
+                ManifestPlan {
+                    partition_spec_id: 1,
+                    partition_value: 1,
+                    data_files: 3,
+                    sequence_number: 10,
+                },
+                ManifestPlan {
+                    partition_spec_id: 2,
+                    partition_value: 1,
+                    data_files: 4,
+                    sequence_number: 10,
+                },
+            ],
+        )
+        .await;
+
+        assert_parity(&table, false, 4).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_stats_parity_splits_by_sequence_only_when_preserving_row_lineage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = table_with_live_data_files(
+            dir.path(),
+            &[
+                ManifestPlan {
+                    partition_spec_id: 1,
+                    partition_value: 1,
+                    data_files: 3,
+                    sequence_number: 10,
+                },
+                ManifestPlan {
+                    partition_spec_id: 1,
+                    partition_value: 1,
+                    data_files: 2,
+                    sequence_number: 11,
+                },
+                ManifestPlan {
+                    partition_spec_id: 2,
+                    partition_value: 1,
+                    data_files: 4,
+                    sequence_number: 10,
+                },
+            ],
+        )
+        .await;
+
+        assert_parity(&table, false, 5).await;
+        assert_parity(&table, true, 4).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_stats_parity_is_zero_without_a_current_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = table_with_live_data_files(dir.path(), &[]).await;
+
+        assert_parity(&table, false, 0).await;
+        assert_parity(&table, true, 0).await;
+    }
+
+    async fn assert_parity(table: &Table, preserve_row_lineage: bool, expected: i64) {
+        let legacy = super::super::commit::current_live_data_file_compaction_stats(
+            table,
+            table.file_io(),
+            preserve_row_lineage,
+        )
+        .await
+        .expect("legacy compaction stats")
+        .max_compactable_data_files;
+        let provider =
+            novarocks_connector_iceberg::commit::current_live_data_file_compaction_stats(
+                table,
+                table.file_io(),
+                preserve_row_lineage,
+            )
+            .await
+            .expect("provider compaction stats")
+            .max_compactable_data_files;
+
+        assert_eq!(
+            legacy, provider,
+            "legacy and provider compaction grouping disagree (preserve_row_lineage={preserve_row_lineage})"
+        );
+        assert_eq!(legacy, expected);
+    }
+
+    fn test_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "p", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .expect("schema")
+    }
+
+    fn test_partition_spec(schema: &Schema, spec_id: i32) -> PartitionSpec {
+        PartitionSpec::builder(schema.clone())
+            .with_spec_id(spec_id)
+            .add_partition_field("p", "p", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("partition spec")
+    }
+
+    fn test_data_file(plan: &ManifestPlan, ordinal: usize) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!(
+                "data/spec-{}-p-{}-seq-{}-{ordinal}.parquet",
+                plan.partition_spec_id, plan.partition_value, plan.sequence_number
+            ))
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::from_iter([Some(Literal::Primitive(
+                PrimitiveLiteral::Int(plan.partition_value),
+            ))]))
+            .partition_spec_id(plan.partition_spec_id)
+            .record_count(1)
+            .file_size_in_bytes(1024)
+            .build()
+            .expect("data file")
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis() as i64
+    }
+
+    /// Writes real avro manifests plus a manifest list under `dir` and returns
+    /// a table whose current snapshot points at them. An empty `plans` list
+    /// yields a table without any snapshot.
+    async fn table_with_live_data_files(dir: &Path, plans: &[ManifestPlan]) -> Table {
+        let location = format!("file://{}", dir.display());
+        std::fs::create_dir_all(dir.join("metadata")).expect("metadata dir");
+        let schema = test_schema();
+        let file_io =
+            novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None);
+        let builder = TableMetadataBuilder::new(
+            schema.clone(),
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            location.clone(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("table metadata builder");
+        let metadata = if plans.is_empty() {
+            builder.build().expect("table metadata").metadata
+        } else {
+            let mut manifests = Vec::new();
+            for (index, plan) in plans.iter().enumerate() {
+                let path = format!("{location}/metadata/live-{index}.avro");
+                let output = file_io.new_output(&path).expect("manifest output");
+                let mut writer = ManifestWriterBuilder::new(
+                    output,
+                    Some(SNAPSHOT_ID),
+                    None,
+                    Arc::new(schema.clone()),
+                    test_partition_spec(&schema, plan.partition_spec_id),
+                )
+                .build_v2_data();
+                for ordinal in 0..plan.data_files {
+                    writer
+                        .add_file(test_data_file(plan, ordinal), plan.sequence_number)
+                        .expect("add data file");
+                }
+                let mut manifest = writer.write_manifest_file().await.expect("write manifest");
+                manifest.sequence_number = plan.sequence_number;
+                manifest.min_sequence_number = plan.sequence_number;
+                manifests.push(manifest);
+            }
+            let manifest_list_path = format!("{location}/metadata/snap-{SNAPSHOT_ID}.avro");
+            let output = file_io
+                .new_output(&manifest_list_path)
+                .expect("manifest list output");
+            let mut list_writer =
+                ManifestListWriter::v2(output, SNAPSHOT_ID, None, SNAPSHOT_SEQUENCE_NUMBER);
+            list_writer
+                .add_manifests(manifests.into_iter())
+                .expect("add manifests");
+            list_writer.close().await.expect("close manifest list");
+            let snapshot = Snapshot::builder()
+                .with_snapshot_id(SNAPSHOT_ID)
+                .with_sequence_number(SNAPSHOT_SEQUENCE_NUMBER)
+                .with_timestamp_ms(now_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_schema_id(0)
+                .build();
+            builder
+                .add_snapshot(snapshot)
+                .expect("add snapshot")
+                .set_ref(
+                    "main",
+                    SnapshotReference::new(
+                        SNAPSHOT_ID,
+                        SnapshotRetention::Branch {
+                            min_snapshots_to_keep: None,
+                            max_snapshot_age_ms: None,
+                            max_ref_age_ms: None,
+                        },
+                    ),
+                )
+                .expect("set main ref")
+                .build()
+                .expect("table metadata")
+                .metadata
+        };
+        Table::builder()
+            .identifier(TableIdent::from_strs(["db", "t"]).expect("table ident"))
+            .file_io(file_io)
+            .metadata(metadata)
+            .build()
+            .expect("table")
+    }
 }
