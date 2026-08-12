@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod activity;
+mod coordination;
 mod create;
 pub(crate) mod maintenance;
 pub(crate) mod maintenance_worker;

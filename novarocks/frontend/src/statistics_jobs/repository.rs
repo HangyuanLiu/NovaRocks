@@ -50,13 +50,11 @@ const CREATE_CONFLICT_RETRY_LIMIT: usize = 8;
 /// A worker passes this closure to atomically validate its coordination fence
 /// before a durable job mutation. The repository deliberately has no lease
 /// dependency and never manufactures an in-memory ownership fallback.
-pub type FenceValidator = Arc<
-    dyn for<'txn> Fn(
-            &'txn mut dyn WriteTransaction,
-        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'txn>>
-        + Send
-        + Sync,
->;
+///
+/// Defined once in [`crate::coordination`] so the statistics and MV refresh
+/// owners cannot drift into two different notions of "validated in the same
+/// transaction".
+pub use crate::coordination::FenceValidator;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsJobRepositoryErrorKind {
