@@ -48,6 +48,9 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let scenario_root = config.artifact_root.join(scenario.name().replace('/', "-"));
     fs::create_dir_all(&scenario_root)
         .with_context(|| format!("create scenario artifact root {}", scenario_root.display()))?;
+    let launch_config = scenario
+        .launch_config(&scenario_root)
+        .with_context(|| format!("prepare launch configuration for {}", scenario.name()))?;
     let handle = CrossProcessServerHandle::launch(CrossProcessClusterOptions {
         binary: config.binary.clone(),
         base_config_path: config.base_config_path.clone(),
@@ -56,10 +59,12 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         query_lifecycle_faults_enabled: true,
         cleanup_faults_enabled: true,
         startup_timeout: config.timeout,
-        child_environment: scenario.child_environment(),
+        child_environment: launch_config.child_environment,
+        config_overlay: launch_config.config_overlay,
+        initial_backend_seeds: launch_config.initial_backend_seeds,
     })
     .with_context(|| format!("launch system scenario {}", scenario.name()))?;
-    let mut context = ScenarioContext::new(scenario.name(), handle, config.timeout);
+    let mut context = ScenarioContext::new(scenario.name(), handle, scenario_root, config.timeout);
     context.action("cluster launched and topology barrier passed");
     let result = scenario.run(&mut context);
     if let Err(error) = &result {

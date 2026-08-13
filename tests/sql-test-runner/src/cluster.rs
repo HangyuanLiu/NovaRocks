@@ -69,6 +69,8 @@ pub(crate) fn launch_server(
                 cleanup_faults_enabled,
                 startup_timeout: startup_timeout(),
                 child_environment: Default::default(),
+                config_overlay: Default::default(),
+                initial_backend_seeds: None,
             },
         )?)),
     }

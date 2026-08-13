@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessServerHandle, ServerHandle,
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessServerHandle, ServerHandle,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub trait Scenario: Send + Sync {
@@ -12,21 +12,42 @@ pub trait Scenario: Send + Sync {
         CrossProcessChildEnvironment::default()
     }
 
+    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        Ok(ScenarioLaunchConfig {
+            child_environment: self.child_environment(),
+            ..Default::default()
+        })
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScenarioLaunchConfig {
+    pub child_environment: CrossProcessChildEnvironment,
+    pub config_overlay: CrossProcessConfigOverlay,
+    pub initial_backend_seeds: Option<Vec<usize>>,
 }
 
 pub struct ScenarioContext {
     name: &'static str,
     handle: CrossProcessServerHandle,
+    scenario_root: PathBuf,
     deadline: Instant,
     actions: Vec<String>,
 }
 
 impl ScenarioContext {
-    pub fn new(name: &'static str, handle: CrossProcessServerHandle, timeout: Duration) -> Self {
+    pub fn new(
+        name: &'static str,
+        handle: CrossProcessServerHandle,
+        scenario_root: PathBuf,
+        timeout: Duration,
+    ) -> Self {
         Self {
             name,
             handle,
+            scenario_root,
             deadline: Instant::now() + timeout,
             actions: Vec::new(),
         }
@@ -70,6 +91,10 @@ impl ScenarioContext {
 
     pub fn runtime_dir(&self) -> &Path {
         self.handle.runtime_dir()
+    }
+
+    pub fn scenario_root(&self) -> &Path {
+        &self.scenario_root
     }
 
     pub fn diagnostics(&self) -> String {
