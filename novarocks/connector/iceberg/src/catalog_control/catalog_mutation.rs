@@ -64,6 +64,27 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
         if let Err(error) = validate_request(self, &request) {
             return Ok(known_uncommitted(error));
         }
+        if self.runtime().control_state().configuration().kind == IcebergCatalogKind::Hadoop
+            && let ConnectorCatalogMutationOperation::CreateTable {
+                table,
+                columns,
+                key,
+                partitioning,
+                properties,
+                policy,
+            } = &request.operation
+        {
+            return execute_hadoop_create_table(
+                self,
+                &request,
+                table,
+                columns,
+                key.as_ref(),
+                partitioning,
+                properties,
+                *policy,
+            );
+        }
         if let ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
             table,
             expected_current_snapshot,
@@ -414,6 +435,31 @@ fn create_table(
     {
         return Err(not_found("Iceberg table namespace does not exist"));
     }
+    let (namespace, creation) =
+        prepare_table_creation(provider, table, columns, key, partitioning, properties)?;
+    let catalog = provider.runtime().catalog().clone();
+    provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { catalog.create_table(&namespace, creation).await })
+        .map_err(unavailable)?
+        .map_err(map_iceberg)?;
+    provider
+        .runtime()
+        .control_state()
+        .invalidate_table_cache(&table.namespace, &table.table);
+    Ok(ExternalMutationEffect::Applied)
+}
+
+fn prepare_table_creation(
+    provider: &IcebergControlProvider,
+    table: &ConnectorTableIdentity,
+    columns: &[ConnectorColumnDefinition],
+    key: Option<&ConnectorTableKey>,
+    partitioning: &[ConnectorPartitionTransform],
+    properties: &[(Arc<str>, Arc<str>)],
+) -> Result<(NamespaceIdent, TableCreation), ConnectorError> {
     let (format_version, mut properties) = table_properties(columns, key, properties)?;
     if format_version != FormatVersion::V3
         && columns.iter().any(|column| {
@@ -459,19 +505,120 @@ fn create_table(
     } else {
         creation.build()
     };
-    let catalog = provider.runtime().catalog().clone();
-    provider
+    Ok((namespace, creation))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_hadoop_create_table(
+    provider: &IcebergControlProvider,
+    request: &ConnectorCatalogMutationRequest,
+    table: &ConnectorTableIdentity,
+    columns: &[ConnectorColumnDefinition],
+    key: Option<&ConnectorTableKey>,
+    partitioning: &[ConnectorPartitionTransform],
+    properties: &[(Arc<str>, Arc<str>)],
+    policy: CreatePolicy,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    ensure_owner(provider, &table.instance_id)?;
+    if !provider
+        .runtime()
+        .namespace_exists(&table.namespace)
+        .map_err(unavailable)?
+    {
+        return Ok(known_uncommitted(not_found(
+            "Iceberg table namespace does not exist",
+        )));
+    }
+    let (namespace, creation) =
+        match prepare_table_creation(provider, table, columns, key, partitioning, properties) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+    let hadoop = provider
+        .runtime()
+        .hadoop_catalog()
+        .cloned()
+        .ok_or_else(|| internal("Hadoop catalog runtime is missing its typed client"))?;
+    let operation_id = hex_encode(&request.operation_id.to_bytes());
+    let attempt = match hadoop.prepare_create_attempt(&namespace, creation, operation_id.clone()) {
+        Ok(attempt) => attempt,
+        Err(error) => return Ok(known_uncommitted(map_hadoop_create_failure(&error))),
+    };
+    let facts = attempt.facts().clone();
+    let evidence = hadoop_create_evidence(provider, request, table, &facts)?;
+    validate_context(&request.context)?;
+    let result = provider
         .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move { catalog.create_table(&namespace, creation).await })
-        .map_err(unavailable)?
-        .map_err(map_iceberg)?;
+        .block_on(async move { hadoop.publish_create_attempt(attempt).await });
+    let result = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            if error.kind == crate::hadoop_catalog::HadoopCreateFailureKind::Unknown {
+                return Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: failure(&map_hadoop_create_failure(&error)),
+                    evidence,
+                });
+            }
+            return Ok(known_uncommitted(map_hadoop_create_failure(&error)));
+        }
+        Err(error) => {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(&unavailable(error)),
+                evidence,
+            });
+        }
+    };
+    if result.facts.operation_id != operation_id {
+        return Err(internal(
+            "Hadoop create result operation identity changed during publication",
+        ));
+    }
     provider
         .runtime()
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
+    match result.disposition {
+        crate::hadoop_catalog::HadoopCreateDisposition::Created => {
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt: hadoop_create_receipt(
+                    provider,
+                    request.operation_id,
+                    request.operation.kind(),
+                    result.table.metadata_location(),
+                    &result.authoritative_table_uuid,
+                    &result.authoritative_metadata_digest,
+                )?,
+                finalization: hadoop_finalization(result.finalization_failure),
+            })
+        }
+        crate::hadoop_catalog::HadoopCreateDisposition::Existing
+            if policy == CreatePolicy::NoOpIfExists =>
+        {
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: hadoop_create_receipt(
+                    provider,
+                    request.operation_id,
+                    request.operation.kind(),
+                    result.table.metadata_location(),
+                    &result.authoritative_table_uuid,
+                    &result.authoritative_metadata_digest,
+                )?,
+                finalization: ExternalMutationFinalization::Complete,
+            })
+        }
+        crate::hadoop_catalog::HadoopCreateDisposition::Existing => {
+            Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::AlreadyExists,
+                    "Iceberg table already exists",
+                ),
+            })
+        }
+    }
 }
 
 fn drop_table(
@@ -1887,6 +2034,27 @@ fn evidence(
     )
 }
 
+fn hadoop_create_evidence(
+    provider: &IcebergControlProvider,
+    request: &ConnectorCatalogMutationRequest,
+    table: &ConnectorTableIdentity,
+    facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
+) -> Result<ExternalMutationEvidence, ConnectorError> {
+    evidence(
+        provider,
+        request.operation_id,
+        request.operation.kind(),
+        IcebergMutationEvidenceTarget::HadoopCreate {
+            namespace: table.namespace.to_string(),
+            table: table.table.to_string(),
+            expected_uuid: facts.table_uuid.clone(),
+            metadata_location: facts.metadata_location.clone(),
+            metadata_digest: facts.metadata_digest.clone(),
+            operation_id: facts.operation_id.clone(),
+        },
+    )
+}
+
 fn reconcile_evidence(
     provider: &IcebergControlProvider,
     target: IcebergMutationEvidenceTarget,
@@ -1959,6 +2127,70 @@ fn reconcile_evidence(
                     uncommitted("Iceberg table mutation postcondition is absent")
                 }
                 _ => ambiguous("Iceberg table incarnation changed during reconciliation"),
+            }
+        }
+        IcebergMutationEvidenceTarget::HadoopCreate {
+            namespace,
+            table,
+            expected_uuid,
+            metadata_location,
+            metadata_digest,
+            operation_id,
+        } => {
+            if operation_id != hex_encode(&evidence.operation_id().to_bytes()) {
+                return Err(invalid(
+                    "Hadoop create evidence operation identity does not match its envelope",
+                ));
+            }
+            let hadoop = provider
+                .runtime()
+                .hadoop_catalog()
+                .cloned()
+                .ok_or_else(|| invalid("Hadoop create evidence requires a Hadoop catalog"))?;
+            let reconcile_namespace = namespace.clone();
+            let reconcile_table = table.clone();
+            let reconcile_uuid = expected_uuid.clone();
+            let reconcile_location = metadata_location.clone();
+            let reconcile_digest = metadata_digest.clone();
+            let result = provider
+                .runtime()
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    hadoop
+                        .reconcile_create_attempt(
+                            &reconcile_namespace,
+                            &reconcile_table,
+                            &reconcile_uuid,
+                            &reconcile_location,
+                            &reconcile_digest,
+                        )
+                        .await
+                });
+            match result {
+                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Committed {
+                    finalization_failure,
+                })) => Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: hadoop_create_receipt(
+                        provider,
+                        evidence.operation_id(),
+                        evidence.operation_kind(),
+                        Some(&metadata_location),
+                        &expected_uuid,
+                        &metadata_digest,
+                    )?,
+                    finalization: hadoop_finalization(finalization_failure),
+                }),
+                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Absent)) => {
+                    uncommitted("Hadoop create fence is absent")
+                }
+                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Foreign)) => {
+                    ambiguous("Hadoop create fence belongs to another table incarnation")
+                }
+                Ok(Err(message)) | Err(message) => ambiguous(&format!(
+                    "read authoritative Hadoop create fence: {message}"
+                )),
             }
         }
         IcebergMutationEvidenceTarget::View {
@@ -2250,6 +2482,67 @@ fn receipt_with_version(
     )
 }
 
+#[derive(serde::Serialize)]
+struct HadoopCreateProviderVersion<'a> {
+    metadata_location: &'a str,
+    table_uuid: &'a str,
+    metadata_digest: &'a str,
+}
+
+fn hadoop_create_receipt(
+    provider: &IcebergControlProvider,
+    operation_id: ConnectorMutationOperationId,
+    operation_kind: &str,
+    metadata_location: Option<&str>,
+    table_uuid: &str,
+    metadata_digest: &str,
+) -> Result<ConnectorCatalogMutationReceipt, ConnectorError> {
+    let metadata_location = metadata_location
+        .ok_or_else(|| internal("committed Hadoop create is missing metadata location"))?;
+    let version = serde_json::to_vec(&HadoopCreateProviderVersion {
+        metadata_location,
+        table_uuid,
+        metadata_digest,
+    })
+    .map_err(|error| internal(format!("encode Hadoop create receipt: {error}")))?;
+    ConnectorCatalogMutationReceipt::try_new(
+        provider.descriptor().clone(),
+        provider.incarnation(),
+        operation_id,
+        operation_kind,
+        Some(Bytes::from(version)),
+    )
+}
+
+fn hadoop_finalization(failure: Option<String>) -> ExternalMutationFinalization {
+    match failure {
+        Some(message) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            message,
+        )),
+        None => ExternalMutationFinalization::Complete,
+    }
+}
+
+fn map_hadoop_create_failure(
+    failure: &crate::hadoop_catalog::HadoopCreateFailure,
+) -> ConnectorError {
+    let kind = match failure.kind {
+        crate::hadoop_catalog::HadoopCreateFailureKind::Invalid => {
+            ConnectorErrorKind::InvalidRequest
+        }
+        crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => {
+            ConnectorErrorKind::Unsupported
+        }
+        crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => ConnectorErrorKind::Unavailable,
+    };
+    let message = match failure.facts.as_ref() {
+        Some(facts) => format!("{} [operation_id={}]", failure.message, facts.operation_id),
+        None => failure.message.clone(),
+    };
+    ConnectorError::new(kind, message)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -2485,6 +2778,161 @@ mod tests {
         )
         .expect("create guarded table");
         table
+    }
+
+    fn create_namespace(provider: &IcebergControlProvider, name: &str) {
+        let namespace = NamespaceIdent::new(name.to_string());
+        let catalog = provider.runtime().catalog().clone();
+        provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
+            .expect("namespace runtime")
+            .expect("create namespace");
+    }
+
+    fn create_request(
+        provider: &IcebergControlProvider,
+        operation_id: ConnectorMutationOperationId,
+        policy: CreatePolicy,
+    ) -> ConnectorCatalogMutationRequest {
+        ConnectorCatalogMutationRequest {
+            operation_id,
+            target: ConnectorExecutionBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: ConnectorCatalogMutationOperation::CreateTable {
+                table: ConnectorTableIdentity {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    namespace: "atomic".into(),
+                    table: "events".into(),
+                },
+                columns: vec![ConnectorColumnDefinition {
+                    name: "id".into(),
+                    data_type: ConnectorDataType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                }],
+                key: None,
+                partitioning: Vec::new(),
+                properties: Vec::new(),
+                policy,
+            },
+            context: context(),
+        }
+    }
+
+    #[test]
+    fn hadoop_create_policy_maps_one_owner_and_existing_table() {
+        let (_executor, _warehouse, provider) = provider();
+        create_namespace(&provider, "atomic");
+
+        let first = provider
+            .execute(create_request(
+                &provider,
+                ConnectorMutationOperationId::new(),
+                CreatePolicy::FailIfExists,
+            ))
+            .expect("first create");
+        assert!(matches!(
+            first,
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ));
+
+        let strict = provider
+            .execute(create_request(
+                &provider,
+                ConnectorMutationOperationId::new(),
+                CreatePolicy::FailIfExists,
+            ))
+            .expect("strict existing create");
+        assert!(matches!(
+            strict,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::AlreadyExists
+        ));
+
+        let no_op = provider
+            .execute(create_request(
+                &provider,
+                ConnectorMutationOperationId::new(),
+                CreatePolicy::NoOpIfExists,
+            ))
+            .expect("no-op existing create");
+        assert!(matches!(
+            no_op,
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hadoop_create_reconcile_attributes_only_the_frozen_v1() {
+        let (_executor, _warehouse, provider) = provider();
+        create_namespace(&provider, "atomic");
+        let operation_id = ConnectorMutationOperationId::new();
+        let request = create_request(&provider, operation_id, CreatePolicy::FailIfExists);
+        let ConnectorCatalogMutationOperation::CreateTable {
+            table,
+            columns,
+            key,
+            partitioning,
+            properties,
+            ..
+        } = &request.operation
+        else {
+            panic!("create request");
+        };
+        let (namespace, creation) = prepare_table_creation(
+            &provider,
+            table,
+            columns,
+            key.as_ref(),
+            partitioning,
+            properties,
+        )
+        .expect("prepare table creation");
+        let hadoop = provider
+            .runtime()
+            .hadoop_catalog()
+            .cloned()
+            .expect("Hadoop catalog");
+        let attempt = hadoop
+            .prepare_create_attempt(&namespace, creation, hex_encode(&operation_id.to_bytes()))
+            .expect("prepare attempt");
+        let evidence = hadoop_create_evidence(&provider, &request, table, attempt.facts())
+            .expect("create evidence");
+        provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { hadoop.publish_create_attempt(attempt).await })
+            .expect("catalog runtime")
+            .expect("publish v1");
+
+        let reconciled = provider
+            .reconcile(ConnectorCatalogMutationReconcileRequest {
+                evidence,
+                context: context(),
+            })
+            .expect("reconcile response loss");
+        assert!(matches!(
+            reconciled,
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                ..
+            }
+        ));
     }
 
     #[test]

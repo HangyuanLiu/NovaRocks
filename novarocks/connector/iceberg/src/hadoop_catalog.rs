@@ -59,6 +59,8 @@ pub(crate) enum HadoopCreateDisposition {
 pub(crate) struct HadoopCreateResult {
     pub(crate) disposition: HadoopCreateDisposition,
     pub(crate) facts: HadoopCreateAttemptFacts,
+    pub(crate) authoritative_table_uuid: String,
+    pub(crate) authoritative_metadata_digest: String,
     pub(crate) table: Table,
     pub(crate) finalization_failure: Option<String>,
 }
@@ -78,11 +80,27 @@ pub(crate) struct HadoopCreateFailure {
 }
 
 #[derive(Debug)]
-struct FrozenHadoopCreateAttempt {
+pub(crate) struct HadoopCreateAttempt {
+    ident: TableIdent,
     facts: HadoopCreateAttemptFacts,
     table_location: String,
     metadata: TableMetadata,
     metadata_bytes: Bytes,
+}
+
+impl HadoopCreateAttempt {
+    pub(crate) fn facts(&self) -> &HadoopCreateAttemptFacts {
+        &self.facts
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum HadoopCreateReconciliation {
+    Committed {
+        finalization_failure: Option<String>,
+    },
+    Absent,
+    Foreign,
 }
 
 #[derive(Debug)]
@@ -288,12 +306,12 @@ impl HadoopFileSystemCatalog {
         Ok(Some(metadata_location))
     }
 
-    fn freeze_create_attempt(
+    pub(crate) fn prepare_create_attempt(
         &self,
         namespace: &NamespaceIdent,
         creation: TableCreation,
         operation_id: String,
-    ) -> std::result::Result<(TableIdent, FrozenHadoopCreateAttempt), HadoopCreateFailure> {
+    ) -> std::result::Result<HadoopCreateAttempt, HadoopCreateFailure> {
         let ident = TableIdent::new(namespace.clone(), creation.name.clone());
         let table_location = creation
             .location
@@ -329,15 +347,13 @@ impl HadoopFileSystemCatalog {
             metadata_location,
             metadata_digest: hex_digest(&metadata_bytes),
         };
-        Ok((
+        Ok(HadoopCreateAttempt {
             ident,
-            FrozenHadoopCreateAttempt {
-                facts,
-                table_location,
-                metadata,
-                metadata_bytes: metadata_bytes.into(),
-            },
-        ))
+            facts,
+            table_location,
+            metadata,
+            metadata_bytes: metadata_bytes.into(),
+        })
     }
 
     pub(crate) async fn create_table_fenced(
@@ -346,7 +362,14 @@ impl HadoopFileSystemCatalog {
         creation: TableCreation,
         operation_id: String,
     ) -> std::result::Result<HadoopCreateResult, HadoopCreateFailure> {
-        let (ident, attempt) = self.freeze_create_attempt(namespace, creation, operation_id)?;
+        let attempt = self.prepare_create_attempt(namespace, creation, operation_id)?;
+        self.publish_create_attempt(attempt).await
+    }
+
+    pub(crate) async fn publish_create_attempt(
+        &self,
+        attempt: HadoopCreateAttempt,
+    ) -> std::result::Result<HadoopCreateResult, HadoopCreateFailure> {
         let access = crate::fs_io::resolve_access_for_location(
             &attempt.facts.metadata_location,
             self.object_store_config.as_ref(),
@@ -381,10 +404,12 @@ impl HadoopFileSystemCatalog {
             .handle()
             .create_if_absent(0, attempt.metadata_bytes.clone(), &cancellation)
             .await;
-        let (disposition, metadata) = match conditional {
-            Ok(ConditionalCreateOutcome::Created) => {
-                (HadoopCreateDisposition::Created, attempt.metadata.clone())
-            }
+        let (disposition, metadata, authoritative_metadata_digest) = match conditional {
+            Ok(ConditionalCreateOutcome::Created) => (
+                HadoopCreateDisposition::Created,
+                attempt.metadata.clone(),
+                attempt.facts.metadata_digest.clone(),
+            ),
             Ok(ConditionalCreateOutcome::AlreadyExists) => {
                 self.classify_existing_v1(&attempt).await?
             }
@@ -418,13 +443,17 @@ impl HadoopFileSystemCatalog {
             }
         }
 
-        let key = Self::table_key(&ident);
+        let key = Self::table_key(&attempt.ident);
         self.tables
             .lock()
             .await
             .insert(key, attempt.facts.metadata_location.clone());
         let table = self
-            .build_table(ident, metadata, attempt.facts.metadata_location.clone())
+            .build_table(
+                attempt.ident,
+                metadata,
+                attempt.facts.metadata_location.clone(),
+            )
             .map_err(|error| HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Unknown,
                 facts: Some(attempt.facts.clone()),
@@ -433,6 +462,8 @@ impl HadoopFileSystemCatalog {
         Ok(HadoopCreateResult {
             disposition,
             facts: attempt.facts,
+            authoritative_table_uuid: table.metadata().uuid().to_string(),
+            authoritative_metadata_digest,
             table,
             finalization_failure,
         })
@@ -440,8 +471,9 @@ impl HadoopFileSystemCatalog {
 
     async fn classify_existing_v1(
         &self,
-        attempt: &FrozenHadoopCreateAttempt,
-    ) -> std::result::Result<(HadoopCreateDisposition, TableMetadata), HadoopCreateFailure> {
+        attempt: &HadoopCreateAttempt,
+    ) -> std::result::Result<(HadoopCreateDisposition, TableMetadata, String), HadoopCreateFailure>
+    {
         let input = self
             .file_io
             .new_input(&attempt.facts.metadata_location)
@@ -461,8 +493,9 @@ impl HadoopFileSystemCatalog {
                 facts: Some(attempt.facts.clone()),
                 message: format!("decode authoritative Hadoop v1 metadata: {error}"),
             })?;
+        let authoritative_digest = hex_digest(&bytes);
         let same_owner = metadata.uuid().to_string() == attempt.facts.table_uuid
-            && hex_digest(&bytes) == attempt.facts.metadata_digest;
+            && authoritative_digest == attempt.facts.metadata_digest;
         Ok((
             if same_owner {
                 HadoopCreateDisposition::Created
@@ -470,7 +503,55 @@ impl HadoopFileSystemCatalog {
                 HadoopCreateDisposition::Existing
             },
             metadata,
+            authoritative_digest,
         ))
+    }
+
+    pub(crate) async fn reconcile_create_attempt(
+        &self,
+        namespace: &str,
+        table: &str,
+        expected_uuid: &str,
+        expected_metadata_location: &str,
+        expected_metadata_digest: &str,
+    ) -> std::result::Result<HadoopCreateReconciliation, String> {
+        let ident = TableIdent::from_strs([namespace, table])
+            .map_err(|error| format!("build Hadoop table identity: {error}"))?;
+        let table_location = self.table_location(&ident);
+        let canonical_v1 = Self::metadata_path(&table_location, 1);
+        if canonical_v1 != expected_metadata_location {
+            return Ok(HadoopCreateReconciliation::Foreign);
+        }
+        if !self
+            .file_io
+            .exists(&canonical_v1)
+            .await
+            .map_err(|error| format!("probe authoritative Hadoop v1 metadata: {error}"))?
+        {
+            return Ok(HadoopCreateReconciliation::Absent);
+        }
+        let bytes = self
+            .file_io
+            .new_input(&canonical_v1)
+            .map_err(|error| format!("open authoritative Hadoop v1 metadata: {error}"))?
+            .read()
+            .await
+            .map_err(|error| format!("read authoritative Hadoop v1 metadata: {error}"))?;
+        let metadata: TableMetadata = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("decode authoritative Hadoop v1 metadata: {error}"))?;
+        if metadata.uuid().to_string() != expected_uuid
+            || hex_digest(&bytes) != expected_metadata_digest
+        {
+            return Ok(HadoopCreateReconciliation::Foreign);
+        }
+        let finalization_failure = self
+            .write_version_hint(&table_location, 1)
+            .await
+            .err()
+            .map(|error| format!("repair committed Hadoop catalog version hint: {error}"));
+        Ok(HadoopCreateReconciliation::Committed {
+            finalization_failure,
+        })
     }
 }
 

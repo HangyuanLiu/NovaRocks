@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
+pub const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 2;
 pub const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
 pub const ICEBERG_STAGED_PUBLICATION_PROOF_VERSION: u16 = 1;
 
@@ -56,6 +56,14 @@ pub enum IcebergMutationEvidenceTarget {
         table: String,
         should_exist: bool,
         before_uuid: Option<String>,
+    },
+    HadoopCreate {
+        namespace: String,
+        table: String,
+        expected_uuid: String,
+        metadata_location: String,
+        metadata_digest: String,
+        operation_id: String,
     },
     View {
         namespace: String,
@@ -191,5 +199,14 @@ mod tests {
             statistics_path: "stats.puffin".to_string(),
         };
         assert!(encode_statistics_evidence(&evidence).is_err());
+
+        let mutation = IcebergMutationEvidenceV1 {
+            version: 1,
+            target: IcebergMutationEvidenceTarget::Namespace {
+                namespace: "db".to_string(),
+                should_exist: true,
+            },
+        };
+        assert!(encode_mutation_evidence(&mutation).is_err());
     }
 }
