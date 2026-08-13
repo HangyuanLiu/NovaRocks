@@ -18,6 +18,7 @@
 mod cleanup_maintenance;
 mod context;
 mod control;
+mod ctas_staged_publication;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
@@ -65,6 +66,23 @@ pub use control::{
     ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlPlanningLease,
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
+};
+pub use ctas_staged_publication::{
+    CONNECTOR_CTAS_STAGED_PUBLICATION_CONTRACT_VERSION, ConnectorCtasAbortDisposition,
+    ConnectorCtasAbortRequest, ConnectorCtasAbortResult, ConnectorCtasActionId,
+    ConnectorCtasAdvanceFenceRequest, ConnectorCtasOperationId, ConnectorCtasProofPurpose,
+    ConnectorCtasPublicationFence, ConnectorCtasPublicationFenceReceipt,
+    ConnectorCtasPublicationProof, ConnectorCtasPublicationReceipt,
+    ConnectorCtasPublishDisposition, ConnectorCtasPublishRequest, ConnectorCtasPublishResult,
+    ConnectorCtasStageRequest, ConnectorCtasStageResult, ConnectorCtasStagedLocator,
+    ConnectorCtasStagedPublication, ConnectorCtasStagedPublicationCapability,
+    ConnectorCtasStagedPublicationLease, ConnectorHistoricalCtasAction,
+    ConnectorHistoricalCtasCheckpoint, ConnectorHistoricalCtasCleanupReceipt,
+    ConnectorHistoricalCtasCleanupRequest, ConnectorHistoricalCtasDescriptor,
+    ConnectorHistoricalCtasDispatchState, ConnectorHistoricalCtasDisposition,
+    ConnectorHistoricalCtasObservation, ConnectorHistoricalCtasStagedPublicationRecovery,
+    MAX_CONNECTOR_CTAS_PUBLICATION_CHECKPOINTS, MAX_CONNECTOR_CTAS_PUBLICATION_PAYLOAD_BYTES,
+    validate_ctas_staged_publication_owner, validate_historical_ctas_staged_publication_owner,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

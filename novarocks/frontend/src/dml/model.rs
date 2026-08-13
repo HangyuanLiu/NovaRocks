@@ -30,13 +30,12 @@ use uuid::Uuid;
 /// Ordinary DML journal values are intentionally an atomic format. There is
 /// no persisted predecessor to read or migrate.
 ///
-/// CP-3C cuts v6 to v7. A v6 operation record predates the direct data-mutation
-/// external fence invariant, so it may describe a TRUNCATE or ADD FILES that
-/// was dispatched without a confirmed fence receipt, and it can carry neither a
-/// direct-mutation fence receipt nor a historical data-mutation recovery
-/// obligation. v7 code must never interpret such a record: the journal fails the
-/// read explicitly instead of migrating or dual-reading it.
-pub const DML_OPERATION_SCHEMA_VERSION: u8 = 7;
+/// CP-3D cuts v7 to v8. A v7 operation record predates the CTAS catalog-fence
+/// and retention invariant, so it may describe a staged create, publish, or
+/// abort whose external authority and historical obligation cannot be rebuilt
+/// after restart. v8 code must never interpret such a record: the journal fails
+/// the read explicitly instead of migrating or dual-reading it.
+pub const DML_OPERATION_SCHEMA_VERSION: u8 = 8;
 pub const DML_UNFINISHED_SCHEMA_VERSION: u8 = 1;
 pub const DML_COORDINATION_RESOURCE_CODEC_VERSION: u8 = 1;
 pub const DML_RECOVERY_DUE_SCHEMA_VERSION: u8 = 1;
@@ -74,6 +73,11 @@ pub const DML_DIRECT_MUTATION_FENCE_ENCODED_LIMIT: usize = DML_EXTERNAL_FENCE_EN
 /// sealed request (with the old fence receipt), the raised fence receipt, and up
 /// to three opaque payloads.
 pub const DML_HISTORICAL_DATA_MUTATION_RECOVERY_ENCODED_LIMIT: usize = 48 * 1024;
+/// CP-3D CTAS catalog-fence, historical observation, and retention codec.
+pub const DML_CTAS_RECOVERY_CODEC_VERSION: u8 = 1;
+/// A CTAS recovery record contains only bounded neutral identities, digests,
+/// opaque catalog receipts/locators, and retention facts.
+pub const DML_CTAS_RECOVERY_ENCODED_LIMIT: usize = 64 * 1024;
 /// CTAS retains four phase facts in one StateStore value. Bound each complete
 /// fact envelope, not each individual string, so the four-fact maximum leaves
 /// room for operation identity, target facts, digests, and JSON framing.
@@ -2095,6 +2099,451 @@ pub struct CtasSagaRecord {
     #[serde(default)]
     pub abort_staging_fact: Option<DurableExternalFact>,
     pub next_action: StatementNextAction,
+}
+
+// ---------------------------------------------------------------------------
+// CP-3D: catalog-fenced CTAS takeover and historical recovery.
+//
+// These records deliberately contain no provider metadata. Receipts and staged
+// locators are bounded opaque strings; everything else is a stable identity,
+// scalar, digest, dispatch checkpoint, or retention decision. The provider is
+// the only component that may interpret an opaque value.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlCtasActionKind {
+    Stage,
+    Write,
+    Publish,
+    Abort,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlCtasDispatchCertainty {
+    ConfirmedNotDispatched,
+    PossiblyDispatched,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlCtasCatalogFenceRecord {
+    pub generation: DmlExternalFenceGeneration,
+    pub request_digest: String,
+    pub dispatch_certainty: DmlCtasDispatchCertainty,
+    pub dispatched_at_ms: Option<i64>,
+    pub fence_digest: Option<String>,
+    pub receipt_digest: Option<String>,
+    /// Bounded opaque catalog receipt. Frontend never decodes this value and
+    /// Debug output is redacted by `DmlOpaquePayload`.
+    pub receipt_payload: Option<DmlOpaquePayload>,
+    pub established_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlCtasDispatchCheckpointRecord {
+    pub action: DmlCtasActionKind,
+    pub child_operation_id: Uuid,
+    pub request_digest: String,
+    pub dispatch_certainty: DmlCtasDispatchCertainty,
+    pub dispatched_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlCtasHistoricalDisposition {
+    Staged,
+    Published,
+    Aborted,
+    Absent,
+    Conflict,
+    Ambiguous,
+    Unsupported,
+}
+
+impl DmlCtasHistoricalDisposition {
+    pub const fn is_conclusive(self) -> bool {
+        matches!(
+            self,
+            Self::Staged | Self::Published | Self::Aborted | Self::Absent | Self::Conflict
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlCtasHistoricalObservationRecord {
+    pub action: DmlCtasActionKind,
+    pub child_operation_id: Uuid,
+    pub disposition: DmlCtasHistoricalDisposition,
+    pub observation_digest: String,
+    /// Mandatory for conclusive dispositions, absent only when the provider
+    /// explicitly reports ambiguous or unsupported evidence.
+    pub proof_digest: Option<String>,
+    /// Bounded opaque proof required to perform a guarded cleanup after
+    /// restart. Frontend persists but never interprets or logs the payload.
+    pub proof_payload: Option<DmlOpaquePayload>,
+    pub failure: Option<String>,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlCtasChildSupersessionRecord {
+    pub action: DmlCtasActionKind,
+    pub predecessor_child_operation_id: Uuid,
+    pub successor_child_operation_id: Uuid,
+    pub reason_digest: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlCtasCleanupRetention {
+    NotRequired,
+    Pending,
+    Completed,
+    ManualRetention,
+}
+
+/// Durable CP-3D facts stored beside the top-level CTAS operation.
+///
+/// `next_action` and `cleanup_retention` intentionally remain independent from
+/// the SQL-visible operation state. A terminal operation can therefore remain
+/// in the bounded recovery index until catalog visibility and proof-bound
+/// cleanup have both converged.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlCtasRecoveryRecord {
+    pub codec_version: u8,
+    pub capability_version: u16,
+    pub recovery_attempt_id: Uuid,
+    pub recovery_cycle: u32,
+    pub catalog_fence: Option<DmlCtasCatalogFenceRecord>,
+    /// Bounded opaque staged locator. Frontend never treats it as table
+    /// metadata and never opens an old provider session from it.
+    pub staged_locator: Option<DmlOpaquePayload>,
+    pub staged_proof_digest: Option<String>,
+    pub dispatch_checkpoints: Vec<DmlCtasDispatchCheckpointRecord>,
+    pub historical_observations: Vec<DmlCtasHistoricalObservationRecord>,
+    pub child_supersessions: Vec<DmlCtasChildSupersessionRecord>,
+    pub cleanup_retention: DmlCtasCleanupRetention,
+    pub next_action: StatementNextAction,
+    pub updated_at_ms: i64,
+}
+
+impl DmlCtasRecoveryRecord {
+    pub fn requires_recovery_scan(&self) -> bool {
+        self.next_action != StatementNextAction::None
+            || matches!(
+                self.cleanup_retention,
+                DmlCtasCleanupRetention::Pending | DmlCtasCleanupRetention::ManualRetention
+            )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmlCtasRecoveryMutationRequest {
+    pub operation_id: DmlOperationId,
+    pub expected_revision: u64,
+    pub mutation_id: Uuid,
+    pub recovery: DmlCtasRecoveryRecord,
+}
+
+fn validate_ctas_dispatch_checkpoint(
+    checkpoint: &DmlCtasDispatchCheckpointRecord,
+) -> Result<(), String> {
+    if checkpoint.child_operation_id.is_nil() {
+        return Err("CTAS dispatch checkpoint child operation id must not be nil".to_string());
+    }
+    if !is_lowercase_digest(&checkpoint.request_digest) {
+        return Err(
+            "CTAS dispatch checkpoint request digest must be lowercase SHA-256".to_string(),
+        );
+    }
+    match checkpoint.dispatch_certainty {
+        DmlCtasDispatchCertainty::ConfirmedNotDispatched
+            if checkpoint.dispatched_at_ms.is_some() =>
+        {
+            Err(
+                "CTAS confirmed-not-dispatched checkpoint cannot have a dispatch timestamp"
+                    .to_string(),
+            )
+        }
+        DmlCtasDispatchCertainty::PossiblyDispatched
+            if checkpoint
+                .dispatched_at_ms
+                .is_none_or(|timestamp| timestamp < 0) =>
+        {
+            Err(
+                "CTAS possibly-dispatched checkpoint requires a nonnegative dispatch timestamp"
+                    .to_string(),
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Validate one complete provider-neutral CP-3D recovery record.
+pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), String> {
+    if record.codec_version != DML_CTAS_RECOVERY_CODEC_VERSION {
+        return Err(format!(
+            "unsupported CTAS recovery codec version: {}",
+            record.codec_version
+        ));
+    }
+    if record.capability_version == 0 {
+        return Err("CTAS capability version must be nonzero".to_string());
+    }
+    if !is_uuid_v7(record.recovery_attempt_id) || record.recovery_cycle == 0 {
+        return Err("CTAS recovery requires a UUIDv7 attempt and nonzero cycle".to_string());
+    }
+    if record.updated_at_ms < 0 {
+        return Err("CTAS recovery timestamp must be nonnegative".to_string());
+    }
+    if let Some(fence) = &record.catalog_fence {
+        if fence.generation.control_plane_incarnation == 0
+            || fence.generation.resource_epoch == 0
+            || fence.generation.fence_generation == 0
+            || !is_lowercase_digest(&fence.request_digest)
+        {
+            return Err("CTAS catalog fence generation or request digest is invalid".to_string());
+        }
+        match fence.dispatch_certainty {
+            DmlCtasDispatchCertainty::ConfirmedNotDispatched
+                if fence.dispatched_at_ms.is_some() =>
+            {
+                return Err(
+                    "CTAS undispatched catalog fence cannot have a dispatch timestamp".to_string(),
+                );
+            }
+            DmlCtasDispatchCertainty::PossiblyDispatched
+                if fence.dispatched_at_ms.is_none_or(|timestamp| timestamp < 0) =>
+            {
+                return Err(
+                    "CTAS dispatched catalog fence requires a nonnegative timestamp".to_string(),
+                );
+            }
+            _ => {}
+        }
+        let receipt_complete = fence.fence_digest.is_some()
+            && fence.receipt_digest.is_some()
+            && fence.receipt_payload.is_some()
+            && fence.established_at_ms.is_some();
+        let receipt_absent = fence.fence_digest.is_none()
+            && fence.receipt_digest.is_none()
+            && fence.receipt_payload.is_none()
+            && fence.established_at_ms.is_none();
+        if !receipt_complete && !receipt_absent {
+            return Err(
+                "CTAS catalog fence receipt facts must become durable together".to_string(),
+            );
+        }
+        if receipt_complete {
+            if !is_lowercase_digest(fence.fence_digest.as_deref().unwrap())
+                || !is_lowercase_digest(fence.receipt_digest.as_deref().unwrap())
+                || fence
+                    .established_at_ms
+                    .is_some_and(|timestamp| timestamp < 0)
+            {
+                return Err("CTAS catalog fence receipt digest or timestamp is invalid".to_string());
+            }
+            if fence.dispatch_certainty != DmlCtasDispatchCertainty::PossiblyDispatched {
+                return Err("a confirmed CTAS catalog fence must have been dispatched".to_string());
+            }
+        }
+    }
+    match (&record.staged_locator, &record.staged_proof_digest) {
+        (Some(_locator), Some(proof)) => {
+            if !is_lowercase_digest(proof) {
+                return Err("CTAS staged proof digest must be lowercase SHA-256".to_string());
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "CTAS staged locator and proof digest must become durable together".to_string(),
+            );
+        }
+    }
+    if record.catalog_fence.is_none()
+        && (record.staged_locator.is_some()
+            || !record.dispatch_checkpoints.is_empty()
+            || !record.historical_observations.is_empty())
+    {
+        return Err("CTAS external checkpoints require a durable catalog fence".to_string());
+    }
+    let mut checkpoint_identities = Vec::with_capacity(record.dispatch_checkpoints.len());
+    for checkpoint in &record.dispatch_checkpoints {
+        validate_ctas_dispatch_checkpoint(checkpoint)?;
+        let identity = (checkpoint.action, checkpoint.child_operation_id);
+        if checkpoint_identities.contains(&identity) {
+            return Err("CTAS recovery has duplicate child action checkpoints".to_string());
+        }
+        checkpoint_identities.push(identity);
+    }
+    for observation in &record.historical_observations {
+        if observation.child_operation_id.is_nil() {
+            return Err(
+                "CTAS historical observation child operation id must not be nil".to_string(),
+            );
+        }
+        if !is_lowercase_digest(&observation.observation_digest) || observation.observed_at_ms < 0 {
+            return Err("CTAS historical observation digest or timestamp is invalid".to_string());
+        }
+        if observation
+            .proof_digest
+            .as_ref()
+            .is_some_and(|digest| !is_lowercase_digest(digest))
+        {
+            return Err("CTAS historical proof digest must be lowercase SHA-256".to_string());
+        }
+        let proof_complete =
+            observation.proof_digest.is_some() && observation.proof_payload.is_some();
+        let proof_absent =
+            observation.proof_digest.is_none() && observation.proof_payload.is_none();
+        if !proof_complete && !proof_absent {
+            return Err(
+                "CTAS historical proof digest and payload must become durable together".to_string(),
+            );
+        }
+        if observation.disposition.is_conclusive() && !proof_complete {
+            return Err(
+                "a conclusive CTAS historical observation requires provider proof".to_string(),
+            );
+        }
+        if matches!(
+            observation.disposition,
+            DmlCtasHistoricalDisposition::Ambiguous | DmlCtasHistoricalDisposition::Unsupported
+        ) && (!proof_absent || observation.failure.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(
+                "an inconclusive CTAS historical observation requires a durable failure and cannot carry cleanup proof"
+                    .to_string(),
+            );
+        }
+    }
+    for supersession in &record.child_supersessions {
+        if supersession.predecessor_child_operation_id.is_nil()
+            || supersession.successor_child_operation_id.is_nil()
+            || supersession.predecessor_child_operation_id
+                == supersession.successor_child_operation_id
+            || !is_lowercase_digest(&supersession.reason_digest)
+            || supersession.created_at_ms < 0
+        {
+            return Err("CTAS child supersession is invalid".to_string());
+        }
+    }
+    if record.cleanup_retention == DmlCtasCleanupRetention::Pending
+        && record.next_action == StatementNextAction::None
+    {
+        return Err("pending CTAS cleanup requires a recovery next action".to_string());
+    }
+    let encoded = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    if encoded.len() > DML_CTAS_RECOVERY_ENCODED_LIMIT {
+        return Err(format!(
+            "CTAS recovery encoded size {} exceeds limit {DML_CTAS_RECOVERY_ENCODED_LIMIT}",
+            encoded.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate monotone replacement of a CP-3D recovery record.
+pub fn validate_ctas_recovery_transition(
+    existing: Option<&DmlCtasRecoveryRecord>,
+    next: &DmlCtasRecoveryRecord,
+) -> Result<(), String> {
+    validate_ctas_recovery(next)?;
+    let Some(existing) = existing else {
+        if next.recovery_cycle != 1 {
+            return Err("a new CTAS recovery must start at cycle 1".to_string());
+        }
+        return Ok(());
+    };
+    if existing.capability_version != next.capability_version {
+        return Err("CTAS capability version is immutable once durable".to_string());
+    }
+    if next.recovery_cycle < existing.recovery_cycle {
+        return Err("CTAS recovery cycle must not move backwards".to_string());
+    }
+    if next.recovery_cycle == existing.recovery_cycle
+        && next.recovery_attempt_id != existing.recovery_attempt_id
+    {
+        return Err("one CTAS recovery cycle is owned by one coordination attempt".to_string());
+    }
+    match (&existing.catalog_fence, &next.catalog_fence) {
+        (Some(previous), Some(current)) if current.generation < previous.generation => {
+            return Err("CTAS catalog fence generation must not move backwards".to_string());
+        }
+        (Some(previous), Some(current)) if current.generation == previous.generation => {
+            if current.request_digest != previous.request_digest {
+                return Err("one CTAS catalog fence generation has one request digest".to_string());
+            }
+            if previous.dispatch_certainty == DmlCtasDispatchCertainty::PossiblyDispatched
+                && (current.dispatch_certainty != DmlCtasDispatchCertainty::PossiblyDispatched
+                    || current.dispatched_at_ms != previous.dispatched_at_ms)
+            {
+                return Err(
+                    "a dispatched CTAS catalog fence checkpoint cannot be rewound".to_string(),
+                );
+            }
+            if previous.receipt_payload.is_some()
+                && (current.fence_digest != previous.fence_digest
+                    || current.receipt_digest != previous.receipt_digest
+                    || current.receipt_payload != previous.receipt_payload
+                    || current.established_at_ms != previous.established_at_ms)
+            {
+                return Err("a confirmed CTAS catalog fence receipt is immutable".to_string());
+            }
+        }
+        (Some(_), None) => return Err("a durable CTAS catalog fence cannot be dropped".to_string()),
+        _ => {}
+    }
+    if existing.staged_locator.is_some()
+        && (existing.staged_locator != next.staged_locator
+            || existing.staged_proof_digest != next.staged_proof_digest)
+    {
+        return Err("a proven CTAS staged locator cannot be replaced or dropped".to_string());
+    }
+    for (index, previous) in existing.dispatch_checkpoints.iter().enumerate() {
+        let Some(current) = next.dispatch_checkpoints.get(index) else {
+            return Err("a durable CTAS dispatch checkpoint cannot be dropped".to_string());
+        };
+        let valid = current == previous
+            || (previous.dispatch_certainty == DmlCtasDispatchCertainty::ConfirmedNotDispatched
+                && current.dispatch_certainty == DmlCtasDispatchCertainty::PossiblyDispatched
+                && current.action == previous.action
+                && current.child_operation_id == previous.child_operation_id
+                && current.request_digest == previous.request_digest);
+        if !valid {
+            return Err(
+                "a CTAS dispatch checkpoint can only advance to possibly dispatched".to_string(),
+            );
+        }
+    }
+    if !next
+        .historical_observations
+        .starts_with(&existing.historical_observations)
+    {
+        return Err("CTAS historical observation history is append-only".to_string());
+    }
+    if !next
+        .child_supersessions
+        .starts_with(&existing.child_supersessions)
+    {
+        return Err("CTAS child supersession history is append-only".to_string());
+    }
+    if matches!(
+        existing.cleanup_retention,
+        DmlCtasCleanupRetention::Completed | DmlCtasCleanupRetention::ManualRetention
+    ) && existing.cleanup_retention != next.cleanup_retention
+    {
+        return Err("terminal CTAS cleanup retention cannot be reopened".to_string());
+    }
+    if existing.cleanup_retention == DmlCtasCleanupRetention::Pending
+        && next.cleanup_retention == DmlCtasCleanupRetention::NotRequired
+    {
+        return Err("pending CTAS cleanup cannot be forgotten".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

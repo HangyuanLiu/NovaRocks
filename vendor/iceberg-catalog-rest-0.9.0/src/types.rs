@@ -34,6 +34,14 @@ pub(super) struct CatalogConfig {
     pub(super) defaults: HashMap<String, String>,
 }
 
+impl CatalogConfig {
+    pub(super) fn merged_properties(&self) -> HashMap<String, String> {
+        let mut properties = self.defaults.clone();
+        properties.extend(self.overrides.clone());
+        properties
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 /// Wrapper for all non-2xx error responses from the REST API
 pub struct ErrorResponse {

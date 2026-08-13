@@ -17,6 +17,11 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
+#[path = "ctas_fenced_publication.rs"]
+mod ctas_fenced_publication;
+
+pub use ctas_fenced_publication::*;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
@@ -354,6 +359,9 @@ struct RestContext {
     ///
     /// It's could be different from the user config.
     config: RestCatalogConfig,
+    /// Properties advertised by `/v1/config`, excluding all user-supplied
+    /// properties. Extension capability gates must only consult this map.
+    server_properties: HashMap<String, String>,
 }
 
 /// Rest catalog implementation.
@@ -436,10 +444,15 @@ impl RestCatalog {
             .get_or_try_init(|| async {
                 let client = HttpClient::new(&self.user_config)?;
                 let catalog_config = RestCatalog::load_config(&client, &self.user_config).await?;
+                let server_properties = catalog_config.merged_properties();
                 let config = self.user_config.clone().merge_with_config(catalog_config);
                 let client = client.update_with(&config)?;
 
-                Ok(RestContext { config, client })
+                Ok(RestContext {
+                    config,
+                    client,
+                    server_properties,
+                })
             })
             .await
     }
