@@ -117,7 +117,11 @@ mod tests {
 
     #[test]
     fn manifest_accepts_only_explicit_only() {
-        assert!(SuiteManifest::parse("explicit_only = true\n").unwrap().explicit_only);
+        assert!(
+            SuiteManifest::parse("explicit_only = true\n")
+                .unwrap()
+                .explicit_only
+        );
         assert!(SuiteManifest::parse("cluster_size = 3\n").is_err());
     }
 
@@ -125,7 +129,10 @@ mod tests {
     fn all_selection_excludes_explicit_only_suites() {
         let suites = fixture_suites([("filter", false), ("explicit", true)]);
         assert_eq!(select_suite_names("all", &suites).unwrap(), vec!["filter"]);
-        assert_eq!(select_suite_names("explicit", &suites).unwrap(), vec!["explicit"]);
+        assert_eq!(
+            select_suite_names("explicit", &suites).unwrap(),
+            vec!["explicit"]
+        );
     }
 
     #[test]

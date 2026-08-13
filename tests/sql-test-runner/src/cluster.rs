@@ -26,9 +26,8 @@ use std::time::Duration;
 
 #[allow(unused_imports)]
 pub(crate) use novarocks_cluster_harness::{
-    BePorts, ClusterProcessRole, CrossProcessRuntime, QueryLifecyclePhase,
-    ServerHandle, build_novarocks_command, render_cross_process_config,
-    startup_timeout_from_env,
+    BePorts, ClusterProcessRole, CrossProcessRuntime, QueryLifecyclePhase, ServerHandle,
+    build_novarocks_command, render_cross_process_config, startup_timeout_from_env,
 };
 use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
 
@@ -151,7 +150,11 @@ fn resolve_base_app_config_path(repo_root: &Path, runner_config: &RunnerConfig) 
 }
 
 fn startup_timeout() -> Duration {
-    startup_timeout_from_env(std::env::var("NOVAROCKS_STARTUP_TIMEOUT_SECS").ok().as_deref())
+    startup_timeout_from_env(
+        std::env::var("NOVAROCKS_STARTUP_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 #[cfg(test)]

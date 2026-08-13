@@ -857,7 +857,6 @@ fn evaluate_log_evidence(
         }
     }
 
-
     for pattern in &step.meta.be_log_not_contains {
         let mut total = 0usize;
         for index in 0..endpoint_count {
@@ -870,9 +869,7 @@ fn evaluate_log_evidence(
                 "BE log unexpectedly contains forbidden step-scoped pattern {pattern:?} {total} time(s)"
             );
         }
-        successes.push(format!(
-            "    @be_log_not_contains PASS pattern={pattern:?}"
-        ));
+        successes.push(format!("    @be_log_not_contains PASS pattern={pattern:?}"));
     }
 
     for (pattern, required) in &step.meta.be_log_count_at_least {
@@ -1185,9 +1182,9 @@ mod tests {
         run(&step, &handle, &before, &mut log)
             .expect("pre-step markers must not fail a step-scoped assertion");
 
-        assert!(log.contains(
-            "@be_log_not_contains PASS pattern=\"NOVAROCKS_CONNECTOR_WRITER_OPENED\""
-        ));
+        assert!(
+            log.contains("@be_log_not_contains PASS pattern=\"NOVAROCKS_CONNECTOR_WRITER_OPENED\"")
+        );
     }
 
     #[test]
@@ -1204,9 +1201,11 @@ mod tests {
         let error = run(&step, &handle, &before, &mut log)
             .expect_err("post-step marker must fail the negative assertion");
 
-        assert!(error
-            .to_string()
-            .contains("unexpectedly contains forbidden step-scoped pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("unexpectedly contains forbidden step-scoped pattern")
+        );
     }
 
     #[test]

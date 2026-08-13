@@ -44,9 +44,8 @@ use crate::config::{
 };
 use crate::parser::load_suite_hook;
 use crate::results::{
-    case_result_path, compare_result_sets, find_legacy_result_paths, load_expected_results,
-    MismatchArtifacts,
-    normalize_explain_timing_rows, step_allows_missing_expected_result,
+    MismatchArtifacts, case_result_path, compare_result_sets, find_legacy_result_paths,
+    load_expected_results, normalize_explain_timing_rows, step_allows_missing_expected_result,
     step_has_implicit_skip_result, step_requires_recorded_result, step_retry_count,
     step_retry_interval, verify_text_assertions, write_mismatch_artifacts, write_result_file,
 };
@@ -569,34 +568,32 @@ fn execute_wait_alter(
         if let Some(ref exec) = execution {
             total_elapsed += exec.elapsed;
         }
-        if ok
-            && let Some(exec) = &execution
-        {
+        if ok && let Some(exec) = &execution {
             match classify_alter_job_poll(exec) {
-                    AlterJobPollState::Finished => {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
-                            kind.to_lowercase(),
-                            table_name,
-                            attempt + 1,
-                            max_retries,
-                        );
-                        return (true, total_elapsed);
-                    }
-                    AlterJobPollState::Failed(message) => {
-                        let _ = writeln!(
-                            log,
-                            "    ❌ wait_alter_{} on `{}` failed (attempt {}/{}): {}",
-                            kind.to_lowercase(),
-                            table_name,
-                            attempt + 1,
-                            max_retries,
-                            message,
-                        );
-                        return (false, total_elapsed);
-                    }
-                    AlterJobPollState::Pending => {}
+                AlterJobPollState::Finished => {
+                    let _ = writeln!(
+                        log,
+                        "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
+                        kind.to_lowercase(),
+                        table_name,
+                        attempt + 1,
+                        max_retries,
+                    );
+                    return (true, total_elapsed);
+                }
+                AlterJobPollState::Failed(message) => {
+                    let _ = writeln!(
+                        log,
+                        "    ❌ wait_alter_{} on `{}` failed (attempt {}/{}): {}",
+                        kind.to_lowercase(),
+                        table_name,
+                        attempt + 1,
+                        max_retries,
+                        message,
+                    );
+                    return (false, total_elapsed);
+                }
+                AlterJobPollState::Pending => {}
             }
         }
         if attempt + 1 < max_retries {
@@ -2000,8 +1997,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             .as_ref()
                             .and_then(|results| results.get(&step.query_number)),
                         last_execution.as_ref(),
-                    )
-                        && last_failure.starts_with("VERIFY FAILED: ")
+                    ) && last_failure.starts_with("VERIFY FAILED: ")
                     {
                         let artifact_id = format!("{}-query{}", case.case_id, step.query_number);
                         let reason = last_failure
@@ -2017,11 +2013,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             actual_rows: &execution.rows,
                             reason: &reason,
                         }) {
-                            let _ = writeln!(
-                                log,
-                                "    ⚠️ failed to write mismatch artifacts: {}",
-                                exc
-                            );
+                            let _ =
+                                writeln!(log, "    ⚠️ failed to write mismatch artifacts: {}", exc);
                         }
                     }
                 }
@@ -2559,7 +2552,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         }
     }
 
-    if !case_failed && ctx.mode == Mode::Record && case_requires_result_file
+    if !case_failed
+        && ctx.mode == Mode::Record
+        && case_requires_result_file
         && let Some(path) = case_path.as_ref()
     {
         if let Err(exc) = write_result_file(path, &recorded_results, multi_step) {

@@ -83,7 +83,8 @@ pub(crate) fn install(table: &str) -> Result<OrphanFixture> {
         namespace,
         table_name
     );
-    runtime()?.block_on(operator.write(&path, "novarocks orphan fixture\n"))
+    runtime()?
+        .block_on(operator.write(&path, "novarocks orphan fixture\n"))
         .with_context(|| format!("write MinIO orphan fixture {path}"))?;
     Ok(OrphanFixture {
         operator,
