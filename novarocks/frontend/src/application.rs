@@ -415,14 +415,25 @@ impl FrontendApplicationHost {
             None => None,
         };
         let statistics = host.statistics_service();
-        host.dml_service = Some(Arc::new(match host.coordination() {
-            Some(coordination) => DmlService::compose_with_coordination(
-                journal,
-                statistics,
-                coordination,
-                tokio::runtime::Handle::current(),
-            ),
-            None => DmlService::compose(journal, statistics),
+        let connector_control = host.connector_control_registry();
+        host.dml_service = Some(Arc::new({
+            let mut dml = match host.coordination() {
+                Some(coordination) => DmlService::compose_with_coordination(
+                    journal,
+                    statistics,
+                    coordination,
+                    tokio::runtime::Handle::current(),
+                ),
+                None => DmlService::compose(journal, statistics),
+            };
+            // The bounded recovery controller can only classify a historical
+            // TRUNCATE or ADD FILES through the current provider generation's
+            // separately installed historical facet, so it is given the
+            // control registry rather than any process-global state.
+            dml.install_statement_recovery(
+                crate::dml::statement_recovery::control_registry_resolver(connector_control),
+            );
+            dml
         }));
         if host.coordination.is_some() {
             host.dml_recovery_controller = Some(DmlRecoveryController::start(host.dml_service()));

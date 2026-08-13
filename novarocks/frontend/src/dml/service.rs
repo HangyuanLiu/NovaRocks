@@ -32,6 +32,10 @@ use crate::dml::runner::{
     ActiveWriteTransactionRunner, AlwaysAdmit, WriteAdmission, WriteExecutor,
     WriteTransactionRunner, preparing_request,
 };
+use crate::dml::statement_recovery::{
+    HistoricalDataMutationRecoveryResolver, StatementRecoveryProfile, StatementRecoveryProgress,
+    direct_mutation_kind, is_authority_loss,
+};
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
 /// admission) and drives write transactions. Constructed from narrow handles —
@@ -42,6 +46,11 @@ pub struct DmlService {
     admission: Arc<dyn WriteAdmission>,
     coordinator: Option<DmlCoordinator>,
     allow_unfenced_focused_test_support: bool,
+    /// The CP-3C direct data-mutation recovery profile, installed only when the
+    /// host can resolve the current provider generation's historical facet. A
+    /// service without it defers statement-family recovery instead of
+    /// classifying anything.
+    statement_recovery: Option<StatementRecoveryProfile>,
 }
 
 impl DmlService {
@@ -67,6 +76,7 @@ impl DmlService {
             admission: Arc::new(AlwaysAdmit),
             coordinator: None,
             allow_unfenced_focused_test_support: true,
+            statement_recovery: None,
         }
     }
 
@@ -88,7 +98,21 @@ impl DmlService {
             admission: Arc::new(AlwaysAdmit),
             coordinator: Some(DmlCoordinator::new(frontend, runtime)),
             allow_unfenced_focused_test_support: false,
+            statement_recovery: None,
         }
+    }
+
+    /// Install the CP-3C direct data-mutation recovery profile.
+    ///
+    /// The resolver reaches the *current* provider generation's separately
+    /// installed historical facet. Without it the bounded controller keeps
+    /// deferring TRUNCATE and ADD FILES rather than guessing anything about
+    /// external truth.
+    pub fn install_statement_recovery(
+        &mut self,
+        resolver: Arc<dyn HistoricalDataMutationRecoveryResolver>,
+    ) {
+        self.statement_recovery = Some(StatementRecoveryProfile::new(resolver));
     }
 
     /// Build a service with a custom admission gate (CP-3 fencing).
@@ -103,6 +127,7 @@ impl DmlService {
             admission,
             coordinator: None,
             allow_unfenced_focused_test_support: true,
+            statement_recovery: None,
         }
     }
 
@@ -174,22 +199,88 @@ impl DmlService {
         candidate: DmlRecoveryCandidate,
         next_due_at_ms: i64,
     ) -> Result<(), DmlError> {
+        let Some(mut active) = self.claim_recovery_candidate(candidate)? else {
+            return Ok(());
+        };
+        let result = active.reschedule_recovery_due(Some(next_due_at_ms));
+        let release = active.release();
+        result.and(release)
+    }
+
+    /// Drive one claimed recovery candidate through its family profile.
+    ///
+    /// The claim is taken under the candidate's exact operation lease, exactly
+    /// as the blanket deferral took it. A direct data-mutation family
+    /// (TRUNCATE, ADD FILES) converges through the CP-3C profile when one is
+    /// installed; every other family keeps the bounded deferral until its own
+    /// profile lands. The lease is released either way.
+    pub(crate) fn drive_recovery_candidate(
+        &self,
+        candidate: DmlRecoveryCandidate,
+        now_ms: i64,
+        deferred_due_at_ms: i64,
+    ) -> Result<Option<StatementRecoveryProgress>, DmlError> {
+        let Some(profile) = self.statement_recovery.as_ref() else {
+            self.defer_recovery_candidate(candidate, deferred_due_at_ms)?;
+            return Ok(None);
+        };
+        let Some(mut active) = self.claim_recovery_candidate(candidate)? else {
+            return Ok(None);
+        };
+        // The scan candidate carries no family, so the decision is taken from
+        // the claimed operation itself.
+        if direct_mutation_kind(active.stored.operation_kind).is_none() {
+            let result = active.reschedule_recovery_due(Some(deferred_due_at_ms));
+            let release = active.release();
+            return result.and(release).map(|()| None);
+        }
+        let result = profile.drive(&mut active, now_ms);
+        // The lease is released whichever way the cycle went: a profile failure
+        // must never strand the operation under a dead owner.
+        let release = active.release();
+        match result {
+            Ok(progress) => release.map(|()| Some(progress)),
+            Err(error) => {
+                // Losing the lease mid-cycle is an ordinary takeover, not a
+                // fault: the new owner re-drives the same immutable request.
+                // The release failure, if any, is subordinate to the cycle
+                // failure that already explains this operation's state.
+                if let Err(release_error) = release {
+                    tracing::debug!(
+                        error = %release_error,
+                        "historical data mutation recovery could not release its lease"
+                    );
+                }
+                if is_authority_loss(&error) {
+                    tracing::debug!(
+                        error = %error,
+                        "historical data mutation recovery lost its authority mid-cycle"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-read and claim one recovery candidate under its exact operation
+    /// lease, or report that it moved on since the scan observed it.
+    fn claim_recovery_candidate(
+        &self,
+        candidate: DmlRecoveryCandidate,
+    ) -> Result<Option<ActiveDmlOperation>, DmlError> {
         let journal = self.require_journal_arc()?;
         let Some(operation) = journal.load(candidate.operation_id)? else {
-            return Ok(());
+            return Ok(None);
         };
         if operation.revision != candidate.operation_revision
             || operation.last_mutation_id != candidate.last_mutation_id
             || operation.recovery_due_at_ms != Some(candidate.recovery_due_at_ms)
         {
-            return Ok(());
+            return Ok(None);
         }
-        let mut active = self
-            .require_coordinator()?
-            .claim_recovery(journal, operation)?;
-        let result = active.reschedule_recovery_due(Some(next_due_at_ms));
-        let release = active.release();
-        result.and(release)
+        self.require_coordinator()?
+            .claim_recovery(journal, operation)
+            .map(Some)
     }
 
     /// Run one Iceberg write transaction with the given executor.

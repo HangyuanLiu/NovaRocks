@@ -17,10 +17,19 @@
 
 //! Bounded CP-3A recovery scheduling.
 //!
-//! Statement-family historical reconciliation lands in CP-3B/C/D. Until
-//! those profiles are installed, this controller only claims due operations
-//! under their exact operation lease and defers them without changing any
-//! business lifecycle or external evidence.
+//! The controller claims due operations under their exact operation lease and
+//! hands each claim to the family profile that owns it. CP-3C installs the
+//! first one: a direct data-mutation family (TRUNCATE, ADD FILES) converges
+//! through [`crate::dml::statement_recovery`], which raises a strictly higher
+//! external fence, classifies the historical attempt against immutable external
+//! truth, and finalizes, cleans up, or stays unresolved.
+//!
+//! Every other family keeps the original behaviour — claim, defer, change no
+//! business lifecycle and no external evidence — until its own profile lands
+//! (CP-3B for distributed writes, CP-3D for CTAS). The same bounded budgets
+//! apply to both paths: the poll interval, the claims-per-poll cap, and the
+//! round-robin shard offsets are unchanged, so installing a profile cannot make
+//! the scan busier than the deferral it replaced.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,16 +110,24 @@ impl DmlRecoveryController {
                         let operation_id = candidate.operation_id;
                         let next_due =
                             cutoff.saturating_add(DML_RECOVERY_UNSUPPORTED_PROFILE_DELAY_MS);
+                        // The profile talks to a provider and to the StateStore
+                        // through blocking ports, so one bounded cycle runs on
+                        // the blocking pool exactly like the deferral did.
                         match tokio::task::spawn_blocking(move || {
-                            service_for_claim.defer_recovery_candidate(candidate, next_due)
+                            service_for_claim.drive_recovery_candidate(candidate, cutoff, next_due)
                         })
                         .await
                         {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(None)) => {}
+                            Ok(Ok(Some(progress))) => tracing::debug!(
+                                operation_id = %operation_id,
+                                ?progress,
+                                "DML historical data mutation recovery cycle completed"
+                            ),
                             Ok(Err(error)) => tracing::debug!(
                                 operation_id = %operation_id,
                                 error = %error,
-                                "DML recovery candidate was not claimed"
+                                "DML recovery candidate was not claimed or could not converge"
                             ),
                             Err(error) => tracing::warn!(
                                 operation_id = %operation_id,
