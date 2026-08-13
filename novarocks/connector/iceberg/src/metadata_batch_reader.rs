@@ -559,6 +559,14 @@ fn load_snapshot_rows(cfg: &MetadataBatchReaderConfig) -> Result<Vec<SnapshotMet
     let mut rows = Vec::with_capacity(metadata.snapshots().len());
     for snapshot in metadata.snapshots() {
         let summary = snapshot.summary();
+        // External write fence markers are provider bookkeeping, not table
+        // history. They carry no data and describe no user write, so they must
+        // not appear in `$snapshots` alongside the snapshots a user actually
+        // produced. (They remain present in the raw Iceberg metadata, which is
+        // an accepted cost of the carrier -- see ADR-0068.)
+        if crate::commit::write_fence::is_fence_marker_snapshot(summary) {
+            continue;
+        }
         let summary_pairs = if summary.additional_properties.is_empty() {
             None
         } else {

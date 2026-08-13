@@ -43,9 +43,7 @@ use crate::iceberg::spec::{
     Operation, PartitionSpecRef, Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -53,9 +51,9 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
-    effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    read_snapshot_manifest_list, required_target_ref_snapshot_id, snapshot_summary,
-    target_ref_snapshot_id, write_manifest_list,
+    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
+    snapshot_summary, submit_fenced_action, target_ref_snapshot_id, write_manifest_list,
 };
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, WrittenFile};
@@ -95,7 +93,7 @@ impl IcebergCommitAction for RowDeltaCommit {
         }
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let action = RowDeltaTxnAction {
+        let action = Arc::new(RowDeltaTxnAction {
             written,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
@@ -104,33 +102,43 @@ impl IcebergCommitAction for RowDeltaCommit {
             manifest_paths_out: manifest_paths_out.clone(),
             target_ref: ctx.target_ref.to_string(),
             snapshot_properties: ctx.snapshot_properties.clone(),
-        };
+        });
 
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
+        let written_manifest_paths = || {
+            manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .clone()
+        };
 
-        let tx = Transaction::new(ctx.table);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("RowDelta apply failed: {e}"))?;
-        let table_after = tx
-            .commit(ctx.catalog)
-            .await
-            .map_err(|e| format!("RowDelta commit failed: {e}"))?;
-        let new_snapshot_id =
-            required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, "RowDelta")?;
-        // DELETE preserves NDV upper-bound semantics — carry forward the
-        // previous snapshot's Puffin entry to the new snapshot id.
-        if let Some(prev) = prev_snapshot_id {
-            carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev).await;
+        match submit_fenced_action(ctx.catalog, ctx.table, action, ctx.fence, "RowDelta").await {
+            Ok(FencedSubmit::Committed(table_after)) => {
+                let new_snapshot_id = required_target_ref_snapshot_id(
+                    table_after.metadata(),
+                    ctx.target_ref,
+                    "RowDelta",
+                )?;
+                // DELETE preserves NDV upper-bound semantics — carry forward the
+                // previous snapshot's Puffin entry to the new snapshot id.
+                if let Some(prev) = prev_snapshot_id {
+                    carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev)
+                        .await;
+                }
+                Ok(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: written_manifest_paths(),
+                })
+            }
+            // Delete-file input is non-empty here (spec §4.1 handled the empty
+            // case above) and the action always stages a snapshot, so this arm
+            // reports the same value the empty-input no-op above reports.
+            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+                new_snapshot_id: prev_snapshot_id.unwrap_or(0),
+                written_manifest_paths: written_manifest_paths(),
+            }),
+            Err(error) => Err(error.into_detail()),
         }
-        let written_manifest_paths = manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .clone();
-        Ok(CommitOutcome {
-            new_snapshot_id,
-            written_manifest_paths,
-        })
     }
 }
 

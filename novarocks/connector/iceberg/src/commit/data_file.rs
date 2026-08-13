@@ -16,71 +16,13 @@
 // for the specific language governing permissions and
 // limitations under the License.
 
-//! `WrittenFile` → `crate::iceberg::spec::DataFile` conversion shared across
-//! all three commit-action implementations.
+//! `crate::iceberg::spec::DataFile` re-construction shared by the
+//! commit-action implementations.
 //!
-//! `DataFile` fields are `pub(crate)` in iceberg-rust 0.9, so construction
-//! goes through `DataFileBuilder`. Column statistics carried by the
-//! `WrittenFile` (`column_sizes`, `value_counts`, `null_value_counts`,
-//! `nan_value_counts`, `lower_bounds`, `upper_bounds`, per spec §3.4) are forwarded onto the
-//! committed manifest entry. Bounds are passed through as `Datum`s; the
-//! iceberg-rust manifest serializer applies the spec's binary single-value
-//! encoding. Empty maps remain at the builder defaults.
+//! `DataFile` fields are `pub(crate)` in iceberg-rust 0.9, so every
+//! reconstruction goes through `DataFileBuilder`.
 
 use crate::iceberg::spec::{DataFile, DataFileBuilder};
-
-use super::collector::IcebergCommitCollector;
-use crate::commit::WrittenFile;
-
-pub fn written_file_to_iceberg_data_file(
-    f: &WrittenFile,
-    _collector: &IcebergCommitCollector,
-) -> Result<DataFile, String> {
-    let mut builder = DataFileBuilder::default();
-    builder
-        .content(f.content)
-        .file_path(f.path.clone())
-        .file_format(f.format)
-        .partition(f.partition_values.clone())
-        .partition_spec_id(f.partition_spec_id)
-        .record_count(f.record_count)
-        .file_size_in_bytes(f.file_size_in_bytes);
-
-    if !f.split_offsets.is_empty() {
-        builder.split_offsets(Some(f.split_offsets.clone()));
-    }
-    if let Some(km) = &f.key_metadata {
-        builder.key_metadata(Some(km.clone()));
-    }
-    if let Some(ref_path) = &f.referenced_data_file {
-        builder.referenced_data_file(Some(ref_path.clone()));
-    }
-    if let Some(equality_ids) = &f.equality_ids {
-        builder.equality_ids(Some(equality_ids.clone()));
-    }
-    if !f.column_sizes.is_empty() {
-        builder.column_sizes(f.column_sizes.clone());
-    }
-    if !f.value_counts.is_empty() {
-        builder.value_counts(f.value_counts.clone());
-    }
-    if !f.null_value_counts.is_empty() {
-        builder.null_value_counts(f.null_value_counts.clone());
-    }
-    if !f.nan_value_counts.is_empty() {
-        builder.nan_value_counts(f.nan_value_counts.clone());
-    }
-    if !f.lower_bounds.is_empty() {
-        builder.lower_bounds(f.lower_bounds.clone());
-    }
-    if !f.upper_bounds.is_empty() {
-        builder.upper_bounds(f.upper_bounds.clone());
-    }
-
-    builder
-        .build()
-        .map_err(|e| format!("failed to build iceberg DataFile from WrittenFile: {e}"))
-}
 
 /// Clone a `DataFile`, overriding `first_row_id` with the given value.
 ///

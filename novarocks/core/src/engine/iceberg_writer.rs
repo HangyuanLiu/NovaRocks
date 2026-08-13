@@ -45,11 +45,11 @@ use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
-    ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest,
-    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest,
+    ConnectorError, ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -433,6 +433,28 @@ impl PreparedIcebergWrite {
 
     pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
         self.spec.commit.base_snapshot_id
+    }
+
+    /// The exact write authority this preparation activated, ready to be fenced.
+    ///
+    /// INSERT APPEND and INSERT OVERWRITE both activate their write generation
+    /// during preparation, so the authority already exists before the frontend
+    /// dispatches anything. The identity comes from the activated template: its
+    /// operation id and provider-signed target ref, plus the resolved target
+    /// namespace and table the same generation loaded.
+    pub(crate) fn external_fence_authority(
+        &self,
+    ) -> Result<crate::engine::external_write_fence::ExternalWriteFenceAuthority, ConnectorError>
+    {
+        let template = &self.executor.connector_write;
+        crate::engine::external_write_fence::ExternalWriteFenceAuthority::try_new(
+            template.lease(),
+            template.operation_id(),
+            &self.executor.target.namespace,
+            &self.executor.target.table,
+            template.preparation().target_ref().clone(),
+            self.executor.connector_context.clone(),
+        )
     }
 
     pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {

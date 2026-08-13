@@ -32,8 +32,9 @@ use uuid::Uuid;
 
 use super::{
     ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorMutationFailure,
-    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExternalFenceReceipt,
+    ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorMutationFailure,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteFencing, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
@@ -486,7 +487,7 @@ impl ConnectorWriteTargetRef {
         self.0.as_ref()
     }
 
-    fn validate(&self) -> Result<(), ConnectorError> {
+    pub(super) fn validate(&self) -> Result<(), ConnectorError> {
         if self.0.is_empty() || self.0.len() > 256 || self.0.chars().any(char::is_control) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -2775,9 +2776,14 @@ pub struct ConnectorOpenWriterRequest {
     pub context: ConnectorRequestContext,
 }
 
+/// A terminal commit submitted under one established external fence.
+///
+/// The fence is not optional: the provider compares it at the external
+/// linearization point so a superseded control-plane owner cannot commit late.
 #[derive(Clone)]
 pub struct ConnectorWriteCommitRequest {
     pub completion: ConnectorWriteOperationCompletion,
+    pub fence: ConnectorWriteFencing,
     pub context: ConnectorRequestContext,
 }
 
@@ -2801,6 +2807,15 @@ impl ConnectorWriteCommitRequest {
     pub const fn aggregate_digest(&self) -> [u8; 32] {
         self.completion.aggregate_digest()
     }
+
+    pub fn fence(&self) -> &ConnectorWriteFencing {
+        &self.fence
+    }
+
+    /// Fail closed unless the carried fence seals exactly this operation.
+    pub fn validate_fence(&self) -> Result<(), ConnectorError> {
+        self.fence.validate_for_operation(self.operation_id())
+    }
 }
 
 #[derive(Clone)]
@@ -2809,6 +2824,7 @@ pub struct ConnectorWriteAbortRequest {
     pub sealed: ConnectorSealedWriteCohortSet,
     pub cohorts: Vec<ConnectorWriteCohortCompletion>,
     pub aggregate_digest: [u8; 32],
+    pub fence: ConnectorWriteFencing,
     pub context: ConnectorRequestContext,
 }
 
@@ -2817,21 +2833,28 @@ impl ConnectorWriteAbortRequest {
         owner: ConnectorExecutionBindingKey,
         sealed: ConnectorSealedWriteCohortSet,
         cohorts: Vec<ConnectorWriteCohortCompletion>,
+        fence: ConnectorWriteFencing,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_operation_cohorts(&owner, &sealed, &cohorts, false)?;
+        fence.validate_for_operation(sealed.operation_id())?;
         let aggregate_digest = operation_completion_digest(&owner, &sealed, &cohorts);
         Ok(Self {
             owner,
             sealed,
             cohorts,
             aggregate_digest,
+            fence,
             context,
         })
     }
 
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
         self.sealed.operation_id
+    }
+
+    pub fn fence(&self) -> &ConnectorWriteFencing {
+        &self.fence
     }
 }
 
@@ -2841,8 +2864,20 @@ pub struct ConnectorWriteReconcileRequest {
     pub operation_id: ConnectorWriteOperationId,
     pub cohort_set_digest: [u8; 32],
     pub aggregate_digest: [u8; 32],
+    pub fence: ConnectorWriteFencing,
     pub evidence: ExternalMutationEvidence,
     pub context: ConnectorRequestContext,
+}
+
+impl ConnectorWriteReconcileRequest {
+    pub fn fence(&self) -> &ConnectorWriteFencing {
+        &self.fence
+    }
+
+    /// Fail closed unless the carried fence seals exactly this operation.
+    pub fn validate_fence(&self) -> Result<(), ConnectorError> {
+        self.fence.validate_for_operation(self.operation_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2911,6 +2946,26 @@ pub trait ConnectorWriteControl: Send + Sync {
         ))
     }
 
+    /// Atomically establish or raise the external operation fence for one
+    /// coordination attempt, before any writer or commit dispatch that can
+    /// produce an irreversible external effect.
+    ///
+    /// Implementations must compare the fence generation at the same external
+    /// linearization point as the later commit: a lower generation must not be
+    /// able to commit afterwards, an identical request must be idempotent, and
+    /// a foreign operation must never reuse another operation's marker. A
+    /// conflict must be reported with `ConnectorError::external_fence`, never
+    /// downgraded to an unknown or unsupported result.
+    fn establish_external_fence(
+        &self,
+        _request: ConnectorExternalFenceRequest,
+    ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement external operation fencing",
+        ))
+    }
+
     fn plan_write(
         &self,
         request: ConnectorWritePlanningRequest,
@@ -2938,11 +2993,30 @@ pub struct ConnectorWriteLease {
     control: Arc<dyn ConnectorWriteControl>,
     execution_distribution: Option<Arc<dyn ConnectorExecutionDistribution>>,
     metadata: Option<Arc<dyn super::ConnectorMetadata>>,
+    fence: Arc<Mutex<Option<ConnectorEstablishedWriteFence>>>,
     _release: Arc<ConnectorWriteLeaseRelease>,
 }
 
 struct ConnectorWriteLeaseRelease {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
+}
+
+/// The external operation fence established for one exact write authority,
+/// together with the provider receipt that acknowledged it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorEstablishedWriteFence {
+    fence: ConnectorExternalOperationFence,
+    receipt: ConnectorExternalFenceReceipt,
+}
+
+impl ConnectorEstablishedWriteFence {
+    pub fn fence(&self) -> &ConnectorExternalOperationFence {
+        &self.fence
+    }
+
+    pub fn receipt(&self) -> &ConnectorExternalFenceReceipt {
+        &self.receipt
+    }
 }
 
 impl ConnectorWriteLease {
@@ -2962,9 +3036,96 @@ impl ConnectorWriteLease {
             control,
             execution_distribution: None,
             metadata: None,
+            fence: Arc::new(Mutex::new(None)),
             _release: Arc::new(ConnectorWriteLeaseRelease {
                 release: Mutex::new(Some(Box::new(release))),
             }),
+        })
+    }
+
+    /// Establish or raise the external operation fence of this exact write
+    /// authority.
+    ///
+    /// The fence belongs to the authority rather than to a single operation
+    /// session, because every terminal provider call of one coordination
+    /// attempt goes through this lease: the sealed operation session, the
+    /// known-empty release, and the pre-registration abort of an already
+    /// activated authority. Clones of one lease share the established fence.
+    ///
+    /// This must be called before any writer or commit dispatch that can
+    /// produce an irreversible external effect. Replaying the identical fence
+    /// is idempotent; a generation behind the established fence is rejected as
+    /// a typed stale conflict before the provider is contacted.
+    pub fn establish_external_fence(
+        &self,
+        fence: ConnectorExternalOperationFence,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
+        fence.validate()?;
+        if let Some(established) = self.lock_fence()?.as_ref() {
+            fence.validate_monotonic_successor_of(established.fence())?;
+        }
+        let receipt = self
+            .control
+            .establish_external_fence(ConnectorExternalFenceRequest {
+                owner: self.binding_key.clone(),
+                fence: fence.clone(),
+                context,
+            })?;
+        receipt.validate()?;
+        if !receipt.matches(&fence) {
+            return Err(ConnectorError::external_fence(
+                super::ConnectorExternalFenceFailure::ForeignOperation,
+                "connector provider returned an external fence receipt for another fence",
+            ));
+        }
+        let mut slot = self.lock_fence()?;
+        // Re-check under the write lock: a concurrent establishment may have
+        // raised this authority's fence while the provider call was in flight.
+        if let Some(established) = slot.as_ref() {
+            fence.validate_monotonic_successor_of(established.fence())?;
+        }
+        let established = ConnectorEstablishedWriteFence { fence, receipt };
+        *slot = Some(established.clone());
+        Ok(established)
+    }
+
+    /// The established external fence of this authority, if any.
+    pub fn established_external_fence(
+        &self,
+    ) -> Result<Option<ConnectorEstablishedWriteFence>, ConnectorError> {
+        Ok(self.lock_fence()?.clone())
+    }
+
+    /// Fail closed unless this authority has an established external fence.
+    ///
+    /// There is deliberately no unfenced terminal path: without an established
+    /// fence the provider has no linearization point that could reject a late
+    /// commit from a superseded control-plane owner, so the operation must be
+    /// left to historical write recovery instead of being terminalized here.
+    pub fn require_external_fence(
+        &self,
+    ) -> Result<ConnectorExternalOperationFence, ConnectorError> {
+        self.lock_fence()?
+            .as_ref()
+            .map(|established| established.fence.clone())
+            .ok_or_else(|| {
+                ConnectorError::external_fence(
+                    super::ConnectorExternalFenceFailure::NotEstablished,
+                    "connector write authority has no established external fence; the fence must be established before any commit, abort or reconcile",
+                )
+            })
+    }
+
+    fn lock_fence(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<ConnectorEstablishedWriteFence>>, ConnectorError>
+    {
+        self.fence.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector write lease external fence lock poisoned",
+            )
         })
     }
 

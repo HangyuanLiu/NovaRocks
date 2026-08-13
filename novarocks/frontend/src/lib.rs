@@ -20,7 +20,8 @@ pub mod catalog_application;
 pub mod catalog_attachment;
 pub mod catalog_controller;
 pub mod connector;
-mod coordination;
+#[doc(hidden)]
+pub mod coordination;
 pub mod coordinator;
 pub mod deployment;
 pub mod dml;

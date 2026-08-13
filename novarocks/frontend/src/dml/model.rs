@@ -24,12 +24,17 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence,
 };
 use novarocks_state_store::coordination::FencingToken;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 /// Ordinary DML journal values are intentionally an atomic format. There is
 /// no persisted predecessor to read or migrate.
-pub const DML_OPERATION_SCHEMA_VERSION: u8 = 5;
+///
+/// CP-3B cuts v5 to v6. A v5 operation record predates the external operation
+/// fence invariant, so it may describe a write that was dispatched without a
+/// confirmed fence receipt. v6 code must never interpret such a record: the
+/// journal fails the read explicitly instead of migrating or dual-reading it.
+pub const DML_OPERATION_SCHEMA_VERSION: u8 = 6;
 pub const DML_UNFINISHED_SCHEMA_VERSION: u8 = 1;
 pub const DML_COORDINATION_RESOURCE_CODEC_VERSION: u8 = 1;
 pub const DML_RECOVERY_DUE_SCHEMA_VERSION: u8 = 1;
@@ -38,6 +43,22 @@ pub const DML_FOREGROUND_RECOVERY_VISIBILITY_MS: i64 = 18_000;
 pub const DML_RECOVERY_PAGE_SIZE: usize = 128;
 pub const DML_EXTERNAL_FACT_ENCODED_LIMIT: usize = 16 * 1024;
 pub const DML_CONNECTOR_WRITE_WIRE_LIMIT: usize = 128 * 1024;
+/// CP-3B external operation fence receipt codec. The frontend stores identity,
+/// scalar generation values, digests, and a bounded opaque provider payload.
+pub const DML_EXTERNAL_FENCE_CODEC_VERSION: u8 = 1;
+/// CP-3B historical write recovery codec.
+pub const DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION: u8 = 1;
+/// Raw byte bound for one opaque provider payload. The durable form is
+/// lowercase hex, so a payload contributes at most twice this many encoded
+/// bytes plus JSON framing.
+pub const DML_OPAQUE_PAYLOAD_LIMIT: usize = 4 * 1024;
+/// Encoded bound for one complete external fence receipt record: one opaque
+/// payload plus identity, generation, and digest framing.
+pub const DML_EXTERNAL_FENCE_ENCODED_LIMIT: usize = 12 * 1024;
+/// Encoded bound for one complete historical write recovery record: the sealed
+/// request (with the old fence receipt), the raised fence receipt, and up to
+/// three opaque payloads.
+pub const DML_HISTORICAL_WRITE_RECOVERY_ENCODED_LIMIT: usize = 48 * 1024;
 /// CTAS retains four phase facts in one StateStore value. Bound each complete
 /// fact envelope, not each individual string, so the four-fact maximum leaves
 /// room for operation identity, target facts, digests, and JSON framing.
@@ -479,6 +500,760 @@ pub struct OperationFact {
     pub lifecycle: ConnectorWriteLifecycleRecord,
 }
 
+// ---------------------------------------------------------------------------
+// CP-3B: external operation fence and historical write recovery records.
+//
+// These records are deliberately provider-neutral: identity, scalar generation
+// values, digests, and bounded opaque payloads only. They must not depend on
+// any connector fence or historical-recovery type, so the frontend cannot start
+// interpreting provider payloads. Mapping SPI values onto these fields belongs
+// to the frontend fence projection and recovery profile, not to the journal.
+// ---------------------------------------------------------------------------
+
+/// A bounded provider payload the frontend stores without interpretation.
+///
+/// External fence receipts, historical proofs, evidence, and continuations are
+/// opaque: the frontend never decodes them, and `Debug` never reveals their
+/// contents. The durable form is canonical lowercase hex so a record's encoded
+/// size stays a predictable multiple of its payload length.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DmlOpaquePayload(Vec<u8>);
+
+impl DmlOpaquePayload {
+    pub fn try_new(bytes: Vec<u8>) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > DML_OPAQUE_PAYLOAD_LIMIT {
+            return Err(format!(
+                "opaque DML payload must hold 1..={DML_OPAQUE_PAYLOAD_LIMIT} bytes, found {}",
+                bytes.len()
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DmlOpaquePayload {
+    /// Redacted on purpose: an opaque provider payload must never reach a log.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DmlOpaquePayload")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
+impl Serialize for DmlOpaquePayload {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for DmlOpaquePayload {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&text).map_err(serde::de::Error::custom)?;
+        if hex::encode(&bytes) != text {
+            return Err(serde::de::Error::custom(
+                "opaque DML payload must use canonical lowercase hex",
+            ));
+        }
+        Self::try_new(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Totally ordered generation of one external operation fence.
+///
+/// The order is lexicographic over the declared field order: a higher control
+/// plane incarnation outranks any resource epoch, and a higher resource epoch
+/// outranks any provider fence generation. That is exactly the comparison a new
+/// owner needs to prove its fence is strictly above the old authority's fence
+/// without reading any connector type.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DmlExternalFenceGeneration {
+    /// CP-1 control plane incarnation the fence was minted under (nonzero).
+    pub control_plane_incarnation: u64,
+    /// CP-1 resource epoch of the fenced operation lease (nonzero).
+    pub resource_epoch: u64,
+    /// Provider-visible monotone fence generation (nonzero).
+    pub fence_generation: u64,
+}
+
+/// Identity an external operation fence is bound to.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlExternalFenceIdentity {
+    /// Digest of the cluster identity the fence was minted from.
+    pub cluster_identity_digest: String,
+    /// Digest of the fenced resource identity (table plus target ref).
+    pub resource_digest: String,
+    /// Stable write operation id every attempt of this DML statement shares.
+    pub write_operation_id: Uuid,
+    /// CP-3A coordination attempt that minted the fence.
+    pub coordination_attempt_id: Uuid,
+    pub generation: DmlExternalFenceGeneration,
+}
+
+/// Durable proof that one DML operation attempt confirmed an external
+/// operation fence before any writer or commit dispatch could start.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlExternalFenceReceiptRecord {
+    pub codec_version: u8,
+    pub identity: DmlExternalFenceIdentity,
+    /// Digest of the fence value the provider compared at its linearization
+    /// point.
+    pub fence_digest: String,
+    /// Digest of the provider receipt that confirmed the fence.
+    pub receipt_digest: String,
+    pub receipt_payload: DmlOpaquePayload,
+    pub established_at_ms: i64,
+}
+
+impl DmlExternalFenceReceiptRecord {
+    pub const fn generation(&self) -> DmlExternalFenceGeneration {
+        self.identity.generation
+    }
+}
+
+/// What the frontend knew about the old attempt's dispatch when it sealed a
+/// historical write recovery request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlHistoricalDispatchCertainty {
+    ConfirmedNotDispatched,
+    PossiblyDispatched,
+    ConfirmedDispatched,
+}
+
+/// Typed provider disposition of a historical write operation.
+///
+/// The frontend classifies nothing itself: it records exactly what the current
+/// provider generation proved and never downgrades a conflict to an unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlHistoricalWriteDisposition {
+    /// Provider proved the target external truth carries this operation.
+    Applied,
+    /// Provider proved the old operation did not commit.
+    NotApplied,
+    /// Provider proved no writer or commit was ever dispatched.
+    NotDispatched,
+    /// Writer output exists but was never committed; cleanup is proof-bound.
+    Staged,
+    /// External base or fence moved on under another operation.
+    Conflict,
+    /// Evidence is insufficient; the recovery index must be retained.
+    Ambiguous,
+    /// The provider has no historical write recovery capability.
+    Unsupported,
+}
+
+/// Retention state of the proof-bound cleanup a disposition may require.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlHistoricalCleanupState {
+    NotRequired,
+    Pending,
+    Completed,
+    /// Explicitly handed to an operator. The obligation is retained but the
+    /// bounded automatic scan stops.
+    ManualRetention,
+}
+
+/// Where one historical write recovery cycle stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DmlHistoricalRecoveryPhase {
+    /// The immutable request is durable; no higher fence exists yet.
+    Requested,
+    /// The current generation established a strictly higher external fence.
+    FenceRaised,
+    /// The provider returned a conclusive typed disposition.
+    Inspected,
+    /// A proof-bound guarded cleanup is outstanding.
+    CleanupPending,
+    /// Terminal: finalized, cleaned up, or handed to an operator.
+    Resolved,
+    /// Evidence was insufficient; a later cycle may repeat inspection.
+    Unresolved,
+}
+
+impl DmlHistoricalRecoveryPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "REQUESTED",
+            Self::FenceRaised => "FENCE_RAISED",
+            Self::Inspected => "INSPECTED",
+            Self::CleanupPending => "CLEANUP_PENDING",
+            Self::Resolved => "RESOLVED",
+            Self::Unresolved => "UNRESOLVED",
+        }
+    }
+
+    /// Monotone progress rank inside one recovery cycle. A retry that needs to
+    /// move backwards must open a new cycle instead.
+    const fn progress(self) -> u8 {
+        match self {
+            Self::Requested => 0,
+            Self::FenceRaised => 1,
+            Self::Inspected => 2,
+            Self::CleanupPending => 3,
+            Self::Unresolved => 4,
+            Self::Resolved => 5,
+        }
+    }
+}
+
+/// The immutable, digest-sealed description of the historical write a new owner
+/// asks the current provider generation to classify.
+///
+/// Every field is either neutral identity, a digest, or a bounded opaque
+/// payload. The frontend never resolves the old owner into a live binding and
+/// never replays the old operation through the ordinary write path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlHistoricalWriteRequestRecord {
+    /// Old exact connector owner, kept as neutral strings for audit only.
+    pub old_provider_id: String,
+    pub old_connector_instance_id: String,
+    /// 32 lowercase hexadecimal characters.
+    pub old_connector_incarnation: String,
+    pub old_coordination_attempt_id: Option<Uuid>,
+    /// The fence the old attempt confirmed, when one was durable. This is the
+    /// baseline a raised fence must be strictly above.
+    pub old_fence: Option<DmlExternalFenceReceiptRecord>,
+    /// Stable write operation id shared by every attempt of this statement.
+    pub write_operation_id: Uuid,
+    /// Sealed writer cohort set digest.
+    pub cohort_set_digest: String,
+    /// Sealed aggregate write digest, when the old attempt reached one.
+    pub aggregate_write_digest: Option<String>,
+    pub dispatch_certainty: DmlHistoricalDispatchCertainty,
+    /// Whether writer output was durably checkpointed before the owner was
+    /// lost. A checkpointed writer cohort is never adopted across generations.
+    pub writer_output_checkpointed: bool,
+    pub commit_dispatched_at_ms: Option<i64>,
+    /// Digest over the complete immutable request as it was handed to the
+    /// provider. The double check after a historical call compares this value.
+    pub request_digest: String,
+}
+
+/// The typed provider outcome of one historical inspection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlHistoricalWriteResultRecord {
+    pub disposition: DmlHistoricalWriteDisposition,
+    /// Digest of the provider observation the disposition came from.
+    pub observation_digest: String,
+    pub evidence_payload: Option<DmlOpaquePayload>,
+    pub proof_payload: Option<DmlOpaquePayload>,
+    /// Only a proven `NotDispatched` disposition may carry a continuation, and
+    /// only once a strictly higher fence closed the old authority.
+    pub continuation_payload: Option<DmlOpaquePayload>,
+    pub cleanup: DmlHistoricalCleanupState,
+    /// Typed stale, conflict, or unsupported classification. A fence conflict
+    /// is recorded here and is never downgraded to an unknown outcome.
+    pub failure: Option<ConnectorWriteFailureRecord>,
+    pub observed_at_ms: i64,
+}
+
+/// One durable historical write recovery record: a sealed request plus the
+/// fence the current generation raised and the typed result it obtained.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmlHistoricalWriteRecoveryRecord {
+    pub codec_version: u8,
+    pub phase: DmlHistoricalRecoveryPhase,
+    /// CP-3A coordination attempt that owns this cycle.
+    pub recovery_attempt_id: Uuid,
+    /// Monotone cycle counter over the same immutable request. Repeating an
+    /// inspection opens a new cycle instead of rewinding the current one.
+    pub recovery_cycle: u32,
+    pub request: DmlHistoricalWriteRequestRecord,
+    pub raised_fence: Option<DmlExternalFenceReceiptRecord>,
+    pub result: Option<DmlHistoricalWriteResultRecord>,
+    pub next_action: StatementNextAction,
+    pub requested_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl DmlHistoricalWriteRecoveryRecord {
+    /// True while the bounded recovery scan must keep visiting this operation.
+    ///
+    /// Only `Resolved` ends the scan, so a pending cleanup outcome cannot be
+    /// dropped because the user-visible statement result became terminal.
+    pub const fn requires_recovery_scan(&self) -> bool {
+        !matches!(self.phase, DmlHistoricalRecoveryPhase::Resolved)
+    }
+
+    pub const fn cleanup(&self) -> Option<DmlHistoricalCleanupState> {
+        match &self.result {
+            Some(result) => Some(result.cleanup),
+            None => None,
+        }
+    }
+}
+
+/// Authorized mutation that attaches a confirmed external fence receipt to one
+/// DML operation attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmlExternalFenceMutationRequest {
+    pub operation_id: DmlOperationId,
+    pub expected_revision: u64,
+    pub mutation_id: Uuid,
+    pub fence: DmlExternalFenceReceiptRecord,
+}
+
+/// Authorized mutation that publishes a historical write recovery request or
+/// its typed result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmlHistoricalWriteRecoveryMutationRequest {
+    pub operation_id: DmlOperationId,
+    pub expected_revision: u64,
+    pub mutation_id: Uuid,
+    pub recovery: DmlHistoricalWriteRecoveryRecord,
+}
+
+fn is_lowercase_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+}
+
+fn is_lowercase_incarnation(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+}
+
+fn is_uuid_v7(value: Uuid) -> bool {
+    value.get_version() == Some(uuid::Version::SortRand)
+        && value.get_variant() == uuid::Variant::RFC4122
+}
+
+/// Validate the complete shape of an external fence receipt record.
+pub fn validate_external_fence_receipt(
+    record: &DmlExternalFenceReceiptRecord,
+) -> Result<(), String> {
+    if record.codec_version != DML_EXTERNAL_FENCE_CODEC_VERSION {
+        return Err(format!(
+            "unsupported DML external fence codec version: {}",
+            record.codec_version
+        ));
+    }
+    let generation = record.identity.generation;
+    if generation.control_plane_incarnation == 0
+        || generation.resource_epoch == 0
+        || generation.fence_generation == 0
+    {
+        return Err("DML external fence generation components must all be nonzero".to_string());
+    }
+    for (label, digest) in [
+        ("cluster identity", &record.identity.cluster_identity_digest),
+        ("resource", &record.identity.resource_digest),
+        ("fence", &record.fence_digest),
+        ("receipt", &record.receipt_digest),
+    ] {
+        if !is_lowercase_digest(digest) {
+            return Err(format!(
+                "DML external fence {label} digest must be 64 lowercase hexadecimal characters"
+            ));
+        }
+    }
+    if record.identity.write_operation_id.is_nil() {
+        return Err("DML external fence write operation id must not be nil".to_string());
+    }
+    if !is_uuid_v7(record.identity.coordination_attempt_id) {
+        return Err("DML external fence coordination attempt id must be UUIDv7".to_string());
+    }
+    if record.established_at_ms < 0 {
+        return Err("DML external fence timestamp must be nonnegative".to_string());
+    }
+    if record.receipt_payload.as_bytes().len() > DML_OPAQUE_PAYLOAD_LIMIT {
+        return Err(format!(
+            "DML external fence receipt payload exceeds {DML_OPAQUE_PAYLOAD_LIMIT} bytes"
+        ));
+    }
+    let encoded = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    if encoded.len() > DML_EXTERNAL_FENCE_ENCODED_LIMIT {
+        return Err(format!(
+            "DML external fence record encoded size {} exceeds limit {DML_EXTERNAL_FENCE_ENCODED_LIMIT}",
+            encoded.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that replacing `existing` with `next` keeps the external fence
+/// generation monotone and cannot reuse a marker across operations.
+pub fn validate_external_fence_transition(
+    existing: Option<&DmlExternalFenceReceiptRecord>,
+    next: &DmlExternalFenceReceiptRecord,
+) -> Result<(), String> {
+    validate_external_fence_receipt(next)?;
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if existing.identity.write_operation_id != next.identity.write_operation_id {
+        return Err(
+            "DML external fence receipt cannot be reused across write operations".to_string(),
+        );
+    }
+    if existing.identity.resource_digest != next.identity.resource_digest
+        || existing.identity.cluster_identity_digest != next.identity.cluster_identity_digest
+    {
+        return Err("DML external fence receipt changed its fenced identity".to_string());
+    }
+    match next.generation().cmp(&existing.generation()) {
+        std::cmp::Ordering::Less => {
+            Err("DML external fence generation must not move backwards".to_string())
+        }
+        std::cmp::Ordering::Equal if existing != next => {
+            Err("DML external fence receipt changed without advancing its generation".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_historical_write_request(
+    request: &DmlHistoricalWriteRequestRecord,
+) -> Result<(), String> {
+    if request.old_provider_id.is_empty() || request.old_connector_instance_id.is_empty() {
+        return Err(
+            "DML historical write recovery requires a non-empty old provider and instance"
+                .to_string(),
+        );
+    }
+    if !is_lowercase_incarnation(&request.old_connector_incarnation) {
+        return Err(
+            "DML historical write recovery old incarnation must be 32 lowercase hexadecimal characters"
+                .to_string(),
+        );
+    }
+    if request
+        .old_coordination_attempt_id
+        .is_some_and(|attempt| !is_uuid_v7(attempt))
+    {
+        return Err(
+            "DML historical write recovery old coordination attempt id must be UUIDv7".to_string(),
+        );
+    }
+    if request.write_operation_id.is_nil() {
+        return Err("DML historical write recovery write operation id must not be nil".to_string());
+    }
+    for (label, digest) in [
+        ("cohort set", Some(&request.cohort_set_digest)),
+        ("aggregate write", request.aggregate_write_digest.as_ref()),
+        ("request", Some(&request.request_digest)),
+    ] {
+        if let Some(digest) = digest
+            && !is_lowercase_digest(digest)
+        {
+            return Err(format!(
+                "DML historical write recovery {label} digest must be 64 lowercase hexadecimal characters"
+            ));
+        }
+    }
+    if request
+        .commit_dispatched_at_ms
+        .is_some_and(|timestamp| timestamp < 0)
+    {
+        return Err(
+            "DML historical write recovery commit dispatch timestamp must be nonnegative"
+                .to_string(),
+        );
+    }
+    if request.dispatch_certainty == DmlHistoricalDispatchCertainty::ConfirmedNotDispatched
+        && (request.writer_output_checkpointed || request.commit_dispatched_at_ms.is_some())
+    {
+        return Err(
+            "DML historical write recovery cannot claim not-dispatched with dispatch facts"
+                .to_string(),
+        );
+    }
+    if let Some(old_fence) = &request.old_fence {
+        validate_external_fence_receipt(old_fence)?;
+        if old_fence.identity.write_operation_id != request.write_operation_id {
+            return Err(
+                "DML historical write recovery old fence belongs to another write operation"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_historical_write_result(result: &DmlHistoricalWriteResultRecord) -> Result<(), String> {
+    if !is_lowercase_digest(&result.observation_digest) {
+        return Err(
+            "DML historical write observation digest must be 64 lowercase hexadecimal characters"
+                .to_string(),
+        );
+    }
+    if result.observed_at_ms < 0 {
+        return Err("DML historical write observation timestamp must be nonnegative".to_string());
+    }
+    if result
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.message.is_empty())
+    {
+        return Err("DML historical write failure message must not be empty".to_string());
+    }
+    if result.continuation_payload.is_some()
+        && result.disposition != DmlHistoricalWriteDisposition::NotDispatched
+    {
+        return Err(
+            "DML historical write continuation is only valid for a proven NOT_DISPATCHED disposition"
+                .to_string(),
+        );
+    }
+    match result.disposition {
+        DmlHistoricalWriteDisposition::Applied
+        | DmlHistoricalWriteDisposition::NotApplied
+        | DmlHistoricalWriteDisposition::NotDispatched
+        | DmlHistoricalWriteDisposition::Staged
+        | DmlHistoricalWriteDisposition::Conflict
+            if result.proof_payload.is_none() && result.evidence_payload.is_none() =>
+        {
+            return Err(
+                "a conclusive DML historical write disposition requires provider proof or evidence"
+                    .to_string(),
+            );
+        }
+        DmlHistoricalWriteDisposition::Conflict if result.failure.is_none() => {
+            return Err(
+                "a DML historical write conflict requires a typed failure classification"
+                    .to_string(),
+            );
+        }
+        DmlHistoricalWriteDisposition::Staged
+            if result.cleanup == DmlHistoricalCleanupState::NotRequired =>
+        {
+            return Err(
+                "a staged DML historical write disposition requires proof-bound cleanup"
+                    .to_string(),
+            );
+        }
+        DmlHistoricalWriteDisposition::Ambiguous | DmlHistoricalWriteDisposition::Unsupported
+            if result.cleanup == DmlHistoricalCleanupState::Completed =>
+        {
+            return Err(
+                "an inconclusive DML historical write disposition cannot report completed cleanup"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    for payload in [
+        result.evidence_payload.as_ref(),
+        result.proof_payload.as_ref(),
+        result.continuation_payload.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if payload.as_bytes().len() > DML_OPAQUE_PAYLOAD_LIMIT {
+            return Err(format!(
+                "DML historical write payload exceeds {DML_OPAQUE_PAYLOAD_LIMIT} bytes"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the complete shape of a historical write recovery record.
+pub fn validate_historical_write_recovery(
+    record: &DmlHistoricalWriteRecoveryRecord,
+) -> Result<(), String> {
+    if record.codec_version != DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION {
+        return Err(format!(
+            "unsupported DML historical write recovery codec version: {}",
+            record.codec_version
+        ));
+    }
+    if !is_uuid_v7(record.recovery_attempt_id) {
+        return Err("DML historical write recovery attempt id must be UUIDv7".to_string());
+    }
+    if record.recovery_cycle == 0 {
+        return Err("DML historical write recovery cycle must be nonzero".to_string());
+    }
+    if record.requested_at_ms < 0 || record.updated_at_ms < record.requested_at_ms {
+        return Err("DML historical write recovery has invalid timestamps".to_string());
+    }
+    validate_historical_write_request(&record.request)?;
+    if let Some(raised) = &record.raised_fence {
+        validate_external_fence_receipt(raised)?;
+        if raised.identity.write_operation_id != record.request.write_operation_id {
+            return Err("DML raised external fence belongs to another write operation".to_string());
+        }
+        if raised.identity.coordination_attempt_id != record.recovery_attempt_id {
+            return Err(
+                "DML raised external fence was not minted by the current recovery attempt"
+                    .to_string(),
+            );
+        }
+        if let Some(old_fence) = &record.request.old_fence
+            && raised.generation() <= old_fence.generation()
+        {
+            return Err(
+                "DML raised external fence must be strictly above the old attempt's fence"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(result) = &record.result {
+        validate_historical_write_result(result)?;
+        if record.raised_fence.is_none() {
+            return Err(
+                "DML historical write inspection requires a durable raised external fence"
+                    .to_string(),
+            );
+        }
+    }
+    validate_historical_phase_shape(record)?;
+    let encoded = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    if encoded.len() > DML_HISTORICAL_WRITE_RECOVERY_ENCODED_LIMIT {
+        return Err(format!(
+            "DML historical write recovery encoded size {} exceeds limit {DML_HISTORICAL_WRITE_RECOVERY_ENCODED_LIMIT}",
+            encoded.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_historical_phase_shape(
+    record: &DmlHistoricalWriteRecoveryRecord,
+) -> Result<(), String> {
+    let cleanup = record.cleanup();
+    let phase = record.phase;
+    let shape_ok = match phase {
+        DmlHistoricalRecoveryPhase::Requested => {
+            record.raised_fence.is_none() && record.result.is_none()
+        }
+        DmlHistoricalRecoveryPhase::FenceRaised => {
+            record.raised_fence.is_some() && record.result.is_none()
+        }
+        DmlHistoricalRecoveryPhase::Inspected => {
+            cleanup.is_some_and(|cleanup| cleanup != DmlHistoricalCleanupState::Pending)
+        }
+        DmlHistoricalRecoveryPhase::CleanupPending => {
+            cleanup == Some(DmlHistoricalCleanupState::Pending)
+        }
+        DmlHistoricalRecoveryPhase::Resolved => {
+            cleanup.is_some_and(|cleanup| cleanup != DmlHistoricalCleanupState::Pending)
+        }
+        DmlHistoricalRecoveryPhase::Unresolved => record.result.as_ref().is_none_or(|result| {
+            matches!(
+                result.disposition,
+                DmlHistoricalWriteDisposition::Ambiguous
+                    | DmlHistoricalWriteDisposition::Unsupported
+            )
+        }),
+    };
+    if !shape_ok {
+        return Err(format!(
+            "DML historical write recovery phase {} disagrees with its durable facts",
+            phase.as_str()
+        ));
+    }
+    let next_action_ok = if phase == DmlHistoricalRecoveryPhase::Resolved {
+        if cleanup == Some(DmlHistoricalCleanupState::ManualRetention) {
+            record.next_action == StatementNextAction::ManualInspect
+        } else {
+            record.next_action == StatementNextAction::None
+        }
+    } else {
+        record.next_action != StatementNextAction::None
+    };
+    if !next_action_ok {
+        return Err(format!(
+            "DML historical write recovery phase {} disagrees with next action {:?}",
+            phase.as_str(),
+            record.next_action
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that replacing `existing` with `next` preserves the immutable
+/// request, keeps the cycle and phase monotone, and never drops a retained
+/// cleanup obligation.
+pub fn validate_historical_write_recovery_transition(
+    existing: Option<&DmlHistoricalWriteRecoveryRecord>,
+    next: &DmlHistoricalWriteRecoveryRecord,
+) -> Result<(), String> {
+    validate_historical_write_recovery(next)?;
+    let Some(existing) = existing else {
+        if next.recovery_cycle != 1 || next.phase != DmlHistoricalRecoveryPhase::Requested {
+            return Err(
+                "a new DML historical write recovery must start at cycle 1 in REQUESTED phase"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    };
+    if existing.request != next.request {
+        return Err(
+            "a DML historical write recovery request is immutable once durable".to_string(),
+        );
+    }
+    if existing.phase == DmlHistoricalRecoveryPhase::Resolved && existing != next {
+        return Err("a resolved DML historical write recovery cannot be reopened".to_string());
+    }
+    if next.recovery_cycle < existing.recovery_cycle {
+        return Err("DML historical write recovery cycle must not move backwards".to_string());
+    }
+    if next.recovery_cycle == existing.recovery_cycle {
+        if next.recovery_attempt_id != existing.recovery_attempt_id {
+            return Err(
+                "a DML historical write recovery cycle is owned by one coordination attempt"
+                    .to_string(),
+            );
+        }
+        if next.phase.progress() < existing.phase.progress() {
+            return Err(format!(
+                "DML historical write recovery phase cannot move from {} back to {} inside one cycle",
+                existing.phase.as_str(),
+                next.phase.as_str()
+            ));
+        }
+    }
+    // A raised fence closed the old authority. Neither a later phase nor a new
+    // cycle may forget or lower it, so `Requested` is only reachable before the
+    // first raise.
+    match (&existing.raised_fence, &next.raised_fence) {
+        (Some(previous), Some(raised)) => {
+            validate_external_fence_transition(Some(previous), raised)?;
+        }
+        (Some(_), None) => {
+            return Err(
+                "a raised DML external fence cannot be dropped from a historical write recovery"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    if existing.cleanup() == Some(DmlHistoricalCleanupState::Pending)
+        && !matches!(
+            next.cleanup(),
+            Some(
+                DmlHistoricalCleanupState::Pending
+                    | DmlHistoricalCleanupState::Completed
+                    | DmlHistoricalCleanupState::ManualRetention
+            )
+        )
+    {
+        return Err(
+            "a pending DML historical cleanup outcome must be retained until it completes or is explicitly kept for manual retention"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExternalFactOutcome {
@@ -703,6 +1478,40 @@ pub enum OperationPayload {
     CtasSaga(CtasSagaRecord),
     TruncateLifecycle(TruncateLifecycleRecord),
     AddFilesLifecycle(AddFilesLifecycleRecord),
+}
+
+/// True when the bounded recovery scan must keep visiting this operation.
+///
+/// The user-visible statement state is not the whole truth. A durable CP-3B
+/// historical write recovery keeps the obligation alive after the statement
+/// result became terminal, so a pending external finalization or proof-bound
+/// cleanup cannot be dropped just because the user already saw a failure.
+///
+/// Callers that compute a recovery due for an authorized mutation must use this
+/// function, not the operation state alone.
+pub fn operation_requires_recovery_scan(
+    state: OperationState,
+    payload: &OperationPayload,
+    historical_write_recovery: Option<&DmlHistoricalWriteRecoveryRecord>,
+) -> bool {
+    if !state.is_finished() {
+        return true;
+    }
+    if historical_write_recovery
+        .is_some_and(DmlHistoricalWriteRecoveryRecord::requires_recovery_scan)
+    {
+        return true;
+    }
+    match payload {
+        OperationPayload::ConnectorWriteLifecycle(_) => false,
+        OperationPayload::CtasSaga(record) => record.next_action != StatementNextAction::None,
+        OperationPayload::TruncateLifecycle(record) => {
+            record.next_action != StatementNextAction::None
+        }
+        OperationPayload::AddFilesLifecycle(record) => {
+            record.next_action != StatementNextAction::None
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

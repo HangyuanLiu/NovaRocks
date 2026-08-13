@@ -46,6 +46,7 @@ pub mod file_pruning;
 pub mod file_reader;
 pub mod fs_io;
 pub mod hadoop_catalog;
+pub mod historical_write_recovery;
 pub mod loaded_table;
 pub mod manifest;
 pub mod metadata_batch_reader;

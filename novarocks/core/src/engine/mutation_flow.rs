@@ -539,6 +539,14 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) match_target_schema: arrow::datatypes::SchemaRef,
     /// The one exact connector generation admitted with this statement.
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    /// The one write lease this statement will use, derived once here.
+    ///
+    /// `derive_write_lease` mints a fresh fence cell on every call, so deriving
+    /// it again inside staging would fence a lease that nothing later commits
+    /// through. Deriving once at preparation lets the coordinator establish the
+    /// external fence before any writer is dispatched, and staging reuses the
+    /// same authority.
+    pub(crate) write_lease: novarocks_spi::connector::ConnectorWriteLease,
     pub(crate) cow_preparations: Option<DmlChangeStreamPreparations>,
     pub(crate) mor_write_target: Option<PreparedMorUpdateWriteTarget>,
     /// The physical route the provider signed for this statement. Kept as the
@@ -578,6 +586,14 @@ pub(crate) struct PreparedMergeMutation {
     pub(crate) table_write_mode: novarocks_spi::connector::ConnectorRowMutationStrategy,
     /// The one exact connector generation admitted with this statement.
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    /// The one write lease this statement will use, derived once here.
+    ///
+    /// `derive_write_lease` mints a fresh fence cell on every call, so deriving
+    /// it again inside staging would fence a lease that nothing later commits
+    /// through. Deriving once at preparation lets the coordinator establish the
+    /// external fence before any writer is dispatched, and staging reuses the
+    /// same authority.
+    pub(crate) write_lease: novarocks_spi::connector::ConnectorWriteLease,
     pub(crate) cow_preparations: Option<DmlChangeStreamPreparations>,
     pub(crate) mor_write_target: Option<PreparedMorMergeWriteTarget>,
     pub(crate) insert_columns_resolved: Option<MergeInsertColumns>,
@@ -872,6 +888,9 @@ pub(crate) fn prepare_update_mutation(
         } else {
             None
         };
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive UPDATE write lease: {error}"))?;
     Ok(PreparedUpdateMutation {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
@@ -880,6 +899,7 @@ pub(crate) fn prepare_update_mutation(
         target_ref,
         match_target_schema,
         planning_lease,
+        write_lease,
         cow_preparations,
         mor_write_target,
         mode,
@@ -1026,6 +1046,9 @@ pub(crate) fn prepare_merge_mutation(
     } else {
         None
     };
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive MERGE write lease: {error}"))?;
     Ok(PreparedMergeMutation {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
@@ -1035,6 +1058,7 @@ pub(crate) fn prepare_merge_mutation(
         match_target_schema,
         table_write_mode,
         planning_lease,
+        write_lease,
         cow_preparations,
         mor_write_target,
         insert_columns_resolved,
@@ -1042,6 +1066,84 @@ pub(crate) fn prepare_merge_mutation(
         execution: execution.clone(),
         connector_context: connector_context.clone(),
     })
+}
+
+impl PreparedUpdateMutation {
+    /// Expose the exact write authority this preparation derived, so the
+    /// coordinator can fence it before staging dispatches anything.
+    pub(crate) fn external_fence_authority(
+        &self,
+    ) -> Result<
+        crate::engine::external_write_fence::ExternalWriteFenceAuthority,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let operation_id = prepared_write_operation_id(
+            self.cow_preparations.as_ref(),
+            self.mor_write_target.as_ref(),
+        )?;
+        crate::engine::external_write_fence::ExternalWriteFenceAuthority::try_new(
+            self.write_lease.clone(),
+            operation_id,
+            &self.target.namespace,
+            &self.target.table,
+            novarocks_spi::connector::ConnectorWriteTargetRef::parse(self.target_ref.as_str())?,
+            self.connector_context.clone(),
+        )
+    }
+}
+
+impl PreparedMergeMutation {
+    /// Expose the exact write authority this preparation derived, so the
+    /// coordinator can fence it before staging dispatches anything.
+    pub(crate) fn external_fence_authority(
+        &self,
+    ) -> Result<
+        crate::engine::external_write_fence::ExternalWriteFenceAuthority,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let operation_id = self
+            .cow_preparations
+            .as_ref()
+            .map(|preparations| preparations.operation_id)
+            .or_else(|| {
+                self.mor_write_target
+                    .as_ref()
+                    .map(|target| target.preparations.operation_id)
+            })
+            .ok_or_else(|| {
+                crate::engine::external_write_fence::invalid_fence_request(
+                    "MERGE reached fencing without a provider-signed preparation".to_string(),
+                )
+            })?;
+        crate::engine::external_write_fence::ExternalWriteFenceAuthority::try_new(
+            self.write_lease.clone(),
+            operation_id,
+            &self.target.namespace,
+            &self.target.table,
+            novarocks_spi::connector::ConnectorWriteTargetRef::parse(self.target_ref.as_str())?,
+            self.connector_context.clone(),
+        )
+    }
+}
+
+/// The stable write operation id the provider signed for this statement.
+///
+/// Exactly one of the two route-specific preparations is present; a statement
+/// carrying neither never reached provider admission and must not be fenced.
+fn prepared_write_operation_id(
+    cow: Option<&DmlChangeStreamPreparations>,
+    mor: Option<&PreparedMorUpdateWriteTarget>,
+) -> Result<
+    novarocks_spi::connector::ConnectorWriteOperationId,
+    novarocks_spi::connector::ConnectorError,
+> {
+    cow.map(|preparations| preparations.operation_id)
+        .or_else(|| mor.map(|target| target.preparations.operation_id))
+        .ok_or_else(|| {
+            crate::engine::external_write_fence::invalid_fence_request(
+                "row mutation reached fencing without a provider-signed preparation".to_string(),
+            )
+        })
 }
 
 /// Execute the post-intent half of an UPDATE. Preparation above only freezes
@@ -1060,6 +1162,7 @@ pub(crate) fn stage_prepared_update_mutation(
         target_ref,
         match_target_schema,
         planning_lease,
+        write_lease,
         cow_preparations,
         mor_write_target,
         mode,
@@ -1165,9 +1268,9 @@ pub(crate) fn stage_prepared_update_mutation(
                     "MOR UPDATE requires a provider-signed written version".to_string()
                 })?;
             let preparations = preparations.activate()?;
-            let write_lease = write_planning_lease
-                .derive_write_lease()
-                .map_err(|error| format!("derive MOR UPDATE write lease: {error}"))?;
+            // The write lease was derived once at preparation so the
+            // coordinator could fence it before dispatch; re-deriving here
+            // would mint a fresh fence cell and silently discard that fence.
             let write = build_update_mor_change_stream_write_plan(
                 state,
                 &target,
@@ -2190,14 +2293,20 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
             Some(session) => session
                 .abort(self.connector_context.clone())
                 .map_err(|error| format!("abort MOR UPDATE connector operation: {error}")),
-            None => novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
-                self.write_lease.binding_key().clone(),
-                self.activated_sealed.clone(),
-                Vec::new(),
-                self.connector_context.clone(),
-            )
-            .and_then(|request| self.write_lease.control().abort(request))
-            .map_err(|error| format!("abort activated MOR UPDATE operation: {error}")),
+            None => self
+                .write_lease
+                .require_external_fence()
+                .and_then(|fence| {
+                    novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
+                        self.write_lease.binding_key().clone(),
+                        self.activated_sealed.clone(),
+                        Vec::new(),
+                        novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
+                        self.connector_context.clone(),
+                    )
+                })
+                .and_then(|request| self.write_lease.control().abort(request))
+                .map_err(|error| format!("abort activated MOR UPDATE operation: {error}")),
         }
     }
 
@@ -2299,14 +2408,20 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
             Some(session) => session
                 .abort(self.connector_context.clone())
                 .map_err(|error| format!("abort MOR MERGE connector operation: {error}")),
-            None => novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
-                self.write_lease.binding_key().clone(),
-                self.activated_sealed.clone(),
-                Vec::new(),
-                self.connector_context.clone(),
-            )
-            .and_then(|request| self.write_lease.control().abort(request))
-            .map_err(|error| format!("abort activated MOR MERGE operation: {error}")),
+            None => self
+                .write_lease
+                .require_external_fence()
+                .and_then(|fence| {
+                    novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
+                        self.write_lease.binding_key().clone(),
+                        self.activated_sealed.clone(),
+                        Vec::new(),
+                        novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
+                        self.connector_context.clone(),
+                    )
+                })
+                .and_then(|request| self.write_lease.control().abort(request))
+                .map_err(|error| format!("abort activated MOR MERGE operation: {error}")),
         }
     }
 
@@ -2980,13 +3095,18 @@ fn build_cow_update_distributed_execution(
     let operation_session = match begin {
         Ok(session) => session,
         Err(error) => {
-            let abort = novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
-                write_lease.binding_key().clone(),
-                sealed,
-                Vec::new(),
-                connector_context.clone(),
-            )
-            .and_then(|request| write_lease.control().abort(request));
+            let abort = write_lease
+                .require_external_fence()
+                .and_then(|fence| {
+                    novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
+                        write_lease.binding_key().clone(),
+                        sealed,
+                        Vec::new(),
+                        novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
+                        connector_context.clone(),
+                    )
+                })
+                .and_then(|request| write_lease.control().abort(request));
             return match abort {
                 Ok(_) => Err(error),
                 Err(abort_error) => Err(format!(
@@ -3687,6 +3807,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         match_target_schema,
         table_write_mode,
         planning_lease,
+        write_lease,
         cow_preparations,
         mor_write_target,
         insert_columns_resolved,
@@ -3721,9 +3842,9 @@ pub(crate) fn stage_prepared_merge_mutation(
             .written_version_ordinal()
             .ok_or_else(|| "MOR MERGE requires a provider-signed written version".to_string())?;
         let preparations = preparations.activate()?;
-        let write_lease = write_planning_lease
-            .derive_write_lease()
-            .map_err(|error| format!("derive MOR MERGE write lease: {error}"))?;
+        // The write lease was derived once at preparation so the coordinator
+        // could fence it before dispatch; re-deriving here would mint a fresh
+        // fence cell and silently discard that fence.
         let write = build_merge_mor_change_stream_write_plan(
             state,
             &target,
@@ -4789,6 +4910,29 @@ mod tests {
         .expect("connector request context")
     }
 
+    fn external_operation_fence_for_test(
+        instance_id: novarocks_spi::connector::ConnectorInstanceId,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    ) -> novarocks_spi::connector::ConnectorExternalOperationFence {
+        novarocks_spi::connector::ConnectorExternalOperationFence::try_new(
+            novarocks_spi::connector::ConnectorClusterIdentity::derive(
+                "mutation-flow-test-cluster",
+            )
+            .expect("cluster identity"),
+            novarocks_spi::connector::ConnectorExternalFenceGeneration::try_new(1, 1, 1)
+                .expect("fence generation"),
+            operation_id,
+            [6; 16],
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id,
+                namespace: std::sync::Arc::from("db"),
+                table: std::sync::Arc::from("t"),
+            },
+            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+        )
+        .expect("external operation fence")
+    }
+
     fn col(name: &str) -> ColumnDef {
         ColumnDef {
             name: name.to_string(),
@@ -5386,6 +5530,20 @@ mod tests {
             &self.owner
         }
 
+        fn establish_external_fence(
+            &self,
+            request: novarocks_spi::connector::ConnectorExternalFenceRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorExternalFenceReceipt,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            request.validate(&self.owner)?;
+            novarocks_spi::connector::ConnectorExternalFenceReceipt::try_new(
+                &request.fence,
+                bytes::Bytes::from_static(b"recording-fence-marker"),
+            )
+        }
+
         fn activate_write(
             &self,
             request: novarocks_spi::connector::ConnectorWriteActivationRequest,
@@ -5597,10 +5755,22 @@ mod tests {
             2,
             "provider activation must preserve the complete abort authority"
         );
+        let fence = lease
+            .establish_external_fence(
+                external_operation_fence_for_test(
+                    lease.binding_key().instance_id.clone(),
+                    failed.sealed_cohorts.operation_id(),
+                ),
+                connector_context_for_test(),
+            )
+            .expect("establish the external operation fence")
+            .fence()
+            .clone();
         let abort = novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
             lease.binding_key().clone(),
             failed.sealed_cohorts,
             Vec::new(),
+            novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
             connector_context_for_test(),
         )
         .and_then(|request| lease.control().abort(request))

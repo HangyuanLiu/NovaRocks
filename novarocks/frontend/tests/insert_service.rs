@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
 use bytes::Bytes;
+use common::coordination_fixture::JournalInspect;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::engine::insert_engine::{
     IcebergInsertCommit, IcebergInsertOperation, IcebergInsertSource, IcebergPreparedInsert,
@@ -56,6 +57,8 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use uuid::Uuid;
+
+mod common;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Call {
@@ -169,6 +172,21 @@ impl StatisticsEngine for FakeInsertEngine {
 }
 
 impl InsertEngine for FakeInsertEngine {
+    /// Distributed write fails closed until a fence is established, so the fake
+    /// engine must expose a real write authority to fence against.
+    fn establish_iceberg_write_external_fence(
+        &self,
+        _prepared: &dyn novarocks::engine::insert_engine::IcebergPreparedInsert,
+        proposal: &dyn novarocks::engine::external_write_fence::ExternalWriteFenceProposal,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorEstablishedWriteFence,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        common::fence_fixture::establish_from_proposal(|operation_id, table, target_ref| {
+            proposal.seal(operation_id, table, target_ref)
+        })
+    }
+
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String> {
         self.calls.lock().unwrap().push(Call::Resolve {
             target: request.target.parts,
@@ -602,11 +620,45 @@ fn context() -> (RequestContext, QueryCancellationSource, Instant) {
     )
 }
 
-fn service(journal: Option<Arc<FakeJournal>>, statistics: Arc<RecordingStatistics>) -> DmlService {
-    DmlService::compose(
-        journal.map(|journal| journal as Arc<dyn OperationJournal>),
+/// A service wired to real coordination over a real journal.
+///
+/// Distributed write is fenced now, and a fence can only be minted from a live
+/// coordination lease, so a service composed without coordination cannot
+/// dispatch at all. Derefs to `DmlService` so the call sites stay unchanged.
+struct TestService {
+    dml: DmlService,
+    _coordination: common::coordination_fixture::BlockingCoordination,
+}
+
+impl std::ops::Deref for TestService {
+    type Target = DmlService;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dml
+    }
+}
+
+fn service_over(
+    coordination: common::coordination_fixture::BlockingCoordination,
+    journal: Option<Arc<dyn OperationJournal>>,
+    statistics: Arc<RecordingStatistics>,
+) -> TestService {
+    let dml = DmlService::compose_with_coordination(
+        journal,
         statistics,
-    )
+        Arc::clone(&coordination.coordination),
+        coordination.handle(),
+    );
+    TestService {
+        dml,
+        _coordination: coordination,
+    }
+}
+
+fn service(journal: Option<Arc<FakeJournal>>, statistics: Arc<RecordingStatistics>) -> TestService {
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = journal.map(|_| Arc::clone(&coordination.journal) as Arc<dyn OperationJournal>);
+    service_over(coordination, journal, statistics)
 }
 
 #[test]
@@ -628,17 +680,22 @@ fn union_all_commits_once_in_source_order() {
     let mut resolved = target();
     resolved.columns = vec![column("a", false)];
     let engine = FakeInsertEngine::new(resolved);
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    service(Some(Arc::clone(&journal)), statistics)
-        .try_execute_insert(
-            &engine,
-            "INSERT INTO t SELECT 1 UNION ALL SELECT 2",
-            &context,
-            None,
-        )
-        .unwrap();
+    service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        statistics,
+    )
+    .try_execute_insert(
+        &engine,
+        "INSERT INTO t SELECT 1 UNION ALL SELECT 2",
+        &context,
+        None,
+    )
+    .unwrap();
     assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert_eq!(
         engine
@@ -706,18 +763,23 @@ fn branch_insert_requires_iceberg_v3() {
 #[test]
 fn branch_insert_journals_the_prepared_branch_base_snapshot() {
     let engine = FakeInsertEngine::new(target());
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
 
-    service(Some(Arc::clone(&journal)), statistics)
-        .try_execute_insert(
-            &engine,
-            "INSERT INTO t.branch_dev VALUES (1, 2)",
-            &context,
-            None,
-        )
-        .expect("branch INSERT");
+    service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        statistics,
+    )
+    .try_execute_insert(
+        &engine,
+        "INSERT INTO t.branch_dev VALUES (1, 2)",
+        &context,
+        None,
+    )
+    .expect("branch INSERT");
 
     let operation = journal.only_operation();
     assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
@@ -758,12 +820,17 @@ fn iceberg_without_journal_fails_before_prepare() {
 fn iceberg_append_empty_records_known_empty_terminal_fact() {
     let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::FilelessOutput);
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    service(Some(Arc::clone(&journal)), statistics)
-        .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
-        .unwrap();
+    service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        statistics,
+    )
+    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+    .unwrap();
     assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert!(!engine.calls().contains(&Call::Commit));
     assert!(!engine.calls().contains(&Call::Finalize));
@@ -773,12 +840,17 @@ fn iceberg_append_empty_records_known_empty_terminal_fact() {
 fn iceberg_overwrite_empty_commits_and_finalizes() {
     let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::FilelessOutput);
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    service(Some(Arc::clone(&journal)), statistics)
-        .try_execute_insert(&engine, "INSERT OVERWRITE t VALUES (1, 2)", &context, None)
-        .unwrap();
+    service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        statistics,
+    )
+    .try_execute_insert(&engine, "INSERT OVERWRITE t VALUES (1, 2)", &context, None)
+    .unwrap();
     assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert!(engine.calls().contains(&Call::Commit));
     assert!(engine.calls().contains(&Call::Finalize));
@@ -788,12 +860,17 @@ fn iceberg_overwrite_empty_commits_and_finalizes() {
 fn iceberg_commit_unknown_is_persisted_without_retry() {
     let engine = FakeInsertEngine::new(target());
     engine.set_commit_behavior(CommitBehavior::Unknown);
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    let error = service(Some(Arc::clone(&journal)), statistics)
-        .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
-        .unwrap_err();
+    let error = service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        statistics,
+    )
+    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+    .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::Commit);
     assert_eq!(journal.states(), vec![OperationState::CommitUnknown]);
     assert_eq!(
@@ -842,30 +919,40 @@ fn admitted_context_reaches_insert_select_and_iceberg_write() {
 #[test]
 fn statistics_runs_once_after_success() {
     let engine = FakeInsertEngine::new(target());
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    service(Some(journal), Arc::clone(&statistics))
-        .try_execute_insert(
-            &engine,
-            "INSERT INTO t VALUES (1, 2), (3, 4)",
-            &context,
-            None,
-        )
-        .unwrap();
+    service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        Arc::clone(&statistics),
+    )
+    .try_execute_insert(
+        &engine,
+        "INSERT INTO t VALUES (1, 2), (3, 4)",
+        &context,
+        None,
+    )
+    .unwrap();
     assert_eq!(statistics.insert_count.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn statistics_error_does_not_change_finalized_operation() {
     let engine = FakeInsertEngine::new(target());
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     statistics.fail_insert();
     let (context, _, _) = context();
-    let error = service(Some(Arc::clone(&journal)), Arc::clone(&statistics))
-        .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
-        .unwrap_err();
+    let error = service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        Arc::clone(&statistics),
+    )
+    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+    .unwrap_err();
     assert!(error.to_string().contains("statistics observation failed"));
     assert_eq!(statistics.insert_count.load(Ordering::SeqCst), 1);
     assert_eq!(journal.states(), vec![OperationState::Finalized]);
@@ -883,12 +970,17 @@ fn statistics_error_does_not_change_finalized_operation() {
 fn writer_abort_is_recorded_without_commit() {
     let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::Aborted);
-    let journal = Arc::new(FakeJournal::default());
+    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
+    let journal = Arc::clone(&coordination.journal);
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    let error = service(Some(Arc::clone(&journal)), statistics)
-        .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
-        .unwrap_err();
+    let error = service_over(
+        coordination,
+        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
+        statistics,
+    )
+    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+    .unwrap_err();
     assert!(error.to_string().contains("writer aborted"));
     assert!(!engine.calls().contains(&Call::Commit));
     assert_eq!(

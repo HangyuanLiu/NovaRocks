@@ -31,10 +31,16 @@ use novarocks_frontend::dml::model::{
     CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
     DML_COORDINATION_RESOURCE_CODEC_VERSION, DML_CTAS_FACT_ENCODED_LIMIT,
     DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
-    DML_OPERATION_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE,
+    DML_EXTERNAL_FENCE_CODEC_VERSION, DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION,
+    DML_OPAQUE_PAYLOAD_LIMIT, DML_OPERATION_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE,
 };
 use novarocks_frontend::dml::model::{
-    DmlCoordinationClaimRequest, DmlCoordinationProvenance, DmlFencingTokenV1,
+    DmlCoordinationClaimRequest, DmlCoordinationProvenance, DmlExternalFenceGeneration,
+    DmlExternalFenceIdentity, DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord,
+    DmlFencingTokenV1, DmlHistoricalCleanupState, DmlHistoricalDispatchCertainty,
+    DmlHistoricalRecoveryPhase, DmlHistoricalWriteDisposition,
+    DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord,
+    DmlHistoricalWriteRequestRecord, DmlHistoricalWriteResultRecord, DmlOpaquePayload,
     DmlRecoveryDueRescheduleRequest,
 };
 use novarocks_frontend::dml::{
@@ -474,7 +480,8 @@ async fn admitted_claim_and_authority_validation_share_state_store_transactions(
             authority,
         )
         .unwrap();
-    assert_eq!(claimed.schema_version, 5);
+    assert_eq!(claimed.schema_version, DML_OPERATION_SCHEMA_VERSION);
+    assert_eq!(DML_OPERATION_SCHEMA_VERSION, 6);
     assert_eq!(claimed.revision, 2);
     assert_eq!(claimed.recovery_due_at_ms, Some(500));
     assert_eq!(
@@ -2644,4 +2651,1181 @@ async fn statement_connector_owner_requires_lossless_lowercase_incarnation() {
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
     assert!(journal.list_operations().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// CP-3B: external operation fence receipts and historical write recovery.
+// ---------------------------------------------------------------------------
+
+fn fence_generation(
+    control_plane_incarnation: u64,
+    resource_epoch: u64,
+    fence_generation: u64,
+) -> DmlExternalFenceGeneration {
+    DmlExternalFenceGeneration {
+        control_plane_incarnation,
+        resource_epoch,
+        fence_generation,
+    }
+}
+
+fn external_fence(
+    write_operation_id: Uuid,
+    coordination_attempt_id: Uuid,
+    generation: DmlExternalFenceGeneration,
+) -> DmlExternalFenceReceiptRecord {
+    DmlExternalFenceReceiptRecord {
+        codec_version: DML_EXTERNAL_FENCE_CODEC_VERSION,
+        identity: DmlExternalFenceIdentity {
+            cluster_identity_digest: "1a".repeat(32),
+            resource_digest: "2b".repeat(32),
+            write_operation_id,
+            coordination_attempt_id,
+            generation,
+        },
+        fence_digest: format!("{:062x}{:02x}", generation.fence_generation, 0xab_u8),
+        receipt_digest: format!("{:062x}{:02x}", generation.fence_generation, 0xcd_u8),
+        receipt_payload: DmlOpaquePayload::try_new(
+            b"opaque provider external fence receipt".to_vec(),
+        )
+        .unwrap(),
+        established_at_ms: 1_000,
+    }
+}
+
+fn historical_request(
+    write_operation_id: Uuid,
+    old_coordination_attempt_id: Uuid,
+    old_fence: Option<DmlExternalFenceReceiptRecord>,
+) -> DmlHistoricalWriteRequestRecord {
+    DmlHistoricalWriteRequestRecord {
+        old_provider_id: "iceberg".to_string(),
+        old_connector_instance_id: "iceberg-rest".to_string(),
+        old_connector_incarnation: "5e".repeat(16),
+        old_coordination_attempt_id: Some(old_coordination_attempt_id),
+        old_fence,
+        write_operation_id,
+        cohort_set_digest: "6f".repeat(32),
+        aggregate_write_digest: Some("7a".repeat(32)),
+        dispatch_certainty: DmlHistoricalDispatchCertainty::PossiblyDispatched,
+        writer_output_checkpointed: true,
+        commit_dispatched_at_ms: Some(900),
+        request_digest: "8b".repeat(32),
+    }
+}
+
+fn historical_requested(
+    recovery_attempt_id: Uuid,
+    request: DmlHistoricalWriteRequestRecord,
+) -> DmlHistoricalWriteRecoveryRecord {
+    DmlHistoricalWriteRecoveryRecord {
+        codec_version: DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION,
+        phase: DmlHistoricalRecoveryPhase::Requested,
+        recovery_attempt_id,
+        recovery_cycle: 1,
+        request,
+        raised_fence: None,
+        result: None,
+        next_action: StatementNextAction::Reconcile,
+        requested_at_ms: 1_000,
+        updated_at_ms: 1_000,
+    }
+}
+
+fn staged_result(cleanup: DmlHistoricalCleanupState) -> DmlHistoricalWriteResultRecord {
+    DmlHistoricalWriteResultRecord {
+        disposition: DmlHistoricalWriteDisposition::Staged,
+        observation_digest: "9c".repeat(32),
+        evidence_payload: None,
+        proof_payload: Some(
+            DmlOpaquePayload::try_new(b"opaque provider staged proof".to_vec()).unwrap(),
+        ),
+        continuation_payload: None,
+        cleanup,
+        failure: None,
+        observed_at_ms: 1_200,
+    }
+}
+
+/// Claim `operation_id` under `attempt` and move it into `Writing` so it can
+/// accept an external fence receipt.
+fn claim_and_start_writing(
+    journal: &StateStoreOperationJournal,
+    operation_id: DmlOperationId,
+    attempt: Uuid,
+    validator: Arc<TestTransactionValidator>,
+) -> StoredOperation {
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let claimed = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: coordination_provenance(Uuid::now_v7(), attempt, 100),
+                recovery_due_at_ms: 500,
+            },
+            authority(),
+        )
+        .unwrap();
+    journal
+        .transition_authorized(
+            operation_id,
+            claimed.revision,
+            Uuid::now_v7(),
+            OperationState::Writing,
+            Some(500),
+            authority(),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_fence_receipt_round_trips_and_only_advances_its_generation() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (host, store, journal) = open_store(&path).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap();
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let writing = claim_and_start_writing(&journal, operation_id, attempt, validator.clone());
+
+    let write_operation_id = Uuid::now_v7();
+    let fence = external_fence(write_operation_id, attempt, fence_generation(1, 7, 1));
+    let fenced_request = DmlExternalFenceMutationRequest {
+        operation_id,
+        expected_revision: writing.revision,
+        mutation_id: Uuid::now_v7(),
+        fence: fence.clone(),
+    };
+    journal.preflight_external_fence(&fenced_request).unwrap();
+    let fenced = journal
+        .record_external_fence_authorized(fenced_request, Some(600), authority())
+        .unwrap();
+    assert_eq!(fenced.revision, writing.revision + 1);
+    assert_eq!(fenced.state, OperationState::Writing);
+    assert_eq!(fenced.recovery_due_at_ms, Some(600));
+    assert_eq!(
+        journal.load_external_fence(operation_id).unwrap(),
+        Some(fence.clone())
+    );
+
+    // A lower generation must never replace a confirmed fence.
+    let lower = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: external_fence(write_operation_id, attempt, fence_generation(1, 6, 9)),
+            },
+            Some(600),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(lower.kind(), DmlErrorKind::JournalCorruption);
+    assert!(lower.to_string().contains("must not move backwards"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), fenced);
+    assert_eq!(
+        journal.load_external_fence(operation_id).unwrap(),
+        Some(fence.clone())
+    );
+
+    // A different receipt at the same generation cannot reuse the marker.
+    let mut same_generation =
+        external_fence(write_operation_id, attempt, fence_generation(1, 7, 1));
+    same_generation.receipt_digest = "0f".repeat(32);
+    let reused = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: same_generation,
+            },
+            Some(600),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(reused.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        reused
+            .to_string()
+            .contains("without advancing its generation")
+    );
+
+    // A strictly higher generation is the only legal replacement.
+    let raised = external_fence(write_operation_id, attempt, fence_generation(1, 7, 2));
+    let advanced = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: raised.clone(),
+            },
+            Some(700),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(advanced.revision, fenced.revision + 1);
+
+    // The receipt survives a real StateStore restart byte for byte, and `open`
+    // must not mutate anything it reads back.
+    drop(journal);
+    drop(store);
+    drop(host);
+    let (_host, _store, recovered) = open_store(&path).await;
+    assert_eq!(recovered.load(operation_id).unwrap().unwrap(), advanced);
+    assert_eq!(
+        recovered.load_external_fence(operation_id).unwrap(),
+        Some(raised)
+    );
+    assert_eq!(
+        recovered
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_fence_receipt_is_rejected_after_the_operation_has_an_external_outcome() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap();
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let writing = claim_and_start_writing(&journal, operation_id, attempt, validator.clone());
+    let terminal = journal
+        .record_fact_authorized(
+            operation_id,
+            writing.revision,
+            Uuid::now_v7(),
+            OperationFact {
+                state: OperationState::FailedKnownUncommitted,
+                lifecycle: ConnectorWriteLifecycleRecord::KnownUncommitted {
+                    failure: ConnectorWriteFailureRecord {
+                        kind: ConnectorWriteFailureKind::Unavailable,
+                        message: "writer never dispatched".to_string(),
+                    },
+                },
+            },
+            None,
+            authority(),
+        )
+        .unwrap();
+
+    let error = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: terminal.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: external_fence(Uuid::now_v7(), attempt, fence_generation(1, 7, 1)),
+            },
+            None,
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(
+        error
+            .to_string()
+            .contains("cannot accept an external fence receipt in state")
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), terminal);
+    assert_eq!(journal.load_external_fence(operation_id).unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_write_recovery_round_trips_and_keeps_its_due_until_resolved() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (host, store, journal) = open_store(&path).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap();
+    let old_attempt = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let writing = claim_and_start_writing(&journal, operation_id, attempt, validator.clone());
+    let shard = (0..journal.recovery_shard_count())
+        .find(|shard| {
+            journal
+                .recovery_candidates(*shard, i64::MAX)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.operation_id == operation_id)
+        })
+        .unwrap();
+
+    let write_operation_id = Uuid::now_v7();
+    let old_fence = external_fence(write_operation_id, old_attempt, fence_generation(1, 7, 3));
+    let request_record = historical_request(write_operation_id, old_attempt, Some(old_fence));
+    let requested = historical_requested(attempt, request_record.clone());
+    let mutation = DmlHistoricalWriteRecoveryMutationRequest {
+        operation_id,
+        expected_revision: writing.revision,
+        mutation_id: Uuid::now_v7(),
+        recovery: requested.clone(),
+    };
+    journal
+        .preflight_historical_write_recovery(&mutation)
+        .unwrap();
+    let opened = journal
+        .record_historical_write_recovery_authorized(mutation, Some(1_500), authority())
+        .unwrap();
+    assert_eq!(opened.revision, writing.revision + 1);
+    assert_eq!(
+        journal
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        Some(requested.clone())
+    );
+
+    // A raised fence must be strictly above the old attempt's fence.
+    let too_low = DmlHistoricalWriteRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::FenceRaised,
+        raised_fence: Some(external_fence(
+            write_operation_id,
+            attempt,
+            fence_generation(1, 7, 3),
+        )),
+        updated_at_ms: 1_100,
+        ..requested.clone()
+    };
+    let error = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: opened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: too_low,
+            },
+            Some(1_500),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert!(error.to_string().contains("strictly above"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), opened);
+
+    let raised_fence = external_fence(write_operation_id, attempt, fence_generation(1, 8, 1));
+    let fence_raised = DmlHistoricalWriteRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::FenceRaised,
+        raised_fence: Some(raised_fence.clone()),
+        updated_at_ms: 1_100,
+        ..requested.clone()
+    };
+    let raised = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: opened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: fence_raised.clone(),
+            },
+            Some(1_500),
+            authority(),
+        )
+        .unwrap();
+
+    let cleanup_pending = DmlHistoricalWriteRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::CleanupPending,
+        result: Some(staged_result(DmlHistoricalCleanupState::Pending)),
+        updated_at_ms: 1_200,
+        ..fence_raised.clone()
+    };
+    let pending = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: raised.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: cleanup_pending.clone(),
+            },
+            Some(1_500),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(
+        journal
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        Some(cleanup_pending.clone())
+    );
+
+    // A terminal user-visible result must not drop the pending cleanup
+    // obligation by clearing the recovery due.
+    let dropped = journal
+        .record_fact_authorized(
+            operation_id,
+            pending.revision,
+            Uuid::now_v7(),
+            OperationFact {
+                state: OperationState::FailedKnownUncommitted,
+                lifecycle: ConnectorWriteLifecycleRecord::KnownUncommitted {
+                    failure: ConnectorWriteFailureRecord {
+                        kind: ConnectorWriteFailureKind::Conflict,
+                        message: "old generation commit was fenced out".to_string(),
+                    },
+                },
+            },
+            None,
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(dropped.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(dropped.to_string().contains("CLEANUP_PENDING"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), pending);
+
+    // Forgetting the cleanup outcome inside the recovery record is refused too.
+    let forgotten = DmlHistoricalWriteRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Resolved,
+        result: None,
+        next_action: StatementNextAction::None,
+        updated_at_ms: 1_300,
+        ..fence_raised.clone()
+    };
+    let error = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: pending.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: forgotten,
+            },
+            Some(1_500),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), pending);
+
+    // Completing the cleanup resolves the record and releases the scan.
+    let resolved_record = DmlHistoricalWriteRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Resolved,
+        result: Some(staged_result(DmlHistoricalCleanupState::Completed)),
+        next_action: StatementNextAction::None,
+        updated_at_ms: 1_400,
+        ..cleanup_pending.clone()
+    };
+    let resolved = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: pending.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: resolved_record.clone(),
+            },
+            Some(1_500),
+            authority(),
+        )
+        .unwrap();
+    assert!(
+        journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.operation_id == operation_id)
+    );
+
+    let finished = journal
+        .record_fact_authorized(
+            operation_id,
+            resolved.revision,
+            Uuid::now_v7(),
+            OperationFact {
+                state: OperationState::FailedKnownUncommitted,
+                lifecycle: ConnectorWriteLifecycleRecord::KnownUncommitted {
+                    failure: ConnectorWriteFailureRecord {
+                        kind: ConnectorWriteFailureKind::Conflict,
+                        message: "old generation commit was fenced out".to_string(),
+                    },
+                },
+            },
+            None,
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(finished.recovery_due_at_ms, None);
+    assert!(
+        journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A resolved recovery cannot be reopened, and it survives a restart.
+    let reopened = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: finished.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: DmlHistoricalWriteRecoveryRecord {
+                    phase: DmlHistoricalRecoveryPhase::CleanupPending,
+                    result: Some(staged_result(DmlHistoricalCleanupState::Pending)),
+                    next_action: StatementNextAction::Reconcile,
+                    recovery_cycle: 2,
+                    updated_at_ms: 1_500,
+                    ..cleanup_pending
+                },
+            },
+            Some(1_600),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(reopened.kind(), DmlErrorKind::JournalCorruption);
+    assert!(reopened.to_string().contains("cannot be reopened"));
+
+    drop(journal);
+    drop(store);
+    drop(host);
+    let (_host, _store, recovered) = open_store(&path).await;
+    assert_eq!(recovered.load(operation_id).unwrap().unwrap(), finished);
+    assert_eq!(
+        recovered
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        Some(resolved_record)
+    );
+    assert_eq!(
+        recovered.load_external_fence(operation_id).unwrap(),
+        None,
+        "the raised recovery fence must not be mistaken for the attempt's own fence"
+    );
+    assert!(
+        recovered
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty(),
+        "reopening the journal must not resurrect a resolved recovery"
+    );
+    assert!(recovered.list_unfinished().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cp3b_side_records_reject_a_stale_attempt_and_a_wrong_expected_revision() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap();
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let writing = claim_and_start_writing(&journal, operation_id, attempt, validator.clone());
+    let write_operation_id = Uuid::now_v7();
+
+    // A stale coordination attempt cannot install a fence receipt.
+    let stale_attempt = Uuid::now_v7();
+    let stale_validator = Arc::new(TestTransactionValidator::default());
+    let stale_authority =
+        DmlMutationAuthority::try_new(stale_attempt, stale_validator.clone()).unwrap();
+    let stale = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: writing.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: external_fence(write_operation_id, stale_attempt, fence_generation(1, 7, 1)),
+            },
+            Some(600),
+            stale_authority,
+        )
+        .unwrap_err();
+    assert_eq!(stale.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(stale.to_string().contains("another coordination attempt"));
+    assert_eq!(stale_validator.calls(), 1);
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), writing);
+    assert_eq!(journal.load_external_fence(operation_id).unwrap(), None);
+
+    // A fence minted by a foreign attempt is refused even under live authority.
+    let foreign = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: writing.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: external_fence(
+                    write_operation_id,
+                    Uuid::now_v7(),
+                    fence_generation(1, 7, 1),
+                ),
+            },
+            Some(600),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(foreign.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(
+        foreign
+            .to_string()
+            .contains("was minted by another coordination attempt")
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), writing);
+    assert_eq!(journal.load_external_fence(operation_id).unwrap(), None);
+
+    // A wrong expected revision cannot change durable state either.
+    let wrong_revision = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: writing.revision + 5,
+                mutation_id: Uuid::now_v7(),
+                fence: external_fence(write_operation_id, attempt, fence_generation(1, 7, 1)),
+            },
+            Some(600),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(wrong_revision.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(wrong_revision.to_string().contains("revision changed"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), writing);
+    assert_eq!(journal.load_external_fence(operation_id).unwrap(), None);
+
+    // The same two rejections hold for a historical write recovery record.
+    let recovery = historical_requested(
+        attempt,
+        historical_request(write_operation_id, Uuid::now_v7(), None),
+    );
+    let wrong_revision = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: writing.revision + 5,
+                mutation_id: Uuid::now_v7(),
+                recovery: recovery.clone(),
+            },
+            Some(1_500),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(wrong_revision.kind(), DmlErrorKind::JournalUnresolved);
+    assert_eq!(
+        journal
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+
+    let foreign_recovery = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: writing.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: DmlHistoricalWriteRecoveryRecord {
+                    recovery_attempt_id: Uuid::now_v7(),
+                    ..recovery
+                },
+            },
+            Some(1_500),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(foreign_recovery.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(
+        foreign_recovery
+            .to_string()
+            .contains("belongs to another coordination attempt")
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), writing);
+    assert_eq!(
+        journal
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_cp1_superseded_holder_cannot_write_cp3b_side_records() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    gate.bootstrap(OperationId::new_v7()).await.unwrap();
+    let operation_id = journal
+        .create_preparing_admitted(
+            request(),
+            Arc::new(Cp1AdmissionValidator {
+                admission: gate.admit_writes().await.unwrap(),
+                observed: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .unwrap();
+
+    let clock = Arc::new(ManualDmlLeaseClock::new(500_000, 20_000));
+    let holder_a = Uuid::now_v7();
+    let holder_b = Uuid::now_v7();
+    let manager_a = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_a),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let manager_b = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_b),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let resource = dml_operation_resource_key(operation_id).unwrap();
+    let attempt_a = Uuid::now_v7();
+    let attempt_b = Uuid::now_v7();
+    let guard_a = Arc::new(AsyncMutex::new(acquired(
+        manager_a
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_a).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+    let claimed_a = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(holder_a, attempt_a, &guard_a, clock.wall_ms() as i64)
+                    .await,
+                recovery_due_at_ms: 500_100,
+            },
+            current_authority(attempt_a, Arc::clone(&guard_a), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+
+    clock.advance_wall(16_001);
+    assert!(matches!(
+        manager_b
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_b).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(2_000);
+    let guard_b = Arc::new(AsyncMutex::new(acquired(
+        manager_b
+            .acquire(
+                resource,
+                AttemptId::try_from(attempt_b).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+
+    // Holder A still believes it owns the operation. Its fence receipt must be
+    // refused by the latest live fence, not by a captured snapshot.
+    let rejection = Arc::new(Mutex::new(None));
+    let write_operation_id = Uuid::now_v7();
+    let error = journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: external_fence(write_operation_id, attempt_a, fence_generation(1, 7, 1)),
+            },
+            Some(500_200),
+            current_authority(attempt_a, Arc::clone(&guard_a), Arc::clone(&rejection)),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed_a);
+    assert_eq!(journal.load_external_fence(operation_id).unwrap(), None);
+
+    let recovery_rejection = Arc::new(Mutex::new(None));
+    let error = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: historical_requested(
+                    attempt_a,
+                    historical_request(write_operation_id, Uuid::now_v7(), None),
+                ),
+            },
+            Some(500_200),
+            current_authority(
+                attempt_a,
+                Arc::clone(&guard_a),
+                Arc::clone(&recovery_rejection),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *recovery_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed_a);
+    assert_eq!(
+        journal
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+
+    // The new owner re-claims and installs its own strictly higher fence.
+    let claimed_b = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(holder_b, attempt_b, &guard_b, clock.wall_ms() as i64)
+                    .await,
+                recovery_due_at_ms: 516_100,
+            },
+            current_authority(attempt_b, Arc::clone(&guard_b), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+    let fence_b = external_fence(write_operation_id, attempt_b, fence_generation(1, 8, 1));
+    journal
+        .record_external_fence_authorized(
+            DmlExternalFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed_b.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: fence_b.clone(),
+            },
+            Some(516_200),
+            current_authority(attempt_b, Arc::clone(&guard_b), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+    assert_eq!(
+        journal.load_external_fence(operation_id).unwrap(),
+        Some(fence_b)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v5_operation_record_read_fails_without_migration_or_dual_format_decode() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (_host, store, journal) = open_store(&path).await;
+    drop(journal);
+    let operation_id = Uuid::now_v7();
+    raw_put(
+        store.as_ref(),
+        key(OPERATION_PREFIX, operation_id),
+        raw_operation(operation_id, 5),
+    )
+    .await;
+    raw_put(
+        store.as_ref(),
+        key(UNFINISHED_PREFIX, operation_id),
+        raw_unfinished(operation_id),
+    )
+    .await;
+
+    let reopened =
+        StateStoreOperationJournal::open(Arc::clone(&store), tokio::runtime::Handle::current())
+            .await
+            .expect("journal open must not scan or migrate operation records");
+    let error = reopened
+        .load(DmlOperationId::from(operation_id))
+        .expect_err("a v5 operation record must not be decoded by v6 code");
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported frontend DML operation schema version: 5"),
+        "the hard cut must name the rejected version: {error}"
+    );
+    let scan_error = reopened
+        .list_unfinished()
+        .expect_err("a v5 record must not be silently skipped by the unfinished scan");
+    assert_eq!(scan_error.kind(), DmlErrorKind::JournalCorruption);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cp3b_side_record_codecs_reject_corrupt_durable_values() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap();
+
+    // An unknown codec version must fail the read instead of being upgraded.
+    raw_put(
+        store.as_ref(),
+        key(
+            "novarocks/frontend/dml/v1/external-fences/",
+            *operation_id.as_uuid(),
+        ),
+        Value::try_from(Bytes::from(
+            serde_json::to_vec(&json!({
+                "codec_version": 99,
+                "identity": {
+                    "cluster_identity_digest": "1a".repeat(32),
+                    "resource_digest": "2b".repeat(32),
+                    "write_operation_id": Uuid::now_v7(),
+                    "coordination_attempt_id": Uuid::now_v7(),
+                    "generation": {
+                        "control_plane_incarnation": 1,
+                        "resource_epoch": 1,
+                        "fence_generation": 1
+                    }
+                },
+                "fence_digest": "3c".repeat(32),
+                "receipt_digest": "4d".repeat(32),
+                "receipt_payload": "aabb",
+                "established_at_ms": 1
+            }))
+            .unwrap(),
+        ))
+        .unwrap(),
+    )
+    .await;
+    let error = journal.load_external_fence(operation_id).unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported DML external fence codec version: 99")
+    );
+
+    // Non-canonical opaque payload encodings are refused by the codec itself.
+    let second_id = journal
+        .create_preparing_admitted(request(), Arc::new(TestTransactionValidator::default()))
+        .unwrap();
+    raw_put(
+        store.as_ref(),
+        key(
+            "novarocks/frontend/dml/v1/external-fences/",
+            *second_id.as_uuid(),
+        ),
+        Value::try_from(Bytes::from(
+            serde_json::to_vec(&json!({
+                "codec_version": DML_EXTERNAL_FENCE_CODEC_VERSION,
+                "identity": {
+                    "cluster_identity_digest": "1a".repeat(32),
+                    "resource_digest": "2b".repeat(32),
+                    "write_operation_id": Uuid::now_v7(),
+                    "coordination_attempt_id": Uuid::now_v7(),
+                    "generation": {
+                        "control_plane_incarnation": 1,
+                        "resource_epoch": 1,
+                        "fence_generation": 1
+                    }
+                },
+                "fence_digest": "3c".repeat(32),
+                "receipt_digest": "4d".repeat(32),
+                "receipt_payload": "AABB",
+                "established_at_ms": 1
+            }))
+            .unwrap(),
+        ))
+        .unwrap(),
+    )
+    .await;
+    let error = journal.load_external_fence(second_id).unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert!(error.to_string().contains("canonical lowercase hex"));
+}
+
+#[test]
+fn opaque_payload_is_bounded_and_never_leaks_into_debug_output() {
+    assert!(DmlOpaquePayload::try_new(Vec::new()).is_err());
+    assert!(DmlOpaquePayload::try_new(vec![7; DML_OPAQUE_PAYLOAD_LIMIT]).is_ok());
+    assert!(DmlOpaquePayload::try_new(vec![7; DML_OPAQUE_PAYLOAD_LIMIT + 1]).is_err());
+
+    let payload = DmlOpaquePayload::try_new(b"provider-private continuation".to_vec()).unwrap();
+    let rendered = format!("{payload:?}");
+    assert!(!rendered.contains("continuation"), "{rendered}");
+    assert!(rendered.contains("len"), "{rendered}");
+
+    let encoded = serde_json::to_string(&payload).unwrap();
+    assert_eq!(encoded, format!("\"{}\"", hex::encode(payload.as_bytes())));
+    assert_eq!(
+        serde_json::from_str::<DmlOpaquePayload>(&encoded).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn external_fence_generation_is_totally_ordered_by_its_scalar_components() {
+    let base = fence_generation(1, 7, 5);
+    assert!(fence_generation(1, 7, 6) > base);
+    assert!(fence_generation(1, 8, 1) > base);
+    assert!(fence_generation(2, 1, 1) > base);
+    assert!(fence_generation(1, 7, 4) < base);
+    assert!(fence_generation(1, 6, 9) < base);
+    assert_eq!(fence_generation(1, 7, 5), base);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_write_recovery_reopens_the_scan_for_an_already_terminal_operation() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let admission = Arc::new(TestTransactionValidator::default());
+    let operation_id = journal
+        .create_preparing_admitted(request(), admission)
+        .unwrap();
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let writing = claim_and_start_writing(&journal, operation_id, attempt, validator.clone());
+
+    // The statement already failed and left the recovery scan. This is the
+    // KNOWN_UNCOMMITTED case whose external finalization must survive.
+    let terminal = journal
+        .record_fact_authorized(
+            operation_id,
+            writing.revision,
+            Uuid::now_v7(),
+            OperationFact {
+                state: OperationState::FailedKnownUncommitted,
+                lifecycle: ConnectorWriteLifecycleRecord::KnownUncommitted {
+                    failure: ConnectorWriteFailureRecord {
+                        kind: ConnectorWriteFailureKind::Unavailable,
+                        message: "old owner disappeared".to_string(),
+                    },
+                },
+            },
+            None,
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(terminal.recovery_due_at_ms, None);
+    let shard = (0..journal.recovery_shard_count()).find(|shard| {
+        journal
+            .recovery_candidates(*shard, i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.operation_id == operation_id)
+    });
+    assert_eq!(shard, None, "a terminal write operation leaves the scan");
+
+    // Opening a historical write recovery must put it back into the scan even
+    // though the user-visible statement result is already terminal.
+    let write_operation_id = Uuid::now_v7();
+    let recovery = historical_requested(
+        attempt,
+        historical_request(write_operation_id, Uuid::now_v7(), None),
+    );
+    let reopened = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: terminal.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: recovery.clone(),
+            },
+            Some(2_000),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(reopened.state, OperationState::FailedKnownUncommitted);
+    assert_eq!(reopened.recovery_due_at_ms, Some(2_000));
+    let shard = (0..journal.recovery_shard_count())
+        .find(|shard| {
+            journal
+                .recovery_candidates(*shard, i64::MAX)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.operation_id == operation_id)
+        })
+        .expect("an open historical recovery must keep the operation scannable");
+    assert!(journal.list_unfinished().unwrap().is_empty());
+
+    // Opening it without a due is refused: the obligation cannot be invisible.
+    let unscanned = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: reopened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: DmlHistoricalWriteRecoveryRecord {
+                    updated_at_ms: 1_100,
+                    ..recovery.clone()
+                },
+            },
+            None,
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(unscanned.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(
+        unscanned.to_string().contains(
+            "cannot drop its recovery due while historical write recovery phase REQUESTED"
+        )
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), reopened);
+
+    // Resolving it releases the scan in the same fenced mutation.
+    let raised_fence = external_fence(write_operation_id, attempt, fence_generation(1, 9, 1));
+    let resolved_record = DmlHistoricalWriteRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Resolved,
+        raised_fence: Some(raised_fence),
+        result: Some(DmlHistoricalWriteResultRecord {
+            disposition: DmlHistoricalWriteDisposition::NotApplied,
+            observation_digest: "9c".repeat(32),
+            evidence_payload: None,
+            proof_payload: Some(
+                DmlOpaquePayload::try_new(b"opaque provider not-applied proof".to_vec()).unwrap(),
+            ),
+            continuation_payload: None,
+            cleanup: DmlHistoricalCleanupState::NotRequired,
+            failure: None,
+            observed_at_ms: 1_300,
+        }),
+        next_action: StatementNextAction::None,
+        updated_at_ms: 1_400,
+        ..recovery
+    };
+    let resolved = journal
+        .record_historical_write_recovery_authorized(
+            DmlHistoricalWriteRecoveryMutationRequest {
+                operation_id,
+                expected_revision: reopened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: resolved_record.clone(),
+            },
+            None,
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(resolved.recovery_due_at_ms, None);
+    assert!(
+        journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        journal
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        Some(resolved_record)
+    );
 }

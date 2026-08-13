@@ -43,10 +43,14 @@ use crate::dml::model::{
     DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
     DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DML_OPERATION_SCHEMA_VERSION,
     DML_RECOVERY_DUE_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE, DML_RECOVERY_SHARD_COUNT,
-    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest, DmlOperationId,
-    DmlRecoveryCandidate, DmlRecoveryDueRescheduleRequest, DurableExternalFact,
-    ExternalFactOutcome, OperationFact, OperationKind, OperationMutationRequest, OperationPayload,
-    OperationState, OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
+    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest, DmlExternalFenceMutationRequest,
+    DmlExternalFenceReceiptRecord, DmlHistoricalWriteRecoveryMutationRequest,
+    DmlHistoricalWriteRecoveryRecord, DmlOperationId, DmlRecoveryCandidate,
+    DmlRecoveryDueRescheduleRequest, DurableExternalFact, ExternalFactOutcome, OperationFact,
+    OperationKind, OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
+    SourceScopeOwnership, StatementNextAction, StoredOperation, operation_requires_recovery_scan,
+    validate_external_fence_receipt, validate_external_fence_transition,
+    validate_historical_write_recovery, validate_historical_write_recovery_transition,
     validate_operation_transition, validate_statement_operation_transition,
 };
 use crate::dml::now_unix_millis;
@@ -56,7 +60,20 @@ const UNFINISHED_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/unfinished/";
 const RECOVERY_DUE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/recovery-due/";
 const ADD_FILES_ARTIFACT_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/add-files-artifacts/";
 const ADD_FILES_SOURCE_SCOPE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/add-files-source-scopes/";
+const EXTERNAL_FENCE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/external-fences/";
+const HISTORICAL_WRITE_RECOVERY_PREFIX: &[u8] =
+    b"novarocks/frontend/dml/v1/historical-write-recoveries/";
 const ADD_FILES_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Operation states in which an external operation fence receipt may still be
+/// attached. A fence must be confirmed before any writer or commit dispatch, so
+/// an operation that already carries an external outcome cannot accept one.
+const EXTERNAL_FENCE_ALLOWED_STATES: [OperationState; 4] = [
+    OperationState::Preparing,
+    OperationState::Writing,
+    OperationState::Collecting,
+    OperationState::Committing,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct StoredAddFilesSourceScopeV1 {
@@ -240,6 +257,7 @@ impl StateStoreOperationJournal {
             finished_at_ms: None,
         };
         validate_operation(&operation)?;
+        validate_recovery_due_scope(&operation, None)?;
         let operation_id = operation.operation_id;
         let mutation_id = operation.last_mutation_id;
         let operation_key = operation_key(operation_id)?;
@@ -453,6 +471,12 @@ impl StateStoreOperationJournal {
                     if operation.state.is_finished() {
                         operation.finished_at_ms = Some(operation.updated_at_ms);
                     }
+                    // Statement families do not own a CP-3B historical write
+                    // recovery record, so the exact obligation is the operation
+                    // record alone.
+                    if let Err(error) = validate_recovery_due_scope(&operation, None) {
+                        return Ok(Err(error));
+                    }
                     let operation_value =
                         match encode_operation_with_limit(&operation, max_value_bytes) {
                             Ok(value) => value,
@@ -614,6 +638,11 @@ impl StateStoreOperationJournal {
                         operation.finished_at_ms = Some(operation.updated_at_ms);
                     }
                     if let Err(error) = validate_operation(&operation) {
+                        return Ok(Err(error));
+                    }
+                    // ADD FILES does not own a CP-3B historical write recovery
+                    // record, so the exact obligation is the operation alone.
+                    if let Err(error) = validate_recovery_due_scope(&operation, None) {
                         return Ok(Err(error));
                     }
                     // `run_side_effect_free` can report a closure error after
@@ -960,6 +989,263 @@ impl StateStoreOperationJournal {
         .await
     }
 
+    async fn record_external_fence_async(
+        &self,
+        request: DmlExternalFenceMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.apply_side_record_mutation_async(
+            request.operation_id,
+            request.expected_revision,
+            request.mutation_id,
+            recovery_due_at_ms,
+            DmlSideRecord::ExternalFence(Box::new(request.fence)),
+            authority,
+        )
+        .await
+    }
+
+    async fn record_historical_write_recovery_async(
+        &self,
+        request: DmlHistoricalWriteRecoveryMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.apply_side_record_mutation_async(
+            request.operation_id,
+            request.expected_revision,
+            request.mutation_id,
+            recovery_due_at_ms,
+            DmlSideRecord::HistoricalWriteRecovery(Box::new(request.recovery)),
+            authority,
+        )
+        .await
+    }
+
+    /// Publish one CP-3B side record atomically with the operation revision it
+    /// belongs to.
+    ///
+    /// The single StateStore transaction validates the dynamic latest lease
+    /// fence, the expected operation revision, and the persisted coordination
+    /// attempt before it writes anything, so a stale response can never change
+    /// the journal.
+    async fn apply_side_record_mutation_async(
+        &self,
+        operation_id: DmlOperationId,
+        expected_revision: u64,
+        mutation_id: Uuid,
+        recovery_due_at_ms: Option<i64>,
+        side: DmlSideRecord,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        let operation_key = operation_key(operation_id)?;
+        let unfinished_key = unfinished_key(operation_id)?;
+        let side_key = side.key(operation_id)?;
+        let action = side.action();
+        let max_value_bytes = self.store.limits().max_value_bytes;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            OperationId::from(mutation_id),
+            action,
+            |transaction| {
+                let operation_key = operation_key.clone();
+                let unfinished_key = unfinished_key.clone();
+                let side_key = side_key.clone();
+                let side = side.clone();
+                let authority = authority.clone();
+                Box::pin(async move {
+                    if let Err(error) = authority.validator().validate_in(transaction).await {
+                        return Ok(Err(error));
+                    }
+                    let Some(record) = transaction.get(&operation_key).await? else {
+                        return Ok(Err(DmlError::journal_unavailable(format!(
+                            "DML operation {operation_id} not found"
+                        ))));
+                    };
+                    let operation_version = record.version.clone();
+                    let mut operation = match decode_operation(record.key, record.value) {
+                        Ok(operation) => operation,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let stored_side = transaction.get(&side_key).await?;
+                    let side_version = stored_side
+                        .as_ref()
+                        .map(|record| record.version.clone());
+                    let existing_side = match stored_side
+                        .map(|record| side.decode(&side_key, record.value))
+                        .transpose()
+                    {
+                        Ok(existing_side) => existing_side,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if operation.last_mutation_id == mutation_id {
+                        let applied_revision = match expected_revision.checked_add(1) {
+                            Some(revision) => revision,
+                            None => {
+                                return Ok(Err(DmlError::journal_corruption(format!(
+                                    "DML operation {operation_id} revision overflow"
+                                ))));
+                            }
+                        };
+                        if operation.revision == applied_revision
+                            && operation.recovery_due_at_ms == recovery_due_at_ms
+                            && existing_side.as_ref() == Some(&side)
+                            && operation
+                                .coordination_provenance
+                                .as_ref()
+                                .map(|provenance| provenance.coordination_attempt_id)
+                                == Some(authority.coordination_attempt_id())
+                        {
+                            return Ok(Ok(operation));
+                        }
+                        return Ok(Err(DmlError::journal_unresolved(format!(
+                            "conflicting authorized DML {} replay for operation {operation_id}",
+                            side.label()
+                        ))));
+                    }
+                    if operation.revision != expected_revision {
+                        return Ok(Err(DmlError::journal_unresolved(format!(
+                            "DML operation {operation_id} revision changed from expected {expected_revision} to {}",
+                            operation.revision
+                        ))));
+                    }
+                    if let Err(error) = validate_persisted_authority(&operation, &authority) {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) =
+                        side.validate_against(&operation, existing_side.as_ref(), &authority)
+                    {
+                        return Ok(Err(error));
+                    }
+                    // Writing a historical recovery record supersedes whatever
+                    // was durable, so a mutation that resolves the recovery may
+                    // release the bounded scan in the same transaction.
+                    let historical = match &side {
+                        DmlSideRecord::HistoricalWriteRecovery(recovery) => {
+                            Some(recovery.as_ref().clone())
+                        }
+                        DmlSideRecord::ExternalFence(_) => {
+                            match load_historical_write_recovery_in(transaction, operation_id).await
+                            {
+                                Ok(historical) => historical,
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        }
+                    };
+                    if let Err(error) = validate_historical_retention(
+                        operation_id,
+                        historical.as_ref(),
+                        recovery_due_at_ms,
+                    ) {
+                        return Ok(Err(error));
+                    }
+                    let previous = operation.clone();
+                    operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
+                    operation.revision = match operation.revision.checked_add(1) {
+                        Some(revision) => revision,
+                        None => {
+                            return Ok(Err(DmlError::journal_corruption(format!(
+                                "DML operation {operation_id} revision overflow"
+                            ))));
+                        }
+                    };
+                    operation.last_mutation_id = mutation_id;
+                    operation.recovery_due_at_ms = recovery_due_at_ms;
+                    operation.updated_at_ms = now_unix_millis();
+                    if let Err(error) = validate_operation(&operation) {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) =
+                        validate_recovery_due_scope(&operation, historical.as_ref())
+                    {
+                        return Ok(Err(error));
+                    }
+                    let operation_value =
+                        match encode_operation_with_limit(&operation, max_value_bytes) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    let side_value = match side.encode(max_value_bytes) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    transaction
+                        .put(
+                            operation_key,
+                            operation_value,
+                            Precondition::Version(operation_version),
+                        )
+                        .await?;
+                    transaction
+                        .put(
+                            side_key,
+                            side_value,
+                            match side_version {
+                                Some(version) => Precondition::Version(version),
+                                None => Precondition::Absent,
+                            },
+                        )
+                        .await?;
+                    if let Err(error) =
+                        update_recovery_due_index(transaction, &previous, &operation).await
+                    {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) =
+                        update_unfinished_index(transaction, &operation, &unfinished_key).await
+                    {
+                        return Ok(Err(error));
+                    }
+                    Ok(Ok(operation))
+                })
+            },
+        )
+        .await;
+        self.finish_statement_mutation(result, operation_key, mutation_id, action)
+            .await
+    }
+
+    async fn load_external_fence_async(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlExternalFenceReceiptRecord>, DmlError> {
+        let key = external_fence_key(operation_id)?;
+        self.load_side_record(&key)
+            .await?
+            .map(|value| decode_external_fence(&key, value))
+            .transpose()
+    }
+
+    async fn load_historical_write_recovery_async(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError> {
+        let key = historical_write_recovery_key(operation_id)?;
+        self.load_side_record(&key)
+            .await?
+            .map(|value| decode_historical_write_recovery(&key, value))
+            .transpose()
+    }
+
+    async fn load_side_record(&self, key: &Key) -> Result<Option<Value>, DmlError> {
+        let mut transaction = self
+            .store
+            .begin_read()
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        let record = transaction
+            .get(key)
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        transaction
+            .abort()
+            .await
+            .map_err(DmlError::journal_unavailable)?;
+        Ok(record.map(|record| record.value))
+    }
+
     // Design: ADR-0054 (docs/adr/ADR-0054-frontend-dml-operation-authority-boundary.md)
     async fn mutate_operation_authorized_async(
         &self,
@@ -1040,6 +1326,18 @@ impl StateStoreOperationJournal {
                     {
                         return Ok(Err(error));
                     }
+                    let historical =
+                        match load_historical_write_recovery_in(transaction, operation_id).await {
+                            Ok(historical) => historical,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    if let Err(error) = validate_historical_retention(
+                        operation_id,
+                        historical.as_ref(),
+                        recovery_due_at_ms,
+                    ) {
+                        return Ok(Err(error));
+                    }
                     let previous = operation.clone();
                     if let Err(error) = mutation(&mut operation) {
                         return Ok(Err(error));
@@ -1057,6 +1355,11 @@ impl StateStoreOperationJournal {
                     operation.recovery_due_at_ms = recovery_due_at_ms;
                     operation.updated_at_ms = now_unix_millis();
                     if let Err(error) = validate_operation(&operation) {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) =
+                        validate_recovery_due_scope(&operation, historical.as_ref())
+                    {
                         return Ok(Err(error));
                     }
                     let value = match encode_operation_with_limit(&operation, max_value_bytes) {
@@ -1649,6 +1952,63 @@ impl OperationJournal for StateStoreOperationJournal {
         ))
     }
 
+    fn record_external_fence_authorized(
+        &self,
+        request: DmlExternalFenceMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.record_external_fence_async(request, recovery_due_at_ms, authority))
+    }
+
+    fn record_historical_write_recovery_authorized(
+        &self,
+        request: DmlHistoricalWriteRecoveryMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.record_historical_write_recovery_async(
+            request,
+            recovery_due_at_ms,
+            authority,
+        ))
+    }
+
+    fn load_external_fence(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlExternalFenceReceiptRecord>, DmlError> {
+        self.blocking(self.load_external_fence_async(operation_id))
+    }
+
+    fn load_historical_write_recovery(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError> {
+        self.blocking(self.load_historical_write_recovery_async(operation_id))
+    }
+
+    fn preflight_external_fence(
+        &self,
+        request: &DmlExternalFenceMutationRequest,
+    ) -> Result<(), DmlError> {
+        validate_external_fence_receipt(&request.fence).map_err(DmlError::journal_corruption)?;
+        DmlSideRecord::ExternalFence(Box::new(request.fence.clone()))
+            .encode(self.store.limits().max_value_bytes)
+            .map(|_| ())
+    }
+
+    fn preflight_historical_write_recovery(
+        &self,
+        request: &DmlHistoricalWriteRecoveryMutationRequest,
+    ) -> Result<(), DmlError> {
+        validate_historical_write_recovery(&request.recovery)
+            .map_err(DmlError::journal_corruption)?;
+        DmlSideRecord::HistoricalWriteRecovery(Box::new(request.recovery.clone()))
+            .encode(self.store.limits().max_value_bytes)
+            .map(|_| ())
+    }
+
     fn recovery_candidates(
         &self,
         shard: u8,
@@ -1778,6 +2138,215 @@ impl StateStoreOperationJournal {
     }
 }
 
+/// One CP-3B durable record that lives beside its DML operation.
+///
+/// Both kinds are published in the same StateStore transaction that advances the
+/// operation revision, so the operation record itself keeps its v6 shape and a
+/// fenced mutation is the only way to change either record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DmlSideRecord {
+    ExternalFence(Box<DmlExternalFenceReceiptRecord>),
+    HistoricalWriteRecovery(Box<DmlHistoricalWriteRecoveryRecord>),
+}
+
+impl DmlSideRecord {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::ExternalFence(_) => "external fence receipt",
+            Self::HistoricalWriteRecovery(_) => "historical write recovery",
+        }
+    }
+
+    const fn action(&self) -> &'static str {
+        match self {
+            Self::ExternalFence(_) => "record frontend DML external fence receipt",
+            Self::HistoricalWriteRecovery(_) => "record frontend DML historical write recovery",
+        }
+    }
+
+    fn key(&self, operation_id: DmlOperationId) -> Result<Key, DmlError> {
+        match self {
+            Self::ExternalFence(_) => external_fence_key(operation_id),
+            Self::HistoricalWriteRecovery(_) => historical_write_recovery_key(operation_id),
+        }
+    }
+
+    fn decode(&self, key: &Key, value: Value) -> Result<Self, DmlError> {
+        match self {
+            Self::ExternalFence(_) => decode_external_fence(key, value)
+                .map(|record| Self::ExternalFence(Box::new(record))),
+            Self::HistoricalWriteRecovery(_) => decode_historical_write_recovery(key, value)
+                .map(|record| Self::HistoricalWriteRecovery(Box::new(record))),
+        }
+    }
+
+    fn encode(&self, max_value_bytes: usize) -> Result<Value, DmlError> {
+        let encoded = match self {
+            Self::ExternalFence(record) => serde_json::to_vec(record.as_ref()),
+            Self::HistoricalWriteRecovery(record) => serde_json::to_vec(record.as_ref()),
+        }
+        .map_err(DmlError::journal_corruption)?;
+        if encoded.len() > max_value_bytes {
+            return Err(DmlError::journal_unavailable(format!(
+                "DML {} encoded size {} exceeds StateStore value limit {max_value_bytes}",
+                self.label(),
+                encoded.len()
+            )));
+        }
+        Value::try_from(Bytes::from(encoded)).map_err(DmlError::journal_unavailable)
+    }
+
+    fn validate_against(
+        &self,
+        operation: &StoredOperation,
+        existing: Option<&Self>,
+        authority: &DmlMutationAuthority,
+    ) -> Result<(), DmlError> {
+        match (self, existing) {
+            (Self::ExternalFence(fence), existing) => {
+                let existing = match existing {
+                    Some(Self::ExternalFence(existing)) => Some(existing.as_ref()),
+                    Some(_) => {
+                        return Err(DmlError::journal_corruption(
+                            "DML external fence key holds another record kind",
+                        ));
+                    }
+                    None => None,
+                };
+                if fence.identity.coordination_attempt_id != authority.coordination_attempt_id() {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} external fence receipt was minted by another coordination attempt",
+                        operation.operation_id
+                    )));
+                }
+                if !EXTERNAL_FENCE_ALLOWED_STATES.contains(&operation.state) {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} cannot accept an external fence receipt in state {}",
+                        operation.operation_id,
+                        operation.state.as_str()
+                    )));
+                }
+                validate_external_fence_transition(existing, fence)
+                    .map_err(DmlError::journal_corruption)
+            }
+            (Self::HistoricalWriteRecovery(recovery), existing) => {
+                let existing = match existing {
+                    Some(Self::HistoricalWriteRecovery(existing)) => Some(existing.as_ref()),
+                    Some(_) => {
+                        return Err(DmlError::journal_corruption(
+                            "DML historical write recovery key holds another record kind",
+                        ));
+                    }
+                    None => None,
+                };
+                if recovery.recovery_attempt_id != authority.coordination_attempt_id() {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} historical write recovery belongs to another coordination attempt",
+                        operation.operation_id
+                    )));
+                }
+                validate_historical_write_recovery_transition(existing, recovery)
+                    .map_err(DmlError::journal_corruption)
+            }
+        }
+    }
+}
+
+fn external_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
+    key_for(EXTERNAL_FENCE_PREFIX, operation_id)
+}
+
+fn historical_write_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
+    key_for(HISTORICAL_WRITE_RECOVERY_PREFIX, operation_id)
+}
+
+fn decode_external_fence(
+    key: &Key,
+    value: Value,
+) -> Result<DmlExternalFenceReceiptRecord, DmlError> {
+    decode_key(EXTERNAL_FENCE_PREFIX, key)?;
+    let record: DmlExternalFenceReceiptRecord =
+        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+    validate_external_fence_receipt(&record).map_err(DmlError::journal_corruption)?;
+    Ok(record)
+}
+
+fn decode_historical_write_recovery(
+    key: &Key,
+    value: Value,
+) -> Result<DmlHistoricalWriteRecoveryRecord, DmlError> {
+    decode_key(HISTORICAL_WRITE_RECOVERY_PREFIX, key)?;
+    let record: DmlHistoricalWriteRecoveryRecord =
+        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+    validate_historical_write_recovery(&record).map_err(DmlError::journal_corruption)?;
+    Ok(record)
+}
+
+/// Read the durable historical write recovery record inside an open
+/// transaction, so a fenced mutation can weigh it before it changes anything.
+async fn load_historical_write_recovery_in(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: DmlOperationId,
+) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError> {
+    let key = historical_write_recovery_key(operation_id)?;
+    let Some(record) = transaction
+        .get(&key)
+        .await
+        .map_err(DmlError::journal_unavailable)?
+    else {
+        return Ok(None);
+    };
+    decode_historical_write_recovery(&key, record.value).map(Some)
+}
+
+/// Refuse to drop the bounded recovery scan while a durable historical write
+/// recovery still needs it.
+///
+/// A terminal user-visible statement result must not discard an outstanding
+/// external finalization or proof-bound cleanup obligation. `historical` is the
+/// record that will be durable after this mutation, so a mutation that resolves
+/// the recovery may release the scan in the same transaction.
+fn validate_historical_retention(
+    operation_id: DmlOperationId,
+    historical: Option<&DmlHistoricalWriteRecoveryRecord>,
+    recovery_due_at_ms: Option<i64>,
+) -> Result<(), DmlError> {
+    if recovery_due_at_ms.is_some() {
+        return Ok(());
+    }
+    let Some(recovery) = historical else {
+        return Ok(());
+    };
+    if recovery.requires_recovery_scan() {
+        return Err(DmlError::journal_unresolved(format!(
+            "DML operation {operation_id} cannot drop its recovery due while historical write recovery phase {} is still open",
+            recovery.phase.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// Enforce that the recovery due matches exactly the obligations the operation
+/// and its CP-3B historical recovery record still carry.
+///
+/// `validate_operation` can only prove the "an obligation always keeps a due"
+/// half, because a decoded operation cannot see its side records. This is the
+/// mutation-time check that also proves the converse.
+fn validate_recovery_due_scope(
+    operation: &StoredOperation,
+    historical: Option<&DmlHistoricalWriteRecoveryRecord>,
+) -> Result<(), DmlError> {
+    let required =
+        operation_requires_recovery_scan(operation.state, &operation.payload, historical);
+    if required != operation.recovery_due_at_ms.is_some() {
+        return Err(DmlError::journal_corruption(format!(
+            "DML operation {} has inconsistent recovery due eligibility",
+            operation.operation_id
+        )));
+    }
+    Ok(())
+}
+
 fn validate_persisted_authority(
     operation: &StoredOperation,
     authority: &DmlMutationAuthority,
@@ -1823,20 +2392,12 @@ fn validate_coordination_provenance(
     Ok(())
 }
 
+/// Obligations visible from the operation record alone. A decoded operation
+/// cannot see its CP-3B side records, so this is a lower bound on the real
+/// obligation; `validate_recovery_due_scope` proves the exact answer at
+/// mutation time.
 fn operation_requires_recovery(operation: &StoredOperation) -> bool {
-    if !operation.state.is_finished() {
-        return true;
-    }
-    match &operation.payload {
-        OperationPayload::ConnectorWriteLifecycle(_) => false,
-        OperationPayload::CtasSaga(record) => record.next_action != StatementNextAction::None,
-        OperationPayload::TruncateLifecycle(record) => {
-            record.next_action != StatementNextAction::None
-        }
-        OperationPayload::AddFilesLifecycle(record) => {
-            record.next_action != StatementNextAction::None
-        }
-    }
+    operation_requires_recovery_scan(operation.state, &operation.payload, None)
 }
 
 fn legacy_recovery_due_after_mutation(
@@ -2400,7 +2961,12 @@ fn validate_operation(operation: &StoredOperation) -> Result<(), DmlError> {
             )));
         }
     }
-    if operation_requires_recovery(operation) != operation.recovery_due_at_ms.is_some() {
+    // Only the "an obligation always keeps a due" half is provable here: a
+    // decoded operation cannot see whether a CP-3B historical write recovery
+    // still needs the scan, and that record legitimately keeps a due alive on a
+    // terminal operation. Every mutation additionally proves the converse
+    // through `validate_recovery_due_scope`, which does see the side record.
+    if operation_requires_recovery(operation) && operation.recovery_due_at_ms.is_none() {
         return Err(DmlError::journal_corruption(format!(
             "DML operation {} has inconsistent recovery due eligibility",
             operation.operation_id

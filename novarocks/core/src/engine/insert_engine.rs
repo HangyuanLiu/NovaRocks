@@ -29,6 +29,9 @@ use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::external_write_fence::{
+    ExternalWriteFenceProposal, external_fence_authority_unavailable, invalid_fence_request,
+};
 use crate::engine::statistics::StatisticsEngine;
 use crate::engine::{StandaloneState, iceberg_writer};
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
@@ -199,6 +202,30 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
         request: PrepareIcebergInsert,
     ) -> Result<PreparedIcebergInsert, String>;
 
+    /// Establish the caller's external operation fence on the exact write
+    /// authority this preparation retained (CP-3B spec D2).
+    ///
+    /// The frontend calls this after its durable intent reaches `Writing` and
+    /// before [`Self::run_iceberg_write`], because the coordinated write is the
+    /// first call that can reach a writer. The preparation already holds the
+    /// activated write lease, so the fence lands on the same authority that
+    /// later commits.
+    ///
+    /// The default fails closed. There is deliberately no unfenced dispatch:
+    /// an engine that cannot expose its write authority must not run a writer.
+    fn establish_iceberg_write_external_fence(
+        &self,
+        _prepared: &dyn IcebergPreparedInsert,
+        _proposal: &dyn ExternalWriteFenceProposal,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorEstablishedWriteFence,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(external_fence_authority_unavailable(
+            "Iceberg INSERT engine does not expose an external operation fence authority",
+        ))
+    }
+
     fn run_iceberg_write(
         &self,
         prepared: &dyn IcebergPreparedInsert,
@@ -334,6 +361,21 @@ impl InsertEngine for Arc<StandaloneState> {
             operation,
             handle: Arc::new(CorePreparedIcebergInsert { prepared }),
         })
+    }
+
+    fn establish_iceberg_write_external_fence(
+        &self,
+        prepared: &dyn IcebergPreparedInsert,
+        proposal: &dyn ExternalWriteFenceProposal,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorEstablishedWriteFence,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        downcast_prepared(prepared)
+            .map_err(invalid_fence_request)?
+            .prepared
+            .external_fence_authority()?
+            .establish(proposal)
     }
 
     fn run_iceberg_write(

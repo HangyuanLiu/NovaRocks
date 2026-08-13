@@ -32,9 +32,7 @@ use crate::iceberg::spec::{
     SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -42,10 +40,10 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot};
 use super::helpers::{
-    debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
+    FencedSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
     required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
-    target_ref_snapshot_id, write_manifest_list,
+    submit_fenced_action, target_ref_snapshot_id, write_manifest_list,
 };
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_metadata_only, dv_summary, dv_total_records,
@@ -104,7 +102,7 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
         .await?;
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let action = RowDeltaDvFromFilesTxnAction {
+        let action = Arc::new(RowDeltaDvFromFilesTxnAction {
             written_dvs,
             written: written_data,
             // Fresh INSERT rows: see the channel comment above. The action leaves
@@ -120,34 +118,53 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
             manifest_paths_out: manifest_paths_out.clone(),
             target_ref: ctx.target_ref.to_string(),
             snapshot_properties: ctx.snapshot_properties.clone(),
-        };
+        });
 
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        let tx = Transaction::new(ctx.table);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("RowDeltaDvFromFiles apply failed: {e}"))?;
-        let table_after = tx
-            .commit(ctx.catalog)
-            .await
-            .map_err(|e| format!("RowDeltaDvFromFiles commit failed: {e}"))?;
-        cleanup_superseded_writer_dvs(ctx.file_io, superseded_writer_dvs).await;
-        let new_snapshot_id = required_target_ref_snapshot_id(
-            table_after.metadata(),
-            ctx.target_ref,
+        let written_manifest_paths = || {
+            manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .clone()
+        };
+
+        match submit_fenced_action(
+            ctx.catalog,
+            ctx.table,
+            action,
+            ctx.fence,
             "RowDeltaDvFromFiles",
-        )?;
-        if let Some(prev) = prev_snapshot_id {
-            carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev).await;
+        )
+        .await
+        {
+            Ok(FencedSubmit::Committed(table_after)) => {
+                // Only a published snapshot makes the superseded writer DVs
+                // unreachable; every failure path leaves them for abort cleanup.
+                cleanup_superseded_writer_dvs(ctx.file_io, superseded_writer_dvs).await;
+                let new_snapshot_id = required_target_ref_snapshot_id(
+                    table_after.metadata(),
+                    ctx.target_ref,
+                    "RowDeltaDvFromFiles",
+                )?;
+                if let Some(prev) = prev_snapshot_id {
+                    carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev)
+                        .await;
+                }
+                Ok(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: written_manifest_paths(),
+                })
+            }
+            // Fully empty input already returned through
+            // `commit_empty_iceberg_mv_snapshot` above, and the action always
+            // stages a snapshot, so this arm reports the same value that path
+            // reports for an empty change set.
+            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+                new_snapshot_id: prev_snapshot_id.unwrap_or(0),
+                written_manifest_paths: written_manifest_paths(),
+            }),
+            Err(error) => Err(error.into_detail()),
         }
-        let written_manifest_paths = manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .clone();
-        Ok(CommitOutcome {
-            new_snapshot_id,
-            written_manifest_paths,
-        })
     }
 }
 

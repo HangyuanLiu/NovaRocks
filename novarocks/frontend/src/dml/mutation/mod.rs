@@ -27,6 +27,7 @@ use novarocks::engine::mutation_engine::{
 use novarocks::query_execution::request_context::RequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
+use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::DmlError;
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{
@@ -42,6 +43,33 @@ struct MutationWriteExecutor<'a> {
 impl WriteExecutor for MutationWriteExecutor<'_> {
     type CommitHandle = Arc<dyn MutationCommit>;
     type AbortHandle = Arc<dyn MutationAbort>;
+
+    /// UPDATE and MERGE both fence through the exact write authority the
+    /// mutation preparation retained, and the same fence must cover the
+    /// terminal abort of an already activated authority.
+    ///
+    /// The reverse port does not expose that authority yet, so this route fails
+    /// closed: no writer and no commit may run without a fence the provider can
+    /// compare at its external linearization point.
+    /// UPDATE and MERGE derive their write lease at preparation precisely so the
+    /// fence can be established here, before staging dispatches anything.
+    ///
+    /// `derive_write_lease` mints a fresh fence cell on every call, so a lease
+    /// derived later inside staging would carry no fence at all — which is why
+    /// the derivation was hoisted rather than the fence pushed later.
+    fn establish_external_fence(
+        &self,
+        _spec: &WriteTransactionSpec,
+        proposal: &DmlExternalFenceProposal,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorEstablishedWriteFence,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        self.engine.establish_mutation_external_fence(
+            self.prepared.handle.as_ref(),
+            &|operation_id, table, target_ref| proposal.seal(operation_id, table, target_ref),
+        )
+    }
 
     fn run_coordinated_write(
         &self,
@@ -266,8 +294,13 @@ mod tests {
         ))
     }
 
+    /// The durable intent is still published before anything reaches the
+    /// mutation engine, and the statement subkind is still recorded. What
+    /// changed with CP-3B is that staging no longer follows: a route whose
+    /// write authority cannot establish an external operation fence must not
+    /// dispatch a writer at all.
     #[test]
-    fn update_intent_is_durable_before_stage_and_carries_subkind() {
+    fn update_intent_is_durable_and_no_stage_runs_without_an_external_fence() {
         let journal = Arc::new(InMemoryOperationJournal::default());
         let service = DmlService::new(journal.clone());
         let engine = RecordingMutationEngine {
@@ -275,20 +308,19 @@ mod tests {
             events: Mutex::new(Vec::new()),
         };
 
-        assert_eq!(
-            service
-                .try_execute_update(&engine, "UPDATE t SET k = 1", &context(), None)
-                .unwrap(),
-            Some(())
-        );
-        assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
+        let error = service
+            .try_execute_update(&engine, "UPDATE t SET k = 1", &context(), None)
+            .expect_err("an unfenced UPDATE must not stage");
+
+        assert_eq!(*engine.events.lock().unwrap(), ["prepare"]);
         let record = journal.list_operations().unwrap().pop().unwrap();
         assert_eq!(record.operation_subkind.as_deref(), Some("UPDATE"));
-        assert_eq!(record.state, OperationState::Finalized);
+        assert_eq!(record.state, OperationState::Writing);
+        assert_eq!(error.operation_id(), Some(record.operation_id));
     }
 
     #[test]
-    fn merge_intent_is_durable_before_stage_and_carries_subkind() {
+    fn merge_intent_is_durable_and_no_stage_runs_without_an_external_fence() {
         let journal = Arc::new(InMemoryOperationJournal::default());
         let service = DmlService::new(journal.clone());
         let engine = RecordingMutationEngine {
@@ -296,20 +328,19 @@ mod tests {
             events: Mutex::new(Vec::new()),
         };
 
-        assert_eq!(
-            service
-                .try_execute_merge(
-                    &engine,
-                    "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = s.k",
-                    &context(),
-                    None,
-                )
-                .unwrap(),
-            Some(())
-        );
-        assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
+        let error = service
+            .try_execute_merge(
+                &engine,
+                "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = s.k",
+                &context(),
+                None,
+            )
+            .expect_err("an unfenced MERGE must not stage");
+
+        assert_eq!(*engine.events.lock().unwrap(), ["prepare"]);
         let record = journal.list_operations().unwrap().pop().unwrap();
         assert_eq!(record.operation_subkind.as_deref(), Some("MERGE"));
-        assert_eq!(record.state, OperationState::Finalized);
+        assert_eq!(record.state, OperationState::Writing);
+        assert_eq!(error.operation_id(), Some(record.operation_id));
     }
 }

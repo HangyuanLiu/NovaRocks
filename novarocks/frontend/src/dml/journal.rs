@@ -27,7 +27,9 @@ use crate::dml::error::DmlError;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesMutationRequest, CreatePreparingRequest,
     CreateStatementOperationRequest, DML_COORDINATION_RESOURCE_CODEC_VERSION,
-    DML_RECOVERY_SHARD_COUNT, DmlCoordinationClaimRequest, DmlOperationId, DmlRecoveryCandidate,
+    DML_RECOVERY_SHARD_COUNT, DmlCoordinationClaimRequest, DmlExternalFenceMutationRequest,
+    DmlExternalFenceReceiptRecord, DmlHistoricalWriteRecoveryMutationRequest,
+    DmlHistoricalWriteRecoveryRecord, DmlOperationId, DmlRecoveryCandidate,
     DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest, OperationState,
     StoredOperation,
 };
@@ -175,6 +177,82 @@ pub trait OperationJournal: Send + Sync {
     ) -> Result<StoredOperation, DmlError> {
         Err(DmlError::journal_unavailable(
             "authorized ADD FILES mutation is not supported by this journal",
+        ))
+    }
+
+    /// Persist the external operation fence one attempt confirmed before any
+    /// writer or commit dispatch could produce an irreversible external effect.
+    ///
+    /// The mutation validates the live lease fence and the expected operation
+    /// revision inside the same StateStore transaction that writes the receipt,
+    /// so a stale holder can never install a fence receipt.
+    fn record_external_fence_authorized(
+        &self,
+        _request: DmlExternalFenceMutationRequest,
+        _recovery_due_at_ms: Option<i64>,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "authorized DML external fence receipt mutation is not supported by this journal",
+        ))
+    }
+
+    /// Persist a historical write recovery request, the fence the current
+    /// generation raised above the old authority, or the typed result of one
+    /// provider inspection.
+    ///
+    /// The mutation is fenced exactly like every other authorized mutation and
+    /// refuses to drop a retained cleanup obligation.
+    fn record_historical_write_recovery_authorized(
+        &self,
+        _request: DmlHistoricalWriteRecoveryMutationRequest,
+        _recovery_due_at_ms: Option<i64>,
+        _authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "authorized DML historical write recovery mutation is not supported by this journal",
+        ))
+    }
+
+    fn load_external_fence(
+        &self,
+        _operation_id: DmlOperationId,
+    ) -> Result<Option<DmlExternalFenceReceiptRecord>, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "DML external fence receipt loading is not supported by this journal",
+        ))
+    }
+
+    fn load_historical_write_recovery(
+        &self,
+        _operation_id: DmlOperationId,
+    ) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "DML historical write recovery loading is not supported by this journal",
+        ))
+    }
+
+    /// Validate that a confirmed fence receipt can be durably encoded before
+    /// the caller asks a provider to establish it. Failing closed keeps the
+    /// fence-before-dispatch ordering honest: a receipt that could never be
+    /// recorded must not be created.
+    fn preflight_external_fence(
+        &self,
+        _request: &DmlExternalFenceMutationRequest,
+    ) -> Result<(), DmlError> {
+        Err(DmlError::journal_unavailable(
+            "DML external fence receipt preflight is not supported by this journal",
+        ))
+    }
+
+    /// Validate that a historical write recovery record can be durably encoded
+    /// before the caller raises a fence or inspects the old operation.
+    fn preflight_historical_write_recovery(
+        &self,
+        _request: &DmlHistoricalWriteRecoveryMutationRequest,
+    ) -> Result<(), DmlError> {
+        Err(DmlError::journal_unavailable(
+            "DML historical write recovery preflight is not supported by this journal",
         ))
     }
 

@@ -240,6 +240,11 @@ pub fn classify_commit_error(error: &str) -> CommitFailureKind {
     }
 
     let definite_signals = [
+        // A fenced attempt is definitely uncommitted: the catalog rejected the
+        // conditional update, so we hold positive proof rather than an
+        // ambiguous outcome. Keep in sync with
+        // `commit::write_fence::WRITE_FENCE_SUPERSEDED_SIGNAL`.
+        crate::commit::write_fence::WRITE_FENCE_SUPERSEDED_SIGNAL,
         "conflict",
         "assertrefsnapshotid",
         "ref_snapshot_id_match",
