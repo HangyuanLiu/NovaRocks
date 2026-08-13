@@ -3879,7 +3879,6 @@ fn lake_rebuild_context(
     state: &Arc<StandaloneState>,
 ) -> crate::engine::mv::lake_rebuild::LakeRebuildContext<'_> {
     crate::engine::mv::lake_rebuild::LakeRebuildContext {
-        metadata_is_authority: state.metadata_provider.is_some(),
         catalog_runtime_projection: state.catalog_runtime_projection.as_ref(),
         catalog_application: state.catalog_application.as_deref(),
         connector_control: state.connector_control.as_ref(),
@@ -3899,10 +3898,9 @@ struct EngineMvStartupRestore<'a> {
 }
 
 impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_> {
-    fn rebuild_cache_from_lake(&self, _metadata_is_authority: bool) -> Result<(), String> {
-        // W4 statelessness: rediscover lake-native Iceberg MV packages present on
-        // the lake but missing from a fresh `[metadata]` (SQLite) cache, and
-        // persist their rebuilt definitions.
+    fn rebuild_cache_from_lake(&self) -> Result<(), String> {
+        // Rediscover lake-native Iceberg MV packages that are admitted here but
+        // missing from the MV repository, and persist their rebuilt definitions.
         crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&lake_rebuild_context(
             self.state,
         ))
@@ -3928,9 +3926,6 @@ fn restore_metadata_if_needed(
     state: &Arc<StandaloneState>,
     installed: Option<&Arc<dyn crate::mv::startup_restore::MvStartupRestore>>,
 ) -> Result<(), String> {
-    // Whether a durable cache is the runtime authority is only known here, so it
-    // is passed to the restore rather than expected of it.
-    let metadata_is_authority = state.metadata_provider.is_some();
     // Catalog attachments are restored by the Frontend controller from
     // StateStore before the engine opens; Core has no attachment reader.
     //
@@ -3938,14 +3933,10 @@ fn restore_metadata_if_needed(
     // composition that has no frontend to own startup orchestration. Both run
     // through the same runner, so the step ordering cannot differ between them.
     match installed {
-        Some(restore) => crate::mv::startup_restore::run_mv_startup_restore(
-            restore.as_ref(),
-            metadata_is_authority,
-        ),
-        None => crate::mv::startup_restore::run_mv_startup_restore(
-            &EngineMvStartupRestore { state },
-            metadata_is_authority,
-        ),
+        Some(restore) => crate::mv::startup_restore::run_mv_startup_restore(restore.as_ref()),
+        None => {
+            crate::mv::startup_restore::run_mv_startup_restore(&EngineMvStartupRestore { state })
+        }
     }
 }
 

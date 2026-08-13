@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 pub(crate) struct IcebergWriteCommitPolicy {
     pub(crate) base_snapshot_id: Option<i64>,
     pub(crate) base_snapshot_map: BTreeMap<String, i64>,
@@ -24,8 +23,7 @@ pub(crate) enum IcebergWriteSource {
 }
 
 pub(crate) struct IcebergWriteTransactionSpec {
-    pub(crate) target: IcebergOperationTarget,
-    pub(crate) operation_kind: IcebergOperationKind,
+    pub(crate) is_overwrite: bool,
     pub(crate) attempt_id: String,
     pub(crate) commit: IcebergWriteCommitPolicy,
     pub(crate) validation: IcebergWriteValidationPolicy,
