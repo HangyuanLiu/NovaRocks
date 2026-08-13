@@ -488,10 +488,41 @@ impl FrontendApplicationHost {
                     Arc::clone(port)
                         as Arc<dyn crate::mv::repository::CatalogAttachmentObservationSource>
                 });
-                match StateStoreMvRepository::open_with_catalog_attachment_observations(
+                // Cluster-wide refresh ownership. The refresh path registers with
+                // this registry before creating durable state, so installing it as
+                // the repository's fence source below makes every durable refresh
+                // transition prove ownership inside its own transaction.
+                let ownership = match crate::mv::coordination::MvRefreshOwnershipContext::open(
+                    Arc::clone(&store),
+                )
+                .await
+                {
+                    Ok(ownership) => Some(ownership),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "frontend MV refresh ownership coordination unavailable; \
+                             refreshes remain single-owner"
+                        );
+                        None
+                    }
+                };
+                // Installing the registry as the repository's fence source is what
+                // makes ownership binding: every durable refresh transition then
+                // proves ownership inside its own transaction, so a superseded
+                // owner's write fails at commit rather than racing.
+                //
+                // This must land together with the refresh path's acquisition, and
+                // it does -- the registry is fail-closed for unregistered targets,
+                // so installing it without acquisition refuses every refresh in the
+                // cluster. `installing_a_fence_source_without_registration_stops_\
+                // every_refresh` guards that combination.
+                let refresh_fence = ownership.as_ref().map(|context| context.registry());
+                match StateStoreMvRepository::open_with_observations_and_refresh_fence(
                     store,
                     tokio::runtime::Handle::current(),
                     attachment_observations,
+                    refresh_fence,
                 )
                 .await
                 {
@@ -511,6 +542,7 @@ impl FrontendApplicationHost {
                             execution.mv_maintenance.clone(),
                             host.table_maintenance_service(),
                             execution.optimizer_query_mem_limit_bytes(),
+                            ownership,
                         ));
                         host.mv_background_engine_sink = Some(
                             FrontendMvService::background_engine_sink(Arc::clone(&service)),

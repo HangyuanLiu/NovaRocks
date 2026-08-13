@@ -163,6 +163,12 @@ impl ConnectorControlFactory for IcebergControlFactory {
         } else {
             None
         };
+        // One owner implements both MV control facets: fencing and attempt
+        // discovery share the provider, the stable resource vocabulary, and the
+        // same freshness requirement.
+        let mv_fencing = Arc::new(
+            crate::mv_publication_fencing::IcebergMvPublicationFencing::new(provider.clone()),
+        );
         let binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
                 descriptor.clone(),
                 incarnation,
@@ -185,9 +191,8 @@ impl ConnectorControlFactory for IcebergControlFactory {
                     Arc::clone(&unpublished.runtime),
                 )?,
             )))?
-            .try_with_mv_publication_fencing(Some(Arc::new(
-                crate::mv_publication_fencing::IcebergMvPublicationFencing::new(provider.clone()),
-            )))?
+            .try_with_mv_publication_fencing(Some(mv_fencing.clone()))?
+            .try_with_mv_attempt_discovery(Some(mv_fencing))?
             .try_with_view_metadata(Some(provider))?;
         ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
     }

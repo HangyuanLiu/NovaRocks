@@ -30,6 +30,7 @@ mod identity;
 mod metadata;
 mod metadata_maintenance;
 mod mutation;
+mod mv_attempt_discovery;
 mod mv_publication_fencing;
 mod predicate;
 mod read;
@@ -168,6 +169,13 @@ pub use mutation::{
     ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+};
+pub use mv_attempt_discovery::{
+    CONNECTOR_MV_ATTEMPT_DISCOVERY_CONTRACT_VERSION, ConnectorMvAttemptContinuation,
+    ConnectorMvAttemptDiscovery, ConnectorMvAttemptDiscoveryRequest,
+    ConnectorMvAttemptDiscoveryResolver, ConnectorMvAttemptPage, ConnectorMvAttemptScanLimit,
+    ConnectorMvAttemptSummary, MAX_CONNECTOR_MV_ATTEMPT_CONTINUATION_BYTES,
+    MAX_CONNECTOR_MV_ATTEMPT_PAGE_ITEMS,
 };
 pub use mv_publication_fencing::{
     CONNECTOR_MV_PUBLICATION_FENCING_CONTRACT_VERSION, ConnectorMvPublicationDisposition,

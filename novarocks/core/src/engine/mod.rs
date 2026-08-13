@@ -1337,6 +1337,14 @@ pub struct StandaloneOpenServices {
     /// durable and external refresh transition.
     pub mv_refresh_provider_activation_sink:
         Option<std::sync::Arc<dyn crate::mv::application::MvRefreshProviderActivationSink>>,
+    /// Frontend-owned MV startup restore. When installed, the engine runs the
+    /// application's implementation instead of its own, which is how startup
+    /// orchestration stops being an aggregate-Core responsibility.
+    ///
+    /// Optional so a composition without a frontend still restores; the ordering
+    /// contract is the same either way because both go through the same runner.
+    pub mv_startup_restore:
+        Option<std::sync::Arc<dyn crate::mv::startup_restore::MvStartupRestore>>,
     /// Receives the provider-neutral MV background adapter after restore and
     /// table-maintenance recovery. The frontend owns all worker lifecycle.
     pub mv_background_engine_sink:
@@ -1407,6 +1415,7 @@ impl StandaloneOpenServices {
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
             mv_refresh_provider_activation_sink: None,
+            mv_startup_restore: None,
             mv_background_engine_sink: None,
             connector_control,
             connector_control_factory_resolver,
@@ -1487,6 +1496,16 @@ impl StandaloneOpenServices {
         sink: Option<std::sync::Arc<dyn crate::mv::application::MvRefreshProviderActivationSink>>,
     ) -> Self {
         self.mv_refresh_provider_activation_sink = sink;
+        self
+    }
+
+    /// Installs the application's MV startup restore, making it the owner of
+    /// when startup restoration runs.
+    pub fn with_mv_startup_restore(
+        mut self,
+        restore: std::sync::Arc<dyn crate::mv::startup_restore::MvStartupRestore>,
+    ) -> Self {
+        self.mv_startup_restore = Some(restore);
         self
     }
 
@@ -1582,6 +1601,7 @@ impl StandaloneNovaRocks {
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
             mv_refresh_provider_activation_sink,
+            mv_startup_restore,
             mv_background_engine_sink,
             connector_control,
             connector_control_factory_resolver,
@@ -1651,7 +1671,7 @@ impl StandaloneNovaRocks {
                 ),
             ))?;
         }
-        restore_metadata_if_needed(&inner)?;
+        restore_metadata_if_needed(&inner, mv_startup_restore.as_ref())?;
         let engine = Self { inner };
         if let Some(sink) = statistics_target_resolver_sink {
             sink.bind_statistics_target_resolver(engine.statistics_target_resolver())?;
@@ -3850,22 +3870,82 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
         .map_err(|e| format!("read current directory failed: {e}"))
 }
 
-fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
+/// Projects aggregate engine state into the explicit inputs a lake rebuild needs.
+///
+/// Living here keeps the rebuild itself free of engine state, which is what lets
+/// it move to the frontend without dragging `StandaloneState` along.
+fn lake_rebuild_context(
+    state: &Arc<StandaloneState>,
+) -> crate::engine::mv::lake_rebuild::LakeRebuildContext<'_> {
+    crate::engine::mv::lake_rebuild::LakeRebuildContext {
+        metadata_is_authority: state.metadata_provider.is_some(),
+        catalog_runtime_projection: state.catalog_runtime_projection.as_ref(),
+        catalog_application: state.catalog_application.as_deref(),
+        connector_control: state.connector_control.as_ref(),
+        mv_storage_observation: state.mv_storage_observation.as_ref(),
+        mv_repository: state.mv_repository.as_ref(),
+    }
+}
+
+/// Engine-side implementation of the MV startup restore steps.
+///
+/// The steps read lake state through engine internals, so they stay here; the
+/// ordering that makes them correct lives in the port. Separating the two is the
+/// dependency-inversion step before the implementation itself moves out of
+/// aggregate Core.
+struct EngineMvStartupRestore<'a> {
+    state: &'a Arc<StandaloneState>,
+}
+
+impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_> {
+    fn rebuild_cache_from_lake(&self, _metadata_is_authority: bool) -> Result<(), String> {
+        // W4 statelessness: rediscover lake-native Iceberg MV packages present on
+        // the lake but missing from a fresh `[metadata]` (SQLite) cache, and
+        // persist their rebuilt definitions.
+        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&lake_rebuild_context(
+            self.state,
+        ))
+    }
+
+    fn restore_targets(&self) -> Result<(), String> {
+        crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(
+            &crate::engine::mv::iceberg_refresh::mv_target_restore_context(self.state),
+        )
+    }
+
+    fn recover_unfinished_refreshes(&self) -> Result<(), String> {
+        // Recovery is a frontend application decision; the engine only sequences
+        // it after the state it depends on has been restored.
+        self.state
+            .mv_application_service
+            .recover_startup_mv_refreshes()
+            .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
+    }
+}
+
+fn restore_metadata_if_needed(
+    state: &Arc<StandaloneState>,
+    installed: Option<&Arc<dyn crate::mv::startup_restore::MvStartupRestore>>,
+) -> Result<(), String> {
+    // Whether a durable cache is the runtime authority is only known here, so it
+    // is passed to the restore rather than expected of it.
+    let metadata_is_authority = state.metadata_provider.is_some();
     // Catalog attachments are restored by the Frontend controller from
     // StateStore before the engine opens; Core has no attachment reader.
-    // W4 statelessness: rediscover lake-native Iceberg MV packages that are
-    // present on the lake but missing from a fresh `[metadata]` (SQLite) cache,
-    // and persist their rebuilt definitions.
-    crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(state)?;
-    crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
-    // Recovery is a frontend application decision. At this point catalog
-    // bindings and target descriptors have both been restored, so the service
-    // can acquire one current-generation inspection lease per fenced attempt.
-    state
-        .mv_application_service
-        .recover_startup_mv_refreshes()
-        .map_err(|error| format!("frontend MV startup recovery failed: {error}"))?;
-    Ok(())
+    //
+    // An installed implementation wins: the engine's own is the fallback for a
+    // composition that has no frontend to own startup orchestration. Both run
+    // through the same runner, so the step ordering cannot differ between them.
+    match installed {
+        Some(restore) => crate::mv::startup_restore::run_mv_startup_restore(
+            restore.as_ref(),
+            metadata_is_authority,
+        ),
+        None => crate::mv::startup_restore::run_mv_startup_restore(
+            &EngineMvStartupRestore { state },
+            metadata_is_authority,
+        ),
+    }
 }
 
 /// The engine's only catalog authority.

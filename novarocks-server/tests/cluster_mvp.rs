@@ -4389,6 +4389,44 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1_000
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }
 
+/// Refreshes an MV whose previous owner crashed while holding its refresh lease.
+///
+/// The crashed frontend never released the lease, and a lease is precisely the
+/// mechanism that cannot distinguish "crashed" from "partitioned but still
+/// publishing". So the restarted frontend must wait it out rather than reclaim
+/// it -- reclaiming early is the split-brain this ownership exists to prevent.
+///
+/// Only the ownership refusal is tolerated. Any other error fails immediately,
+/// so this stays a wait for takeover and does not become a blanket retry that
+/// would paper over a real recovery bug.
+#[cfg(unix)]
+fn refresh_after_owner_crash(conn: &mut mysql::Conn, mv: &str) {
+    use std::time::Instant;
+
+    // The frontend lease is 15s with a 2s takeover observation; this leaves room
+    // for both plus scheduling slack.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let statement = format!("REFRESH MATERIALIZED VIEW {mv}");
+    loop {
+        match conn.query_drop(&statement) {
+            Ok(()) => return,
+            Err(error) => {
+                let message = error.to_string();
+                let awaiting_takeover = message.contains("another frontend currently owns");
+                assert!(
+                    awaiting_takeover,
+                    "recovery must release staged attempt fence for a fresh refresh: {error}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "the crashed owner's refresh lease never aged out: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
 /// Exercises the two crash windows that startup recovery must converge without
 /// replaying a historical write or publication: a staged write before main
 /// publication, and a published main snapshot before staging cleanup/finalize.
@@ -4485,8 +4523,7 @@ fn cross_process_three_be_mvx3_recovery_reconciles_staged_and_published_attempts
         after_staged_restart.is_empty(),
         "staged-only recovery must not publish main: {after_staged_restart:?}"
     );
-    conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
-        .expect("recovery must release staged attempt fence for a fresh refresh");
+    refresh_after_owner_crash(&mut conn, "orders_mv");
     let first_rows: Vec<(i32, i64)> = conn
         .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
         .expect("read recovered first refresh");

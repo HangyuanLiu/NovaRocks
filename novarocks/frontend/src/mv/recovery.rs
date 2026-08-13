@@ -63,7 +63,81 @@ pub struct FrontendMvRecoverySummary {
 pub(super) struct FrontendMvRecoveryDependencies {
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
     pub(super) provider_activation: Arc<super::refresh::FrontendMvRefreshProviderActivationPort>,
+    /// Cluster-wide refresh ownership, shared with the refresh path.
+    ///
+    /// Recovery writes durable state, so it competes for the same lease as a
+    /// refresh does. It is not exempt: a crashed frontend's attempts may still be
+    /// being reconciled by a *different* surviving frontend, and two reconcilers
+    /// on one target is the same split-brain as two refreshers.
+    pub(super) ownership: Option<super::coordination::MvRefreshOwnershipContext>,
 }
+
+/// Takes ownership of one recovery candidate's target, or declines it.
+///
+/// Declining is the safe answer: a candidate this frontend cannot own is left
+/// for whoever does own it, and recovery reports it as unresolved rather than
+/// reconciling it without the right to.
+fn own_recovery_candidate(
+    dependencies: &FrontendMvRecoveryDependencies,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    refresh: &StoredMvRefresh,
+) -> Result<Option<super::coordination::OwnedRefresh>, ()> {
+    let Some(context) = dependencies.ownership.as_ref() else {
+        return Ok(None);
+    };
+    let instance =
+        ConnectorInstanceId::parse(refresh.target_catalog.as_deref().ok_or(())?).map_err(|_| ())?;
+    let resource = super::coordination::resolve_target_resource_for(
+        lease.binding(),
+        ConnectorTableIdentity {
+            instance_id: instance,
+            namespace: Arc::from(refresh.target_namespace.as_deref().ok_or(())?),
+            table: Arc::from(refresh.target_table.as_deref().ok_or(())?),
+        },
+        &recovery_context().map_err(|_| ())?,
+    )
+    .map_err(|_| ())?;
+    // Wait out a previous owner's lease rather than skipping the candidate.
+    //
+    // This is the crash case recovery exists for: the frontend that staged this
+    // attempt died holding the target's refresh lease, and a lease cannot be
+    // reclaimed early without reintroducing the split-brain it prevents. So the
+    // only correct move is to wait for it to age out.
+    //
+    // Skipping instead would strand the target permanently: recovery is a
+    // one-shot startup pass, so a candidate declined here is never revisited, and
+    // every later refresh conflicts with the attempt nobody reconciled. That is
+    // not a hypothetical -- it is what this path did before the wait was added,
+    // and `cross_process_three_be_mvx3_recovery_reconciles_staged_and_published_\
+    // attempts` fails exactly that way without it.
+    let deadline = Instant::now() + RECOVERY_OWNERSHIP_WAIT;
+    loop {
+        match context.block_on_acquisition(super::coordination::acquire_refresh_ownership(
+            context,
+            refresh.mv_id,
+            resource.clone(),
+        )) {
+            Ok(owned) => return Ok(Some(owned)),
+            // A live owner that is not us. Either it is still running and will
+            // reconcile its own attempt, or it is gone and its lease is aging out.
+            Err(
+                super::coordination::OwnershipRefusal::Contended
+                | super::coordination::OwnershipRefusal::AwaitingTakeover,
+            ) if Instant::now() < deadline => {
+                std::thread::sleep(RECOVERY_OWNERSHIP_POLL);
+            }
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+/// How long startup recovery waits for a crashed owner's refresh lease.
+///
+/// Covers the frontend lease duration plus its takeover observation, with slack.
+/// Recovery runs on the MV background worker, not the SQL admission path, so a
+/// wait here delays reconciliation rather than the frontend accepting queries.
+const RECOVERY_OWNERSHIP_WAIT: Duration = Duration::from_secs(30);
+const RECOVERY_OWNERSHIP_POLL: Duration = Duration::from_millis(500);
 
 pub(super) fn recover_once(
     repository: &dyn MvRepository,
@@ -121,6 +195,9 @@ fn recover_one(
         .connector_control
         .acquire_current(&instance)
         .map_err(|_| ())?;
+    // Before any durable transition: the repository proves ownership inside each
+    // transaction, so reconciling without it fails at commit rather than here.
+    let _owned = own_recovery_candidate(dependencies, &lease, &refresh)?;
     let cleanup_operation_id = refresh
         .frontend_recovery
         .as_ref()
@@ -1196,6 +1273,10 @@ mod tests {
         .expect("bind descriptor projection");
         (
             FrontendMvRecoveryDependencies {
+                // Unfenced: these tests drive recovery decisions directly, and
+                // ownership is exercised by the cluster tests that run two real
+                // frontends against one StateStore.
+                ownership: None,
                 connector_control: host.clone(),
                 provider_activation,
             },

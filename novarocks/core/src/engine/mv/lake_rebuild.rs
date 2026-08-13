@@ -29,7 +29,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
-use crate::engine::StandaloneState;
 use crate::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -122,11 +121,31 @@ pub(crate) fn rebuild_mv_definition_from_lake(
 /// `catalog.namespace.table`) are skipped, so calling this at startup
 /// on an already-populated cluster is a no-op.
 ///
-pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Result<(), String> {
+/// The state a lake rebuild reads, named explicitly rather than reached through
+/// aggregate engine state.
+///
+/// Naming the inputs is what makes this module movable: it turns "needs the
+/// engine" into a short, checkable list, and every one of these is already
+/// reachable from a frontend composition.
+pub struct LakeRebuildContext<'a> {
+    /// Whether a durable metadata cache is the runtime authority. Without one
+    /// there is nothing to rebuild into and the sweep is a no-op.
+    pub metadata_is_authority: bool,
+    /// Catalogs this process currently admits. An absent projection means no
+    /// lease to enumerate namespaces with.
+    pub catalog_runtime_projection:
+        Option<&'a Arc<crate::catalog_application::CatalogRuntimeProjection>>,
+    pub catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
+    pub mv_storage_observation: &'a dyn crate::mv::storage_observation::MvStorageObservationPort,
+    pub mv_repository: &'a dyn crate::mv::repository::MvRepository,
+}
+
+pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
     // No metadata provider means SQLite is not the runtime authority (e.g.
     // FE-compatible mode or a metadata-less test state); there is nothing to
     // rebuild a cache into.
-    if state.metadata_provider.is_none() {
+    if !ctx.metadata_is_authority {
         return Ok(());
     }
 
@@ -135,7 +154,7 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
     // Only catalogs this process currently admits can be scanned: the durable
     // attachment record belongs to the Frontend controller, and an Unavailable
     // projection has no lease to enumerate namespaces with.
-    let Some(projection) = state.catalog_runtime_projection.as_ref() else {
+    let Some(projection) = ctx.catalog_runtime_projection else {
         return Ok(());
     };
     let instance_ids = projection
@@ -151,9 +170,9 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
         .map(|observation| observation.instance_id)
         .collect::<Vec<_>>();
     let packages = discover_mv_lake_packages(
-        state.connector_control.as_ref(),
+        ctx.connector_control,
         instance_ids,
-        state.mv_storage_observation.as_ref(),
+        ctx.mv_storage_observation,
         context,
     )
     .map_err(|error| format!("discover lake MV packages failed: {error}"))?;
@@ -165,10 +184,10 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
         // assertion correctly refuses. Skipping keeps a foreign or
         // already-dropped package from failing frontend startup, while the
         // targeted rebuild procedure still fails closed on the same condition.
-        if !package_catalogs_are_admitted(state, &package)? {
+        if !package_catalogs_are_admitted(ctx.catalog_application, &package)? {
             continue;
         }
-        rebuild_one_lake_package_if_missing(state, &package)?;
+        rebuild_one_lake_package_if_missing(ctx, &package)?;
     }
     Ok(())
 }
@@ -176,10 +195,10 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
 /// Whether every catalog this lake MV package references is currently `Ready`
 /// on this frontend.
 fn package_catalogs_are_admitted(
-    state: &Arc<StandaloneState>,
+    application: Option<&dyn crate::catalog_application::CatalogApplicationPort>,
     package: &MvLakePackageObservation,
 ) -> Result<bool, String> {
-    let Some(application) = state.catalog_application.as_ref() else {
+    let Some(application) = application else {
         return Ok(false);
     };
     let mut catalogs = std::collections::BTreeSet::new();
@@ -216,12 +235,12 @@ fn package_catalogs_are_admitted(
 /// rebuild for the `full` level, instead of sweeping every registered catalog
 /// through [`rebuild_imv_cache_from_lake`].
 pub(crate) fn rebuild_one_lake_package_if_missing(
-    state: &Arc<StandaloneState>,
+    ctx: &LakeRebuildContext<'_>,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
     // Cache-hit check: skip MVs already recorded in SQLite. The rebuilt target
     // maps to (discovered.catalog, discovered.namespace, discovered.table).
-    let existing = state
+    let existing = ctx
         .mv_repository
         .find_by_target(&crate::mv::model::MvTarget {
             catalog: Some(package.table.instance_id.as_str().to_string()),
@@ -238,7 +257,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing(
     let dependencies =
         dependency_requests_from_descriptor(&package.descriptor.base_dependencies, created_at_ms)?;
 
-    let definition = state
+    let definition = ctx
         .mv_repository
         .create(
             uuid::Uuid::new_v4(),
@@ -249,8 +268,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing(
             },
         )
         .map_err(|e| format!("rebuild iceberg MV repository metadata failed: {e}"))?;
-    state
-        .mv_repository
+    ctx.mv_repository
         .set_rebuilt_refresh_watermark(
             definition.mv_id,
             rebuilt.last_refresh_snapshots,
@@ -547,7 +565,7 @@ mod tests {
 
         let absent = state_with_admission(crate::catalog_application::CatalogAdmission::Absent);
         assert!(
-            !package_catalogs_are_admitted(&absent, &package)
+            !package_catalogs_are_admitted(absent.catalog_application.as_deref(), &package)
                 .expect("absent admission is decidable"),
             "an absent attachment must make the sweep skip the package"
         );
@@ -557,7 +575,7 @@ mod tests {
                 reason: "projection is stale".to_string(),
             });
         assert!(
-            !package_catalogs_are_admitted(&unavailable, &package)
+            !package_catalogs_are_admitted(unavailable.catalog_application.as_deref(), &package)
                 .expect("unavailable admission is decidable"),
             "an unmaterialized attachment must also make the sweep skip the package"
         );
@@ -572,7 +590,8 @@ mod tests {
             },
         ));
         assert!(
-            package_catalogs_are_admitted(&ready, &package).expect("ready admission is decidable"),
+            package_catalogs_are_admitted(ready.catalog_application.as_deref(), &package)
+                .expect("ready admission is decidable"),
             "a package whose target and upstream catalogs are admitted must be rebuilt"
         );
     }
@@ -585,7 +604,7 @@ mod tests {
         let state = Arc::new(crate::engine::StandaloneState::default());
 
         assert!(
-            !package_catalogs_are_admitted(&state, &package)
+            !package_catalogs_are_admitted(state.catalog_application.as_deref(), &package)
                 .expect("missing application is decidable"),
         );
     }

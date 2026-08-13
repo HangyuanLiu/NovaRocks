@@ -105,6 +105,7 @@ impl FrontendMvService {
             dyn novarocks::engine::table_maintenance::TableMaintenanceService,
         >,
         optimizer_query_mem_limit_bytes: u64,
+        ownership: Option<super::coordination::MvRefreshOwnershipContext>,
     ) -> Self {
         Self {
             repository,
@@ -112,8 +113,14 @@ impl FrontendMvService {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
+                // Cloning shares the same `Arc<MvRefreshOwnershipRegistry>` with
+                // recovery, which is what makes ownership sticky across them: a
+                // target recovery took at startup is still owned when the first
+                // refresh runs, so that refresh does not re-compete for it.
+                ownership: ownership.clone(),
             }),
             recovery: Some(recovery::FrontendMvRecoveryDependencies {
+                ownership: ownership.clone(),
                 connector_control,
                 provider_activation: Arc::clone(&provider_activation),
             }),
@@ -156,6 +163,19 @@ impl FrontendMvService {
         };
         runtime.stop_and_join(Instant::now() + MV_WORKER_SHUTDOWN_TIMEOUT)?;
         guard.take();
+        // Ownership is sticky per target, so it outlives any single refresh and
+        // must be given up with the worker that held it. Doing this after the
+        // worker has joined means no refresh can re-acquire behind us, and doing
+        // it here rather than at process exit means the renewal loops stop before
+        // the StateStore is asked to shut down -- a loop still renewing keeps the
+        // provider from draining inside its deadline.
+        if let Some(ownership) = self
+            .refresh
+            .as_ref()
+            .and_then(|refresh| refresh.ownership.as_ref())
+        {
+            ownership.shutdown();
+        }
         Ok(())
     }
 

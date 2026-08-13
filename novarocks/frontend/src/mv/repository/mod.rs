@@ -95,6 +95,8 @@ pub struct StateStoreMvRepository {
 /// A source returns an error for a target this process does not currently own.
 /// That is the fail-closed path: losing the lease must stop durable writes, not
 /// downgrade them to unfenced ones.
+///
+/// Design: ADR-0065 (docs/adr/ADR-0065-mv-refresh-ownership-fencing.md)
 pub trait MvRefreshFenceSource: Send + Sync {
     /// The validator for the current owner of this MV's refresh resource.
     fn validator_for(&self, mv_id: i64) -> Result<FenceValidator, MvRepositoryError>;
@@ -157,6 +159,15 @@ impl StateStoreMvRepository {
         });
         repository.validate_open_state().await?;
         Ok(repository)
+    }
+
+    /// Whether durable refresh transitions are fenced at all.
+    ///
+    /// Exists so a composition can be asserted to have installed ownership rather
+    /// than silently running unfenced. An unfenced repository is only correct
+    /// where a single owner is structurally guaranteed.
+    pub fn has_refresh_fence(&self) -> bool {
+        self.refresh_fence.is_some()
     }
 
     /// Resolves the fence this process must prove for `mv_id`'s next durable

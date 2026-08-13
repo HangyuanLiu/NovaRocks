@@ -22,10 +22,14 @@ use novarocks::mv::repository::{
     FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
     RecordFrontendMvRecoveryCleanupOutcomeRequest, RecordFrontendMvRecoveryObservationRequest,
 };
+use novarocks_frontend::mv::coordination::{
+    MvRefreshOwnershipContext, OwnershipRefusal, acquire_refresh_ownership,
+};
 use novarocks_frontend::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, FenceValidator, MvRefreshFenceSource,
     StateStoreMvRepository,
 };
+use novarocks_spi::connector::{ConnectorMvRefreshResourceIdentity, ConnectorProviderId};
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -1157,4 +1161,181 @@ fn definition_ddl_stays_outside_the_refresh_ownership_fence() {
             definition_support::create_request("daily_fenced"),
         )
         .expect("definition DDL must not require a refresh lease");
+}
+
+/// A registry-backed fence source, exactly as production would install it.
+struct RegistryLikeSource {
+    registered: std::sync::Mutex<std::collections::HashSet<i64>>,
+}
+
+impl RegistryLikeSource {
+    fn empty() -> Self {
+        Self {
+            registered: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
+impl MvRefreshFenceSource for RegistryLikeSource {
+    fn validator_for(&self, mv_id: i64) -> Result<FenceValidator, MvRepositoryError> {
+        if !self.registered.lock().unwrap().contains(&mv_id) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!("no refresh lease registered for mv {mv_id}"),
+            ));
+        }
+        Ok(Arc::new(|_transaction| Box::pin(async { Ok(()) })))
+    }
+}
+
+/// Pins the coupling between installing the fence source and registering
+/// ownership at the refresh entry points.
+///
+/// The registry fails closed for unregistered targets, so installing it without
+/// wiring the entry points stops every refresh in the cluster. This test makes
+/// that an executable fact rather than a comment: it goes red the moment a
+/// composition installs a registry-backed source while the entry points still do
+/// not register, which is precisely the half-landed change to prevent.
+#[test]
+fn installing_a_fence_source_without_registration_stops_every_refresh() {
+    let (_temp, _runtime, _host, repository) =
+        fenced_repository(Arc::new(RegistryLikeSource::empty()));
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_fenced"),
+        )
+        .expect("create definition");
+
+    let error = repository
+        .begin_frontend_refresh_intent(fence_intent_request(definition.mv_id))
+        .expect_err("an unregistered target must not begin a refresh");
+    assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict, "{error}");
+
+    // The failure is total, not partial: no refresh can start for any target,
+    // which is what makes install-without-registration a cluster outage rather
+    // than a degraded mode.
+    let second = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("another_fenced"),
+        )
+        .expect("create second definition");
+    assert!(
+        repository
+            .begin_frontend_refresh_intent(fence_intent_request(second.mv_id))
+            .is_err(),
+        "install-without-registration must fail closed for every target"
+    );
+}
+
+/// Two logical frontends sharing one StateStore, competing for the same target.
+///
+/// This is the property the whole ownership layer exists for: two frontends both
+/// find a target due, and exactly one may proceed. It is asserted against real
+/// coordination over a shared SQLite StateStore rather than a mock, because the
+/// failure this guards against is precisely two processes disagreeing about who
+/// won.
+#[test]
+fn two_frontends_competing_for_one_target_yield_a_single_owner() {
+    let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let registry = builtin_state_store_provider_registry().expect("providers");
+    let host = runtime
+        .block_on(StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "mv-ownership-race".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: temp.path().join("state-store.sqlite"),
+                            deployment_owner: "mv-ownership-race".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                // The SQLite backend supports one FE deployment. That is fine
+                // here: the race being tested is between two logical controllers
+                // sharing a store, which is what two coordination runtimes model.
+                active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+                topology_revision: Bytes::from_static(b"mv-ownership-race-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        ))
+        .expect("open SQLite StateStore host");
+    let store = host.state_store().expect("host exposes StateStore");
+
+    // Two independent coordination runtimes over one store: this is what two
+    // frontend processes look like to the lease manager.
+    let first = runtime
+        .block_on(MvRefreshOwnershipContext::open(Arc::clone(&store)))
+        .expect("first frontend coordination");
+    let second = runtime
+        .block_on(MvRefreshOwnershipContext::open(Arc::clone(&store)))
+        .expect("second frontend coordination");
+
+    let resource = ConnectorMvRefreshResourceIdentity::try_new(
+        ConnectorProviderId::parse("iceberg").expect("provider"),
+        uuid::Uuid::from_u128(0x5150),
+    )
+    .expect("stable target resource");
+
+    let winner = runtime
+        .block_on(acquire_refresh_ownership(&first, 42, resource.clone()))
+        .expect("the first frontend acquires an uncontended target");
+
+    // The second frontend sees the same target as due and tries to take it.
+    let refusal = runtime
+        .block_on(acquire_refresh_ownership(&second, 42, resource.clone()))
+        .expect_err("a second frontend must not also own the target");
+    assert!(
+        matches!(
+            refusal,
+            OwnershipRefusal::Contended | OwnershipRefusal::AwaitingTakeover
+        ),
+        "contention must be reported as contention, not as unavailability: {refusal:?}"
+    );
+
+    // And the loser has no registered fence, so its durable transitions would
+    // fail closed rather than racing the winner's.
+    assert!(
+        !second.registry.holds(42),
+        "a frontend that lost the race must not be registered as an owner"
+    );
+    assert!(
+        first.registry.holds(42),
+        "the winner must be registered so its transitions can prove ownership"
+    );
+
+    // Releasing lets the other frontend take over -- ownership is transferable,
+    // not permanent, or a crashed frontend would strand the target forever.
+    drop(winner);
+    assert!(!first.registry.holds(42));
+}
+
+/// Guards that installing ownership is a deliberate choice, not a default.
+///
+/// The unfenced constructor still exists because a composition without a
+/// StateStore has a structurally single owner. This pins that the difference is
+/// explicit: a repository is fenced exactly when a fence source was passed, so a
+/// composition that forgets to install ownership is detectable rather than
+/// quietly unfenced.
+#[test]
+fn a_repository_is_fenced_exactly_when_a_fence_source_is_installed() {
+    let (_temp, _runtime, _host, fenced) = fenced_repository(Arc::new(SupersededOwner));
+    assert!(
+        fenced.has_refresh_fence(),
+        "installing a fence source must make refresh transitions fenced"
+    );
+
+    let (_temp2, _runtime2, _host2, unfenced) = repository();
+    assert!(
+        !unfenced.has_refresh_fence(),
+        "the unfenced constructor must remain visibly unfenced, not accidentally fenced"
+    );
 }

@@ -84,7 +84,28 @@ fn standalone_open_services(
     .with_statistics_attempt_executor_sink(host.statistics_application_port())
     .with_mv_refresh_provider_activation_sink(host.mv_refresh_provider_activation_sink())
     .with_mv_background_engine_sink(host.mv_background_engine_sink())
-    .with_mv_storage_observation(mv_storage_observation)
+    .with_mv_storage_observation(mv_storage_observation.clone())
+    // The frontend owns when MV state is restored at startup. The engine keeps
+    // its own implementation as the fallback for a composition without a
+    // frontend; both run through the same runner, so the step ordering is
+    // identical either way.
+    .with_mv_startup_restore(Arc::new(
+        crate::mv::startup_restore::FrontendMvStartupRestore::new(
+            host.connector_control_registry(),
+            host.catalog_runtime_projection(),
+            host.catalog_application_port(),
+            mv_storage_observation,
+            host.mv_repository(),
+            {
+                let application = host.mv_application_service();
+                Box::new(move || {
+                    application
+                        .recover_startup_mv_refreshes()
+                        .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
+                })
+            },
+        ),
+    ))
 }
 
 /// Opens the frontend services once for an externally composed server. The
