@@ -3157,6 +3157,7 @@ dependencies = [
  "mysql",
  "mysql_common 0.32.4",
  "novarocks-catalog",
+ "novarocks-connector-iceberg",
  "novarocks-execution",
  "novarocks-fs",
  "novarocks-protocol",

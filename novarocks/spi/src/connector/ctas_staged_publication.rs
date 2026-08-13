@@ -200,6 +200,7 @@ impl ConnectorCtasStagedPublicationCapability {
 /// This deliberately reuses only the shared cluster identity and ordered
 /// generation primitives. It is not a table/ref `ConnectorExternalOperationFence`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Design: ADR-0070 (docs/adr/ADR-0070-ctas-uses-absent-target-catalog-fencing.md)
 pub struct ConnectorCtasPublicationFence {
     cluster: ConnectorClusterIdentity,
     generation: ConnectorExternalFenceGeneration,

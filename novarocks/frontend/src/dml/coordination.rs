@@ -1172,6 +1172,15 @@ impl ActiveDmlOperation {
     }
 
     pub(crate) fn journal_authority(&self) -> Result<DmlMutationAuthority, DmlError> {
+        #[cfg(test)]
+        if self.authority.is_none()
+            && let Some(testing) = self.testing_fence.as_ref()
+        {
+            return DmlMutationAuthority::try_new(
+                testing.proposal.coordination_attempt_id(),
+                Arc::clone(&testing.validator),
+            );
+        }
         self.authority
             .as_ref()
             .ok_or_else(|| {

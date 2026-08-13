@@ -656,6 +656,13 @@ mod tests {
             creation.binding().ctas_staged_publication().is_none(),
             "Hadoop generations must not expose catalog-native fenced CTAS"
         );
+        assert!(
+            creation
+                .binding()
+                .historical_ctas_staged_publication_recovery()
+                .is_none(),
+            "Hadoop generations must not expose historical fenced CTAS"
+        );
         let recovery = creation
             .binding()
             .staged_publication_recovery()
@@ -760,6 +767,47 @@ mod tests {
             .expect("vanilla REST control");
         server.join().expect("config server");
 
+        assert!(creation.binding().ctas_staged_publication().is_none());
+        assert!(
+            creation
+                .binding()
+                .historical_ctas_staged_publication_recovery()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hive_factory_never_installs_fenced_ctas_capabilities() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+            binding,
+            runtime.handle().clone(),
+        ));
+        let request = ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            ConnectorInstanceId::parse("hive").expect("instance ID"),
+            vec![
+                ("iceberg.catalog.type".to_string(), "hive".to_string()),
+                (
+                    "hive.metastore.uris".to_string(),
+                    "thrift://127.0.0.1:9083".to_string(),
+                ),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse.path().display().to_string(),
+                ),
+            ],
+        )
+        .expect("Hive factory request");
+
+        let creation = factory.create_control(request).expect("Hive control");
         assert!(creation.binding().ctas_staged_publication().is_none());
         assert!(
             creation

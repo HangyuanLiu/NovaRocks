@@ -1589,8 +1589,703 @@ fn operation_error(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
+
     use super::*;
-    use novarocks_spi::connector::{ConnectorClusterIdentity, ConnectorExternalFenceGeneration};
+    use async_trait::async_trait;
+    use novarocks::engine::ctas_engine::*;
+    use novarocks_spi::connector::{
+        ConnectorClusterIdentity, ConnectorCtasAbortResult, ConnectorCtasPublishResult,
+        ConnectorCtasStagedLocator, ConnectorError, ConnectorErrorKind,
+        ConnectorExecutionBindingKey, ConnectorExternalFenceGeneration,
+        ConnectorExternalFenceReceipt, ConnectorHistoricalCtasCleanupReceipt,
+        ConnectorHistoricalWriteCleanupReceipt, ConnectorHistoricalWriteCleanupRequest,
+        ConnectorHistoricalWriteDescriptor, ConnectorHistoricalWriteDisposition,
+        ConnectorHistoricalWriteFenceRaiseRequest, ConnectorHistoricalWriteObservation,
+        ConnectorHistoricalWriteOutcomeFacts, ConnectorHistoricalWriteProof,
+        ConnectorHistoricalWriteRecovery, ConnectorInstanceDescriptor, ConnectorMutationFailure,
+        ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorProviderId,
+        ConnectorWriteOperationCompletion, ExternalMutationEffect, ExternalMutationEvidence,
+        ExternalMutationFinalization, ExternalMutationOutcome,
+    };
+    use novarocks_spi::state_store::WriteTransaction;
+
+    use crate::dml::coordination::{ActiveDmlOperation, DmlExternalFenceProposal};
+    use crate::dml::journal::{
+        DmlMutationAuthority, DmlMutationAuthorityValidator, OperationJournal,
+    };
+    use crate::dml::model::{
+        DML_OPERATION_SCHEMA_VERSION, DmlCtasRecoveryMutationRequest,
+        DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord,
+        DmlOperationId, OperationMutationRequest, OperationState, OperationTarget, StoredOperation,
+        validate_ctas_recovery_transition, validate_historical_write_recovery_transition,
+    };
+    use crate::dml::write_recovery::HistoricalWriteRecoveryHandle;
+
+    struct AlwaysCurrent;
+
+    #[async_trait]
+    impl DmlMutationAuthorityValidator for AlwaysCurrent {
+        async fn validate_in(
+            &self,
+            _transaction: &mut dyn WriteTransaction,
+        ) -> Result<(), DmlError> {
+            Ok(())
+        }
+    }
+
+    struct RecoveryDriveJournal {
+        operation: Mutex<StoredOperation>,
+        recovery: Mutex<DmlCtasRecoveryRecord>,
+        write_recovery: Mutex<Option<DmlHistoricalWriteRecoveryRecord>>,
+    }
+
+    impl OperationJournal for RecoveryDriveJournal {
+        fn create_preparing(
+            &self,
+            _request: crate::dml::model::CreatePreparingRequest,
+        ) -> Result<DmlOperationId, DmlError> {
+            unreachable!("recovery drive does not create operations")
+        }
+
+        fn transition(
+            &self,
+            _operation_id: DmlOperationId,
+            _to: OperationState,
+        ) -> Result<(), DmlError> {
+            unreachable!("fenced recovery uses authorized statement mutation")
+        }
+
+        fn record_fact(
+            &self,
+            _operation_id: DmlOperationId,
+            _fact: crate::dml::model::OperationFact,
+        ) -> Result<(), DmlError> {
+            unreachable!("CTAS recovery records statement facts")
+        }
+
+        fn load(&self, operation_id: DmlOperationId) -> Result<Option<StoredOperation>, DmlError> {
+            let operation = self.operation.lock().expect("operation lock");
+            Ok((operation.operation_id == operation_id).then(|| operation.clone()))
+        }
+
+        fn load_ctas_recovery(
+            &self,
+            operation_id: DmlOperationId,
+        ) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
+            if self.operation.lock().expect("operation lock").operation_id != operation_id {
+                return Ok(None);
+            }
+            Ok(Some(self.recovery.lock().expect("recovery lock").clone()))
+        }
+
+        fn load_historical_write_recovery(
+            &self,
+            operation_id: DmlOperationId,
+        ) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError> {
+            if self.operation.lock().expect("operation lock").operation_id != operation_id {
+                return Ok(None);
+            }
+            Ok(self
+                .write_recovery
+                .lock()
+                .expect("write recovery lock")
+                .clone())
+        }
+
+        fn load_external_fence(
+            &self,
+            operation_id: DmlOperationId,
+        ) -> Result<Option<crate::dml::model::DmlExternalFenceReceiptRecord>, DmlError> {
+            if self.operation.lock().expect("operation lock").operation_id != operation_id {
+                return Ok(None);
+            }
+            Ok(None)
+        }
+
+        fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
+            Ok(vec![self.operation.lock().expect("operation lock").clone()])
+        }
+
+        fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {
+            self.list_operations()
+        }
+
+        fn preflight_ctas_recovery(
+            &self,
+            request: &DmlCtasRecoveryMutationRequest,
+        ) -> Result<(), DmlError> {
+            let existing = self.recovery.lock().expect("recovery lock");
+            validate_ctas_recovery_transition(Some(&existing), &request.recovery)
+                .map_err(DmlError::journal_corruption)
+        }
+
+        fn preflight_historical_write_recovery(
+            &self,
+            request: &DmlHistoricalWriteRecoveryMutationRequest,
+        ) -> Result<(), DmlError> {
+            let existing = self.write_recovery.lock().expect("write recovery lock");
+            validate_historical_write_recovery_transition(existing.as_ref(), &request.recovery)
+                .map_err(DmlError::journal_corruption)
+        }
+
+        fn record_ctas_recovery_authorized(
+            &self,
+            request: DmlCtasRecoveryMutationRequest,
+            recovery_due_at_ms: Option<i64>,
+            authority: DmlMutationAuthority,
+        ) -> Result<StoredOperation, DmlError> {
+            let mut operation = self.operation.lock().expect("operation lock");
+            if operation.operation_id != request.operation_id
+                || operation.revision != request.expected_revision
+                || authority.coordination_attempt_id() != request.recovery.recovery_attempt_id
+            {
+                return Err(DmlError::journal_unresolved("stale CTAS recovery mutation"));
+            }
+            let mut existing = self.recovery.lock().expect("recovery lock");
+            validate_ctas_recovery_transition(Some(&existing), &request.recovery)
+                .map_err(DmlError::journal_corruption)?;
+            *existing = request.recovery;
+            operation.revision += 1;
+            operation.last_mutation_id = request.mutation_id;
+            operation.recovery_due_at_ms = recovery_due_at_ms;
+            Ok(operation.clone())
+        }
+
+        fn record_historical_write_recovery_authorized(
+            &self,
+            request: DmlHistoricalWriteRecoveryMutationRequest,
+            recovery_due_at_ms: Option<i64>,
+            authority: DmlMutationAuthority,
+        ) -> Result<StoredOperation, DmlError> {
+            let mut operation = self.operation.lock().expect("operation lock");
+            let recovery_attempt = self
+                .recovery
+                .lock()
+                .expect("recovery lock")
+                .recovery_attempt_id;
+            if operation.operation_id != request.operation_id
+                || operation.revision != request.expected_revision
+                || authority.coordination_attempt_id() != recovery_attempt
+            {
+                return Err(DmlError::journal_unresolved(
+                    "stale CTAS historical writer mutation",
+                ));
+            }
+            let mut existing = self.write_recovery.lock().expect("write recovery lock");
+            validate_historical_write_recovery_transition(existing.as_ref(), &request.recovery)
+                .map_err(DmlError::journal_corruption)?;
+            *existing = Some(request.recovery);
+            operation.revision += 1;
+            operation.last_mutation_id = request.mutation_id;
+            operation.recovery_due_at_ms = recovery_due_at_ms;
+            Ok(operation.clone())
+        }
+
+        fn mutate_statement_operation_authorized(
+            &self,
+            request: OperationMutationRequest,
+            recovery_due_at_ms: Option<i64>,
+            authority: DmlMutationAuthority,
+        ) -> Result<StoredOperation, DmlError> {
+            let recovery_attempt = self
+                .recovery
+                .lock()
+                .expect("recovery lock")
+                .recovery_attempt_id;
+            let mut operation = self.operation.lock().expect("operation lock");
+            if operation.operation_id != request.operation_id
+                || operation.revision != request.expected_revision
+                || authority.coordination_attempt_id() != recovery_attempt
+            {
+                return Err(DmlError::journal_unresolved("stale CTAS terminal mutation"));
+            }
+            operation.state = request.state;
+            operation.payload = request.payload;
+            operation.revision += 1;
+            operation.last_mutation_id = request.mutation_id;
+            operation.recovery_due_at_ms = recovery_due_at_ms;
+            Ok(operation.clone())
+        }
+
+        fn mutate_statement_operation(
+            &self,
+            request: OperationMutationRequest,
+        ) -> Result<StoredOperation, DmlError> {
+            let mut operation = self.operation.lock().expect("operation lock");
+            if operation.operation_id != request.operation_id
+                || operation.revision != request.expected_revision
+            {
+                return Err(DmlError::journal_unresolved("stale CTAS terminal mutation"));
+            }
+            operation.state = request.state;
+            operation.payload = request.payload;
+            operation.revision += 1;
+            operation.last_mutation_id = request.mutation_id;
+            if request.state.is_finished()
+                && !self
+                    .recovery
+                    .lock()
+                    .expect("recovery lock")
+                    .requires_recovery_scan()
+            {
+                operation.recovery_due_at_ms = None;
+            }
+            Ok(operation.clone())
+        }
+    }
+
+    struct RecoveryDriveEngine {
+        disposition: ConnectorHistoricalCtasDisposition,
+        inspect_calls: AtomicUsize,
+        cleanup_calls: AtomicUsize,
+        inspect_entered: Option<Arc<Barrier>>,
+        inspect_release: Option<Arc<Barrier>>,
+    }
+
+    impl RecoveryDriveEngine {
+        fn new(disposition: ConnectorHistoricalCtasDisposition) -> Arc<Self> {
+            Arc::new(Self {
+                disposition,
+                inspect_calls: AtomicUsize::new(0),
+                cleanup_calls: AtomicUsize::new(0),
+                inspect_entered: None,
+                inspect_release: None,
+            })
+        }
+
+        fn blocked(
+            disposition: ConnectorHistoricalCtasDisposition,
+            inspect_entered: Arc<Barrier>,
+            inspect_release: Arc<Barrier>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                disposition,
+                inspect_calls: AtomicUsize::new(0),
+                cleanup_calls: AtomicUsize::new(0),
+                inspect_entered: Some(inspect_entered),
+                inspect_release: Some(inspect_release),
+            })
+        }
+    }
+
+    impl CtasEngine for RecoveryDriveEngine {
+        fn classify_ctas(&self, _sql: &str) -> Result<Option<CtasCommand>, String> {
+            unreachable!("recovery never classifies SQL")
+        }
+
+        fn preflight_ctas_target(
+            &self,
+            _command: &CtasCommand,
+            _current_catalog: Option<&str>,
+            _current_database: &str,
+        ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
+            unreachable!("recovery never uses ordinary preflight")
+        }
+
+        fn prepare_ctas_source(
+            &self,
+            _preflight: &dyn CtasPreparedTargetPreflight,
+            _request: PrepareCtasSourceRequest,
+        ) -> Result<PreparedCtasSource, CtasFailure> {
+            unreachable!("recovery never prepares source")
+        }
+
+        fn prepare_ctas_fence_advance(
+            &self,
+            _preflight: &dyn CtasPreparedTargetPreflight,
+            _fence: ConnectorCtasPublicationFence,
+            _action_id: ConnectorCtasActionId,
+        ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
+            unreachable!("recovery uses the historical facet")
+        }
+
+        fn advance_ctas_fence(
+            &self,
+            _action: &dyn CtasPreparedCatalogAction,
+        ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
+            unreachable!("recovery uses the historical facet")
+        }
+
+        fn prepare_ctas_target(
+            &self,
+            _source: &dyn CtasPreparedSource,
+            _fence: ConnectorCtasPublicationFence,
+            _stage_action_id: ConnectorCtasActionId,
+            _policy: CreatePolicy,
+        ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
+            unreachable!("recovery never stages")
+        }
+
+        fn stage_ctas_target(
+            &self,
+            _action: &dyn CtasPreparedCatalogAction,
+        ) -> Result<CtasTargetStageResult, ConnectorCtasFailure> {
+            unreachable!("recovery never stages")
+        }
+
+        fn prepare_ctas_write(
+            &self,
+            _source: &dyn CtasPreparedSource,
+            _target: &dyn CtasPreparedTarget,
+            _write_operation_id: ConnectorWriteOperationId,
+        ) -> Result<PreparedCtasWrite, CtasFailure> {
+            unreachable!("recovery never prepares writers")
+        }
+
+        fn execute_ctas_write(&self, _prepared: &dyn CtasPreparedWrite) -> CtasWriteOutcome {
+            unreachable!("recovery never executes writers")
+        }
+
+        fn reconcile_ctas_write(
+            &self,
+            _prepared: &dyn CtasPreparedWrite,
+            _evidence: ExternalMutationEvidence,
+        ) -> CtasWriteOutcome {
+            unreachable!("recovery never uses an old ordinary writer")
+        }
+
+        fn prepare_publish_ctas(
+            &self,
+            _target: &dyn CtasPreparedTarget,
+            _action_id: ConnectorCtasActionId,
+            _completion: ConnectorWriteOperationCompletion,
+        ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
+            unreachable!("recovery never publishes through ordinary authority")
+        }
+
+        fn publish_ctas(
+            &self,
+            _action: &dyn CtasPreparedCatalogAction,
+        ) -> Result<ConnectorCtasPublishResult, ConnectorCtasFailure> {
+            unreachable!("recovery never publishes through ordinary authority")
+        }
+
+        fn prepare_abort_ctas(
+            &self,
+            _target: &dyn CtasPreparedTarget,
+            _action_id: ConnectorCtasActionId,
+        ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
+            unreachable!("recovery never aborts through ordinary authority")
+        }
+
+        fn abort_ctas(
+            &self,
+            _action: &dyn CtasPreparedCatalogAction,
+        ) -> Result<ConnectorCtasAbortResult, ConnectorCtasFailure> {
+            unreachable!("recovery never aborts through ordinary authority")
+        }
+
+        fn inspect_historical_ctas(
+            &self,
+            descriptor: ConnectorHistoricalCtasDescriptor,
+            _context: ConnectorRequestContext,
+        ) -> Result<ConnectorHistoricalCtasObservation, ConnectorCtasFailure> {
+            self.inspect_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(entered) = &self.inspect_entered {
+                entered.wait();
+            }
+            if let Some(release) = &self.inspect_release {
+                release.wait();
+            }
+            let binding = descriptor.historical_binding.clone();
+            let locator = if self.disposition == ConnectorHistoricalCtasDisposition::Staged {
+                let stage = descriptor
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.action == ConnectorHistoricalCtasAction::Stage)
+                    .expect("staged recovery checkpoint");
+                Some(
+                    ConnectorCtasStagedLocator::try_new(
+                        binding.clone(),
+                        &descriptor.fence,
+                        stage.action_id,
+                        descriptor.target_digest,
+                        Bytes::from_static(b"full-drive-staged-locator"),
+                    )
+                    .expect("historical staged locator"),
+                )
+            } else {
+                None
+            };
+            let (proof, failure) = match self.disposition {
+                ConnectorHistoricalCtasDisposition::Ambiguous => (
+                    None,
+                    Some(ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "injected ambiguous catalog truth",
+                    )),
+                ),
+                ConnectorHistoricalCtasDisposition::Published
+                | ConnectorHistoricalCtasDisposition::Staged => (
+                    Some(
+                        ConnectorCtasPublicationProof::try_new(
+                            binding.clone(),
+                            &descriptor.fence,
+                            match self.disposition {
+                                ConnectorHistoricalCtasDisposition::Published => {
+                                    ConnectorCtasProofPurpose::HistoricalPublished
+                                }
+                                ConnectorHistoricalCtasDisposition::Staged => {
+                                    ConnectorCtasProofPurpose::HistoricalStaged
+                                }
+                                _ => unreachable!("conclusive proof purpose"),
+                            },
+                            None,
+                            descriptor.digest(),
+                            locator.as_ref(),
+                            Bytes::from_static(b"full-drive-proof"),
+                        )
+                        .expect("historical proof"),
+                    ),
+                    None,
+                ),
+                _ => unreachable!("unsupported full-drive catalog disposition"),
+            };
+            ConnectorHistoricalCtasObservation::try_new(
+                binding,
+                &descriptor,
+                self.disposition,
+                locator,
+                proof,
+                None,
+                failure,
+            )
+            .map_err(|error| {
+                ConnectorCtasFailure::CommittedResponseInvalid(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::CorruptData,
+                    error.to_string(),
+                ))
+            })
+        }
+
+        fn advance_historical_ctas_fence(
+            &self,
+            request: ConnectorCtasAdvanceFenceRequest,
+        ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
+            ConnectorCtasPublicationFenceReceipt::try_new(
+                &request,
+                Bytes::from_static(b"full-drive-fence-receipt"),
+            )
+            .map_err(|error| {
+                ConnectorCtasFailure::CommittedResponseInvalid(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::CorruptData,
+                    error.to_string(),
+                ))
+            })
+        }
+
+        fn cleanup_historical_ctas(
+            &self,
+            request: ConnectorHistoricalCtasCleanupRequest,
+        ) -> Result<ConnectorHistoricalCtasCleanupReceipt, ConnectorCtasFailure> {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            if self.disposition != ConnectorHistoricalCtasDisposition::Staged {
+                return Err(ConnectorCtasFailure::KnownNotDispatched(
+                    ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::InvalidRequest,
+                        "cleanup was not expected",
+                    ),
+                ));
+            }
+            request.validate().map_err(|error| {
+                ConnectorCtasFailure::CommittedResponseInvalid(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::CorruptData,
+                    error.to_string(),
+                ))
+            })?;
+            let locator = request.observation.locator.as_ref();
+            let proof = ConnectorCtasPublicationProof::try_new(
+                request.observation.inspection_binding.clone(),
+                &request.descriptor.fence,
+                ConnectorCtasProofPurpose::HistoricalCleanup,
+                None,
+                request.observation.digest(),
+                locator,
+                Bytes::from_static(b"full-drive-cleanup-proof"),
+            )
+            .map_err(|error| {
+                ConnectorCtasFailure::CommittedResponseInvalid(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::CorruptData,
+                    error.to_string(),
+                ))
+            })?;
+            ConnectorHistoricalCtasCleanupReceipt::try_new(&request, proof).map_err(|error| {
+                ConnectorCtasFailure::CommittedResponseInvalid(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::CorruptData,
+                    error.to_string(),
+                ))
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecoveryWriterPlan {
+        StagedCleanupLost,
+        Ambiguous,
+    }
+
+    struct RecoveryWriteFacet {
+        key: ConnectorExecutionBindingKey,
+        plan: RecoveryWriterPlan,
+        raised: Mutex<Option<novarocks_spi::connector::ConnectorExternalOperationFence>>,
+        issued: Mutex<Vec<[u8; 32]>>,
+        cleanup_calls: AtomicUsize,
+        reconcile_calls: AtomicUsize,
+    }
+
+    impl RecoveryWriteFacet {
+        fn new(plan: RecoveryWriterPlan) -> Arc<Self> {
+            Arc::new(Self {
+                key: ConnectorExecutionBindingKey {
+                    instance_id: ConnectorInstanceId::parse("rest").expect("instance"),
+                    incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+                },
+                plan,
+                raised: Mutex::new(None),
+                issued: Mutex::new(Vec::new()),
+                cleanup_calls: AtomicUsize::new(0),
+                reconcile_calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ConnectorHistoricalWriteRecovery for RecoveryWriteFacet {
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.key
+        }
+
+        fn raise_external_fence(
+            &self,
+            request: ConnectorHistoricalWriteFenceRaiseRequest,
+        ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
+            request.validate()?;
+            let receipt = ConnectorExternalFenceReceipt::try_new(
+                &request.raised,
+                Bytes::from_static(b"full-drive-writer-fence"),
+            )?;
+            *self.raised.lock().expect("raised fence lock") = Some(request.raised);
+            Ok(receipt)
+        }
+
+        fn inspect(
+            &self,
+            descriptor: ConnectorHistoricalWriteDescriptor,
+            _context: ConnectorRequestContext,
+        ) -> Result<ConnectorHistoricalWriteObservation, ConnectorError> {
+            descriptor.validate()?;
+            let raised = self.raised.lock().expect("raised fence lock");
+            if raised.as_ref().map(|fence| fence.digest()) != Some(descriptor.raised_fence.digest())
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "historical writer inspection ran before its exact fence raise",
+                ));
+            }
+            let (disposition, cleanup_required) = match self.plan {
+                RecoveryWriterPlan::StagedCleanupLost => {
+                    (ConnectorHistoricalWriteDisposition::Staged, true)
+                }
+                RecoveryWriterPlan::Ambiguous => {
+                    (ConnectorHistoricalWriteDisposition::Ambiguous, false)
+                }
+            };
+            let observation = ConnectorHistoricalWriteObservation::try_new(
+                &descriptor,
+                disposition,
+                ConnectorHistoricalWriteOutcomeFacts {
+                    cleanup_required,
+                    ..ConnectorHistoricalWriteOutcomeFacts::default()
+                },
+                ConnectorHistoricalWriteProof::try_new(Bytes::from_static(
+                    b"full-drive-writer-proof",
+                ))?,
+            )?;
+            self.issued
+                .lock()
+                .expect("issued observation lock")
+                .push(observation.digest());
+            Ok(observation)
+        }
+
+        fn cleanup(
+            &self,
+            request: ConnectorHistoricalWriteCleanupRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorHistoricalWriteCleanupReceipt>, ConnectorError>
+        {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            if !self
+                .issued
+                .lock()
+                .expect("issued observation lock")
+                .contains(&request.observation.digest())
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "cleanup observation was not issued by this writer facet",
+                ));
+            }
+            Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "injected lost writer cleanup response",
+                ),
+                evidence: ExternalMutationEvidence::try_new(
+                    1,
+                    ConnectorInstanceDescriptor {
+                        provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                        instance_id: self.key.instance_id.clone(),
+                    },
+                    self.key.incarnation,
+                    ConnectorMutationOperationId::from_bytes(request.operation_id.to_bytes()),
+                    "historical-write-cleanup",
+                    Bytes::from_static(b"full-drive-writer-cleanup-evidence"),
+                )?,
+            })
+        }
+
+        fn reconcile_cleanup(
+            &self,
+            _operation_id: ConnectorWriteOperationId,
+            _evidence: ExternalMutationEvidence,
+            _context: ConnectorRequestContext,
+        ) -> Result<ExternalMutationOutcome<ConnectorHistoricalWriteCleanupReceipt>, ConnectorError>
+        {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt: ConnectorHistoricalWriteCleanupReceipt {
+                    descriptor_digest: [0; 32],
+                    observation_digest: [0; 32],
+                },
+                finalization: ExternalMutationFinalization::Complete,
+            })
+        }
+    }
+
+    struct RecoveryWriteResolver {
+        facet: Arc<RecoveryWriteFacet>,
+    }
+
+    impl HistoricalWriteRecoveryResolver for RecoveryWriteResolver {
+        fn resolve(
+            &self,
+            instance_id: &ConnectorInstanceId,
+        ) -> Result<HistoricalWriteRecoveryHandle, ConnectorError> {
+            if instance_id != &self.facet.key.instance_id {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "historical writer instance drifted",
+                ));
+            }
+            Ok(HistoricalWriteRecoveryHandle::new(
+                "iceberg".to_string(),
+                self.facet.clone(),
+            ))
+        }
+    }
 
     fn test_fence(operation_id: Uuid) -> ConnectorCtasPublicationFence {
         ConnectorCtasPublicationFence::try_new(
@@ -1630,6 +2325,168 @@ mod tests {
             abort_staging_fact: None,
             next_action: StatementNextAction::ManualInspect,
         }
+    }
+
+    fn recovery_drive_harness(
+        disposition: ConnectorHistoricalCtasDisposition,
+    ) -> (
+        Arc<RecoveryDriveJournal>,
+        Arc<RecoveryDriveEngine>,
+        ActiveDmlOperation,
+    ) {
+        let operation_id = DmlOperationId::new_v7();
+        let attempt = Uuid::now_v7();
+        let operation = StoredOperation {
+            schema_version: DML_OPERATION_SCHEMA_VERSION,
+            operation_id,
+            revision: 1,
+            last_mutation_id: Uuid::now_v7(),
+            operation_kind: OperationKind::CreateTableAsSelect,
+            operation_subkind: None,
+            target: OperationTarget {
+                catalog: "rest".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                ref_name: None,
+            },
+            state: OperationState::CommitUnknown,
+            attempt_id: "ctas-recovery".to_string(),
+            base_snapshot_id: None,
+            base_snapshot_map: BTreeMap::new(),
+            staged_artifacts: Vec::new(),
+            payload: OperationPayload::CtasSaga(test_saga(Uuid::now_v7(), Uuid::now_v7())),
+            coordination_provenance: None,
+            recovery_due_at_ms: Some(1),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: None,
+        };
+        let recovery = DmlCtasRecoveryRecord {
+            codec_version: crate::dml::model::DML_CTAS_RECOVERY_CODEC_VERSION,
+            capability_version: 1,
+            recovery_attempt_id: attempt,
+            recovery_cycle: 1,
+            catalog_fence_history: Vec::new(),
+            catalog_fence: None,
+            staged_target_digest: Some(hex::encode([4_u8; 32])),
+            staged_locator: None,
+            staged_locator_digest: None,
+            staged_proof_digest: None,
+            staged_proof: None,
+            dispatch_checkpoints: Vec::new(),
+            historical_observations: Vec::new(),
+            child_supersessions: Vec::new(),
+            cleanup_retention: DmlCtasCleanupRetention::NotRequired,
+            cleanup_receipt: None,
+            next_action: StatementNextAction::Reconcile,
+            updated_at_ms: 1,
+        };
+        let journal = Arc::new(RecoveryDriveJournal {
+            operation: Mutex::new(operation.clone()),
+            recovery: Mutex::new(recovery),
+            write_recovery: Mutex::new(None),
+        });
+        let proposal = DmlExternalFenceProposal::testing(
+            operation_id,
+            "cluster",
+            attempt,
+            crate::dml::model::DmlExternalFenceGeneration {
+                control_plane_incarnation: 1,
+                resource_epoch: 1,
+                fence_generation: 1,
+            },
+        )
+        .expect("testing fence");
+        let active = ActiveDmlOperation::testing_fenced(
+            journal.clone(),
+            operation,
+            proposal,
+            Arc::new(AlwaysCurrent),
+        );
+        (journal, RecoveryDriveEngine::new(disposition), active)
+    }
+
+    fn configure_staged_writer_recovery(
+        journal: &RecoveryDriveJournal,
+        active: &mut ActiveDmlOperation,
+    ) {
+        let mut operation = journal.operation.lock().expect("operation lock");
+        let OperationPayload::CtasSaga(saga) = &mut operation.payload else {
+            panic!("expected CTAS saga");
+        };
+        saga.write_cohort_set_digest = Some(hex::encode([6_u8; 32]));
+        saga.aggregate_write_digest = Some(hex::encode([7_u8; 32]));
+        let saga = saga.clone();
+        active.stored.payload = operation.payload.clone();
+        drop(operation);
+
+        let mut recovery = journal.recovery.lock().expect("recovery lock");
+        let durable_operation_id = active.operation_id();
+        let operation_id = durable_operation_id.as_uuid();
+        let fence = ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster").expect("cluster"),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 1).expect("generation"),
+            ConnectorCtasOperationId::try_from_bytes(*operation_id.as_bytes())
+                .expect("CTAS operation"),
+            ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse("rest").expect("instance"),
+                namespace: "db".into(),
+                table: "t".into(),
+            },
+        )
+        .expect("catalog fence");
+        let request = ConnectorCtasAdvanceFenceRequest::try_new(
+            fence.clone(),
+            ConnectorCtasActionId::try_from_bytes(*recovery.recovery_attempt_id.as_bytes())
+                .expect("fence action"),
+            request_context().expect("request context"),
+        )
+        .expect("fence request");
+        let receipt = ConnectorCtasPublicationFenceReceipt::try_new(
+            &request,
+            Bytes::from_static(b"preexisting-full-drive-fence"),
+        )
+        .expect("fence receipt");
+        recovery.catalog_fence = Some(DmlCtasCatalogFenceRecord {
+            generation: crate::dml::model::DmlExternalFenceGeneration {
+                control_plane_incarnation: 1,
+                resource_epoch: 1,
+                fence_generation: 1,
+            },
+            action_id: recovery.recovery_attempt_id,
+            request_digest: hex::encode(request.input_digest),
+            dispatch_certainty: DmlCtasDispatchCertainty::PossiblyDispatched,
+            dispatched_at_ms: Some(2),
+            fence_digest: Some(hex::encode(fence.digest())),
+            receipt_digest: Some(hex::encode(receipt.digest())),
+            receipt_payload: Some(
+                DmlOpaquePayload::try_new(receipt.payload().to_vec()).expect("receipt payload"),
+            ),
+            established_at_ms: Some(2),
+        });
+        recovery.dispatch_checkpoints = vec![
+            DmlCtasDispatchCheckpointRecord {
+                action: DmlCtasActionKind::Stage,
+                child_operation_id: saga.prepare_operation_id,
+                request_digest: hex::encode([8_u8; 32]),
+                dispatch_certainty: DmlCtasDispatchCertainty::PossiblyDispatched,
+                dispatched_at_ms: Some(2),
+            },
+            DmlCtasDispatchCheckpointRecord {
+                action: DmlCtasActionKind::Write,
+                child_operation_id: saga.write_operation_id,
+                request_digest: hex::encode([9_u8; 32]),
+                dispatch_certainty: DmlCtasDispatchCertainty::PossiblyDispatched,
+                dispatched_at_ms: Some(3),
+            },
+            DmlCtasDispatchCheckpointRecord {
+                action: DmlCtasActionKind::Abort,
+                child_operation_id: saga.abort_staging_operation_id,
+                request_digest: hex::encode([10_u8; 32]),
+                dispatch_certainty: DmlCtasDispatchCertainty::ConfirmedNotDispatched,
+                dispatched_at_ms: None,
+            },
+        ];
     }
 
     #[test]
@@ -1830,6 +2687,177 @@ mod tests {
         assert_eq!(
             durable_write_cleanup_decision(&saga, Some(&possible), None),
             WriteCleanupDecision::Authorized
+        );
+    }
+
+    #[test]
+    fn full_drive_publishes_or_parks_ambiguity_without_catalog_cleanup() {
+        for disposition in [
+            ConnectorHistoricalCtasDisposition::Published,
+            ConnectorHistoricalCtasDisposition::Ambiguous,
+        ] {
+            let (journal, engine, mut active) = recovery_drive_harness(disposition);
+            let progress = CtasRecoveryProfile::new(engine.clone(), None)
+                .drive(&mut active, 10)
+                .expect("full recovery drive");
+            assert_eq!(engine.inspect_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(engine.cleanup_calls.load(Ordering::SeqCst), 0);
+
+            let operation = journal.operation.lock().expect("operation lock").clone();
+            let recovery = journal.recovery.lock().expect("recovery lock").clone();
+            match disposition {
+                ConnectorHistoricalCtasDisposition::Published => {
+                    assert_eq!(progress, CtasRecoveryProgress::Published);
+                    assert_eq!(operation.state, OperationState::Finalized);
+                    assert_eq!(operation.recovery_due_at_ms, None);
+                    assert_eq!(
+                        recovery.cleanup_retention,
+                        DmlCtasCleanupRetention::NotRequired
+                    );
+                    assert_eq!(recovery.next_action, StatementNextAction::None);
+                }
+                ConnectorHistoricalCtasDisposition::Ambiguous => {
+                    assert_eq!(progress, CtasRecoveryProgress::Unresolved);
+                    assert_eq!(operation.state, OperationState::CommitUnknown);
+                    assert!(operation.recovery_due_at_ms.is_some());
+                    assert_eq!(recovery.next_action, StatementNextAction::ManualInspect);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn full_drive_reconciles_lost_writer_cleanup_before_catalog_cleanup() {
+        let (journal, engine, mut active) =
+            recovery_drive_harness(ConnectorHistoricalCtasDisposition::Staged);
+        configure_staged_writer_recovery(&journal, &mut active);
+        let writer = RecoveryWriteFacet::new(RecoveryWriterPlan::StagedCleanupLost);
+        let resolver = Arc::new(RecoveryWriteResolver {
+            facet: writer.clone(),
+        });
+
+        let progress = CtasRecoveryProfile::new(engine.clone(), Some(resolver))
+            .drive(&mut active, 20)
+            .expect("staged full recovery drive");
+
+        assert_eq!(progress, CtasRecoveryProgress::CleanupCompleted);
+        assert_eq!(writer.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.cleanup_calls.load(Ordering::SeqCst), 1);
+        let write_recovery = journal
+            .write_recovery
+            .lock()
+            .expect("write recovery lock")
+            .clone()
+            .expect("durable historical writer result");
+        assert_eq!(
+            write_recovery.result.expect("writer result").cleanup,
+            DmlHistoricalCleanupState::Completed
+        );
+        assert_eq!(
+            journal
+                .recovery
+                .lock()
+                .expect("recovery lock")
+                .cleanup_retention,
+            DmlCtasCleanupRetention::Completed
+        );
+    }
+
+    #[test]
+    fn full_drive_never_cleans_catalog_staging_for_ambiguous_writer_truth() {
+        let (journal, engine, mut active) =
+            recovery_drive_harness(ConnectorHistoricalCtasDisposition::Staged);
+        configure_staged_writer_recovery(&journal, &mut active);
+        let writer = RecoveryWriteFacet::new(RecoveryWriterPlan::Ambiguous);
+        let resolver = Arc::new(RecoveryWriteResolver {
+            facet: writer.clone(),
+        });
+
+        let progress = CtasRecoveryProfile::new(engine.clone(), Some(resolver))
+            .drive(&mut active, 30)
+            .expect("ambiguous writer full recovery drive");
+
+        assert_eq!(progress, CtasRecoveryProgress::Unresolved);
+        assert_eq!(writer.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            journal
+                .operation
+                .lock()
+                .expect("operation lock")
+                .recovery_due_at_ms
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn superseded_holder_cannot_persist_a_late_catalog_observation() {
+        let (journal, _, active) =
+            recovery_drive_harness(ConnectorHistoricalCtasDisposition::Ambiguous);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let old_engine = RecoveryDriveEngine::blocked(
+            ConnectorHistoricalCtasDisposition::Ambiguous,
+            entered.clone(),
+            release.clone(),
+        );
+        let old = std::thread::spawn(move || {
+            let mut active = active;
+            CtasRecoveryProfile::new(old_engine, None).drive(&mut active, 20)
+        });
+        entered.wait();
+
+        let next_attempt = Uuid::now_v7();
+        let operation = journal.operation.lock().expect("operation lock").clone();
+        let proposal = DmlExternalFenceProposal::testing(
+            operation.operation_id,
+            "cluster",
+            next_attempt,
+            crate::dml::model::DmlExternalFenceGeneration {
+                control_plane_incarnation: 1,
+                resource_epoch: 2,
+                fence_generation: 1,
+            },
+        )
+        .expect("higher testing fence");
+        let mut current = ActiveDmlOperation::testing_fenced(
+            journal.clone(),
+            operation,
+            proposal,
+            Arc::new(AlwaysCurrent),
+        );
+        let current_engine =
+            RecoveryDriveEngine::new(ConnectorHistoricalCtasDisposition::Published);
+        assert_eq!(
+            CtasRecoveryProfile::new(current_engine, None)
+                .drive(&mut current, 21)
+                .expect("current holder recovery"),
+            CtasRecoveryProgress::Published
+        );
+        let revision_after_current = journal.operation.lock().expect("operation lock").revision;
+
+        release.wait();
+        let error = old
+            .join()
+            .expect("old holder thread")
+            .expect_err("old holder must lose its late writeback");
+        assert!(matches!(
+            error.kind(),
+            DmlErrorKind::JournalUnresolved | DmlErrorKind::JournalCorruption
+        ));
+        let operation = journal.operation.lock().expect("operation lock").clone();
+        assert_eq!(operation.revision, revision_after_current);
+        assert_eq!(operation.state, OperationState::Finalized);
+        assert_eq!(
+            journal
+                .recovery
+                .lock()
+                .expect("recovery lock")
+                .recovery_attempt_id,
+            next_attempt
         );
     }
 }

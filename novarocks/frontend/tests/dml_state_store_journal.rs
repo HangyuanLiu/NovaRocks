@@ -2247,6 +2247,176 @@ async fn ctas_v8_recovery_facts_are_authority_revision_bound_and_restart_durable
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sqlite_superseded_ctas_holder_cannot_persist_late_side_or_statement_writes() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    gate.bootstrap(OperationId::new_v7()).await.unwrap();
+
+    let operation_id = DmlOperationId::new_v7();
+    let payload = ctas_payload(CtasSagaPhase::PreparingSource);
+    journal
+        .create_statement_operation_admitted(
+            statement_request(
+                operation_id,
+                Uuid::now_v7(),
+                OperationKind::CreateTableAsSelect,
+                payload.clone(),
+            ),
+            Arc::new(TestTransactionValidator::default()),
+        )
+        .unwrap();
+
+    let clock = Arc::new(ManualDmlLeaseClock::new(700_000, 30_000));
+    let holder_a = Uuid::now_v7();
+    let holder_b = Uuid::now_v7();
+    let attempt_a = Uuid::now_v7();
+    let attempt_b = Uuid::now_v7();
+    let manager_a = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_a),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let manager_b = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_b),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let resource = dml_operation_resource_key(operation_id).unwrap();
+    let guard_a = Arc::new(AsyncMutex::new(acquired(
+        manager_a
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_a).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+    let claimed_a = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(holder_a, attempt_a, &guard_a, clock.wall_ms() as i64)
+                    .await,
+                recovery_due_at_ms: 700_100,
+            },
+            current_authority(attempt_a, Arc::clone(&guard_a), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+
+    // The provider reply represented by this recovery record arrives only
+    // after holder B has taken the real SQLite-backed operation lease.
+    let mut late_recovery = ctas_recovery(attempt_a, ctas_saga(&payload));
+    late_recovery.catalog_fence.as_mut().unwrap().action_id = attempt_a;
+
+    clock.advance_wall(16_001);
+    assert!(matches!(
+        manager_b
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_b).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(2_000);
+    let guard_b = Arc::new(AsyncMutex::new(acquired(
+        manager_b
+            .acquire(
+                resource,
+                AttemptId::try_from(attempt_b).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+    let claimed_b = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(holder_b, attempt_b, &guard_b, clock.wall_ms() as i64)
+                    .await,
+                recovery_due_at_ms: 716_100,
+            },
+            current_authority(attempt_b, Arc::clone(&guard_b), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+    let mut current_recovery = ctas_recovery(attempt_b, ctas_saga(&payload));
+    current_recovery.catalog_fence.as_mut().unwrap().action_id = attempt_b;
+    let current = journal
+        .record_ctas_recovery_authorized(
+            DmlCtasRecoveryMutationRequest {
+                operation_id,
+                expected_revision: claimed_b.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: current_recovery.clone(),
+            },
+            Some(716_200),
+            current_authority(attempt_b, Arc::clone(&guard_b), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+
+    let side_rejection = Arc::new(Mutex::new(None));
+    let error = journal
+        .record_ctas_recovery_authorized(
+            DmlCtasRecoveryMutationRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: late_recovery,
+            },
+            Some(716_300),
+            current_authority(attempt_a, Arc::clone(&guard_a), Arc::clone(&side_rejection)),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *side_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+
+    let statement_rejection = Arc::new(Mutex::new(None));
+    let error = journal
+        .mutate_statement_operation_authorized(
+            OperationMutationRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                state: OperationState::CommitUnknown,
+                payload: payload.clone(),
+            },
+            Some(716_300),
+            current_authority(
+                attempt_a,
+                Arc::clone(&guard_a),
+                Arc::clone(&statement_rejection),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *statement_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap(), Some(current));
+    assert_eq!(
+        journal.load_ctas_recovery(operation_id).unwrap(),
+        Some(current_recovery)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn terminal_ctas_keeps_recovery_due_until_proof_bound_cleanup_converges() {
     let temp = TempDir::new().unwrap();
     let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;

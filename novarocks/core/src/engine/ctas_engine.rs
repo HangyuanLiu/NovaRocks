@@ -2070,7 +2070,10 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -2080,6 +2083,10 @@ mod tests {
     use crate::query_execution::cancellation::QueryCancellationSource;
     use crate::sql::optimizer::options::SessionOptimizerSettings;
     use bytes::Bytes;
+    use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+    use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
+    use novarocks_connector_iceberg::resources::IcebergControlResources;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::*;
 
     struct NeverCancelled;
@@ -2714,22 +2721,128 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unsupported_preflight_stops_before_source_preparation() {
-        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
-            ConnectorProviderId::parse("iceberg").unwrap(),
-            "rest",
-            Default::default(),
-            None,
-        );
+    #[derive(Default)]
+    struct CtasSideEffectCounts {
+        source_preparations: AtomicUsize,
+        stage_dispatches: AtomicUsize,
+        file_writes: AtomicUsize,
+    }
+
+    fn assert_real_binding_rejects_ctas_before_side_effects(binding: ConnectorControlBinding) {
         let planning = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
-        let source_preparations = AtomicUsize::new(0);
-        let failure = match derive_ctas_foreground_leases(&planning) {
-            Ok(_) => panic!("unsupported fixture must not derive fenced CTAS leases"),
-            Err(failure) => failure,
-        };
+        let effects = CtasSideEffectCounts::default();
+        let result = derive_ctas_foreground_leases(&planning).map(|_| {
+            effects.source_preparations.fetch_add(1, Ordering::SeqCst);
+            effects.stage_dispatches.fetch_add(1, Ordering::SeqCst);
+            effects.file_writes.fetch_add(1, Ordering::SeqCst);
+        });
+        let failure = result.expect_err("unsupported catalog must fail the production CTAS gate");
         assert_eq!(failure.kind, CtasFailureKind::Unsupported);
-        assert_eq!(source_preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(effects.source_preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(effects.stage_dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(effects.file_writes.load(Ordering::SeqCst), 0);
+    }
+
+    fn vanilla_rest_config_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind REST config server");
+        let address = listener.local_addr().expect("REST config server address");
+        let body = r#"{"defaults":{},"overrides":{}}"#.to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept REST config request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("REST config request timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read REST config request");
+                assert_ne!(read, 0, "REST config request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            assert!(
+                String::from_utf8(request)
+                    .expect("UTF-8 REST config request")
+                    .starts_with("GET /v1/config ")
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write REST config response");
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[test]
+    fn real_iceberg_bindings_reject_unsupported_ctas_before_all_side_effects() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let read_binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+            read_binding,
+            runtime.handle().clone(),
+        ));
+
+        let hadoop = factory
+            .create_control(
+                ConnectorControlFactoryRequest::try_new(
+                    factory.provider_id().clone(),
+                    ConnectorInstanceId::parse("hadoop-negative").expect("instance ID"),
+                    vec![(
+                        "iceberg.catalog.warehouse".to_string(),
+                        warehouse.path().display().to_string(),
+                    )],
+                )
+                .expect("Hadoop request"),
+            )
+            .expect("Hadoop control");
+        assert_real_binding_rejects_ctas_before_side_effects(hadoop.into_parts().0);
+
+        let hive = factory
+            .create_control(
+                ConnectorControlFactoryRequest::try_new(
+                    factory.provider_id().clone(),
+                    ConnectorInstanceId::parse("hive-negative").expect("instance ID"),
+                    vec![
+                        ("iceberg.catalog.type".to_string(), "hive".to_string()),
+                        (
+                            "hive.metastore.uris".to_string(),
+                            "thrift://127.0.0.1:9083".to_string(),
+                        ),
+                        (
+                            "iceberg.catalog.warehouse".to_string(),
+                            warehouse.path().display().to_string(),
+                        ),
+                    ],
+                )
+                .expect("Hive request"),
+            )
+            .expect("Hive control");
+        assert_real_binding_rejects_ctas_before_side_effects(hive.into_parts().0);
+
+        let (uri, server) = vanilla_rest_config_server();
+        let rest = factory
+            .create_control(
+                ConnectorControlFactoryRequest::try_new(
+                    factory.provider_id().clone(),
+                    ConnectorInstanceId::parse("rest-negative").expect("instance ID"),
+                    vec![
+                        ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                        ("uri".to_string(), uri),
+                    ],
+                )
+                .expect("REST request"),
+            )
+            .expect("vanilla REST control");
+        server.join().expect("REST config server");
+        assert_real_binding_rejects_ctas_before_side_effects(rest.into_parts().0);
     }
 
     #[test]

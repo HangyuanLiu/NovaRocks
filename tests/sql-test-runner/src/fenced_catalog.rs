@@ -306,6 +306,10 @@ struct Record {
     operation: Operation,
     generation: Generation,
     fence: ActionSeal,
+    #[serde(default)]
+    staged_target_identity: Option<String>,
+    #[serde(default)]
+    current_target_identity: Option<String>,
     staged: Option<Staged>,
     in_flight: Option<InFlight>,
     terminal: Option<Terminal>,
@@ -330,6 +334,13 @@ enum Fault {
 #[derive(Debug, Deserialize)]
 struct FaultRequest {
     fault: Fault,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct ReplaceTargetRequest {
+    operation: Operation,
+    replacement_identity: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -394,6 +405,7 @@ fn build_state(config: &FixtureConfig) -> Result<AppState> {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/_fixture/faults/{operation_id}", post(arm_fault))
+        .route("/_fixture/drop-recreate-target", post(drop_recreate_target))
         .fallback(any(dispatch))
         .with_state(state)
 }
@@ -427,6 +439,39 @@ async fn arm_fault(
         .or_default()
         .push(request.fault);
     StatusCode::NO_CONTENT
+}
+
+async fn drop_recreate_target(
+    State(state): State<AppState>,
+    Json(request): Json<ReplaceTargetRequest>,
+) -> Response {
+    if request.replacement_identity.trim().is_empty() {
+        return wire_error(
+            StatusCode::BAD_REQUEST,
+            "identity-conflict",
+            "replacement target identity must not be empty",
+        );
+    }
+    let key = operation_key(&request.operation);
+    match transact(&state, &key, |record| {
+        let current =
+            record.ok_or_else(|| conflict("ambiguous", "catalog operation record is missing"))?;
+        if current.operation != request.operation {
+            return Err(conflict("identity-conflict", "operation identity drifted"));
+        }
+        if current.staged_target_identity.is_none() {
+            return Err(conflict(
+                "ambiguous",
+                "catalog operation has no durable staged target identity",
+            ));
+        }
+        let mut next = current.clone();
+        next.current_target_identity = Some(request.replacement_identity.clone());
+        Ok(next)
+    }) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(response) => response,
+    }
 }
 
 async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
@@ -553,6 +598,8 @@ async fn handle_advance(state: &AppState, request: AdvanceRequest) -> Response {
                 operation: request.action.operation.clone(),
                 generation: request.action.generation.clone(),
                 fence: seal,
+                staged_target_identity: None,
+                current_target_identity: None,
                 staged: None,
                 in_flight: None,
                 terminal: None,
@@ -732,6 +779,14 @@ async fn handle_stage(state: &AppState, request: StageRequest) -> Response {
                 ));
             }
         };
+    let target_identity = match staged_target_identity(&staged_table) {
+        Ok(value) => value,
+        Err(message) => {
+            return temporary_failure(format!(
+                "staged target identity could not be proven: {message}"
+            ));
+        }
+    };
     let outcome = transact(state, &key, |record| {
         let current = require_current(record, &request.action)?;
         if let Some(terminal) = &current.terminal {
@@ -767,6 +822,22 @@ async fn handle_stage(state: &AppState, request: StageRequest) -> Response {
         }
         next.in_flight = None;
         next.staged = Some(staged);
+        match (
+            next.staged_target_identity.as_ref(),
+            next.current_target_identity.as_ref(),
+        ) {
+            (None, None) => {
+                next.staged_target_identity = Some(target_identity.clone());
+                next.current_target_identity = Some(target_identity.clone());
+            }
+            (Some(staged), Some(current)) if staged == &target_identity && current == staged => {}
+            _ => {
+                return Err(conflict(
+                    "identity-conflict",
+                    "staged target identity drifted before durable stage persistence",
+                ));
+            }
+        }
         next.cleanup_authority = Some(cleanup_authority.clone());
         next.cleanup_authority_publish_action = None;
         Ok(next)
@@ -851,6 +922,21 @@ async fn handle_inspect(state: &AppState, request: InspectRequest) -> Response {
                 "kind":"identity-conflict",
                 "message":"operation target or owner identity drifted",
                 "proof":proof("inspect-identity-conflict", &key, &serde_json::to_string(&request.operation).expect("operation serializes"))
+            }),
+        );
+    }
+    if let (Some(staged), Some(current)) = (
+        record.staged_target_identity.as_deref(),
+        record.current_target_identity.as_deref(),
+    ) && staged != current
+    {
+        return json_response(
+            StatusCode::OK,
+            json!({
+                "state":"conflict",
+                "kind":"identity-conflict",
+                "message":"durable target was dropped and recreated with a new identity",
+                "proof":proof("inspect-target-replaced", staged, current)
             }),
         );
     }
@@ -1558,6 +1644,18 @@ fn derive_stage_cleanup_authority(
     Ok(descriptor)
 }
 
+fn staged_target_identity(staged_table: &Value) -> std::result::Result<String, String> {
+    let identity = staged_table
+        .get("metadata")
+        .and_then(|metadata| metadata.get("table-uuid"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "staged table metadata is missing its table UUID".to_string())?;
+    if identity.trim().is_empty() || identity.len() > MAX_CLEANUP_PATH_BYTES {
+        return Err("staged table UUID is empty or exceeds the bounded identity limit".to_string());
+    }
+    Ok(identity.to_string())
+}
+
 fn parse_publish_action(
     payload: &str,
     durable: &CleanupDescriptor,
@@ -1858,6 +1956,16 @@ fn require_current<'a>(
     if record.operation != action.operation {
         return Err(conflict("identity-conflict", "operation identity drifted"));
     }
+    if let (Some(staged), Some(current)) = (
+        record.staged_target_identity.as_deref(),
+        record.current_target_identity.as_deref(),
+    ) && staged != current
+    {
+        return Err(conflict(
+            "identity-conflict",
+            "durable target was dropped and recreated with a new identity",
+        ));
+    }
     if action.generation != record.generation {
         return Err(stale());
     }
@@ -2133,7 +2241,11 @@ mod tests {
                     post(|| async {
                         Json(json!({
                             "metadata-location":"s3://warehouse/staged/metadata/00000.metadata.json",
-                            "metadata":{"format-version":2,"location":"s3://warehouse/staged"},
+                            "metadata":{
+                                "format-version":2,
+                                "location":"s3://warehouse/staged",
+                                "table-uuid":"00000000-0000-4000-8000-000000000001"
+                            },
                             "config":{}
                         }))
                     }),
@@ -2265,6 +2377,48 @@ mod tests {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn inject_fault(client: &reqwest::Client, uri: &str, fault: &str) {
+        let response = client
+            .post(format!("{uri}/_fixture/faults/operation-a"))
+            .json(&json!({"fault":fault}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    fn stage_request() -> Value {
+        json!({
+            "action":action(1,"stage","stage-digest"),
+            "staged-identity":"staged-a",
+            "initialization-digest":"init-a",
+            "create-policy":"fail-if-exists",
+            "create-policy-digest":"policy-a",
+            "provider-payload":downstream_payload("/stage")
+        })
+    }
+
+    fn abort_request(staged: &Value) -> Value {
+        json!({
+            "action":action(1,"abort","abort-a"),
+            "staged-locator":staged["staged-locator"],
+            "staged-proof":staged["staged-proof"],
+            "provider-payload":""
+        })
+    }
+
+    fn publish_request(staged: &Value) -> Value {
+        json!({
+            "action":action(1,"publish","publish-a"),
+            "staged-locator":staged["staged-locator"],
+            "staged-proof":staged["staged-proof"],
+            "write-completion-digest":"write-a",
+            "create-policy":"fail-if-exists",
+            "create-policy-digest":"policy-a",
+            "provider-payload":publish_payload("/commit", vec![])
+        })
     }
 
     async fn advance(
@@ -2588,6 +2742,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_boundary_faults_are_typed_for_every_catalog_action() {
+        let temp = TempDir::new().unwrap();
+        let downstream = downstream().await;
+        let client = reqwest::Client::new();
+
+        for fault in ["before-accept", "after-accept"] {
+            let proxy = fixture(
+                &downstream.uri,
+                &temp.path().join(format!("advance-{fault}.sqlite")),
+            )
+            .await;
+            inject_fault(&client, &proxy.uri, fault).await;
+            assert_eq!(
+                advance(&client, &proxy.uri, 1).await.status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            let replay = advance(&client, &proxy.uri, 1).await;
+            if fault == "before-accept" {
+                assert_eq!(replay.status(), StatusCode::OK);
+            } else {
+                assert_eq!(replay.status(), StatusCode::OK);
+                let body: Value = replay.json().await.unwrap();
+                assert_eq!(body["generation"], generation(1));
+            }
+        }
+
+        for fault in ["before-accept", "after-accept"] {
+            let proxy = fixture(
+                &downstream.uri,
+                &temp.path().join(format!("stage-{fault}.sqlite")),
+            )
+            .await;
+            assert_eq!(
+                advance(&client, &proxy.uri, 1).await.status(),
+                StatusCode::OK
+            );
+            inject_fault(&client, &proxy.uri, fault).await;
+            assert_eq!(
+                post_json(&client, &proxy.uri, "stage", stage_request())
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            let replay = post_json(&client, &proxy.uri, "stage", stage_request()).await;
+            if fault == "before-accept" {
+                assert_eq!(replay.status(), StatusCode::OK);
+            } else {
+                assert_eq!(replay.status(), StatusCode::CONFLICT);
+                let inspection: Value = post_json(
+                    &client,
+                    &proxy.uri,
+                    "inspect",
+                    json!({"operation":operation(),"generation":generation(1),"input-digest":"lineage-1"}),
+                )
+                .await
+                .json()
+                .await
+                .unwrap();
+                assert_eq!(inspection["state"], "ambiguous");
+            }
+        }
+
+        for fault in ["before-accept", "after-accept"] {
+            let proxy = fixture(
+                &downstream.uri,
+                &temp.path().join(format!("publish-{fault}.sqlite")),
+            )
+            .await;
+            assert_eq!(
+                advance(&client, &proxy.uri, 1).await.status(),
+                StatusCode::OK
+            );
+            let staged = stage(&client, &proxy.uri, 1).await;
+            inject_fault(&client, &proxy.uri, fault).await;
+            assert_eq!(
+                post_json(&client, &proxy.uri, "publish", publish_request(&staged))
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            let replay = post_json(&client, &proxy.uri, "publish", publish_request(&staged)).await;
+            if fault == "before-accept" {
+                assert_eq!(replay.status(), StatusCode::OK);
+            } else {
+                assert_eq!(replay.status(), StatusCode::CONFLICT);
+                let inspection: Value = post_json(
+                    &client,
+                    &proxy.uri,
+                    "inspect",
+                    json!({"operation":operation(),"generation":generation(1),"input-digest":"lineage-1"}),
+                )
+                .await
+                .json()
+                .await
+                .unwrap();
+                assert_eq!(inspection["state"], "ambiguous");
+            }
+        }
+
+        for fault in ["before-accept", "after-accept"] {
+            let storage = temp.path().join(format!("abort-{fault}-storage"));
+            std::fs::create_dir_all(&storage).unwrap();
+            let cleanup_operator = Operator::new(
+                opendal::services::Fs::default().root(storage.to_string_lossy().as_ref()),
+            )
+            .unwrap()
+            .finish();
+            let proxy = fixture_with_cleanup_backend(
+                &downstream.uri,
+                &temp.path().join(format!("abort-{fault}.sqlite")),
+                CleanupBackend::Fixed(cleanup_operator),
+            )
+            .await;
+            assert_eq!(
+                advance(&client, &proxy.uri, 1).await.status(),
+                StatusCode::OK
+            );
+            let staged = stage(&client, &proxy.uri, 1).await;
+            inject_fault(&client, &proxy.uri, fault).await;
+            assert_eq!(
+                post_json(&client, &proxy.uri, "abort", abort_request(&staged))
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            let replay = post_json(&client, &proxy.uri, "abort", abort_request(&staged)).await;
+            if fault == "before-accept" {
+                assert_eq!(replay.status(), StatusCode::OK);
+            } else {
+                assert_eq!(replay.status(), StatusCode::CONFLICT);
+                let inspection: Value = post_json(
+                    &client,
+                    &proxy.uri,
+                    "inspect",
+                    json!({"operation":operation(),"generation":generation(1),"input-digest":"lineage-1"}),
+                )
+                .await
+                .json()
+                .await
+                .unwrap();
+                assert_eq!(inspection["state"], "ambiguous");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_downstream_faults_remain_durable_across_restart() {
+        for fault in [
+            "after-downstream-before-terminal",
+            "after-downstream-before-response",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let downstream = downstream().await;
+            let sqlite = temp.path().join("fixture.sqlite");
+            let storage = temp.path().join("cleanup-storage");
+            std::fs::create_dir_all(&storage).unwrap();
+            let cleanup_operator = Operator::new(
+                opendal::services::Fs::default().root(storage.to_string_lossy().as_ref()),
+            )
+            .unwrap()
+            .finish();
+            let client = reqwest::Client::new();
+            let first = fixture_with_cleanup_backend(
+                &downstream.uri,
+                &sqlite,
+                CleanupBackend::Fixed(cleanup_operator.clone()),
+            )
+            .await;
+            assert_eq!(
+                advance(&client, &first.uri, 1).await.status(),
+                StatusCode::OK
+            );
+            let staged = stage(&client, &first.uri, 1).await;
+            inject_fault(&client, &first.uri, fault).await;
+            assert_eq!(
+                post_json(&client, &first.uri, "abort", abort_request(&staged))
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            drop(first);
+
+            let restarted = fixture_with_cleanup_backend(
+                &downstream.uri,
+                &sqlite,
+                CleanupBackend::Fixed(cleanup_operator),
+            )
+            .await;
+            let inspection: Value = post_json(
+                &client,
+                &restarted.uri,
+                "inspect",
+                json!({"operation":operation(),"generation":generation(1),"input-digest":"lineage-1"}),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+            if fault == "after-downstream-before-terminal" {
+                assert_eq!(inspection["state"], "ambiguous");
+                assert_eq!(
+                    post_json(&client, &restarted.uri, "abort", abort_request(&staged))
+                        .await
+                        .status(),
+                    StatusCode::CONFLICT
+                );
+            } else {
+                assert_eq!(inspection["state"], "aborted");
+                assert_eq!(
+                    post_json(&client, &restarted.uri, "abort", abort_request(&staged))
+                        .await
+                        .status(),
+                    StatusCode::OK
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn delayed_old_request_cannot_cross_a_higher_fence() {
         let temp = TempDir::new().unwrap();
         let downstream = downstream().await;
@@ -2625,6 +2998,61 @@ mod tests {
         let (old, higher) = tokio::join!(old, higher);
         assert_eq!(higher.status(), StatusCode::OK);
         assert_eq!(old.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn delayed_old_stage_and_abort_cannot_cross_a_higher_fence() {
+        let temp = TempDir::new().unwrap();
+        let downstream = downstream().await;
+        let client = reqwest::Client::new();
+
+        let stage_sqlite = temp.path().join("stage.sqlite");
+        let stage_first = fixture(&downstream.uri, &stage_sqlite).await;
+        let stage_second = fixture(&downstream.uri, &stage_sqlite).await;
+        assert_eq!(
+            advance(&client, &stage_first.uri, 1).await.status(),
+            StatusCode::OK
+        );
+        inject_fault(&client, &stage_second.uri, "delayed-old-request").await;
+        let old_stage = post_json(&client, &stage_second.uri, "stage", stage_request());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let higher = advance(&client, &stage_first.uri, 2);
+        let (old_stage, higher) = tokio::join!(old_stage, higher);
+        assert_eq!(higher.status(), StatusCode::OK);
+        assert_eq!(old_stage.status(), StatusCode::PRECONDITION_FAILED);
+
+        let abort_sqlite = temp.path().join("abort.sqlite");
+        let storage = temp.path().join("abort-storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let cleanup_operator = Operator::new(
+            opendal::services::Fs::default().root(storage.to_string_lossy().as_ref()),
+        )
+        .unwrap()
+        .finish();
+        let abort_first = fixture_with_cleanup_backend(
+            &downstream.uri,
+            &abort_sqlite,
+            CleanupBackend::Fixed(cleanup_operator.clone()),
+        )
+        .await;
+        let abort_second = fixture_with_cleanup_backend(
+            &downstream.uri,
+            &abort_sqlite,
+            CleanupBackend::Fixed(cleanup_operator),
+        )
+        .await;
+        assert_eq!(
+            advance(&client, &abort_first.uri, 1).await.status(),
+            StatusCode::OK
+        );
+        let staged = stage(&client, &abort_first.uri, 1).await;
+        inject_fault(&client, &abort_second.uri, "delayed-old-request").await;
+        let old_abort = post_json(&client, &abort_second.uri, "abort", abort_request(&staged));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let higher = advance(&client, &abort_first.uri, 2);
+        let (old_abort, higher) = tokio::join!(old_abort, higher);
+        assert_eq!(higher.status(), StatusCode::OK);
+        assert_eq!(old_abort.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
@@ -3060,7 +3488,10 @@ mod tests {
         let durable = derive_stage_cleanup_authority(
             &json!({
                 "metadata-location":null,
-                "metadata":{"location":"s3://warehouse/db/table"}
+                "metadata":{
+                    "location":"s3://warehouse/db/table",
+                    "table-uuid":"00000000-0000-4000-8000-000000000002"
+                }
             }),
             "01234567-89ab-cdef-0123-456789abcdef",
         )
@@ -3378,6 +3809,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drop_recreate_replaces_durable_target_identity_and_forbids_cleanup_after_restart() {
+        let temp = TempDir::new().unwrap();
+        let sqlite = temp.path().join("fixture.sqlite");
+        let storage = temp.path().join("storage");
+        let operator = Operator::new(
+            opendal::services::Fs::default().root(storage.to_string_lossy().as_ref()),
+        )
+        .unwrap()
+        .finish();
+        let downstream = downstream().await;
+        let client = reqwest::Client::new();
+        let first = fixture_with_cleanup_backend(
+            &downstream.uri,
+            &sqlite,
+            CleanupBackend::Fixed(operator.clone()),
+        )
+        .await;
+        assert_eq!(
+            advance(&client, &first.uri, 1).await.status(),
+            StatusCode::OK
+        );
+        let staged = stage(&client, &first.uri, 1).await;
+        operator
+            .write("staged/data/_staging/stage/part-a.parquet", b"a".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .post(format!("{}/_fixture/drop-recreate-target", first.uri))
+                .json(&json!({
+                    "operation":operation(),
+                    "replacement-identity":"00000000-0000-4000-8000-000000000099"
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        drop(first);
+
+        let restarted = fixture_with_cleanup_backend(
+            &downstream.uri,
+            &sqlite,
+            CleanupBackend::Fixed(operator.clone()),
+        )
+        .await;
+        let inspect_request = json!({
+            "operation":operation(),
+            "generation":generation(1),
+            "input-digest":"lineage-1"
+        });
+        let first_inspection: Value =
+            post_json(&client, &restarted.uri, "inspect", inspect_request.clone())
+                .await
+                .json()
+                .await
+                .unwrap();
+        let replayed_inspection: Value =
+            post_json(&client, &restarted.uri, "inspect", inspect_request)
+                .await
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(first_inspection["state"], "conflict");
+        assert_eq!(first_inspection["kind"], "identity-conflict");
+        assert_eq!(first_inspection["proof"], replayed_inspection["proof"]);
+        assert_eq!(
+            post_json(&client, &restarted.uri, "abort", abort_request(&staged))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(
+            operator
+                .stat("staged/data/_staging/stage/part-a.parquet")
+                .await
+                .is_ok(),
+            "identity replacement must prevent external cleanup"
+        );
+    }
+
+    #[tokio::test]
     async fn inspect_conflicts_are_conclusive_and_carry_deterministic_proofs() {
         let temp = TempDir::new().unwrap();
         let downstream = downstream().await;
@@ -3408,40 +3922,46 @@ mod tests {
         assert_eq!(stale_first["proof"], stale_replay["proof"]);
         assert!(stale_first["proof"].as_str().unwrap().len() < 128);
 
-        let digest_conflict: Value = post_json(
-            &client,
-            &fixture.uri,
-            "inspect",
-            json!({
-                "operation":operation(),
-                "generation":generation(2),
-                "input-digest":"foreign-lineage"
-            }),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
+        let digest_request = json!({
+            "operation":operation(),
+            "generation":generation(2),
+            "input-digest":"foreign-lineage"
+        });
+        let digest_conflict: Value =
+            post_json(&client, &fixture.uri, "inspect", digest_request.clone())
+                .await
+                .json()
+                .await
+                .unwrap();
+        let digest_replay: Value = post_json(&client, &fixture.uri, "inspect", digest_request)
+            .await
+            .json()
+            .await
+            .unwrap();
         assert_eq!(digest_conflict["kind"], "digest-conflict");
+        assert_eq!(digest_conflict["proof"], digest_replay["proof"]);
         assert!(digest_conflict["proof"].as_str().unwrap().len() < 128);
 
         let mut foreign_operation = operation();
         foreign_operation["target"]["name"] = Value::String("foreign-target".to_string());
-        let identity_conflict: Value = post_json(
-            &client,
-            &fixture.uri,
-            "inspect",
-            json!({
-                "operation":foreign_operation,
-                "generation":generation(2),
-                "input-digest":"lineage-2"
-            }),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
+        let identity_request = json!({
+            "operation":foreign_operation,
+            "generation":generation(2),
+            "input-digest":"lineage-2"
+        });
+        let identity_conflict: Value =
+            post_json(&client, &fixture.uri, "inspect", identity_request.clone())
+                .await
+                .json()
+                .await
+                .unwrap();
+        let identity_replay: Value = post_json(&client, &fixture.uri, "inspect", identity_request)
+            .await
+            .json()
+            .await
+            .unwrap();
         assert_eq!(identity_conflict["kind"], "identity-conflict");
+        assert_eq!(identity_conflict["proof"], identity_replay["proof"]);
         assert!(identity_conflict["proof"].as_str().unwrap().len() < 128);
     }
 }
