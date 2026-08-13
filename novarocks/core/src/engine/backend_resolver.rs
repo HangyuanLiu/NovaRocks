@@ -138,7 +138,7 @@ fn require_catalog_admission(state: &StandaloneState, catalog: &str) -> Result<(
         .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
     application
         .admit_catalog(&instance_id)
-        .require_ready()
+        .require_ready(&instance_id)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
@@ -202,6 +202,6 @@ mod tests {
             "default_db",
         )
         .expect_err("absent attachment must block an external table target");
-        assert!(error.contains("was not found"));
+        assert_eq!(error, "unknown catalog `warehouse`");
     }
 }

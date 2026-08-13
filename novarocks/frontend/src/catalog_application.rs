@@ -513,7 +513,9 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
                     "catalog attachment already exists",
                 ));
             }
-            return self.admit_catalog(&command.instance_id).require_ready();
+            return self
+                .admit_catalog(&command.instance_id)
+                .require_ready(&command.instance_id);
         }
 
         let provider_id = provider_id_from_properties(&command.properties)?;

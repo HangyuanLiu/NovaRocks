@@ -484,7 +484,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
             .map_err(|error| format!("invalid catalog instance `{catalog}`: {error}"))?;
         application
             .admit_catalog(&instance_id)
-            .require_ready()
+            .require_ready(&instance_id)
             .map(Some)
             .map_err(|error| error.to_string())
     }
@@ -904,7 +904,10 @@ mod tests {
             .resolve_table_for_analysis(None, "db", "orders")
             .expect_err("stale projection must not materialize a table");
 
-        assert_eq!(error, "projection is stale");
+        assert_eq!(
+            error,
+            "catalog `ice` is unavailable on this frontend: projection is stale"
+        );
     }
 
     #[test]

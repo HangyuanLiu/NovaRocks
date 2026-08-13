@@ -158,9 +158,53 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
     )
     .map_err(|error| format!("discover lake MV packages failed: {error}"))?;
     for package in packages {
+        // Startup rediscovery is opportunistic. A package on the lake whose
+        // referenced catalogs are not all attached to this cluster is not ours
+        // to rebuild: persisting it would create a durable MV definition that
+        // references an absent attachment, which the MV writer's attachment
+        // assertion correctly refuses. Skipping keeps a foreign or
+        // already-dropped package from failing frontend startup, while the
+        // targeted rebuild procedure still fails closed on the same condition.
+        if !package_catalogs_are_admitted(state, &package)? {
+            continue;
+        }
         rebuild_one_lake_package_if_missing(state, &package)?;
     }
     Ok(())
+}
+
+/// Whether every catalog this lake MV package references is currently `Ready`
+/// on this frontend.
+fn package_catalogs_are_admitted(
+    state: &Arc<StandaloneState>,
+    package: &MvLakePackageObservation,
+) -> Result<bool, String> {
+    let Some(application) = state.catalog_application.as_ref() else {
+        return Ok(false);
+    };
+    let mut catalogs = std::collections::BTreeSet::new();
+    catalogs.insert(package.table.instance_id.as_str().to_string());
+    for dependency in &package.descriptor.base_dependencies {
+        if !dependency.catalog.is_empty() {
+            catalogs.insert(dependency.catalog.clone());
+        }
+    }
+    for catalog in catalogs {
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&catalog)
+            .map_err(|error| format!("parse MV rebuild catalog `{catalog}`: {error}"))?;
+        if !matches!(
+            application.admit_catalog(&instance_id),
+            crate::catalog_application::CatalogAdmission::Ready(_)
+        ) {
+            tracing::info!(
+                catalog = catalog.as_str(),
+                mv_target = %package.table.table,
+                "skipping lake MV rebuild because a referenced catalog attachment is not admitted here"
+            );
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Persist a single observed lake package's definition into SQLite if it is not already
@@ -453,5 +497,96 @@ mod tests {
             "SELECT id FROM ice.sales.orders"
         );
         assert!(rebuilt.create_request.schema_contract.is_some());
+    }
+
+    struct FixedAdmission(crate::catalog_application::CatalogAdmission);
+
+    impl crate::catalog_application::CatalogApplicationPort for FixedAdmission {
+        fn create_catalog(
+            &self,
+            _command: crate::catalog_application::CatalogCreateCommand,
+        ) -> Result<
+            crate::catalog_application::CatalogRuntimeObservation,
+            crate::catalog_application::CatalogApplicationError,
+        > {
+            unreachable!("lake rebuild never creates a catalog")
+        }
+
+        fn drop_catalog(
+            &self,
+            _command: crate::catalog_application::CatalogDropCommand,
+        ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+            unreachable!("lake rebuild never drops a catalog")
+        }
+
+        fn admit_catalog(
+            &self,
+            _instance_id: &ConnectorInstanceId,
+        ) -> crate::catalog_application::CatalogAdmission {
+            self.0.clone()
+        }
+    }
+
+    fn state_with_admission(
+        admission: crate::catalog_application::CatalogAdmission,
+    ) -> Arc<crate::engine::StandaloneState> {
+        Arc::new(crate::engine::StandaloneState {
+            catalog_application: Some(Arc::new(FixedAdmission(admission))),
+            ..Default::default()
+        })
+    }
+
+    /// Startup rediscovery must not take the frontend down over a lake package
+    /// it has no business rebuilding. Persisting one would create a durable MV
+    /// definition pointing at an absent attachment, which the MV writer's
+    /// attachment assertion refuses — previously that surfaced as a fatal
+    /// "rebuild iceberg MV repository metadata failed" during FE startup.
+    #[test]
+    fn sweep_skips_a_package_whose_catalog_is_not_admitted_here() {
+        let package = sample_package(sample_publication());
+
+        let absent = state_with_admission(crate::catalog_application::CatalogAdmission::Absent);
+        assert!(
+            !package_catalogs_are_admitted(&absent, &package)
+                .expect("absent admission is decidable"),
+            "an absent attachment must make the sweep skip the package"
+        );
+
+        let unavailable =
+            state_with_admission(crate::catalog_application::CatalogAdmission::Unavailable {
+                reason: "projection is stale".to_string(),
+            });
+        assert!(
+            !package_catalogs_are_admitted(&unavailable, &package)
+                .expect("unavailable admission is decidable"),
+            "an unmaterialized attachment must also make the sweep skip the package"
+        );
+
+        let ready = state_with_admission(crate::catalog_application::CatalogAdmission::Ready(
+            crate::catalog_application::CatalogRuntimeObservation {
+                attachment_id: uuid::Uuid::now_v7(),
+                instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("provider ID"),
+                generation: 1,
+            },
+        ));
+        assert!(
+            package_catalogs_are_admitted(&ready, &package).expect("ready admission is decidable"),
+            "a package whose target and upstream catalogs are admitted must be rebuilt"
+        );
+    }
+
+    /// Without a catalog application there is no attachment authority at all, so
+    /// the sweep cannot prove the package belongs to this cluster.
+    #[test]
+    fn sweep_skips_every_package_without_a_catalog_application() {
+        let package = sample_package(sample_publication());
+        let state = Arc::new(crate::engine::StandaloneState::default());
+
+        assert!(
+            !package_catalogs_are_admitted(&state, &package)
+                .expect("missing application is decidable"),
+        );
     }
 }

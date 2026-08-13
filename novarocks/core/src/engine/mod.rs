@@ -1800,7 +1800,7 @@ impl StandaloneNovaRocks {
             })?;
         application
             .admit_catalog(&instance_id)
-            .require_ready()
+            .require_ready(&instance_id)
             .map(|_| ())
     }
 

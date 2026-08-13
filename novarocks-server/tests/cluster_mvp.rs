@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
+use novarocks_frontend::catalog_attachment::CatalogAttachmentRepository;
 use novarocks_frontend::dml::{
     AddFilesLifecyclePhase, ConnectorWriteFinalizationRecord, ConnectorWriteLifecycleRecord,
     CtasSagaPhase, ExternalFactOutcome, OperationKind, OperationPayload, OperationState,
@@ -3748,6 +3749,171 @@ deployment_owner = "fe-1"
     assert_eq!(rows, vec![1i64, 2i64]);
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+}
+
+/// The catalog attachment is a StateStore fact under the production topology.
+///
+/// This is the acceptance case for the attachment control plane: a catalog
+/// created on a live 1FE+3BE cluster must serve a real distributed Iceberg read,
+/// survive an FE restart that begins with an **empty** local metadata cache, and
+/// stay gone after its DROP — including across another restart. The metadata
+/// cache is deliberately deleted between restarts: if any part of the restore
+/// still came from local metadata rather than the StateStore, the catalog would
+/// not come back.
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_catalog_attachment_lifecycle() {
+    let _guard = lock_cluster_mvp();
+    let fixture_dir = tempfile::tempdir_in(runtime_dir())
+        .expect("create catalog attachment lifecycle fixture directory");
+    let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
+    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let warehouse =
+        tempfile::tempdir_in(runtime_dir()).expect("create catalog attachment lifecycle warehouse");
+    const CLUSTER_ID: &str = "catalog-attachment-lifecycle";
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+        &state_store_path,
+        &metadata_path,
+        CLUSTER_ID,
+    );
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let create_catalog = format!(
+        r#"CREATE EXTERNAL CATALOG cp2_attach PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    );
+    conn.query_drop(&create_catalog)
+        .expect("create the catalog attachment");
+    conn.query_drop(create_catalog.replacen(
+        "CREATE EXTERNAL CATALOG",
+        "CREATE EXTERNAL CATALOG IF NOT EXISTS",
+        1,
+    ))
+    .expect("CREATE CATALOG IF NOT EXISTS must resolve the existing attachment");
+    conn.query_drop("CREATE DATABASE cp2_attach.ns")
+        .expect("create the catalog attachment namespace");
+    conn.query_drop(
+        "CREATE TABLE cp2_attach.ns.orders (id INT, amount INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\")",
+    )
+    .expect("create the catalog attachment table");
+    conn.query_drop("INSERT INTO cp2_attach.ns.orders VALUES (1, 10), (2, 20), (3, 30)")
+        .expect("seed rows through the attached catalog");
+
+    // Session catalog context is an admission decision, not a local lookup.
+    conn.query_drop("USE cp2_attach.ns")
+        .expect("session catalog context resolves through attachment admission");
+    let scheduled_before = scheduled_fragments(&mut conn);
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, amount FROM cp2_attach.ns.orders ORDER BY id")
+        .expect("read the attached Iceberg table through the distributed connector");
+    assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30)]);
+    let scheduled_after = scheduled_fragments(&mut conn);
+    assert!(
+        scheduled_after > scheduled_before,
+        "the attached catalog read must schedule remote fragments: \
+         before={scheduled_before}, after={scheduled_after}"
+    );
+    drop(conn);
+
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    assert!(
+        state_store_path.is_file(),
+        "the catalog attachment StateStore must persist across FE shutdown"
+    );
+    // Discard the local metadata cache. Only the StateStore attachment can
+    // bring this catalog back.
+    if metadata_path.is_file() {
+        std::fs::remove_file(&metadata_path).expect("discard the local metadata cache");
+    }
+    cluster.restart_fe();
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let restored: Vec<(i32, i32)> = conn
+        .query("SELECT id, amount FROM cp2_attach.ns.orders ORDER BY id")
+        .expect("the attachment must be restored from the StateStore, not local metadata");
+    assert_eq!(
+        restored,
+        vec![(1, 10), (2, 20), (3, 30)],
+        "the restored attachment must serve the same external table"
+    );
+
+    conn.query_drop("DROP CATALOG cp2_attach")
+        .expect("drop the catalog attachment");
+    let dropped = conn
+        .query_drop("SELECT id FROM cp2_attach.ns.orders")
+        .expect_err("a dropped catalog must stop admitting new queries");
+    assert!(
+        dropped.to_string().contains("cp2_attach"),
+        "the dropped catalog must be reported by name: {dropped}"
+    );
+    conn.query_drop("DROP CATALOG IF EXISTS cp2_attach")
+        .expect("DROP CATALOG IF EXISTS on an absent attachment is a no-op");
+    drop(conn);
+
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let still_absent = conn
+        .query_drop("SELECT id FROM cp2_attach.ns.orders")
+        .expect_err("the durable attachment delete must survive an FE restart");
+    assert!(
+        still_absent.to_string().contains("cp2_attach"),
+        "the absent catalog must be reported by name after restart: {still_absent}"
+    );
+    // The external warehouse is untouched by DROP: re-attaching the same
+    // location exposes the same Iceberg table again.
+    conn.query_drop(&create_catalog)
+        .expect("re-attach the same external warehouse");
+    let reattached: Vec<(i32, i32)> = conn
+        .query("SELECT id, amount FROM cp2_attach.ns.orders ORDER BY id")
+        .expect("DROP CATALOG must not delete external namespaces or tables");
+    assert_eq!(reattached, vec![(1, 10), (2, 20), (3, 30)]);
+    conn.query_drop("DROP CATALOG cp2_attach")
+        .expect("drop the re-attached catalog");
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+
+    // Direct durable inspection: the attachment keyspace is empty, so DROP
+    // removed the record rather than only revoking local admission.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build catalog attachment inspection runtime");
+    let host = runtime
+        .block_on(FrontendApplicationHost::open(
+            Some(sqlite_state_store_config(&state_store_path, CLUSTER_ID)),
+            frontend_execution_config(),
+            ClusterBackendOpenConfig::new(
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                Vec::new(),
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("valid catalog attachment inspection backend config"),
+        ))
+        .expect("reopen the catalog attachment StateStore after clean FE shutdown");
+    let store = host
+        .state_store()
+        .expect("inspection host exposes its StateStore");
+    let repository = runtime
+        .block_on(CatalogAttachmentRepository::open(store))
+        .expect("open the catalog attachment repository");
+    let attachments = runtime
+        .block_on(repository.list())
+        .expect("list durable catalog attachments");
+    assert!(
+        attachments.is_empty(),
+        "DROP CATALOG must leave no durable attachment record: {attachments:?}"
+    );
+    drop(repository);
+    runtime
+        .block_on(host.shutdown())
+        .expect("inspection host shutdown");
 }
 
 #[cfg(unix)]
