@@ -2152,11 +2152,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &ctx.server_handle,
                             &mut target_session,
                             &mut log,
-                        ) {
-                            case_failed = true;
-                            let _ = writeln!(log, "    ❌ {error:#}");
-                            continue;
-                        }
+                        )
+                    {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {error:#}");
+                        continue;
+                    }
                     if step.meta.iceberg_orphan_fixture_absent {
                         let Some(fixture) = orphan_fixture.as_ref() else {
                             case_failed = true;
