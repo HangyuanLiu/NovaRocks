@@ -960,6 +960,91 @@ fn scheduled_fragments(conn: &mut MysqlConn) -> u64 {
         .sum()
 }
 
+fn live_backend_scheduled_fragments(conn: &mut MysqlConn) -> Vec<(String, u64)> {
+    let rows = show_backends(conn);
+    rows.iter()
+        .filter(|row| row.get::<String, usize>(3).as_deref() == Some("Live"))
+        .map(|row| {
+            let backend_id = row
+                .get::<String, usize>(0)
+                .unwrap_or_else(|| panic!("Live backend must expose BackendId; rows={rows:?}"));
+            let value = row.get::<String, usize>(4).unwrap_or_else(|| {
+                panic!("Live backend must expose ScheduledFragments; rows={rows:?}")
+            });
+            let scheduled = value.parse::<u64>().unwrap_or_else(|error| {
+                panic!(
+                    "Live backend ScheduledFragments must be an unsigned integer \
+                     ({value:?}): {error}; rows={rows:?}"
+                )
+            });
+            (backend_id, scheduled)
+        })
+        .collect()
+}
+
+fn assert_every_backend_scheduled_more(
+    before: &[(String, u64)],
+    after: &[(String, u64)],
+    context: &str,
+) {
+    assert_eq!(
+        before.len(),
+        3,
+        "{context} must begin with exactly three Live backends: {before:?}"
+    );
+    assert_eq!(
+        after.len(),
+        3,
+        "{context} must end with exactly three Live backends: {after:?}"
+    );
+    for ((before_id, before_count), (after_id, after_count)) in before.iter().zip(after) {
+        assert_eq!(
+            before_id, after_id,
+            "{context} must preserve backend identity: before={before:?}, after={after:?}"
+        );
+        assert!(
+            after_count > before_count,
+            "{context} must schedule at least one fragment on backend {before_id}: \
+             before={before:?}, after={after:?}"
+        );
+    }
+}
+
+fn current_hadoop_metadata_location(table_path: &Path) -> PathBuf {
+    let metadata_directory = table_path.join("metadata");
+    let version = std::fs::read_to_string(metadata_directory.join("version-hint.text"))
+        .expect("read Hadoop catalog version hint");
+    let version = version.trim();
+    assert!(
+        !version.is_empty() && version.chars().all(|character| character.is_ascii_digit()),
+        "Hadoop catalog version hint must contain a decimal metadata version: {version:?}"
+    );
+    metadata_directory.join(format!("v{version}.metadata.json"))
+}
+
+fn read_iceberg_table_uuid(metadata_location: &Path) -> String {
+    let metadata = std::fs::read_to_string(metadata_location).unwrap_or_else(|error| {
+        panic!(
+            "read Iceberg metadata {}: {error}",
+            metadata_location.display()
+        )
+    });
+    let key = "\"table-uuid\"";
+    let value = metadata
+        .split_once(key)
+        .and_then(|(_, tail)| tail.split_once(':'))
+        .map(|(_, value)| value.trim_start())
+        .and_then(|value| value.strip_prefix('"'))
+        .and_then(|value| value.split_once('"').map(|(uuid, _)| uuid))
+        .unwrap_or_else(|| {
+            panic!(
+                "Iceberg metadata must contain a string table-uuid: {}",
+                metadata_location.display()
+            )
+        });
+    value.to_string()
+}
+
 fn show_optimize_jobs(
     conn: &mut MysqlConn,
     catalog: &str,
@@ -3504,6 +3589,103 @@ deployment_owner = "fe-1"
         .query(multi_submit_query_sql())
         .expect("distributed query must succeed after immediate FE restart");
     assert_eq!(rows, vec![1i64, 2i64]);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+}
+
+/// Production-topology acceptance for the Hadoop catalog create commit point.
+///
+/// The table is created and populated through a real FE, scanned by all three
+/// live BEs, and loaded again after replacing the FE process. The authoritative
+/// Hadoop metadata UUID and location must remain unchanged across that lifecycle.
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_hadoop_catalog_create_fencing() {
+    let _guard = lock_cluster_mvp();
+    let fixture_dir = tempfile::tempdir_in(runtime_dir())
+        .expect("create Hadoop catalog fencing fixture directory");
+    let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
+    let warehouse =
+        tempfile::tempdir_in(runtime_dir()).expect("create Hadoop catalog fencing warehouse");
+    const CLUSTER_ID: &str = "hadoop-catalog-create-fencing";
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store(&state_store_path, CLUSTER_ID);
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG spi4b_h1 PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create the Hadoop catalog attachment");
+    conn.query_drop("CREATE DATABASE spi4b_h1.fencing")
+        .expect("create the Hadoop catalog namespace");
+    conn.query_drop(
+        "CREATE TABLE spi4b_h1.fencing.orders (id INT, amount INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\")",
+    )
+    .expect("create the fenced Hadoop catalog table");
+
+    // Three independent writes retain three physical scan units, making the
+    // production fanout assertion deterministic rather than relying on a
+    // standalone shortcut or a synthetic empty-table fragment.
+    for values in ["(1, 10), (2, 20)", "(3, 30), (4, 40)", "(5, 50), (6, 60)"] {
+        conn.query_drop(format!(
+            "INSERT INTO spi4b_h1.fencing.orders VALUES {values}"
+        ))
+        .expect("write a distinct Iceberg data file");
+    }
+
+    let table_path = warehouse.path().join("fencing").join("orders");
+    let metadata_location_before = current_hadoop_metadata_location(&table_path);
+    let table_uuid_before = read_iceberg_table_uuid(&metadata_location_before);
+    let scheduled_before = live_backend_scheduled_fragments(&mut conn);
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, amount FROM spi4b_h1.fencing.orders ORDER BY id")
+        .expect("scan the fenced Hadoop table through three BEs");
+    assert_eq!(
+        rows,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)]
+    );
+    let scheduled_after = live_backend_scheduled_fragments(&mut conn);
+    assert_every_backend_scheduled_more(
+        &scheduled_before,
+        &scheduled_after,
+        "the initial Hadoop table read",
+    );
+    drop(conn);
+
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    assert!(
+        state_store_path.is_file(),
+        "the catalog attachment must persist in the frontend StateStore"
+    );
+    cluster.restart_fe();
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let restart_scheduled_before = live_backend_scheduled_fragments(&mut conn);
+    let restored_rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, amount FROM spi4b_h1.fencing.orders ORDER BY id")
+        .expect("load the same Hadoop table from the shared warehouse after FE restart");
+    assert_eq!(restored_rows, rows);
+    let restart_scheduled_after = live_backend_scheduled_fragments(&mut conn);
+    assert_every_backend_scheduled_more(
+        &restart_scheduled_before,
+        &restart_scheduled_after,
+        "the post-restart Hadoop table read",
+    );
+
+    let metadata_location_after = current_hadoop_metadata_location(&table_path);
+    let table_uuid_after = read_iceberg_table_uuid(&metadata_location_after);
+    assert_eq!(
+        metadata_location_after, metadata_location_before,
+        "FE restart must load the same authoritative Hadoop metadata location"
+    );
+    assert_eq!(
+        table_uuid_after, table_uuid_before,
+        "FE restart must not attribute the table to a new UUID"
+    );
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }

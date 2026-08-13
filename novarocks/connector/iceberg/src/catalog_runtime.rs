@@ -32,6 +32,7 @@ use crate::catalog_config::{IcebergCatalogConfiguration, IcebergCatalogKind};
 /// runtime downcast.
 pub struct IcebergCatalogClient {
     generic: Arc<dyn crate::iceberg::Catalog>,
+    hadoop: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
     rest: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
 }
 
@@ -42,6 +43,10 @@ impl IcebergCatalogClient {
 
     pub fn rest(&self) -> Option<&Arc<crate::iceberg_catalog_rest::RestCatalog>> {
         self.rest.as_ref()
+    }
+
+    pub fn hadoop(&self) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
+        self.hadoop.as_ref()
     }
 }
 
@@ -58,10 +63,13 @@ pub fn build_hadoop_catalog(
         &configuration.warehouse_uri,
         configuration.object_store_config.as_ref(),
     );
-    Ok(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
-        file_io,
-        configuration.warehouse_uri.clone(),
-    ))
+    Ok(
+        crate::hadoop_catalog::HadoopFileSystemCatalog::new_with_object_store_config(
+            file_io,
+            configuration.warehouse_uri.clone(),
+            configuration.object_store_config.clone(),
+        ),
+    )
 }
 
 pub async fn build_rest_catalog(
@@ -170,20 +178,27 @@ pub async fn build_catalog_client(
     configuration: &IcebergCatalogConfiguration,
 ) -> Result<IcebergCatalogClient, String> {
     match configuration.kind {
-        IcebergCatalogKind::Hadoop => Ok(IcebergCatalogClient {
-            generic: Arc::new(build_hadoop_catalog(configuration)?),
-            rest: None,
-        }),
+        IcebergCatalogKind::Hadoop => {
+            let hadoop = Arc::new(build_hadoop_catalog(configuration)?);
+            let generic: Arc<dyn crate::iceberg::Catalog> = hadoop.clone();
+            Ok(IcebergCatalogClient {
+                generic,
+                hadoop: Some(hadoop),
+                rest: None,
+            })
+        }
         IcebergCatalogKind::Rest => {
             let rest = Arc::new(build_rest_catalog(configuration).await?);
             let generic: Arc<dyn crate::iceberg::Catalog> = rest.clone();
             Ok(IcebergCatalogClient {
                 generic,
+                hadoop: None,
                 rest: Some(rest),
             })
         }
         IcebergCatalogKind::Hive => Ok(IcebergCatalogClient {
             generic: Arc::new(build_hms_catalog(configuration).await?),
+            hadoop: None,
             rest: None,
         }),
     }
@@ -218,6 +233,7 @@ mod tests {
             .await
             .expect("provider catalog");
         assert!(client.rest().is_none());
+        assert!(client.hadoop().is_some());
         assert!(Arc::strong_count(client.generic()) >= 1);
     }
 }

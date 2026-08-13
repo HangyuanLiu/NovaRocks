@@ -411,7 +411,9 @@ fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
     conn.query_drop("insert into ice.db1.tbl values (1, 'a'), (2, 'b')")
         .expect("insert iceberg rows");
 
-    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 2);
+    // Every connector write first persists the provider-owned write-fence
+    // snapshot, then publishes the data snapshot.
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 3);
 }
 
 #[test]
@@ -437,7 +439,7 @@ fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     conn.query_drop("insert into ice.db1.tbl values (1, 'a'), (2, 'b')")
         .expect("insert iceberg rows");
 
-    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 2);
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 3);
 
     // Phase 2: Register a fresh catalog with a different name over the SAME
     // warehouse, so the per-entry table_cache is empty. This simulates reading
@@ -469,8 +471,9 @@ fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     conn.query_drop("insert into ice2.db1.tbl values (3, 'c')")
         .expect("insert into hadoop-only table");
 
-    // Each INSERT publishes one data metadata commit in the distributed write path.
-    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 3);
+    // Each INSERT first publishes its write-fence snapshot and then the data
+    // metadata commit in the distributed write path.
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 5);
 }
 
 #[test]

@@ -59,6 +59,20 @@ impl IcebergFsAccess {
             )),
         }
     }
+
+    pub fn supports_conditional_create(&self) -> bool {
+        self.operator()
+            .info()
+            .full_capability()
+            .write_with_if_not_exists
+    }
+
+    pub async fn ensure_parent_directory(&self) -> std::result::Result<(), String> {
+        let relative_path = self.single_relative_path()?.to_string();
+        IcebergFsStorage::ensure_parent_dir(&self.operator(), &relative_path)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
