@@ -1286,22 +1286,12 @@ fn two_frontends_competing_for_one_target_yield_a_single_owner() {
     .expect("stable target resource");
 
     let winner = runtime
-        .block_on(acquire_refresh_ownership(
-            &first.coordination,
-            &first.registry,
-            42,
-            resource.clone(),
-        ))
+        .block_on(acquire_refresh_ownership(&first, 42, resource.clone()))
         .expect("the first frontend acquires an uncontended target");
 
     // The second frontend sees the same target as due and tries to take it.
     let refusal = runtime
-        .block_on(acquire_refresh_ownership(
-            &second.coordination,
-            &second.registry,
-            42,
-            resource.clone(),
-        ))
+        .block_on(acquire_refresh_ownership(&second, 42, resource.clone()))
         .expect_err("a second frontend must not also own the target");
     assert!(
         matches!(
