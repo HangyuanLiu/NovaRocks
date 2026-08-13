@@ -76,9 +76,19 @@ Frontend transaction owner 组合进同一次 commit，而不是各建一套协�
   refresh 路径。真正的补强需要架构 guard 断言生产 composition 已安装，那尚未落地。
 - **registry 按 `mv_id` 键。** repository 调用只带 `mv_id`，所以这是唯一可用的键；每个条目同时记录稳定 resource
   以防 rebuild 后条目存活于错误的 target incarnation，但这是补偿而非根治。
-- **本决策落地时，三个 refresh 入口尚未切到 acquisition service。** 因此「两个 Frontend 竞争同一 target 只有一个
-  越过 barrier」端到端还不成立；已经成立的是「任何 durable refresh 转换若不能在其事务内证明 fence 就会失败」。
-  这一半先落地是因为 repository 强制点是另一半的前提，不是因为它本身构成完整保证。
+- **ownership 按 target 粘性持有，跨多次 refresh 复用，而不是每次 refresh 取/放。** 这不是为了省开销，是因为
+  per-refresh 模型无法做对：`LeaseGuard` 的 release 是 spawn 出去的（异步落地），而 acquisition 是同步的，
+  于是「recovery 刚结束就发起的 refresh」会输给自己前一次的 release。粘性持有直接消灭这个竞态。
+  代价是必须自带续约循环：租约在本 Frontend 仍自认为持有时悄悄过期，是**比不做 ownership 更危险**的失败模式
+  （静默 split-brain）。缓解手段是续约失败即注销 target，而 registry 对未注册 target 一律 fail closed，
+  于是「租约丢失」表现为写入被拒，而不是写入不带 fence。
+- **续约必须同步推进已注册的 fence。** 续约会推进 fence，若 registry 里那份没跟着推进，每个 durable 转换都会
+  拿一个被取代的 fence 去校验，表现为「本 Frontend 在刚刚续约完自己的租约之后拒绝自己的写入」。这一条是实测
+  发现的，不是设计时预见的。
+- **startup recovery 会等待前任 owner 的租约老化（最长 30s），而不是跳过该 candidate。** 崩溃后无法区分
+  「已死」与「被网络隔离但仍在发布」，所以只能等租约到期。跳过看起来更快，但 recovery 是**一次性**启动扫描：
+  被跳过的 candidate 永远不会被重访，之后每一次 refresh 都会和那个没人和解的 attempt 冲突——这是实测到的
+  死锁形态，不是假设。真正的补强是让 recovery 可重入/周期化，那尚未落地。
 
 ## 何时重新评估
 
