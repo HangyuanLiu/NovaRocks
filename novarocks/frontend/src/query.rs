@@ -27,10 +27,10 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
-use novarocks::engine::{
-    SessionCatalogResolver, backend_command::BackendCommandExecutor,
-    catalog_command::CatalogCommandExecutor, iceberg_ref_command::IcebergRefCommandExecutor,
-};
+use novarocks::catalog_application::command::CatalogCommandExecutor;
+use novarocks::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
+use novarocks::engine::SessionCatalogResolver;
+use novarocks::query_execution::backend_command::BackendCommandExecutor;
 use novarocks::maintenance::command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor};
 use novarocks::mv::command::MvCommandExecutor;
 use novarocks::query_execution::backend::BackendTopologyService;

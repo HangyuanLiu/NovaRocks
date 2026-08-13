@@ -31,9 +31,10 @@ use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::engine::domain;
 use crate::engine::{
-    CoreQueryCompiler, UnifiedStatisticsResolver, backend_command, catalog_command,
-    iceberg_ref_command,
+    CoreQueryCompiler, UnifiedStatisticsResolver,
 };
+use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
+use crate::query_execution::backend_command;
 use crate::maintenance::TableMaintenanceService;
 use crate::maintenance::command as maintenance_command;
 use crate::mv::application::MvApplicationService;

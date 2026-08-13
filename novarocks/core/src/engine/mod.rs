@@ -56,14 +56,10 @@ use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
-pub(crate) mod aggregate;
-pub mod backend_command;
 pub(crate) mod backend_resolver;
-pub mod catalog_command;
 pub(crate) mod domain;
 pub use domain::SessionCatalogResolver;
 pub mod frontend_capabilities;
-pub mod iceberg_ref_command;
 pub(crate) mod statement;
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
