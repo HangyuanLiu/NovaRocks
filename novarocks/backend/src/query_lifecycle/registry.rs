@@ -2033,21 +2033,21 @@ impl QueryLifecycleRegistry {
                 continue;
             }
             if terminal_retention_expired {
-                {
+                let reason = {
                     let mut state = entry.state.lock().expect("query lifecycle entry lock");
+                    let reason = state
+                        .termination_reason
+                        .unwrap_or(QueryTerminationReason::CoordinatorFinalize);
                     state.terminal_record = None;
-                }
+                    reason
+                };
                 entry.terminal_delivery_completed.notify_all();
                 self.release_terminal_record(entry.manifest.execution_id());
                 self.increment_terminal_metric(|metrics| {
                     metrics.terminal_retention_expired =
                         metrics.terminal_retention_expired.saturating_add(1);
                 });
-                self.publish_tombstone(
-                    &entry,
-                    entry.manifest.execution_id(),
-                    QueryTerminationReason::CoordinatorFinalize,
-                );
+                self.publish_tombstone(&entry, entry.manifest.execution_id(), reason);
             }
         }
     }
@@ -2896,6 +2896,9 @@ impl QueryLifecycleRegistry {
                 self.local_backend_id().unwrap_or_default(),
             );
         }
+        let reason = state
+            .termination_reason
+            .unwrap_or(QueryTerminationReason::CoordinatorFinalize);
         state.terminal_record = None;
         drop(state);
         entry.terminal_delivery_completed.notify_all();
@@ -2903,11 +2906,7 @@ impl QueryLifecycleRegistry {
             metrics.terminal_acknowledged = metrics.terminal_acknowledged.saturating_add(1);
         });
         self.release_terminal_record(ack.execution_id());
-        self.publish_tombstone(
-            &entry,
-            ack.execution_id(),
-            QueryTerminationReason::CoordinatorFinalize,
-        );
+        self.publish_tombstone(&entry, ack.execution_id(), reason);
         Ok(())
     }
 
