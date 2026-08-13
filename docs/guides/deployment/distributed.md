@@ -126,10 +126,6 @@ FE 节点也会启动 `server.grpc_port`，用于接收 BE 回报执行状态。
 ```toml
 log_level = "info"
 
-[metadata]
-provider = "sqlite"
-path = "meta/fe.sqlite"
-
 [state_store]
 provider = "sqlite"
 cluster_id = "production-cluster"
@@ -158,7 +154,7 @@ backends = [
 ]
 ```
 
-`[metadata]` 保存 native control metadata，不提供内部 StarRocks 表或 backend membership fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供 connector execution 的进程本地凭据。`[state_store]` 中的 membership 会在 FE 重启后恢复。`[cluster].backends` 只会补充尚不存在的 endpoint：它不会删除 StateStore 中已有的 backend，也不会重新激活正在 decommissioning 的 backend。
+`[state_store]` 是 FE durable control-plane state 的唯一持久化入口，其中的 membership 会在 FE 重启后恢复；不得添加第二套 metadata store 或内存 registry 作为 fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供 connector execution 的进程本地凭据。`[cluster].backends` 只会补充尚不存在的 endpoint：它不会删除 StateStore 中已有的 backend，也不会重新激活正在 decommissioning 的 backend。
 
 启动 FE：
 

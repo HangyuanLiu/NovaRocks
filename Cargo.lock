@@ -3132,7 +3132,6 @@ name = "novarocks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apache-avro",
  "arrow",
  "arrow-buffer",
  "arrow-data",
@@ -3181,7 +3180,6 @@ dependencies = [
  "regex",
  "reqwest",
  "roaring 0.10.12",
- "rusqlite",
  "ryu",
  "serde",
  "serde_json",

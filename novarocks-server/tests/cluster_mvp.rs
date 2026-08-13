@@ -711,30 +711,14 @@ deployment_owner = "fe-1"
         Self::start_n_be_with_options(3, "", &[], &state_store_config, false)
     }
 
-    fn start_three_be_sqlite_state_store_with_metadata(
+    fn start_three_be_sqlite_state_store_with_be_extra(
         state_store_path: &Path,
-        metadata_path: &Path,
-        cluster_id: &str,
-    ) -> Self {
-        Self::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
-            state_store_path,
-            metadata_path,
-            cluster_id,
-            &[],
-            "",
-        )
-    }
-
-    fn start_three_be_sqlite_state_store_with_metadata_and_be_extra(
-        state_store_path: &Path,
-        metadata_path: &Path,
         cluster_id: &str,
         be_debug_env: &[(&str, &str)],
         be_extra: &str,
     ) -> Self {
-        Self::start_three_be_sqlite_state_store_with_metadata_and_extras(
+        Self::start_three_be_sqlite_state_store_with_extras(
             state_store_path,
-            metadata_path,
             cluster_id,
             be_extra,
             be_debug_env,
@@ -742,9 +726,8 @@ deployment_owner = "fe-1"
         )
     }
 
-    fn start_three_be_sqlite_state_store_with_metadata_and_extras(
+    fn start_three_be_sqlite_state_store_with_extras(
         state_store_path: &Path,
-        metadata_path: &Path,
         cluster_id: &str,
         be_extra: &str,
         be_debug_env: &[(&str, &str)],
@@ -755,24 +738,14 @@ deployment_owner = "fe-1"
             "SQLite StateStore path must be absolute: {}",
             state_store_path.display()
         );
-        assert!(
-            metadata_path.is_absolute(),
-            "SQLite metadata path must be absolute: {}",
-            metadata_path.display()
-        );
         let fe_extra = format!(
             r#"
-[metadata]
-provider = "sqlite"
-path = "{}"
-
 [state_store]
 provider = "sqlite"
 path = "{}"
 cluster_id = "{cluster_id}"
 deployment_owner = "fe-1"
 "#,
-            metadata_path.display(),
             state_store_path.display(),
         );
         Self::start_n_be_with_options_and_standalone_extra(
@@ -785,9 +758,8 @@ deployment_owner = "fe-1"
         )
     }
 
-    fn start_three_be_sqlite_state_store_with_metadata_and_fault_dir(
+    fn start_three_be_sqlite_state_store_with_fault_dir(
         state_store_path: &Path,
-        metadata_path: &Path,
         cluster_id: &str,
         fault_dir: &Path,
     ) -> Self {
@@ -797,10 +769,6 @@ deployment_owner = "fe-1"
         let debug = String::new();
         let fe_extra = format!(
             r#"
-[metadata]
-provider = "sqlite"
-path = "{}"
-
 [state_store]
 provider = "sqlite"
 path = "{}"
@@ -809,7 +777,6 @@ deployment_owner = "fe-1"
 
 {debug}
 "#,
-            metadata_path.display(),
             state_store_path.display(),
         );
         Self::start_n_be_with_options(3, &debug, &[], &fe_extra, false)
@@ -1662,21 +1629,19 @@ fn cross_process_three_be_connector_read_distributes_splits_and_cancels() {
     let _guard = lock_cluster_mvp();
     let fixture_dir =
         tempfile::tempdir_in(runtime_dir()).expect("create cancellation fixture directory");
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
-            &fixture_dir.path().join("frontend-state.sqlite"),
-            &fixture_dir.path().join("frontend-metadata.sqlite"),
-            "connector-cancellation",
-            &[
-                ("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1"),
-                ("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1"),
-                ("NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER", "1"),
-            ],
-            r#"
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_be_extra(
+        &fixture_dir.path().join("frontend-state.sqlite"),
+        "connector-cancellation",
+        &[
+            ("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1"),
+            ("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1"),
+            ("NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER", "1"),
+        ],
+        r#"
 [runtime]
 operator_buffer_chunks = 1
 "#,
-        );
+    );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create cancellation warehouse");
     let mut control = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut control, 3);
@@ -1818,21 +1783,11 @@ fn cross_process_three_be_connector_catalog_mutation_is_visible_to_non_empty_rea
         return;
     }
     let _guard = lock_cluster_mvp();
-    let metadata_dir =
-        tempfile::tempdir_in(runtime_dir()).expect("create catalog mutation metadata directory");
-    let metadata_config = format!(
-        r#"
-[metadata]
-provider = "sqlite"
-path = "{}"
-"#,
-        metadata_dir.path().join("catalog.db").display()
-    );
     let mut cluster = MultiBeClusterHarness::start_n_be_with_debug_env(
         3,
         "",
         &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
-        &metadata_config,
+        "",
     );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create catalog mutation warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -1922,21 +1877,11 @@ fn cross_process_three_be_connector_static_predicate_prunes_files_and_row_groups
         return;
     }
     let _guard = lock_cluster_mvp();
-    let metadata_dir =
-        tempfile::tempdir_in(runtime_dir()).expect("create static-pruning metadata directory");
-    let metadata_config = format!(
-        r#"
-[metadata]
-provider = "sqlite"
-path = "{}"
-"#,
-        metadata_dir.path().join("catalog.db").display()
-    );
     let mut cluster = MultiBeClusterHarness::start_n_be_with_debug_env(
         3,
         "",
         &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
-        &metadata_config,
+        "",
     );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create static-pruning warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -2075,14 +2020,12 @@ fn cross_process_three_be_connector_read_applies_deletion_vectors() {
     }
     let _guard = lock_cluster_mvp();
     let fixture_dir = tempfile::tempdir_in(runtime_dir()).expect("create DV fixture directory");
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
-            &fixture_dir.path().join("frontend-state.sqlite"),
-            &fixture_dir.path().join("frontend-metadata.sqlite"),
-            "connector-deletion-vectors",
-            &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
-            "",
-        );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_be_extra(
+        &fixture_dir.path().join("frontend-state.sqlite"),
+        "connector-deletion-vectors",
+        &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
+        "",
+    );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create DV warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
@@ -2164,17 +2107,15 @@ fn cross_process_three_be_connector_generation_replacement_drains_old_readers() 
     let _guard = lock_cluster_mvp();
     let fixture_dir =
         tempfile::tempdir_in(runtime_dir()).expect("create generation fixture directory");
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
-            &fixture_dir.path().join("frontend-state.sqlite"),
-            &fixture_dir.path().join("frontend-metadata.sqlite"),
-            "connector-generation",
-            &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
-            r#"
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_be_extra(
+        &fixture_dir.path().join("frontend-state.sqlite"),
+        "connector-generation",
+        &[("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")],
+        r#"
 [runtime]
 operator_buffer_chunks = 1
 "#,
-        );
+    );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create generation warehouse");
     let mut control = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut control, 3);
@@ -2429,9 +2370,8 @@ fn cross_process_three_be_statistics_service() {
     let _guard = lock_cluster_mvp();
     let fixture_dir =
         tempfile::tempdir_in(runtime_dir()).expect("create statistics fixture directory");
-    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store(
         &fixture_dir.path().join("frontend-state.sqlite"),
-        &fixture_dir.path().join("frontend-metadata.sqlite"),
         "statistics-service",
     );
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -2531,11 +2471,10 @@ fn cross_process_three_be_frontend_insert_service_lifecycle() {
     let fixture_dir =
         tempfile::tempdir_in(runtime_dir()).expect("create INSERT lifecycle fixture directory");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
-    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let legacy_metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create INSERT lifecycle warehouse");
-    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store(
         &state_store_path,
-        &metadata_path,
         "frontend-insert-lifecycle",
     );
 
@@ -2611,7 +2550,10 @@ fn cross_process_three_be_frontend_insert_service_lifecycle() {
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
     assert!(state_store_path.is_file(), "DML StateStore must persist");
-    assert!(metadata_path.is_file(), "legacy metadata must persist");
+    assert!(
+        !legacy_metadata_path.exists(),
+        "the retired legacy metadata database must not be created"
+    );
     cluster.restart_fe();
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -2702,11 +2644,9 @@ fn cross_process_three_be_frontend_delete_service_lifecycle() {
     let _guard = lock_cluster_mvp();
     let fixture_dir = tempfile::tempdir_in(runtime_dir()).expect("create DELETE lifecycle fixture");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
-    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create DELETE lifecycle warehouse");
-    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store(
         &state_store_path,
-        &metadata_path,
         "frontend-delete-lifecycle",
     );
 
@@ -2853,7 +2793,7 @@ fn cross_process_three_be_frontend_ctas_truncate_lifecycle() {
     let fixture_dir = tempfile::tempdir_in(runtime_dir())
         .expect("create CTAS/TRUNCATE lifecycle fixture directory");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
-    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let legacy_metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
     let namespace = format!("dml3_cluster_{}", std::process::id());
     let catalog = "ctas_truncate_lifecycle_ice";
     let cluster_id = "frontend-ctas-truncate-lifecycle";
@@ -2867,15 +2807,13 @@ region = "us-east-1"
 enable_path_style_access = true
 "#
     );
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
-            &state_store_path,
-            &metadata_path,
-            cluster_id,
-            &be_object_store,
-            &[],
-            &be_object_store,
-        );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_extras(
+        &state_store_path,
+        cluster_id,
+        &be_object_store,
+        &[],
+        &be_object_store,
+    );
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
@@ -3004,7 +2942,10 @@ enable_path_style_access = true
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
     assert!(state_store_path.is_file(), "DML StateStore must persist");
-    assert!(metadata_path.is_file(), "frontend metadata must persist");
+    assert!(
+        !legacy_metadata_path.exists(),
+        "the retired legacy metadata database must not be created"
+    );
     cluster.restart_fe();
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -3175,7 +3116,6 @@ fn cross_process_three_be_frontend_add_files_lifecycle() {
     let fixture_dir =
         tempfile::tempdir_in(runtime_dir()).expect("create ADD FILES lifecycle fixture directory");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
-    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
     let suffix = std::process::id();
     let namespace = format!("dml_add_files_cluster_{suffix}");
     let table = "imported_orders";
@@ -3231,15 +3171,13 @@ region = "us-east-1"
 enable_path_style_access = true
 "#
     );
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
-            &state_store_path,
-            &metadata_path,
-            cluster_id,
-            &be_object_store,
-            &[],
-            &be_object_store,
-        );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_extras(
+        &state_store_path,
+        cluster_id,
+        &be_object_store,
+        &[],
+        &be_object_store,
+    );
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
@@ -3353,7 +3291,6 @@ fn cross_process_three_be_frontend_update_merge_lifecycle() {
     let fixture_dir = tempfile::tempdir_in(runtime_dir())
         .expect("create UPDATE/MERGE lifecycle fixture directory");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
-    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
     let namespace = format!("dml6_cluster_{}", std::process::id());
     let catalog = "update_merge_lifecycle_ice";
     let cluster_id = "frontend-update-merge-lifecycle";
@@ -3367,15 +3304,13 @@ region = "us-east-1"
 enable_path_style_access = true
 "#
     );
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
-            &state_store_path,
-            &metadata_path,
-            cluster_id,
-            &be_object_store,
-            &[],
-            &be_object_store,
-        );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_extras(
+        &state_store_path,
+        cluster_id,
+        &be_object_store,
+        &[],
+        &be_object_store,
+    );
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
     conn.query_drop(format!(
@@ -3665,21 +3600,8 @@ enable_path_style_access = true
 #[test]
 fn cross_process_three_be_insert_without_state_store_fails_before_side_effect() {
     let _guard = lock_cluster_mvp();
-    let fixture_dir =
-        tempfile::tempdir_in(runtime_dir()).expect("create no-StateStore fixture directory");
-    let metadata_config = format!(
-        r#"
-[metadata]
-provider = "sqlite"
-path = "{}"
-"#,
-        fixture_dir
-            .path()
-            .join("frontend-metadata.sqlite")
-            .display()
-    );
     let failure = match std::panic::catch_unwind(|| {
-        MultiBeClusterHarness::start_n_be_without_state_store(3, "", &metadata_config)
+        MultiBeClusterHarness::start_n_be_without_state_store(3, "", "")
     }) {
         Ok(_cluster) => panic!("role=fe without StateStore must fail before serving SQL"),
         Err(failure) => failure,
@@ -3755,11 +3677,9 @@ deployment_owner = "fe-1"
 ///
 /// This is the acceptance case for the attachment control plane: a catalog
 /// created on a live 1FE+3BE cluster must serve a real distributed Iceberg read,
-/// survive an FE restart that begins with an **empty** local metadata cache, and
-/// stay gone after its DROP — including across another restart. The metadata
-/// cache is deliberately deleted between restarts: if any part of the restore
-/// still came from local metadata rather than the StateStore, the catalog would
-/// not come back.
+/// survive an FE restart from the durable StateStore attachment, and stay gone
+/// after its DROP — including across another restart. The retired legacy
+/// metadata database must never be created during this lifecycle.
 #[cfg(unix)]
 #[test]
 fn cross_process_three_be_catalog_attachment_lifecycle() {
@@ -3767,15 +3687,12 @@ fn cross_process_three_be_catalog_attachment_lifecycle() {
     let fixture_dir = tempfile::tempdir_in(runtime_dir())
         .expect("create catalog attachment lifecycle fixture directory");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
-    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let legacy_metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
     let warehouse =
         tempfile::tempdir_in(runtime_dir()).expect("create catalog attachment lifecycle warehouse");
     const CLUSTER_ID: &str = "catalog-attachment-lifecycle";
-    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
-        &state_store_path,
-        &metadata_path,
-        CLUSTER_ID,
-    );
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store(&state_store_path, CLUSTER_ID);
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
@@ -3822,18 +3739,17 @@ fn cross_process_three_be_catalog_attachment_lifecycle() {
         state_store_path.is_file(),
         "the catalog attachment StateStore must persist across FE shutdown"
     );
-    // Discard the local metadata cache. Only the StateStore attachment can
-    // bring this catalog back.
-    if metadata_path.is_file() {
-        std::fs::remove_file(&metadata_path).expect("discard the local metadata cache");
-    }
+    assert!(
+        !legacy_metadata_path.exists(),
+        "the retired legacy metadata database must not be created"
+    );
     cluster.restart_fe();
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
     let restored: Vec<(i32, i32)> = conn
         .query("SELECT id, amount FROM cp2_attach.ns.orders ORDER BY id")
-        .expect("the attachment must be restored from the StateStore, not local metadata");
+        .expect("the attachment must be restored from the StateStore");
     assert_eq!(
         restored,
         vec![(1, 10), (2, 20), (3, 30)],
@@ -3922,11 +3838,9 @@ fn cross_process_three_be_table_maintenance_lifecycle() {
     let _guard = lock_cluster_mvp();
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create state store tempdir");
     let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
-    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create fixture warehouse");
-    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store(
         &state_store_path,
-        &metadata_path,
         "table-maintenance",
     );
     let diagnostics = cluster.log_diagnostics();
@@ -4063,10 +3977,8 @@ fn cross_process_three_be_mv_state_store_restart() {
     let _guard = lock_cluster_mvp();
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
     let state_store_path = state_store_dir.path().join("frontend-mv.sqlite");
-    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
-    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store(
         &state_store_path,
-        &metadata_path,
         "mv-state-store-restart",
     );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MV warehouse");
@@ -4212,7 +4124,6 @@ fn cross_process_three_be_mvx4_scheduler_catches_up_and_bounds_concurrency() {
     std::fs::write(&hold_trigger, "hold\n").expect("arm scheduler concurrency barrier");
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
     let state_store_path = state_store_dir.path().join("frontend-mvx4.sqlite");
-    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
     let scheduler_config = r#"
 mv_refresh_scheduler_enabled = true
 mv_refresh_scheduler_interval_ms = 100
@@ -4220,15 +4131,13 @@ mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 100
 mv_refresh_scheduler_max_failure_backoff_ms = 1_000
 "#;
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
-            &state_store_path,
-            &metadata_path,
-            "mvx4-scheduler",
-            "",
-            &[],
-            scheduler_config,
-        );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_extras(
+        &state_store_path,
+        "mvx4-scheduler",
+        "",
+        &[],
+        scheduler_config,
+    );
     let diagnostics = cluster.log_diagnostics();
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MVX-4 warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -4323,7 +4232,6 @@ fn cross_process_three_be_mvx4_shutdown_cancels_and_recovers_background_work() {
     std::fs::write(&hold_trigger, "hold\n").expect("arm scheduler shutdown barrier");
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
     let state_store_path = state_store_dir.path().join("frontend-mvx4.sqlite");
-    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
     let scheduler_config = r#"
 mv_refresh_scheduler_enabled = true
 mv_refresh_scheduler_interval_ms = 100
@@ -4331,15 +4239,13 @@ mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 100
 mv_refresh_scheduler_max_failure_backoff_ms = 1_000
 "#;
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
-            &state_store_path,
-            &metadata_path,
-            "mvx4-shutdown-recovery",
-            "",
-            &[],
-            scheduler_config,
-        );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_extras(
+        &state_store_path,
+        "mvx4-shutdown-recovery",
+        "",
+        &[],
+        scheduler_config,
+    );
     let diagnostics = cluster.log_diagnostics();
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MVX-4 warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -4442,14 +4348,11 @@ fn cross_process_three_be_mvx3_recovery_reconciles_staged_and_published_attempts
     );
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
     let state_store_path = state_store_dir.path().join("frontend-mv.sqlite");
-    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
-    let mut cluster =
-        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_fault_dir(
-            &state_store_path,
-            &metadata_path,
-            "mvx3-recovery-reconciliation",
-            fault_dir.path(),
-        );
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_fault_dir(
+        &state_store_path,
+        "mvx3-recovery-reconciliation",
+        fault_dir.path(),
+    );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MV recovery warehouse");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);

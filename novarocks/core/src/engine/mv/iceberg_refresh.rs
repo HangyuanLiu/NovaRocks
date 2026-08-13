@@ -9299,65 +9299,6 @@ struct ImvRefreshPlannedChangeStream {
     connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST: std::cell::RefCell<
-        Option<crate::query_execution::outcome::QueryExecutionResult>,
-    > = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-struct ImvChangeStreamExecutionResultGuard {
-    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-#[cfg(test)]
-impl Drop for ImvChangeStreamExecutionResultGuard {
-    fn drop(&mut self) {
-        IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| {
-            *slot.borrow_mut() = None;
-        });
-    }
-}
-
-#[cfg(test)]
-fn install_imv_change_stream_execution_result_for_test(
-    result: crate::query_execution::outcome::QueryExecutionResult,
-) -> ImvChangeStreamExecutionResultGuard {
-    IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| {
-        let replaced = slot.borrow_mut().replace(result);
-        assert!(
-            replaced.is_none(),
-            "IMV change-stream execution result already installed for this test thread"
-        );
-    });
-    ImvChangeStreamExecutionResultGuard {
-        _not_send: std::marker::PhantomData,
-    }
-}
-
-#[cfg(test)]
-fn take_imv_change_stream_execution_result_for_test()
--> Option<crate::query_execution::outcome::QueryExecutionResult> {
-    IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| slot.borrow_mut().take())
-}
-
-#[cfg(test)]
-fn imv_change_stream_writer_abort_result_for_test(
-    reason: &str,
-) -> crate::query_execution::outcome::QueryExecutionResult {
-    let mut abort =
-        crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file();
-    abort.reason = reason.to_string();
-    crate::query_execution::outcome::QueryExecutionResult {
-        query_result: crate::runtime::query_result::QueryResult::empty(),
-        write_commit: None,
-        write_abort: Some(abort),
-        connector_completion: None,
-        fragment_profiles: Vec::new(),
-    }
-}
-
 /// A change stream that carries any deletion route retracts previously
 /// materialized rows; otherwise the refresh only adds rows.
 ///

@@ -26,7 +26,6 @@ use arrow::record_batch::RecordBatch;
 
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::MvListRow;
-use crate::meta::MetaReadTxn;
 use crate::mv::analysis::{MvAnalysis, finish_mv_analysis, prepare_mv_select_for_catalog_provider};
 use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};

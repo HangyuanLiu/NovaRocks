@@ -36,7 +36,6 @@ use crate::engine::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy,
 };
-use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::Literal;
@@ -63,6 +62,12 @@ pub(crate) enum IcebergWriteMode {
     Append,
     FullTableOverwrite,
     DynamicPartitionOverwrite,
+}
+
+impl IcebergWriteMode {
+    const fn is_overwrite(self) -> bool {
+        !matches!(self, Self::Append)
+    }
 }
 
 /// Provider-owned identity and snapshot facts for a prepared Iceberg write.
@@ -283,13 +288,7 @@ fn prepare_iceberg_distributed_write(
         connector_write,
     };
     let spec = IcebergWriteTransactionSpec {
-        target: IcebergOperationTarget {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
-        },
-        operation_kind: operation_kind_for_overwrite_mode(overwrite_mode),
+        is_overwrite: overwrite_mode.is_overwrite(),
         attempt_id: connector_operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
             base_snapshot_id,
@@ -428,7 +427,7 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn is_overwrite(&self) -> bool {
-        self.spec.operation_kind == IcebergOperationKind::InsertOverwrite
+        self.spec.is_overwrite
     }
 
     pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
@@ -1202,23 +1201,6 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
     })
 }
 
-/// The durable operation-journal kind for a SQL write mode.
-///
-/// This used to route through `CommitOpKind`, the provider's physical commit
-/// vocabulary. `IcebergOperationKind` is Core's own durable journal type, so the
-/// mapping is now keyed on the Core-owned write mode directly and the physical
-/// commit vocabulary stays inside the provider. The three reachable outcomes are
-/// unchanged: append maps to InsertAppend, both overwrite shapes to
-/// InsertOverwrite.
-fn operation_kind_for_overwrite_mode(overwrite_mode: IcebergWriteMode) -> IcebergOperationKind {
-    match overwrite_mode {
-        IcebergWriteMode::Append => IcebergOperationKind::InsertAppend,
-        IcebergWriteMode::FullTableOverwrite | IcebergWriteMode::DynamicPartitionOverwrite => {
-            IcebergOperationKind::InsertOverwrite
-        }
-    }
-}
-
 pub(crate) fn invalidate_iceberg_caches(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
@@ -1307,6 +1289,13 @@ mod tests {
                 .map(|(name, data_type)| Arc::new(Field::new(name, data_type, true)))
                 .collect::<Vec<_>>(),
         ))
+    }
+
+    #[test]
+    fn write_mode_preserves_append_and_overwrite_classification() {
+        assert!(!IcebergWriteMode::Append.is_overwrite());
+        assert!(IcebergWriteMode::FullTableOverwrite.is_overwrite());
+        assert!(IcebergWriteMode::DynamicPartitionOverwrite.is_overwrite());
     }
 
     #[test]

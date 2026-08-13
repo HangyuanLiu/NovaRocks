@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pure reconstruction of an MV's SQLite definition-create inputs from its
+//! Pure reconstruction of an MV's repository definition-create inputs from its
 //! lake package observation (descriptor + publication facts).
 //!
-//! This is the core of W4's "SQLite as a rebuildable cache" property: given
-//! nothing but a validated lake package observation,
+//! Given nothing but a validated lake package observation,
 //! [`rebuild_mv_definition_from_lake`] reproduces exactly the
-//! inputs `create_iceberg_mv` would have persisted into SQLite at CREATE
+//! inputs `create_iceberg_mv` would have persisted at CREATE
 //! time, plus the refresh watermark a completed refresh would have recorded.
 //! M3 calls this at startup for MVs discovered on the lake but missing from
-//! SQLite. No catalog I/O happens here — every input is already in memory.
+//! the MV repository. No catalog I/O happens here — every input is already in
+//! memory.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
@@ -50,7 +50,7 @@ pub(crate) struct RebuiltMvDefinition {
     pub last_refresh_table_uuids: BTreeMap<String, String>,
 }
 
-/// Reconstruct an MV's SQLite definition-create inputs purely from its lake
+/// Reconstruct an MV's repository definition-create inputs purely from its lake
 /// package (descriptor + optional current-snapshot provenance). Pure: no I/O.
 ///
 pub(crate) fn rebuild_mv_definition_from_lake(
@@ -105,21 +105,19 @@ pub(crate) fn rebuild_mv_definition_from_lake(
 }
 
 /// Rebuild any lake-native Iceberg MV definitions that are present on the lake
-/// but missing from SQLite, making them visible and refreshable on a
-/// fresh-`[metadata]` cluster.
+/// but missing from the MV repository, making them visible and refreshable.
 ///
-/// This is the integration that fulfills W4 statelessness: SQLite is treated as
-/// a rebuildable cache over the lake. For every registered Iceberg catalog we
+/// For every admitted Iceberg catalog we
 /// enumerate its namespaces, discover the MV packages each namespace carries
-/// (MV-table inline descriptor — never SQLite), and for each MV whose target is
-/// not already recorded in SQLite we
+/// (MV-table inline descriptor), and for each MV whose target is not already
+/// recorded in the repository we
 /// reconstruct its definition-create inputs with
 /// [`rebuild_mv_definition_from_lake`] and persist them (definition + refresh
 /// watermark + dependencies) through the repository's ordinary create path.
 ///
-/// Idempotent: MVs already present in SQLite (cache hit, matched by target
+/// Idempotent: MVs already present in the repository (matched by target
 /// `catalog.namespace.table`) are skipped, so calling this at startup
-/// on an already-populated cluster is a no-op.
+/// when all admitted packages are present is a no-op.
 ///
 /// The state a lake rebuild reads, named explicitly rather than reached through
 /// aggregate engine state.
@@ -128,9 +126,6 @@ pub(crate) fn rebuild_mv_definition_from_lake(
 /// engine" into a short, checkable list, and every one of these is already
 /// reachable from a frontend composition.
 pub struct LakeRebuildContext<'a> {
-    /// Whether a durable metadata cache is the runtime authority. Without one
-    /// there is nothing to rebuild into and the sweep is a no-op.
-    pub metadata_is_authority: bool,
     /// Catalogs this process currently admits. An absent projection means no
     /// lease to enumerate namespaces with.
     pub catalog_runtime_projection:
@@ -142,13 +137,6 @@ pub struct LakeRebuildContext<'a> {
 }
 
 pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
-    // No metadata provider means SQLite is not the runtime authority (e.g.
-    // FE-compatible mode or a metadata-less test state); there is nothing to
-    // rebuild a cache into.
-    if !ctx.metadata_is_authority {
-        return Ok(());
-    }
-
     let context =
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
     // Only catalogs this process currently admits can be scanned: the durable
@@ -226,8 +214,8 @@ fn package_catalogs_are_admitted(
     Ok(true)
 }
 
-/// Persist a single observed lake package's definition into SQLite if it is not already
-/// present. The MV is keyed by its target `catalog.namespace.table`
+/// Persist a single observed lake package's definition if it is not already
+/// present in the MV repository. The MV is keyed by its target `catalog.namespace.table`
 /// (the same key the create path registers via `find_by_target`).
 ///
 /// Exposed to the crate so the W0 stateless-rebuild harness
@@ -238,7 +226,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing(
     ctx: &LakeRebuildContext<'_>,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
-    // Cache-hit check: skip MVs already recorded in SQLite. The rebuilt target
+    // Repository-hit check: skip MVs already recorded. The rebuilt target
     // maps to (discovered.catalog, discovered.namespace, discovered.table).
     let existing = ctx
         .mv_repository
@@ -607,5 +595,22 @@ mod tests {
             !package_catalogs_are_admitted(state.catalog_application.as_deref(), &package)
                 .expect("missing application is decidable"),
         );
+    }
+
+    /// Startup always enters the rebuild step. With no ready catalog projection,
+    /// the bounded sweep has no admitted instance IDs and completes without
+    /// touching the repository or provider observation ports.
+    #[test]
+    fn sweep_is_empty_without_a_ready_catalog_projection() {
+        let state = Arc::new(crate::engine::StandaloneState::default());
+        let context = LakeRebuildContext {
+            catalog_runtime_projection: None,
+            catalog_application: state.catalog_application.as_deref(),
+            connector_control: state.connector_control.as_ref(),
+            mv_storage_observation: state.mv_storage_observation.as_ref(),
+            mv_repository: state.mv_repository.as_ref(),
+        };
+
+        rebuild_imv_cache_from_lake(&context).expect("empty sweep succeeds");
     }
 }

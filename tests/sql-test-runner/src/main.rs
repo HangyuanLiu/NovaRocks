@@ -21,7 +21,6 @@ mod be_log_directive;
 mod config;
 mod fault_injection;
 mod iceberg_orphan_fixture;
-mod imv_stateless;
 mod managed_process;
 mod parser;
 mod results;
@@ -4450,10 +4449,6 @@ mod tests {
             fe_mysql_port: 29030,
         };
         let base = r#"
-[metadata]
-provider = "sqlite"
-path = "tmp/sql-tests.sqlite"
-
 [standalone_server]
 mysql_port = 9030
 
@@ -4471,10 +4466,8 @@ enable_path_style_access = true
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
         let be_value: toml::Value = be.parse().expect("parse be toml");
 
-        assert_eq!(
-            fe_value["metadata"]["path"].as_str(),
-            Some("tmp/sql-tests.sqlite")
-        );
+        assert!(fe_value.get("metadata").is_none());
+        assert!(be_value.get("metadata").is_none());
         assert_eq!(
             fe_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")

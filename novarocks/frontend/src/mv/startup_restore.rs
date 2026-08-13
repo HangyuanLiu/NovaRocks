@@ -68,12 +68,12 @@ impl FrontendMvStartupRestore {
 }
 
 impl MvStartupRestore for FrontendMvStartupRestore {
-    fn rebuild_cache_from_lake(&self, metadata_is_authority: bool) -> Result<(), String> {
-        // The caller supplies this: whether a durable cache is the runtime
-        // authority is resolved during engine open, after this value was composed.
+    fn rebuild_cache_from_lake(&self) -> Result<(), String> {
+        // Always enter the bounded discovery sweep. The admitted catalog
+        // projection and provider observations naturally determine whether any
+        // lake package is eligible for rebuild.
         novarocks::mv_startup::rebuild_imv_cache_from_lake(
             &novarocks::mv_startup::LakeRebuildContext {
-                metadata_is_authority,
                 catalog_runtime_projection: Some(&self.catalog_runtime_projection),
                 catalog_application: Some(self.catalog_application.as_ref()),
                 connector_control: self.connector_control.as_ref(),
@@ -114,7 +114,7 @@ mod tests {
             recover: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
         }
         impl MvStartupRestore for OnlyRecovery {
-            fn rebuild_cache_from_lake(&self, _authority: bool) -> Result<(), String> {
+            fn rebuild_cache_from_lake(&self) -> Result<(), String> {
                 Ok(())
             }
             fn restore_targets(&self) -> Result<(), String> {
@@ -131,14 +131,13 @@ mod tests {
                 Ok(())
             }),
         };
-        novarocks::mv::startup_restore::run_mv_startup_restore(&restore, true)
-            .expect("restore succeeds");
+        novarocks::mv::startup_restore::run_mv_startup_restore(&restore).expect("restore succeeds");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let failing = OnlyRecovery {
             recover: Box::new(|| Err("recovery failed".to_string())),
         };
-        let error = novarocks::mv::startup_restore::run_mv_startup_restore(&failing, true)
+        let error = novarocks::mv::startup_restore::run_mv_startup_restore(&failing)
             .expect_err("a failing recovery must not be swallowed");
         assert!(error.contains("recovery failed"), "{error}");
     }

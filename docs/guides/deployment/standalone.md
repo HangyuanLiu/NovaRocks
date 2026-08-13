@@ -63,9 +63,11 @@ NovaRocks 按以下顺序查找配置：
 [server]
 grpc_port = 9080
 
-[metadata]
+[state_store]
 provider = "sqlite"
-path = "meta/standalone.sqlite"
+path = "meta/frontend-state.sqlite"
+cluster_id = "local-cluster"
+deployment_owner = "fe-1"
 
 [standalone_server]
 mysql_port = 9030
@@ -83,7 +85,7 @@ enable_path_style_access = true
 - `mysql_port` 是客户端连接 NovaRocks 的端口。
 - `[server].grpc_port` 是 NovaRocksGrpc 端口。`role=be` 和 `role=all-in-one` 由 BE host 提供完整 fragment/exchange 服务；`role=fe` 只提供 coordinator report 服务。`all-in-one` 仍通过该 gRPC 边界调度本机 BE，不使用 direct-call shortcut。默认值为 `9080`。
 - `user` 当前只支持 `root`。
-- `[metadata].path` 用于保存 native control metadata，不承载用户内表数据。
+- `[state_store]` 是 FE durable control-plane state 的唯一持久化入口；不要配置第二套 metadata store。
 - native 持久表必须属于显式创建的 external Iceberg catalog；NovaRocks 不创建内部 StarRocks 类型表。
 - `[connector.object_store]` 为 connector execution 提供进程本地对象存储凭据；它本身不创建 catalog 或内表。
 

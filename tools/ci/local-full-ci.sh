@@ -340,31 +340,31 @@ prepare_runtime() {
   ci_render_summary "RUNNING"
 }
 
-reset_native_metadata_stage() {
-  local log_path="$CI_RUN_DIR/metadata-reset.log"
+reset_frontend_state_store_stage() {
+  local log_path="$CI_RUN_DIR/frontend-state-reset.log"
   local start
   local code
   local duration
-  local metadata_db
+  local state_store_db
 
-  metadata_db="$NOVA_ENV_RUNTIME_DIR/metadata.sqlite"
+  state_store_db="$NOVA_ENV_RUNTIME_DIR/frontend-state.sqlite"
   start="$(ci_epoch)"
   {
-    echo "Reset native control metadata before SQL CI."
-    echo "metadata_db=$metadata_db"
-    rm -f "$metadata_db" "$metadata_db-shm" "$metadata_db-wal"
+    echo "Reset frontend StateStore before SQL CI."
+    echo "state_store_db=$state_store_db"
+    rm -f "$state_store_db" "$state_store_db-shm" "$state_store_db-wal"
   } >"$log_path" 2>&1
   code=$?
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
-    ci_record_stage "reset metadata" "FAIL" "$duration" "$log_path"
-    ci_mark_failure_tail "reset metadata failed" "$log_path"
+    ci_record_stage "reset frontend StateStore" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "reset frontend StateStore failed" "$log_path"
     ci_render_summary "FAIL"
     exit "$code"
   fi
 
-  ci_record_stage "reset metadata" "PASS" "$duration" "$log_path"
+  ci_record_stage "reset frontend StateStore" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
 
@@ -1045,7 +1045,7 @@ main() {
 
   prepare_runtime
   run_cargo_gates
-  reset_native_metadata_stage
+  reset_frontend_state_store_stage
   if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
     start_server_stage
   else
