@@ -31,11 +31,11 @@ use crate::query_execution::StatementResult;
 /// Core application façade or manufacture a topology/cancellation fallback.
 #[derive(Clone)]
 pub struct MaintenanceCommandExecutor {
-    kernel: crate::engine::domain::MaintenanceExecutionKernel,
+    kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
 }
 
 impl MaintenanceCommandExecutor {
-    pub(crate) fn new(kernel: crate::engine::domain::MaintenanceExecutionKernel) -> Self {
+    pub(crate) fn new(kernel: crate::query_execution::kernels::MaintenanceExecutionKernel) -> Self {
         Self { kernel }
     }
 
@@ -85,7 +85,7 @@ impl MaintenanceReadCommandExecutor {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<Option<StatementResult>, String> {
-        if !crate::engine::statement::looks_like_show_alter_table_optimize(sql) {
+        if !crate::catalog_application::statement::looks_like_show_alter_table_optimize(sql) {
             return Ok(None);
         }
         self.service

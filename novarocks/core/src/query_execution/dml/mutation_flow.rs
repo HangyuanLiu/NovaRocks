@@ -26,7 +26,7 @@ use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::domain::DmlExecutionKernel;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
@@ -346,7 +346,7 @@ struct DmlPreExpandKeyedAssert {
 
 #[allow(clippy::too_many_arguments)]
 fn build_dml_change_stream_write_plan(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     producer: crate::sql::optimizer::OptimizedOperatorNode,
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
@@ -450,7 +450,7 @@ fn build_dml_change_stream_write_plan(
 
 fn plan_dml_change_stream_write(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     plan: &mut DmlChangeStreamWritePlan,
 ) -> Result<crate::engine::PlannedIcebergChangeStreamWrite, String> {
     let keyed_assert = plan.pre_expand_keyed_assert.as_ref().map(|keyed_assert| {
@@ -530,7 +530,7 @@ pub(crate) enum MutationStagedWrite {
 pub(crate) struct PreparedUpdateMutation {
     pub(crate) stmt: UpdateStmt,
     pub(crate) current_catalog: Option<String>,
-    pub(crate) target: crate::engine::backend_resolver::TargetBackend,
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) target_ref: String,
     /// Exact Provider schema that belongs to the opaque preparation table.
@@ -577,7 +577,7 @@ pub(crate) struct PreparedMorUpdateWriteTarget {
 pub(crate) struct PreparedMergeMutation {
     pub(crate) stmt: MergeStmt,
     pub(crate) current_catalog: Option<String>,
-    pub(crate) target: crate::engine::backend_resolver::TargetBackend,
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) target_ref: String,
     /// See [`PreparedUpdateMutation::match_target_schema`].
@@ -782,7 +782,7 @@ pub(crate) fn prepare_update_mutation(
         _ => "main".to_string(),
     };
 
-    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
         current_catalog,
@@ -941,7 +941,7 @@ pub(crate) fn prepare_merge_mutation(
         Some(IcebergRefSuffix::Branch(branch)) => branch.clone(),
         _ => "main".to_string(),
     };
-    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
         current_catalog,
@@ -1372,7 +1372,7 @@ pub(crate) fn stage_prepared_update_mutation(
 #[cfg(test)]
 fn materialize_update_matches(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
     execution: &QueryExecutionContext,
@@ -1417,7 +1417,7 @@ fn mutation_source_to_sql(
     state: &DmlExecutionKernel,
     source: &Option<crate::sql::parser::ast::MutationSource>,
     current_catalog: Option<&str>,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<Option<String>, String> {
     match source {
         None => Ok(None),
@@ -1431,7 +1431,7 @@ fn mutation_source_relation_to_sql(
     state: &DmlExecutionKernel,
     source: &crate::sql::parser::ast::MutationSource,
     current_catalog: Option<&str>,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<String, String> {
     use crate::sql::parser::ast::MutationSource;
     match source {
@@ -1443,7 +1443,7 @@ fn mutation_source_relation_to_sql(
             // target's namespace+catalog (lets refresh follow the
             // current-catalog path), and a 2-part `<namespace>.<table>` name
             // otherwise so the standalone analyzer can find it directly.
-            let resolved = crate::engine::backend_resolver::resolve_existing_table_target(
+            let resolved = crate::catalog_application::resolver::resolve_existing_table_target(
                 state,
                 name,
                 current_catalog,
@@ -1473,7 +1473,7 @@ fn mutation_source_relation_to_sql(
 #[allow(clippy::too_many_arguments)]
 fn build_update_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -1597,7 +1597,7 @@ fn update_assignment_projection_sql(
 }
 
 fn update_change_stream_target_sql(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     target_alias: &str,
     target_ref: &str,
 ) -> String {
@@ -2150,7 +2150,7 @@ fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Que
     }
 }
 
-fn qualify_iceberg_table(target: &crate::engine::backend_resolver::TargetBackend) -> String {
+fn qualify_iceberg_table(target: &crate::catalog_application::resolver::TargetBackend) -> String {
     format!(
         "{}.{}.{}",
         sql_identifier(&target.catalog),
@@ -2173,7 +2173,7 @@ fn sql_string_literal(value: &str) -> String {
 
 struct MorUpdateChangeStreamExecutor {
     state: DmlExecutionKernel,
-    target: crate::engine::backend_resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
@@ -2191,7 +2191,7 @@ struct MorUpdateChangeStreamExecutor {
 
 struct MorMergeChangeStreamExecutor {
     state: DmlExecutionKernel,
-    target: crate::engine::backend_resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
@@ -2468,7 +2468,7 @@ struct CowUpdateDistributedWrite {
 }
 
 fn build_cow_update_distributed_write(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     provider_plan: novarocks_spi::connector::ConnectorRowMutationExecutionPlan,
@@ -2880,7 +2880,7 @@ fn build_cow_rewrite_query(
 
 struct DistributedCowUpdateExecutor {
     state: DmlExecutionKernel,
-    target: crate::engine::backend_resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     write: Mutex<Option<CowUpdateDistributedWrite>>,
     operation_session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
     execution: QueryExecutionContext,
@@ -2936,7 +2936,7 @@ impl MutationExecution for DistributedCowUpdateExecutor {
 
 fn run_cow_cohort_writes(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
     operation_session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
     execution: &QueryExecutionContext,
@@ -2970,7 +2970,7 @@ fn run_cow_cohort_writes(
 
 fn run_one_cow_cohort(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     plan: CowCohortWritePlan,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
@@ -3070,7 +3070,7 @@ fn run_one_cow_cohort(
 
 fn build_cow_update_distributed_execution(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -3395,7 +3395,7 @@ fn execute_update_match_query(
 #[allow(clippy::too_many_arguments)]
 fn execute_exact_cow_match_query(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     query: &sqlparser::ast::Query,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -3750,7 +3750,7 @@ fn build_update_match_query_sql(
 }
 
 fn build_exact_cow_update_selection_query(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &UpdateStmt,
     source_sql: Option<&str>,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -4232,7 +4232,7 @@ impl MergeMatchRows {
 #[cfg(test)]
 fn materialize_merge_match(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -4364,7 +4364,7 @@ fn materialize_merge_match(
 
 fn build_exact_cow_merge_selection_query(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     insert_columns: Option<&[MergeInsertColumn]>,
@@ -4509,7 +4509,7 @@ fn build_exact_cow_merge_selection_query(
 #[allow(clippy::too_many_arguments)]
 fn build_merge_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -4830,7 +4830,7 @@ fn build_merge_match_query_sql(
 
 fn build_merge_unmatched_insert_query(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -4985,8 +4985,8 @@ mod tests {
         }
     }
 
-    fn iceberg_target() -> crate::engine::backend_resolver::TargetBackend {
-        crate::engine::backend_resolver::TargetBackend {
+    fn iceberg_target() -> crate::catalog_application::resolver::TargetBackend {
+        crate::catalog_application::resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
@@ -6145,7 +6145,7 @@ mod tests {
              WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id) VALUES (s.id)",
         )
         .expect("parse MERGE");
-        let stmt = crate::engine::statement::convert_sqlparser_merge_to_custom(&raw)
+        let stmt = crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)
             .expect("convert MERGE");
         let target_columns = vec![col("id"), col("v")];
         let insert_columns = resolve_merge_insert_columns(

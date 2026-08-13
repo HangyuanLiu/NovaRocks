@@ -32,7 +32,7 @@ use crate::sql::compiler::mv_rewrite::{
 /// Freeze rewrite candidates through the explicit MV kernel.  The frozen
 /// index remains request-local; the kernel only supplies its leaf ports.
 pub(crate) fn freeze_mv_rewrite_definition_index_with_kernel(
-    kernel: &crate::engine::domain::MvExecutionKernel,
+    kernel: &crate::query_execution::kernels::MvExecutionKernel,
 ) -> Result<MvRewriteDefinitionIndex, String> {
     freeze_mv_rewrite_definition_index_with_ports(
         kernel.repository().as_ref(),

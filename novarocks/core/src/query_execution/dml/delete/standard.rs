@@ -36,8 +36,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
 use sqlparser::ast as sqlast;
 
-use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
-use crate::engine::domain::DmlExecutionKernel;
+use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn delete_position_sink_query_projects_row_identity_and_partition_sources() {
-        let target = crate::engine::backend_resolver::TargetBackend {
+        let target = crate::catalog_application::resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn delete_position_sink_query_pins_branch_read_snapshot() {
-        let target = crate::engine::backend_resolver::TargetBackend {
+        let target = crate::catalog_application::resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: "ice".to_string(),
             namespace: "db".to_string(),

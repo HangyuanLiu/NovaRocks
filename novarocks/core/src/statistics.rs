@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use crate::engine::CatalogServiceSource;
-use crate::engine::domain::DmlExecutionKernel;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::ObjectName;
 

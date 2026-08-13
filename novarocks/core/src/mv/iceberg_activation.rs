@@ -15,7 +15,7 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::engine::domain::QueryPreparationKernel;
+use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::mv::application::{
     MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
     MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite, PreparedMvRefreshWrite,
@@ -132,7 +132,7 @@ pub(crate) fn activate_first_refresh_connector_write(
         );
     }
     let operation_id: ConnectorWriteOperationId = prepared.operation_id();
-    let target = crate::engine::backend_resolver::TargetBackend {
+    let target = crate::catalog_application::resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: prepared.target_catalog().to_string(),
         namespace: prepared.target_namespace().to_string(),

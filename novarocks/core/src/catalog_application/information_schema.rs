@@ -22,7 +22,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::engine::domain::{MvExecutionKernel, SystemTableQueryKernel};
+use crate::query_execution::kernels::{MvExecutionKernel, SystemTableQueryKernel};
 use crate::mv::repository::MvRepository;
 use crate::query_execution::StatementResult;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};

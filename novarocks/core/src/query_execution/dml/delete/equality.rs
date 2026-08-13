@@ -20,9 +20,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::engine::backend_resolver::resolve_existing_table_target;
-use crate::engine::domain::DmlExecutionKernel;
-use crate::engine::statement::AddEqualityDeleteStmt;
+use crate::catalog_application::resolver::resolve_existing_table_target;
+use crate::query_execution::kernels::DmlExecutionKernel;
+use crate::catalog_application::statement::AddEqualityDeleteStmt;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
@@ -121,7 +121,7 @@ pub(crate) fn prepare_equality_delete_statement(
 
 struct DistributedEqualityDeleteWriteExecutor {
     state: DmlExecutionKernel,
-    target: crate::engine::backend_resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     delete_query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
@@ -199,7 +199,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
 #[allow(clippy::too_many_arguments)]
 fn prepare_equality_delete_distributed_write(
     state: &DmlExecutionKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     current_snapshot_id: Option<i64>,
     delete_columns: &[Field],
     values_query: sqlparser::ast::Query,

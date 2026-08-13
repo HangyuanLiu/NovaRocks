@@ -29,7 +29,7 @@ use novarocks_spi::connector::ConnectorControlRegistry;
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
-use crate::engine::domain;
+use crate::query_execution::kernels as domain;
 use crate::engine::{
     CoreQueryCompiler, UnifiedStatisticsResolver,
 };

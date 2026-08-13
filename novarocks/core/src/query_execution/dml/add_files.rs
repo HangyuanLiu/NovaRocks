@@ -36,7 +36,7 @@ use crate::connector::data_mutation::{
     CompletedDataMutation, DataMutationDispatchState, DataMutationIntent, DataMutationSession,
     KnownUncommittedDataMutation, ResolvedDataMutation,
 };
-use crate::engine::domain::DmlExecutionKernel;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::dialect::add_files::classify_add_files;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -265,7 +265,7 @@ impl AddFilesEngine for DmlExecutionKernel {
         &self,
         request: PlanAddFilesRequest,
     ) -> Result<PreparedAddFiles, AddFilesPlanError> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
             &crate::sql::parser::ast::ObjectName {
                 parts: request.command.table_parts,

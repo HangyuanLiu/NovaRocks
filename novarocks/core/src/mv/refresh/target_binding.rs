@@ -129,7 +129,7 @@ impl MvTargetBinding {
 /// Resolve a target through the explicit MV execution kernel.  This is the
 /// kernel-first entry used by frontend-owned MV lifecycle composition.
 pub(crate) fn load_mv_target_binding_with_kernel(
-    kernel: &crate::engine::domain::MvExecutionKernel,
+    kernel: &crate::query_execution::kernels::MvExecutionKernel,
     table: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, String> {

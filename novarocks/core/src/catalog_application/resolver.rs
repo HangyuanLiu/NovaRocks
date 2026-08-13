@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use crate::catalog_application::CatalogApplicationPort;
-use crate::engine::domain::{
+use crate::query_execution::kernels::{
     CatalogCommandKernel, DmlExecutionKernel, MaintenanceExecutionKernel, MvExecutionKernel,
     QueryPreparationKernel, ViewExecutionKernel,
 };

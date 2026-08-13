@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Field;
 
 use crate::connector::backend::ResolvedTable;
-use crate::engine::backend_resolver::TargetBackend;
-use crate::engine::domain::DmlExecutionKernel;
+use crate::catalog_application::resolver::TargetBackend;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,

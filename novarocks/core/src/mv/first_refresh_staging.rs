@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
-use crate::engine::domain::QueryPreparationKernel;
+use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::engine::iceberg_write_shuffle_by_output_name;
 use crate::mv::application::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,

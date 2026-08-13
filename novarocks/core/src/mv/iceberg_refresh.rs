@@ -906,7 +906,7 @@ fn first_refresh_target_handle(
     select_retained_target_handle(retained, || {
         crate::query_execution::dml::iceberg_writer::iceberg_connector_table_handle(
             write_lease,
-            &crate::engine::backend_resolver::TargetBackend {
+            &crate::catalog_application::resolver::TargetBackend {
                 backend_name: "iceberg",
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
@@ -1767,14 +1767,14 @@ impl MvEngine for StandaloneMvEngine {
                     columns: prepared
                         .columns
                         .iter()
-                        .map(crate::engine::statement::connector_column)
+                        .map(crate::catalog_application::statement::connector_column)
                         .collect::<Result<_, _>>()
                         .map_err(engine_target_error)?,
                     key: None,
                     partitioning: prepared
                         .partition_fields
                         .iter()
-                        .map(crate::engine::statement::connector_partition_transform)
+                        .map(crate::catalog_application::statement::connector_partition_transform)
                         .collect(),
                     properties: prepared
                         .target_properties
@@ -8208,7 +8208,7 @@ fn synthetic_snapshot_object_name(
 /// remaining logical join artifact: it deliberately does not re-register
 /// snapshot tables in `PlannerMemoryCatalog`.
 pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
-    query_kernel: &crate::engine::domain::QueryPreparationKernel,
+    query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
     rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     bindings: Arc<QueryTableBindingStore>,
@@ -9445,8 +9445,8 @@ fn deletion_route_write_effect(
 /// frontend-owned incremental refresh attempt.
 #[allow(clippy::too_many_arguments)]
 fn prepare_imv_change_stream_writer(
-    query_kernel: &crate::engine::domain::QueryPreparationKernel,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
     refresh_plan: ImvRefreshPlannedChangeStream,
     provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
@@ -9490,7 +9490,7 @@ fn prepare_imv_change_stream_writer(
 /// scan and writer facts here; it returns a prepared result-free request and
 /// never advances MV metadata or executes an external commit.
 pub(crate) fn bind_prepared_mv_incremental_staging(
-    query_kernel: &crate::engine::domain::QueryPreparationKernel,
+    query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
     ports: &IcebergMvCorePorts,
     prepared: crate::mv::application::PreparedMvIncrementalWrite,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -9516,7 +9516,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         planning_lease,
         &connector_context,
     )?;
-    let target = crate::engine::backend_resolver::TargetBackend {
+    let target = crate::catalog_application::resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: request.target_catalog,
         namespace: request.target_namespace,
@@ -10018,8 +10018,8 @@ fn imv_change_stream_effect_scalar(
 
 fn iceberg_mv_target_backend(
     target: &IcebergMvTarget,
-) -> crate::engine::backend_resolver::TargetBackend {
-    crate::engine::backend_resolver::TargetBackend {
+) -> crate::catalog_application::resolver::TargetBackend {
+    crate::catalog_application::resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: target.catalog.clone(),
         namespace: target.namespace.clone(),
@@ -10028,7 +10028,7 @@ fn iceberg_mv_target_backend(
 }
 
 fn iceberg_change_stream_write_dag_for_imv_refresh(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     refresh_plan: &ImvRefreshPlannedChangeStream,
     effect_output_ordinal: Option<usize>,
 ) -> Result<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String>
@@ -10053,7 +10053,7 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
 }
 
 fn provider_change_stream_write_dag_for_imv_refresh(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     refresh_plan: &ImvRefreshPlannedChangeStream,
     effect_output_ordinal: Option<usize>,
     provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
@@ -10127,7 +10127,7 @@ fn is_imv_change_op_output_column(column: &OutputColumn) -> bool {
 }
 
 fn build_imv_change_stream_routes(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     output_columns: &[OutputColumn],
     producer_branches: &[ImvChangeStreamProducerRoute],
@@ -10257,7 +10257,7 @@ fn build_imv_change_stream_routes(
 }
 
 fn build_provider_imv_change_stream_routes(
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     output_columns: &[OutputColumn],
     provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
@@ -10339,7 +10339,7 @@ fn build_provider_imv_change_stream_routes(
 
 fn mv_change_stream_write_binding_for_mode(
     bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     mode: crate::sql::planner::distributed::write::contract::SqlWriteSinkMode,
 ) -> Result<crate::sql::binding::SqlTableBindingId, String> {
     use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;

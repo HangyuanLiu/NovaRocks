@@ -249,7 +249,7 @@ fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String>
         .ok_or_else(|| "mutation engine received a foreign abort handle".to_string())
 }
 
-impl MutationEngine for crate::engine::domain::DmlExecutionKernel {
+impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
     fn establish_mutation_external_fence(
         &self,
         prepared: &dyn MutationPrepared,
@@ -288,7 +288,7 @@ impl MutationEngine for crate::engine::domain::DmlExecutionKernel {
         )?;
         let (kernel, target, base_snapshot_id) = match request.kind {
             MutationStatementKind::Update => {
-                let stmt = crate::engine::statement::convert_sqlparser_update_to_custom(&raw)?;
+                let stmt = crate::catalog_application::statement::convert_sqlparser_update_to_custom(&raw)?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_update_mutation(
                     self,
                     &stmt,
@@ -308,7 +308,7 @@ impl MutationEngine for crate::engine::domain::DmlExecutionKernel {
                 )
             }
             MutationStatementKind::Merge => {
-                let stmt = crate::engine::statement::convert_sqlparser_merge_to_custom(&raw)?;
+                let stmt = crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_merge_mutation(
                     self,
                     &stmt,
@@ -531,10 +531,10 @@ mod tests {
     use crate::query_execution::outcome::QueryExecutionResult;
     use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
 
-    fn test_dml_kernel() -> crate::engine::domain::DmlExecutionKernel {
+    fn test_dml_kernel() -> crate::query_execution::kernels::DmlExecutionKernel {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
             Arc::new(crate::engine::TestConnectorControlRegistry::default());
-        crate::engine::domain::DmlExecutionKernel::new(
+        crate::query_execution::kernels::DmlExecutionKernel::new(
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),

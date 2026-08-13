@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::domain::CatalogCommandKernel;
+use crate::query_execution::kernels::CatalogCommandKernel;
 use crate::query_execution::StatementResult;
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
@@ -51,7 +51,7 @@ use crate::sql::literal::sqlparser_expr_to_literal;
 /// catalog DDL needs only catalog admission, exact-generation connector
 /// control, local catalog invalidation, MV guards, and view metadata lookup.
 pub(crate) trait CatalogDropContext:
-    crate::engine::backend_resolver::CatalogAdmission
+    crate::catalog_application::resolver::CatalogAdmission
 {
     fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
@@ -670,7 +670,7 @@ fn update_alias_name(
 /// command routing cannot recover an application facade just to resolve a
 /// catalog target or issue a provider-owned mutation.
 pub(crate) trait CatalogMutationContext:
-    crate::engine::backend_resolver::CatalogAdmission
+    crate::catalog_application::resolver::CatalogAdmission
 {
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
 }
@@ -689,7 +689,7 @@ pub(crate) fn execute_create_database_statement(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
-        crate::engine::backend_resolver::resolve_namespace_target(context, name, current_catalog)?;
+        crate::catalog_application::resolver::resolve_namespace_target(context, name, current_catalog)?;
     let instance_id = mutation_instance_id(&target.catalog)?;
     crate::connector::mutation::execute_catalog_mutation(
         context.connector_control(),
@@ -785,7 +785,7 @@ pub(crate) fn execute_create_table_statement(
                 }
             }
 
-            let target = crate::engine::backend_resolver::resolve_table_target(
+            let target = crate::catalog_application::resolver::resolve_table_target(
                 context,
                 &stmt.name,
                 current_catalog,
@@ -1020,7 +1020,7 @@ pub(crate) fn execute_drop_database_statement(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
-        crate::engine::backend_resolver::resolve_namespace_target(context, name, current_catalog)?;
+        crate::catalog_application::resolver::resolve_namespace_target(context, name, current_catalog)?;
     if target.backend_name == "iceberg" {
         ensure_no_iceberg_mv_targets_in_scope(context, &target.catalog, Some(&target.namespace))?;
         ensure_no_external_iceberg_dependents(context, &target.catalog, Some(&target.namespace))?;
@@ -1151,7 +1151,7 @@ pub(crate) fn execute_drop_table_statement(
     _force: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let target = match crate::engine::backend_resolver::resolve_existing_table_target(
+    let target = match crate::catalog_application::resolver::resolve_existing_table_target(
         context,
         name,
         current_catalog,
@@ -1270,7 +1270,7 @@ fn is_missing_table_guard_error(err: &str) -> bool {
 
 fn cleanup_iceberg_drop_table_registration_if_exists(
     context: &impl CatalogDropContext,
-    target: &crate::engine::backend_resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<(), String> {
     context.catalog_service().invalidate_table(
         &target.catalog,

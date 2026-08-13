@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::domain::MvExecutionKernel;
+use crate::query_execution::kernels::MvExecutionKernel;
 use crate::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::persistence::definition::{

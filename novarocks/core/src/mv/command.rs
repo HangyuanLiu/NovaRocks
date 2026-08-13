@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::domain::MvExecutionKernel;
+use crate::query_execution::kernels::MvExecutionKernel;
 use crate::query_execution::StatementResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 

@@ -651,14 +651,14 @@ impl TableMaintenanceService for EmptyTableMaintenanceService {
 /// a second topology, deadline, or cancellation scope.
 #[derive(Clone)]
 pub(crate) struct RequestScopedMaintenanceEngine {
-    kernel: crate::engine::domain::MaintenanceExecutionKernel,
+    kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
     execution: crate::query_execution::request_context::QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl RequestScopedMaintenanceEngine {
     pub(crate) fn new(
-        kernel: crate::engine::domain::MaintenanceExecutionKernel,
+        kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
         execution: crate::query_execution::request_context::QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
@@ -730,13 +730,13 @@ pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
 /// weak self reference.
 #[derive(Clone)]
 pub(crate) struct BackgroundMaintenanceEngine {
-    kernel: crate::engine::domain::MaintenanceExecutionKernel,
+    kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
     attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
 }
 
 impl BackgroundMaintenanceEngine {
     pub(crate) fn new(
-        kernel: crate::engine::domain::MaintenanceExecutionKernel,
+        kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
         attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
     ) -> Self {
         Self {
@@ -775,7 +775,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceTarget, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
             &self.kernel,
             &crate::sql::parser::ast::ObjectName {
                 parts: name_parts.to_vec(),

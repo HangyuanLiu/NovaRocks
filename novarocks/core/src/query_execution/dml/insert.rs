@@ -28,8 +28,8 @@ use std::sync::Arc;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
-use crate::engine::backend_resolver::TargetBackend;
-use crate::engine::domain::DmlExecutionKernel;
+use crate::catalog_application::resolver::TargetBackend;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::dml::external_write_fence::{
     ExternalWriteFenceProposal, external_fence_authority_unavailable, invalid_fence_request,
 };
@@ -279,7 +279,7 @@ impl InsertEngine for DmlExecutionKernel {
         )?;
         crate::connector::validate_request_context(&connector_context)?;
 
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
             &name,
             request.current_catalog.as_deref(),

@@ -96,7 +96,7 @@ pub trait MetadataMaintenanceCacheFinalizer {
     ) -> Result<(), ConnectorError>;
 }
 
-impl MetadataMaintenanceCacheFinalizer for crate::engine::domain::MaintenanceExecutionKernel {
+impl MetadataMaintenanceCacheFinalizer for crate::query_execution::kernels::MaintenanceExecutionKernel {
     fn invalidate_generic_table(
         &self,
         table: &ConnectorTableIdentity,

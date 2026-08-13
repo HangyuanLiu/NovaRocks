@@ -28,7 +28,7 @@ use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution
 /// connector's latest generation within the same decision.
 /// Freeze a refresh-base observation through the explicit MV kernel.
 pub(crate) fn observe_current_refresh_base_with_kernel(
-    kernel: &crate::engine::domain::MvExecutionKernel,
+    kernel: &crate::query_execution::kernels::MvExecutionKernel,
     table_ref: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::engine::CatalogServiceSource;
-use crate::engine::domain::ViewExecutionKernel;
+use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 pub mod view_command;
 /// Shared StarRocks SQL parser contract for view DDL, storage, and rewrite.
@@ -281,7 +281,7 @@ where
                     aggregation: None,
                     default: None,
                 };
-                crate::engine::statement::connector_column(&column)
+                crate::catalog_application::statement::connector_column(&column)
             })
             .collect::<Result<Vec<_>, String>>()?;
         let instance_id = ConnectorInstanceId::parse(&request.target.catalog)

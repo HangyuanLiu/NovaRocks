@@ -35,7 +35,7 @@ use novarocks_spi::connector::{
 /// Execute an Iceberg ref mutation using only the explicit MV kernel ports
 /// required for MV-target admission.
 pub(crate) fn execute_with_kernel(
-    kernel: &crate::engine::domain::MvExecutionKernel,
+    kernel: &crate::query_execution::kernels::MvExecutionKernel,
     current_database: &str,
     stmt: &AlterIcebergRefStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -71,7 +71,7 @@ pub(crate) fn execute_with_ports(
         &table_name,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let target = crate::engine::backend_resolver::TargetBackend {
+    let target = crate::catalog_application::resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: catalog_name.clone(),
         namespace: namespace.clone(),

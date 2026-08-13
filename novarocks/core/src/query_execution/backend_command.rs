@@ -18,7 +18,7 @@
 //! Closed Frontend backend-membership command capability.
 
 use crate::common::app_config::ClusterRole;
-use crate::engine::domain::BackendManagementKernel;
+use crate::query_execution::kernels::BackendManagementKernel;
 use crate::query_execution::StatementResult;
 
 #[derive(Clone)]

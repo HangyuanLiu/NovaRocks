@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
-use crate::engine::domain::{
+use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel, StatisticsExecutionKernel,
 };
 use crate::query_execution::planning::bindings::{

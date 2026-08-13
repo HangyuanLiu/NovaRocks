@@ -34,7 +34,7 @@ use crate::connector::data_mutation::{
     CompletedDataMutation, DataMutationDispatchState, DataMutationIntent, DataMutationSession,
     KnownUncommittedDataMutation, ResolvedDataMutation,
 };
-use crate::engine::domain::DmlExecutionKernel;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::{ObjectName, Statement};
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -292,7 +292,7 @@ impl TruncateEngine for DmlExecutionKernel {
                 message: "TRUNCATE target ref must not be empty".to_string(),
             }));
         }
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
             &ObjectName {
                 parts: request.command.target_parts,

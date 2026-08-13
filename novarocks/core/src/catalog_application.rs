@@ -33,6 +33,8 @@ pub mod command;
 pub mod iceberg_ref_command;
 pub mod information_schema;
 pub(crate) mod query_catalog;
+pub(crate) mod resolver;
+pub(crate) mod statement;
 pub mod system_catalog;
 pub mod virtual_table;
 

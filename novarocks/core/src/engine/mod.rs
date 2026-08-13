@@ -56,12 +56,9 @@ use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
-pub(crate) mod backend_resolver;
-pub(crate) mod domain;
 pub use domain::SessionCatalogResolver;
 pub mod frontend_capabilities;
-pub(crate) mod statement;
-use self::statement::{
+use crate::catalog_application::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
     looks_like_add_equality_delete, looks_like_alter_iceberg_properties,
@@ -69,6 +66,8 @@ use self::statement::{
     looks_like_show_create_table, parse_alter_iceberg_properties_sql,
     parse_alter_partition_column_sql, parse_show_create_table,
 };
+use crate::catalog_application::resolver as backend_resolver;
+use crate::query_execution::kernels as domain;
 use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
 };
@@ -1301,7 +1300,7 @@ fn is_query_sql(sql: &str) -> bool {
 }
 
 pub(crate) fn connector_schema_path(
-    path: crate::engine::statement::ColumnPath,
+    path: crate::catalog_application::statement::ColumnPath,
 ) -> novarocks_spi::connector::ConnectorColumnPath {
     novarocks_spi::connector::ConnectorColumnPath {
         segments: path
@@ -1313,21 +1312,21 @@ pub(crate) fn connector_schema_path(
 }
 
 pub(crate) fn connector_schema_position(
-    position: crate::engine::statement::AddPosition,
+    position: crate::catalog_application::statement::AddPosition,
 ) -> novarocks_spi::connector::ConnectorColumnPosition {
     match position {
-        crate::engine::statement::AddPosition::Default => {
+        crate::catalog_application::statement::AddPosition::Default => {
             novarocks_spi::connector::ConnectorColumnPosition::Default
         }
-        crate::engine::statement::AddPosition::First => {
+        crate::catalog_application::statement::AddPosition::First => {
             novarocks_spi::connector::ConnectorColumnPosition::First
         }
-        crate::engine::statement::AddPosition::After(column) => {
+        crate::catalog_application::statement::AddPosition::After(column) => {
             novarocks_spi::connector::ConnectorColumnPosition::After {
                 column: Arc::from(column),
             }
         }
-        crate::engine::statement::AddPosition::Before(column) => {
+        crate::catalog_application::statement::AddPosition::Before(column) => {
             novarocks_spi::connector::ConnectorColumnPosition::Before {
                 column: Arc::from(column),
             }

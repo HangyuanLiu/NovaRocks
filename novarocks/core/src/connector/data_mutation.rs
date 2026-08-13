@@ -82,7 +82,7 @@ pub(crate) trait DataMutationCacheFinalizer {
     ) -> Result<(), ConnectorError>;
 }
 
-impl DataMutationCacheFinalizer for crate::engine::domain::DmlExecutionKernel {
+impl DataMutationCacheFinalizer for crate::query_execution::kernels::DmlExecutionKernel {
     fn invalidate_generic_table(
         &self,
         table: &ConnectorTableIdentity,

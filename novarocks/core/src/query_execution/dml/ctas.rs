@@ -44,7 +44,7 @@ use novarocks_spi::connector::{
     CreatePolicy, ExternalMutationEvidence,
 };
 
-use crate::engine::domain::DmlExecutionKernel;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
@@ -460,7 +460,7 @@ fn prepare_planned_ctas_connector_write(
 
 #[derive(Clone)]
 struct CoreCtasTargetPreflight {
-    target: crate::engine::backend_resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     lease: ConnectorCtasStagedPublicationLease,
     write_lease: ConnectorWriteLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
@@ -937,7 +937,7 @@ struct CorePreparedCtasSource {
     gate: Arc<CtasSourceExecutionGate>,
     preflight: CoreCtasTargetPreflight,
     command: CtasCommand,
-    target: crate::engine::backend_resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     current_catalog: Option<String>,
     current_database: String,
     query_options: Option<QueryOptions>,
@@ -1304,7 +1304,7 @@ impl CtasEngine for DmlExecutionKernel {
             source_sql: source.to_string(),
             partitioning: partition_fields
                 .iter()
-                .map(crate::engine::statement::connector_partition_transform)
+                .map(crate::catalog_application::statement::connector_partition_transform)
                 .collect(),
             properties: normalized_properties,
         }))
@@ -1316,7 +1316,7 @@ impl CtasEngine for DmlExecutionKernel {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
-        let target = crate::engine::backend_resolver::resolve_table_target(
+        let target = crate::catalog_application::resolver::resolve_table_target(
             self,
             &crate::sql::parser::ast::ObjectName {
                 parts: command.target_parts.clone(),
@@ -1383,7 +1383,7 @@ impl CtasEngine for DmlExecutionKernel {
         request: PrepareCtasSourceRequest,
     ) -> Result<PreparedCtasSource, CtasFailure> {
         let preflight = downcast_preflight(preflight)?;
-        let target = crate::engine::backend_resolver::resolve_table_target(
+        let target = crate::catalog_application::resolver::resolve_table_target(
             self,
             &crate::sql::parser::ast::ObjectName {
                 parts: request.command.target_parts.clone(),
@@ -1445,7 +1445,7 @@ impl CtasEngine for DmlExecutionKernel {
             .map_err(internal_failure)?;
         let output_columns = table_columns
             .iter()
-            .map(crate::engine::statement::connector_column)
+            .map(crate::catalog_application::statement::connector_column)
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_failure)?;
         let schema_text = format!("{output_schema:?}");
@@ -2620,7 +2620,7 @@ mod tests {
         capability: Arc<dyn ConnectorCtasStagedPublication>,
     ) -> CoreCtasTargetPreflight {
         CoreCtasTargetPreflight {
-            target: crate::engine::backend_resolver::TargetBackend {
+            target: crate::catalog_application::resolver::TargetBackend {
                 backend_name: "iceberg",
                 catalog: owner.instance_id.as_str().to_string(),
                 namespace: "db".to_string(),

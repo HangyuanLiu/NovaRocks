@@ -23,7 +23,7 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::engine::domain::DmlExecutionKernel;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
@@ -52,10 +52,10 @@ pub fn parse_delete_statement(sql: &str) -> Result<Option<sqlparser::ast::Delete
 
 /// Recognize the NovaRocks equality-delete ALTER TABLE extension.
 pub fn parse_equality_delete_statement(sql: &str) -> Result<Option<()>, String> {
-    if !crate::engine::statement::looks_like_add_equality_delete(sql) {
+    if !crate::catalog_application::statement::looks_like_add_equality_delete(sql) {
         return Ok(None);
     }
-    crate::engine::statement::parse_add_equality_delete_sql(sql)?;
+    crate::catalog_application::statement::parse_add_equality_delete_sql(sql)?;
     Ok(Some(()))
 }
 
@@ -202,7 +202,7 @@ impl DeleteEngine for DmlExecutionKernel {
                     "DELETE request did not contain a DELETE statement".to_string()
                 })?;
                 let statement =
-                    crate::engine::statement::convert_sqlparser_delete_to_custom(&delete)?;
+                    crate::catalog_application::statement::convert_sqlparser_delete_to_custom(&delete)?;
                 standard::prepare_delete_statement(
                     self,
                     &statement,
@@ -214,7 +214,7 @@ impl DeleteEngine for DmlExecutionKernel {
             }
             DeleteStatementKind::Equality => {
                 let statement =
-                    crate::engine::statement::parse_add_equality_delete_sql(request.sql)?;
+                    crate::catalog_application::statement::parse_add_equality_delete_sql(request.sql)?;
                 equality::prepare_equality_delete_statement(
                     self,
                     &statement,

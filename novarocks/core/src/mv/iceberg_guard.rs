@@ -23,7 +23,7 @@ use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
 };
 
-use crate::engine::backend_resolver::TargetBackend;
+use crate::catalog_application::resolver::TargetBackend;
 use crate::mv::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 use novarocks_catalog::identifier::normalize_identifier;
 
@@ -139,7 +139,7 @@ pub(crate) fn reject_if_iceberg_mv_table_with_ports(
 pub(crate) fn reject_drop_column_mv_dependencies_with_repository(
     repository: &dyn crate::mv::repository::MvRepository,
     target: &TargetBackend,
-    column_path: &crate::engine::statement::ColumnPath,
+    column_path: &crate::catalog_application::statement::ColumnPath,
 ) -> Result<(), String> {
     let leaf = column_path
         .last()

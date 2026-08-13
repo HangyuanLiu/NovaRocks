@@ -35,7 +35,7 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::engine::domain::SystemTableQueryKernel;
+use crate::query_execution::kernels::SystemTableQueryKernel;
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
@@ -452,7 +452,7 @@ mod tests {
         SystemCatalog, SystemCatalogInputs, SystemTableData,
     };
     use crate::engine::TestConnectorControlRegistry;
-    use crate::engine::domain::SystemTableQueryKernel;
+    use crate::query_execution::kernels::SystemTableQueryKernel;
     use crate::mv::repository::UnavailableMvRepository;
     use crate::sql::parser::dialect::StarRocksDialect;
     use arrow::array::StringArray;

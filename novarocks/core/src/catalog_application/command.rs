@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use crate::catalog_application::CatalogCreateCommand;
 use crate::engine::build_iceberg_create_table_ddl;
-use crate::engine::domain::CatalogCommandKernel;
-use crate::engine::statement::{
+use crate::query_execution::kernels::CatalogCommandKernel;
+use crate::catalog_application::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
 };
@@ -77,7 +77,7 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
-        if crate::engine::statement::looks_like_show_create_table(&normalized) {
+        if crate::catalog_application::statement::looks_like_show_create_table(&normalized) {
             return execute_show_create_table(
                 &self.kernel,
                 &normalized,
@@ -87,7 +87,7 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
-        if crate::engine::statement::looks_like_alter_iceberg_properties(&normalized) {
+        if crate::catalog_application::statement::looks_like_alter_iceberg_properties(&normalized) {
             return execute_alter_iceberg_properties(
                 &self.kernel,
                 &normalized,
@@ -97,7 +97,7 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
-        if crate::engine::statement::looks_like_alter_iceberg_schema(&normalized) {
+        if crate::catalog_application::statement::looks_like_alter_iceberg_schema(&normalized) {
             return execute_alter_iceberg_schema(
                 &self.kernel,
                 &normalized,
@@ -107,10 +107,10 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
-        if crate::engine::statement::looks_like_alter_partition_column(&normalized) {
+        if crate::catalog_application::statement::looks_like_alter_partition_column(&normalized) {
             return execute_alter_partition_spec(
                 &self.kernel,
-                crate::engine::statement::parse_alter_partition_column_sql(&normalized)?,
+                crate::catalog_application::statement::parse_alter_partition_column_sql(&normalized)?,
                 current_catalog,
                 current_database,
                 connector_context,
@@ -228,8 +228,8 @@ fn execute_alter_iceberg_properties(
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let statement = crate::engine::statement::parse_alter_iceberg_properties_sql(sql)?;
-    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+    let statement = crate::catalog_application::statement::parse_alter_iceberg_properties_sql(sql)?;
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
         kernel,
         &statement.table,
         current_catalog,
@@ -247,7 +247,7 @@ fn execute_alter_iceberg_properties(
         );
     }
     let changes = match statement.op {
-        crate::engine::statement::PropertiesOp::Set { entries } => entries
+        crate::catalog_application::statement::PropertiesOp::Set { entries } => entries
             .into_iter()
             .map(
                 |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
@@ -256,7 +256,7 @@ fn execute_alter_iceberg_properties(
                 },
             )
             .collect(),
-        crate::engine::statement::PropertiesOp::Unset { keys, if_exists } => keys
+        crate::catalog_application::statement::PropertiesOp::Unset { keys, if_exists } => keys
             .into_iter()
             .map(
                 |key| novarocks_spi::connector::ConnectorPropertyChange::Unset {
@@ -294,8 +294,8 @@ fn execute_alter_iceberg_schema(
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let statement = crate::engine::statement::parse_alter_iceberg_schema_sql(sql)?;
-    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+    let statement = crate::catalog_application::statement::parse_alter_iceberg_schema_sql(sql)?;
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
         kernel,
         &statement.table,
         current_catalog,
@@ -307,7 +307,7 @@ fn execute_alter_iceberg_schema(
         &target,
         crate::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
-    if let crate::engine::statement::IcebergSchemaChange::DropColumn { path } = &statement.change {
+    if let crate::catalog_application::statement::IcebergSchemaChange::DropColumn { path } = &statement.change {
         crate::mv::iceberg_guard::reject_drop_column_mv_dependencies_with_repository(
             kernel.mv_repository().as_ref(),
             &target,
@@ -317,7 +317,7 @@ fn execute_alter_iceberg_schema(
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
     let change = match statement.change {
-        crate::engine::statement::IcebergSchemaChange::AddColumn {
+        crate::catalog_application::statement::IcebergSchemaChange::AddColumn {
             parent,
             name,
             data_type,
@@ -339,40 +339,40 @@ fn execute_alter_iceberg_schema(
                         .map(|segment| Arc::from(segment.as_str()))
                         .collect(),
                 },
-                column: crate::engine::statement::connector_column(&column)?,
+                column: crate::catalog_application::statement::connector_column(&column)?,
                 position: crate::engine::connector_schema_position(position),
             }
         }
-        crate::engine::statement::IcebergSchemaChange::DropColumn { path } => {
+        crate::catalog_application::statement::IcebergSchemaChange::DropColumn { path } => {
             novarocks_spi::connector::ConnectorSchemaChange::DropColumn {
                 path: crate::engine::connector_schema_path(path),
             }
         }
-        crate::engine::statement::IcebergSchemaChange::RenameColumn { path, new_name } => {
+        crate::catalog_application::statement::IcebergSchemaChange::RenameColumn { path, new_name } => {
             novarocks_spi::connector::ConnectorSchemaChange::RenameColumn {
                 path: crate::engine::connector_schema_path(path),
                 to: Arc::from(new_name),
             }
         }
-        crate::engine::statement::IcebergSchemaChange::ModifyColumn { path, new_type } => {
+        crate::catalog_application::statement::IcebergSchemaChange::ModifyColumn { path, new_type } => {
             novarocks_spi::connector::ConnectorSchemaChange::ModifyColumn {
                 path: crate::engine::connector_schema_path(path),
-                data_type: crate::engine::statement::connector_data_type(&new_type)?,
+                data_type: crate::catalog_application::statement::connector_data_type(&new_type)?,
             }
         }
-        crate::engine::statement::IcebergSchemaChange::SetNullable { path, nullable } => {
+        crate::catalog_application::statement::IcebergSchemaChange::SetNullable { path, nullable } => {
             novarocks_spi::connector::ConnectorSchemaChange::SetColumnNullability {
                 path: crate::engine::connector_schema_path(path),
                 nullable,
             }
         }
-        crate::engine::statement::IcebergSchemaChange::Reorder { path, position } => {
+        crate::catalog_application::statement::IcebergSchemaChange::Reorder { path, position } => {
             novarocks_spi::connector::ConnectorSchemaChange::ReorderColumn {
                 path: crate::engine::connector_schema_path(path),
                 position: crate::engine::connector_schema_position(position),
             }
         }
-        crate::engine::statement::IcebergSchemaChange::UpdateComment { path, comment } => {
+        crate::catalog_application::statement::IcebergSchemaChange::UpdateComment { path, comment } => {
             novarocks_spi::connector::ConnectorSchemaChange::SetColumnComment {
                 path: crate::engine::connector_schema_path(path),
                 comment: Arc::from(comment),
@@ -413,7 +413,7 @@ fn execute_alter_partition_spec(
             ..
         } => table,
     };
-    let target = crate::engine::backend_resolver::resolve_table_target(
+    let target = crate::catalog_application::resolver::resolve_table_target(
         kernel,
         table_name,
         current_catalog,
@@ -478,7 +478,7 @@ fn execute_create_table_like(
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let source_target = crate::engine::backend_resolver::resolve_existing_table_target(
+    let source_target = crate::catalog_application::resolver::resolve_existing_table_target(
         kernel,
         &source,
         current_catalog,
@@ -541,8 +541,8 @@ fn execute_show_create_table(
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    let table_name = crate::engine::statement::parse_show_create_table(sql)?;
-    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+    let table_name = crate::catalog_application::statement::parse_show_create_table(sql)?;
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
         kernel,
         &table_name,
         current_catalog,

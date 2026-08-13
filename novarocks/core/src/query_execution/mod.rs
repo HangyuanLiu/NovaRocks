@@ -21,6 +21,7 @@ pub mod backend;
 pub mod backend_command;
 pub mod cancellation;
 pub mod completion;
+pub(crate) mod kernels;
 mod connector_binding;
 pub(crate) mod connector_write_transaction;
 pub mod contract;
