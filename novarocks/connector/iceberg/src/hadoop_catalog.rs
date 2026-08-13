@@ -27,6 +27,7 @@
 ///   only accepts the `{version}-{uuid}.metadata.json` format.
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{TableMetadata, TableMetadataBuilder};
@@ -42,6 +43,12 @@ use novarocks_fs::FileError;
 use novarocks_fs::{ConditionalCreateOutcome, FileCancellation, FileErrorKind, ObjectStoreConfig};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+// A native local conditional create can expose the newly reserved path before
+// its payload is fully visible to a competing reader. Retry only the
+// authoritative reread; never replay the create request after its fence point.
+const AUTHORITATIVE_V1_READ_ATTEMPTS: usize = 3;
+const AUTHORITATIVE_V1_READ_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HadoopCreateAttemptFacts {
@@ -558,37 +565,42 @@ impl HadoopFileSystemCatalog {
                 message: "injected authoritative Hadoop v1 reread failure".to_string(),
             });
         }
-        let input = self
-            .file_io
-            .new_input(&attempt.facts.metadata_location)
-            .map_err(|error| HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Unknown,
-                facts: Some(attempt.facts.clone()),
-                message: format!("open authoritative Hadoop v1 metadata: {error}"),
-            })?;
-        let bytes = input.read().await.map_err(|error| HadoopCreateFailure {
-            kind: HadoopCreateFailureKind::Unknown,
-            facts: Some(attempt.facts.clone()),
-            message: format!("read authoritative Hadoop v1 metadata: {error}"),
-        })?;
-        let metadata: TableMetadata =
-            serde_json::from_slice(&bytes).map_err(|error| HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Unknown,
-                facts: Some(attempt.facts.clone()),
-                message: format!("decode authoritative Hadoop v1 metadata: {error}"),
-            })?;
-        let authoritative_digest = hex_digest(&bytes);
-        let same_owner = metadata.uuid().to_string() == attempt.facts.table_uuid
-            && authoritative_digest == attempt.facts.metadata_digest;
-        Ok((
-            if same_owner {
-                HadoopCreateDisposition::Created
-            } else {
-                HadoopCreateDisposition::Existing
-            },
-            metadata,
-            authoritative_digest,
-        ))
+        for read_attempt in 0..AUTHORITATIVE_V1_READ_ATTEMPTS {
+            let read_result = async {
+                let input = self.file_io.new_input(&attempt.facts.metadata_location)?;
+                let bytes = input.read().await?;
+                let metadata = serde_json::from_slice::<TableMetadata>(&bytes)?;
+                Ok::<_, Error>((metadata, hex_digest(&bytes)))
+            }
+            .await;
+            match read_result {
+                Ok((metadata, authoritative_digest)) => {
+                    let same_owner = metadata.uuid().to_string() == attempt.facts.table_uuid
+                        && authoritative_digest == attempt.facts.metadata_digest;
+                    return Ok((
+                        if same_owner {
+                            HadoopCreateDisposition::Created
+                        } else {
+                            HadoopCreateDisposition::Existing
+                        },
+                        metadata,
+                        authoritative_digest,
+                    ));
+                }
+                Err(error) if read_attempt + 1 < AUTHORITATIVE_V1_READ_ATTEMPTS => {
+                    tokio::time::sleep(AUTHORITATIVE_V1_READ_RETRY_DELAY).await;
+                    let _ = error;
+                }
+                Err(error) => {
+                    return Err(HadoopCreateFailure {
+                        kind: HadoopCreateFailureKind::Unknown,
+                        facts: Some(attempt.facts.clone()),
+                        message: format!("read authoritative Hadoop v1 metadata: {error}"),
+                    });
+                }
+            }
+        }
+        unreachable!("authoritative reread either succeeds or returns its final failure")
     }
 
     pub(crate) async fn reconcile_create_attempt(
