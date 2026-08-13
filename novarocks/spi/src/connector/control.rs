@@ -24,9 +24,10 @@ use super::{
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
-    ConnectorHistoricalWriteRecovery, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceResolver, ConnectorMvAttemptDiscovery,
+    ConnectorHistoricalDataMutationRecovery, ConnectorHistoricalWriteRecovery,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorMvAttemptDiscovery,
     ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
     ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
@@ -241,6 +242,7 @@ pub struct ConnectorControlBinding {
     mv_publication_fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
     mv_attempt_discovery: Option<Arc<dyn ConnectorMvAttemptDiscovery>>,
     historical_write_recovery: Option<Arc<dyn ConnectorHistoricalWriteRecovery>>,
+    historical_data_mutation_recovery: Option<Arc<dyn ConnectorHistoricalDataMutationRecovery>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
@@ -429,6 +431,7 @@ impl ConnectorControlBinding {
             mv_publication_fencing: None,
             mv_attempt_discovery: None,
             historical_write_recovery: None,
+            historical_data_mutation_recovery: None,
             view_metadata: None,
         })
     }
@@ -820,6 +823,36 @@ impl ConnectorControlBinding {
 
     pub fn historical_write_recovery(&self) -> Option<&Arc<dyn ConnectorHistoricalWriteRecovery>> {
         self.historical_write_recovery.as_ref()
+    }
+
+    /// Installs the provider-owned historical direct-mutation inspector.
+    ///
+    /// It is installed separately from the ordinary data-mutation capability on
+    /// purpose. TRUNCATE and ADD FILES are executed exactly once by one exact
+    /// generation; letting an ordinary execution path fall back into
+    /// cross-generation inspection is precisely how a destructive mutation
+    /// would get replayed. A provider may own ordinary direct mutation without
+    /// owning historical recovery, and this facet is also independent from the
+    /// distributed-write historical facet.
+    pub fn try_with_historical_data_mutation_recovery(
+        mut self,
+        recovery: Option<Arc<dyn ConnectorHistoricalDataMutationRecovery>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(recovery) = &recovery {
+            super::historical_data_mutation_recovery::validate_historical_data_mutation_recovery_owner(
+                &self.descriptor,
+                self.incarnation,
+                recovery.as_ref(),
+            )?;
+        }
+        self.historical_data_mutation_recovery = recovery;
+        Ok(self)
+    }
+
+    pub fn historical_data_mutation_recovery(
+        &self,
+    ) -> Option<&Arc<dyn ConnectorHistoricalDataMutationRecovery>> {
+        self.historical_data_mutation_recovery.as_ref()
     }
 
     pub fn execution_declaration(

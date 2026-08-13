@@ -47,9 +47,7 @@ use crate::iceberg::spec::{
     SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
