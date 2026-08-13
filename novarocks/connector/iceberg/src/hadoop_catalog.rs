@@ -75,6 +75,29 @@ impl HadoopFileSystemCatalog {
         )
     }
 
+    fn namespace_location(&self, namespace: &NamespaceIdent) -> String {
+        format!("{}/{}", self.warehouse_location, namespace.join("/"))
+    }
+
+    async fn external_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        let namespace_location = self.namespace_location(namespace);
+        let mut tables = Vec::new();
+        for table in self.file_io.list_directories(&namespace_location).await? {
+            if self
+                .file_io
+                .exists(Self::version_hint_path(&format!(
+                    "{namespace_location}/{table}"
+                )))
+                .await?
+            {
+                tables.push(TableIdent::new(namespace.clone(), table));
+            }
+        }
+        tables.sort_by(|left, right| left.name().cmp(right.name()));
+        tables.dedup();
+        Ok(tables)
+    }
+
     /// Returns the path to the `vN.metadata.json` file for a given table location
     /// and version number.
     pub fn metadata_path(table_location: &str, version: u32) -> String {
@@ -202,10 +225,19 @@ impl Catalog for HadoopFileSystemCatalog {
         Ok(Namespace::new(namespace.clone()))
     }
 
-    async fn namespace_exists(&self, _namespace: &NamespaceIdent) -> Result<bool> {
-        self.file_io
-            .exists(self.namespace_marker_location(_namespace))
-            .await
+    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
+        if self
+            .file_io
+            .exists(self.namespace_marker_location(namespace))
+            .await?
+        {
+            return Ok(true);
+        }
+        // Hadoop catalogs do not have a standard namespace metadata object.
+        // External engines such as Spark establish one through direct table
+        // directories. Inspect only direct children and their version hints;
+        // never scan data files below the namespace.
+        Ok(!self.external_tables(namespace).await?.is_empty())
     }
 
     async fn update_namespace(
@@ -222,8 +254,8 @@ impl Catalog for HadoopFileSystemCatalog {
             .await
     }
 
-    async fn list_tables(&self, _namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        Ok(vec![])
+    async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        self.external_tables(namespace).await
     }
 
     /// Create a table: write `v1.metadata.json` and `version-hint.text=1`.
@@ -487,5 +519,30 @@ mod tests {
         assert!(restored.namespace_exists(&namespace).await.unwrap());
         restored.drop_namespace(&namespace).await.unwrap();
         assert!(!restored.namespace_exists(&namespace).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn external_table_directory_establishes_namespace_without_private_marker() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("spark_created".to_string());
+        let metadata_dir = warehouse
+            .path()
+            .join("spark_created")
+            .join("orders")
+            .join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("create Spark-style metadata directory");
+        std::fs::write(metadata_dir.join("version-hint.text"), b"1\n")
+            .expect("write Spark-style version hint");
+
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert_eq!(
+            catalog.list_tables(&namespace).await.unwrap(),
+            vec![TableIdent::new(namespace, "orders".to_string())]
+        );
     }
 }

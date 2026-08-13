@@ -150,10 +150,14 @@ fn encode_bound_required_columns(src: &PlanScanNode, binding: &ResolvedScanBindi
 fn encode_bound_scan_output_column(
     column: &crate::query_execution::preparation::scan::ResolvedScanColumn,
 ) -> Result<common::OutputColumn, String> {
+    let data_type = match column.source.logical_type.as_ref() {
+        Some(logical_type) => encode_sql_type(logical_type)?,
+        None => encode_type(&column.source.data_type)?,
+    };
     Ok(common::OutputColumn {
         column_id: column.planner.column_id.0,
         name: column.source.name.clone(),
-        r#type: Some(encode_type(&column.source.data_type)?),
+        r#type: Some(data_type),
         nullable: column.source.nullable,
         is_internal: column.planner.is_internal,
     })
@@ -645,7 +649,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::reader::StreamReader;
 
-    use super::encode_connector_expected_schema_ipc;
+    use super::{encode_bound_scan_output_column, encode_connector_expected_schema_ipc};
+    use crate::query_execution::preparation::scan::{ResolvedScanColumn, ResolvedScanColumnKind};
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use novarocks_protocol::common;
@@ -715,5 +720,50 @@ mod tests {
                 .get("novarocks.iceberg.initial_default"),
             Some(&"9".to_string())
         );
+    }
+
+    #[test]
+    fn bound_scan_output_preserves_signed_binary_logical_types() {
+        fn encoded_primitive(
+            logical_type: Option<novarocks_catalog::schema::SqlType>,
+        ) -> common::PrimitiveType {
+            let column = ResolvedScanColumn {
+                planner: OutputColumn {
+                    column_id: ColumnId(7),
+                    name: "state".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: true,
+                    is_internal: false,
+                },
+                source: novarocks_catalog::schema::ColumnDef {
+                    name: "state".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: true,
+                    write_default: None,
+                    logical_type,
+                },
+                kind: ResolvedScanColumnKind::PhysicalTableColumn,
+            };
+            let encoded = encode_bound_scan_output_column(&column).expect("encode bound column");
+            let common::type_desc::Kind::Scalar(scalar) = encoded
+                .r#type
+                .expect("encoded type")
+                .kind
+                .expect("type kind")
+            else {
+                panic!("expected scalar type")
+            };
+            common::PrimitiveType::try_from(scalar.r#type).expect("known primitive")
+        }
+
+        assert_eq!(
+            encoded_primitive(Some(novarocks_catalog::schema::SqlType::Bitmap)),
+            common::PrimitiveType::Bitmap
+        );
+        assert_eq!(
+            encoded_primitive(Some(novarocks_catalog::schema::SqlType::Hll)),
+            common::PrimitiveType::Hll
+        );
+        assert_eq!(encoded_primitive(None), common::PrimitiveType::Varbinary);
     }
 }

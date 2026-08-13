@@ -151,6 +151,39 @@ impl Storage for IcebergFsStorage {
         })
     }
 
+    async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
+        let (access, mut relative_path) = self.resolve_path("list_directories", path)?;
+        if !relative_path.ends_with('/') {
+            relative_path.push('/');
+        }
+        access
+            .operator()
+            .list_with(&relative_path)
+            .await
+            .map(|entries| {
+                let prefix = relative_path.trim_start_matches('/');
+                let mut directories = entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let listed = entry.path().trim_start_matches('/');
+                        let relative = listed.strip_prefix(prefix)?.trim_start_matches('/');
+                        let directory = relative.strip_suffix('/')?;
+                        (!directory.is_empty() && !directory.contains('/'))
+                            .then(|| directory.to_string())
+                    })
+                    .collect::<Vec<_>>();
+                directories.sort();
+                directories.dedup();
+                directories
+            })
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("fs list_directories({path}) through {relative_path}: {error}"),
+                )
+            })
+    }
+
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let (access, relative_path) = self.resolve_path("metadata", path)?;
         let meta = access.operator().stat(&relative_path).await.map_err(|e| {

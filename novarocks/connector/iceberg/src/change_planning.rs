@@ -38,8 +38,8 @@ use crate::delta::{
     delta_source_files_from_change_batch,
 };
 use crate::iceberg::spec::{
-    DataContentType, DataFileFormat, FormatVersion, ManifestContentType, ManifestStatus, Operation,
-    Snapshot, TableMetadata,
+    DataContentType, DataFileFormat, FormatVersion, ManifestContentType, ManifestStatus,
+    NestedField, Operation, Schema, Snapshot, TableMetadata, Type,
 };
 use crate::iceberg::table::Table;
 use crate::resources::IcebergCatalogRuntime;
@@ -107,13 +107,19 @@ pub(crate) fn plan_change_window(
         .block_on(async move { collect_files(&collect_metadata, &file_io, &actions).await })
         .map_err(unavailable)??;
     check_active(context)?;
+    // A multi-snapshot window can contain a COW file that was both created and
+    // replaced before the upper endpoint. Iceberg files are immutable, so the
+    // same path on both sides is an intermediate artifact, not a net row
+    // change. Cancel it before freezing delta sources; otherwise the refresh
+    // reads and retracts transient rows that are absent from both endpoints.
+    let (inserts, deleted_data_files) = cancel_exact_transient_data_files(collected.0, collected.3);
     let batch = IcebergChangeBatch {
         previous_snapshot_id: from_exclusive,
         current_snapshot_id: to_inclusive,
-        inserts: collected.0,
+        inserts,
         deletes: collected.1,
         equality_deletes: collected.2,
-        deleted_data_files: collected.3,
+        deleted_data_files,
     };
     if batch.inserts.is_empty()
         && batch.deletes.is_empty()
@@ -130,6 +136,83 @@ pub(crate) fn plan_change_window(
         partition_impact: partition_impact(metadata, &batch, context)?,
     };
     Ok((admission, batch))
+}
+
+fn cancel_exact_transient_data_files(
+    inserts: Vec<DataFileRef>,
+    deleted: Vec<DeletedDataFileRef>,
+) -> (Vec<DataFileRef>, Vec<DeletedDataFileRef>) {
+    #[derive(Hash, PartialEq, Eq)]
+    struct ExactIdentity<'a> {
+        path: &'a str,
+        size: i64,
+        record_count: Option<i64>,
+        partition_spec_id: Option<i32>,
+        partition_key: Option<&'a str>,
+        partition_values: &'a [ChangePartitionFieldValue],
+        first_row_id: Option<i64>,
+        data_sequence_number: Option<i64>,
+    }
+
+    fn insert_identity(file: &DataFileRef) -> ExactIdentity<'_> {
+        ExactIdentity {
+            path: &file.path,
+            size: file.size,
+            record_count: file.record_count,
+            partition_spec_id: file.partition_spec_id,
+            partition_key: file.partition_key.as_deref(),
+            partition_values: &file.partition_values,
+            first_row_id: file.first_row_id,
+            data_sequence_number: file.data_sequence_number,
+        }
+    }
+
+    fn deleted_identity(file: &DeletedDataFileRef) -> ExactIdentity<'_> {
+        ExactIdentity {
+            path: &file.path,
+            size: file.size,
+            record_count: file.record_count,
+            partition_spec_id: file.partition_spec_id,
+            partition_key: file.partition_key.as_deref(),
+            partition_values: &file.partition_values,
+            first_row_id: file.first_row_id,
+            data_sequence_number: file.data_sequence_number,
+        }
+    }
+
+    let mut insert_is_transient = vec![false; inserts.len()];
+    let mut delete_is_transient = vec![false; deleted.len()];
+    let mut delete_indices_by_identity = HashMap::<ExactIdentity<'_>, Vec<usize>>::new();
+    for (index, file) in deleted.iter().enumerate() {
+        delete_indices_by_identity
+            .entry(deleted_identity(file))
+            .or_default()
+            .push(index);
+    }
+    for (insert_index, insert) in inserts.iter().enumerate() {
+        if insert.row_id_allow_list.is_some() {
+            continue;
+        }
+        if let Some(delete_index) = delete_indices_by_identity
+            .get_mut(&insert_identity(insert))
+            .and_then(Vec::pop)
+        {
+            insert_is_transient[insert_index] = true;
+            delete_is_transient[delete_index] = true;
+        }
+    }
+    (
+        inserts
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, file)| (!insert_is_transient[index]).then_some(file))
+            .collect(),
+        deleted
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, file)| (!delete_is_transient[index]).then_some(file))
+            .collect(),
+    )
 }
 
 pub(crate) fn freeze_delta_scan_plan(
@@ -475,12 +558,27 @@ fn classify_lineage(
             }
         }
         if !matches!(snapshot.summary().operation, Operation::Replace)
-            && parent.is_some_and(|parent| snapshot.schema_id() != parent.schema_id())
+            && let Some(parent) = parent
+            && snapshot.schema_id() != parent.schema_id()
         {
-            return Err(unsupported(format!(
-                "Iceberg schema changed at snapshot {}; incremental change-window planning is not supported",
-                snapshot.snapshot_id()
-            )));
+            let previous_schema = parent.schema(metadata).map_err(|error| {
+                corrupt(format!(
+                    "resolve Iceberg snapshot {} schema: {error}",
+                    parent.snapshot_id()
+                ))
+            })?;
+            let next_schema = snapshot.schema(metadata).map_err(|error| {
+                corrupt(format!(
+                    "resolve Iceberg snapshot {} schema: {error}",
+                    snapshot.snapshot_id()
+                ))
+            })?;
+            if !schema_differs_only_by_field_names(&previous_schema, &next_schema) {
+                return Err(unsupported(format!(
+                    "Iceberg schema changed at snapshot {}; incremental change-window planning is not supported",
+                    snapshot.snapshot_id()
+                )));
+            }
         }
         match parent_id {
             Some(id) if id == from_exclusive => break,
@@ -509,6 +607,47 @@ fn classify_lineage(
     } else {
         LineageAdmission::Incremental(actions)
     })
+}
+
+fn schema_differs_only_by_field_names(previous: &Schema, next: &Schema) -> bool {
+    previous
+        .identifier_field_ids()
+        .eq(next.identifier_field_ids())
+        && fields_differ_only_by_names(previous.as_struct().fields(), next.as_struct().fields())
+}
+
+fn fields_differ_only_by_names(previous: &[Arc<NestedField>], next: &[Arc<NestedField>]) -> bool {
+    previous.len() == next.len()
+        && previous
+            .iter()
+            .zip(next)
+            .all(|(previous, next)| field_differs_only_by_name(previous, next))
+}
+
+fn field_differs_only_by_name(previous: &NestedField, next: &NestedField) -> bool {
+    previous.id == next.id
+        && previous.required == next.required
+        && previous.doc == next.doc
+        && previous.initial_default == next.initial_default
+        && previous.write_default == next.write_default
+        && type_differs_only_by_field_names(&previous.field_type, &next.field_type)
+}
+
+fn type_differs_only_by_field_names(previous: &Type, next: &Type) -> bool {
+    match (previous, next) {
+        (Type::Primitive(previous), Type::Primitive(next)) => previous == next,
+        (Type::Struct(previous), Type::Struct(next)) => {
+            fields_differ_only_by_names(previous.fields(), next.fields())
+        }
+        (Type::List(previous), Type::List(next)) => {
+            field_differs_only_by_name(&previous.element_field, &next.element_field)
+        }
+        (Type::Map(previous), Type::Map(next)) => {
+            field_differs_only_by_name(&previous.key_field, &next.key_field)
+                && field_differs_only_by_name(&previous.value_field, &next.value_field)
+        }
+        _ => false,
+    }
 }
 
 enum SnapshotDecision {
@@ -1200,5 +1339,73 @@ mod tests {
         let metadata = metadata_with_snapshots(Vec::new());
         let error = classify_lineage(&metadata, 1, 2).expect_err("missing upper snapshot");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn field_id_preserving_rename_is_the_only_incremental_schema_change() {
+        let previous = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                7,
+                "region",
+                Type::Primitive(PrimitiveType::String),
+            ))])
+            .build()
+            .expect("previous schema");
+        let renamed = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                7,
+                "area",
+                Type::Primitive(PrimitiveType::String),
+            ))])
+            .build()
+            .expect("renamed schema");
+        let widened = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                7,
+                "area",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("widened schema");
+
+        assert!(schema_differs_only_by_field_names(&previous, &renamed));
+        assert!(!schema_differs_only_by_field_names(&previous, &widened));
+    }
+
+    #[test]
+    fn transient_file_netting_requires_exact_iceberg_identity() {
+        let inserted = DataFileRef {
+            path: "warehouse/orders/data/file.parquet".to_string(),
+            size: 128,
+            record_count: Some(3),
+            partition_spec_id: Some(1),
+            partition_key: Some("region=us".to_string()),
+            partition_values: Vec::new(),
+            first_row_id: Some(10),
+            data_sequence_number: Some(7),
+            row_id_allow_list: None,
+        };
+        let exact_delete = DeletedDataFileRef {
+            path: inserted.path.clone(),
+            size: inserted.size,
+            record_count: inserted.record_count,
+            partition_spec_id: inserted.partition_spec_id,
+            partition_key: inserted.partition_key.clone(),
+            partition_values: inserted.partition_values.clone(),
+            first_row_id: inserted.first_row_id,
+            data_sequence_number: inserted.data_sequence_number,
+        };
+        let mut different_delete = exact_delete.clone();
+        different_delete.data_sequence_number = Some(8);
+
+        let (remaining_inserts, remaining_deletes) =
+            cancel_exact_transient_data_files(vec![inserted.clone()], vec![exact_delete]);
+        assert!(remaining_inserts.is_empty());
+        assert!(remaining_deletes.is_empty());
+
+        let (remaining_inserts, remaining_deletes) =
+            cancel_exact_transient_data_files(vec![inserted], vec![different_delete]);
+        assert_eq!(remaining_inserts.len(), 1);
+        assert_eq!(remaining_deletes.len(), 1);
     }
 }

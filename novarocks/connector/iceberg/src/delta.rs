@@ -146,7 +146,7 @@ pub struct DataFileRef {
     pub row_id_allow_list: Option<BTreeSet<i64>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChangePartitionFieldValue {
     pub source_field_id: i32,
     pub source_column: Option<String>,
@@ -155,7 +155,7 @@ pub struct ChangePartitionFieldValue {
     pub value: ChangePartitionValue,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ChangePartitionValue {
     Null,
     Primitive(String),

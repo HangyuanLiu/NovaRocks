@@ -372,7 +372,16 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver
         self.read
             .lock()
             .map_err(|_| "frozen connector read lock poisoned".to_string())
-            .map(|mut read| read.take())
+            .map(|mut read| {
+                read.take().map(|mut read| {
+                    // The opaque source was planned before SQL compilation, so
+                    // none of the query's scan predicates could have been
+                    // negotiated with the provider. Core must retain every one
+                    // as an execution residual when the frozen read is injected.
+                    read.residual_predicates = scan.predicates.clone();
+                    read
+                })
+            })
     }
 }
 
@@ -643,10 +652,17 @@ mod tests {
         };
         let binding = admit_frozen_connector_scan_binding(&bindings, &identity, &metadata.schema)
             .expect("admit frozen binding");
-        let plan = frozen_connector_scan_physical_plan(&identity, &metadata.schema, binding);
-        let crate::sql::planner::physical::PhysicalPlanKind::Scan(scan) = &plan.kind else {
+        let mut plan = frozen_connector_scan_physical_plan(&identity, &metadata.schema, binding);
+        let crate::sql::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
             panic!("expected scan")
         };
+        scan.predicates.push(crate::sql::analysis::TypedExpr {
+            kind: crate::sql::analysis::ExprKind::Literal(
+                crate::sql::analysis::LiteralValue::Bool(true),
+            ),
+            data_type: DataType::Boolean,
+            nullable: false,
+        });
         let wrong_identity = SqlTableIdentity {
             catalog: "__frozen".to_string(),
             namespace: "operation".to_string(),
@@ -678,12 +694,16 @@ mod tests {
             .is_none()
         );
 
-        assert!(
+        let resolved =
             crate::query_execution::preparation::scan::ScanBindingResolver::resolve_connector_read(
                 &resolver, 9, scan,
             )
             .expect("first resolver call")
-            .is_some()
+            .expect("frozen read");
+        assert_eq!(resolved.residual_predicates.len(), 1);
+        assert_eq!(
+            format!("{:?}", resolved.residual_predicates),
+            format!("{:?}", scan.predicates)
         );
         assert!(
             crate::query_execution::preparation::scan::ScanBindingResolver::resolve_connector_read(

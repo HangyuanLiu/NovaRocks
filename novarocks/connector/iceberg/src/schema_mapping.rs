@@ -32,6 +32,137 @@ use crate::row_lineage_synth::{
 };
 use crate::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
+/// Convert one frozen Iceberg schema into the SQL read carrier exposed by the
+/// Provider. iceberg-rust's generic Arrow mapping intentionally chooses wider
+/// physical representations for several primitives; NovaRocks binds these
+/// exact logical carriers at admission and must reproduce them at begin-scan.
+pub fn sql_read_schema_from_iceberg(
+    iceberg_schema: &crate::iceberg::spec::Schema,
+) -> Result<SchemaRef, String> {
+    let arrow_schema = crate::iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+        .map_err(|error| format!("convert Iceberg schema to Arrow: {error}"))?;
+    if arrow_schema.fields().len() != iceberg_schema.as_struct().fields().len() {
+        return Err("Iceberg schema field count does not match its Arrow carrier".to_string());
+    }
+    let fields = arrow_schema
+        .fields()
+        .iter()
+        .zip(iceberg_schema.as_struct().fields())
+        .map(|(field, iceberg_field)| sql_read_field(field.as_ref(), iceberg_field).map(Arc::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        arrow_schema.metadata().clone(),
+    )))
+}
+
+fn sql_read_field(
+    field: &Field,
+    iceberg_field: &crate::iceberg::spec::NestedField,
+) -> Result<Field, String> {
+    Ok(field.clone().with_data_type(sql_read_data_type(
+        field.data_type(),
+        iceberg_field.field_type.as_ref(),
+        field.name(),
+    )?))
+}
+
+fn sql_read_data_type(
+    arrow_type: &DataType,
+    iceberg_type: &crate::iceberg::spec::Type,
+    path: &str,
+) -> Result<DataType, String> {
+    use crate::iceberg::spec::{PrimitiveType, Type};
+    use arrow::datatypes::TimeUnit;
+
+    match iceberg_type {
+        Type::Primitive(PrimitiveType::Binary) => Ok(DataType::Binary),
+        Type::Primitive(PrimitiveType::Variant) => Ok(DataType::LargeBinary),
+        Type::Primitive(PrimitiveType::Timestamptz) => {
+            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
+        }
+        Type::Primitive(PrimitiveType::TimestamptzNs) => {
+            Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+        }
+        Type::Primitive(_) => Ok(arrow_type.clone()),
+        Type::Struct(iceberg_struct) => {
+            let DataType::Struct(arrow_fields) = arrow_type else {
+                return Err(format!(
+                    "Iceberg struct {path} has incompatible Arrow carrier {arrow_type:?}"
+                ));
+            };
+            if arrow_fields.len() != iceberg_struct.fields().len() {
+                return Err(format!(
+                    "Iceberg struct {path} field count does not match its Arrow carrier"
+                ));
+            }
+            let fields = arrow_fields
+                .iter()
+                .zip(iceberg_struct.fields())
+                .map(|(field, iceberg_field)| {
+                    sql_read_field(field.as_ref(), iceberg_field).map(Arc::new)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataType::Struct(fields.into()))
+        }
+        Type::List(iceberg_list) => {
+            let (field, wrap): (&Field, Box<dyn FnOnce(Arc<Field>) -> DataType>) = match arrow_type
+            {
+                DataType::List(field) => (field.as_ref(), Box::new(DataType::List)),
+                DataType::LargeList(field) => (field.as_ref(), Box::new(DataType::LargeList)),
+                DataType::FixedSizeList(field, size) => {
+                    let size = *size;
+                    (
+                        field.as_ref(),
+                        Box::new(move |field| DataType::FixedSizeList(field, size)),
+                    )
+                }
+                _ => {
+                    return Err(format!(
+                        "Iceberg list {path} has incompatible Arrow carrier {arrow_type:?}"
+                    ));
+                }
+            };
+            Ok(wrap(Arc::new(sql_read_field(
+                field,
+                &iceberg_list.element_field,
+            )?)))
+        }
+        Type::Map(iceberg_map) => {
+            let DataType::Map(entries, sorted) = arrow_type else {
+                return Err(format!(
+                    "Iceberg map {path} has incompatible Arrow carrier {arrow_type:?}"
+                ));
+            };
+            let DataType::Struct(arrow_fields) = entries.data_type() else {
+                return Err(format!("Iceberg map {path} has non-struct Arrow entries"));
+            };
+            if arrow_fields.len() != 2 {
+                return Err(format!(
+                    "Iceberg map {path} does not have key/value entries"
+                ));
+            }
+            let fields = vec![
+                Arc::new(sql_read_field(
+                    arrow_fields[0].as_ref(),
+                    &iceberg_map.key_field,
+                )?),
+                Arc::new(sql_read_field(
+                    arrow_fields[1].as_ref(),
+                    &iceberg_map.value_field,
+                )?),
+            ];
+            let entries = Arc::new(
+                entries
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Struct(fields.into())),
+            );
+            Ok(DataType::Map(entries, *sorted))
+        }
+    }
+}
+
 /// Validates and canonically encodes an Iceberg name mapping.
 ///
 /// Name mappings are physical Iceberg schema facts.  Keeping validation and
@@ -249,6 +380,10 @@ fn apply_scan_field_id_recursive(
         );
     }
     let data_type = match field.data_type() {
+        // Parquet VARIANT is one Iceberg primitive field whose physical Arrow
+        // carrier is a Struct. Its metadata/value children are encoding
+        // details, not independently identified Iceberg nested fields.
+        data_type if is_variant_struct_data_type(data_type) => data_type.clone(),
         DataType::Struct(children) => DataType::Struct(
             children
                 .iter()
@@ -464,7 +599,18 @@ pub fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_name_mapping;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    use super::{
+        apply_scan_field_id_recursive, canonical_name_mapping, sql_read_schema_from_iceberg,
+    };
+    use crate::iceberg::spec::{
+        ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema, StructType, Type,
+    };
+    use crate::scan_model::IcebergSchemaFieldDef;
 
     #[test]
     fn canonical_name_mapping_is_strict_and_provider_owned() {
@@ -486,5 +632,131 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn frozen_variant_annotation_keeps_physical_children_opaque() {
+        let field = Field::new(
+            "v",
+            DataType::Struct(
+                vec![
+                    Field::new("metadata", DataType::Binary, false),
+                    Field::new("value", DataType::LargeBinary, false),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let frozen = IcebergSchemaFieldDef {
+            field_id: 7,
+            name: "v".to_string(),
+            initial_default: None,
+            write_default: None,
+            initial_default_json: None,
+            write_default_json: None,
+            children: Vec::new(),
+        };
+
+        let annotated =
+            apply_scan_field_id_recursive(&field, &frozen).expect("annotate variant field");
+        assert_eq!(
+            annotated.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"7".to_string())
+        );
+        assert_eq!(annotated.data_type(), field.data_type());
+        let DataType::Struct(children) = annotated.data_type() else {
+            panic!("variant remains a struct carrier");
+        };
+        assert!(children.iter().all(|child| child.metadata().is_empty()));
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn frozen_iceberg_primitives_use_exact_sql_read_carriers() {
+        let iceberg = IcebergSchema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "binary", Type::Primitive(PrimitiveType::Binary)).into(),
+                NestedField::optional(2, "variant", Type::Primitive(PrimitiveType::Variant)).into(),
+                NestedField::required(
+                    3,
+                    "timestamptz",
+                    Type::Primitive(PrimitiveType::Timestamptz),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("Iceberg schema");
+
+        let schema = sql_read_schema_from_iceberg(&iceberg).expect("SQL read schema");
+        assert_eq!(schema.field(0).data_type(), &DataType::Binary);
+        assert_eq!(schema.field(1).data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn frozen_nested_iceberg_primitives_use_exact_sql_read_carriers() {
+        let iceberg = IcebergSchema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "record",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                        2,
+                        "payload",
+                        Type::Primitive(PrimitiveType::Binary),
+                    ))])),
+                )
+                .into(),
+                NestedField::optional(
+                    3,
+                    "items",
+                    Type::List(ListType::new(Arc::new(NestedField::list_element(
+                        4,
+                        Type::Primitive(PrimitiveType::Binary),
+                        false,
+                    )))),
+                )
+                .into(),
+                NestedField::optional(
+                    5,
+                    "attributes",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::map_key_element(
+                            6,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::map_value_element(
+                            7,
+                            Type::Primitive(PrimitiveType::Variant),
+                            false,
+                        )),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("Iceberg schema");
+
+        let schema = sql_read_schema_from_iceberg(&iceberg).expect("SQL read schema");
+        let DataType::Struct(record) = schema.field(0).data_type() else {
+            panic!("record is a struct")
+        };
+        assert_eq!(record[0].data_type(), &DataType::Binary);
+        let DataType::List(items) = schema.field(1).data_type() else {
+            panic!("items is a list")
+        };
+        assert_eq!(items.data_type(), &DataType::Binary);
+        let DataType::Map(entries, _) = schema.field(2).data_type() else {
+            panic!("attributes is a map")
+        };
+        let DataType::Struct(entries) = entries.data_type() else {
+            panic!("map entries are a struct")
+        };
+        assert_eq!(entries[1].data_type(), &DataType::LargeBinary);
     }
 }
