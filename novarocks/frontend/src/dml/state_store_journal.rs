@@ -2669,6 +2669,15 @@ fn validate_ctas_recovery_against_saga(
     use crate::dml::model::{DmlCtasActionKind, DmlCtasDispatchCertainty};
 
     let mut chains = [
+        (
+            DmlCtasActionKind::AdvanceFence,
+            recovery
+                .catalog_fence_history
+                .iter()
+                .chain(recovery.catalog_fence.iter())
+                .map(|fence| fence.action_id)
+                .collect(),
+        ),
         (DmlCtasActionKind::Stage, vec![saga.prepare_operation_id]),
         (DmlCtasActionKind::Write, vec![saga.write_operation_id]),
         (DmlCtasActionKind::Publish, vec![saga.publish_operation_id]),
@@ -2718,11 +2727,20 @@ fn validate_ctas_recovery_against_saga(
                 "CTAS catalog recovery cannot classify the distributed write child",
             ));
         }
-        let possibly_dispatched = recovery.dispatch_checkpoints.iter().any(|checkpoint| {
-            checkpoint.action == observation.action
-                && checkpoint.child_operation_id == observation.child_operation_id
-                && checkpoint.dispatch_certainty == DmlCtasDispatchCertainty::PossiblyDispatched
-        });
+        let possibly_dispatched = observation.action == DmlCtasActionKind::AdvanceFence
+            && recovery
+                .catalog_fence_history
+                .iter()
+                .chain(recovery.catalog_fence.iter())
+                .any(|fence| {
+                    fence.action_id == observation.child_operation_id
+                        && fence.receipt_payload.is_some()
+                })
+            || recovery.dispatch_checkpoints.iter().any(|checkpoint| {
+                checkpoint.action == observation.action
+                    && checkpoint.child_operation_id == observation.child_operation_id
+                    && checkpoint.dispatch_certainty == DmlCtasDispatchCertainty::PossiblyDispatched
+            });
         if !possibly_dispatched {
             return Err(DmlError::journal_corruption(
                 "CTAS historical observation requires a possibly-dispatched action checkpoint",

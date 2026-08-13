@@ -176,6 +176,10 @@ pub trait CtasPreparedWrite: Send + Sync {
 pub struct PreparedCtasWrite {
     pub target_facts: CtasTargetFacts,
     pub write_operation_id: ConnectorWriteOperationId,
+    /// Digest of the exact provider-signed writer cohort set. Frontend keeps
+    /// this neutral value before dispatch so a later generation can build the
+    /// CP-3B historical descriptor without decoding opaque evidence.
+    pub cohort_set_digest: [u8; 32],
     pub execution_identity: [u8; 32],
     pub handle: Arc<dyn CtasPreparedWrite>,
 }
@@ -185,6 +189,7 @@ pub enum CtasWriteOutcome {
     Completed {
         completion: ConnectorWriteOperationCompletion,
         execution_identity: [u8; 32],
+        established_fence: Option<novarocks_spi::connector::ConnectorEstablishedWriteFence>,
     },
     KnownUncommitted {
         failure: CtasFailure,
@@ -192,6 +197,7 @@ pub enum CtasWriteOutcome {
     CommitUnknown {
         failure: CtasFailure,
         evidence: ExternalMutationEvidence,
+        established_fence: Option<novarocks_spi::connector::ConnectorEstablishedWriteFence>,
     },
 }
 
@@ -1230,6 +1236,7 @@ fn write_commit_unknown(
             message: failure_message,
         },
         evidence,
+        established_fence: session.established_external_fence().ok().flatten(),
     }
 }
 
@@ -1664,12 +1671,18 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
             template,
         )
         .map_err(internal_failure)?;
+        let cohort_set_digest = prepared
+            .registration()
+            .sealed_cohorts()
+            .map_err(connector_failure)?
+            .digest();
         let target = target_arc;
         let facts = target_facts(target.as_ref());
         let identity = source.gate.execution_identity();
         Ok(PreparedCtasWrite {
             target_facts: facts,
             write_operation_id,
+            cohort_set_digest,
             execution_identity: identity,
             handle: Arc::new(CorePreparedCtasWrite {
                 state: Arc::clone(self),
@@ -1771,6 +1784,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                 Ok(CtasWriteOutcome::Completed {
                     completion: sealed,
                     execution_identity: prepared.execution_identity,
+                    established_fence: session.established_external_fence().ok().flatten(),
                 })
             });
         match result {
@@ -1796,6 +1810,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                 return CtasWriteOutcome::CommitUnknown {
                     failure: internal_failure(format!("CTAS write evidence lock: {error}")),
                     evidence,
+                    established_fence: None,
                 };
             }
         };
@@ -1816,6 +1831,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                         .to_string(),
                 },
                 evidence: stored_evidence,
+                established_fence: None,
             };
         }
         let session = match prepared.write_session.lock() {
@@ -1824,6 +1840,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                 return CtasWriteOutcome::CommitUnknown {
                     failure: internal_failure(format!("CTAS write session lock: {error}")),
                     evidence: stored_evidence,
+                    established_fence: None,
                 };
             }
         };
@@ -1831,6 +1848,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
             return CtasWriteOutcome::CommitUnknown {
                 failure: internal_failure("CTAS unresolved writer lost its exact retained session"),
                 evidence: stored_evidence,
+                established_fence: None,
             };
         };
         let expected = write_staging_evidence(&session);
@@ -1840,6 +1858,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                     "CTAS stored writer evidence failed exact session validation",
                 ),
                 evidence: stored_evidence,
+                established_fence: session.established_external_fence().ok().flatten(),
             };
         }
         let completion = match session.sealed_operation_completion() {
@@ -1851,6 +1870,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                         message: format!("CTAS writer is still incomplete: {error}"),
                     },
                     evidence: stored_evidence,
+                    established_fence: session.established_external_fence().ok().flatten(),
                 };
             }
         };
@@ -1861,11 +1881,13 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
             return CtasWriteOutcome::CommitUnknown {
                 failure: connector_failure(error),
                 evidence: stored_evidence,
+                established_fence: session.established_external_fence().ok().flatten(),
             };
         }
         CtasWriteOutcome::Completed {
             completion,
             execution_identity: prepared.execution_identity,
+            established_fence: session.established_external_fence().ok().flatten(),
         }
     }
 

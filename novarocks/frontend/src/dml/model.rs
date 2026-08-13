@@ -2088,6 +2088,11 @@ pub struct CtasSagaRecord {
     pub write_cohort_id: Option<String>,
     #[serde(default)]
     pub staged_handle_digest: Option<String>,
+    /// Provider-neutral digest of the exact sealed distributed-writer cohort
+    /// set. It is durable before writer dispatch and is required to inspect a
+    /// historical CTAS write without decoding provider evidence.
+    #[serde(default)]
+    pub write_cohort_set_digest: Option<String>,
     #[serde(default)]
     pub aggregate_write_digest: Option<String>,
     #[serde(default)]
@@ -2113,6 +2118,7 @@ pub struct CtasSagaRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DmlCtasActionKind {
+    AdvanceFence,
     Stage,
     Write,
     Publish,
@@ -2255,7 +2261,15 @@ pub struct DmlCtasRecoveryRecord {
     pub capability_version: u32,
     pub recovery_attempt_id: Uuid,
     pub recovery_cycle: u32,
+    /// Superseded fence attempts. Takeover appends the old current attempt
+    /// here before durably recording the next dispatch; an attempt whose
+    /// response was lost may intentionally have no receipt.
+    pub catalog_fence_history: Vec<DmlCtasCatalogFenceRecord>,
     pub catalog_fence: Option<DmlCtasCatalogFenceRecord>,
+    /// Digest used by the original Stage request. It stays immutable when a
+    /// takeover installs a higher current catalog fence, so a response-lost
+    /// Stage can still be inspected without a returned locator.
+    pub staged_target_digest: Option<String>,
     /// Bounded opaque staged locator. Frontend never treats it as table
     /// metadata and never opens an old provider session from it.
     pub staged_locator: Option<DmlOpaquePayload>,
@@ -2290,16 +2304,25 @@ fn ctas_terminal_closes_staged_lineage(record: &DmlCtasRecoveryRecord) -> bool {
     record.historical_observations.iter().any(|terminal| {
         let expected_action = match terminal.disposition {
             DmlCtasHistoricalDisposition::Published => DmlCtasActionKind::Publish,
+            DmlCtasHistoricalDisposition::NoOp if terminal.locator_digest.is_none() => {
+                if terminal.action == DmlCtasActionKind::AdvanceFence {
+                    DmlCtasActionKind::AdvanceFence
+                } else {
+                    DmlCtasActionKind::Publish
+                }
+            }
             DmlCtasHistoricalDisposition::Aborted => DmlCtasActionKind::Abort,
-            DmlCtasHistoricalDisposition::Absent => DmlCtasActionKind::Stage,
             _ => return false,
         };
-        if terminal.action != expected_action
-            || !record.dispatch_checkpoints.iter().any(|checkpoint| {
+        let exact_action = terminal.action == DmlCtasActionKind::AdvanceFence
+            && record.catalog_fence.as_ref().is_some_and(|fence| {
+                fence.action_id == terminal.child_operation_id && fence.receipt_payload.is_some()
+            })
+            || record.dispatch_checkpoints.iter().any(|checkpoint| {
                 checkpoint.action == terminal.action
                     && checkpoint.child_operation_id == terminal.child_operation_id
-            })
-        {
+            });
+        if terminal.action != expected_action || !exact_action {
             return false;
         }
         // A terminal observation closes retained staging only when its own
@@ -2359,6 +2382,57 @@ fn validate_ctas_dispatch_checkpoint(
     }
 }
 
+fn validate_ctas_catalog_fence(fence: &DmlCtasCatalogFenceRecord) -> Result<bool, String> {
+    if fence.generation.control_plane_incarnation == 0
+        || fence.generation.resource_epoch == 0
+        || fence.generation.fence_generation == 0
+        || !is_uuid_v7(fence.action_id)
+        || !is_lowercase_digest(&fence.request_digest)
+    {
+        return Err("CTAS catalog fence generation or request digest is invalid".to_string());
+    }
+    match fence.dispatch_certainty {
+        DmlCtasDispatchCertainty::ConfirmedNotDispatched if fence.dispatched_at_ms.is_some() => {
+            return Err(
+                "CTAS undispatched catalog fence cannot have a dispatch timestamp".to_string(),
+            );
+        }
+        DmlCtasDispatchCertainty::PossiblyDispatched
+            if fence.dispatched_at_ms.is_none_or(|timestamp| timestamp < 0) =>
+        {
+            return Err(
+                "CTAS dispatched catalog fence requires a nonnegative timestamp".to_string(),
+            );
+        }
+        _ => {}
+    }
+    let receipt_complete = fence.fence_digest.is_some()
+        && fence.receipt_digest.is_some()
+        && fence.receipt_payload.is_some()
+        && fence.established_at_ms.is_some();
+    let receipt_absent = fence.fence_digest.is_none()
+        && fence.receipt_digest.is_none()
+        && fence.receipt_payload.is_none()
+        && fence.established_at_ms.is_none();
+    if !receipt_complete && !receipt_absent {
+        return Err("CTAS catalog fence receipt facts must become durable together".to_string());
+    }
+    if receipt_complete {
+        if !is_lowercase_digest(fence.fence_digest.as_deref().unwrap())
+            || !is_lowercase_digest(fence.receipt_digest.as_deref().unwrap())
+            || fence
+                .established_at_ms
+                .is_some_and(|timestamp| timestamp < 0)
+        {
+            return Err("CTAS catalog fence receipt digest or timestamp is invalid".to_string());
+        }
+        if fence.dispatch_certainty != DmlCtasDispatchCertainty::PossiblyDispatched {
+            return Err("a confirmed CTAS catalog fence must have been dispatched".to_string());
+        }
+    }
+    Ok(receipt_complete)
+}
+
 /// Validate one complete provider-neutral CP-3D recovery record.
 pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), String> {
     if record.codec_version != DML_CTAS_RECOVERY_CODEC_VERSION {
@@ -2377,59 +2451,22 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
         return Err("CTAS recovery timestamp must be nonnegative".to_string());
     }
     let mut catalog_fence_receipt_complete = false;
+    let mut prior_generation = None;
+    if record.catalog_fence_history.len() > 64 {
+        return Err("CTAS catalog fence history exceeds 64 entries".to_string());
+    }
+    for fence in &record.catalog_fence_history {
+        catalog_fence_receipt_complete |= validate_ctas_catalog_fence(fence)?;
+        if prior_generation.is_some_and(|generation| fence.generation <= generation) {
+            return Err("CTAS catalog fence history must be strictly ordered".to_string());
+        }
+        prior_generation = Some(fence.generation);
+    }
     if let Some(fence) = &record.catalog_fence {
-        if fence.generation.control_plane_incarnation == 0
-            || fence.generation.resource_epoch == 0
-            || fence.generation.fence_generation == 0
-            || !is_uuid_v7(fence.action_id)
-            || !is_lowercase_digest(&fence.request_digest)
-        {
-            return Err("CTAS catalog fence generation or request digest is invalid".to_string());
+        if prior_generation.is_some_and(|generation| fence.generation <= generation) {
+            return Err("current CTAS catalog fence must follow its history".to_string());
         }
-        match fence.dispatch_certainty {
-            DmlCtasDispatchCertainty::ConfirmedNotDispatched
-                if fence.dispatched_at_ms.is_some() =>
-            {
-                return Err(
-                    "CTAS undispatched catalog fence cannot have a dispatch timestamp".to_string(),
-                );
-            }
-            DmlCtasDispatchCertainty::PossiblyDispatched
-                if fence.dispatched_at_ms.is_none_or(|timestamp| timestamp < 0) =>
-            {
-                return Err(
-                    "CTAS dispatched catalog fence requires a nonnegative timestamp".to_string(),
-                );
-            }
-            _ => {}
-        }
-        let receipt_complete = fence.fence_digest.is_some()
-            && fence.receipt_digest.is_some()
-            && fence.receipt_payload.is_some()
-            && fence.established_at_ms.is_some();
-        let receipt_absent = fence.fence_digest.is_none()
-            && fence.receipt_digest.is_none()
-            && fence.receipt_payload.is_none()
-            && fence.established_at_ms.is_none();
-        if !receipt_complete && !receipt_absent {
-            return Err(
-                "CTAS catalog fence receipt facts must become durable together".to_string(),
-            );
-        }
-        if receipt_complete {
-            catalog_fence_receipt_complete = true;
-            if !is_lowercase_digest(fence.fence_digest.as_deref().unwrap())
-                || !is_lowercase_digest(fence.receipt_digest.as_deref().unwrap())
-                || fence
-                    .established_at_ms
-                    .is_some_and(|timestamp| timestamp < 0)
-            {
-                return Err("CTAS catalog fence receipt digest or timestamp is invalid".to_string());
-            }
-            if fence.dispatch_certainty != DmlCtasDispatchCertainty::PossiblyDispatched {
-                return Err("a confirmed CTAS catalog fence must have been dispatched".to_string());
-            }
-        }
+        catalog_fence_receipt_complete |= validate_ctas_catalog_fence(fence)?;
     }
     match (
         &record.staged_locator,
@@ -2450,6 +2487,13 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
                 "CTAS staged locator, locator digest, proof digest, and proof wire must become durable together".to_string(),
             );
         }
+    }
+    if record
+        .staged_target_digest
+        .as_ref()
+        .is_some_and(|digest| !is_lowercase_digest(digest))
+    {
+        return Err("CTAS staged target digest must be lowercase SHA-256".to_string());
     }
     if !catalog_fence_receipt_complete
         && (record.staged_locator.is_some()
@@ -2499,7 +2543,19 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
                     .to_string(),
             );
         }
-        if !checkpoint_identities.contains(&(observation.action, observation.child_operation_id)) {
+        let confirmed_fence_observation = observation.action == DmlCtasActionKind::AdvanceFence
+            && record
+                .catalog_fence_history
+                .iter()
+                .chain(record.catalog_fence.iter())
+                .any(|fence| {
+                    fence.action_id == observation.child_operation_id
+                        && fence.receipt_payload.is_some()
+                });
+        if !confirmed_fence_observation
+            && !checkpoint_identities
+                .contains(&(observation.action, observation.child_operation_id))
+        {
             return Err(
                 "CTAS historical observation must answer an exact durable checkpoint".to_string(),
             );
@@ -2561,14 +2617,10 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
                     .to_string(),
             );
         }
-        if matches!(
-            observation.disposition,
-            DmlCtasHistoricalDisposition::Staged | DmlCtasHistoricalDisposition::NoOp
-        ) && observation.locator_digest.is_none()
+        if observation.disposition == DmlCtasHistoricalDisposition::Staged
+            && observation.locator_digest.is_none()
         {
-            return Err(
-                "cleanup-eligible CTAS observations require an exact locator digest".to_string(),
-            );
+            return Err("a staged CTAS observation requires an exact locator digest".to_string());
         }
         if observation.disposition == DmlCtasHistoricalDisposition::Published
             && observation.locator_digest.is_some()
@@ -2577,7 +2629,8 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
         }
     }
     for supersession in &record.child_supersessions {
-        if supersession.predecessor_child_operation_id.is_nil()
+        if supersession.action == DmlCtasActionKind::AdvanceFence
+            || supersession.predecessor_child_operation_id.is_nil()
             || supersession.successor_child_operation_id.is_nil()
             || supersession.predecessor_child_operation_id
                 == supersession.successor_child_operation_id
@@ -2628,7 +2681,7 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
             matches!(
                 observation.disposition,
                 DmlCtasHistoricalDisposition::Staged | DmlCtasHistoricalDisposition::NoOp
-            )
+            ) && observation.locator_digest.is_some()
         });
     match (record.cleanup_retention, &record.cleanup_receipt) {
         (DmlCtasCleanupRetention::Pending, None)
@@ -2704,11 +2757,6 @@ pub fn validate_ctas_recovery_transition(
     if next.recovery_cycle < existing.recovery_cycle {
         return Err("CTAS recovery cycle must not move backwards".to_string());
     }
-    if next.recovery_cycle == existing.recovery_cycle
-        && next.recovery_attempt_id != existing.recovery_attempt_id
-    {
-        return Err("one CTAS recovery cycle is owned by one coordination attempt".to_string());
-    }
     match (&existing.catalog_fence, &next.catalog_fence) {
         (Some(previous), Some(current)) if current.generation < previous.generation => {
             return Err("CTAS catalog fence generation must not move backwards".to_string());
@@ -2750,6 +2798,26 @@ pub fn validate_ctas_recovery_transition(
     {
         return Err("a proven CTAS staged locator cannot be replaced or dropped".to_string());
     }
+    if existing.staged_target_digest.is_some()
+        && existing.staged_target_digest != next.staged_target_digest
+    {
+        return Err("the CTAS staged target digest cannot be replaced or dropped".to_string());
+    }
+    let current_fence_complete = next
+        .catalog_fence
+        .as_ref()
+        .is_some_and(|fence| fence.receipt_payload.is_some());
+    let adds_current_generation_fact = (existing.staged_locator.is_none()
+        && next.staged_locator.is_some())
+        || next.dispatch_checkpoints.len() > existing.dispatch_checkpoints.len()
+        || next.historical_observations.len() > existing.historical_observations.len()
+        || (existing.cleanup_receipt.is_none() && next.cleanup_receipt.is_some());
+    if adds_current_generation_fact && !current_fence_complete {
+        return Err(
+            "new CTAS action, inspection, locator, and cleanup facts require the current catalog fence receipt"
+                .to_string(),
+        );
+    }
     for (index, previous) in existing.dispatch_checkpoints.iter().enumerate() {
         let Some(current) = next.dispatch_checkpoints.get(index) else {
             return Err("a durable CTAS dispatch checkpoint cannot be dropped".to_string());
@@ -2765,6 +2833,52 @@ pub fn validate_ctas_recovery_transition(
                 "a CTAS dispatch checkpoint can only advance to possibly dispatched".to_string(),
             );
         }
+    }
+    if !next
+        .catalog_fence_history
+        .starts_with(&existing.catalog_fence_history)
+    {
+        return Err("CTAS catalog fence history is append-only".to_string());
+    }
+    let current_replaced = matches!(
+        (&existing.catalog_fence, &next.catalog_fence),
+        (Some(previous), Some(current))
+            if current.generation != previous.generation || current.action_id != previous.action_id
+    );
+    if current_replaced {
+        if next.catalog_fence_history.len() != existing.catalog_fence_history.len() + 1 {
+            return Err(
+                "replacing a CTAS catalog fence must archive exactly one prior attempt".to_string(),
+            );
+        }
+        let Some(previous_current) = existing.catalog_fence.as_ref() else {
+            return Err("CTAS fence history cannot grow without a current fence".to_string());
+        };
+        if next.catalog_fence_history.last() != Some(previous_current) {
+            return Err("CTAS takeover must retain the exact superseded fence receipt".to_string());
+        }
+        if next.recovery_cycle != existing.recovery_cycle.saturating_add(1)
+            || next.recovery_attempt_id == existing.recovery_attempt_id
+            || next
+                .catalog_fence
+                .as_ref()
+                .is_none_or(|current| current.action_id != next.recovery_attempt_id)
+        {
+            return Err(
+                "one CTAS takeover requires the next cycle and a new matching attempt".to_string(),
+            );
+        }
+    } else if next.catalog_fence_history.len() != existing.catalog_fence_history.len()
+        || ((next.recovery_cycle != existing.recovery_cycle
+            || next.recovery_attempt_id != existing.recovery_attempt_id)
+            && !(next.recovery_cycle == existing.recovery_cycle.saturating_add(1)
+                && next.recovery_attempt_id != existing.recovery_attempt_id
+                && next.cleanup_retention == DmlCtasCleanupRetention::ManualRetention
+                && next.next_action == StatementNextAction::ManualInspect))
+    {
+        return Err(
+            "CTAS recovery cycle, attempt, and fence history may change only together".to_string(),
+        );
     }
     if !next
         .historical_observations
@@ -3135,6 +3249,7 @@ mod tests {
             source_execution_identity: Some("execution".to_string()),
             write_cohort_id: Some("cohort".to_string()),
             staged_handle_digest: Some("staged".to_string()),
+            write_cohort_set_digest: None,
             aggregate_write_digest: Some("write".to_string()),
             prepare_fact: None,
             write_fact: None,

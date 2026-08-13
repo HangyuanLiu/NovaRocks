@@ -22,10 +22,10 @@ use novarocks_spi::connector::{
     ConnectorCtasStagedPublicationCapability, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorHistoricalCtasAction,
     ConnectorHistoricalCtasCleanupReceipt, ConnectorHistoricalCtasCleanupRequest,
-    ConnectorHistoricalCtasDescriptor, ConnectorHistoricalCtasDisposition,
-    ConnectorHistoricalCtasObservation, ConnectorHistoricalCtasStagedPublicationRecovery,
-    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorRequestContext,
+    ConnectorHistoricalCtasDescriptor, ConnectorHistoricalCtasDispatchState,
+    ConnectorHistoricalCtasDisposition, ConnectorHistoricalCtasObservation,
+    ConnectorHistoricalCtasStagedPublicationRecovery, ConnectorInstanceDescriptor,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorRequestContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -216,15 +216,20 @@ impl IcebergHistoricalCtasRecovery {
                 "Iceberg historical CTAS inspection requires the exact completed current-fence receipt",
             ));
         }
-        let stage = unique_checkpoint_record(descriptor, ConnectorHistoricalCtasAction::Stage)
-            .map_err(|message| {
-                known_not_dispatched(ConnectorMutationFailureKind::InvalidRequest, message)
-            })?;
-        if descriptor
-            .locator
-            .as_ref()
-            .is_some_and(|locator| locator.stage_action_id() != stage.action_id)
-        {
+        let stage =
+            optional_unique_checkpoint_record(descriptor, ConnectorHistoricalCtasAction::Stage)
+                .map_err(|message| {
+                    known_not_dispatched(ConnectorMutationFailureKind::InvalidRequest, message)
+                })?;
+        if (descriptor.locator.is_some() || descriptor.evidence.is_some()) && stage.is_none() {
+            return Err(known_not_dispatched(
+                ConnectorMutationFailureKind::InvalidRequest,
+                "Iceberg historical CTAS staged authority requires the exact stage checkpoint",
+            ));
+        }
+        if descriptor.locator.as_ref().is_some_and(|locator| {
+            stage.is_none_or(|stage| locator.stage_action_id() != stage.action_id)
+        }) {
             return Err(known_not_dispatched(
                 ConnectorMutationFailureKind::InvalidRequest,
                 "Iceberg historical CTAS staged locator does not match its durable stage checkpoint",
@@ -466,6 +471,22 @@ impl IcebergHistoricalCtasRecovery {
         if catalog_locator.is_empty() {
             return Err("Iceberg historical CTAS inspection returned an empty locator".into());
         }
+        let stage_action = unique_checkpoint(descriptor, ConnectorHistoricalCtasAction::Stage)
+            .map_err(str::to_owned)?;
+        let stage_checkpoint = descriptor
+            .checkpoints
+            .iter()
+            .find(|checkpoint| {
+                checkpoint.action == ConnectorHistoricalCtasAction::Stage
+                    && checkpoint.action_id == stage_action
+            })
+            .ok_or_else(|| "Iceberg historical CTAS stage checkpoint is missing".to_string())?;
+        if stage_checkpoint.dispatch == ConnectorHistoricalCtasDispatchState::NotDispatched {
+            return Err(
+                "Iceberg catalog reported staged state for a definitely undispatched stage action"
+                    .into(),
+            );
+        }
         if let Some(locator) = &descriptor.locator {
             let durable = std::str::from_utf8(locator.payload())
                 .map_err(|error| format!("durable Iceberg CTAS locator is not UTF-8: {error}"))?;
@@ -476,8 +497,6 @@ impl IcebergHistoricalCtasRecovery {
             }
             return Ok(locator.clone());
         }
-        let stage_action = unique_checkpoint(descriptor, ConnectorHistoricalCtasAction::Stage)
-            .map_err(str::to_owned)?;
         ConnectorCtasStagedLocator::try_new(
             self.binding_key.clone(),
             &descriptor.fence,
@@ -669,13 +688,19 @@ fn unique_checkpoint_record(
     descriptor: &ConnectorHistoricalCtasDescriptor,
     action: ConnectorHistoricalCtasAction,
 ) -> Result<&novarocks_spi::connector::ConnectorHistoricalCtasCheckpoint, &'static str> {
+    optional_unique_checkpoint_record(descriptor, action)?
+        .ok_or("historical CTAS descriptor is missing the required action checkpoint")
+}
+
+fn optional_unique_checkpoint_record(
+    descriptor: &ConnectorHistoricalCtasDescriptor,
+    action: ConnectorHistoricalCtasAction,
+) -> Result<Option<&novarocks_spi::connector::ConnectorHistoricalCtasCheckpoint>, &'static str> {
     let mut matches = descriptor
         .checkpoints
         .iter()
         .filter(|checkpoint| checkpoint.action == action);
-    let Some(checkpoint) = matches.next() else {
-        return Err("historical CTAS descriptor is missing the required action checkpoint");
-    };
+    let checkpoint = matches.next();
     if matches.next().is_some() {
         return Err("historical CTAS descriptor has multiple records for one required action");
     }
@@ -1104,6 +1129,24 @@ mod tests {
         descriptor_with_policy(with_locator, CreatePolicy::NoOpIfExists)
     }
 
+    fn pre_stage_descriptor() -> ConnectorHistoricalCtasDescriptor {
+        let advance = checkpoints()
+            .into_iter()
+            .find(|checkpoint| checkpoint.action == ConnectorHistoricalCtasAction::AdvanceFence)
+            .expect("advance-fence checkpoint");
+        ConnectorHistoricalCtasDescriptor::try_new(
+            binding(1),
+            fence(2),
+            [4; 32],
+            [3; 32],
+            CreatePolicy::NoOpIfExists,
+            None,
+            vec![advance],
+            None,
+        )
+        .expect("pre-stage historical descriptor")
+    }
+
     fn recovery(fake: Arc<FakeCatalog>) -> IcebergHistoricalCtasRecovery {
         IcebergHistoricalCtasRecovery {
             descriptor: descriptor_identity(),
@@ -1215,6 +1258,128 @@ mod tests {
         assert_eq!(request.generation, wire_generation(fence(2).generation()));
         assert_eq!(request.input_digest, encode_hex([11; 32]));
         assert_eq!(request.operation.target.name(), "orders");
+    }
+
+    #[test]
+    fn fence_only_descriptor_can_prove_not_created_without_cleanup() {
+        let fake = FakeCatalog::with_inspect(InspectCtasTargetResponse::NotCreated {
+            proof: "not-created-proof".into(),
+        });
+        let recovery = recovery(Arc::clone(&fake));
+        let descriptor = pre_stage_descriptor();
+
+        let observation = recovery
+            .inspect(descriptor, context())
+            .expect("fence-only inspection");
+
+        assert_eq!(
+            observation.disposition,
+            ConnectorHistoricalCtasDisposition::NotCreated
+        );
+        assert!(observation.locator.is_none());
+        assert_eq!(fake.inspect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.abort_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retained_staging_without_stage_checkpoint_is_ambiguous_and_cannot_cleanup() {
+        for response in [
+            InspectCtasTargetResponse::Staged {
+                staged_locator: "recovered-locator".into(),
+                proof: "recovered-stage-proof".into(),
+            },
+            InspectCtasTargetResponse::NoOp {
+                provenance: "no-op".into(),
+                proof: "no-op-proof".into(),
+                staged_locator: Some("recovered-locator".into()),
+                staged_proof: Some("recovered-stage-proof".into()),
+            },
+        ] {
+            let fake = FakeCatalog::with_inspect(response);
+            let recovery = recovery(Arc::clone(&fake));
+            let descriptor = pre_stage_descriptor();
+            let observation = recovery
+                .inspect(descriptor.clone(), context())
+                .expect("retained staging degrades to a typed observation");
+
+            assert_eq!(
+                observation.disposition,
+                ConnectorHistoricalCtasDisposition::Ambiguous
+            );
+            assert!(observation.locator.is_none());
+            assert!(observation.proof.is_none());
+            let cleanup = recovery.cleanup(ConnectorHistoricalCtasCleanupRequest {
+                descriptor,
+                observation,
+                context: context(),
+            });
+            assert!(matches!(
+                cleanup,
+                Err(ConnectorCtasFailure::KnownNotDispatched(_))
+            ));
+            assert_eq!(fake.inspect_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.abort_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn staged_result_cannot_contradict_a_definitely_undispatched_stage() {
+        let fake = FakeCatalog::with_inspect(InspectCtasTargetResponse::Staged {
+            staged_locator: "recovered-locator".into(),
+            proof: "recovered-stage-proof".into(),
+        });
+        let recovery = recovery(Arc::clone(&fake));
+        let mut stage_not_dispatched = checkpoints();
+        stage_not_dispatched
+            .retain(|checkpoint| checkpoint.action != ConnectorHistoricalCtasAction::Abort);
+        stage_not_dispatched
+            .iter_mut()
+            .find(|checkpoint| checkpoint.action == ConnectorHistoricalCtasAction::Stage)
+            .expect("stage checkpoint")
+            .dispatch = ConnectorHistoricalCtasDispatchState::NotDispatched;
+        for locator in [
+            None,
+            Some(
+                ConnectorCtasStagedLocator::try_new(
+                    binding(1),
+                    &fence(1),
+                    action(2),
+                    [3; 32],
+                    Bytes::from_static(b"recovered-locator"),
+                )
+                .expect("durable locator"),
+            ),
+        ] {
+            let descriptor = ConnectorHistoricalCtasDescriptor::try_new(
+                binding(1),
+                fence(2),
+                [4; 32],
+                [3; 32],
+                CreatePolicy::NoOpIfExists,
+                locator,
+                stage_not_dispatched.clone(),
+                None,
+            )
+            .expect("descriptor with definitely undispatched stage");
+
+            *fake.inspect_response.lock().expect("inspect response lock") =
+                Some(InspectCtasTargetResponse::Staged {
+                    staged_locator: "recovered-locator".into(),
+                    proof: "recovered-stage-proof".into(),
+                });
+            let observation = recovery
+                .inspect(descriptor, context())
+                .expect("contradictory staging degrades to typed ambiguity");
+
+            assert_eq!(
+                observation.disposition,
+                ConnectorHistoricalCtasDisposition::Ambiguous
+            );
+            assert!(observation.locator.is_none());
+            assert!(observation.proof.is_none());
+        }
+        assert_eq!(fake.inspect_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.abort_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

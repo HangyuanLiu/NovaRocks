@@ -24,12 +24,12 @@
 //! external fence, classifies the historical attempt against immutable external
 //! truth, and finalizes, cleans up, or stays unresolved.
 //!
-//! Every other family keeps the original behaviour — claim, defer, change no
-//! business lifecycle and no external evidence — until its own profile lands
-//! (CP-3B for distributed writes, CP-3D for CTAS). The same bounded budgets
-//! apply to both paths: the poll interval, the claims-per-poll cap, and the
-//! round-robin shard offsets are unchanged, so installing a profile cannot make
-//! the scan busier than the deferral it replaced.
+//! CP-3D installs CTAS takeover beside that direct-mutation profile. Every
+//! other family keeps the original behaviour — claim, defer, change no business
+//! lifecycle and no external evidence — until its own profile lands. The same
+//! bounded budgets apply to every path: the poll interval, claims-per-poll cap,
+//! and round-robin shard offsets are unchanged, so installing a profile cannot
+//! make the scan busier than the deferral it replaced.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,7 +122,7 @@ impl DmlRecoveryController {
                             Ok(Ok(Some(progress))) => tracing::debug!(
                                 operation_id = %operation_id,
                                 ?progress,
-                                "DML historical data mutation recovery cycle completed"
+                                "DML historical recovery cycle completed"
                             ),
                             Ok(Err(error)) => tracing::debug!(
                                 operation_id = %operation_id,

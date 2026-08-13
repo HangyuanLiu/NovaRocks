@@ -52,7 +52,7 @@ use novarocks_frontend::dml::model::{
     DmlHistoricalDispatchCertainty, DmlHistoricalRecoveryPhase, DmlHistoricalWriteDisposition,
     DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord,
     DmlHistoricalWriteRequestRecord, DmlHistoricalWriteResultRecord, DmlOpaquePayload,
-    DmlRecoveryDueRescheduleRequest, validate_ctas_recovery,
+    DmlRecoveryDueRescheduleRequest, validate_ctas_recovery, validate_ctas_recovery_transition,
 };
 use novarocks_frontend::dml::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
@@ -1739,6 +1739,7 @@ fn ctas_payload(phase: CtasSagaPhase) -> OperationPayload {
         source_execution_identity: Some("execution-identity".to_string()),
         write_cohort_id: Some("write-cohort".to_string()),
         staged_handle_digest: None,
+        write_cohort_set_digest: None,
         aggregate_write_digest: None,
         prepare_fact,
         write_fact,
@@ -1761,6 +1762,7 @@ fn ctas_recovery(recovery_attempt_id: Uuid, saga: &CtasSagaRecord) -> DmlCtasRec
         capability_version: 1,
         recovery_attempt_id,
         recovery_cycle: 1,
+        catalog_fence_history: Vec::new(),
         catalog_fence: Some(DmlCtasCatalogFenceRecord {
             generation: DmlExternalFenceGeneration {
                 control_plane_incarnation: 1,
@@ -1778,6 +1780,7 @@ fn ctas_recovery(recovery_attempt_id: Uuid, saga: &CtasSagaRecord) -> DmlCtasRec
             ),
             established_at_ms: Some(295),
         }),
+        staged_target_digest: Some("11".repeat(32)),
         staged_locator: None,
         staged_locator_digest: None,
         staged_proof_digest: None,
@@ -2537,6 +2540,53 @@ fn ctas_historical_ambiguous_proof_is_optional_but_unsupported_never_has_one() {
     observation.proof_payload =
         Some(DmlOpaquePayload::try_new(b"forbidden proof".to_vec()).unwrap());
     assert!(validate_ctas_recovery(&recovery).is_err());
+}
+
+#[test]
+fn ctas_advance_fence_observation_remains_bound_after_takeover_archives_its_fence() {
+    let payload = ctas_payload(CtasSagaPhase::PreparingSource);
+    let mut previous = ctas_recovery(Uuid::now_v7(), ctas_saga(&payload));
+    let previous_fence = previous.catalog_fence.as_ref().unwrap().clone();
+    previous
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action: DmlCtasActionKind::AdvanceFence,
+            child_operation_id: previous_fence.action_id,
+            disposition: DmlCtasHistoricalDisposition::Ambiguous,
+            descriptor_digest: "31".repeat(32),
+            descriptor_locator_digest: None,
+            observation_digest: "32".repeat(32),
+            locator_digest: None,
+            proof_digest: None,
+            proof_payload: None,
+            conflict_kind: None,
+            failure: Some("catalog inspection reply was lost".to_string()),
+            observed_at_ms: 905,
+        });
+    validate_ctas_recovery(&previous).unwrap();
+
+    let mut next = previous.clone();
+    let next_attempt = Uuid::now_v7();
+    next.recovery_attempt_id = next_attempt;
+    next.recovery_cycle += 1;
+    next.catalog_fence_history.push(previous_fence.clone());
+    let current = next.catalog_fence.as_mut().unwrap();
+    current.generation.fence_generation += 1;
+    current.action_id = next_attempt;
+    current.request_digest = "33".repeat(32);
+    current.fence_digest = Some("34".repeat(32));
+    current.receipt_digest = Some("35".repeat(32));
+    current.receipt_payload =
+        Some(DmlOpaquePayload::try_new(b"next catalog fence receipt".to_vec()).unwrap());
+    current.dispatched_at_ms = Some(910);
+    current.established_at_ms = Some(911);
+    next.updated_at_ms = 912;
+
+    validate_ctas_recovery_transition(Some(&previous), &next).unwrap();
+    validate_ctas_recovery(&next).unwrap();
+
+    next.catalog_fence_history.clear();
+    assert!(validate_ctas_recovery(&next).is_err());
 }
 
 #[test]

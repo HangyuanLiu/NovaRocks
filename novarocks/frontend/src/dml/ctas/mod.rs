@@ -22,6 +22,8 @@
 //! operation IDs and the durable ordering barriers around every external
 //! effect.
 
+pub(crate) mod recovery;
+
 use novarocks::engine::ctas_engine::{
     CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetFacts,
     CtasTargetPreflightOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
@@ -123,6 +125,7 @@ impl DmlService {
             source_execution_identity: None,
             write_cohort_id: None,
             staged_handle_digest: None,
+            write_cohort_set_digest: None,
             aggregate_write_digest: None,
             prepare_fact: None,
             write_fact: None,
@@ -288,6 +291,7 @@ fn execute_ctas_operation(
         .as_mut()
         .expect("fence record")
         .established_at_ms = Some(crate::dml::now_unix_millis());
+    recovery.staged_target_digest = Some(hex::encode(fence.digest()));
     recovery.next_action = StatementNextAction::None;
     record_recovery(active, &recovery)?;
 
@@ -469,6 +473,13 @@ fn execute_foreground_write(
         }
     };
     validate_prepared_write(&active.stored, &source, &target, &prepared)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.write_cohort_set_digest = Some(hex::encode(prepared.cohort_set_digest));
+    active.mutate_statement(
+        active.stored.state,
+        OperationPayload::CtasSaga(saga),
+        active.stored.recovery_due_at_ms,
+    )?;
     append_checkpoint(
         &mut recovery,
         DmlCtasActionKind::Write,
@@ -483,7 +494,13 @@ fn execute_foreground_write(
         CtasWriteOutcome::Completed {
             completion,
             execution_identity,
+            established_fence,
         } => {
+            if let Some(established) = established_fence {
+                let record = crate::dml::reconcile::external_fence_receipt_record(&established)
+                    .map_err(DmlError::journal_corruption)?;
+                active.record_external_fence(record, Some(crate::dml::now_unix_millis()))?;
+            }
             validate_completion(
                 &active.stored,
                 &source,
@@ -520,7 +537,16 @@ fn execute_foreground_write(
             failure_fact(&failure),
             format_failure("CTAS writer is known uncommitted", &failure),
         ),
-        CtasWriteOutcome::CommitUnknown { failure, evidence } => {
+        CtasWriteOutcome::CommitUnknown {
+            failure,
+            evidence,
+            established_fence,
+        } => {
+            if let Some(established) = established_fence {
+                let record = crate::dml::reconcile::external_fence_receipt_record(&established)
+                    .map_err(DmlError::journal_corruption)?;
+                active.record_external_fence(record, Some(crate::dml::now_unix_millis()))?;
+            }
             let mut saga = ctas_record(&active.stored)?;
             saga.phase = CtasSagaPhase::WriteUnknown;
             saga.write_fact = Some(DurableExternalFact {
@@ -755,6 +781,7 @@ fn foreground_historical_descriptor(
     }];
     for checkpoint in &recovery.dispatch_checkpoints {
         let action = match checkpoint.action {
+            DmlCtasActionKind::AdvanceFence => continue,
             DmlCtasActionKind::Stage => ConnectorHistoricalCtasAction::Stage,
             DmlCtasActionKind::Publish => ConnectorHistoricalCtasAction::Publish,
             DmlCtasActionKind::Abort => ConnectorHistoricalCtasAction::Abort,
@@ -813,24 +840,39 @@ fn observation_checkpoint_identity(
     observation: &ConnectorHistoricalCtasObservation,
 ) -> Result<(DmlCtasActionKind, Uuid), DmlError> {
     let preferred = match observation.disposition {
-        ConnectorHistoricalCtasDisposition::Published => DmlCtasActionKind::Publish,
-        ConnectorHistoricalCtasDisposition::Aborted => DmlCtasActionKind::Abort,
-        _ => DmlCtasActionKind::Stage,
+        ConnectorHistoricalCtasDisposition::Published => Some(DmlCtasActionKind::Publish),
+        ConnectorHistoricalCtasDisposition::NoOp => Some(DmlCtasActionKind::Publish),
+        ConnectorHistoricalCtasDisposition::Aborted => Some(DmlCtasActionKind::Abort),
+        ConnectorHistoricalCtasDisposition::Staged => Some(DmlCtasActionKind::Stage),
+        ConnectorHistoricalCtasDisposition::NotCreated
+        | ConnectorHistoricalCtasDisposition::Conflict
+        | ConnectorHistoricalCtasDisposition::Ambiguous
+        | ConnectorHistoricalCtasDisposition::Unsupported => None,
     };
-    recovery
-        .dispatch_checkpoints
-        .iter()
-        .rev()
-        .find(|checkpoint| checkpoint.action == preferred)
-        .or_else(|| {
-            recovery
-                .dispatch_checkpoints
-                .iter()
-                .rev()
-                .find(|checkpoint| checkpoint.action == DmlCtasActionKind::Stage)
-        })
-        .map(|checkpoint| (checkpoint.action, checkpoint.child_operation_id))
-        .ok_or_else(|| DmlError::journal_corruption("CTAS inspection has no durable checkpoint"))
+    let checkpoint = preferred.and_then(|preferred| {
+        recovery
+            .dispatch_checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| checkpoint.action == preferred)
+    });
+    if let Some(checkpoint) = checkpoint {
+        return Ok((checkpoint.action, checkpoint.child_operation_id));
+    }
+    if observation.disposition == ConnectorHistoricalCtasDisposition::Staged {
+        return Err(DmlError::journal_corruption(
+            "staged CTAS inspection has no durable stage checkpoint",
+        ));
+    }
+    let fence = recovery.catalog_fence.as_ref().ok_or_else(|| {
+        DmlError::journal_corruption("CTAS inspection has no current catalog fence")
+    })?;
+    if fence.receipt_payload.is_none() {
+        return Err(DmlError::journal_corruption(
+            "CTAS inspection has no confirmed current catalog fence",
+        ));
+    }
+    Ok((DmlCtasActionKind::AdvanceFence, fence.action_id))
 }
 
 const fn durable_historical_disposition(
@@ -1117,6 +1159,7 @@ fn new_recovery_record(
         capability_version: facts.capability_version,
         recovery_attempt_id: attempt_id,
         recovery_cycle: 1,
+        catalog_fence_history: Vec::new(),
         catalog_fence: Some(DmlCtasCatalogFenceRecord {
             generation,
             action_id: Uuid::from_bytes(action_id.to_bytes()),
@@ -1128,6 +1171,7 @@ fn new_recovery_record(
             receipt_payload: None,
             established_at_ms: None,
         }),
+        staged_target_digest: None,
         staged_locator: None,
         staged_locator_digest: None,
         staged_proof_digest: None,
@@ -1818,6 +1862,7 @@ mod tests {
         recovery.staged_locator_digest = Some(hex::encode([7; 32]));
         recovery.staged_proof_digest = Some(hex::encode([8; 32]));
         recovery.staged_proof = Some(DmlOpaquePayload::try_new(vec![9]).unwrap());
+        recovery.staged_target_digest = Some(hex::encode([2; 32]));
         recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
         recovery.next_action = StatementNextAction::AbortStaging;
         stage
@@ -1883,6 +1928,66 @@ mod tests {
         validate_ctas_recovery(&recovery).unwrap();
         assert!(recovery.requires_recovery_scan());
         assert!(recovery.staged_locator.is_none());
+    }
+
+    #[test]
+    fn takeover_archives_one_fence_attempt_and_keeps_stage_authority() {
+        let mut previous = confirmed_recovery();
+        install_staging(&mut previous);
+        validate_ctas_recovery(&previous).unwrap();
+
+        let mut takeover = previous.clone();
+        let superseded = takeover.catalog_fence.take().unwrap();
+        takeover.catalog_fence_history.push(superseded);
+        takeover.recovery_cycle += 1;
+        takeover.recovery_attempt_id = Uuid::now_v7();
+        takeover.catalog_fence = Some(DmlCtasCatalogFenceRecord {
+            generation: DmlExternalFenceGeneration {
+                control_plane_incarnation: 1,
+                resource_epoch: 2,
+                fence_generation: 2,
+            },
+            action_id: takeover.recovery_attempt_id,
+            request_digest: hex::encode([20; 32]),
+            dispatch_certainty: DmlCtasDispatchCertainty::PossiblyDispatched,
+            dispatched_at_ms: Some(4),
+            fence_digest: None,
+            receipt_digest: None,
+            receipt_payload: None,
+            established_at_ms: None,
+        });
+
+        validate_ctas_recovery_transition(Some(&previous), &takeover).unwrap();
+        assert_eq!(takeover.catalog_fence_history.len(), 1);
+        assert_eq!(takeover.staged_target_digest, previous.staged_target_digest);
+
+        let mut before_current_receipt = takeover.clone();
+        append_checkpoint(
+            &mut before_current_receipt,
+            DmlCtasActionKind::Publish,
+            Uuid::now_v7(),
+            [21; 32],
+        );
+        assert!(
+            validate_ctas_recovery_transition(Some(&takeover), &before_current_receipt).is_err()
+        );
+
+        let mut skipped = takeover.clone();
+        skipped.catalog_fence_history.push(
+            skipped
+                .catalog_fence
+                .as_ref()
+                .expect("current fence")
+                .clone(),
+        );
+        skipped.catalog_fence_history.push(
+            skipped
+                .catalog_fence
+                .as_ref()
+                .expect("current fence")
+                .clone(),
+        );
+        assert!(validate_ctas_recovery_transition(Some(&takeover), &skipped).is_err());
     }
 
     #[test]
