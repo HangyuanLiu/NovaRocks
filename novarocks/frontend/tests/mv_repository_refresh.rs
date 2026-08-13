@@ -7,6 +7,7 @@ use bytes::Bytes;
 use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
+use novarocks::mv::persistence::definition::UpdateMvRefreshMetadataRequest;
 use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
 use novarocks::mv::persistence::partition::ReplaceMvPartitionStatesRequest;
 use novarocks::mv::persistence::refresh::{
@@ -1161,6 +1162,31 @@ fn definition_ddl_stays_outside_the_refresh_ownership_fence() {
             definition_support::create_request("daily_fenced"),
         )
         .expect("definition DDL must not require a refresh lease");
+}
+
+#[test]
+fn definition_ddl_can_update_refresh_configuration_without_a_refresh_lease() {
+    let (_temp, _runtime, _host, repository) = fenced_repository(Arc::new(SupersededOwner));
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_fenced"),
+        )
+        .expect("create definition");
+
+    let updated = repository
+        .update_definition_refresh_metadata(UpdateMvRefreshMetadataRequest {
+            mv_id: definition.mv_id,
+            refresh_policy: definition.refresh_policy,
+            refresh_paused: true,
+            refresh_interval_ms: definition.refresh_interval_ms,
+            max_staleness_ms: definition.max_staleness_ms,
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
+        })
+        .expect("definition DDL must not require a refresh lease");
+
+    assert!(updated.refresh_paused);
 }
 
 /// A registry-backed fence source, exactly as production would install it.

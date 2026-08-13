@@ -607,8 +607,8 @@ pub(crate) fn alter_mv_with_connector_context(
     };
     state
         .mv_repository
-        .update_refresh_metadata(req.clone())
-        .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
+        .update_definition_refresh_metadata(req.clone())
+        .map_err(|e| format!("update MV refresh definition metadata failed: {e}"))?;
     crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor(
         state,
         &definition,

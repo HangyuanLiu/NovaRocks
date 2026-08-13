@@ -267,6 +267,18 @@ pub trait MvRepository: Send + Sync {
         &self,
         request: UpdateMvRefreshMetadataRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError>;
+    /// Updates user-owned refresh configuration as definition DDL.
+    ///
+    /// This is deliberately distinct from lifecycle metadata writes: a user may
+    /// pause, resume, or change an MV refresh policy without owning the active
+    /// refresh lease. Implementations that fence refresh execution must override
+    /// this method so definition DDL does not enter that fence domain.
+    fn update_definition_refresh_metadata(
+        &self,
+        request: UpdateMvRefreshMetadataRequest,
+    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+        self.update_refresh_metadata(request)
+    }
     fn update_partition_contract(
         &self,
         request: UpdateMvPartitionContractRequest,

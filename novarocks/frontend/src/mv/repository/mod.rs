@@ -1276,6 +1276,58 @@ impl StateStoreMvRepository {
         .await
     }
 
+    async fn update_definition_refresh_metadata_async(
+        &self,
+        request: UpdateMvRefreshMetadataRequest,
+    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+        validate_refresh_metadata_request(&request)?;
+        let definition = self.load_by_id_async(request.mv_id).await?.ok_or_else(|| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::NotFound,
+                format!("MV definition {} does not exist", request.mv_id),
+            )
+        })?;
+        let attachment_observations = self.capture_catalog_attachment_observations(
+            definition
+                .target_catalog
+                .into_iter()
+                .map(|catalog| catalog.to_ascii_lowercase())
+                .collect(),
+        )?;
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "update MV refresh definition metadata",
+            move |transaction| {
+                let request = request.clone();
+                let attachment_observations = attachment_observations.clone();
+                Box::pin(async move {
+                    assert_attachment_versions(transaction, &attachment_observations).await?;
+                    let (record, mut definition) =
+                        load_definition_transaction(transaction, request.mv_id).await?;
+                    definition.refresh_policy = request.refresh_policy;
+                    definition.refresh_paused = request.refresh_paused;
+                    definition.refresh_interval_ms = request.refresh_interval_ms;
+                    definition.max_staleness_ms = request.max_staleness_ms;
+                    definition.last_scheduler_error = request.last_scheduler_error;
+                    definition.next_refresh_after_ms = request.next_refresh_after_ms;
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(record.version),
+                    )
+                    .await?;
+                    Ok(definition)
+                })
+            },
+        )
+        .await
+    }
+
     async fn begin_refresh_intent_async(
         &self,
         mv_id: i64,
@@ -2888,6 +2940,12 @@ impl MvRepository for StateStoreMvRepository {
         request: UpdateMvRefreshMetadataRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         self.blocking(self.update_refresh_metadata_async(request))
+    }
+    fn update_definition_refresh_metadata(
+        &self,
+        request: UpdateMvRefreshMetadataRequest,
+    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+        self.blocking(self.update_definition_refresh_metadata_async(request))
     }
     fn update_partition_contract(
         &self,
