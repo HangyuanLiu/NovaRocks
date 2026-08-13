@@ -22,15 +22,13 @@
 //! for post-compile preparation and native request assembly.
 // Design: ADR-0036 (docs/adr/ADR-0036-sql-compiler-dependency-inversion.md)
 
-pub(crate) mod bindings;
 pub(crate) mod catalog_materializer;
 pub(crate) mod catalog_runtime;
-pub(crate) mod delta_scan;
-pub(crate) mod write_sink;
 
 use std::{collections::HashMap, sync::Arc};
 
 use crate::query_execution::cancellation::QueryCancellationView;
+use crate::query_execution::planning::bindings;
 use crate::sql::compiler::{SqlCancellationObservation, SqlCompileRequest};
 use crate::sql::explain::distributed::{
     SqlExplainProfile, SqlFragmentProfile, SqlFragmentProfileView, SqlOperatorMetrics,

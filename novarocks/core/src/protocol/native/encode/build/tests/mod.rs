@@ -102,8 +102,8 @@ fn physical_values_node(
 pub(super) fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-) -> Option<crate::engine::query_planning::bindings::QueryTableBindingStore> {
-    use crate::engine::query_planning::bindings::{
+) -> Option<crate::query_execution::planning::bindings::QueryTableBindingStore> {
+    use crate::query_execution::planning::bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
 
@@ -165,7 +165,7 @@ pub(super) fn fixture_query_table_bindings(
                     ),
                     statistics_pin: None,
                     admission:
-                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                        crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact(
                             lease.clone(),
                         ),
                     scan_materialization: Some(QueryScanMaterialization {

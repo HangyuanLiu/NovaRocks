@@ -54,11 +54,11 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::StatementResult;
 use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvStorageObservationPort,
 };
+use crate::query_execution::StatementResult;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::procedure::CallProcedureStmt;
 use novarocks_spi::connector::{

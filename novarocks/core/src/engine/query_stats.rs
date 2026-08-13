@@ -30,14 +30,14 @@ use crate::connector::unified_statistics::{
 use crate::engine::domain::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel, StatisticsExecutionKernel,
 };
-use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
-    QueryTableBindingStore, parse_time_travel_overlay_identity,
-};
 use crate::engine::query_planning::catalog_materializer::{
     QueryTableBindingLoader, connector_query_binding_from_materialization,
     load_connector_table_alias_materialization_with_lease,
     load_connector_table_materialization_with_lease,
+};
+use crate::query_execution::planning::bindings::{
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
+    QueryTableBindingStore, parse_time_travel_overlay_identity,
 };
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::optimizer::operator::Operator;

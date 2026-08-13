@@ -21,7 +21,7 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicate, normalize_predicate_dispositions,
 };
 
-use crate::engine::query_planning::bindings::QueryScanMaterialization;
+use crate::query_execution::planning::bindings::QueryScanMaterialization;
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
 use crate::sql::analysis::TypedExpr;
 use crate::sql::planner::payload::PlanScanNode;

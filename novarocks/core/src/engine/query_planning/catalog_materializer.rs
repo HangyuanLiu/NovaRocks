@@ -29,7 +29,7 @@ use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::provider::CatalogProvider;
 use novarocks_catalog::table::CatalogTable;
 
-use crate::engine::query_planning::bindings::{
+use crate::query_execution::planning::bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
     QueryTableBindingStore,
 };

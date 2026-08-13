@@ -73,8 +73,8 @@ fn prepare_scan_bindings_with_controls(
 fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-) -> crate::engine::query_planning::bindings::QueryTableBindingStore {
-    use crate::engine::query_planning::bindings::{
+) -> crate::query_execution::planning::bindings::QueryTableBindingStore {
+    use crate::query_execution::planning::bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
     use crate::sql::planner::table::{SqlScanKind, SqlScanSource, SqlTableIdentity};
@@ -203,12 +203,12 @@ fn fixture_query_table_bindings(
                     statistics_pin: None,
                     admission: planning_lease
                         .clone()
-                        .map(crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact)
-                        .unwrap_or(crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local),
+                        .map(crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact)
+                        .unwrap_or(crate::query_execution::planning::bindings::QueryTableBindingAdmission::Local),
                     scan_materialization: Some(scan_materialization.clone()),
                     mv_target_read: match &source.kind {
                         SqlScanKind::MvTargetState { facts } => Some(
-                            crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                            crate::query_execution::planning::bindings::MvTargetReadAdmission {
                                 full: scan_materialization.clone(),
                                 affected_partitions: scan_materialization.clone(),
                                 target_table_uuid: facts.target_table_uuid.clone(),
@@ -216,7 +216,7 @@ fn fixture_query_table_bindings(
                             },
                         ),
                         SqlScanKind::MvTargetLocator { facts } => Some(
-                            crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                            crate::query_execution::planning::bindings::MvTargetReadAdmission {
                                 full: scan_materialization.clone(),
                                 affected_partitions: scan_materialization.clone(),
                                 target_table_uuid: facts.target_table_uuid.clone(),

@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::StatementResult;
+use crate::query_execution::StatementResult;
 use crate::sql::parser::ast::{
     AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
 };

@@ -41,11 +41,11 @@ use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
 use crate::engine::domain::DmlExecutionKernel;
-use crate::engine::query_planning::bindings::QueryTableBindingStore;
-use crate::engine::query_planning::write_sink::{
+use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::planning::bindings::QueryTableBindingStore;
+use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
-use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};

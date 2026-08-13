@@ -28,14 +28,14 @@ use arrow::datatypes::Field;
 use crate::connector::backend::ResolvedTable;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::domain::DmlExecutionKernel;
-use crate::engine::query_planning::write_sink::{
-    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
-};
 use crate::engine::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy,
 };
 use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::planning::write_sink::{
+    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
+};
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
@@ -244,7 +244,7 @@ fn prepare_iceberg_distributed_write(
         connector_context.clone(),
     )?;
     let table_bindings =
-        Arc::new(crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()?);
+        Arc::new(crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()?);
     let target_binding = admit_prepared_connector_write_target(
         table_bindings.as_ref(),
         crate::sql::planner::table::SqlTableIdentity {
@@ -631,7 +631,7 @@ struct PreparedIcebergWriteExecutor {
     target: TargetBackend,
     query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,

@@ -19,6 +19,7 @@ pub mod artifact;
 pub(crate) mod assembly;
 pub mod backend;
 pub mod cancellation;
+pub mod completion;
 mod connector_binding;
 pub(crate) mod connector_write_transaction;
 pub mod contract;
@@ -30,6 +31,11 @@ pub(crate) mod frozen_connector_read;
 pub(crate) mod in_process_test;
 pub mod lifecycle;
 pub(crate) mod outcome;
+pub(crate) mod planning;
+pub use completion::{
+    PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
+    PreparedQueryCompletion, PreparedQueryOperation, StatementResult,
+};
 pub use outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary, WriteExecutionOutcome};
 pub(crate) mod preparation;
 pub use preparation::runtime_filter_view::{

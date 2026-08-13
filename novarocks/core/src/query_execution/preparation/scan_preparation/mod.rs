@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::engine::query_planning::bindings::{QueryScanMaterialization, QueryTableBindingStore};
+use crate::query_execution::planning::bindings::{
+    QueryScanMaterialization, QueryTableBindingStore,
+};
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };

@@ -19,7 +19,8 @@
 
 use crate::common::app_config::ClusterRole;
 use crate::engine::domain::BackendManagementKernel;
-use crate::engine::{StatementResult, require_backend_management_role};
+use crate::engine::require_backend_management_role;
+use crate::query_execution::StatementResult;
 
 #[derive(Clone)]
 pub struct BackendCommandExecutor {

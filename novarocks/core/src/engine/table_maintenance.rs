@@ -1473,7 +1473,7 @@ fn stage_frozen_rewrite_cohort_with_ports(
     )
     .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
     let table_bindings =
-        Arc::new(crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()?);
+        Arc::new(crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()?);
     let source_binding =
         crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
             table_bindings.as_ref(),
@@ -1489,13 +1489,13 @@ fn stage_frozen_rewrite_cohort_with_ports(
             source_binding,
         );
     let target_binding =
-        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+        crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
             table_bindings.as_ref(),
             rewrite_target_identity(session, cohort_id),
             cohort.preparation().clone(),
             session.lease().planning_lease(),
         )?;
-    let sink = crate::engine::query_planning::write_sink::sql_write_plan_input_for_admitted_target(
+    let sink = crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
         rewrite_sink_mode(cohort.preparation().input())?,

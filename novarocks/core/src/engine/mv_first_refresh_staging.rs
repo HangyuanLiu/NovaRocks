@@ -11,12 +11,12 @@ use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLeas
 use crate::engine::domain::QueryPreparationKernel;
 use crate::engine::iceberg_write_shuffle_by_output_name;
 use crate::engine::mv::iceberg_refresh::IcebergMvCorePorts;
-use crate::engine::query_planning::bindings::QueryTableBindingStore;
-use crate::engine::query_planning::write_sink::{
-    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
-};
 use crate::mv::application::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
+};
+use crate::query_execution::planning::bindings::QueryTableBindingStore;
+use crate::query_execution::planning::write_sink::{
+    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;

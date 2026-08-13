@@ -27,6 +27,11 @@ use tokio::runtime::Handle;
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::novarocks_config;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
+use crate::query_execution::{
+    PreparedImmediateQuery, PreparedQueryCompletion,
+    PreparedQueryDistributedOperation as PreparedDistributedQuery, PreparedQueryOperation,
+    StatementResult,
+};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
@@ -244,7 +249,7 @@ pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
     catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
 ) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     let bindings = Arc::new(
-        crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+        crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()
             .expect("query table binding scope allocation must not fail"),
     );
     build_catalog_service_provider_with_bindings_and_query_local_overlays(
@@ -263,7 +268,7 @@ pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overl
     catalog_service: &'a QueryCatalogService,
     controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
     catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
 ) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
@@ -276,165 +281,6 @@ pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overl
         overlays,
     )
     .with_catalog_application(catalog_application)
-}
-
-#[derive(Clone, Debug)]
-pub enum StatementResult {
-    Query(QueryResult),
-    Ok,
-}
-
-/// An opaque, one-shot result of core query compilation.
-///
-/// The frontend owns submission to `QueryExecutionService`, while the core
-/// keeps the native request construction and result formatting capabilities.
-/// This prevents a second router from reconstructing query artifacts or
-/// interpreting coordinator-specific state.
-pub enum PreparedQueryOperation {
-    Immediate(PreparedImmediateQuery),
-    Distributed(PreparedDistributedQuery),
-}
-
-pub struct PreparedImmediateQuery {
-    result: StatementResult,
-}
-
-impl PreparedImmediateQuery {
-    pub fn into_result(self) -> StatementResult {
-        self.result
-    }
-}
-
-pub struct PreparedDistributedQuery {
-    request: crate::query_execution::contract::DistributedQueryRequest,
-    completion: PreparedQueryCompletion,
-}
-
-impl PreparedDistributedQuery {
-    pub fn into_parts(
-        self,
-    ) -> (
-        crate::query_execution::contract::DistributedQueryRequest,
-        PreparedQueryCompletion,
-    ) {
-        (self.request, self.completion)
-    }
-}
-
-/// Core-owned completion formatter paired with a distributed request.
-///
-/// It is deliberately not constructible outside core: frontend can submit the
-/// request exactly once, but cannot substitute a formatter for a different
-/// distributed-query intent.
-pub struct PreparedQueryCompletion {
-    formatter: PreparedQueryFormatter,
-}
-
-enum PreparedQueryFormatter {
-    Result,
-    Profile(PreparedProfileFormatter),
-}
-
-struct PreparedProfileFormatter {
-    distributed_plan: crate::sql::planner::distributed::DistributedPlan,
-    planning_elapsed: std::time::Duration,
-    execution_started_at: std::time::Instant,
-    connector_static_planning: crate::query_execution::profile::ConnectorStaticPlanningMetrics,
-}
-
-impl PreparedQueryCompletion {
-    pub fn complete(
-        self,
-        outcome: crate::query_execution::contract::DistributedQueryOutcome,
-    ) -> Result<StatementResult, String> {
-        match self.formatter {
-            PreparedQueryFormatter::Result => outcome
-                .into_result()
-                .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
-                .map(StatementResult::Query)
-                .map_err(|error| error.to_string()),
-            PreparedQueryFormatter::Profile(formatter) => {
-                let outcome = outcome
-                    .into_profile()
-                    .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
-                    .map_err(|error| error.to_string())?;
-                let (query_result, fragment_profiles) = outcome;
-                let fragment_profiles = fragment_profiles.into_profiles();
-                if fragment_profiles.is_empty() {
-                    return Err(
-                        "EXPLAIN ANALYZE completed without fragment runtime profiles".into(),
-                    );
-                }
-                let actuals = crate::query_execution::profile::collect_actuals_by_plan_node_id_from_profile_trees(
-                    &fragment_profiles,
-                );
-                let profile_summary = crate::query_execution::profile::collect_distributed_profile_summary_from_profile_trees(
-                    &fragment_profiles,
-                );
-                let per_fragment =
-                    crate::query_execution::profile::collect_per_fragment_profile_summaries(
-                        &fragment_profiles,
-                    );
-                let mut lines = Vec::new();
-                lines.push(format!(
-                    "Planning: {} / Execution: {} / Rows: {}",
-                    format_explain_analyze_duration(formatter.planning_elapsed),
-                    format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
-                    query_result.row_count()
-                ));
-                lines.push(format_distributed_profile_summary(&profile_summary));
-                if let Some(apply) = crate::query_execution::profile::collect_native_runtime_filter_apply_from_profile_trees(
-                    &fragment_profiles,
-                ) {
-                    lines.push(apply.to_string());
-                }
-                if let Some(apply) = crate::query_execution::profile::collect_native_scan_conjunct_apply_from_profile_trees(
-                    &fragment_profiles,
-                ) {
-                    lines.push(apply.to_string());
-                }
-                if !formatter.connector_static_planning.is_empty() {
-                    lines.push(formatter.connector_static_planning.to_string());
-                }
-                if let Some(counters) =
-                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
-                        &fragment_profiles,
-                        ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
-                        "ProfileCounters",
-                    )
-                {
-                    lines.push(counters);
-                }
-                if let Some(counters) =
-                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
-                        &fragment_profiles,
-                        RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES,
-                        "RuntimeFilterScanUnits",
-                    )
-                {
-                    lines.push(counters);
-                }
-                if let Some(counters) =
-                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
-                        &fragment_profiles,
-                        CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES,
-                        "ConnectorFileMetrics",
-                    )
-                {
-                    lines.push(counters);
-                }
-                lines.extend(
-                    crate::sql::explain::distributed::explain_distributed_plan_analyze(
-                        &formatter.distributed_plan,
-                        crate::sql::explain::ExplainLevel::Analyze,
-                        &actuals,
-                        Some(&per_fragment),
-                    ),
-                );
-                build_string_query_result("Explain String", lines).map(StatementResult::Query)
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1321,9 +1167,9 @@ impl CoreQueryCompiler {
                     level,
                     force_logical_explain,
                 )?;
-                Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
-                    result: StatementResult::Query(result),
-                }))
+                Ok(PreparedQueryOperation::Immediate(
+                    PreparedImmediateQuery::new(StatementResult::Query(result)),
+                ))
             }
             sqlast::Statement::Explain {
                 statement,
@@ -1347,9 +1193,9 @@ impl CoreQueryCompiler {
                     &self.system_tables,
                     query,
                 )? {
-                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
-                        result,
-                    }));
+                    return Ok(PreparedQueryOperation::Immediate(
+                        PreparedImmediateQuery::new(result),
+                    ));
                 }
                 let mut prepared = query.as_ref().clone();
                 self.view.view_service().rewrite_query(
@@ -1395,12 +1241,7 @@ impl CoreQueryCompiler {
                     true,
                 )?;
                 Ok(PreparedQueryOperation::Distributed(
-                    PreparedDistributedQuery {
-                        request,
-                        completion: PreparedQueryCompletion {
-                            formatter: PreparedQueryFormatter::Result,
-                        },
-                    },
+                    PreparedDistributedQuery::new(request, PreparedQueryCompletion::result()),
                 ))
             }
             _ => Err("query compiler only supports SELECT and EXPLAIN statements".to_string()),
@@ -1453,17 +1294,15 @@ impl CoreQueryCompiler {
                 true,
             )?;
         Ok(PreparedQueryOperation::Distributed(
-            PreparedDistributedQuery {
+            PreparedDistributedQuery::new(
                 request,
-                completion: PreparedQueryCompletion {
-                    formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
-                        distributed_plan,
-                        planning_elapsed: planning_start.elapsed(),
-                        execution_started_at: std::time::Instant::now(),
-                        connector_static_planning,
-                    }),
-                },
-            },
+                PreparedQueryCompletion::profile(
+                    distributed_plan,
+                    planning_start.elapsed(),
+                    std::time::Instant::now(),
+                    connector_static_planning,
+                ),
+            ),
         ))
     }
 }
@@ -2068,71 +1907,6 @@ fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> Que
     query_options
 }
 
-const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
-    "IcebergRuntimeFilePruning/FilesTotal",
-    "IcebergRuntimeFilePruning/FilesSelected",
-    "IcebergRuntimeFilePruning/FilesPruned",
-    "IcebergRuntimeFilePruning/Predicates",
-    "IcebergRuntimeFilePruning/Unsupported",
-    "IcebergRuntimeFilePruning/Unavailable",
-];
-
-const RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES: &[&str] = &[
-    "RuntimeFilterScanUnitsPruned",
-    "RuntimeFilterScanUnitsKept",
-    "RuntimeFilterScanUnitsNotEvaluated",
-    "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing",
-    "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing",
-    "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported",
-    "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported",
-    "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable",
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable",
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut",
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
-];
-
-const CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES: &[&str] = &[
-    "ConnectorFileRowGroupsRead",
-    "ConnectorFileRowGroupsPruned",
-    "ConnectorUnitReadersOpened",
-];
-
-fn format_distributed_profile_summary(
-    summary: &crate::query_execution::profile::DistributedProfileSummary,
-) -> String {
-    format!(
-        "Profile: fragments={} fragment_wall_max={} fragment_wall_sum={} driver_total={} driver_blocked={} source_wait={} sink_wait={} dependency_wait={} operator_active={} exchange_wait={} exchange_process={} network={} scan_io={}",
-        summary.fragment_instance_count,
-        format_explain_analyze_duration_ns(summary.fragment_wall_max_ns),
-        format_explain_analyze_duration_ns(summary.fragment_wall_sum_ns),
-        format_explain_analyze_duration_ns(summary.driver_total_time_ns),
-        format_explain_analyze_duration_ns(summary.driver_blocked_time_ns),
-        format_explain_analyze_duration_ns(summary.source_wait_time_ns),
-        format_explain_analyze_duration_ns(summary.sink_wait_time_ns),
-        format_explain_analyze_duration_ns(summary.dependency_wait_time_ns),
-        format_explain_analyze_duration_ns(summary.operator_active_time_ns),
-        format_explain_analyze_duration_ns(summary.exchange_wait_time_ns),
-        format_explain_analyze_duration_ns(summary.exchange_process_time_ns),
-        format_explain_analyze_duration_ns(summary.network_time_ns),
-        format_explain_analyze_duration_ns(summary.scan_io_time_ns)
-    )
-}
-
-fn format_explain_analyze_duration_ns(ns: i64) -> String {
-    format_explain_analyze_duration(std::time::Duration::from_nanos(ns.max(0) as u64))
-}
-
-fn format_explain_analyze_duration(duration: std::time::Duration) -> String {
-    let ms = duration.as_secs_f64() * 1000.0;
-    if ms < 1.0 {
-        format!("{ms:.3}ms")
-    } else if ms < 1000.0 {
-        format!("{ms:.1}ms")
-    } else {
-        format!("{:.2}s", duration.as_secs_f64())
-    }
-}
-
 pub(crate) fn iceberg_write_shuffle_by_output_name(
     output_name: impl Into<String>,
 ) -> crate::sql::compiler::RootDistributionRequirement {
@@ -2152,7 +1926,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -2185,7 +1959,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -2216,7 +1990,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -2251,7 +2025,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overl
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -2294,7 +2068,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
     crate::connector::validate_request_context(connector_context)?;
@@ -2341,7 +2115,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
             &optimizer_settings,
         )?;
     let scan_resolver =
-        crate::engine::query_planning::delta_scan::QueryTableBindingScanResolver::new(
+        crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
             table_bindings.as_ref(),
         );
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -2376,7 +2150,7 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging_with_ports
     sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    table_bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    table_bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
 ) -> Result<
@@ -2456,7 +2230,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -2584,7 +2358,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: Option<crate::sql::compiler::RootDistributionRequirement>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
@@ -2812,7 +2586,9 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
-    query_table_bindings: Option<&crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    query_table_bindings: Option<
+        &crate::query_execution::planning::bindings::QueryTableBindingStore,
+    >,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -2830,7 +2606,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
     let scan_resolver = query_table_bindings
-        .map(crate::engine::query_planning::delta_scan::QueryTableBindingScanResolver::new);
+        .map(crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new);
     let scan_binding_resolver = scan_resolver.as_ref().map(|resolver| {
         resolver as &dyn crate::query_execution::preparation::scan::ScanBindingResolver
     });
@@ -2988,7 +2764,7 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
     pub(crate) change_stream:
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     pub(crate) table_bindings:
-        Option<Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>>,
+        Option<Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>>,
 }
 
 pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
@@ -2997,7 +2773,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     current_database: &str,
     imv_rewrite: Option<&crate::sql::compiler::SqlImvPlanningInput>,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
@@ -3940,7 +3716,7 @@ mod tests {
             .try_execute("SHOW TABLE STATS ice.analytics.orders", None, "default")
             .expect("show typed table stats")
             .expect("statistics command result");
-        let crate::engine::StatementResult::Query(show_stats) = show_stats else {
+        let crate::query_execution::StatementResult::Query(show_stats) = show_stats else {
             panic!("SHOW TABLE STATS must return a query result");
         };
         assert_eq!(show_stats.columns[0].name, "metric");

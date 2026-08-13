@@ -19,9 +19,9 @@
 
 use novarocks_spi::connector::ConnectorRequestContext;
 
-use crate::engine::StatementResult;
 use crate::engine::domain::ViewExecutionKernel;
 use crate::engine::view::{ViewRequestContext, ViewService, ViewStatementResult};
+use crate::query_execution::StatementResult;
 
 #[derive(Clone)]
 pub struct ViewCommandExecutor {

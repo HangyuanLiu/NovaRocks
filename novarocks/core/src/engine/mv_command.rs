@@ -19,9 +19,9 @@
 
 use std::sync::Arc;
 
-use crate::engine::StatementResult;
 use crate::engine::domain::MvExecutionKernel;
 use crate::mv::application::MvApplicationService;
+use crate::query_execution::StatementResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 
 #[derive(Clone)]

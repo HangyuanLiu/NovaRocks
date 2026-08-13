@@ -21,7 +21,7 @@
 //! exact planning lease. Preparation retrieves only the sealed SPI scan by its
 //! query-local token and snapshot window.
 
-use crate::engine::query_planning::bindings::QueryTableBindingStore;
+use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::{ResolvedScanExecution, ScanBindingResolver};
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::{ScanSource, SqlScanKind};
@@ -86,7 +86,7 @@ mod tests {
     };
 
     use super::{QueryTableBindingScanResolver, ScanBindingResolver};
-    use crate::engine::query_planning::bindings::{
+    use crate::query_execution::planning::bindings::{
         QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
     use crate::query_execution::preparation::scan::ResolvedScanExecution;
@@ -188,7 +188,8 @@ mod tests {
                 },
             ),
             statistics_pin: None,
-            admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local,
+            admission:
+                crate::query_execution::planning::bindings::QueryTableBindingAdmission::Local,
             scan_materialization: None,
             write_target_admission: None,
             mv_target_read: None,

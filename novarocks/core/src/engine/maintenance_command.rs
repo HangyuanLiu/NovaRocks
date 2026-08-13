@@ -19,11 +19,11 @@
 
 use std::sync::Arc;
 
-use crate::engine::StatementResult;
 use crate::engine::table_maintenance::{
     MaintenanceRequestContext, MaintenanceStatementResult, RequestScopedMaintenanceEngine,
     TableMaintenanceService,
 };
+use crate::query_execution::StatementResult;
 
 /// Foreground maintenance command capability.  Each invocation creates a
 /// short-lived engine carrying only the Frontend-composed maintenance ports

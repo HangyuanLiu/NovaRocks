@@ -34,7 +34,7 @@ use novarocks::engine::insert_engine::InsertEngine;
 use novarocks::engine::mutation_engine::MutationEngine;
 use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
-    CoreQueryCompiler, PreparedQueryOperation, SessionCatalogResolver, StatementResult,
+    CoreQueryCompiler, SessionCatalogResolver,
     backend_command::BackendCommandExecutor,
     catalog_command::CatalogCommandExecutor,
     iceberg_ref_command::IcebergRefCommandExecutor,
@@ -57,6 +57,7 @@ use novarocks::query_execution::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
+use novarocks::query_execution::{PreparedQueryOperation, StatementResult};
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;

@@ -186,7 +186,7 @@ pub(crate) fn admit_prepared_connector_write_target(
 
 fn admitted_write_target(
     binding: &QueryTableBinding,
-) -> Result<&crate::engine::query_planning::bindings::QueryWriteTargetAdmission, String> {
+) -> Result<&crate::query_execution::planning::bindings::QueryWriteTargetAdmission, String> {
     binding
         .write_target_admission
         .as_ref()
@@ -241,7 +241,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use std::sync::Arc;
 
-    use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingKey};
+    use crate::query_execution::planning::bindings::{QueryTableBinding, QueryTableBindingKey};
     use crate::sql::catalog::ResolvedAnalyzerTable;
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,

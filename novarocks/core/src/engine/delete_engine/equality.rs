@@ -25,12 +25,12 @@ use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
 use crate::engine::domain::DmlExecutionKernel;
-use crate::engine::query_planning::bindings::QueryTableBindingStore;
-use crate::engine::query_planning::write_sink::{
-    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
-};
 use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::planning::bindings::QueryTableBindingStore;
+use crate::query_execution::planning::write_sink::{
+    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
+};
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;

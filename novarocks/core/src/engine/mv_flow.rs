@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use crate::engine::StatementResult;
 use crate::engine::domain::MvExecutionKernel;
 use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::mv::model::{MvStorageEngine, MvTarget};
@@ -27,6 +26,7 @@ use crate::mv::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
 use crate::mv::repository::MvRepository;
+use crate::query_execution::StatementResult;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,

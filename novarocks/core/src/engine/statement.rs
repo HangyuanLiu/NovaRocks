@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use crate::engine::StatementResult;
 use crate::engine::domain::CatalogCommandKernel;
+use crate::query_execution::StatementResult;
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use bytes::Bytes;

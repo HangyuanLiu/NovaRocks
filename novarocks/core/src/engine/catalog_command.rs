@@ -28,12 +28,14 @@ use sqlparser::parser::Parser;
 use std::sync::Arc;
 
 use crate::catalog_application::CatalogCreateCommand;
+use crate::engine::build_iceberg_create_table_ddl;
 use crate::engine::domain::CatalogCommandKernel;
 use crate::engine::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
 };
-use crate::engine::{QueryResultColumn, StatementResult, build_iceberg_create_table_ddl};
+use crate::query_execution::StatementResult;
+use crate::runtime::query_result::QueryResultColumn;
 use crate::sql::parser::dialect::{
     StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
     looks_like_create_table, looks_like_drop_statement,

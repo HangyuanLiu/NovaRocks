@@ -30,7 +30,6 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog_application::CatalogApplicationPort;
 use crate::common::engine_error::EngineError;
-use crate::engine::StatementResult;
 use crate::engine::mv::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, now_ms, validate_ivm_primary_key,
 };
@@ -39,10 +38,6 @@ use crate::engine::mv::lifecycle::{
 };
 use crate::engine::mv::refresh_io::{acquire_mv_refresh_lock, parse_iceberg_table_refs};
 use crate::engine::mv::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
-use crate::engine::query_planning::bindings::{
-    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
-    QueryTableBindingStore,
-};
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
@@ -107,6 +102,11 @@ use crate::mv::schema_validation::{
 use crate::mv::schema_validation::{validate_join_schema_contract, validate_schema_contract};
 use crate::mv::storage_observation::MvSchemaValidationObservation;
 use crate::mv::storage_observation::{MvStorageObservationPort, MvTargetCreationObservation};
+use crate::query_execution::StatementResult;
+use crate::query_execution::planning::bindings::{
+    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
+    QueryTableBindingStore,
+};
 #[cfg(test)]
 use crate::sql::analysis::ProjectItem;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
@@ -8545,9 +8545,10 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
             // optimizer statistics are resolved for this target as a side
             // channel during refresh preparation.
             statistics_pin: None,
-            admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
-                planning_lease,
-            ),
+            admission:
+                crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact(
+                    planning_lease,
+                ),
             scan_materialization: Some(mv_target_read.full.clone()),
             mv_target_read: Some(mv_target_read),
             write_target_admission: None,
@@ -9410,7 +9411,7 @@ const IMV_CHANGE_STREAM_EFFECT_APPENDED: i32 = 2;
 struct ImvRefreshPlannedChangeStream {
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     table_bindings:
-        Option<std::sync::Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>>,
+        Option<std::sync::Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>>,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerRoute>,
@@ -9587,7 +9588,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         .map(|route| route.cohort_id())
         .ok_or_else(|| "MV incremental provider plan has no writer routes".to_string())?;
     for route in &provider_routes {
-        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+        crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
             target_bindings.as_ref(),
             crate::sql::planner::table::SqlTableIdentity {
                 catalog: target.catalog.clone(),
@@ -10129,14 +10130,14 @@ fn is_imv_change_op_output_column(column: &OutputColumn) -> bool {
 
 fn build_imv_change_stream_routes(
     target: &crate::engine::backend_resolver::TargetBackend,
-    bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     output_columns: &[OutputColumn],
     producer_branches: &[ImvChangeStreamProducerRoute],
 ) -> Result<
     Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
     String,
 > {
-    use crate::engine::query_planning::write_sink::sql_write_plan_input_for_admitted_target;
+    use crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target;
     use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
     use crate::sql::planner::distributed::write::contract::{
         ConnectorWriteInputBinding, SqlWriteSinkMode,
@@ -10259,14 +10260,14 @@ fn build_imv_change_stream_routes(
 
 fn build_provider_imv_change_stream_routes(
     target: &crate::engine::backend_resolver::TargetBackend,
-    bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     output_columns: &[OutputColumn],
     provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
 ) -> Result<
     Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
     String,
 > {
-    use crate::engine::query_planning::write_sink::sql_write_plan_input_for_admitted_target;
+    use crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target;
     use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
     use crate::sql::planner::distributed::write::contract::{
         ConnectorWriteInputBinding, SqlWriteSinkMode,
@@ -10339,7 +10340,7 @@ fn build_provider_imv_change_stream_routes(
 }
 
 fn mv_change_stream_write_binding_for_mode(
-    bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     target: &crate::engine::backend_resolver::TargetBackend,
     mode: crate::sql::planner::distributed::write::contract::SqlWriteSinkMode,
 ) -> Result<crate::sql::binding::SqlTableBindingId, String> {

@@ -27,11 +27,11 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::engine::domain::DmlExecutionKernel;
-use crate::engine::query_planning::bindings::QueryTableBindingStore;
-use crate::engine::query_planning::write_sink::{
+use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::planning::bindings::QueryTableBindingStore;
+use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
-use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
@@ -1526,7 +1526,7 @@ fn build_update_mor_change_stream_write_plan(
     // can recover the write token from the same store that resolves producer
     // scans. No preparation phase is allowed to reacquire current/latest.
     for route in preparations.routes() {
-        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+        crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
             table_bindings.as_ref(),
             crate::sql::planner::table::SqlTableIdentity {
                 catalog: target.catalog.clone(),
@@ -4639,7 +4639,7 @@ fn build_merge_mor_change_stream_write_plan(
         not_matched_insert: has_not_matched_insert,
     };
     for route in preparations.routes() {
-        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+        crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
             table_bindings.as_ref(),
             crate::sql::planner::table::SqlTableIdentity {
                 catalog: target.catalog.clone(),

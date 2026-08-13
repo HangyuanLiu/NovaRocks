@@ -23,7 +23,7 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicate,
 };
 
-use crate::engine::query_planning::bindings::QueryScanMaterialization;
+use crate::query_execution::planning::bindings::QueryScanMaterialization;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::TypedExpr;
