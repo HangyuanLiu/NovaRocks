@@ -34,10 +34,13 @@ mod lake_discovery;
 pub(crate) mod maintenance;
 pub(crate) mod maintenance_worker;
 mod recovery;
+// Installed by the composition root so the frontend owns startup ordering.
 mod refresh;
 pub mod repository;
 pub(crate) mod scheduler;
 mod service;
+#[allow(dead_code)]
+pub(crate) mod startup_restore;
 
 pub use recovery::FrontendMvRecoverySummary;
 pub(crate) use refresh::FrontendMvRefreshProviderActivationPort;

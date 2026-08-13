@@ -127,23 +127,22 @@ pub(crate) fn rebuild_mv_definition_from_lake(
 /// Naming the inputs is what makes this module movable: it turns "needs the
 /// engine" into a short, checkable list, and every one of these is already
 /// reachable from a frontend composition.
-pub(crate) struct LakeRebuildContext<'a> {
+pub struct LakeRebuildContext<'a> {
     /// Whether a durable metadata cache is the runtime authority. Without one
     /// there is nothing to rebuild into and the sweep is a no-op.
-    pub(crate) metadata_is_authority: bool,
+    pub metadata_is_authority: bool,
     /// Catalogs this process currently admits. An absent projection means no
     /// lease to enumerate namespaces with.
-    pub(crate) catalog_runtime_projection:
+    pub catalog_runtime_projection:
         Option<&'a Arc<crate::catalog_application::CatalogRuntimeProjection>>,
-    pub(crate) catalog_application:
+    pub catalog_application:
         Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
-    pub(crate) connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
-    pub(crate) mv_storage_observation:
-        &'a dyn crate::mv::storage_observation::MvStorageObservationPort,
-    pub(crate) mv_repository: &'a dyn crate::mv::repository::MvRepository,
+    pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
+    pub mv_storage_observation: &'a dyn crate::mv::storage_observation::MvStorageObservationPort,
+    pub mv_repository: &'a dyn crate::mv::repository::MvRepository,
 }
 
-pub(crate) fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
+pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
     // No metadata provider means SQLite is not the runtime authority (e.g.
     // FE-compatible mode or a metadata-less test state); there is nothing to
     // rebuild a cache into.

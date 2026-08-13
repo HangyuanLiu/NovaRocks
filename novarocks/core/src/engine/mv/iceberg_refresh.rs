@@ -4514,9 +4514,9 @@ pub(crate) fn mv_target_restore_context(
 /// Same shape and motive as the lake rebuild's context: two inputs, both already
 /// reachable from a frontend composition, so restoring targets stops requiring
 /// the engine.
-pub(crate) struct MvTargetRestoreContext<'a> {
-    pub(crate) connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
-    pub(crate) mv_repository: &'a dyn crate::mv::repository::MvRepository,
+pub struct MvTargetRestoreContext<'a> {
+    pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
+    pub mv_repository: &'a dyn crate::mv::repository::MvRepository,
 }
 
 pub(crate) fn register_iceberg_mv_target_in_catalog(
@@ -4538,7 +4538,7 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
     Ok(())
 }
 
-pub(crate) fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<(), String> {
+pub fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<(), String> {
     if !ctx.mv_repository.availability().is_available() {
         return Ok(());
     }
