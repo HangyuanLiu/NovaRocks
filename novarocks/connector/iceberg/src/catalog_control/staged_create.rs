@@ -237,6 +237,11 @@ struct UnknownOperation {
     prepared: Option<PreparedOperation>,
 }
 
+pub(crate) struct IcebergFencedCleanupAction {
+    pub(crate) data_prefixes: Vec<String>,
+    pub(crate) objects: Vec<String>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PublishEvidenceV1 {
     version: u16,
@@ -609,6 +614,253 @@ impl IcebergStagedCreateAdapter {
             },
         }
     }
+
+    /// Register a catalog-authoritative fenced stage in the exact-generation
+    /// foreground cache. The cache only retains writer objects; the external
+    /// catalog locator remains the durable recovery authority.
+    pub(crate) fn register_fenced_stage(
+        &self,
+        operation_id: ConnectorStagedCreateOperationId,
+        staged: RestStagedTableCreate,
+        policy: CreatePolicy,
+        handle_payload: Bytes,
+    ) -> Result<ConnectorStagedTableHandle, ConnectorError> {
+        let handle =
+            ConnectorStagedTableHandle::try_new(self.owner(), operation_id, handle_payload)?;
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|error| internal(format!("staged-create operation lock: {error}")))?;
+        if let Some(existing) = operations.get(&operation_id) {
+            return match existing {
+                OperationState::Prepared(prepared)
+                    if prepared.handle_digest == handle.digest() && prepared.policy == policy =>
+                {
+                    Ok(handle)
+                }
+                OperationState::Prepared(_) => Err(invalid(
+                    "Iceberg fenced CTAS exact stage replay drifted from the cached target",
+                )),
+                _ => Err(invalid(
+                    "Iceberg fenced CTAS stage action is no longer an unpublished target",
+                )),
+            };
+        }
+        operations.insert(
+            operation_id,
+            OperationState::Prepared(PreparedOperation {
+                handle_digest: handle.digest(),
+                staged,
+                policy,
+                planning: None,
+                write: None,
+            }),
+        );
+        Ok(handle)
+    }
+
+    pub(crate) fn fenced_cleanup_action(
+        &self,
+        operation_id: ConnectorStagedCreateOperationId,
+    ) -> Result<IcebergFencedCleanupAction, ConnectorError> {
+        const MAX_CLEANUP_OBJECTS: usize = 256;
+        const MAX_CLEANUP_PATH_BYTES: usize = 2 * 1024;
+
+        let prepared = take_prepared(&self.operations, operation_id)?;
+        let result = (|| {
+            let table_location = prepared
+                .staged
+                .table
+                .metadata()
+                .location()
+                .trim_end_matches('/');
+            let data_prefix = format!(
+                "{}/",
+                fenced_staging_data_prefix(table_location, operation_id)
+            );
+            let Some(write) = &prepared.write else {
+                return Ok(IcebergFencedCleanupAction {
+                    data_prefixes: vec![data_prefix],
+                    objects: Vec::new(),
+                });
+            };
+            let (data_files, mut objects) = write.abort_handle.snapshot_paths();
+            if data_files
+                .iter()
+                .any(|path| !path.starts_with(&data_prefix))
+            {
+                return Err(corrupt(
+                    "Iceberg fenced CTAS cleanup data file escaped its operation staging prefix",
+                ));
+            }
+            let table_prefix = format!("{table_location}/");
+            if objects.iter().any(|path| !path.starts_with(&table_prefix)) {
+                return Err(corrupt(
+                    "Iceberg fenced CTAS cleanup manifest escaped its staged table location",
+                ));
+            }
+            objects.sort();
+            objects.dedup();
+            if objects.len() > MAX_CLEANUP_OBJECTS {
+                return Err(invalid(format!(
+                    "Iceberg fenced CTAS cleanup exceeds the {MAX_CLEANUP_OBJECTS}-object limit"
+                )));
+            }
+            if std::iter::once(data_prefix.as_str())
+                .chain(objects.iter().map(String::as_str))
+                .any(|path| {
+                    path.len() > MAX_CLEANUP_PATH_BYTES || path.contains('?') || path.contains('#')
+                })
+            {
+                return Err(invalid(
+                    "Iceberg fenced CTAS cleanup contains an oversized or credential-bearing path",
+                ));
+            }
+            Ok(IcebergFencedCleanupAction {
+                data_prefixes: vec![data_prefix],
+                objects,
+            })
+        })();
+        self.record_terminal(operation_id, OperationState::Prepared(prepared));
+        result
+    }
+
+    pub(crate) fn plan_fenced_write(
+        &self,
+        request: ConnectorStagedWritePlanningRequest,
+    ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorError> {
+        <Self as ConnectorStagedCreate>::plan_write(self, request)
+    }
+
+    pub(crate) fn bind_fenced_write(
+        &self,
+        handle: ConnectorStagedTableHandle,
+        completion: ConnectorWriteOperationCompletion,
+    ) -> Result<(), ConnectorError> {
+        <Self as ConnectorStagedCreate>::bind_write(self, handle, completion)
+    }
+
+    /// Build the standard assert-create request without dispatching it. The
+    /// fence-aware catalog executes this payload inside its serialized publish
+    /// action, so `TableRequirement::NotExist` is not a client-side fallback.
+    pub(crate) fn fenced_publish_commit(
+        &self,
+        operation_id: ConnectorStagedCreateOperationId,
+        completion_digest: [u8; 32],
+    ) -> Result<TableCommit, ConnectorError> {
+        let mut prepared = take_prepared(&self.operations, operation_id)?;
+        let Some(write) = prepared.write.as_ref() else {
+            self.record_terminal(operation_id, OperationState::Prepared(prepared));
+            return Err(invalid(
+                "Iceberg fenced CTAS publish requires a bound writer aggregate",
+            ));
+        };
+        if write.completion.aggregate_digest() != completion_digest {
+            self.record_terminal(operation_id, OperationState::Prepared(prepared));
+            return Err(invalid(
+                "Iceberg fenced CTAS publish completion digest is not bound to this target",
+            ));
+        }
+        if !write.action_built {
+            let completion = write.completion.clone();
+            match self.build_action(&prepared, &completion) {
+                Ok((updates, expected_snapshot_id, abort_handle)) => {
+                    let write = prepared.write.as_mut().expect("validated staged write");
+                    write.updates = updates;
+                    write.expected_snapshot_id = expected_snapshot_id;
+                    write.abort_handle = abort_handle;
+                    write.action_built = true;
+                }
+                Err(error) => {
+                    self.record_terminal(operation_id, OperationState::Prepared(prepared));
+                    return Err(error);
+                }
+            }
+        }
+        let write = prepared.write.as_ref().expect("built staged write");
+        let mut updates = prepared.staged.initialization_updates.clone();
+        updates.extend(write.updates.clone());
+        let commit = TableCommit::builder()
+            .ident(prepared.staged.table.identifier().clone())
+            .requirements(vec![TableRequirement::NotExist])
+            .updates(updates)
+            .build();
+        self.record_terminal(operation_id, OperationState::Prepared(prepared));
+        Ok(commit)
+    }
+
+    pub(crate) fn finish_fenced_published(
+        &self,
+        operation_id: ConnectorStagedCreateOperationId,
+    ) -> Result<(), ConnectorError> {
+        let prepared = {
+            let mut operations = self
+                .operations
+                .lock()
+                .map_err(|error| internal(format!("staged-create operation lock: {error}")))?;
+            match operations.remove(&operation_id) {
+                Some(OperationState::Published) => {
+                    operations.insert(operation_id, OperationState::Published);
+                    return Ok(());
+                }
+                Some(OperationState::Prepared(prepared)) => prepared,
+                Some(state) => {
+                    operations.insert(operation_id, state);
+                    return Err(invalid(
+                        "Iceberg fenced CTAS publish cannot finalize this local operation state",
+                    ));
+                }
+                None => return Err(invalid("unknown Iceberg staged-create operation")),
+            }
+        };
+        invalidate_prepared(&self.runtime, &prepared);
+        let finalization =
+            self.finish_write_terminal(&prepared, ExternalMutationFinalization::Complete);
+        self.record_terminal(operation_id, OperationState::Published);
+        match finalization {
+            ExternalMutationFinalization::Complete => Ok(()),
+            ExternalMutationFinalization::Failed(failure) => Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                failure.message(),
+            )),
+        }
+    }
+
+    pub(crate) fn finish_fenced_aborted(
+        &self,
+        operation_id: ConnectorStagedCreateOperationId,
+    ) -> Result<(), ConnectorError> {
+        let prepared = {
+            let mut operations = self
+                .operations
+                .lock()
+                .map_err(|error| internal(format!("staged-create operation lock: {error}")))?;
+            match operations.remove(&operation_id) {
+                Some(OperationState::Aborted) => {
+                    operations.insert(operation_id, OperationState::Aborted);
+                    return Ok(());
+                }
+                Some(OperationState::Prepared(prepared)) => prepared,
+                Some(state) => {
+                    operations.insert(operation_id, state);
+                    return Err(invalid(
+                        "Iceberg fenced CTAS abort cannot finalize this local operation state",
+                    ));
+                }
+                None => return Err(invalid("unknown Iceberg staged-create operation")),
+            }
+        };
+        let finalization =
+            self.finish_write_terminal(&prepared, ExternalMutationFinalization::Complete);
+        self.record_terminal(operation_id, OperationState::Aborted);
+        match finalization {
+            ExternalMutationFinalization::Complete => Ok(()),
+            ExternalMutationFinalization::Failed(failure) => Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                failure.message(),
+            )),
+        }
+    }
 }
 
 impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
@@ -771,7 +1023,11 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         }
         let result = self
             .provider
-            .staged_write_table_handle(&prepared.staged.table, &request.context)
+            .staged_write_table_handle(
+                &prepared.staged.table,
+                target_operation_id,
+                &request.context,
+            )
             .and_then(|table| {
                 ConnectorStagedWritePlanningBinding::try_new(
                     &request.handle,
@@ -1327,6 +1583,17 @@ fn operation_marker(operation_id: ConnectorStagedCreateOperationId) -> String {
     uuid::Uuid::from_bytes(operation_id.to_bytes()).to_string()
 }
 
+pub(crate) fn fenced_staging_data_prefix(
+    table_location: &str,
+    operation_id: ConnectorStagedCreateOperationId,
+) -> String {
+    format!(
+        "{}/data/_staging/{}",
+        table_location.trim_end_matches('/'),
+        operation_marker(operation_id)
+    )
+}
+
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
@@ -1419,6 +1686,18 @@ mod tests {
         assert_eq!(
             operation_marker(operation_id),
             uuid::Uuid::from_bytes(operation_id.to_bytes()).to_string()
+        );
+    }
+
+    #[test]
+    fn fenced_staging_prefix_is_operation_bound_and_canonical() {
+        let operation_id = ConnectorMutationOperationId::new();
+        assert_eq!(
+            fenced_staging_data_prefix("s3://warehouse/db/table/", operation_id),
+            format!(
+                "s3://warehouse/db/table/data/_staging/{}",
+                operation_marker(operation_id)
+            )
         );
     }
 

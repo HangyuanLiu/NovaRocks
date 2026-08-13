@@ -32,8 +32,13 @@ edition = "2024"
 name = "sql-tests"
 path = "src/main.rs"
 
+[[bin]]
+name = "fenced-catalog-fixture"
+path = "src/bin/fenced-catalog-fixture.rs"
+
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 mysql = "25.0.1"
 novarocks-test-support = { path = "../../novarocks/test-support" }
@@ -42,9 +47,14 @@ regex = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-opendal = { version = "0.55", features = ["services-s3"] }
+opendal = { version = "0.55", features = ["services-fs", "services-s3"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "net", "time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.dev-opt]
 inherits = "dev"

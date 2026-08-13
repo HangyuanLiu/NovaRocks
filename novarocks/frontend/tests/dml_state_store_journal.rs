@@ -39,8 +39,9 @@ use novarocks_frontend::dml::model::{
 };
 use novarocks_frontend::dml::model::{
     DmlCoordinationClaimRequest, DmlCoordinationProvenance, DmlCtasActionKind,
-    DmlCtasCatalogFenceRecord, DmlCtasChildSupersessionRecord, DmlCtasCleanupRetention,
-    DmlCtasDispatchCertainty, DmlCtasDispatchCheckpointRecord, DmlCtasHistoricalDisposition,
+    DmlCtasCatalogFenceRecord, DmlCtasChildSupersessionRecord, DmlCtasCleanupReceiptRecord,
+    DmlCtasCleanupRetention, DmlCtasConflictKind, DmlCtasDispatchCertainty,
+    DmlCtasDispatchCheckpointRecord, DmlCtasHistoricalDisposition,
     DmlCtasHistoricalObservationRecord, DmlCtasRecoveryMutationRequest, DmlCtasRecoveryRecord,
     DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
     DmlDirectMutationKind, DmlExternalFenceGeneration, DmlExternalFenceIdentity,
@@ -51,7 +52,7 @@ use novarocks_frontend::dml::model::{
     DmlHistoricalDispatchCertainty, DmlHistoricalRecoveryPhase, DmlHistoricalWriteDisposition,
     DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord,
     DmlHistoricalWriteRequestRecord, DmlHistoricalWriteResultRecord, DmlOpaquePayload,
-    DmlRecoveryDueRescheduleRequest,
+    DmlRecoveryDueRescheduleRequest, validate_ctas_recovery,
 };
 use novarocks_frontend::dml::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
@@ -1766,6 +1767,7 @@ fn ctas_recovery(recovery_attempt_id: Uuid, saga: &CtasSagaRecord) -> DmlCtasRec
                 resource_epoch: 1,
                 fence_generation: 1,
             },
+            action_id: Uuid::now_v7(),
             request_digest: "10".repeat(32),
             dispatch_certainty: DmlCtasDispatchCertainty::PossiblyDispatched,
             dispatched_at_ms: Some(290),
@@ -1777,7 +1779,9 @@ fn ctas_recovery(recovery_attempt_id: Uuid, saga: &CtasSagaRecord) -> DmlCtasRec
             established_at_ms: Some(295),
         }),
         staged_locator: None,
+        staged_locator_digest: None,
         staged_proof_digest: None,
+        staged_proof: None,
         dispatch_checkpoints: vec![DmlCtasDispatchCheckpointRecord {
             action: DmlCtasActionKind::Stage,
             child_operation_id: saga.prepare_operation_id,
@@ -1787,7 +1791,8 @@ fn ctas_recovery(recovery_attempt_id: Uuid, saga: &CtasSagaRecord) -> DmlCtasRec
         }],
         historical_observations: Vec::new(),
         child_supersessions: Vec::new(),
-        cleanup_retention: DmlCtasCleanupRetention::Pending,
+        cleanup_retention: DmlCtasCleanupRetention::NotRequired,
+        cleanup_receipt: None,
         next_action: StatementNextAction::Reconcile,
         updated_at_ms: 300,
     }
@@ -2143,11 +2148,15 @@ async fn ctas_v8_recovery_facts_are_authority_revision_bound_and_restart_durable
     let payload = ctas_payload(CtasSagaPhase::PreparingSource);
     let recovery = ctas_recovery(attempt, ctas_saga(&payload));
     let mut reply_lost = recovery.clone();
+    let stable_fence_action = reply_lost.catalog_fence.as_ref().unwrap().action_id;
     let fence = reply_lost.catalog_fence.as_mut().unwrap();
     fence.fence_digest = None;
     fence.receipt_digest = None;
     fence.receipt_payload = None;
     fence.established_at_ms = None;
+    // Fence reply-loss may only retry/inspect the fence itself. No stage,
+    // publish, abort, locator, or historical checkpoint exists yet.
+    reply_lost.dispatch_checkpoints.clear();
     let claimed = claim_ctas(&journal, operation_id, payload, attempt, validator.clone());
     let mutation = DmlCtasRecoveryMutationRequest {
         operation_id,
@@ -2160,6 +2169,16 @@ async fn ctas_v8_recovery_facts_are_authority_revision_bound_and_restart_durable
         .record_ctas_recovery_authorized(mutation.clone(), Some(600), authority())
         .unwrap();
     assert_eq!(reply_lost_recorded.revision, claimed.revision + 1);
+    assert_eq!(
+        journal
+            .load_ctas_recovery(operation_id)
+            .unwrap()
+            .unwrap()
+            .catalog_fence
+            .unwrap()
+            .action_id,
+        stable_fence_action
+    );
     assert_eq!(
         journal
             .record_ctas_recovery_authorized(mutation, Some(600), authority())
@@ -2183,6 +2202,23 @@ async fn ctas_v8_recovery_facts_are_authority_revision_bound_and_restart_durable
         Some(recovery.clone())
     );
 
+    let mut drifted_action = recovery.clone();
+    drifted_action.catalog_fence.as_mut().unwrap().action_id = Uuid::now_v7();
+    let action_error = journal
+        .record_ctas_recovery_authorized(
+            DmlCtasRecoveryMutationRequest {
+                operation_id,
+                expected_revision: recorded.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: drifted_action,
+            },
+            Some(675),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(action_error.kind(), DmlErrorKind::JournalCorruption);
+
+    let expected_after_restart = recovery.clone();
     let stale = journal
         .record_ctas_recovery_authorized(
             DmlCtasRecoveryMutationRequest {
@@ -2203,7 +2239,7 @@ async fn ctas_v8_recovery_facts_are_authority_revision_bound_and_restart_durable
     let (_host, _store, reopened) = open_store(&path).await;
     assert_eq!(
         reopened.load_ctas_recovery(operation_id).unwrap(),
-        Some(ctas_recovery(attempt, ctas_saga(&recorded.payload)))
+        Some(expected_after_restart)
     );
 }
 
@@ -2259,21 +2295,38 @@ async fn terminal_ctas_keeps_recovery_due_until_proof_bound_cleanup_converges() 
     assert_eq!(terminal.recovery_due_at_ms, Some(700));
 
     let stage_child_operation_id = recovery.dispatch_checkpoints[0].child_operation_id;
+    recovery.staged_locator =
+        Some(DmlOpaquePayload::try_new(b"staged locator wire".to_vec()).unwrap());
+    recovery.staged_locator_digest = Some("31".repeat(32));
+    recovery.staged_proof_digest = Some("32".repeat(32));
+    recovery.staged_proof = Some(DmlOpaquePayload::try_new(b"staged proof wire".to_vec()).unwrap());
     recovery
         .historical_observations
         .push(DmlCtasHistoricalObservationRecord {
             action: DmlCtasActionKind::Stage,
             child_operation_id: stage_child_operation_id,
-            disposition: DmlCtasHistoricalDisposition::Aborted,
+            disposition: DmlCtasHistoricalDisposition::Staged,
+            descriptor_digest: "30".repeat(32),
             observation_digest: "33".repeat(32),
+            locator_digest: Some("31".repeat(32)),
             proof_digest: Some("44".repeat(32)),
             proof_payload: Some(
                 DmlOpaquePayload::try_new(b"opaque historical cleanup proof".to_vec()).unwrap(),
             ),
+            conflict_kind: None,
             failure: None,
             observed_at_ms: 800,
         });
     recovery.cleanup_retention = DmlCtasCleanupRetention::Completed;
+    recovery.cleanup_receipt = Some(DmlCtasCleanupReceiptRecord {
+        descriptor_digest: "30".repeat(32),
+        observation_digest: "33".repeat(32),
+        locator_digest: "31".repeat(32),
+        receipt_digest: "34".repeat(32),
+        proof_digest: "35".repeat(32),
+        proof_payload: DmlOpaquePayload::try_new(b"cleanup receipt proof wire".to_vec()).unwrap(),
+        completed_at_ms: 800,
+    });
     recovery.next_action = StatementNextAction::None;
     recovery.updated_at_ms = 800;
     let resolved = journal
@@ -2424,26 +2477,162 @@ fn ctas_opaque_receipt_locator_and_cleanup_proof_are_redacted_from_debug() {
     let mut recovery = ctas_recovery(Uuid::now_v7(), ctas_saga(&payload));
     recovery.staged_locator =
         Some(DmlOpaquePayload::try_new(b"secret staged locator".to_vec()).unwrap());
+    recovery.staged_locator_digest = Some("87".repeat(32));
     recovery.staged_proof_digest = Some("88".repeat(32));
+    recovery.staged_proof =
+        Some(DmlOpaquePayload::try_new(b"secret staged proof wire".to_vec()).unwrap());
     recovery
         .historical_observations
         .push(DmlCtasHistoricalObservationRecord {
             action: DmlCtasActionKind::Stage,
             child_operation_id: recovery.dispatch_checkpoints[0].child_operation_id,
             disposition: DmlCtasHistoricalDisposition::Staged,
+            descriptor_digest: "98".repeat(32),
             observation_digest: "99".repeat(32),
+            locator_digest: Some("87".repeat(32)),
             proof_digest: Some("aa".repeat(32)),
             proof_payload: Some(
                 DmlOpaquePayload::try_new(b"secret guarded cleanup proof".to_vec()).unwrap(),
             ),
+            conflict_kind: None,
             failure: None,
             observed_at_ms: 900,
         });
     let debug = format!("{recovery:?}");
     assert!(!debug.contains("secret staged locator"));
+    assert!(!debug.contains("secret staged proof wire"));
     assert!(!debug.contains("secret guarded cleanup proof"));
     assert!(!debug.contains("opaque catalog fence receipt"));
     assert!(debug.contains("DmlOpaquePayload"));
+}
+
+#[test]
+fn ctas_historical_ambiguous_proof_is_optional_but_unsupported_never_has_one() {
+    let payload = ctas_payload(CtasSagaPhase::PreparingSource);
+    let mut recovery = ctas_recovery(Uuid::now_v7(), ctas_saga(&payload));
+    let child_operation_id = recovery.dispatch_checkpoints[0].child_operation_id;
+    recovery
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action: DmlCtasActionKind::Stage,
+            child_operation_id,
+            disposition: DmlCtasHistoricalDisposition::Ambiguous,
+            descriptor_digest: "aa".repeat(32),
+            observation_digest: "ab".repeat(32),
+            locator_digest: None,
+            proof_digest: None,
+            proof_payload: None,
+            conflict_kind: None,
+            failure: Some("catalog inspection reply was lost".to_string()),
+            observed_at_ms: 901,
+        });
+    validate_ctas_recovery(&recovery).unwrap();
+
+    let observation = recovery.historical_observations.last_mut().unwrap();
+    observation.disposition = DmlCtasHistoricalDisposition::Unsupported;
+    observation.proof_digest = Some("cd".repeat(32));
+    observation.proof_payload =
+        Some(DmlOpaquePayload::try_new(b"forbidden proof".to_vec()).unwrap());
+    assert!(validate_ctas_recovery(&recovery).is_err());
+}
+
+#[test]
+fn ctas_catalog_fence_conflict_and_cleanup_facts_fail_closed() {
+    let payload = ctas_payload(CtasSagaPhase::PreparingSource);
+    let saga = ctas_saga(&payload);
+
+    let mut incomplete_fence = ctas_recovery(Uuid::now_v7(), saga);
+    let fence = incomplete_fence.catalog_fence.as_mut().unwrap();
+    fence.fence_digest = None;
+    fence.receipt_digest = None;
+    fence.receipt_payload = None;
+    fence.established_at_ms = None;
+    assert!(validate_ctas_recovery(&incomplete_fence).is_err());
+    incomplete_fence.dispatch_checkpoints.clear();
+    validate_ctas_recovery(&incomplete_fence).unwrap();
+
+    let mut conflict = ctas_recovery(Uuid::now_v7(), saga);
+    conflict
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action: DmlCtasActionKind::Stage,
+            child_operation_id: conflict.dispatch_checkpoints[0].child_operation_id,
+            disposition: DmlCtasHistoricalDisposition::Conflict,
+            descriptor_digest: "41".repeat(32),
+            observation_digest: "42".repeat(32),
+            locator_digest: None,
+            proof_digest: Some("43".repeat(32)),
+            proof_payload: Some(DmlOpaquePayload::try_new(b"conflict proof".to_vec()).unwrap()),
+            conflict_kind: None,
+            failure: Some("catalog digest conflict".to_string()),
+            observed_at_ms: 902,
+        });
+    assert!(validate_ctas_recovery(&conflict).is_err());
+    conflict.historical_observations[0].conflict_kind = Some(DmlCtasConflictKind::DigestConflict);
+    validate_ctas_recovery(&conflict).unwrap();
+
+    let mut cleanup = ctas_recovery(Uuid::now_v7(), saga);
+    cleanup.staged_locator = Some(DmlOpaquePayload::try_new(b"locator wire".to_vec()).unwrap());
+    cleanup.staged_locator_digest = Some("51".repeat(32));
+    cleanup.staged_proof_digest = Some("52".repeat(32));
+    cleanup.staged_proof = Some(DmlOpaquePayload::try_new(b"stage proof wire".to_vec()).unwrap());
+    cleanup
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action: DmlCtasActionKind::Stage,
+            child_operation_id: cleanup.dispatch_checkpoints[0].child_operation_id,
+            disposition: DmlCtasHistoricalDisposition::Ambiguous,
+            descriptor_digest: "53".repeat(32),
+            observation_digest: "50".repeat(32),
+            locator_digest: None,
+            proof_digest: None,
+            proof_payload: None,
+            conflict_kind: None,
+            failure: Some("inspection reply lost".to_string()),
+            observed_at_ms: 902,
+        });
+    cleanup
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action: DmlCtasActionKind::Stage,
+            child_operation_id: cleanup.dispatch_checkpoints[0].child_operation_id,
+            disposition: DmlCtasHistoricalDisposition::Staged,
+            descriptor_digest: "53".repeat(32),
+            observation_digest: "54".repeat(32),
+            locator_digest: Some("51".repeat(32)),
+            proof_digest: Some("55".repeat(32)),
+            proof_payload: Some(
+                DmlOpaquePayload::try_new(b"inspection proof wire".to_vec()).unwrap(),
+            ),
+            conflict_kind: None,
+            failure: None,
+            observed_at_ms: 903,
+        });
+    cleanup.cleanup_retention = DmlCtasCleanupRetention::Pending;
+    validate_ctas_recovery(&cleanup).unwrap();
+    cleanup.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+    assert!(validate_ctas_recovery(&cleanup).is_err());
+    cleanup.cleanup_retention = DmlCtasCleanupRetention::Completed;
+    cleanup.next_action = StatementNextAction::None;
+    assert!(validate_ctas_recovery(&cleanup).is_err());
+    cleanup.cleanup_receipt = Some(DmlCtasCleanupReceiptRecord {
+        descriptor_digest: "53".repeat(32),
+        observation_digest: "54".repeat(32),
+        locator_digest: "51".repeat(32),
+        receipt_digest: "56".repeat(32),
+        proof_digest: "57".repeat(32),
+        proof_payload: DmlOpaquePayload::try_new(b"cleanup proof wire".to_vec()).unwrap(),
+        completed_at_ms: 904,
+    });
+    validate_ctas_recovery(&cleanup).unwrap();
+    cleanup.cleanup_receipt.as_mut().unwrap().locator_digest = "58".repeat(32);
+    assert!(validate_ctas_recovery(&cleanup).is_err());
+
+    let mut published = cleanup;
+    published.cleanup_receipt.as_mut().unwrap().locator_digest = "51".repeat(32);
+    published.historical_observations[1].disposition = DmlCtasHistoricalDisposition::Published;
+    published.historical_observations[1].locator_digest = None;
+    assert!(validate_ctas_recovery(&published).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]

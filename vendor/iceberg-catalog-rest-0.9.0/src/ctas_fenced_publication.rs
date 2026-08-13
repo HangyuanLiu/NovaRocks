@@ -54,6 +54,22 @@ pub struct CtasFencedOperation {
     pub target: TableIdent,
 }
 
+/// Totally ordered external ownership generation.
+///
+/// Ordering is lexicographic in field order. Keeping all three components on
+/// the wire prevents a control-plane restart or resource reallocation from
+/// being collapsed into a provider-local counter.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub struct CtasFencedGeneration {
+    /// Durable control-plane incarnation (nonzero).
+    pub control_plane_incarnation: u64,
+    /// Durable operation-resource epoch (nonzero).
+    pub resource_epoch: u64,
+    /// Provider-visible monotone generation (nonzero).
+    pub fence_generation: u64,
+}
+
 /// Common identity and fencing fields carried by every mutating request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -61,11 +77,21 @@ pub struct CtasFencedAction {
     /// Stable CTAS operation and destination.
     pub operation: CtasFencedOperation,
     /// Monotonically ordered external ownership generation.
-    pub generation: u64,
+    pub generation: CtasFencedGeneration,
     /// Stable child action identity within the operation.
     pub action_id: String,
     /// Digest sealing every semantic input to this action.
     pub input_digest: String,
+}
+
+/// Destination visibility policy sealed by a CTAS publication action.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CtasCreatePolicy {
+    /// A pre-existing or concurrently-created destination is a conflict.
+    FailIfExists,
+    /// A pre-existing or concurrently-created destination completes as no-op.
+    NoOpIfExists,
 }
 
 /// Establish or replay the current catalog fence.
@@ -81,7 +107,7 @@ pub struct AdvanceCtasFenceRequest {
 #[serde(rename_all = "kebab-case")]
 pub struct AdvanceCtasFenceResponse {
     /// Established generation.
-    pub generation: u64,
+    pub generation: CtasFencedGeneration,
     /// Digest bound to the established generation.
     pub input_digest: String,
     /// Bounded opaque catalog receipt.
@@ -110,6 +136,8 @@ pub struct StageCtasTargetRequest {
     pub initialization_digest: String,
     /// Digest of the destination create policy.
     pub create_policy_digest: String,
+    /// Exact destination create policy interpreted by the catalog.
+    pub create_policy: CtasCreatePolicy,
     /// Bounded provider payload interpreted only by the catalog extension.
     pub provider_payload: String,
 }
@@ -121,6 +149,7 @@ impl fmt::Debug for StageCtasTargetRequest {
             .field("staged_identity", &self.staged_identity)
             .field("initialization_digest", &self.initialization_digest)
             .field("create_policy_digest", &self.create_policy_digest)
+            .field("create_policy", &self.create_policy)
             .field("provider_payload", &redacted_len(&self.provider_payload))
             .finish()
     }
@@ -134,6 +163,9 @@ pub struct StageCtasTargetResponse {
     pub staged_locator: String,
     /// Provider-opaque proof binding the locator to this operation.
     pub staged_proof: String,
+    /// Authoritative standard REST staged-table result used only to assemble
+    /// the exact foreground writer handle. Historical recovery never needs it.
+    pub staged_table: serde_json::Value,
 }
 
 impl fmt::Debug for StageCtasTargetResponse {
@@ -141,6 +173,7 @@ impl fmt::Debug for StageCtasTargetResponse {
         f.debug_struct("StageCtasTargetResponse")
             .field("staged_locator", &redacted_len(&self.staged_locator))
             .field("staged_proof", &redacted_len(&self.staged_proof))
+            .field("staged_table", &"REDACTED")
             .finish()
     }
 }
@@ -152,7 +185,7 @@ pub struct InspectCtasTargetRequest {
     /// Stable CTAS operation and destination.
     pub operation: CtasFencedOperation,
     /// Generation whose ownership must be inspected.
-    pub generation: u64,
+    pub generation: CtasFencedGeneration,
     /// Digest of the expected operation lineage.
     pub input_digest: String,
 }
@@ -181,6 +214,16 @@ pub enum InspectCtasTargetResponse {
         /// Proof binding the visible target to this saga.
         proof: String,
     },
+    /// `IF NOT EXISTS` completed as a catalog-proven no-op.
+    NoOp {
+        /// Bounded terminal no-op provenance.
+        provenance: String,
+        /// Proof binding the no-op to this saga and create policy.
+        proof: String,
+        /// Optional unpublished staging retained for proof-bound cleanup.
+        #[serde(rename = "staged-locator", skip_serializing_if = "Option::is_none")]
+        staged_locator: Option<String>,
+    },
     /// Guarded abort completed.
     Aborted {
         /// Bounded terminal abort provenance.
@@ -194,11 +237,16 @@ pub enum InspectCtasTargetResponse {
         kind: CtasFencedPublicationConflictKind,
         /// Bounded diagnostic message.
         message: String,
+        /// Proof binding the exact conflict to catalog-authoritative truth.
+        proof: String,
     },
     /// Catalog truth cannot be determined safely.
     Ambiguous {
-        /// Bounded opaque evidence for operator-assisted recovery.
-        proof: String,
+        /// Bounded diagnostic explaining why catalog truth is inconclusive.
+        message: String,
+        /// Optional opaque evidence for operator-assisted recovery.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        proof: Option<String>,
     },
     /// The catalog record uses an unsupported protocol or operation.
     Unsupported {
@@ -227,19 +275,38 @@ impl fmt::Debug for InspectCtasTargetResponse {
                 .field("provenance", &redacted_len(provenance))
                 .field("proof", &redacted_len(proof))
                 .finish(),
+            Self::NoOp {
+                provenance,
+                proof,
+                staged_locator,
+            } => f
+                .debug_struct("NoOp")
+                .field("provenance", &redacted_len(provenance))
+                .field("proof", &redacted_len(proof))
+                .field(
+                    "staged_locator",
+                    &staged_locator.as_deref().map(redacted_len),
+                )
+                .finish(),
             Self::Aborted { provenance, proof } => f
                 .debug_struct("Aborted")
                 .field("provenance", &redacted_len(provenance))
                 .field("proof", &redacted_len(proof))
                 .finish(),
-            Self::Conflict { kind, message } => f
+            Self::Conflict {
+                kind,
+                message,
+                proof,
+            } => f
                 .debug_struct("Conflict")
                 .field("kind", kind)
                 .field("message", message)
-                .finish(),
-            Self::Ambiguous { proof } => f
-                .debug_struct("Ambiguous")
                 .field("proof", &redacted_len(proof))
+                .finish(),
+            Self::Ambiguous { message, proof } => f
+                .debug_struct("Ambiguous")
+                .field("message", message)
+                .field("proof", &proof.as_deref().map(redacted_len))
                 .finish(),
             Self::Unsupported { message } => f
                 .debug_struct("Unsupported")
@@ -263,6 +330,8 @@ pub struct PublishCtasTargetRequest {
     pub write_completion_digest: String,
     /// Digest of the destination create policy.
     pub create_policy_digest: String,
+    /// Exact destination create policy interpreted by the catalog.
+    pub create_policy: CtasCreatePolicy,
     /// Bounded provider payload interpreted only by the catalog extension.
     pub provider_payload: String,
 }
@@ -275,6 +344,7 @@ impl fmt::Debug for PublishCtasTargetRequest {
             .field("staged_proof", &redacted_len(&self.staged_proof))
             .field("write_completion_digest", &self.write_completion_digest)
             .field("create_policy_digest", &self.create_policy_digest)
+            .field("create_policy", &self.create_policy)
             .field("provider_payload", &redacted_len(&self.provider_payload))
             .finish()
     }
@@ -838,10 +908,18 @@ mod tests {
         }
     }
 
+    fn generation(value: u64) -> CtasFencedGeneration {
+        CtasFencedGeneration {
+            control_plane_incarnation: 3,
+            resource_epoch: 5,
+            fence_generation: value,
+        }
+    }
+
     fn action(action_id: &str) -> CtasFencedAction {
         CtasFencedAction {
             operation: operation(),
-            generation: 7,
+            generation: generation(7),
             action_id: action_id.to_string(),
             input_digest: format!("digest-{action_id}"),
         }
@@ -859,7 +937,7 @@ mod tests {
             .match_header("authorization", "Bearer extension-token")
             .match_header("content-type", "application/json")
             .with_status(200)
-            .with_body(r#"{"generation":7,"input-digest":"digest-advance","receipt":"receipt-a"}"#)
+            .with_body(r#"{"generation":{"control-plane-incarnation":3,"resource-epoch":5,"fence-generation":7},"input-digest":"digest-advance","receipt":"receipt-a"}"#)
             .create_async()
             .await;
         let catalog = catalog(&server, &[]).await;
@@ -879,7 +957,7 @@ mod tests {
                 .await
                 .unwrap(),
             AdvanceCtasFenceResponse {
-                generation: 7,
+                generation: generation(7),
                 input_digest: "digest-advance".to_string(),
                 receipt: "receipt-a".to_string(),
             }
@@ -919,7 +997,9 @@ mod tests {
         let stage = server
             .mock("POST", "/v1/extensions/fenced-staged-publication/stage")
             .with_status(200)
-            .with_body(r#"{"staged-locator":"locator","staged-proof":"stage-proof"}"#)
+            .with_body(
+                r#"{"staged-locator":"locator","staged-proof":"stage-proof","staged-table":{}}"#,
+            )
             .create_async()
             .await;
         let inspect = server
@@ -951,6 +1031,7 @@ mod tests {
                 staged_identity: "staged-a".to_string(),
                 initialization_digest: "initialization".to_string(),
                 create_policy_digest: "create-policy".to_string(),
+                create_policy: CtasCreatePolicy::FailIfExists,
                 provider_payload: "payload".to_string(),
             })
             .await
@@ -960,7 +1041,7 @@ mod tests {
             extension
                 .inspect(&InspectCtasTargetRequest {
                     operation: operation(),
-                    generation: 7,
+                    generation: generation(7),
                     input_digest: "inspect-digest".to_string(),
                 })
                 .await
@@ -978,6 +1059,7 @@ mod tests {
                     staged_proof: "stage-proof".to_string(),
                     write_completion_digest: "write-complete".to_string(),
                     create_policy_digest: "create-policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: "payload".to_string(),
                 })
                 .await
@@ -1046,6 +1128,7 @@ mod tests {
                     staged_proof: "proof".to_string(),
                     write_completion_digest: "write".to_string(),
                     create_policy_digest: "policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: String::new(),
                 })
                 .await,
@@ -1095,6 +1178,7 @@ mod tests {
                     staged_proof: "proof".to_string(),
                     write_completion_digest: "write".to_string(),
                     create_policy_digest: "policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: String::new(),
                 })
                 .await,
@@ -1124,7 +1208,7 @@ mod tests {
             extension
                 .inspect(&InspectCtasTargetRequest {
                     operation: operation(),
-                    generation: 7,
+                    generation: generation(7),
                     input_digest: "inspect".to_string(),
                 })
                 .await,
@@ -1210,6 +1294,47 @@ mod tests {
                 response
             );
         }
+
+        let historical_no_op = InspectCtasTargetResponse::NoOp {
+            provenance: "historical-no-op".to_string(),
+            proof: "historical-proof".to_string(),
+            staged_locator: Some("retained-staging".to_string()),
+        };
+        let encoded = serde_json::to_vec(&historical_no_op).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<InspectCtasTargetResponse>(&encoded).unwrap(),
+            historical_no_op
+        );
+
+        let ambiguous_without_proof = InspectCtasTargetResponse::Ambiguous {
+            message: "catalog transaction outcome is unknown".to_string(),
+            proof: None,
+        };
+        let encoded = serde_json::to_vec(&ambiguous_without_proof).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<InspectCtasTargetResponse>(&encoded).unwrap(),
+            ambiguous_without_proof
+        );
+    }
+
+    #[test]
+    fn ordered_generation_round_trips_without_collapsing_control_plane_epochs() {
+        let lower = CtasFencedGeneration {
+            control_plane_incarnation: 3,
+            resource_epoch: u64::MAX,
+            fence_generation: u64::MAX,
+        };
+        let higher = CtasFencedGeneration {
+            control_plane_incarnation: 4,
+            resource_epoch: 1,
+            fence_generation: 1,
+        };
+        assert!(higher > lower);
+        let encoded = serde_json::to_vec(&higher).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CtasFencedGeneration>(&encoded).unwrap(),
+            higher
+        );
     }
 
     #[tokio::test]
@@ -1233,6 +1358,7 @@ mod tests {
                     staged_proof: "proof".to_string(),
                     write_completion_digest: "write".to_string(),
                     create_policy_digest: "policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: String::new(),
                 })
                 .await,
@@ -1302,6 +1428,7 @@ mod tests {
                     staged_proof: "proof".to_string(),
                     write_completion_digest: "write".to_string(),
                     create_policy_digest: "policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: String::new(),
                 })
                 .await,
@@ -1311,7 +1438,7 @@ mod tests {
             extension
                 .inspect(&InspectCtasTargetRequest {
                     operation: operation(),
-                    generation: 7,
+                    generation: generation(7),
                     input_digest: "inspect".to_string(),
                 })
                 .await,
@@ -1354,6 +1481,7 @@ mod tests {
                     staged_proof: "proof".to_string(),
                     write_completion_digest: "write".to_string(),
                     create_policy_digest: "policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: String::new(),
                 })
                 .await,
@@ -1369,7 +1497,7 @@ mod tests {
             format!(
                 "{:?}",
                 AdvanceCtasFenceResponse {
-                    generation: 7,
+                    generation: generation(7),
                     input_digest: "digest".to_string(),
                     receipt: SENTINEL.to_string(),
                 }
@@ -1381,6 +1509,7 @@ mod tests {
                     staged_identity: "identity".to_string(),
                     initialization_digest: "initialization".to_string(),
                     create_policy_digest: "policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: SENTINEL.to_string(),
                 }
             ),
@@ -1389,6 +1518,7 @@ mod tests {
                 StageCtasTargetResponse {
                     staged_locator: SENTINEL.to_string(),
                     staged_proof: SENTINEL.to_string(),
+                    staged_table: serde_json::json!({"secret": SENTINEL}),
                 }
             ),
             format!(
@@ -1406,6 +1536,7 @@ mod tests {
                     staged_proof: SENTINEL.to_string(),
                     write_completion_digest: "write".to_string(),
                     create_policy_digest: "policy".to_string(),
+                    create_policy: CtasCreatePolicy::FailIfExists,
                     provider_payload: SENTINEL.to_string(),
                 }
             ),

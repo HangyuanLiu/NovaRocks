@@ -37,8 +37,19 @@
   `Conflict`; authentication, redirect, rate-limit, missing-endpoint, and
   mismatched status/kind responses fail closed as `Ambiguous`.
 
+- The wire preserves the full lexicographically ordered generation triple
+  (`control-plane-incarnation`, `resource-epoch`, `fence-generation`) rather
+  than collapsing ownership into one counter. Stage and publish also carry the
+  explicit create policy sealed by its digest. A successful stage response
+  embeds the standard REST `LoadTableResult`; `RestCatalog` materializes that
+  result with the same runtime context and FileIO configuration, without a
+  second stage dispatch or client.
+
 - Publication success is a tagged `Published` or `NoOp` disposition, so
-  `IF NOT EXISTS` never collapses into a generic success. Every response body,
+  `IF NOT EXISTS` never collapses into a generic success. Historical `NoOp`
+  may retain an unpublished staged locator for proof-bound cleanup, while an
+  ambiguous observation carries a typed diagnostic and only optional opaque
+  proof. Every response body,
   including 4xx and 5xx bodies, is content-length checked and incrementally
   limited to 64 KiB before decoding. Opaque locators, proofs, receipts,
   provenance, and provider payloads are redacted from `Debug` output.
