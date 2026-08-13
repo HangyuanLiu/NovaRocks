@@ -23,19 +23,22 @@
 //! effect.
 
 use novarocks::engine::ctas_engine::{
-    CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetFacts, CtasTargetPrecheck,
-    CtasTargetPrepareOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
+    CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetFacts,
+    CtasTargetPreflightOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
     PreparedCtasTarget, PreparedCtasWrite,
 };
 use novarocks::query_execution::request_context::RequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
-    ConnectorMutationFailure, ConnectorMutationOperationId, ConnectorStagedCreateAbortOutcome,
-    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreateReceipt,
-    ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateReconcileOutcome,
-    ConnectorStagedCreateReconcilePhase, ConnectorWriteOperationCompletion,
-    ConnectorWriteOperationId, CreatePolicy, ExternalMutationEvidence,
-    ExternalMutationFinalization,
+    ConnectorCtasAbortDisposition, ConnectorCtasActionId, ConnectorCtasConflictKind,
+    ConnectorCtasFailure, ConnectorCtasOperationId, ConnectorCtasPublicationFence,
+    ConnectorCtasPublicationProof, ConnectorCtasPublicationReceipt,
+    ConnectorCtasPublishDisposition, ConnectorCtasStagedLocator, ConnectorHistoricalCtasAction,
+    ConnectorHistoricalCtasCheckpoint, ConnectorHistoricalCtasDescriptor,
+    ConnectorHistoricalCtasDispatchState, ConnectorHistoricalCtasDisposition,
+    ConnectorHistoricalCtasObservation, ConnectorMutationFailure, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorWriteTargetRef, CreatePolicy, ExternalMutationEvidence,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -43,36 +46,20 @@ use uuid::Uuid;
 
 use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::{DmlError, DmlErrorKind};
-#[cfg(test)]
-use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
     CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DML_CTAS_FACT_ENCODED_LIMIT,
-    DmlOperationId, DurableExternalFact, ExternalFactOutcome, OperationKind, OperationPayload,
-    OperationState, OperationTarget, StatementNextAction, StoredOperation,
+    DML_CTAS_RECOVERY_CODEC_VERSION, DmlCtasActionKind, DmlCtasCatalogFenceRecord,
+    DmlCtasCleanupRetention, DmlCtasConflictKind, DmlCtasDispatchCertainty,
+    DmlCtasDispatchCheckpointRecord, DmlCtasHistoricalDisposition,
+    DmlCtasHistoricalObservationRecord, DmlCtasRecoveryRecord, DmlOpaquePayload, DmlOperationId,
+    DurableExternalFact, ExternalFactOutcome, OperationKind, OperationPayload, OperationState,
+    OperationTarget, StatementNextAction, StoredOperation,
 };
 use crate::dml::service::DmlService;
 
 const DURABLE_CTAS_FACT_VERSION: u8 = 1;
 const DURABLE_FAILURE_PREFIX_BYTES: usize = 2 * 1024;
-
-#[derive(Clone, Copy)]
-enum AbortDisposition {
-    SuccessNoOp { retry_finalize: bool },
-    Error(CtasSagaPhase),
-}
-
-#[derive(Serialize)]
-struct DurableCtasReceiptV1<'a> {
-    version: u8,
-    phase: &'static str,
-    effect: &'static str,
-    instance_id: &'a str,
-    incarnation: String,
-    operation_id: String,
-    provider_payload_bytes: usize,
-    provider_payload_sha256: String,
-}
 
 #[derive(Serialize)]
 struct DurableCtasWriteCompletionV1 {
@@ -178,1275 +165,1327 @@ fn execute_ctas_operation(
     context: &RequestContext,
     query_options: Option<&QueryOptions>,
     command: CtasCommand,
-    prepare_operation_id: Uuid,
+    _prepare_operation_id: Uuid,
     policy: CreatePolicy,
     active: &mut ActiveDmlOperation,
 ) -> Result<(), DmlError> {
     let session = context.session();
-    let mut stored = active.stored.clone();
     active.check_before_dispatch()?;
-    let precheck = engine.precheck_ctas_target(
+    let preflight = match engine.preflight_ctas_target(
         &command,
         session.current_catalog(),
         session.current_database(),
-    );
-    if matches!(precheck, Ok(CtasTargetPrecheck::ExistsNoOp)) {
-        let mut record = ctas_record(&stored)?;
-        record.phase = CtasSagaPhase::NoOp;
-        stored = persist(active, stored, OperationState::Committing, record.clone())?;
-        stored = persist(active, stored, OperationState::Committed, record.clone())?;
-        persist(active, stored, OperationState::Finalized, record)?;
-        return Ok(());
-    }
+    ) {
+        Ok(CtasTargetPreflightOutcome::ExistsNoOp) => {
+            let mut record = ctas_record(&active.stored)?;
+            record.phase = CtasSagaPhase::NoOp;
+            record.next_action = StatementNextAction::None;
+            active.mutate_statement(
+                OperationState::Committing,
+                OperationPayload::CtasSaga(record.clone()),
+                None,
+            )?;
+            active.mutate_statement(
+                OperationState::Committed,
+                OperationPayload::CtasSaga(record.clone()),
+                None,
+            )?;
+            active.mutate_statement(
+                OperationState::Finalized,
+                OperationPayload::CtasSaga(record),
+                None,
+            )?;
+            return Ok(());
+        }
+        Ok(CtasTargetPreflightOutcome::Ready(preflight)) => preflight,
+        Err(failure) => return finish_source_failure(active, active.stored.clone(), failure),
+    };
+    validate_preflight_facts(&active.stored, &preflight.facts)?;
 
-    if let Err(failure) = precheck {
-        return finish_source_failure(active, stored, failure);
-    }
-
-    active.check_before_dispatch()?;
-    let source = match engine.prepare_ctas_source(PrepareCtasSourceRequest {
-        command,
-        current_catalog: session.current_catalog().map(ToOwned::to_owned),
-        current_database: session.current_database().to_string(),
-        query_options: query_options.cloned(),
-        execution: context.execution().clone(),
-    }) {
-        Ok(source) => source,
+    let proposal = active.external_fence()?;
+    let table = ConnectorTableIdentity {
+        instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+            &preflight.facts.instance_id,
+        )
+        .map_err(DmlError::executor)?,
+        namespace: preflight.facts.target_namespace.clone().into(),
+        table: preflight.facts.target_table.clone().into(),
+    };
+    let generic_fence = proposal
+        .seal(
+            ConnectorWriteOperationId::from_bytes(*active.operation_id().as_uuid().as_bytes()),
+            table.clone(),
+            ConnectorWriteTargetRef::main(),
+        )
+        .map_err(DmlError::executor)?;
+    let fence = ConnectorCtasPublicationFence::try_new(
+        generic_fence.cluster(),
+        generic_fence.generation(),
+        ConnectorCtasOperationId::try_from_bytes(*active.operation_id().as_uuid().as_bytes())
+            .map_err(DmlError::executor)?,
+        table,
+    )
+    .map_err(DmlError::executor)?;
+    let fence_action_id =
+        ConnectorCtasActionId::try_from_bytes(*proposal.coordination_attempt_id().as_bytes())
+            .map_err(DmlError::executor)?;
+    let fence_action = match engine.prepare_ctas_fence_advance(
+        preflight.handle.as_ref(),
+        fence.clone(),
+        fence_action_id,
+    ) {
+        Ok(action) => action,
         Err(failure) => {
-            return finish_source_failure(active, stored, failure);
+            return finish_source_failure(active, active.stored.clone(), failure);
         }
     };
-    if let Err(error) = validate_source_facts(
-        &stored,
+    let mut recovery = new_recovery_record(
+        &preflight.facts,
+        proposal.coordination_attempt_id(),
+        proposal.generation(),
+        fence_action_id,
+        fence_action.input_digest,
+    )?;
+    record_recovery(active, &recovery)?;
+    mark_fence_dispatched(&mut recovery);
+    record_recovery(active, &recovery)?;
+    active.check_before_dispatch()?;
+    let fence_receipt = match engine.advance_ctas_fence(fence_action.handle.as_ref()) {
+        Ok(receipt) => receipt,
+        Err(failure) if catalog_failure_is_terminal(&failure) => {
+            return finish_catalog_terminal_failure(active, recovery, FactSlot::Prepare, failure);
+        }
+        Err(failure) => {
+            return finish_catalog_unknown(
+                active,
+                recovery,
+                CtasSagaPhase::PrepareUnknown,
+                FactSlot::Prepare,
+                failure,
+            );
+        }
+    };
+    recovery
+        .catalog_fence
+        .as_mut()
+        .expect("fence record")
+        .fence_digest = Some(hex::encode(fence.digest()));
+    recovery
+        .catalog_fence
+        .as_mut()
+        .expect("fence record")
+        .receipt_digest = Some(hex::encode(fence_receipt.digest()));
+    recovery
+        .catalog_fence
+        .as_mut()
+        .expect("fence record")
+        .receipt_payload = Some(
+        DmlOpaquePayload::try_new(fence_receipt.payload().to_vec())
+            .map_err(DmlError::journal_corruption)?,
+    );
+    recovery
+        .catalog_fence
+        .as_mut()
+        .expect("fence record")
+        .established_at_ms = Some(crate::dml::now_unix_millis());
+    recovery.next_action = StatementNextAction::None;
+    record_recovery(active, &recovery)?;
+
+    active.check_before_dispatch()?;
+    let source = match engine.prepare_ctas_source(
+        preflight.handle.as_ref(),
+        PrepareCtasSourceRequest {
+            command,
+            current_catalog: session.current_catalog().map(ToOwned::to_owned),
+            current_database: session.current_database().to_string(),
+            query_options: query_options.cloned(),
+            execution: context.execution().clone(),
+        },
+    ) {
+        Ok(source) => source,
+        Err(failure) => return finish_source_failure(active, active.stored.clone(), failure),
+    };
+    validate_source_facts(
+        &active.stored,
         &source,
         session.current_catalog(),
         session.current_database(),
-    ) {
-        return finish_source_failure(
-            active,
-            stored,
-            CtasFailure {
-                kind: CtasFailureKind::Internal,
-                message: error.to_string(),
-            },
-        );
-    }
-    let mut record = ctas_record(&stored)?;
-    record.phase = CtasSagaPhase::PreparingStagedTable;
-    record.source_plan_digest = Some(hex::encode(source.facts.plan_digest));
-    record.source_schema_digest = Some(hex::encode(source.facts.schema_digest));
-    record.source_execution_identity = Some(hex::encode(source.facts.execution_identity));
-    stored = persist(active, stored, OperationState::Preparing, record)?;
-    if let Err(error) = preflight_external_truth(active, &stored) {
-        return finish_source_failure(
-            active,
-            stored,
-            CtasFailure {
-                kind: CtasFailureKind::Internal,
-                message: format!("CTAS journal cannot retain worst-case external truth: {error}"),
-            },
-        );
-    }
+    )?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::PreparingStagedTable;
+    saga.provider_id = Some(preflight.facts.provider_id.clone());
+    saga.connector_instance_id = Some(preflight.facts.instance_id.clone());
+    saga.connector_incarnation = Some(hex::encode(preflight.facts.incarnation));
+    saga.source_plan_digest = Some(hex::encode(source.facts.plan_digest));
+    saga.source_schema_digest = Some(hex::encode(source.facts.schema_digest));
+    saga.source_execution_identity = Some(hex::encode(source.facts.execution_identity));
+    active.mutate_statement(
+        OperationState::Preparing,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
 
-    active.check_before_dispatch()?;
-    let outcome = engine.prepare_ctas_target(
+    let stage_uuid = ctas_record(&active.stored)?.prepare_operation_id;
+    let stage_action_id = connector_action_id(stage_uuid)?;
+    let stage_action = match engine.prepare_ctas_target(
         source.handle.as_ref(),
-        ConnectorMutationOperationId::from_bytes(*prepare_operation_id.as_bytes()),
+        fence.clone(),
+        stage_action_id,
         policy,
+    ) {
+        Ok(action) => action,
+        Err(failure) => {
+            return finish_local_catalog_preparation_failure(
+                active,
+                recovery,
+                FactSlot::Prepare,
+                failure,
+            );
+        }
+    };
+    append_checkpoint(
+        &mut recovery,
+        DmlCtasActionKind::Stage,
+        stage_uuid,
+        stage_action.input_digest,
     );
-    match outcome {
-        Err(failure) => finish_source_failure(active, stored, failure),
-        Ok(CtasTargetPrepareOutcome::Prepared {
-            target,
-            receipt,
-            finalization,
-        }) => finish_prepared_target(
+    record_recovery(active, &recovery)?;
+    mark_checkpoint_dispatched(&mut recovery, DmlCtasActionKind::Stage, stage_uuid);
+    record_recovery(active, &recovery)?;
+    active.check_before_dispatch()?;
+    let stage = match engine.stage_ctas_target(stage_action.handle.as_ref()) {
+        Ok(stage) => stage,
+        Err(failure) if catalog_failure_is_terminal(&failure) => {
+            return finish_catalog_terminal_failure(active, recovery, FactSlot::Prepare, failure);
+        }
+        Err(failure) => {
+            return finish_catalog_unknown(
+                active,
+                recovery,
+                CtasSagaPhase::PrepareUnknown,
+                FactSlot::Prepare,
+                failure,
+            );
+        }
+    };
+    validate_target_facts_v2(
+        &active.stored,
+        &preflight.facts,
+        &fence,
+        &stage.target.facts,
+        &stage.locator,
+        stage_uuid,
+    )?;
+    recovery.staged_locator = Some(
+        DmlOpaquePayload::try_new(
+            stage
+                .locator
+                .try_to_wire_v1()
+                .map_err(DmlError::executor)?
+                .to_vec(),
+        )
+        .map_err(DmlError::journal_corruption)?,
+    );
+    recovery.staged_locator_digest = Some(hex::encode(stage.locator.digest()));
+    recovery.staged_proof_digest = Some(hex::encode(stage.proof.digest()));
+    recovery.staged_proof = Some(
+        DmlOpaquePayload::try_new(
+            stage
+                .proof
+                .try_to_wire_v1()
+                .map_err(DmlError::executor)?
+                .to_vec(),
+        )
+        .map_err(DmlError::journal_corruption)?,
+    );
+    recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+    recovery.next_action = StatementNextAction::AbortStaging;
+    record_recovery(active, &recovery)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::Staged;
+    saga.staged_handle_digest = Some(hex::encode(stage.target.facts.locator_digest));
+    saga.prepare_fact = Some(publication_fact(
+        ExternalFactOutcome::KnownCommitted,
+        &stage.receipt,
+    ));
+    saga.next_action = StatementNextAction::None;
+    active.mutate_statement(
+        OperationState::Writing,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
+    let historical_context = novarocks::connector::connector_request_context_for_execution(
+        query_options,
+        context.execution(),
+    )
+    .map_err(DmlError::executor)?;
+    execute_foreground_write(
+        engine,
+        active,
+        recovery,
+        source,
+        stage.target,
+        ForegroundStageAuthority {
+            locator: stage.locator,
+            proof: stage.proof,
+            create_policy: policy,
+            historical_context,
+        },
+    )
+}
+
+struct ForegroundStageAuthority {
+    locator: ConnectorCtasStagedLocator,
+    proof: ConnectorCtasPublicationProof,
+    create_policy: CreatePolicy,
+    historical_context: ConnectorRequestContext,
+}
+
+fn execute_foreground_write(
+    engine: &dyn CtasEngine,
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    source: PreparedCtasSource,
+    target: PreparedCtasTarget,
+    authority: ForegroundStageAuthority,
+) -> Result<(), DmlError> {
+    let write_uuid = ctas_record(&active.stored)?.write_operation_id;
+    let prepared = match engine.prepare_ctas_write(
+        source.handle.as_ref(),
+        target.handle.as_ref(),
+        ConnectorWriteOperationId::from_bytes(*write_uuid.as_bytes()),
+    ) {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            return abort_foreground(
+                engine,
+                active,
+                recovery,
+                &target,
+                &authority,
+                failure_fact(&failure),
+                format_failure("CTAS write preparation failed", &failure),
+            );
+        }
+    };
+    validate_prepared_write(&active.stored, &source, &target, &prepared)?;
+    append_checkpoint(
+        &mut recovery,
+        DmlCtasActionKind::Write,
+        write_uuid,
+        prepared.execution_identity,
+    );
+    record_recovery(active, &recovery)?;
+    mark_checkpoint_dispatched(&mut recovery, DmlCtasActionKind::Write, write_uuid);
+    record_recovery(active, &recovery)?;
+    active.check_before_dispatch()?;
+    match engine.execute_ctas_write(prepared.handle.as_ref()) {
+        CtasWriteOutcome::Completed {
+            completion,
+            execution_identity,
+        } => {
+            validate_completion(
+                &active.stored,
+                &source,
+                &target,
+                &prepared,
+                &completion,
+                execution_identity,
+            )?;
+            let (encoded, cohort) = encode_write_completion(&completion)?;
+            let mut saga = ctas_record(&active.stored)?;
+            saga.phase = CtasSagaPhase::Publishing;
+            saga.write_cohort_id = Some(cohort);
+            saga.aggregate_write_digest = Some(hex::encode(completion.aggregate_digest()));
+            saga.write_fact = Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::KnownCommitted,
+                receipt: Some(encoded),
+                evidence: None,
+                finalization_failure: None,
+                failure: None,
+            });
+            active.mutate_statement(
+                OperationState::Committing,
+                OperationPayload::CtasSaga(saga),
+                None,
+            )?;
+            publish_foreground(engine, active, recovery, target, authority, completion)
+        }
+        CtasWriteOutcome::KnownUncommitted { failure } => abort_foreground(
             engine,
             active,
-            stored,
-            source,
-            target,
-            receipt,
-            finalization,
+            recovery,
+            &target,
+            &authority,
+            failure_fact(&failure),
+            format_failure("CTAS writer is known uncommitted", &failure),
         ),
-        Ok(CtasTargetPrepareOutcome::Conflict { failure }) => {
-            finish_prepare_conflict(active, stored, failure)
-        }
-        Ok(CtasTargetPrepareOutcome::KnownUncommitted { failure }) => {
-            finish_prepare_known_uncommitted(active, stored, failure)
-        }
-        Ok(CtasTargetPrepareOutcome::CommitUnknown {
-            target,
-            failure,
-            evidence,
-        }) => finish_prepare_unknown(
-            engine,
-            active,
-            stored,
-            source,
-            target,
-            failure,
-            Some(evidence),
-            true,
-        ),
-        Ok(CtasTargetPrepareOutcome::ContractUnknown { target, failure }) => {
-            finish_prepare_unknown(engine, active, stored, source, target, failure, None, false)
+        CtasWriteOutcome::CommitUnknown { failure, evidence } => {
+            let mut saga = ctas_record(&active.stored)?;
+            saga.phase = CtasSagaPhase::WriteUnknown;
+            saga.write_fact = Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::CommitUnknown,
+                receipt: None,
+                evidence: encode_evidence(&evidence).ok(),
+                finalization_failure: None,
+                failure: Some(encode_failure(&failure)),
+            });
+            saga.next_action = StatementNextAction::ManualInspect;
+            recovery.next_action = StatementNextAction::ManualInspect;
+            record_recovery(active, &recovery)?;
+            active.mutate_statement(
+                OperationState::CommitUnknown,
+                OperationPayload::CtasSaga(saga),
+                Some(crate::dml::now_unix_millis()),
+            )?;
+            Err(unknown_error(
+                active.operation_id(),
+                "CTAS writer",
+                &failure,
+            ))
         }
     }
 }
 
+fn publish_foreground(
+    engine: &dyn CtasEngine,
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    target: PreparedCtasTarget,
+    authority: ForegroundStageAuthority,
+    completion: ConnectorWriteOperationCompletion,
+) -> Result<(), DmlError> {
+    let publish_uuid = ctas_record(&active.stored)?.publish_operation_id;
+    let action = match engine.prepare_publish_ctas(
+        target.handle.as_ref(),
+        connector_action_id(publish_uuid)?,
+        completion,
+    ) {
+        Ok(action) => action,
+        Err(failure) => {
+            let fact = failure_fact(&failure);
+            let cause = format_failure("CTAS publish preparation failed", &failure);
+            return abort_foreground(engine, active, recovery, &target, &authority, fact, cause);
+        }
+    };
+    append_checkpoint(
+        &mut recovery,
+        DmlCtasActionKind::Publish,
+        publish_uuid,
+        action.input_digest,
+    );
+    record_recovery(active, &recovery)?;
+    mark_checkpoint_dispatched(&mut recovery, DmlCtasActionKind::Publish, publish_uuid);
+    record_recovery(active, &recovery)?;
+    active.check_before_dispatch()?;
+    let result = match engine.publish_ctas(action.handle.as_ref()) {
+        Ok(result) => result,
+        Err(failure) if catalog_failure_is_terminal(&failure) => {
+            let fact = connector_failure_fact(&failure);
+            let cause = format!("CTAS publish was rejected: {}", failure.failure());
+            return abort_foreground(engine, active, recovery, &target, &authority, fact, cause);
+        }
+        Err(failure) => {
+            return finish_catalog_unknown(
+                active,
+                recovery,
+                CtasSagaPhase::PublishUnknown,
+                FactSlot::Publish,
+                failure,
+            );
+        }
+    };
+    let disposition = match result.disposition {
+        ConnectorCtasPublishDisposition::Published => DmlCtasHistoricalDisposition::Published,
+        ConnectorCtasPublishDisposition::NoOp => DmlCtasHistoricalDisposition::NoOp,
+    };
+    recovery
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action: DmlCtasActionKind::Publish,
+            child_operation_id: publish_uuid,
+            disposition,
+            descriptor_digest: hex::encode(target.facts.fence_digest),
+            descriptor_locator_digest: Some(hex::encode(target.facts.locator_digest)),
+            observation_digest: hex::encode(result.digest()),
+            locator_digest: (disposition == DmlCtasHistoricalDisposition::NoOp)
+                .then(|| hex::encode(target.facts.locator_digest)),
+            proof_digest: Some(hex::encode(result.proof.digest())),
+            proof_payload: Some(
+                DmlOpaquePayload::try_new(
+                    result
+                        .proof
+                        .try_to_wire_v1()
+                        .map_err(DmlError::executor)?
+                        .to_vec(),
+                )
+                .map_err(DmlError::journal_corruption)?,
+            ),
+            conflict_kind: None,
+            failure: None,
+            observed_at_ms: crate::dml::now_unix_millis(),
+        });
+    let mut saga = ctas_record(&active.stored)?;
+    saga.publish_fact = Some(publication_fact(
+        if result.disposition == ConnectorCtasPublishDisposition::NoOp {
+            ExternalFactOutcome::NoOp
+        } else {
+            ExternalFactOutcome::KnownCommitted
+        },
+        &result.receipt,
+    ));
+    saga.phase = if result.disposition == ConnectorCtasPublishDisposition::NoOp {
+        CtasSagaPhase::NoOp
+    } else {
+        CtasSagaPhase::Committed
+    };
+    saga.next_action = StatementNextAction::None;
+    if result.disposition == ConnectorCtasPublishDisposition::NoOp {
+        recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+        recovery.next_action = StatementNextAction::AbortStaging;
+    } else {
+        recovery.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+        recovery.next_action = StatementNextAction::None;
+    }
+    record_recovery(active, &recovery)?;
+    active.mutate_statement(
+        OperationState::Committed,
+        OperationPayload::CtasSaga(saga.clone()),
+        None,
+    )?;
+    active.mutate_statement(
+        OperationState::Finalized,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
+    Ok(())
+}
+
+fn inspect_foreground_visibility(
+    engine: &dyn CtasEngine,
+    active: &mut ActiveDmlOperation,
+    recovery: &mut DmlCtasRecoveryRecord,
+    authority: &ForegroundStageAuthority,
+) -> Result<(ConnectorHistoricalCtasObservation, String), DmlError> {
+    let descriptor = foreground_historical_descriptor(recovery, authority)?;
+    active.check_before_dispatch()?;
+    let observation = match engine
+        .inspect_historical_ctas(descriptor.clone(), authority.historical_context.clone())
+    {
+        Ok(observation) => observation,
+        Err(failure) => {
+            return match finish_catalog_unknown(
+                active,
+                recovery.clone(),
+                CtasSagaPhase::AbortUnknown,
+                FactSlot::Abort,
+                failure,
+            ) {
+                Err(error) => Err(error),
+                Ok(()) => unreachable!("unresolved CTAS inspection cannot succeed"),
+            };
+        }
+    };
+    let (action, child_operation_id) = observation_checkpoint_identity(recovery, &observation)?;
+    let disposition = durable_historical_disposition(observation.disposition);
+    let proof_payload = observation
+        .proof
+        .as_ref()
+        .map(|proof| {
+            proof
+                .try_to_wire_v1()
+                .map_err(DmlError::executor)
+                .and_then(|wire| {
+                    DmlOpaquePayload::try_new(wire.to_vec()).map_err(DmlError::journal_corruption)
+                })
+        })
+        .transpose()?;
+    let descriptor_digest = hex::encode(descriptor.digest());
+    recovery
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action,
+            child_operation_id,
+            disposition,
+            descriptor_digest: descriptor_digest.clone(),
+            descriptor_locator_digest: recovery.staged_locator_digest.clone(),
+            observation_digest: hex::encode(observation.digest()),
+            locator_digest: observation
+                .locator
+                .as_ref()
+                .map(|locator| hex::encode(locator.digest())),
+            proof_digest: observation
+                .proof
+                .as_ref()
+                .map(|proof| hex::encode(proof.digest())),
+            proof_payload,
+            conflict_kind: observation.conflict_kind.map(durable_conflict_kind),
+            failure: observation
+                .failure
+                .as_ref()
+                .map(|failure| format!("{:?}: {}", failure.kind(), failure.message())),
+            observed_at_ms: crate::dml::now_unix_millis(),
+        });
+    recovery.next_action = StatementNextAction::ManualInspect;
+    record_recovery(active, recovery)?;
+    Ok((observation, descriptor_digest))
+}
+
+fn foreground_historical_descriptor(
+    recovery: &DmlCtasRecoveryRecord,
+    authority: &ForegroundStageAuthority,
+) -> Result<ConnectorHistoricalCtasDescriptor, DmlError> {
+    let fence = recovery
+        .catalog_fence
+        .as_ref()
+        .ok_or_else(|| DmlError::journal_corruption("CTAS recovery has no catalog fence"))?;
+    let fence_receipt_digest = decode_digest(
+        fence
+            .receipt_digest
+            .as_deref()
+            .ok_or_else(|| DmlError::journal_corruption("CTAS catalog fence has no receipt"))?,
+        "CTAS catalog fence receipt",
+    )?;
+    let mut checkpoints = vec![ConnectorHistoricalCtasCheckpoint {
+        action_id: connector_action_id(fence.action_id)?,
+        action: ConnectorHistoricalCtasAction::AdvanceFence,
+        dispatch: ConnectorHistoricalCtasDispatchState::Completed,
+        input_digest: decode_digest(&fence.request_digest, "CTAS advance-fence request")?,
+        evidence_digest: Some(fence_receipt_digest),
+    }];
+    for checkpoint in &recovery.dispatch_checkpoints {
+        let action = match checkpoint.action {
+            DmlCtasActionKind::Stage => ConnectorHistoricalCtasAction::Stage,
+            DmlCtasActionKind::Publish => ConnectorHistoricalCtasAction::Publish,
+            DmlCtasActionKind::Abort => ConnectorHistoricalCtasAction::Abort,
+            DmlCtasActionKind::Write => continue,
+        };
+        let evidence_digest = if checkpoint.action == DmlCtasActionKind::Stage {
+            Some(authority.proof.digest())
+        } else {
+            recovery
+                .historical_observations
+                .iter()
+                .rev()
+                .find(|observation| {
+                    observation.action == checkpoint.action
+                        && observation.child_operation_id == checkpoint.child_operation_id
+                })
+                .and_then(|observation| observation.proof_digest.as_deref())
+                .map(|digest| decode_digest(digest, "CTAS checkpoint evidence"))
+                .transpose()?
+        };
+        let dispatch = if evidence_digest.is_some() {
+            ConnectorHistoricalCtasDispatchState::Completed
+        } else {
+            match checkpoint.dispatch_certainty {
+                DmlCtasDispatchCertainty::ConfirmedNotDispatched => {
+                    ConnectorHistoricalCtasDispatchState::NotDispatched
+                }
+                DmlCtasDispatchCertainty::PossiblyDispatched => {
+                    ConnectorHistoricalCtasDispatchState::Unknown
+                }
+            }
+        };
+        checkpoints.push(ConnectorHistoricalCtasCheckpoint {
+            action_id: connector_action_id(checkpoint.child_operation_id)?,
+            action,
+            dispatch,
+            input_digest: decode_digest(&checkpoint.request_digest, "CTAS action request")?,
+            evidence_digest,
+        });
+    }
+    ConnectorHistoricalCtasDescriptor::try_new(
+        authority.locator.issuance_owner().clone(),
+        authority.locator.issuance_fence().clone(),
+        fence_receipt_digest,
+        authority.locator.target_digest(),
+        authority.create_policy,
+        Some(authority.locator.clone()),
+        checkpoints,
+        Some(authority.proof.clone()),
+    )
+    .map_err(DmlError::executor)
+}
+
+fn observation_checkpoint_identity(
+    recovery: &DmlCtasRecoveryRecord,
+    observation: &ConnectorHistoricalCtasObservation,
+) -> Result<(DmlCtasActionKind, Uuid), DmlError> {
+    let preferred = match observation.disposition {
+        ConnectorHistoricalCtasDisposition::Published => DmlCtasActionKind::Publish,
+        ConnectorHistoricalCtasDisposition::Aborted => DmlCtasActionKind::Abort,
+        _ => DmlCtasActionKind::Stage,
+    };
+    recovery
+        .dispatch_checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.action == preferred)
+        .or_else(|| {
+            recovery
+                .dispatch_checkpoints
+                .iter()
+                .rev()
+                .find(|checkpoint| checkpoint.action == DmlCtasActionKind::Stage)
+        })
+        .map(|checkpoint| (checkpoint.action, checkpoint.child_operation_id))
+        .ok_or_else(|| DmlError::journal_corruption("CTAS inspection has no durable checkpoint"))
+}
+
+const fn durable_historical_disposition(
+    disposition: ConnectorHistoricalCtasDisposition,
+) -> DmlCtasHistoricalDisposition {
+    match disposition {
+        ConnectorHistoricalCtasDisposition::NotCreated => DmlCtasHistoricalDisposition::Absent,
+        ConnectorHistoricalCtasDisposition::Staged => DmlCtasHistoricalDisposition::Staged,
+        ConnectorHistoricalCtasDisposition::Published => DmlCtasHistoricalDisposition::Published,
+        ConnectorHistoricalCtasDisposition::NoOp => DmlCtasHistoricalDisposition::NoOp,
+        ConnectorHistoricalCtasDisposition::Aborted => DmlCtasHistoricalDisposition::Aborted,
+        ConnectorHistoricalCtasDisposition::Conflict => DmlCtasHistoricalDisposition::Conflict,
+        ConnectorHistoricalCtasDisposition::Ambiguous => DmlCtasHistoricalDisposition::Ambiguous,
+        ConnectorHistoricalCtasDisposition::Unsupported => {
+            DmlCtasHistoricalDisposition::Unsupported
+        }
+    }
+}
+
+const fn durable_conflict_kind(kind: ConnectorCtasConflictKind) -> DmlCtasConflictKind {
+    match kind {
+        ConnectorCtasConflictKind::StaleFence => DmlCtasConflictKind::StaleFence,
+        ConnectorCtasConflictKind::IdentityConflict => DmlCtasConflictKind::IdentityConflict,
+        ConnectorCtasConflictKind::DigestConflict => DmlCtasConflictKind::DigestConflict,
+        ConnectorCtasConflictKind::AlreadyPublished => DmlCtasConflictKind::AlreadyPublished,
+        ConnectorCtasConflictKind::AlreadyAborted => DmlCtasConflictKind::AlreadyAborted,
+        ConnectorCtasConflictKind::CreatePolicyConflict => {
+            DmlCtasConflictKind::CreatePolicyConflict
+        }
+    }
+}
+
+fn decode_digest(value: &str, label: &str) -> Result<[u8; 32], DmlError> {
+    let bytes = hex::decode(value).map_err(|error| {
+        DmlError::journal_corruption(format!("{label} digest is not hexadecimal: {error}"))
+    })?;
+    bytes
+        .try_into()
+        .map_err(|_| DmlError::journal_corruption(format!("{label} digest is not 32 bytes")))
+}
+
+fn historical_observation_fact(
+    observation: &ConnectorHistoricalCtasObservation,
+) -> DurableExternalFact {
+    let outcome = match observation.disposition {
+        ConnectorHistoricalCtasDisposition::Published => ExternalFactOutcome::KnownCommitted,
+        ConnectorHistoricalCtasDisposition::NoOp => ExternalFactOutcome::NoOp,
+        ConnectorHistoricalCtasDisposition::NotCreated
+        | ConnectorHistoricalCtasDisposition::Aborted
+        | ConnectorHistoricalCtasDisposition::Staged => ExternalFactOutcome::KnownUncommitted,
+        ConnectorHistoricalCtasDisposition::Conflict => ExternalFactOutcome::Conflict,
+        ConnectorHistoricalCtasDisposition::Unsupported => ExternalFactOutcome::Unsupported,
+        ConnectorHistoricalCtasDisposition::Ambiguous => ExternalFactOutcome::CommitUnknown,
+    };
+    DurableExternalFact {
+        outcome,
+        receipt: Some(hex::encode(observation.digest())),
+        evidence: observation
+            .proof
+            .as_ref()
+            .and_then(|proof| proof.try_to_wire_v1().ok())
+            .map(hex::encode),
+        finalization_failure: None,
+        failure: observation
+            .failure
+            .as_ref()
+            .map(|failure| format!("{:?}: {}", failure.kind(), failure.message())),
+    }
+}
+
+fn abort_foreground(
+    engine: &dyn CtasEngine,
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    target: &PreparedCtasTarget,
+    authority: &ForegroundStageAuthority,
+    cause_fact: DurableExternalFact,
+    cause: String,
+) -> Result<(), DmlError> {
+    let (observation, descriptor_digest) =
+        inspect_foreground_visibility(engine, active, &mut recovery, authority)?;
+    match observation.disposition {
+        ConnectorHistoricalCtasDisposition::Published => {
+            recovery.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+            recovery.next_action = StatementNextAction::None;
+            record_recovery(active, &recovery)?;
+            let mut saga = ctas_record(&active.stored)?;
+            saga.phase = CtasSagaPhase::Committed;
+            saga.publish_fact = Some(historical_observation_fact(&observation));
+            saga.next_action = StatementNextAction::None;
+            if active.stored.state != OperationState::Committing {
+                active.mutate_statement(
+                    OperationState::Committing,
+                    OperationPayload::CtasSaga(saga.clone()),
+                    None,
+                )?;
+            }
+            active.mutate_statement(
+                OperationState::Committed,
+                OperationPayload::CtasSaga(saga.clone()),
+                None,
+            )?;
+            active.mutate_statement(
+                OperationState::Finalized,
+                OperationPayload::CtasSaga(saga),
+                None,
+            )?;
+            return Ok(());
+        }
+        ConnectorHistoricalCtasDisposition::NotCreated
+        | ConnectorHistoricalCtasDisposition::Aborted => {
+            recovery.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+            recovery.next_action = StatementNextAction::None;
+            record_recovery(active, &recovery)?;
+            let mut saga = ctas_record(&active.stored)?;
+            saga.phase = CtasSagaPhase::Failed;
+            saga.write_fact = Some(cause_fact);
+            saga.abort_staging_fact = Some(historical_observation_fact(&observation));
+            saga.next_action = StatementNextAction::None;
+            if active.stored.state != OperationState::Aborting {
+                active.mutate_statement(
+                    OperationState::Aborting,
+                    OperationPayload::CtasSaga(saga.clone()),
+                    None,
+                )?;
+            }
+            active.mutate_statement(
+                OperationState::Aborted,
+                OperationPayload::CtasSaga(saga),
+                None,
+            )?;
+            return Err(operation_error(
+                DmlErrorKind::Executor,
+                active.operation_id(),
+                StatementNextAction::None,
+                cause,
+            ));
+        }
+        ConnectorHistoricalCtasDisposition::Staged | ConnectorHistoricalCtasDisposition::NoOp => {}
+        ConnectorHistoricalCtasDisposition::Conflict
+        | ConnectorHistoricalCtasDisposition::Ambiguous
+        | ConnectorHistoricalCtasDisposition::Unsupported => {
+            recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+            recovery.next_action = StatementNextAction::ManualInspect;
+            record_recovery(active, &recovery)?;
+            let mut saga = ctas_record(&active.stored)?;
+            saga.phase = CtasSagaPhase::AbortUnknown;
+            saga.write_fact = Some(cause_fact);
+            saga.abort_staging_fact = Some(historical_observation_fact(&observation));
+            saga.next_action = StatementNextAction::ManualInspect;
+            active.mutate_statement(
+                OperationState::CommitUnknown,
+                OperationPayload::CtasSaga(saga),
+                Some(crate::dml::now_unix_millis()),
+            )?;
+            return Err(operation_error(
+                DmlErrorKind::Commit,
+                active.operation_id(),
+                StatementNextAction::ManualInspect,
+                format!("CTAS visibility is unresolved; cleanup was not dispatched: {cause}"),
+            ));
+        }
+    }
+    let abort_uuid = ctas_record(&active.stored)?.abort_staging_operation_id;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::AbortingStaging;
+    saga.write_fact = Some(cause_fact.clone());
+    saga.next_action = StatementNextAction::AbortStaging;
+    active.mutate_statement(
+        OperationState::Aborting,
+        OperationPayload::CtasSaga(saga),
+        Some(crate::dml::now_unix_millis()),
+    )?;
+    let action =
+        match engine.prepare_abort_ctas(target.handle.as_ref(), connector_action_id(abort_uuid)?) {
+            Ok(action) => action,
+            Err(failure) => {
+                return finish_local_catalog_preparation_failure_with_cause(
+                    active,
+                    recovery,
+                    FactSlot::Abort,
+                    failure,
+                    cause_fact,
+                    cause,
+                );
+            }
+        };
+    append_checkpoint(
+        &mut recovery,
+        DmlCtasActionKind::Abort,
+        abort_uuid,
+        action.input_digest,
+    );
+    record_recovery(active, &recovery)?;
+    mark_checkpoint_dispatched(&mut recovery, DmlCtasActionKind::Abort, abort_uuid);
+    record_recovery(active, &recovery)?;
+    active.check_before_dispatch()?;
+    let result = match engine.abort_ctas(action.handle.as_ref()) {
+        Ok(result) => result,
+        Err(failure) if catalog_failure_is_terminal(&failure) => {
+            return finish_catalog_terminal_failure_with_cause(
+                active,
+                recovery,
+                FactSlot::Abort,
+                failure,
+                cause_fact,
+                cause,
+            );
+        }
+        Err(failure) => {
+            return finish_catalog_unknown(
+                active,
+                recovery,
+                CtasSagaPhase::AbortUnknown,
+                FactSlot::Abort,
+                failure,
+            );
+        }
+    };
+    debug_assert_eq!(result.disposition, ConnectorCtasAbortDisposition::Aborted);
+    recovery
+        .historical_observations
+        .push(DmlCtasHistoricalObservationRecord {
+            action: DmlCtasActionKind::Abort,
+            child_operation_id: abort_uuid,
+            disposition: DmlCtasHistoricalDisposition::Aborted,
+            descriptor_digest,
+            descriptor_locator_digest: Some(hex::encode(target.facts.locator_digest)),
+            observation_digest: hex::encode(result.digest()),
+            locator_digest: None,
+            proof_digest: Some(hex::encode(result.proof.digest())),
+            proof_payload: Some(
+                DmlOpaquePayload::try_new(
+                    result
+                        .proof
+                        .try_to_wire_v1()
+                        .map_err(DmlError::executor)?
+                        .to_vec(),
+                )
+                .map_err(DmlError::journal_corruption)?,
+            ),
+            conflict_kind: None,
+            failure: None,
+            observed_at_ms: crate::dml::now_unix_millis(),
+        });
+    recovery.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+    recovery.next_action = StatementNextAction::None;
+    record_recovery(active, &recovery)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::Failed;
+    saga.write_fact = Some(cause_fact);
+    saga.abort_staging_fact = Some(publication_fact(
+        ExternalFactOutcome::KnownCommitted,
+        &result.receipt,
+    ));
+    saga.next_action = StatementNextAction::None;
+    active.mutate_statement(
+        OperationState::Aborted,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
+    Err(operation_error(
+        DmlErrorKind::Executor,
+        active.operation_id(),
+        StatementNextAction::None,
+        cause,
+    ))
+}
+
+fn new_recovery_record(
+    facts: &novarocks::engine::ctas_engine::CtasTargetPreflightFacts,
+    attempt_id: Uuid,
+    generation: crate::dml::model::DmlExternalFenceGeneration,
+    action_id: ConnectorCtasActionId,
+    request_digest: [u8; 32],
+) -> Result<DmlCtasRecoveryRecord, DmlError> {
+    if facts.capability_version != 1 {
+        return Err(DmlError::executor(
+            "CTAS requires exact capability version 1",
+        ));
+    }
+    Ok(DmlCtasRecoveryRecord {
+        codec_version: DML_CTAS_RECOVERY_CODEC_VERSION,
+        capability_version: facts.capability_version,
+        recovery_attempt_id: attempt_id,
+        recovery_cycle: 1,
+        catalog_fence: Some(DmlCtasCatalogFenceRecord {
+            generation,
+            action_id: Uuid::from_bytes(action_id.to_bytes()),
+            request_digest: hex::encode(request_digest),
+            dispatch_certainty: DmlCtasDispatchCertainty::ConfirmedNotDispatched,
+            dispatched_at_ms: None,
+            fence_digest: None,
+            receipt_digest: None,
+            receipt_payload: None,
+            established_at_ms: None,
+        }),
+        staged_locator: None,
+        staged_locator_digest: None,
+        staged_proof_digest: None,
+        staged_proof: None,
+        dispatch_checkpoints: Vec::new(),
+        historical_observations: Vec::new(),
+        child_supersessions: Vec::new(),
+        cleanup_retention: DmlCtasCleanupRetention::NotRequired,
+        cleanup_receipt: None,
+        next_action: StatementNextAction::ManualInspect,
+        updated_at_ms: crate::dml::now_unix_millis(),
+    })
+}
+
+fn record_recovery(
+    active: &mut ActiveDmlOperation,
+    recovery: &DmlCtasRecoveryRecord,
+) -> Result<(), DmlError> {
+    let mut recovery = recovery.clone();
+    recovery.updated_at_ms = crate::dml::now_unix_millis();
+    let due = recovery
+        .requires_recovery_scan()
+        .then(crate::dml::now_unix_millis);
+    active.record_ctas_recovery(recovery, due)
+}
+
+fn mark_fence_dispatched(recovery: &mut DmlCtasRecoveryRecord) {
+    let fence = recovery.catalog_fence.as_mut().expect("CTAS fence record");
+    fence.dispatch_certainty = DmlCtasDispatchCertainty::PossiblyDispatched;
+    fence.dispatched_at_ms = Some(crate::dml::now_unix_millis());
+}
+
+fn append_checkpoint(
+    recovery: &mut DmlCtasRecoveryRecord,
+    action: DmlCtasActionKind,
+    child_operation_id: Uuid,
+    request_digest: [u8; 32],
+) {
+    recovery
+        .dispatch_checkpoints
+        .push(DmlCtasDispatchCheckpointRecord {
+            action,
+            child_operation_id,
+            request_digest: hex::encode(request_digest),
+            dispatch_certainty: DmlCtasDispatchCertainty::ConfirmedNotDispatched,
+            dispatched_at_ms: None,
+        });
+    recovery.next_action = StatementNextAction::ManualInspect;
+}
+
+fn mark_checkpoint_dispatched(
+    recovery: &mut DmlCtasRecoveryRecord,
+    action: DmlCtasActionKind,
+    child_operation_id: Uuid,
+) {
+    let checkpoint = recovery
+        .dispatch_checkpoints
+        .iter_mut()
+        .find(|checkpoint| {
+            checkpoint.action == action && checkpoint.child_operation_id == child_operation_id
+        })
+        .expect("CTAS dispatch checkpoint");
+    checkpoint.dispatch_certainty = DmlCtasDispatchCertainty::PossiblyDispatched;
+    checkpoint.dispatched_at_ms = Some(crate::dml::now_unix_millis());
+}
+
+const fn catalog_failure_is_terminal(failure: &ConnectorCtasFailure) -> bool {
+    matches!(
+        failure,
+        ConnectorCtasFailure::KnownNotDispatched(_) | ConnectorCtasFailure::Conflict { .. }
+    )
+}
+
+fn finish_local_catalog_preparation_failure(
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    slot: FactSlot,
+    failure: CtasFailure,
+) -> Result<(), DmlError> {
+    recovery.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+    recovery.next_action = StatementNextAction::None;
+    record_recovery(active, &recovery)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = if failure.kind == CtasFailureKind::Unsupported {
+        CtasSagaPhase::Unsupported
+    } else {
+        CtasSagaPhase::Failed
+    };
+    install_fact(&mut saga, slot, failure_fact(&failure));
+    saga.next_action = StatementNextAction::None;
+    active.mutate_statement(
+        OperationState::FailedKnownUncommitted,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
+    Err(source_failure_error(active.operation_id(), failure))
+}
+
+fn finish_local_catalog_preparation_failure_with_cause(
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    slot: FactSlot,
+    failure: CtasFailure,
+    cause_fact: DurableExternalFact,
+    cause: String,
+) -> Result<(), DmlError> {
+    recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+    recovery.next_action = StatementNextAction::AbortStaging;
+    record_recovery(active, &recovery)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::Failed;
+    saga.write_fact = Some(cause_fact);
+    install_fact(&mut saga, slot, failure_fact(&failure));
+    saga.next_action = StatementNextAction::AbortStaging;
+    active.mutate_statement(
+        OperationState::FailedKnownUncommitted,
+        OperationPayload::CtasSaga(saga),
+        Some(crate::dml::now_unix_millis()),
+    )?;
+    Err(operation_error(
+        DmlErrorKind::Executor,
+        active.operation_id(),
+        StatementNextAction::AbortStaging,
+        format!(
+            "{cause}; CTAS cleanup request could not be prepared: {}",
+            failure.message
+        ),
+    ))
+}
+
+fn finish_catalog_terminal_failure(
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    slot: FactSlot,
+    failure: ConnectorCtasFailure,
+) -> Result<(), DmlError> {
+    if recovery.staged_locator.is_some() {
+        recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+        recovery.next_action = StatementNextAction::AbortStaging;
+    } else {
+        recovery.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+        recovery.next_action = StatementNextAction::None;
+    }
+    record_recovery(active, &recovery)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = if failure.failure().kind()
+        == novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported
+    {
+        CtasSagaPhase::Unsupported
+    } else {
+        CtasSagaPhase::Failed
+    };
+    install_fact(&mut saga, slot, connector_failure_fact(&failure));
+    saga.next_action = recovery.next_action;
+    active.mutate_statement(
+        OperationState::FailedKnownUncommitted,
+        OperationPayload::CtasSaga(saga),
+        recovery
+            .requires_recovery_scan()
+            .then(crate::dml::now_unix_millis),
+    )?;
+    Err(operation_error(
+        DmlErrorKind::Executor,
+        active.operation_id(),
+        recovery.next_action,
+        format!("CTAS catalog action was rejected: {}", failure.failure()),
+    ))
+}
+
+fn finish_catalog_terminal_failure_with_cause(
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    slot: FactSlot,
+    failure: ConnectorCtasFailure,
+    cause_fact: DurableExternalFact,
+    cause: String,
+) -> Result<(), DmlError> {
+    recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+    recovery.next_action = StatementNextAction::AbortStaging;
+    record_recovery(active, &recovery)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::Failed;
+    saga.write_fact = Some(cause_fact);
+    install_fact(&mut saga, slot, connector_failure_fact(&failure));
+    saga.next_action = StatementNextAction::AbortStaging;
+    active.mutate_statement(
+        OperationState::FailedKnownUncommitted,
+        OperationPayload::CtasSaga(saga),
+        Some(crate::dml::now_unix_millis()),
+    )?;
+    Err(operation_error(
+        DmlErrorKind::Executor,
+        active.operation_id(),
+        StatementNextAction::AbortStaging,
+        format!("{cause}; CTAS cleanup was rejected: {}", failure.failure()),
+    ))
+}
+
+fn finish_catalog_unknown(
+    active: &mut ActiveDmlOperation,
+    mut recovery: DmlCtasRecoveryRecord,
+    phase: CtasSagaPhase,
+    slot: FactSlot,
+    failure: ConnectorCtasFailure,
+) -> Result<(), DmlError> {
+    recovery.next_action = StatementNextAction::ManualInspect;
+    if recovery.staged_locator.is_some() {
+        recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+    }
+    record_recovery(active, &recovery)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = phase;
+    saga.next_action = StatementNextAction::ManualInspect;
+    install_fact(&mut saga, slot, connector_failure_fact(&failure));
+    active.mutate_statement(
+        OperationState::CommitUnknown,
+        OperationPayload::CtasSaga(saga),
+        Some(crate::dml::now_unix_millis()),
+    )?;
+    Err(operation_error(
+        DmlErrorKind::Commit,
+        active.operation_id(),
+        StatementNextAction::ManualInspect,
+        format!("CTAS catalog outcome is unresolved: {}", failure.failure()),
+    ))
+}
+
+fn connector_failure_fact(failure: &ConnectorCtasFailure) -> DurableExternalFact {
+    let conflict = failure
+        .conflict_kind()
+        .map(|kind| format!("{kind:?}: "))
+        .unwrap_or_default();
+    let normalized = CtasFailure {
+        kind: if failure.conflict_kind().is_some() {
+            CtasFailureKind::Conflict
+        } else {
+            mutation_failure(failure.failure().clone()).kind
+        },
+        message: format!("{conflict}{}", failure.failure().message()),
+    };
+    DurableExternalFact {
+        outcome: match failure {
+            ConnectorCtasFailure::KnownNotDispatched(_) => ExternalFactOutcome::KnownUncommitted,
+            ConnectorCtasFailure::Conflict { .. } => ExternalFactOutcome::Conflict,
+            ConnectorCtasFailure::PossiblyDispatched(_)
+            | ConnectorCtasFailure::CommittedResponseInvalid(_)
+            | ConnectorCtasFailure::Ambiguous(_) => ExternalFactOutcome::CommitUnknown,
+        },
+        receipt: None,
+        evidence: None,
+        finalization_failure: None,
+        failure: Some(encode_failure(&normalized)),
+    }
+}
+
+fn publication_fact(
+    outcome: ExternalFactOutcome,
+    receipt: &ConnectorCtasPublicationReceipt,
+) -> DurableExternalFact {
+    DurableExternalFact {
+        outcome,
+        receipt: Some(hex::encode(receipt.digest())),
+        evidence: None,
+        finalization_failure: None,
+        failure: None,
+    }
+}
+
+fn connector_action_id(uuid: Uuid) -> Result<ConnectorCtasActionId, DmlError> {
+    ConnectorCtasActionId::try_from_bytes(*uuid.as_bytes()).map_err(DmlError::executor)
+}
+
+fn validate_preflight_facts(
+    stored: &StoredOperation,
+    facts: &novarocks::engine::ctas_engine::CtasTargetPreflightFacts,
+) -> Result<(), DmlError> {
+    if facts.capability_version == 1
+        && facts.instance_id == stored.target.catalog
+        && facts.target_namespace == stored.target.namespace
+        && facts.target_table == stored.target.table
+        && !facts.provider_id.is_empty()
+    {
+        Ok(())
+    } else {
+        Err(operation_error(
+            DmlErrorKind::Executor,
+            stored.operation_id,
+            StatementNextAction::ManualInspect,
+            "CTAS preflight facts conflict with the durable statement target",
+        ))
+    }
+}
+
+fn validate_target_facts_v2(
+    stored: &StoredOperation,
+    preflight: &novarocks::engine::ctas_engine::CtasTargetPreflightFacts,
+    fence: &ConnectorCtasPublicationFence,
+    facts: &CtasTargetFacts,
+    locator: &ConnectorCtasStagedLocator,
+    stage_action_id: Uuid,
+) -> Result<(), DmlError> {
+    if facts.operation_id == *stored.operation_id.as_uuid().as_bytes()
+        && facts.provider_id == preflight.provider_id
+        && facts.instance_id == preflight.instance_id
+        && facts.incarnation == preflight.incarnation
+        && facts.fence_digest == fence.digest()
+        && facts.locator_digest == locator.digest()
+        && locator.issuance_fence().digest() == fence.digest()
+        && locator.operation_id().to_bytes() == *stored.operation_id.as_uuid().as_bytes()
+        && locator.stage_action_id().to_bytes() == *stage_action_id.as_bytes()
+        && Uuid::from_bytes(stage_action_id.into_bytes()).get_version_num() == 7
+    {
+        Ok(())
+    } else {
+        Err(operation_error(
+            DmlErrorKind::Commit,
+            stored.operation_id,
+            StatementNextAction::ManualInspect,
+            "CTAS staged target facts conflict with durable operation identity",
+        ))
+    }
+}
+
+fn source_failure_error(operation_id: DmlOperationId, failure: CtasFailure) -> DmlError {
+    operation_error(
+        DmlErrorKind::Executor,
+        operation_id,
+        StatementNextAction::None,
+        format_failure("CTAS request preparation failed", &failure),
+    )
+}
+
 fn finish_source_failure(
-    journal: &mut ActiveDmlOperation,
+    active: &mut ActiveDmlOperation,
     stored: StoredOperation,
     failure: CtasFailure,
 ) -> Result<(), DmlError> {
-    let unsupported = failure.kind == CtasFailureKind::Unsupported;
     let mut record = ctas_record(&stored)?;
-    record.phase = if unsupported {
+    record.phase = if failure.kind == CtasFailureKind::Unsupported {
         CtasSagaPhase::Unsupported
     } else {
         CtasSagaPhase::Failed
     };
     record.prepare_fact = Some(failure_fact(&failure));
     record.next_action = StatementNextAction::None;
-    let stored = persist(
-        journal,
-        stored,
+    active.mutate_statement(
         OperationState::FailedKnownUncommitted,
-        record,
+        OperationPayload::CtasSaga(record),
+        None,
     )?;
-    Err(operation_error(
-        DmlErrorKind::Executor,
-        stored.operation_id,
-        StatementNextAction::None,
-        format_failure(
-            "CTAS source/target preparation is known uncommitted",
-            &failure,
-        ),
-    ))
-}
-
-fn finish_prepare_conflict(
-    journal: &mut ActiveDmlOperation,
-    mut stored: StoredOperation,
-    failure: CtasFailure,
-) -> Result<(), DmlError> {
-    let mut record = ctas_record(&stored)?;
-    record.prepare_fact = Some(DurableExternalFact {
-        outcome: ExternalFactOutcome::Conflict,
-        receipt: None,
-        evidence: None,
-        finalization_failure: None,
-        failure: Some(encode_failure(&failure)),
-    });
-    record.next_action = StatementNextAction::None;
-    if record.create_policy == CTAS_CREATE_POLICY_NO_OP_IF_EXISTS {
-        record.phase = CtasSagaPhase::NoOp;
-        stored = persist(journal, stored, OperationState::Committing, record.clone())?;
-        stored = persist(journal, stored, OperationState::Committed, record.clone())?;
-        persist(journal, stored, OperationState::Finalized, record)?;
-        Ok(())
-    } else {
-        record.phase = CtasSagaPhase::Conflict;
-        let stored = persist(
-            journal,
-            stored,
-            OperationState::FailedKnownUncommitted,
-            record,
-        )?;
-        Err(operation_error(
-            DmlErrorKind::Executor,
-            stored.operation_id,
-            StatementNextAction::None,
-            format_failure("CTAS target conflicts with a concurrent creator", &failure),
-        ))
-    }
-}
-
-fn finish_prepare_known_uncommitted(
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    failure: CtasFailure,
-) -> Result<(), DmlError> {
-    let mut record = ctas_record(&stored)?;
-    record.phase = CtasSagaPhase::Failed;
-    record.prepare_fact = Some(failure_fact(&failure));
-    record.next_action = StatementNextAction::None;
-    let stored = persist(
-        journal,
-        stored,
-        OperationState::FailedKnownUncommitted,
-        record,
-    )?;
-    Err(operation_error(
-        DmlErrorKind::Executor,
-        stored.operation_id,
-        StatementNextAction::None,
-        format_failure("CTAS staged prepare is known uncommitted", &failure),
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_prepare_unknown(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    source: PreparedCtasSource,
-    target: PreparedCtasTarget,
-    failure: CtasFailure,
-    evidence: Option<ExternalMutationEvidence>,
-    allow_reconcile: bool,
-) -> Result<(), DmlError> {
-    if let Err(error) = validate_target_facts(&stored, &target.facts) {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PrepareUnknown,
-            FactSlot::Prepare,
-            error.to_string(),
-        );
-    }
-    let mut record = ctas_record(&stored)?;
-    install_target_facts(&mut record, &target.facts)?;
-    let durable_evidence = evidence.as_ref().and_then(|evidence| {
-        validate_evidence(
-            &target.facts,
-            record.prepare_operation_id,
-            "staged-create-prepare",
-            evidence,
-        )
-        .and_then(|()| encode_evidence(evidence))
-        .ok()
-    });
-    let can_reconcile = allow_reconcile && evidence.is_some() && durable_evidence.is_some();
-    record.phase = CtasSagaPhase::PrepareUnknown;
-    record.prepare_fact = Some(DurableExternalFact {
-        outcome: ExternalFactOutcome::CommitUnknown,
-        receipt: None,
-        evidence: durable_evidence,
-        finalization_failure: None,
-        failure: Some(encode_failure(&failure)),
-    });
-    record.next_action = if can_reconcile {
-        StatementNextAction::Reconcile
-    } else {
-        StatementNextAction::ManualInspect
-    };
-    let stored = persist(journal, stored, OperationState::CommitUnknown, record)?;
-    let Some(evidence) = evidence.filter(|_| can_reconcile) else {
-        return Err(unknown_error(
-            stored.operation_id,
-            "CTAS staged prepare",
-            &failure,
-        ));
-    };
-    let stored = reconcile_barrier(journal, stored)?;
-    journal.check_before_dispatch()?;
-    match engine.reconcile_ctas(
-        target.handle.as_ref(),
-        ConnectorStagedCreateReconcilePhase::Prepare,
-        evidence.clone(),
-    ) {
-        Ok(ConnectorStagedCreateReconcileOutcome::Prepared {
-            handle,
-            receipt,
-            finalization,
-        }) => {
-            let mut target_facts = target.facts.clone();
-            target_facts.handle_digest = Some(handle.digest());
-            finish_prepared_target(
-                engine,
-                journal,
-                stored,
-                source,
-                PreparedCtasTarget {
-                    facts: target_facts,
-                    handle: target.handle,
-                },
-                receipt,
-                finalization,
-            )
-        }
-        Ok(ConnectorStagedCreateReconcileOutcome::KnownUncommitted { failure }) => {
-            finish_prepare_known_uncommitted(journal, stored, mutation_failure(failure))
-        }
-        Ok(ConnectorStagedCreateReconcileOutcome::CommitUnknown {
-            failure,
-            evidence: next,
-        }) => finish_reconcile_still_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PrepareUnknown,
-            FactSlot::Prepare,
-            mutation_failure(failure),
-            &evidence,
-            &next,
-        ),
-        Ok(_) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PrepareUnknown,
-            FactSlot::Prepare,
-            "CTAS prepare reconcile returned an outcome for another phase",
-        ),
-        Err(failure) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PrepareUnknown,
-            FactSlot::Prepare,
-            format_failure("CTAS prepare reconcile contract failed", &failure),
-        ),
-    }
-}
-
-fn finish_prepared_target(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    source: PreparedCtasSource,
-    target: PreparedCtasTarget,
-    receipt: ConnectorStagedCreateReceipt,
-    finalization: ExternalMutationFinalization,
-) -> Result<(), DmlError> {
-    if let Err(error) = validate_target_facts(&stored, &target.facts) {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PrepareUnknown,
-            FactSlot::Prepare,
-            error.to_string(),
-        );
-    }
-    if let Err(error) = validate_receipt(
-        &target.facts,
-        ctas_record(&stored)?.prepare_operation_id,
-        ConnectorStagedCreateReceiptPhase::Prepared,
-        &receipt,
-    ) {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PrepareUnknown,
-            FactSlot::Prepare,
-            error.to_string(),
-        );
-    }
-    let mut record = ctas_record(&stored)?;
-    install_target_facts(&mut record, &target.facts)?;
-    record.phase = CtasSagaPhase::Staged;
-    record.prepare_fact = Some(match committed_fact(&receipt, &finalization) {
-        Ok(fact) => fact,
-        Err(error) => {
-            return finish_contract_unknown(
-                journal,
-                stored,
-                CtasSagaPhase::PrepareUnknown,
-                FactSlot::Prepare,
-                error.to_string(),
-            );
-        }
-    });
-    record.next_action = finalization_action(&finalization);
-    let stored = persist(journal, stored, OperationState::Writing, record)?;
-    if let ExternalMutationFinalization::Failed(failure) = finalization {
-        return Err(operation_error(
-            DmlErrorKind::CommittedButUnfinalized,
-            stored.operation_id,
-            StatementNextAction::RetryFinalize,
-            format!("CTAS staged prepare is known committed but finalization failed: {failure}"),
-        ));
-    }
-    prepare_and_execute_write(engine, journal, stored, source, target)
-}
-
-fn prepare_and_execute_write(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    source: PreparedCtasSource,
-    target: PreparedCtasTarget,
-) -> Result<(), DmlError> {
-    let write_id = ctas_record(&stored)?.write_operation_id;
-    journal.check_before_dispatch()?;
-    let prepared = match engine.prepare_ctas_write(
-        source.handle.as_ref(),
-        target.handle.as_ref(),
-        ConnectorWriteOperationId::from_bytes(*write_id.as_bytes()),
-    ) {
-        Ok(prepared) => prepared,
-        Err(failure) => {
-            return begin_abort(
-                engine,
-                journal,
-                stored,
-                &target,
-                None,
-                FactSlot::Write,
-                failure_fact(&failure),
-                AbortDisposition::Error(CtasSagaPhase::Failed),
-                format_failure("CTAS write preparation is known uncommitted", &failure),
-            );
-        }
-    };
-    if let Err(error) = validate_prepared_write(&stored, &source, &target, &prepared) {
-        return begin_abort(
-            engine,
-            journal,
-            stored,
-            &target,
-            None,
-            FactSlot::Write,
-            failure_fact(&CtasFailure {
-                kind: CtasFailureKind::Internal,
-                message: error.to_string(),
-            }),
-            AbortDisposition::Error(CtasSagaPhase::Failed),
-            error.to_string(),
-        );
-    }
-    let mut record = ctas_record(&stored)?;
-    record.phase = CtasSagaPhase::Writing;
-    record.next_action = StatementNextAction::None;
-    let stored = persist(journal, stored, OperationState::Writing, record)?;
-    journal.check_before_dispatch()?;
-    match engine.execute_ctas_write(prepared.handle.as_ref()) {
-        CtasWriteOutcome::Completed {
-            completion,
-            execution_identity,
-        } => finish_write_completed(
-            engine,
-            journal,
-            stored,
-            source,
-            target,
-            prepared,
-            completion,
-            execution_identity,
-        ),
-        CtasWriteOutcome::KnownUncommitted { failure } => begin_abort(
-            engine,
-            journal,
-            stored,
-            &target,
-            None,
-            FactSlot::Write,
-            failure_fact(&failure),
-            AbortDisposition::Error(CtasSagaPhase::Failed),
-            format_failure("CTAS writer is known uncommitted", &failure),
-        ),
-        CtasWriteOutcome::CommitUnknown { failure, evidence } => finish_write_unknown(
-            engine, journal, stored, source, target, prepared, failure, evidence, true,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_write_completed(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    source: PreparedCtasSource,
-    target: PreparedCtasTarget,
-    prepared: PreparedCtasWrite,
-    completion: ConnectorWriteOperationCompletion,
-    execution_identity: [u8; 32],
-) -> Result<(), DmlError> {
-    if let Err(error) = validate_completion(
-        &stored,
-        &source,
-        &target,
-        &prepared,
-        &completion,
-        execution_identity,
-    ) {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::WriteUnknown,
-            FactSlot::Write,
-            error.to_string(),
-        );
-    }
-    let (write_receipt, cohort_id) = match encode_write_completion(&completion) {
-        Ok(encoded) => encoded,
-        Err(error) => {
-            return finish_contract_unknown(
-                journal,
-                stored,
-                CtasSagaPhase::WriteUnknown,
-                FactSlot::Write,
-                error.to_string(),
-            );
-        }
-    };
-    let mut record = ctas_record(&stored)?;
-    record.write_cohort_id = Some(cohort_id);
-    record.aggregate_write_digest = Some(hex::encode(completion.aggregate_digest()));
-    record.write_fact = Some(DurableExternalFact {
-        outcome: ExternalFactOutcome::KnownCommitted,
-        receipt: Some(write_receipt),
-        evidence: None,
-        finalization_failure: None,
-        failure: None,
-    });
-    record.phase = CtasSagaPhase::Publishing;
-    record.next_action = StatementNextAction::None;
-    let stored = persist(journal, stored, OperationState::Committing, record)?;
-    finish_publish(engine, journal, stored, target, completion)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_write_unknown(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    source: PreparedCtasSource,
-    target: PreparedCtasTarget,
-    prepared: PreparedCtasWrite,
-    failure: CtasFailure,
-    evidence: ExternalMutationEvidence,
-    allow_reconcile: bool,
-) -> Result<(), DmlError> {
-    let write_id = ctas_record(&stored)?.write_operation_id;
-    let durable_evidence =
-        validate_evidence(&target.facts, write_id, "ctas-write-staging", &evidence)
-            .and_then(|()| encode_evidence(&evidence))
-            .ok();
-    let can_reconcile = allow_reconcile && durable_evidence.is_some();
-    let mut record = ctas_record(&stored)?;
-    let first = retained_evidence(&record.write_fact);
-    if first
-        .as_ref()
-        .is_some_and(|first| Some(first) != durable_evidence.as_ref())
-    {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::WriteUnknown,
-            FactSlot::Write,
-            "CTAS write reconcile returned evidence different from the first durable evidence",
-        );
-    }
-    record.phase = CtasSagaPhase::WriteUnknown;
-    record.write_fact = Some(DurableExternalFact {
-        outcome: ExternalFactOutcome::CommitUnknown,
-        receipt: None,
-        evidence: first.or(durable_evidence),
-        finalization_failure: None,
-        failure: Some(encode_failure(&failure)),
-    });
-    record.next_action = if can_reconcile {
-        StatementNextAction::Reconcile
-    } else {
-        StatementNextAction::ManualInspect
-    };
-    let stored = persist(journal, stored, OperationState::CommitUnknown, record)?;
-    if !can_reconcile {
-        return Err(unknown_error(stored.operation_id, "CTAS writer", &failure));
-    }
-    let stored = reconcile_barrier(journal, stored)?;
-    journal.check_before_dispatch()?;
-    match engine.reconcile_ctas_write(prepared.handle.as_ref(), evidence.clone()) {
-        CtasWriteOutcome::Completed {
-            completion,
-            execution_identity,
-        } => finish_write_completed(
-            engine,
-            journal,
-            stored,
-            source,
-            target,
-            prepared,
-            completion,
-            execution_identity,
-        ),
-        CtasWriteOutcome::KnownUncommitted { failure } => begin_abort(
-            engine,
-            journal,
-            stored,
-            &target,
-            None,
-            FactSlot::Write,
-            failure_fact(&failure),
-            AbortDisposition::Error(CtasSagaPhase::Failed),
-            format_failure("CTAS writer reconcile proved uncommitted", &failure),
-        ),
-        CtasWriteOutcome::CommitUnknown {
-            failure,
-            evidence: next,
-        } => finish_reconcile_still_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::WriteUnknown,
-            FactSlot::Write,
-            failure,
-            &evidence,
-            &next,
-        ),
-    }
-}
-
-fn finish_publish(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    target: PreparedCtasTarget,
-    completion: ConnectorWriteOperationCompletion,
-) -> Result<(), DmlError> {
-    let publish_id = ctas_record(&stored)?.publish_operation_id;
-    journal.check_before_dispatch()?;
-    match engine.publish_ctas(
-        target.handle.as_ref(),
-        ConnectorMutationOperationId::from_bytes(*publish_id.as_bytes()),
-        completion.clone(),
-    ) {
-        Err(failure) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PublishUnknown,
-            FactSlot::Publish,
-            format_failure("CTAS publish may have been dispatched", &failure),
-        ),
-        Ok(ConnectorStagedCreatePublishOutcome::Applied {
-            receipt,
-            finalization,
-        }) => finish_published(journal, stored, &target.facts, receipt, finalization),
-        Ok(ConnectorStagedCreatePublishOutcome::NoOp {
-            receipt,
-            finalization,
-        }) => {
-            if let Err(error) = validate_receipt(
-                &target.facts,
-                publish_id,
-                ConnectorStagedCreateReceiptPhase::Published,
-                &receipt,
-            ) {
-                return finish_contract_unknown(
-                    journal,
-                    stored,
-                    CtasSagaPhase::PublishUnknown,
-                    FactSlot::Publish,
-                    error.to_string(),
-                );
-            }
-            let retry_finalize = matches!(finalization, ExternalMutationFinalization::Failed(_));
-            let no_op = match no_op_fact(&receipt, &finalization) {
-                Ok(fact) => fact,
-                Err(error) => {
-                    return finish_contract_unknown(
-                        journal,
-                        stored,
-                        CtasSagaPhase::PublishUnknown,
-                        FactSlot::Publish,
-                        error.to_string(),
-                    );
-                }
-            };
-            begin_abort(
-                engine,
-                journal,
-                stored,
-                &target,
-                Some(completion),
-                FactSlot::Publish,
-                no_op,
-                AbortDisposition::SuccessNoOp { retry_finalize },
-                "CTAS publish was a no-op".to_string(),
-            )
-        }
-        Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure }) => begin_abort(
-            engine,
-            journal,
-            stored,
-            &target,
-            Some(completion),
-            FactSlot::Publish,
-            mutation_failure_fact(ExternalFactOutcome::Conflict, &failure),
-            AbortDisposition::Error(CtasSagaPhase::Conflict),
-            format!("CTAS publish conflicted with a concurrent creator: {failure}"),
-        ),
-        Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure }) => begin_abort(
-            engine,
-            journal,
-            stored,
-            &target,
-            Some(completion),
-            FactSlot::Publish,
-            mutation_failure_fact(ExternalFactOutcome::KnownUncommitted, &failure),
-            AbortDisposition::Error(CtasSagaPhase::Failed),
-            format!("CTAS publish is known uncommitted: {failure}"),
-        ),
-        Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence }) => {
-            finish_publish_unknown(
-                engine,
-                journal,
-                stored,
-                target,
-                completion,
-                mutation_failure(failure),
-                evidence,
-                true,
-            )
-        }
-    }
-}
-
-fn finish_published(
-    journal: &mut ActiveDmlOperation,
-    mut stored: StoredOperation,
-    target_facts: &CtasTargetFacts,
-    receipt: ConnectorStagedCreateReceipt,
-    finalization: ExternalMutationFinalization,
-) -> Result<(), DmlError> {
-    let publish_id = ctas_record(&stored)?.publish_operation_id;
-    if let Err(error) = validate_receipt(
-        target_facts,
-        publish_id,
-        ConnectorStagedCreateReceiptPhase::Published,
-        &receipt,
-    ) {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PublishUnknown,
-            FactSlot::Publish,
-            error.to_string(),
-        );
-    }
-    let mut record = ctas_record(&stored)?;
-    record.phase = CtasSagaPhase::Committed;
-    record.publish_fact = Some(match committed_fact(&receipt, &finalization) {
-        Ok(fact) => fact,
-        Err(error) => {
-            return finish_contract_unknown(
-                journal,
-                stored,
-                CtasSagaPhase::PublishUnknown,
-                FactSlot::Publish,
-                error.to_string(),
-            );
-        }
-    });
-    record.next_action = finalization_action(&finalization);
-    stored = persist(journal, stored, OperationState::Committed, record.clone())?;
-    match finalization {
-        ExternalMutationFinalization::Complete => {
-            persist(journal, stored, OperationState::Finalized, record)?;
-            Ok(())
-        }
-        ExternalMutationFinalization::Failed(failure) => {
-            stored = persist(journal, stored, OperationState::Finalizing, record.clone())?;
-            let stored = persist(
-                journal,
-                stored,
-                OperationState::FinalizeFailedKnownCommitted,
-                record,
-            )?;
-            Err(operation_error(
-                DmlErrorKind::CommittedButUnfinalized,
-                stored.operation_id,
-                StatementNextAction::RetryFinalize,
-                format!("CTAS publish is known committed but finalization failed: {failure}"),
-            ))
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_publish_unknown(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    target: PreparedCtasTarget,
-    completion: ConnectorWriteOperationCompletion,
-    failure: CtasFailure,
-    evidence: ExternalMutationEvidence,
-    allow_reconcile: bool,
-) -> Result<(), DmlError> {
-    let publish_id = ctas_record(&stored)?.publish_operation_id;
-    let durable_evidence = validate_evidence(
-        &target.facts,
-        publish_id,
-        "staged-create-publish",
-        &evidence,
-    )
-    .and_then(|()| encode_evidence(&evidence))
-    .ok();
-    let can_reconcile = allow_reconcile && durable_evidence.is_some();
-    let mut record = ctas_record(&stored)?;
-    let first = retained_evidence(&record.publish_fact);
-    if first
-        .as_ref()
-        .is_some_and(|first| Some(first) != durable_evidence.as_ref())
-    {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PublishUnknown,
-            FactSlot::Publish,
-            "CTAS publish reconcile returned evidence different from the first durable evidence",
-        );
-    }
-    record.phase = CtasSagaPhase::PublishUnknown;
-    record.publish_fact = Some(DurableExternalFact {
-        outcome: ExternalFactOutcome::CommitUnknown,
-        receipt: None,
-        evidence: first.or(durable_evidence),
-        finalization_failure: None,
-        failure: Some(encode_failure(&failure)),
-    });
-    record.next_action = if can_reconcile {
-        StatementNextAction::Reconcile
-    } else {
-        StatementNextAction::ManualInspect
-    };
-    let stored = persist(journal, stored, OperationState::CommitUnknown, record)?;
-    if !can_reconcile {
-        return Err(unknown_error(stored.operation_id, "CTAS publish", &failure));
-    }
-    let stored = reconcile_barrier(journal, stored)?;
-    journal.check_before_dispatch()?;
-    match engine.reconcile_ctas(
-        target.handle.as_ref(),
-        ConnectorStagedCreateReconcilePhase::Publish,
-        evidence.clone(),
-    ) {
-        Ok(ConnectorStagedCreateReconcileOutcome::Published {
-            receipt,
-            finalization,
-        }) => finish_published(journal, stored, &target.facts, receipt, finalization),
-        Ok(ConnectorStagedCreateReconcileOutcome::KnownUncommitted { failure }) => begin_abort(
-            engine,
-            journal,
-            stored,
-            &target,
-            Some(completion),
-            FactSlot::Publish,
-            mutation_failure_fact(ExternalFactOutcome::KnownUncommitted, &failure),
-            AbortDisposition::Error(CtasSagaPhase::Failed),
-            format!("CTAS publish reconcile proved uncommitted: {failure}"),
-        ),
-        Ok(ConnectorStagedCreateReconcileOutcome::CommitUnknown {
-            failure,
-            evidence: next,
-        }) => finish_reconcile_still_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PublishUnknown,
-            FactSlot::Publish,
-            mutation_failure(failure),
-            &evidence,
-            &next,
-        ),
-        Ok(_) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PublishUnknown,
-            FactSlot::Publish,
-            "CTAS publish reconcile returned an outcome for another phase",
-        ),
-        Err(failure) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::PublishUnknown,
-            FactSlot::Publish,
-            format_failure("CTAS publish reconcile contract failed", &failure),
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn begin_abort(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    target: &PreparedCtasTarget,
-    completion: Option<ConnectorWriteOperationCompletion>,
-    slot: FactSlot,
-    cause_fact: DurableExternalFact,
-    disposition: AbortDisposition,
-    cause_message: String,
-) -> Result<(), DmlError> {
-    let mut record = ctas_record(&stored)?;
-    install_fact(&mut record, slot, cause_fact);
-    record.phase = CtasSagaPhase::AbortingStaging;
-    record.next_action = StatementNextAction::AbortStaging;
-    let stored = persist(journal, stored, OperationState::Aborting, record)?;
-    let abort_id = ctas_record(&stored)?.abort_staging_operation_id;
-    journal.check_before_dispatch()?;
-    match engine.abort_ctas(
-        target.handle.as_ref(),
-        ConnectorMutationOperationId::from_bytes(*abort_id.as_bytes()),
-        completion,
-    ) {
-        Err(failure) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::AbortUnknown,
-            FactSlot::Abort,
-            format_failure("CTAS staged abort may have been dispatched", &failure),
-        ),
-        Ok(ConnectorStagedCreateAbortOutcome::Aborted {
-            receipt,
-            finalization,
-        }) => finish_aborted(
-            journal,
-            stored,
-            &target.facts,
-            receipt,
-            finalization,
-            disposition,
-            cause_message,
-        ),
-        Ok(ConnectorStagedCreateAbortOutcome::KnownUncommitted { failure }) => {
-            let mut record = ctas_record(&stored)?;
-            record.abort_staging_fact = Some(mutation_failure_fact(
-                ExternalFactOutcome::KnownUncommitted,
-                &failure,
-            ));
-            record.next_action = StatementNextAction::AbortStaging;
-            let stored = persist(journal, stored, OperationState::Aborting, record)?;
-            Err(operation_error(
-                DmlErrorKind::Executor,
-                stored.operation_id,
-                StatementNextAction::AbortStaging,
-                format!("{cause_message}; staged abort is known uncommitted: {failure}"),
-            ))
-        }
-        Ok(ConnectorStagedCreateAbortOutcome::CommitUnknown { failure, evidence }) => {
-            finish_abort_unknown(
-                engine,
-                journal,
-                stored,
-                target,
-                mutation_failure(failure),
-                evidence,
-                disposition,
-                cause_message,
-                true,
-            )
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_abort_unknown(
-    engine: &dyn CtasEngine,
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    target: &PreparedCtasTarget,
-    failure: CtasFailure,
-    evidence: ExternalMutationEvidence,
-    disposition: AbortDisposition,
-    cause_message: String,
-    allow_reconcile: bool,
-) -> Result<(), DmlError> {
-    let abort_id = ctas_record(&stored)?.abort_staging_operation_id;
-    let durable_evidence =
-        validate_evidence(&target.facts, abort_id, "staged-create-abort", &evidence)
-            .and_then(|()| encode_evidence(&evidence))
-            .ok();
-    let can_reconcile = allow_reconcile && durable_evidence.is_some();
-    let mut record = ctas_record(&stored)?;
-    let first = retained_evidence(&record.abort_staging_fact);
-    if first
-        .as_ref()
-        .is_some_and(|first| Some(first) != durable_evidence.as_ref())
-    {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::AbortUnknown,
-            FactSlot::Abort,
-            "CTAS abort reconcile returned evidence different from the first durable evidence",
-        );
-    }
-    record.phase = CtasSagaPhase::AbortUnknown;
-    record.abort_staging_fact = Some(DurableExternalFact {
-        outcome: ExternalFactOutcome::CommitUnknown,
-        receipt: None,
-        evidence: first.or(durable_evidence),
-        finalization_failure: None,
-        failure: Some(encode_failure(&failure)),
-    });
-    record.next_action = if can_reconcile {
-        StatementNextAction::Reconcile
-    } else {
-        StatementNextAction::ManualInspect
-    };
-    let stored = persist(journal, stored, OperationState::CommitUnknown, record)?;
-    if !can_reconcile {
-        return Err(unknown_error(
-            stored.operation_id,
-            "CTAS staged abort",
-            &failure,
-        ));
-    }
-    let stored = reconcile_barrier(journal, stored)?;
-    journal.check_before_dispatch()?;
-    match engine.reconcile_ctas(
-        target.handle.as_ref(),
-        ConnectorStagedCreateReconcilePhase::Abort,
-        evidence.clone(),
-    ) {
-        Ok(ConnectorStagedCreateReconcileOutcome::Aborted {
-            receipt,
-            finalization,
-        }) => {
-            let mut stored = stored;
-            if stored.state == OperationState::CommitUnknown {
-                let record = ctas_record(&stored)?;
-                stored = persist(journal, stored, OperationState::Aborting, record)?;
-            }
-            finish_aborted(
-                journal,
-                stored,
-                &target.facts,
-                receipt,
-                finalization,
-                disposition,
-                cause_message,
-            )
-        }
-        Ok(ConnectorStagedCreateReconcileOutcome::KnownUncommitted { failure }) => {
-            let mut record = ctas_record(&stored)?;
-            record.phase = CtasSagaPhase::AbortUnknown;
-            record.next_action = StatementNextAction::ManualInspect;
-            let retained = record
-                .abort_staging_fact
-                .as_ref()
-                .and_then(|fact| fact.evidence.clone());
-            record.abort_staging_fact = Some(DurableExternalFact {
-                outcome: ExternalFactOutcome::CommitUnknown,
-                receipt: None,
-                evidence: retained,
-                finalization_failure: None,
-                failure: Some(encode_failure(&mutation_failure(failure.clone()))),
-            });
-            let stored = persist(journal, stored, OperationState::CommitUnknown, record)?;
-            Err(operation_error(
-                DmlErrorKind::Commit,
-                stored.operation_id,
-                StatementNextAction::ManualInspect,
-                format!(
-                    "{cause_message}; staged abort remains unresolved because the reconcile request was not dispatched: {failure}"
-                ),
-            ))
-        }
-        Ok(ConnectorStagedCreateReconcileOutcome::CommitUnknown {
-            failure,
-            evidence: next,
-        }) => finish_reconcile_still_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::AbortUnknown,
-            FactSlot::Abort,
-            mutation_failure(failure),
-            &evidence,
-            &next,
-        ),
-        Ok(_) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::AbortUnknown,
-            FactSlot::Abort,
-            "CTAS abort reconcile returned an outcome for another phase",
-        ),
-        Err(failure) => finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::AbortUnknown,
-            FactSlot::Abort,
-            format_failure("CTAS abort reconcile contract failed", &failure),
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_aborted(
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    target_facts: &CtasTargetFacts,
-    receipt: ConnectorStagedCreateReceipt,
-    finalization: ExternalMutationFinalization,
-    disposition: AbortDisposition,
-    cause_message: String,
-) -> Result<(), DmlError> {
-    let abort_id = ctas_record(&stored)?.abort_staging_operation_id;
-    if let Err(error) = validate_receipt(
-        target_facts,
-        abort_id,
-        ConnectorStagedCreateReceiptPhase::Aborted,
-        &receipt,
-    ) {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            CtasSagaPhase::AbortUnknown,
-            FactSlot::Abort,
-            error.to_string(),
-        );
-    }
-    let mut record = ctas_record(&stored)?;
-    record.abort_staging_fact = Some(match committed_fact(&receipt, &finalization) {
-        Ok(fact) => fact,
-        Err(error) => {
-            return finish_contract_unknown(
-                journal,
-                stored,
-                CtasSagaPhase::AbortUnknown,
-                FactSlot::Abort,
-                error.to_string(),
-            );
-        }
-    });
-    match finalization {
-        ExternalMutationFinalization::Failed(failure) => {
-            record.phase = CtasSagaPhase::AbortingStaging;
-            record.next_action = StatementNextAction::RetryFinalize;
-            let stored = persist(journal, stored, OperationState::Aborting, record)?;
-            Err(operation_error(
-                DmlErrorKind::CommittedButUnfinalized,
-                stored.operation_id,
-                StatementNextAction::RetryFinalize,
-                format!(
-                    "{cause_message}; staged abort committed but finalization failed: {failure}"
-                ),
-            ))
-        }
-        ExternalMutationFinalization::Complete => {
-            let retry_finalize = matches!(
-                disposition,
-                AbortDisposition::SuccessNoOp {
-                    retry_finalize: true
-                }
-            );
-            record.phase = match disposition {
-                AbortDisposition::SuccessNoOp { .. } => CtasSagaPhase::NoOp,
-                AbortDisposition::Error(phase) => phase,
-            };
-            record.next_action = if retry_finalize {
-                StatementNextAction::RetryFinalize
-            } else {
-                StatementNextAction::None
-            };
-            if retry_finalize {
-                let stored = persist(journal, stored, OperationState::Aborting, record)?;
-                return Err(operation_error(
-                    DmlErrorKind::CommittedButUnfinalized,
-                    stored.operation_id,
-                    StatementNextAction::RetryFinalize,
-                    format!("{cause_message}; publish no-op finalization failed"),
-                ));
-            }
-            let stored = persist(journal, stored, OperationState::Aborted, record)?;
-            match disposition {
-                AbortDisposition::SuccessNoOp { .. } => Ok(()),
-                AbortDisposition::Error(_) => Err(operation_error(
-                    DmlErrorKind::Executor,
-                    stored.operation_id,
-                    StatementNextAction::None,
-                    cause_message,
-                )),
-            }
-        }
-    }
+    Err(source_failure_error(active.operation_id(), failure))
 }
 
 #[derive(Clone, Copy)]
 enum FactSlot {
     Prepare,
-    Write,
     Publish,
     Abort,
-}
-
-fn finish_reconcile_still_unknown(
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    phase: CtasSagaPhase,
-    slot: FactSlot,
-    failure: CtasFailure,
-    first: &ExternalMutationEvidence,
-    next: &ExternalMutationEvidence,
-) -> Result<(), DmlError> {
-    if first != next {
-        return finish_contract_unknown(
-            journal,
-            stored,
-            phase,
-            slot,
-            "CTAS reconcile changed the exact provider evidence",
-        );
-    }
-    let mut record = ctas_record(&stored)?;
-    record.phase = phase;
-    record.next_action = StatementNextAction::ManualInspect;
-    install_fact(
-        &mut record,
-        slot,
-        DurableExternalFact {
-            outcome: ExternalFactOutcome::CommitUnknown,
-            receipt: None,
-            evidence: encode_evidence(first).ok(),
-            finalization_failure: None,
-            failure: Some(encode_failure(&failure)),
-        },
-    );
-    let stored = persist(journal, stored, OperationState::CommitUnknown, record)?;
-    Err(unknown_error(
-        stored.operation_id,
-        "CTAS reconcile",
-        &failure,
-    ))
-}
-
-fn finish_contract_unknown(
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    phase: CtasSagaPhase,
-    slot: FactSlot,
-    message: impl Into<String>,
-) -> Result<(), DmlError> {
-    let message = message.into();
-    let mut record = ctas_record(&stored)?;
-    let evidence = match slot {
-        FactSlot::Prepare => retained_evidence(&record.prepare_fact),
-        FactSlot::Write => retained_evidence(&record.write_fact),
-        FactSlot::Publish => retained_evidence(&record.publish_fact),
-        FactSlot::Abort => retained_evidence(&record.abort_staging_fact),
-    };
-    record.phase = phase;
-    record.next_action = StatementNextAction::ManualInspect;
-    install_fact(
-        &mut record,
-        slot,
-        DurableExternalFact {
-            outcome: ExternalFactOutcome::CommitUnknown,
-            receipt: None,
-            evidence,
-            finalization_failure: None,
-            failure: Some(encode_failure(&CtasFailure {
-                kind: CtasFailureKind::Internal,
-                message: message.clone(),
-            })),
-        },
-    );
-    let stored = persist(journal, stored, OperationState::CommitUnknown, record)?;
-    Err(operation_error(
-        DmlErrorKind::Commit,
-        stored.operation_id,
-        StatementNextAction::ManualInspect,
-        message,
-    ))
-}
-
-fn reconcile_barrier(
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-) -> Result<StoredOperation, DmlError> {
-    let record = ctas_record(&stored)?;
-    persist(journal, stored, OperationState::CommitUnknown, record)
 }
 
 fn validate_source_facts(
@@ -1470,27 +1509,6 @@ fn validate_source_facts(
             stored.operation_id,
             StatementNextAction::ManualInspect,
             "CTAS prepared source facts conflict with the durable statement identity",
-        ))
-    }
-}
-
-fn validate_target_facts(
-    stored: &StoredOperation,
-    facts: &CtasTargetFacts,
-) -> Result<(), DmlError> {
-    let expected = ctas_record(stored)?.prepare_operation_id;
-    if facts.operation_id == *expected.as_bytes()
-        && !facts.provider_id.is_empty()
-        && !facts.instance_id.is_empty()
-        && facts.handle_digest.is_some()
-    {
-        Ok(())
-    } else {
-        Err(operation_error(
-            DmlErrorKind::Executor,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            "CTAS staged target facts conflict with the durable prepare identity",
         ))
     }
 }
@@ -1546,88 +1564,6 @@ fn validate_completion(
     }
 }
 
-fn install_target_facts(
-    record: &mut CtasSagaRecord,
-    facts: &CtasTargetFacts,
-) -> Result<(), DmlError> {
-    if facts.provider_id.is_empty() || facts.instance_id.is_empty() {
-        return Err(DmlError::journal_corruption("CTAS target owner is empty"));
-    }
-    record.provider_id = Some(facts.provider_id.clone());
-    record.connector_instance_id = Some(facts.instance_id.clone());
-    record.connector_incarnation = Some(hex::encode(facts.incarnation));
-    record.staged_handle_digest = facts.handle_digest.map(hex::encode);
-    Ok(())
-}
-
-fn validate_receipt(
-    facts: &CtasTargetFacts,
-    operation_id: Uuid,
-    phase: ConnectorStagedCreateReceiptPhase,
-    receipt: &ConnectorStagedCreateReceipt,
-) -> Result<(), DmlError> {
-    let matching = receipt.owner().instance_id.as_str() == facts.instance_id
-        && receipt.owner().incarnation.to_bytes() == facts.incarnation
-        && receipt.operation_id().to_bytes() == *operation_id.as_bytes()
-        && receipt.phase() == phase;
-    if matching {
-        Ok(())
-    } else {
-        Err(DmlError::commit(
-            "CTAS provider receipt conflicts with durable child identity",
-        ))
-    }
-}
-
-fn validate_evidence(
-    facts: &CtasTargetFacts,
-    operation_id: Uuid,
-    operation_kind: &str,
-    evidence: &ExternalMutationEvidence,
-) -> Result<(), DmlError> {
-    let wire = evidence.try_to_wire_v1().map_err(DmlError::commit)?;
-    let decoded = ExternalMutationEvidence::try_from_wire_v1(&wire).map_err(DmlError::commit)?;
-    let matching = decoded == *evidence
-        && evidence.descriptor().provider_id.as_str() == facts.provider_id
-        && evidence.descriptor().instance_id.as_str() == facts.instance_id
-        && evidence.incarnation().to_bytes() == facts.incarnation
-        && evidence.operation_id().to_bytes() == *operation_id.as_bytes()
-        && evidence.operation_kind() == operation_kind;
-    if matching {
-        Ok(())
-    } else {
-        Err(DmlError::commit(
-            "CTAS provider evidence conflicts with durable child identity",
-        ))
-    }
-}
-
-fn committed_fact(
-    receipt: &ConnectorStagedCreateReceipt,
-    finalization: &ExternalMutationFinalization,
-) -> Result<DurableExternalFact, DmlError> {
-    Ok(DurableExternalFact {
-        outcome: ExternalFactOutcome::KnownCommitted,
-        receipt: Some(encode_receipt(receipt)?),
-        evidence: None,
-        finalization_failure: encode_finalization_failure(finalization),
-        failure: None,
-    })
-}
-
-fn no_op_fact(
-    receipt: &ConnectorStagedCreateReceipt,
-    finalization: &ExternalMutationFinalization,
-) -> Result<DurableExternalFact, DmlError> {
-    Ok(DurableExternalFact {
-        outcome: ExternalFactOutcome::NoOp,
-        receipt: Some(encode_receipt(receipt)?),
-        evidence: None,
-        finalization_failure: encode_finalization_failure(finalization),
-        failure: None,
-    })
-}
-
 fn failure_fact(failure: &CtasFailure) -> DurableExternalFact {
     DurableExternalFact {
         outcome: match failure.kind {
@@ -1644,50 +1580,12 @@ fn failure_fact(failure: &CtasFailure) -> DurableExternalFact {
     }
 }
 
-fn mutation_failure_fact(
-    outcome: ExternalFactOutcome,
-    failure: &ConnectorMutationFailure,
-) -> DurableExternalFact {
-    DurableExternalFact {
-        outcome,
-        receipt: None,
-        evidence: None,
-        finalization_failure: None,
-        failure: Some(encode_failure(&mutation_failure(failure.clone()))),
-    }
-}
-
 fn install_fact(record: &mut CtasSagaRecord, slot: FactSlot, fact: DurableExternalFact) {
     match slot {
         FactSlot::Prepare => record.prepare_fact = Some(fact),
-        FactSlot::Write => record.write_fact = Some(fact),
         FactSlot::Publish => record.publish_fact = Some(fact),
         FactSlot::Abort => record.abort_staging_fact = Some(fact),
     }
-}
-
-fn retained_evidence(fact: &Option<DurableExternalFact>) -> Option<String> {
-    fact.as_ref().and_then(|fact| fact.evidence.clone())
-}
-
-fn encode_receipt(receipt: &ConnectorStagedCreateReceipt) -> Result<String, DmlError> {
-    let payload = receipt.provider_payload();
-    let encoded = serde_json::to_string(&DurableCtasReceiptV1 {
-        version: DURABLE_CTAS_FACT_VERSION,
-        phase: receipt_phase_name(receipt.phase()),
-        effect: match receipt.effect() {
-            novarocks_spi::connector::ExternalMutationEffect::Applied => "APPLIED",
-            novarocks_spi::connector::ExternalMutationEffect::NoOp => "NO_OP",
-        },
-        instance_id: receipt.owner().instance_id.as_str(),
-        incarnation: hex::encode(receipt.owner().incarnation.to_bytes()),
-        operation_id: hex::encode(receipt.operation_id().to_bytes()),
-        provider_payload_bytes: payload.len(),
-        provider_payload_sha256: hex::encode(Sha256::digest(payload)),
-    })
-    .map_err(DmlError::journal_corruption)?;
-    ensure_fact_bound("CTAS receipt", &encoded)?;
-    Ok(encoded)
 }
 
 fn encode_write_completion(
@@ -1720,15 +1618,6 @@ fn encode_evidence(evidence: &ExternalMutationEvidence) -> Result<String, DmlErr
     Ok(encoded)
 }
 
-fn encode_finalization_failure(finalization: &ExternalMutationFinalization) -> Option<String> {
-    match finalization {
-        ExternalMutationFinalization::Complete => None,
-        ExternalMutationFinalization::Failed(failure) => {
-            Some(encode_failure(&mutation_failure(failure.clone())))
-        }
-    }
-}
-
 fn encode_failure(failure: &CtasFailure) -> String {
     let original_message_bytes = failure.message.len();
     let mut prefix_end = original_message_bytes.min(DURABLE_FAILURE_PREFIX_BYTES);
@@ -1748,40 +1637,6 @@ fn encode_failure(failure: &CtasFailure) -> String {
     })
 }
 
-fn preflight_external_truth(
-    journal: &mut ActiveDmlOperation,
-    stored: &StoredOperation,
-) -> Result<(), DmlError> {
-    let maximal = maximal_committed_fact();
-    let mut operation = stored.clone();
-    let mut record = ctas_record(stored)?;
-    record.prepare_fact = Some(maximal.clone());
-    record.write_fact = Some(maximal.clone());
-    record.publish_fact = Some(maximal.clone());
-    record.abort_staging_fact = Some(maximal);
-    operation.payload = OperationPayload::CtasSaga(record);
-    journal.journal.preflight_statement_operation(&operation)
-}
-
-fn maximal_committed_fact() -> DurableExternalFact {
-    let mut payload_len = DML_CTAS_FACT_ENCODED_LIMIT;
-    loop {
-        let fact = DurableExternalFact {
-            outcome: ExternalFactOutcome::KnownCommitted,
-            receipt: Some("x".repeat(payload_len)),
-            evidence: None,
-            finalization_failure: None,
-            failure: None,
-        };
-        if serde_json::to_vec(&fact)
-            .is_ok_and(|encoded| encoded.len() <= DML_CTAS_FACT_ENCODED_LIMIT)
-        {
-            return fact;
-        }
-        payload_len -= 1;
-    }
-}
-
 fn ensure_fact_bound(label: &str, value: &str) -> Result<(), DmlError> {
     if value.len() <= DML_CTAS_FACT_ENCODED_LIMIT {
         Ok(())
@@ -1791,18 +1646,6 @@ fn ensure_fact_bound(label: &str, value: &str) -> Result<(), DmlError> {
             value.len()
         )))
     }
-}
-
-fn persist(
-    journal: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    state: OperationState,
-    record: CtasSagaRecord,
-) -> Result<StoredOperation, DmlError> {
-    journal
-        .mutate_statement(state, OperationPayload::CtasSaga(record), None)
-        .map_err(|error| journal_error(error, stored.operation_id))?;
-    Ok(journal.stored.clone())
 }
 
 fn ctas_record(stored: &StoredOperation) -> Result<CtasSagaRecord, DmlError> {
@@ -1852,21 +1695,6 @@ fn policy_name(policy: CreatePolicy) -> &'static str {
     match policy {
         CreatePolicy::FailIfExists => CTAS_CREATE_POLICY_FAIL_IF_EXISTS,
         CreatePolicy::NoOpIfExists => CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
-    }
-}
-
-fn finalization_action(finalization: &ExternalMutationFinalization) -> StatementNextAction {
-    match finalization {
-        ExternalMutationFinalization::Complete => StatementNextAction::None,
-        ExternalMutationFinalization::Failed(_) => StatementNextAction::RetryFinalize,
-    }
-}
-
-fn receipt_phase_name(phase: ConnectorStagedCreateReceiptPhase) -> &'static str {
-    match phase {
-        ConnectorStagedCreateReceiptPhase::Prepared => "PREPARED",
-        ConnectorStagedCreateReceiptPhase::Published => "PUBLISHED",
-        ConnectorStagedCreateReceiptPhase::Aborted => "ABORTED",
     }
 }
 
@@ -1942,1023 +1770,212 @@ fn failure_kind(kind: CtasFailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    use bytes::Bytes;
-    use novarocks::common::app_config::ClusterRole;
-    use novarocks::engine::statistics::EmptyStatisticsService;
-    use novarocks::query_execution::backend::BackendTopologySnapshot;
-    use novarocks::query_execution::cancellation::QueryCancellationSource;
-    use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
-    use novarocks_spi::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorColumnDefinition, ConnectorDataType,
-        ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorSealedWriteCohortSet,
-        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorWriteAttemptCompletion,
-        ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
-        ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState, ExternalMutationEffect,
-    };
-
     use super::*;
-    use crate::dml::journal::testing::InMemoryOperationJournal;
+    use crate::dml::model::{
+        DmlExternalFenceGeneration, validate_ctas_recovery, validate_ctas_recovery_transition,
+    };
+    use novarocks::engine::ctas_engine::CtasTargetPreflightFacts;
+    use novarocks_spi::connector::ConnectorMutationFailureKind;
 
-    struct FakeSource([u8; 32]);
-
-    impl novarocks::engine::ctas_engine::CtasPreparedSource for FakeSource {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn execution_identity(&self) -> [u8; 32] {
-            self.0
-        }
+    fn confirmed_recovery() -> DmlCtasRecoveryRecord {
+        let action_id = ConnectorCtasActionId::try_from_bytes(*Uuid::now_v7().as_bytes()).unwrap();
+        let facts = CtasTargetPreflightFacts {
+            provider_id: "iceberg".to_string(),
+            instance_id: "rest".to_string(),
+            incarnation: [1; 16],
+            capability_version: 1,
+            target_namespace: "db".to_string(),
+            target_table: "t".to_string(),
+        };
+        let mut recovery = new_recovery_record(
+            &facts,
+            Uuid::now_v7(),
+            DmlExternalFenceGeneration {
+                control_plane_incarnation: 1,
+                resource_epoch: 1,
+                fence_generation: 1,
+            },
+            action_id,
+            [1; 32],
+        )
+        .unwrap();
+        mark_fence_dispatched(&mut recovery);
+        let fence = recovery.catalog_fence.as_mut().unwrap();
+        fence.fence_digest = Some(hex::encode([2; 32]));
+        fence.receipt_digest = Some(hex::encode([3; 32]));
+        fence.receipt_payload = Some(DmlOpaquePayload::try_new(vec![4]).unwrap());
+        fence.established_at_ms = Some(1);
+        recovery.next_action = StatementNextAction::None;
+        recovery
     }
 
-    struct FakeTarget;
-
-    impl novarocks::engine::ctas_engine::CtasPreparedTarget for FakeTarget {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
+    fn install_staging(recovery: &mut DmlCtasRecoveryRecord) -> Uuid {
+        let stage = Uuid::now_v7();
+        append_checkpoint(recovery, DmlCtasActionKind::Stage, stage, [5; 32]);
+        assert_eq!(recovery.next_action, StatementNextAction::ManualInspect);
+        mark_checkpoint_dispatched(recovery, DmlCtasActionKind::Stage, stage);
+        recovery.staged_locator = Some(DmlOpaquePayload::try_new(vec![6]).unwrap());
+        recovery.staged_locator_digest = Some(hex::encode([7; 32]));
+        recovery.staged_proof_digest = Some(hex::encode([8; 32]));
+        recovery.staged_proof = Some(DmlOpaquePayload::try_new(vec![9]).unwrap());
+        recovery.cleanup_retention = DmlCtasCleanupRetention::Pending;
+        recovery.next_action = StatementNextAction::AbortStaging;
+        stage
     }
 
-    struct FakeWrite {
-        operation_id: ConnectorWriteOperationId,
-        execution_identity: [u8; 32],
+    #[test]
+    fn stage_checkpoint_is_durable_before_dispatch_and_retains_cleanup() {
+        let mut recovery = confirmed_recovery();
+        let stage = install_staging(&mut recovery);
+        validate_ctas_recovery(&recovery).unwrap();
+        let checkpoint = recovery.dispatch_checkpoints.first().unwrap();
+        assert_eq!(checkpoint.child_operation_id, stage);
+        assert_eq!(
+            checkpoint.dispatch_certainty,
+            DmlCtasDispatchCertainty::PossiblyDispatched
+        );
+        assert!(checkpoint.dispatched_at_ms.is_some());
+        assert!(recovery.requires_recovery_scan());
     }
 
-    impl novarocks::engine::ctas_engine::CtasPreparedWrite for FakeWrite {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
+    #[test]
+    fn proven_abort_closes_foreground_staging_without_cleanup_receipt() {
+        let mut pending = confirmed_recovery();
+        install_staging(&mut pending);
+        validate_ctas_recovery(&pending).unwrap();
 
-        fn execution_identity(&self) -> [u8; 32] {
-            self.execution_identity
-        }
+        let mut aborted = pending.clone();
+        let action = Uuid::now_v7();
+        append_checkpoint(&mut aborted, DmlCtasActionKind::Abort, action, [10; 32]);
+        mark_checkpoint_dispatched(&mut aborted, DmlCtasActionKind::Abort, action);
+        aborted
+            .historical_observations
+            .push(DmlCtasHistoricalObservationRecord {
+                action: DmlCtasActionKind::Abort,
+                child_operation_id: action,
+                disposition: DmlCtasHistoricalDisposition::Aborted,
+                descriptor_digest: hex::encode([11; 32]),
+                descriptor_locator_digest: Some(hex::encode([7; 32])),
+                observation_digest: hex::encode([12; 32]),
+                locator_digest: None,
+                proof_digest: Some(hex::encode([13; 32])),
+                proof_payload: Some(DmlOpaquePayload::try_new(vec![14]).unwrap()),
+                conflict_kind: None,
+                failure: None,
+                observed_at_ms: 2,
+            });
+        aborted.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+        aborted.next_action = StatementNextAction::None;
+
+        validate_ctas_recovery_transition(Some(&pending), &aborted).unwrap();
+        assert!(!aborted.requires_recovery_scan());
     }
 
-    #[derive(Clone, Copy)]
-    enum PrepareMode {
-        Prepared,
-        Unsupported,
-        ContractUnknown,
-        MalformedContractUnknown,
+    #[test]
+    fn fence_reply_loss_remains_recovery_due_without_stage_facts() {
+        let mut recovery = confirmed_recovery();
+        let fence = recovery.catalog_fence.as_mut().unwrap();
+        fence.fence_digest = None;
+        fence.receipt_digest = None;
+        fence.receipt_payload = None;
+        fence.established_at_ms = None;
+        recovery.next_action = StatementNextAction::ManualInspect;
+        validate_ctas_recovery(&recovery).unwrap();
+        assert!(recovery.requires_recovery_scan());
+        assert!(recovery.staged_locator.is_none());
     }
 
-    #[derive(Clone, Copy)]
-    enum WriteMode {
-        Completed,
-        CommitUnknown,
-    }
-
-    #[derive(Clone, Copy)]
-    enum PublishMode {
-        Applied,
-        AppliedFinalizeFailed,
-        NoOp,
-        Conflict,
-        OuterError,
-    }
-
-    #[derive(Clone, Copy)]
-    enum AbortMode {
-        Aborted,
-        FinalizeFailed,
-        CommitUnknown,
-    }
-
-    #[derive(Clone, Copy)]
-    enum ReconcileMode {
-        OuterError,
-        AbortKnownUncommitted,
-    }
-
-    struct FakeEngine {
-        precheck_exists: bool,
-        precheck_failure: bool,
-        source_session_drift: bool,
-        prepare_mode: PrepareMode,
-        write_mode: WriteMode,
-        publish_mode: PublishMode,
-        abort_mode: AbortMode,
-        reconcile_mode: ReconcileMode,
-        classify_calls: AtomicUsize,
-        source_prepare_calls: AtomicUsize,
-        target_prepare_calls: AtomicUsize,
-        write_prepare_calls: AtomicUsize,
-        write_execute_calls: AtomicUsize,
-        write_reconcile_calls: AtomicUsize,
-        publish_calls: AtomicUsize,
-        abort_calls: AtomicUsize,
-        reconcile_calls: AtomicUsize,
-        child_ids: Mutex<Vec<[u8; 16]>>,
-    }
-
-    impl Default for FakeEngine {
-        fn default() -> Self {
-            Self {
-                precheck_exists: false,
-                precheck_failure: false,
-                source_session_drift: false,
-                prepare_mode: PrepareMode::Prepared,
-                write_mode: WriteMode::Completed,
-                publish_mode: PublishMode::Applied,
-                abort_mode: AbortMode::Aborted,
-                reconcile_mode: ReconcileMode::OuterError,
-                classify_calls: AtomicUsize::new(0),
-                source_prepare_calls: AtomicUsize::new(0),
-                target_prepare_calls: AtomicUsize::new(0),
-                write_prepare_calls: AtomicUsize::new(0),
-                write_execute_calls: AtomicUsize::new(0),
-                write_reconcile_calls: AtomicUsize::new(0),
-                publish_calls: AtomicUsize::new(0),
-                abort_calls: AtomicUsize::new(0),
-                reconcile_calls: AtomicUsize::new(0),
-                child_ids: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl FakeEngine {
-        fn owner() -> ConnectorExecutionBindingKey {
-            ConnectorExecutionBindingKey {
-                instance_id: ConnectorInstanceId::parse("ice").unwrap(),
-                incarnation: ConnectorInstanceIncarnation::from_bytes([0x11; 16]),
-            }
-        }
-
-        fn target_facts(operation_id: [u8; 16]) -> CtasTargetFacts {
-            CtasTargetFacts {
-                provider_id: "iceberg".to_string(),
-                instance_id: "ice".to_string(),
-                incarnation: [0x11; 16],
-                operation_id,
-                handle_digest: Some([0x22; 32]),
-            }
-        }
-
-        fn target(operation_id: [u8; 16]) -> PreparedCtasTarget {
-            PreparedCtasTarget {
-                facts: Self::target_facts(operation_id),
-                handle: Arc::new(FakeTarget),
-            }
-        }
-
-        fn receipt(
-            operation_id: ConnectorMutationOperationId,
-            phase: ConnectorStagedCreateReceiptPhase,
-            effect: ExternalMutationEffect,
-        ) -> ConnectorStagedCreateReceipt {
-            ConnectorStagedCreateReceipt::try_new(
-                Self::owner(),
-                operation_id,
-                phase,
-                effect,
-                Bytes::from_static(b"receipt"),
-            )
-            .unwrap()
-        }
-
-        fn evidence(
-            operation_id: ConnectorMutationOperationId,
-            operation_kind: &'static str,
-        ) -> ExternalMutationEvidence {
-            ExternalMutationEvidence::try_new(
-                1,
-                ConnectorInstanceDescriptor {
-                    provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
-                    instance_id: ConnectorInstanceId::parse("ice").unwrap(),
-                },
-                ConnectorInstanceIncarnation::from_bytes([0x11; 16]),
-                operation_id,
-                operation_kind,
-                Bytes::from_static(b"evidence"),
-            )
-            .unwrap()
-        }
-
-        fn failure(kind: CtasFailureKind, message: &str) -> CtasFailure {
-            CtasFailure {
-                kind,
-                message: message.to_string(),
-            }
-        }
-
-        fn finalization_failure() -> ConnectorMutationFailure {
+    #[test]
+    fn only_definitely_undispatched_or_typed_conflict_is_terminal() {
+        let failure = || {
             ConnectorMutationFailure::new(
-                novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
-                "finalization failed",
+                ConnectorMutationFailureKind::Conflict,
+                "catalog rejected the request",
             )
-        }
-    }
-
-    impl CtasEngine for FakeEngine {
-        fn classify_ctas(
-            &self,
-            sql: &str,
-        ) -> Result<Option<novarocks::engine::ctas_engine::CtasCommand>, String> {
-            self.classify_calls.fetch_add(1, Ordering::SeqCst);
-            if !sql.trim().to_ascii_uppercase().starts_with("CREATE TABLE") {
-                return Ok(None);
-            }
-            Ok(Some(novarocks::engine::ctas_engine::CtasCommand {
-                target_parts: vec!["ice".to_string(), "db".to_string(), "dst".to_string()],
-                if_not_exists: sql.to_ascii_uppercase().contains("IF NOT EXISTS"),
-                source_sql: "SELECT 1 AS x".to_string(),
-                partitioning: Vec::new(),
-                properties: Default::default(),
-            }))
-        }
-
-        fn precheck_ctas_target(
-            &self,
-            command: &novarocks::engine::ctas_engine::CtasCommand,
-            _current_catalog: Option<&str>,
-            _current_database: &str,
-        ) -> Result<CtasTargetPrecheck, CtasFailure> {
-            if self.precheck_failure {
-                return Err(Self::failure(
-                    CtasFailureKind::Unavailable,
-                    "precheck failed",
-                ));
-            }
-            if self.precheck_exists && command.if_not_exists {
-                Ok(CtasTargetPrecheck::ExistsNoOp)
-            } else {
-                Ok(CtasTargetPrecheck::Absent)
-            }
-        }
-
-        fn prepare_ctas_source(
-            &self,
-            request: PrepareCtasSourceRequest,
-        ) -> Result<PreparedCtasSource, CtasFailure> {
-            self.source_prepare_calls.fetch_add(1, Ordering::SeqCst);
-            let identity = [0x33; 32];
-            Ok(PreparedCtasSource {
-                facts: novarocks::engine::ctas_engine::CtasPreparedSourceFacts {
-                    target_catalog: request.command.target_parts[0].clone(),
-                    target_namespace: request.command.target_parts[1].clone(),
-                    target_table: request.command.target_parts[2].clone(),
-                    source_catalog: if self.source_session_drift {
-                        Some("drifted".to_string())
-                    } else {
-                        request.current_catalog
-                    },
-                    source_database: if self.source_session_drift {
-                        "drifted".to_string()
-                    } else {
-                        request.current_database
-                    },
-                    plan_digest: [0x44; 32],
-                    schema_digest: [0x55; 32],
-                    execution_identity: identity,
-                    output_columns: vec![ConnectorColumnDefinition {
-                        name: Arc::from("x"),
-                        data_type: ConnectorDataType::Int,
-                        nullable: false,
-                        aggregation: None,
-                        default: None,
-                    }],
-                },
-                handle: Arc::new(FakeSource(identity)),
-            })
-        }
-
-        fn prepare_ctas_target(
-            &self,
-            _source: &dyn novarocks::engine::ctas_engine::CtasPreparedSource,
-            operation_id: ConnectorMutationOperationId,
-            _policy: CreatePolicy,
-        ) -> Result<CtasTargetPrepareOutcome, CtasFailure> {
-            self.target_prepare_calls.fetch_add(1, Ordering::SeqCst);
-            self.child_ids.lock().unwrap().push(operation_id.to_bytes());
-            match self.prepare_mode {
-                PrepareMode::Prepared => Ok(CtasTargetPrepareOutcome::Prepared {
-                    target: Self::target(operation_id.to_bytes()),
-                    receipt: Self::receipt(
-                        operation_id,
-                        ConnectorStagedCreateReceiptPhase::Prepared,
-                        ExternalMutationEffect::Applied,
-                    ),
-                    finalization: ExternalMutationFinalization::Complete,
-                }),
-                PrepareMode::Unsupported => Err(Self::failure(
-                    CtasFailureKind::Unsupported,
-                    "staged publication unsupported",
-                )),
-                PrepareMode::ContractUnknown => Ok(CtasTargetPrepareOutcome::ContractUnknown {
-                    target: Self::target(operation_id.to_bytes()),
-                    failure: Self::failure(
-                        CtasFailureKind::Unavailable,
-                        "prepare contract unknown",
-                    ),
-                }),
-                PrepareMode::MalformedContractUnknown => {
-                    Ok(CtasTargetPrepareOutcome::ContractUnknown {
-                        target: Self::target([0xff; 16]),
-                        failure: Self::failure(
-                            CtasFailureKind::Unavailable,
-                            "malformed prepare contract unknown",
-                        ),
-                    })
-                }
-            }
-        }
-
-        fn prepare_ctas_write(
-            &self,
-            source: &dyn novarocks::engine::ctas_engine::CtasPreparedSource,
-            target: &dyn novarocks::engine::ctas_engine::CtasPreparedTarget,
-            operation_id: ConnectorWriteOperationId,
-        ) -> Result<PreparedCtasWrite, CtasFailure> {
-            self.write_prepare_calls.fetch_add(1, Ordering::SeqCst);
-            self.child_ids.lock().unwrap().push(operation_id.to_bytes());
-            let _ = target.as_any().downcast_ref::<FakeTarget>().unwrap();
-            let source = source.as_any().downcast_ref::<FakeSource>().unwrap();
-            Ok(PreparedCtasWrite {
-                target_facts: Self::target_facts(self.child_ids.lock().unwrap()[0]),
-                write_operation_id: operation_id,
-                execution_identity: source.0,
-                handle: Arc::new(FakeWrite {
-                    operation_id,
-                    execution_identity: source.0,
-                }),
-            })
-        }
-
-        fn execute_ctas_write(
-            &self,
-            prepared: &dyn novarocks::engine::ctas_engine::CtasPreparedWrite,
-        ) -> CtasWriteOutcome {
-            self.write_execute_calls.fetch_add(1, Ordering::SeqCst);
-            let prepared = prepared.as_any().downcast_ref::<FakeWrite>().unwrap();
-            match self.write_mode {
-                WriteMode::Completed => CtasWriteOutcome::Completed {
-                    completion: completion(Self::owner(), prepared.operation_id),
-                    execution_identity: prepared.execution_identity,
-                },
-                WriteMode::CommitUnknown => CtasWriteOutcome::CommitUnknown {
-                    failure: Self::failure(CtasFailureKind::Unavailable, "write unknown"),
-                    evidence: Self::evidence(
-                        ConnectorMutationOperationId::from_bytes(prepared.operation_id.to_bytes()),
-                        "ctas-write-staging",
-                    ),
-                },
-            }
-        }
-
-        fn reconcile_ctas_write(
-            &self,
-            prepared: &dyn novarocks::engine::ctas_engine::CtasPreparedWrite,
-            _evidence: ExternalMutationEvidence,
-        ) -> CtasWriteOutcome {
-            self.write_reconcile_calls.fetch_add(1, Ordering::SeqCst);
-            let prepared = prepared.as_any().downcast_ref::<FakeWrite>().unwrap();
-            CtasWriteOutcome::Completed {
-                completion: completion(Self::owner(), prepared.operation_id),
-                execution_identity: prepared.execution_identity,
-            }
-        }
-
-        fn publish_ctas(
-            &self,
-            _target: &dyn novarocks::engine::ctas_engine::CtasPreparedTarget,
-            operation_id: ConnectorMutationOperationId,
-            _completion: ConnectorWriteOperationCompletion,
-        ) -> Result<ConnectorStagedCreatePublishOutcome, CtasFailure> {
-            self.publish_calls.fetch_add(1, Ordering::SeqCst);
-            self.child_ids.lock().unwrap().push(operation_id.to_bytes());
-            match self.publish_mode {
-                PublishMode::Applied => Ok(ConnectorStagedCreatePublishOutcome::Applied {
-                    receipt: Self::receipt(
-                        operation_id,
-                        ConnectorStagedCreateReceiptPhase::Published,
-                        ExternalMutationEffect::Applied,
-                    ),
-                    finalization: ExternalMutationFinalization::Complete,
-                }),
-                PublishMode::AppliedFinalizeFailed => {
-                    Ok(ConnectorStagedCreatePublishOutcome::Applied {
-                        receipt: Self::receipt(
-                            operation_id,
-                            ConnectorStagedCreateReceiptPhase::Published,
-                            ExternalMutationEffect::Applied,
-                        ),
-                        finalization: ExternalMutationFinalization::Failed(
-                            Self::finalization_failure(),
-                        ),
-                    })
-                }
-                PublishMode::NoOp => Ok(ConnectorStagedCreatePublishOutcome::NoOp {
-                    receipt: Self::receipt(
-                        operation_id,
-                        ConnectorStagedCreateReceiptPhase::Published,
-                        ExternalMutationEffect::NoOp,
-                    ),
-                    finalization: ExternalMutationFinalization::Complete,
-                }),
-                PublishMode::Conflict => Ok(ConnectorStagedCreatePublishOutcome::Conflict {
-                    failure: ConnectorMutationFailure::new(
-                        novarocks_spi::connector::ConnectorMutationFailureKind::Conflict,
-                        "publish conflict",
-                    ),
-                }),
-                PublishMode::OuterError => Err(Self::failure(
-                    CtasFailureKind::Unavailable,
-                    "publish outer error",
-                )),
-            }
-        }
-
-        fn abort_ctas(
-            &self,
-            _target: &dyn novarocks::engine::ctas_engine::CtasPreparedTarget,
-            operation_id: ConnectorMutationOperationId,
-            _completion: Option<ConnectorWriteOperationCompletion>,
-        ) -> Result<ConnectorStagedCreateAbortOutcome, CtasFailure> {
-            self.abort_calls.fetch_add(1, Ordering::SeqCst);
-            self.child_ids.lock().unwrap().push(operation_id.to_bytes());
-            match self.abort_mode {
-                AbortMode::Aborted | AbortMode::FinalizeFailed => {
-                    Ok(ConnectorStagedCreateAbortOutcome::Aborted {
-                        receipt: Self::receipt(
-                            operation_id,
-                            ConnectorStagedCreateReceiptPhase::Aborted,
-                            ExternalMutationEffect::Applied,
-                        ),
-                        finalization: match self.abort_mode {
-                            AbortMode::Aborted => ExternalMutationFinalization::Complete,
-                            AbortMode::FinalizeFailed => {
-                                ExternalMutationFinalization::Failed(Self::finalization_failure())
-                            }
-                            AbortMode::CommitUnknown => unreachable!(),
-                        },
-                    })
-                }
-                AbortMode::CommitUnknown => Ok(ConnectorStagedCreateAbortOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
-                        "abort unknown",
-                    ),
-                    evidence: Self::evidence(operation_id, "staged-create-abort"),
-                }),
-            }
-        }
-
-        fn reconcile_ctas(
-            &self,
-            _target: &dyn novarocks::engine::ctas_engine::CtasPreparedTarget,
-            phase: ConnectorStagedCreateReconcilePhase,
-            _evidence: ExternalMutationEvidence,
-        ) -> Result<ConnectorStagedCreateReconcileOutcome, CtasFailure> {
-            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
-            match self.reconcile_mode {
-                ReconcileMode::OuterError => Err(Self::failure(
-                    CtasFailureKind::Unavailable,
-                    "unused reconcile",
-                )),
-                ReconcileMode::AbortKnownUncommitted => {
-                    assert_eq!(phase, ConnectorStagedCreateReconcilePhase::Abort);
-                    Ok(ConnectorStagedCreateReconcileOutcome::KnownUncommitted {
-                        failure: ConnectorMutationFailure::new(
-                            novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
-                            "reconcile request not dispatched",
-                        ),
-                    })
-                }
-            }
-        }
-    }
-
-    fn completion(
-        owner: ConnectorExecutionBindingKey,
-        operation_id: ConnectorWriteOperationId,
-    ) -> ConnectorWriteOperationCompletion {
-        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
-        let execution_id = ConnectorWriteExecutionId::new([0x66; 16], 1);
-        let writer = ConnectorWriterIdentity::new(
-            operation_id,
-            cohort_id,
-            execution_id,
-            [0x77; 16],
-            1,
-            0,
-            0,
-            owner.clone(),
+        };
+        let known_not_dispatched = ConnectorCtasFailure::KnownNotDispatched(failure());
+        assert!(catalog_failure_is_terminal(&known_not_dispatched));
+        assert_eq!(
+            connector_failure_fact(&known_not_dispatched).outcome,
+            ExternalFactOutcome::KnownUncommitted
         );
-        let report = ConnectorStagedReport::try_new(
-            writer,
-            CONNECTOR_WRITE_CONTRACT_VERSION,
-            ConnectorWriterTerminalState::Staged,
-            ConnectorStagedReportSummary::default(),
-            Bytes::from_static(b"report"),
-        )
-        .unwrap();
-        let accepted = ConnectorWriteAttemptCompletion::try_new(
-            owner.clone(),
-            operation_id,
-            cohort_id,
-            execution_id,
-            [0x88; 32],
-            vec![report],
-            Bytes::new(),
-        )
-        .unwrap();
-        let sealed = ConnectorSealedWriteCohortSet::try_new(
-            operation_id,
-            vec![ConnectorWriteCohortDescriptor::new(
-                cohort_id,
-                ConnectorWriteIntent::Append,
-                [0x99; 32],
-            )],
-        )
-        .unwrap();
-        ConnectorWriteOperationCompletion::try_new(
-            owner,
-            sealed,
-            vec![
-                ConnectorWriteCohortCompletion::try_new(cohort_id, Some(accepted), vec![]).unwrap(),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn service() -> (DmlService, Arc<InMemoryOperationJournal>) {
-        let journal = Arc::new(InMemoryOperationJournal::default());
-        (
-            DmlService::new(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-            journal,
-        )
-    }
-
-    fn admitted_context() -> RequestContext {
-        let cancellation = QueryCancellationSource::new();
-        RequestContext::admit(RequestAdmission::new(
-            Some("ice".to_string()),
-            "db".to_string(),
-            ClusterRole::Fe,
-            BackendTopologySnapshot::empty(83),
-            None,
-            cancellation.view(),
-            Default::default(),
-        ))
-    }
-
-    fn operation_record(operation: &StoredOperation) -> &CtasSagaRecord {
-        match &operation.payload {
-            OperationPayload::CtasSaga(record) => record,
-            other => panic!("expected CTAS record, got {other:?}"),
+        let conflict = ConnectorCtasFailure::Conflict {
+            kind: ConnectorCtasConflictKind::CreatePolicyConflict,
+            failure: failure(),
+        };
+        assert!(catalog_failure_is_terminal(&conflict));
+        assert_eq!(
+            connector_failure_fact(&conflict).outcome,
+            ExternalFactOutcome::Conflict
+        );
+        for uncertain in [
+            ConnectorCtasFailure::PossiblyDispatched(failure()),
+            ConnectorCtasFailure::CommittedResponseInvalid(failure()),
+            ConnectorCtasFailure::Ambiguous(failure()),
+        ] {
+            assert!(!catalog_failure_is_terminal(&uncertain));
+            assert_eq!(
+                connector_failure_fact(&uncertain).outcome,
+                ExternalFactOutcome::CommitUnknown
+            );
         }
     }
 
     #[test]
-    fn worst_case_fact_fills_but_does_not_exceed_the_complete_envelope_limit() {
-        let fact = maximal_committed_fact();
-        let encoded = serde_json::to_vec(&fact).unwrap();
-        assert!(encoded.len() <= DML_CTAS_FACT_ENCODED_LIMIT);
-        let mut larger = fact;
-        larger.receipt.as_mut().unwrap().push('x');
-        assert!(serde_json::to_vec(&larger).unwrap().len() > DML_CTAS_FACT_ENCODED_LIMIT);
+    fn unrelated_terminal_observation_cannot_forget_staged_cleanup() {
+        let mut pending = confirmed_recovery();
+        install_staging(&mut pending);
+        let abort = Uuid::now_v7();
+        append_checkpoint(&mut pending, DmlCtasActionKind::Abort, abort, [10; 32]);
+        mark_checkpoint_dispatched(&mut pending, DmlCtasActionKind::Abort, abort);
+        pending
+            .historical_observations
+            .push(DmlCtasHistoricalObservationRecord {
+                action: DmlCtasActionKind::Abort,
+                child_operation_id: abort,
+                disposition: DmlCtasHistoricalDisposition::Aborted,
+                descriptor_digest: hex::encode([11; 32]),
+                descriptor_locator_digest: None,
+                observation_digest: hex::encode([12; 32]),
+                locator_digest: None,
+                proof_digest: Some(hex::encode([13; 32])),
+                proof_payload: Some(DmlOpaquePayload::try_new(vec![14]).unwrap()),
+                conflict_kind: None,
+                failure: None,
+                observed_at_ms: 2,
+            });
+        pending.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+        pending.next_action = StatementNextAction::None;
+        assert!(validate_ctas_recovery(&pending).is_err());
+
+        pending.historical_observations[0].descriptor_locator_digest =
+            pending.staged_locator_digest.clone();
+        validate_ctas_recovery(&pending).unwrap();
     }
 
     #[test]
-    fn failure_projection_is_bounded_and_preserves_the_original_digest() {
-        let failure = CtasFailure {
-            kind: CtasFailureKind::Unavailable,
-            message: "x".repeat(64 * 1024),
-        };
-        let encoded = encode_failure(&failure);
-        assert!(encoded.len() < DML_CTAS_FACT_ENCODED_LIMIT);
-        assert!(encoded.contains("UNAVAILABLE"));
-        assert!(encoded.contains(&hex::encode(Sha256::digest(failure.message.as_bytes()))));
-    }
+    fn absent_stage_observation_without_locator_lineage_cannot_forget_cleanup() {
+        let mut pending = confirmed_recovery();
+        let stage = install_staging(&mut pending);
+        pending
+            .historical_observations
+            .push(DmlCtasHistoricalObservationRecord {
+                action: DmlCtasActionKind::Stage,
+                child_operation_id: stage,
+                disposition: DmlCtasHistoricalDisposition::Absent,
+                descriptor_digest: hex::encode([15; 32]),
+                descriptor_locator_digest: None,
+                observation_digest: hex::encode([16; 32]),
+                locator_digest: None,
+                proof_digest: Some(hex::encode([17; 32])),
+                proof_payload: Some(DmlOpaquePayload::try_new(vec![18]).unwrap()),
+                conflict_kind: None,
+                failure: None,
+                observed_at_ms: 3,
+            });
+        pending.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
+        pending.next_action = StatementNextAction::None;
 
-    #[test]
-    fn syntactic_target_uses_the_admitted_session_resolution() {
-        assert_eq!(
-            syntactic_target(&["orders".to_string()], Some("ice"), "sales"),
-            OperationTarget {
-                catalog: "ice".to_string(),
-                namespace: "sales".to_string(),
-                table: "orders".to_string(),
-                ref_name: None,
-            }
-        );
-        assert_eq!(
-            syntactic_target(
-                &["rest".to_string(), "db".to_string(), "t".to_string()],
-                None,
-                "ignored",
-            ),
-            OperationTarget {
-                catalog: "rest".to_string(),
-                namespace: "db".to_string(),
-                table: "t".to_string(),
-                ref_name: None,
-            }
-        );
-    }
-
-    #[test]
-    fn non_ctas_skips_admission_but_ifne_existing_finalizes_a_noop_saga() {
-        let engine = FakeEngine::default();
-        let no_journal = DmlService::compose(None, Arc::new(EmptyStatisticsService));
-        let context = admitted_context();
-        assert_eq!(
-            no_journal
-                .try_execute_ctas(&engine, "SELECT 1", &context, None)
-                .unwrap(),
-            None
-        );
-        assert_eq!(engine.source_prepare_calls.load(Ordering::SeqCst), 0);
-
-        let engine = FakeEngine {
-            precheck_exists: true,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        assert_eq!(
-            service
-                .try_execute_ctas(
-                    &engine,
-                    "CREATE TABLE IF NOT EXISTS ice.db.dst AS SELECT 1",
-                    &context,
-                    None,
-                )
-                .unwrap(),
-            Some(())
-        );
-        assert_eq!(engine.source_prepare_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.target_prepare_calls.load(Ordering::SeqCst), 0);
-        let operation = journal.only_operation();
-        assert_eq!(operation.state, OperationState::Finalized);
-        assert_eq!(operation_record(&operation).phase, CtasSagaPhase::NoOp);
-    }
-
-    #[test]
-    fn happy_path_uses_stable_child_ids_and_executes_the_source_once() {
-        let engine = FakeEngine::default();
-        let (service, journal) = service();
-        let context = admitted_context();
-        assert_eq!(
-            service
-                .try_execute_ctas(
-                    &engine,
-                    "CREATE TABLE ice.db.dst AS SELECT 1",
-                    &context,
-                    None,
-                )
-                .unwrap(),
-            Some(())
-        );
-        let operation = journal.only_operation();
-        let record = operation_record(&operation);
-        assert_eq!(operation.state, OperationState::Finalized);
-        assert_eq!(record.phase, CtasSagaPhase::Committed);
-        assert_eq!(record.next_action, StatementNextAction::None);
-        assert!(record.prepare_fact.is_some());
-        assert!(record.write_fact.is_some());
-        assert!(record.publish_fact.is_some());
-        let ids = [
-            record.prepare_operation_id,
-            record.write_operation_id,
-            record.publish_operation_id,
-            record.abort_staging_operation_id,
-        ];
-        assert!(ids.iter().all(|id| !id.is_nil()));
-        assert_eq!(
-            ids.iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            4
-        );
-        assert_eq!(engine.source_prepare_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.write_execute_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.publish_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            engine.child_ids.lock().unwrap().as_slice(),
-            &[
-                *record.prepare_operation_id.as_bytes(),
-                *record.write_operation_id.as_bytes(),
-                *record.publish_operation_id.as_bytes(),
-            ]
-        );
-    }
-
-    #[test]
-    fn unsupported_target_fails_before_source_execution_and_external_prepare_progress() {
-        let engine = FakeEngine {
-            prepare_mode: PrepareMode::Unsupported,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(error.next_action(), Some(StatementNextAction::None));
-        let operation = journal.only_operation();
-        assert_eq!(operation.state, OperationState::FailedKnownUncommitted);
-        assert_eq!(
-            operation_record(&operation).phase,
-            CtasSagaPhase::Unsupported
-        );
-        assert_eq!(engine.source_prepare_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.write_execute_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.publish_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn prepare_contract_unknown_is_durable_and_never_aborts() {
-        let engine = FakeEngine {
-            prepare_mode: PrepareMode::ContractUnknown,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.next_action(),
-            Some(StatementNextAction::ManualInspect)
-        );
-        let operation = journal.only_operation();
-        let record = operation_record(&operation);
-        assert_eq!(operation.state, OperationState::CommitUnknown);
-        assert_eq!(record.phase, CtasSagaPhase::PrepareUnknown);
-        assert_eq!(record.prepare_fact.as_ref().unwrap().evidence, None);
-        assert_eq!(engine.write_execute_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.reconcile_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn write_unknown_reconciles_without_reexecuting_the_source() {
-        let engine = FakeEngine {
-            write_mode: WriteMode::CommitUnknown,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap();
-        assert_eq!(journal.only_operation().state, OperationState::Finalized);
-        assert_eq!(engine.write_execute_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.write_reconcile_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.publish_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn publish_finalization_failure_preserves_known_committed_truth_without_abort() {
-        let engine = FakeEngine {
-            publish_mode: PublishMode::AppliedFinalizeFailed,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
-        assert_eq!(
-            error.next_action(),
-            Some(StatementNextAction::RetryFinalize)
-        );
-        let operation = journal.only_operation();
-        assert_eq!(
-            operation.state,
-            OperationState::FinalizeFailedKnownCommitted
-        );
-        assert_eq!(operation_record(&operation).phase, CtasSagaPhase::Committed);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn publish_noop_aborts_only_the_opaque_staging_and_returns_success() {
-        let engine = FakeEngine {
-            publish_mode: PublishMode::NoOp,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE IF NOT EXISTS ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap();
-        let operation = journal.only_operation();
-        assert_eq!(operation.state, OperationState::Aborted);
-        assert_eq!(operation_record(&operation).phase, CtasSagaPhase::NoOp);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn publish_outer_error_is_unknown_and_forbids_abort() {
-        let engine = FakeEngine {
-            publish_mode: PublishMode::OuterError,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.next_action(),
-            Some(StatementNextAction::ManualInspect)
-        );
-        let operation = journal.only_operation();
-        assert_eq!(operation.state, OperationState::CommitUnknown);
-        assert_eq!(
-            operation_record(&operation).phase,
-            CtasSagaPhase::PublishUnknown
-        );
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn abort_finalization_failure_remains_unfinished_and_is_not_retried() {
-        let engine = FakeEngine {
-            publish_mode: PublishMode::Conflict,
-            abort_mode: AbortMode::FinalizeFailed,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.next_action(),
-            Some(StatementNextAction::RetryFinalize)
-        );
-        let operation = journal.only_operation();
-        let record = operation_record(&operation);
-        assert_eq!(operation.state, OperationState::Aborting);
-        assert_eq!(record.phase, CtasSagaPhase::AbortingStaging);
-        assert_eq!(record.next_action, StatementNextAction::RetryFinalize);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(journal.list_unfinished().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn precheck_failure_is_journaled_and_returns_an_operation_identity() {
-        let engine = FakeEngine {
-            precheck_failure: true,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        let operation = journal.only_operation();
-        assert_eq!(error.operation_id(), Some(operation.operation_id));
-        assert_eq!(error.next_action(), Some(StatementNextAction::None));
-        assert_eq!(operation.state, OperationState::FailedKnownUncommitted);
-        assert_eq!(operation_record(&operation).phase, CtasSagaPhase::Failed);
-        assert_eq!(engine.source_prepare_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.target_prepare_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn prepared_source_must_preserve_the_admitted_session_identity() {
-        let engine = FakeEngine {
-            source_session_drift: true,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        let operation = journal.only_operation();
-        assert_eq!(operation.state, OperationState::FailedKnownUncommitted);
-        assert_eq!(engine.target_prepare_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.write_execute_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn prepare_unknown_rejects_target_identity_drift_before_reconcile() {
-        let engine = FakeEngine {
-            prepare_mode: PrepareMode::MalformedContractUnknown,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.next_action(),
-            Some(StatementNextAction::ManualInspect)
-        );
-        let operation = journal.only_operation();
-        assert_eq!(operation.state, OperationState::CommitUnknown);
-        assert_eq!(
-            operation_record(&operation).phase,
-            CtasSagaPhase::PrepareUnknown
-        );
-        assert_eq!(engine.reconcile_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.write_execute_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn maximal_provider_receipt_uses_a_bounded_digest_projection() {
-        let receipt = ConnectorStagedCreateReceipt::try_new(
-            FakeEngine::owner(),
-            ConnectorMutationOperationId::from_bytes([0xaa; 16]),
-            ConnectorStagedCreateReceiptPhase::Published,
-            ExternalMutationEffect::Applied,
-            Bytes::from(vec![0xbb; 64 * 1024]),
-        )
-        .unwrap();
-        let encoded = encode_receipt(&receipt).unwrap();
-        assert!(encoded.len() < DML_CTAS_FACT_ENCODED_LIMIT);
-        assert!(encoded.contains("\"provider_payload_bytes\":65536"));
-        assert!(!encoded.contains(&"bb".repeat(1024)));
-    }
-
-    #[test]
-    fn abort_reconcile_known_uncommitted_preserves_the_original_unknown_truth() {
-        let engine = FakeEngine {
-            publish_mode: PublishMode::Conflict,
-            abort_mode: AbortMode::CommitUnknown,
-            reconcile_mode: ReconcileMode::AbortKnownUncommitted,
-            ..Default::default()
-        };
-        let (service, journal) = service();
-        let error = service
-            .try_execute_ctas(
-                &engine,
-                "CREATE TABLE ice.db.dst AS SELECT 1",
-                &admitted_context(),
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.next_action(),
-            Some(StatementNextAction::ManualInspect)
-        );
-        let operation = journal.only_operation();
-        let record = operation_record(&operation);
-        assert_eq!(operation.state, OperationState::CommitUnknown);
-        assert_eq!(record.phase, CtasSagaPhase::AbortUnknown);
-        assert_eq!(record.next_action, StatementNextAction::ManualInspect);
-        let abort_fact = record.abort_staging_fact.as_ref().unwrap();
-        assert_eq!(abort_fact.outcome, ExternalFactOutcome::CommitUnknown);
-        assert!(abort_fact.evidence.is_some());
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.reconcile_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(journal.list_unfinished().unwrap().len(), 1);
+        assert!(validate_ctas_recovery(&pending).is_err());
     }
 }

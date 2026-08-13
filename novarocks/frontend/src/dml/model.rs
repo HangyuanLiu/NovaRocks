@@ -2197,6 +2197,9 @@ pub struct DmlCtasHistoricalObservationRecord {
     pub disposition: DmlCtasHistoricalDisposition,
     /// Canonical digest of the exact historical descriptor inspected.
     pub descriptor_digest: String,
+    /// Digest of the retained locator bound into that descriptor, even when
+    /// the observation itself (Published/Aborted/Absent) carries no locator.
+    pub descriptor_locator_digest: Option<String>,
     pub observation_digest: String,
     /// Present when the observation names durable unpublished staging.
     pub locator_digest: Option<String>,
@@ -2278,6 +2281,40 @@ impl DmlCtasRecoveryRecord {
                 DmlCtasCleanupRetention::Pending | DmlCtasCleanupRetention::ManualRetention
             )
     }
+}
+
+fn ctas_terminal_closes_staged_lineage(record: &DmlCtasRecoveryRecord) -> bool {
+    let Some(staged_locator_digest) = record.staged_locator_digest.as_ref() else {
+        return false;
+    };
+    record.historical_observations.iter().any(|terminal| {
+        let expected_action = match terminal.disposition {
+            DmlCtasHistoricalDisposition::Published => DmlCtasActionKind::Publish,
+            DmlCtasHistoricalDisposition::Aborted => DmlCtasActionKind::Abort,
+            DmlCtasHistoricalDisposition::Absent => DmlCtasActionKind::Stage,
+            _ => return false,
+        };
+        if terminal.action != expected_action
+            || !record.dispatch_checkpoints.iter().any(|checkpoint| {
+                checkpoint.action == terminal.action
+                    && checkpoint.child_operation_id == terminal.child_operation_id
+            })
+        {
+            return false;
+        }
+        // A terminal observation closes retained staging only when its own
+        // descriptor binds that locator, or when the same descriptor already
+        // produced an exact Staged/NoOp locator observation. Fence identity or
+        // an Absent disposition alone says nothing about this staged object.
+        terminal.descriptor_locator_digest.as_ref() == Some(staged_locator_digest)
+            || record.historical_observations.iter().any(|staged| {
+                matches!(
+                    staged.disposition,
+                    DmlCtasHistoricalDisposition::Staged | DmlCtasHistoricalDisposition::NoOp
+                ) && staged.locator_digest.as_ref() == Some(staged_locator_digest)
+                    && staged.descriptor_digest == terminal.descriptor_digest
+            })
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2442,12 +2479,25 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
         if !is_lowercase_digest(&observation.descriptor_digest)
             || !is_lowercase_digest(&observation.observation_digest)
             || observation
+                .descriptor_locator_digest
+                .as_ref()
+                .is_some_and(|digest| !is_lowercase_digest(digest))
+            || observation
                 .locator_digest
                 .as_ref()
                 .is_some_and(|digest| !is_lowercase_digest(digest))
             || observation.observed_at_ms < 0
         {
             return Err("CTAS historical observation digest or timestamp is invalid".to_string());
+        }
+        if observation.descriptor_locator_digest.is_some()
+            && observation.descriptor_locator_digest.as_ref()
+                != record.staged_locator_digest.as_ref()
+        {
+            return Err(
+                "CTAS historical descriptor locator must bind the retained staged locator"
+                    .to_string(),
+            );
         }
         if !checkpoint_identities.contains(&(observation.action, observation.child_operation_id)) {
             return Err(
@@ -2581,7 +2631,8 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
             )
         });
     match (record.cleanup_retention, &record.cleanup_receipt) {
-        (DmlCtasCleanupRetention::Pending, None) if cleanup_candidate.is_some() && !published => {}
+        (DmlCtasCleanupRetention::Pending, None)
+            if !published && (cleanup_candidate.is_some() || record.staged_locator.is_some()) => {}
         (DmlCtasCleanupRetention::Completed, Some(receipt)) => {
             let Some(observation) = cleanup_candidate else {
                 return Err(
@@ -2604,7 +2655,8 @@ pub fn validate_ctas_recovery(record: &DmlCtasRecoveryRecord) -> Result<(), Stri
             }
         }
         (DmlCtasCleanupRetention::NotRequired, None)
-            if record.staged_locator.is_none() && !has_cleanup_eligible_observation => {}
+            if (record.staged_locator.is_none() && !has_cleanup_eligible_observation)
+                || ctas_terminal_closes_staged_lineage(record) => {}
         (DmlCtasCleanupRetention::ManualRetention, None) => {}
         (DmlCtasCleanupRetention::Pending, _) => {
             return Err(
@@ -2735,6 +2787,7 @@ pub fn validate_ctas_recovery_transition(
     }
     if existing.cleanup_retention == DmlCtasCleanupRetention::Pending
         && next.cleanup_retention == DmlCtasCleanupRetention::NotRequired
+        && !ctas_terminal_closes_staged_lineage(next)
     {
         return Err("pending CTAS cleanup cannot be forgotten".to_string());
     }
