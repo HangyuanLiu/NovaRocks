@@ -38,6 +38,7 @@ pub struct IcebergControlRuntime {
     control_state: IcebergCatalogControlState,
     resources: IcebergControlResources,
     catalog: Arc<dyn crate::iceberg::Catalog>,
+    hadoop_catalog: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
     rest_catalog: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
     write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
 }
@@ -63,6 +64,7 @@ impl IcebergControlRuntime {
             control_state,
             resources,
             catalog: Arc::clone(catalog.generic()),
+            hadoop_catalog: catalog.hadoop().cloned(),
             rest_catalog: catalog.rest().cloned(),
             write_activations: Arc::new(
                 crate::write_activation::IcebergWriteActivationReservations::default(),
@@ -80,6 +82,12 @@ impl IcebergControlRuntime {
 
     pub(crate) fn rest_catalog(&self) -> Option<&Arc<crate::iceberg_catalog_rest::RestCatalog>> {
         self.rest_catalog.as_ref()
+    }
+
+    pub(crate) fn hadoop_catalog(
+        &self,
+    ) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
+        self.hadoop_catalog.as_ref()
     }
 
     pub(crate) fn resources(&self) -> &IcebergControlResources {
@@ -249,6 +257,7 @@ impl std::fmt::Debug for IcebergControlRuntime {
             .field("control_state", &"<provider catalog state>")
             .field("resources", &self.resources)
             .field("catalog", &"<provider catalog client>")
+            .field("hadoop_catalog", &self.hadoop_catalog.is_some())
             .field("rest_catalog", &self.rest_catalog.is_some())
             .finish()
     }

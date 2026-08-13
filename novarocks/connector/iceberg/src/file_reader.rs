@@ -207,7 +207,9 @@ pub fn map_file_error(error: novarocks_fs::FileError) -> ConnectorError {
         novarocks_fs::FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
         novarocks_fs::FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
         novarocks_fs::FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        novarocks_fs::FileErrorKind::Internal => ConnectorErrorKind::Internal,
+        novarocks_fs::FileErrorKind::AlreadyExists | novarocks_fs::FileErrorKind::Internal => {
+            ConnectorErrorKind::Internal
+        }
     };
     ConnectorError::new(kind, error.to_string())
 }

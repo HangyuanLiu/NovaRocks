@@ -701,7 +701,7 @@ fn map_footer_error(error: FileError) -> ConnectorError {
         FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
         FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
         FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        FileErrorKind::Internal => ConnectorErrorKind::Internal,
+        FileErrorKind::AlreadyExists | FileErrorKind::Internal => ConnectorErrorKind::Internal,
     };
     ConnectorError::new(kind, error.to_string())
 }

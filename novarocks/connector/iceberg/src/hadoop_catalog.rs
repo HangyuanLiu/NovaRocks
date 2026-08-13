@@ -36,12 +36,60 @@ use crate::iceberg::{
     TableIdent,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
+use novarocks_fs::{ConditionalCreateOutcome, FileCancellation, FileErrorKind, ObjectStoreConfig};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HadoopCreateAttemptFacts {
+    pub(crate) operation_id: String,
+    pub(crate) table_uuid: String,
+    pub(crate) metadata_location: String,
+    pub(crate) metadata_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HadoopCreateDisposition {
+    Created,
+    Existing,
+}
+
+#[derive(Debug)]
+pub(crate) struct HadoopCreateResult {
+    pub(crate) disposition: HadoopCreateDisposition,
+    pub(crate) facts: HadoopCreateAttemptFacts,
+    pub(crate) table: Table,
+    pub(crate) finalization_failure: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HadoopCreateFailureKind {
+    Invalid,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub(crate) struct HadoopCreateFailure {
+    pub(crate) kind: HadoopCreateFailureKind,
+    pub(crate) facts: Option<HadoopCreateAttemptFacts>,
+    pub(crate) message: String,
+}
+
+#[derive(Debug)]
+struct FrozenHadoopCreateAttempt {
+    facts: HadoopCreateAttemptFacts,
+    table_location: String,
+    metadata: TableMetadata,
+    metadata_bytes: Bytes,
+}
 
 #[derive(Debug)]
 pub struct HadoopFileSystemCatalog {
     file_io: FileIO,
     warehouse_location: String,
+    object_store_config: Option<ObjectStoreConfig>,
     /// Maps `"namespace/table"` to the current metadata file location.
     tables: Mutex<HashMap<String, String>>,
 }
@@ -49,9 +97,18 @@ pub struct HadoopFileSystemCatalog {
 impl HadoopFileSystemCatalog {
     /// Create a new catalog backed by `file_io` writing under `warehouse_location`.
     pub fn new(file_io: FileIO, warehouse_location: String) -> Self {
+        Self::new_with_object_store_config(file_io, warehouse_location, None)
+    }
+
+    pub(crate) fn new_with_object_store_config(
+        file_io: FileIO,
+        warehouse_location: String,
+        object_store_config: Option<ObjectStoreConfig>,
+    ) -> Self {
         Self {
             file_io,
             warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
+            object_store_config,
             tables: Mutex::new(HashMap::new()),
         }
     }
@@ -183,20 +240,243 @@ impl HadoopFileSystemCatalog {
     /// `load_table` and `table_exists` delegate to this helper so that every
     /// filesystem probe also populates the cache, making subsequent calls
     /// cache-hit fast.
-    async fn try_cache_existing_table(&self, table: &TableIdent) -> Option<String> {
+    async fn try_cache_existing_table(&self, table: &TableIdent) -> Result<Option<String>> {
         let table_location = self.table_location(table);
         let version = self.read_version_hint(&table_location).await;
-        if version == 0 {
-            return None;
-        }
-        let metadata_location = Self::metadata_path(&table_location, version);
+        let metadata_location = if version == 0 {
+            let v1 = Self::metadata_path(&table_location, 1);
+            if !self.file_io.exists(&v1).await? {
+                return Ok(None);
+            }
+            TableMetadata::read_from(&self.file_io, &v1)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("read canonical Hadoop table metadata {v1}: {error}"),
+                    )
+                })?;
+            if let Err(error) = self.write_version_hint(&table_location, 1).await {
+                tracing::warn!(
+                    "failed to repair Hadoop catalog version hint from canonical v1 metadata: {error}"
+                );
+            }
+            v1
+        } else {
+            let hinted = Self::metadata_path(&table_location, version);
+            if !self.file_io.exists(&hinted).await? {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Hadoop catalog version hint points to missing metadata: {hinted}"),
+                ));
+            }
+            TableMetadata::read_from(&self.file_io, &hinted)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("read hinted Hadoop table metadata {hinted}: {error}"),
+                    )
+                })?;
+            hinted
+        };
         let key = Self::table_key(table);
         self.tables
             .lock()
             .await
             .insert(key, metadata_location.clone());
-        Some(metadata_location)
+        Ok(Some(metadata_location))
     }
+
+    fn freeze_create_attempt(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+        operation_id: String,
+    ) -> std::result::Result<(TableIdent, FrozenHadoopCreateAttempt), HadoopCreateFailure> {
+        let ident = TableIdent::new(namespace.clone(), creation.name.clone());
+        let table_location = creation
+            .location
+            .clone()
+            .unwrap_or_else(|| self.table_location(&ident));
+        let creation_with_location = TableCreation {
+            location: Some(table_location.clone()),
+            ..creation
+        };
+        let build_result = TableMetadataBuilder::from_table_creation(creation_with_location)
+            .map_err(|error| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Invalid,
+                facts: None,
+                message: format!("build metadata from creation: {error}"),
+            })?
+            .build()
+            .map_err(|error| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Invalid,
+                facts: None,
+                message: format!("build metadata: {error}"),
+            })?;
+        let metadata = build_result.metadata;
+        let metadata_bytes =
+            serde_json::to_vec(&metadata).map_err(|error| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Invalid,
+                facts: None,
+                message: format!("serialize Hadoop table metadata: {error}"),
+            })?;
+        let metadata_location = Self::metadata_path(&table_location, 1);
+        let facts = HadoopCreateAttemptFacts {
+            operation_id,
+            table_uuid: metadata.uuid().to_string(),
+            metadata_location,
+            metadata_digest: hex_digest(&metadata_bytes),
+        };
+        Ok((
+            ident,
+            FrozenHadoopCreateAttempt {
+                facts,
+                table_location,
+                metadata,
+                metadata_bytes: metadata_bytes.into(),
+            },
+        ))
+    }
+
+    pub(crate) async fn create_table_fenced(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+        operation_id: String,
+    ) -> std::result::Result<HadoopCreateResult, HadoopCreateFailure> {
+        let (ident, attempt) = self.freeze_create_attempt(namespace, creation, operation_id)?;
+        let access = crate::fs_io::resolve_access_for_location(
+            &attempt.facts.metadata_location,
+            self.object_store_config.as_ref(),
+        )
+        .map_err(|message| HadoopCreateFailure {
+            kind: HadoopCreateFailureKind::Invalid,
+            facts: Some(attempt.facts.clone()),
+            message: format!("resolve Hadoop metadata fence: {message}"),
+        })?;
+
+        // Capability validation precedes directory creation so an unsupported
+        // binding fails before any metadata-side storage mutation.
+        if !access.supports_conditional_create() {
+            return Err(HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Unsupported,
+                facts: Some(attempt.facts.clone()),
+                message: "Hadoop catalog storage does not support native conditional create"
+                    .to_string(),
+            });
+        }
+        access
+            .ensure_parent_directory()
+            .await
+            .map_err(|message| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Unknown,
+                facts: Some(attempt.facts.clone()),
+                message: format!("create Hadoop metadata directory: {message}"),
+            })?;
+
+        let cancellation = FileCancellation::new();
+        let conditional = access
+            .handle()
+            .create_if_absent(0, attempt.metadata_bytes.clone(), &cancellation)
+            .await;
+        let (disposition, metadata) = match conditional {
+            Ok(ConditionalCreateOutcome::Created) => {
+                (HadoopCreateDisposition::Created, attempt.metadata.clone())
+            }
+            Ok(ConditionalCreateOutcome::AlreadyExists) => {
+                self.classify_existing_v1(&attempt).await?
+            }
+            Err(error) if error.kind() == FileErrorKind::Unsupported => {
+                return Err(HadoopCreateFailure {
+                    kind: HadoopCreateFailureKind::Unsupported,
+                    facts: Some(attempt.facts.clone()),
+                    message: error.to_string(),
+                });
+            }
+            Err(error) => match self.classify_existing_v1(&attempt).await {
+                Ok(classified) => classified,
+                Err(_) => {
+                    return Err(HadoopCreateFailure {
+                        kind: HadoopCreateFailureKind::Unknown,
+                        facts: Some(attempt.facts.clone()),
+                        message: format!(
+                            "conditionally create Hadoop v1 metadata and authoritative reread failed: {error}"
+                        ),
+                    });
+                }
+            },
+        };
+
+        let mut finalization_failure = None;
+        if disposition == HadoopCreateDisposition::Created {
+            if let Err(error) = self.write_version_hint(&attempt.table_location, 1).await {
+                finalization_failure = Some(format!(
+                    "publish Hadoop catalog version hint after committed v1 metadata: {error}"
+                ));
+            }
+        }
+
+        let key = Self::table_key(&ident);
+        self.tables
+            .lock()
+            .await
+            .insert(key, attempt.facts.metadata_location.clone());
+        let table = self
+            .build_table(ident, metadata, attempt.facts.metadata_location.clone())
+            .map_err(|error| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Unknown,
+                facts: Some(attempt.facts.clone()),
+                message: format!("build committed Hadoop table: {error}"),
+            })?;
+        Ok(HadoopCreateResult {
+            disposition,
+            facts: attempt.facts,
+            table,
+            finalization_failure,
+        })
+    }
+
+    async fn classify_existing_v1(
+        &self,
+        attempt: &FrozenHadoopCreateAttempt,
+    ) -> std::result::Result<(HadoopCreateDisposition, TableMetadata), HadoopCreateFailure> {
+        let input = self
+            .file_io
+            .new_input(&attempt.facts.metadata_location)
+            .map_err(|error| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Unknown,
+                facts: Some(attempt.facts.clone()),
+                message: format!("open authoritative Hadoop v1 metadata: {error}"),
+            })?;
+        let bytes = input.read().await.map_err(|error| HadoopCreateFailure {
+            kind: HadoopCreateFailureKind::Unknown,
+            facts: Some(attempt.facts.clone()),
+            message: format!("read authoritative Hadoop v1 metadata: {error}"),
+        })?;
+        let metadata: TableMetadata =
+            serde_json::from_slice(&bytes).map_err(|error| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Unknown,
+                facts: Some(attempt.facts.clone()),
+                message: format!("decode authoritative Hadoop v1 metadata: {error}"),
+            })?;
+        let same_owner = metadata.uuid().to_string() == attempt.facts.table_uuid
+            && hex_digest(&bytes) == attempt.facts.metadata_digest;
+        Ok((
+            if same_owner {
+                HadoopCreateDisposition::Created
+            } else {
+                HadoopCreateDisposition::Existing
+            },
+            metadata,
+        ))
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[async_trait]
@@ -267,38 +547,24 @@ impl Catalog for HadoopFileSystemCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        let ident = TableIdent::new(namespace.clone(), creation.name.clone());
-        let table_location = creation
-            .location
-            .clone()
-            .unwrap_or_else(|| self.table_location(&ident));
-
-        // Inject the location into the creation so the builder can use it.
-        let creation_with_location = TableCreation {
-            location: Some(table_location.clone()),
-            ..creation
-        };
-
-        let build_result = TableMetadataBuilder::from_table_creation(creation_with_location)
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("build metadata from creation: {}", e),
-                )
-            })?
-            .build()
-            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("build metadata: {}", e)))?;
-
-        let metadata = build_result.metadata;
-        let metadata_location = self.write_metadata(&table_location, &metadata, 1).await?;
-
-        let key = Self::table_key(&ident);
-        self.tables
-            .lock()
+        let result = self
+            .create_table_fenced(namespace, creation, uuid::Uuid::now_v7().to_string())
             .await
-            .insert(key, metadata_location.clone());
-
-        self.build_table(ident, metadata, metadata_location)
+            .map_err(|failure| {
+                let kind = match failure.kind {
+                    HadoopCreateFailureKind::Invalid => ErrorKind::DataInvalid,
+                    HadoopCreateFailureKind::Unsupported => ErrorKind::FeatureUnsupported,
+                    HadoopCreateFailureKind::Unknown => ErrorKind::Unexpected,
+                };
+                Error::new(kind, failure.message)
+            })?;
+        if result.disposition == HadoopCreateDisposition::Existing {
+            return Err(Error::new(
+                ErrorKind::TableAlreadyExists,
+                format!("table already exists: {}", result.table.identifier()),
+            ));
+        }
+        Ok(result.table)
     }
 
     /// Load a table from its registered metadata location.
@@ -316,7 +582,7 @@ impl Catalog for HadoopFileSystemCatalog {
             } else {
                 // Fall back to filesystem: read version-hint.text written by
                 // create_table and populate the cache via try_cache_existing_table.
-                self.try_cache_existing_table(table).await.ok_or_else(|| {
+                self.try_cache_existing_table(table).await?.ok_or_else(|| {
                     Error::new(
                         ErrorKind::TableNotFound,
                         format!("table not found: {}", key),
@@ -365,7 +631,7 @@ impl Catalog for HadoopFileSystemCatalog {
         }
         // Fall back to filesystem: check version-hint.text and populate the
         // in-memory cache so that a subsequent load_table call is cache-hot.
-        Ok(self.try_cache_existing_table(table).await.is_some())
+        Ok(self.try_cache_existing_table(table).await?.is_some())
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
@@ -462,7 +728,25 @@ impl Catalog for HadoopFileSystemCatalog {
 
 #[cfg(test)]
 mod tests {
+    use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+
     use super::*;
+
+    fn test_creation(name: &str) -> TableCreation {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        TableCreation::builder()
+            .name(name.to_string())
+            .schema(schema)
+            .format_version(FormatVersion::V2)
+            .build()
+    }
 
     #[test]
     fn test_metadata_path() {
@@ -544,5 +828,86 @@ mod tests {
             catalog.list_tables(&namespace).await.unwrap(),
             vec![TableIdent::new(namespace, "orders".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn independent_catalog_clients_share_one_v1_owner() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let first = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        let second = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+
+        let (left, right) = tokio::join!(
+            first.create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-left".to_string(),
+            ),
+            second.create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-right".to_string(),
+            ),
+        );
+        let left = left.expect("left create result");
+        let right = right.expect("right create result");
+
+        assert_eq!(
+            [left.disposition, right.disposition]
+                .into_iter()
+                .filter(|disposition| *disposition == HadoopCreateDisposition::Created)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [left.disposition, right.disposition]
+                .into_iter()
+                .filter(|disposition| *disposition == HadoopCreateDisposition::Existing)
+                .count(),
+            1
+        );
+        assert_eq!(left.table.metadata().uuid(), right.table.metadata().uuid());
+        assert_eq!(
+            left.table.metadata_location(),
+            right.table.metadata_location()
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_v1_recovers_table_when_hint_is_missing() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        let created = catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-create".to_string(),
+            )
+            .await
+            .expect("create table");
+        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
+        catalog.file_io.delete(&hint).await.expect("remove hint");
+
+        let restored = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        assert!(restored.table_exists(&ident).await.expect("table exists"));
+        let loaded = restored.load_table(&ident).await.expect("load from v1");
+        assert_eq!(created.table.metadata().uuid(), loaded.metadata().uuid());
+        assert!(restored.file_io.exists(&hint).await.expect("repaired hint"));
     }
 }
