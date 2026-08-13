@@ -41,9 +41,6 @@ pub(crate) struct FrontendMvStartupRestore {
     catalog_application: Arc<dyn CatalogApplicationPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_repository: Arc<dyn MvRepository>,
-    /// Whether a durable metadata cache is the runtime authority. Without one
-    /// there is nothing to rebuild into, and the rebuild step is a no-op.
-    metadata_is_authority: bool,
     /// Reconciles unfinished refresh attempts. Held as a closure because the MV
     /// application service is constructed after this value's other inputs, and
     /// threading a half-built service through would be worse than a callback.
@@ -57,7 +54,6 @@ impl FrontendMvStartupRestore {
         catalog_application: Arc<dyn CatalogApplicationPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_repository: Arc<dyn MvRepository>,
-        metadata_is_authority: bool,
         recover: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
     ) -> Self {
         Self {
@@ -66,17 +62,18 @@ impl FrontendMvStartupRestore {
             catalog_application,
             mv_storage_observation,
             mv_repository,
-            metadata_is_authority,
             recover,
         }
     }
 }
 
 impl MvStartupRestore for FrontendMvStartupRestore {
-    fn rebuild_cache_from_lake(&self) -> Result<(), String> {
+    fn rebuild_cache_from_lake(&self, metadata_is_authority: bool) -> Result<(), String> {
+        // The caller supplies this: whether a durable cache is the runtime
+        // authority is resolved during engine open, after this value was composed.
         novarocks::mv_startup::rebuild_imv_cache_from_lake(
             &novarocks::mv_startup::LakeRebuildContext {
-                metadata_is_authority: self.metadata_is_authority,
+                metadata_is_authority,
                 catalog_runtime_projection: Some(&self.catalog_runtime_projection),
                 catalog_application: Some(self.catalog_application.as_ref()),
                 connector_control: self.connector_control.as_ref(),
@@ -117,7 +114,7 @@ mod tests {
             recover: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
         }
         impl MvStartupRestore for OnlyRecovery {
-            fn rebuild_cache_from_lake(&self) -> Result<(), String> {
+            fn rebuild_cache_from_lake(&self, _authority: bool) -> Result<(), String> {
                 Ok(())
             }
             fn restore_targets(&self) -> Result<(), String> {
@@ -134,13 +131,14 @@ mod tests {
                 Ok(())
             }),
         };
-        novarocks::mv::startup_restore::run_mv_startup_restore(&restore).expect("restore succeeds");
+        novarocks::mv::startup_restore::run_mv_startup_restore(&restore, true)
+            .expect("restore succeeds");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let failing = OnlyRecovery {
             recover: Box::new(|| Err("recovery failed".to_string())),
         };
-        let error = novarocks::mv::startup_restore::run_mv_startup_restore(&failing)
+        let error = novarocks::mv::startup_restore::run_mv_startup_restore(&failing, true)
             .expect_err("a failing recovery must not be swallowed");
         assert!(error.contains("recovery failed"), "{error}");
     }

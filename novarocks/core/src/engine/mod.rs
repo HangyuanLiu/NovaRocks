@@ -1499,6 +1499,16 @@ impl StandaloneOpenServices {
         self
     }
 
+    /// Installs the application's MV startup restore, making it the owner of
+    /// when startup restoration runs.
+    pub fn with_mv_startup_restore(
+        mut self,
+        restore: std::sync::Arc<dyn crate::mv::startup_restore::MvStartupRestore>,
+    ) -> Self {
+        self.mv_startup_restore = Some(restore);
+        self
+    }
+
     pub fn with_mv_background_engine_sink(
         mut self,
         sink: Option<std::sync::Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
@@ -3888,7 +3898,7 @@ struct EngineMvStartupRestore<'a> {
 }
 
 impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_> {
-    fn rebuild_cache_from_lake(&self) -> Result<(), String> {
+    fn rebuild_cache_from_lake(&self, _metadata_is_authority: bool) -> Result<(), String> {
         // W4 statelessness: rediscover lake-native Iceberg MV packages present on
         // the lake but missing from a fresh `[metadata]` (SQLite) cache, and
         // persist their rebuilt definitions.
@@ -3917,6 +3927,9 @@ fn restore_metadata_if_needed(
     state: &Arc<StandaloneState>,
     installed: Option<&Arc<dyn crate::mv::startup_restore::MvStartupRestore>>,
 ) -> Result<(), String> {
+    // Whether a durable cache is the runtime authority is only known here, so it
+    // is passed to the restore rather than expected of it.
+    let metadata_is_authority = state.metadata_provider.is_some();
     // Catalog attachments are restored by the Frontend controller from
     // StateStore before the engine opens; Core has no attachment reader.
     //
@@ -3924,10 +3937,14 @@ fn restore_metadata_if_needed(
     // composition that has no frontend to own startup orchestration. Both run
     // through the same runner, so the step ordering cannot differ between them.
     match installed {
-        Some(restore) => crate::mv::startup_restore::run_mv_startup_restore(restore.as_ref()),
-        None => {
-            crate::mv::startup_restore::run_mv_startup_restore(&EngineMvStartupRestore { state })
-        }
+        Some(restore) => crate::mv::startup_restore::run_mv_startup_restore(
+            restore.as_ref(),
+            metadata_is_authority,
+        ),
+        None => crate::mv::startup_restore::run_mv_startup_restore(
+            &EngineMvStartupRestore { state },
+            metadata_is_authority,
+        ),
     }
 }
 

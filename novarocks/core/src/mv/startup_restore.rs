@@ -38,7 +38,14 @@ pub trait MvStartupRestore: Send + Sync {
     ///
     /// First because everything after it reads MV definitions, and a cache that
     /// was wiped has none until this runs.
-    fn rebuild_cache_from_lake(&self) -> Result<(), String>;
+    ///
+    /// `metadata_is_authority` is supplied by the caller rather than held by the
+    /// implementation because it is the engine's fact: whether a durable cache is
+    /// the runtime authority is resolved while the engine opens, which is after an
+    /// application has finished composing its services. An implementation that
+    /// tried to know it earlier would be guessing, and guessing wrong means either
+    /// skipping a rebuild that was needed or attempting one that cannot persist.
+    fn rebuild_cache_from_lake(&self, metadata_is_authority: bool) -> Result<(), String>;
 
     /// Restore each definition's provider-side target state.
     ///
@@ -59,8 +66,11 @@ pub trait MvStartupRestore: Send + Sync {
 /// Callers use this rather than invoking the steps themselves, so the ordering
 /// lives in one place and a future move of the implementation cannot reorder it
 /// by accident.
-pub fn run_mv_startup_restore(restore: &dyn MvStartupRestore) -> Result<(), String> {
-    restore.rebuild_cache_from_lake()?;
+pub fn run_mv_startup_restore(
+    restore: &dyn MvStartupRestore,
+    metadata_is_authority: bool,
+) -> Result<(), String> {
+    restore.rebuild_cache_from_lake(metadata_is_authority)?;
     restore.restore_targets()?;
     restore.recover_unfinished_refreshes()
 }
@@ -98,7 +108,7 @@ mod tests {
     }
 
     impl MvStartupRestore for RecordingRestore {
-        fn rebuild_cache_from_lake(&self) -> Result<(), String> {
+        fn rebuild_cache_from_lake(&self, _metadata_is_authority: bool) -> Result<(), String> {
             self.record("rebuild")
         }
         fn restore_targets(&self) -> Result<(), String> {
@@ -112,7 +122,7 @@ mod tests {
     #[test]
     fn restore_runs_rebuild_then_targets_then_recovery() {
         let restore = RecordingRestore::default();
-        run_mv_startup_restore(&restore).expect("restore succeeds");
+        run_mv_startup_restore(&restore, true).expect("restore succeeds");
 
         // The order is the contract: recovery needs target descriptors, and
         // target restore needs definitions the rebuild may have just recreated.
@@ -125,12 +135,12 @@ mod tests {
         // that is still missing definitions, and recovery would then see fewer
         // attempts than exist.
         let restore = RecordingRestore::failing_at("rebuild");
-        let error = run_mv_startup_restore(&restore).expect_err("rebuild failure propagates");
+        let error = run_mv_startup_restore(&restore, true).expect_err("rebuild failure propagates");
         assert!(error.contains("rebuild failed"), "{error}");
         assert_eq!(restore.calls(), vec!["rebuild"]);
 
         let restore = RecordingRestore::failing_at("targets");
-        assert!(run_mv_startup_restore(&restore).is_err());
+        assert!(run_mv_startup_restore(&restore, true).is_err());
         assert_eq!(
             restore.calls(),
             vec!["rebuild", "targets"],
