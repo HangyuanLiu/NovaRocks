@@ -55,7 +55,8 @@ use super::{
 use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::{DmlError, DmlErrorKind};
 use crate::dml::model::{
-    CtasSagaPhase, DML_CTAS_RECOVERY_ENCODED_LIMIT, DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION,
+    ConnectorWriteFailureKind, ConnectorWriteFailureRecord, CtasSagaPhase,
+    DML_CTAS_RECOVERY_ENCODED_LIMIT, DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION,
     DmlCtasActionKind, DmlCtasCatalogFenceRecord, DmlCtasCleanupReceiptRecord,
     DmlCtasCleanupRetention, DmlCtasDispatchCertainty, DmlCtasDispatchCheckpointRecord,
     DmlCtasHistoricalObservationRecord, DmlCtasRecoveryRecord, DmlHistoricalCleanupState,
@@ -573,12 +574,14 @@ impl CtasRecoveryProfile {
             ConnectorHistoricalWriteDisposition::NotApplied
             | ConnectorHistoricalWriteDisposition::NotDispatched => Ok(true),
             ConnectorHistoricalWriteDisposition::Staged => {
+                let expected_descriptor_digest = descriptor.digest();
+                let expected_observation_digest = observation.digest();
                 active.check_before_dispatch()?;
                 let cleanup = handle
                     .facet()
                     .cleanup(ConnectorHistoricalWriteCleanupRequest {
                         operation_id: write_operation_id,
-                        descriptor_digest: descriptor.digest(),
+                        descriptor_digest: expected_descriptor_digest,
                         observation,
                         context: request_context()?,
                     })
@@ -590,13 +593,29 @@ impl CtasRecoveryProfile {
                         .unwrap_or(cleanup),
                     _ => cleanup,
                 };
-                let completed = matches!(
-                    cleanup,
-                    ExternalMutationOutcome::KnownCommitted {
-                        finalization: ExternalMutationFinalization::Complete,
-                        ..
+                let completed = match historical_write_cleanup_completed(
+                    &cleanup,
+                    expected_descriptor_digest,
+                    expected_observation_digest,
+                ) {
+                    Ok(completed) => completed,
+                    Err(message) => {
+                        result.failure = Some(ConnectorWriteFailureRecord {
+                            kind: ConnectorWriteFailureKind::CorruptData,
+                            message,
+                        });
+                        cycle.result = Some(result);
+                        cycle.phase = DmlHistoricalRecoveryPhase::CleanupPending;
+                        cycle.next_action = StatementNextAction::ManualInspect;
+                        cycle.updated_at_ms = now_ms;
+                        HistoricalWriteRecoveryLedger::persist_recovery(
+                            active,
+                            cycle,
+                            Some(now_ms),
+                        )?;
+                        return Ok(false);
                     }
-                );
+                };
                 if completed {
                     result.cleanup = DmlHistoricalCleanupState::Completed;
                     cycle.result = Some(result);
@@ -683,6 +702,32 @@ impl CtasRecoveryProfile {
         }
         Ok(CtasRecoveryProgress::CleanupCompleted)
     }
+}
+
+fn historical_write_cleanup_completed(
+    outcome: &ExternalMutationOutcome<
+        novarocks_spi::connector::ConnectorHistoricalWriteCleanupReceipt,
+    >,
+    expected_descriptor_digest: [u8; 32],
+    expected_observation_digest: [u8; 32],
+) -> Result<bool, String> {
+    let ExternalMutationOutcome::KnownCommitted {
+        receipt,
+        finalization: ExternalMutationFinalization::Complete,
+        ..
+    } = outcome
+    else {
+        return Ok(false);
+    };
+    if receipt.descriptor_digest != expected_descriptor_digest
+        || receipt.observation_digest != expected_observation_digest
+    {
+        return Err(
+            "historical write cleanup receipt does not match the exact descriptor and observation"
+                .to_string(),
+        );
+    }
+    Ok(true)
 }
 
 fn durable_write_cleanup_decision(
@@ -2124,6 +2169,8 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RecoveryWriterPlan {
         StagedCleanupLost,
+        StagedCleanupForeignDirectReceipt,
+        StagedCleanupForeignReconcileReceipt,
         Ambiguous,
     }
 
@@ -2132,6 +2179,7 @@ mod tests {
         plan: RecoveryWriterPlan,
         raised: Mutex<Option<novarocks_spi::connector::ConnectorExternalOperationFence>>,
         issued: Mutex<Vec<[u8; 32]>>,
+        cleanup_binding: Mutex<Option<([u8; 32], [u8; 32])>>,
         cleanup_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
     }
@@ -2146,6 +2194,7 @@ mod tests {
                 plan,
                 raised: Mutex::new(None),
                 issued: Mutex::new(Vec::new()),
+                cleanup_binding: Mutex::new(None),
                 cleanup_calls: AtomicUsize::new(0),
                 reconcile_calls: AtomicUsize::new(0),
             })
@@ -2185,7 +2234,9 @@ mod tests {
                 ));
             }
             let (disposition, cleanup_required) = match self.plan {
-                RecoveryWriterPlan::StagedCleanupLost => {
+                RecoveryWriterPlan::StagedCleanupLost
+                | RecoveryWriterPlan::StagedCleanupForeignDirectReceipt
+                | RecoveryWriterPlan::StagedCleanupForeignReconcileReceipt => {
                     (ConnectorHistoricalWriteDisposition::Staged, true)
                 }
                 RecoveryWriterPlan::Ambiguous => {
@@ -2227,6 +2278,18 @@ mod tests {
                     "cleanup observation was not issued by this writer facet",
                 ));
             }
+            *self.cleanup_binding.lock().expect("cleanup binding lock") =
+                Some((request.descriptor_digest, request.observation.digest()));
+            if self.plan == RecoveryWriterPlan::StagedCleanupForeignDirectReceipt {
+                return Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: ConnectorHistoricalWriteCleanupReceipt {
+                        descriptor_digest: [0; 32],
+                        observation_digest: [0; 32],
+                    },
+                    finalization: ExternalMutationFinalization::Complete,
+                });
+            }
             Ok(ExternalMutationOutcome::CommitUnknown {
                 failure: ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Unavailable,
@@ -2254,11 +2317,22 @@ mod tests {
         ) -> Result<ExternalMutationOutcome<ConnectorHistoricalWriteCleanupReceipt>, ConnectorError>
         {
             self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            let (descriptor_digest, observation_digest) = self
+                .cleanup_binding
+                .lock()
+                .expect("cleanup binding lock")
+                .expect("cleanup binding before reconciliation");
+            let (descriptor_digest, observation_digest) =
+                if self.plan == RecoveryWriterPlan::StagedCleanupForeignReconcileReceipt {
+                    ([0; 32], [0; 32])
+                } else {
+                    (descriptor_digest, observation_digest)
+                };
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
                 receipt: ConnectorHistoricalWriteCleanupReceipt {
-                    descriptor_digest: [0; 32],
-                    observation_digest: [0; 32],
+                    descriptor_digest,
+                    observation_digest,
                 },
                 finalization: ExternalMutationFinalization::Complete,
             })
@@ -2763,6 +2837,54 @@ mod tests {
                 .cleanup_retention,
             DmlCtasCleanupRetention::Completed
         );
+    }
+
+    #[test]
+    fn full_drive_rejects_foreign_writer_cleanup_receipts_before_catalog_cleanup() {
+        for plan in [
+            RecoveryWriterPlan::StagedCleanupForeignDirectReceipt,
+            RecoveryWriterPlan::StagedCleanupForeignReconcileReceipt,
+        ] {
+            let (journal, engine, mut active) =
+                recovery_drive_harness(ConnectorHistoricalCtasDisposition::Staged);
+            configure_staged_writer_recovery(&journal, &mut active);
+            let writer = RecoveryWriteFacet::new(plan);
+            let resolver = Arc::new(RecoveryWriteResolver {
+                facet: writer.clone(),
+            });
+
+            let progress = CtasRecoveryProfile::new(engine.clone(), Some(resolver))
+                .drive(&mut active, 25)
+                .expect("foreign writer cleanup receipt must park recovery");
+
+            assert_eq!(progress, CtasRecoveryProgress::Unresolved);
+            assert_eq!(writer.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                writer.reconcile_calls.load(Ordering::SeqCst),
+                usize::from(plan == RecoveryWriterPlan::StagedCleanupForeignReconcileReceipt)
+            );
+            assert_eq!(engine.cleanup_calls.load(Ordering::SeqCst), 0);
+            let write_recovery = journal
+                .write_recovery
+                .lock()
+                .expect("write recovery lock")
+                .clone()
+                .expect("durable historical writer result");
+            let result = write_recovery.result.expect("writer result");
+            assert_eq!(result.cleanup, DmlHistoricalCleanupState::Pending);
+            assert_eq!(
+                result.failure.expect("typed corrupt receipt").kind,
+                ConnectorWriteFailureKind::CorruptData
+            );
+            assert!(
+                journal
+                    .operation
+                    .lock()
+                    .expect("operation lock")
+                    .recovery_due_at_ms
+                    .is_some()
+            );
+        }
     }
 
     #[test]
