@@ -410,9 +410,11 @@ impl BackendRuntimeFilterSession {
                 "consumer-only Backend channel cannot accept a producer contribution",
             )
         })?;
+        // Keep reduction and publication in one ordered critical section.
+        // Otherwise two producer threads can reduce v1 then v2 under this
+        // mutex but publish them as v2 then v1 after releasing it.
+        let mut reduction = reduction.lock().unwrap_or_else(|error| error.into_inner());
         let (apply, publication) = reduction
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
             .submit(stream, sequence, contribution)
             .map_err(reduction_violation)?;
         if let Some(snapshot) = publication.as_ref() {
@@ -420,6 +422,7 @@ impl BackendRuntimeFilterSession {
                 self.publish_reduced_snapshot(snapshot, None)?;
             }
         }
+        drop(reduction);
         Ok(BackendRuntimeFilterSessionSubmission {
             outcome: match apply {
                 BackendReductionApply::Applied { .. } => RuntimeFilterSubmitOutcome::Published,
@@ -1294,7 +1297,12 @@ fn contract_violation(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::thread;
     use std::time::Duration;
 
     use novarocks_execution::runtime_filter::{
@@ -1317,7 +1325,9 @@ mod tests {
         UniqueId::new(raw, raw + 1)
     }
 
-    fn channel() -> (BackendChannelInstall, BackendRuntimeFilterFixture) {
+    fn channel_with_lifecycle(
+        lifecycle: BackendChannelLifecycle,
+    ) -> (BackendChannelInstall, BackendRuntimeFilterFixture) {
         let fixture = BackendRuntimeFilterFixture::membership();
         let schema = fixture.producer_contract().contract().clone();
         let first = BackendProducerInstall::new(
@@ -1376,7 +1386,7 @@ mod tests {
         let channel = BackendChannelInstall::new(
             RuntimeFilterChannelId::new(11),
             schema,
-            BackendChannelLifecycle::CompleteOnce,
+            lifecycle,
             coverage.clone(),
             coverage,
             BackendMaterializationPolicy::new(8, 3, 5, 1, 1024, 1024, 1).unwrap(),
@@ -1388,6 +1398,10 @@ mod tests {
         )
         .unwrap();
         (channel, fixture)
+    }
+
+    fn channel() -> (BackendChannelInstall, BackendRuntimeFilterFixture) {
+        channel_with_lifecycle(BackendChannelLifecycle::CompleteOnce)
     }
 
     fn session() -> (
@@ -1581,6 +1595,110 @@ mod tests {
         assert_eq!(
             session.materialized_logical_version(&second),
             LogicalVersion::FIRST
+        );
+    }
+
+    struct BlockingFirstPublicationObserver {
+        blocked: AtomicBool,
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl BackendRuntimeFilterEventObserver for BlockingFirstPublicationObserver {
+        fn record(&self, event: BackendRuntimeFilterEvent) {
+            if matches!(
+                event,
+                BackendRuntimeFilterEvent::LogicalVersionPublished {
+                    version: LogicalVersion::FIRST,
+                    ..
+                }
+            ) && !self.blocked.swap(true, Ordering::AcqRel)
+            {
+                self.entered
+                    .send(())
+                    .expect("publication test must observe the first version");
+                self.release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv()
+                    .expect("publication test must release the first version");
+            }
+        }
+    }
+
+    #[test]
+    fn monotonic_reduction_and_publication_share_one_ordered_critical_section() {
+        let (channel, fixture) = channel_with_lifecycle(BackendChannelLifecycle::MonotonicUpdates);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let observer = Arc::new(BlockingFirstPublicationObserver {
+            blocked: AtomicBool::new(false),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let session = Arc::new(
+            BackendRuntimeFilterSession::from_channel_install(
+                fixture.identity(),
+                channel,
+                observer,
+            )
+            .unwrap(),
+        );
+        let RuntimeFilterBindOutcome::Bound(producer) = session
+            .open_producer(
+                instance(37),
+                RuntimeFilterProducerOpenRequest::new(fixture.producer_contract(), 2),
+            )
+            .unwrap()
+        else {
+            panic!("installed producer must bind")
+        };
+
+        let first_producer = Arc::clone(&producer);
+        let first_contribution = fixture.membership_contribution_with_values([3]);
+        let first = thread::spawn(move || {
+            first_producer.submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                first_contribution,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first publication must reach the controlled observer");
+
+        let second_producer = Arc::clone(&producer);
+        let second_contribution = fixture.membership_contribution_with_values([9]);
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+        let second = thread::spawn(move || {
+            let result = second_producer.submit(
+                PartitionId::new(1),
+                ProducerSequence::new(0),
+                second_contribution,
+            );
+            second_done_tx
+                .send(())
+                .expect("test receiver must remain alive");
+            result
+        });
+
+        let published_out_of_order = second_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        release_tx
+            .send(())
+            .expect("blocked publication must still be waiting");
+        first
+            .join()
+            .expect("first producer thread must join")
+            .unwrap();
+        second
+            .join()
+            .expect("second producer thread must join")
+            .unwrap();
+        assert!(
+            !published_out_of_order,
+            "v2 publication must not overtake a blocked v1 publication"
         );
     }
 
