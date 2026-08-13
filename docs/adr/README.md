@@ -108,6 +108,7 @@ code-anchors:
 - ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 - ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
+- ADR-0069 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
 
 #### 历史
 
