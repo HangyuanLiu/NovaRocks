@@ -2315,7 +2315,7 @@ mod tests {
     ///
     /// The safe convergence is to keep the record open with the fence intact.
     /// Issuing continuations for real would need a durable "writer dispatch
-    /// started" checkpoint that this change does not add; see ADR-0065.
+    /// started" checkpoint that this change does not add; see ADR-0068.
     #[test]
     fn a_provider_proof_of_non_dispatch_alone_does_not_earn_a_continuation() {
         let facet = FakeFacet::new(FacetPlan::NotDispatched, FacetCleanup::Complete);

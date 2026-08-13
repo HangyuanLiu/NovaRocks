@@ -128,7 +128,7 @@ impl FencedSubmitError {
 /// attempt's marker, the attempt was fenced; if it does still point there, the
 /// conflict came from the data ref and is retryable.
 ///
-// Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
+// Design: ADR-0068 (docs/adr/ADR-0068-external-write-fence-as-catalog-linearization-point.md)
 pub(super) async fn submit_fenced_action<A>(
     catalog: &dyn Catalog,
     base: &Table,

@@ -1,5 +1,5 @@
 ---
-id: ADR-0065
+id: ADR-0068
 title: "External write fence as a catalog linearization point for distributed DML"
 domain: [provider-spi, frontend-dml]
 status: active

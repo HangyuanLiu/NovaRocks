@@ -63,7 +63,7 @@
 //! `$snapshots` metadata table, but another engine reading the same table will
 //! still see them. That is inherent to using a snapshot as the carrier.
 
-// Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
+// Design: ADR-0068 (docs/adr/ADR-0068-external-write-fence-as-catalog-linearization-point.md)
 
 use std::collections::HashMap;
 

@@ -563,7 +563,7 @@ fn load_snapshot_rows(cfg: &MetadataBatchReaderConfig) -> Result<Vec<SnapshotMet
         // history. They carry no data and describe no user write, so they must
         // not appear in `$snapshots` alongside the snapshots a user actually
         // produced. (They remain present in the raw Iceberg metadata, which is
-        // an accepted cost of the carrier -- see ADR-0065.)
+        // an accepted cost of the carrier -- see ADR-0068.)
         if crate::commit::write_fence::is_fence_marker_snapshot(summary) {
             continue;
         }
