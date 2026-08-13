@@ -196,7 +196,8 @@ pub trait AddFilesEngine: Send + Sync {
         request: PlanAddFilesRequest,
     ) -> Result<PreparedAddFiles, AddFilesPlanError>;
 
-    /// Establish this attempt's external fence before dispatch.
+    /// Establish this attempt's external fence before dispatch and return the
+    /// provider receipt that acknowledges the published marker.
     ///
     /// The default fails closed: an engine that cannot expose its mutation
     /// authority must not register files into a table.
@@ -204,7 +205,10 @@ pub trait AddFilesEngine: Send + Sync {
         &self,
         _prepared: &dyn AddFilesPrepared,
         _fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExternalFenceReceipt,
+        novarocks_spi::connector::ConnectorError,
+    > {
         Err(
             crate::engine::external_write_fence::external_fence_authority_unavailable(
                 "ADD FILES engine does not expose an external operation fence authority",
@@ -236,7 +240,10 @@ impl AddFilesEngine for Arc<StandaloneState> {
         &self,
         prepared: &dyn AddFilesPrepared,
         fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExternalFenceReceipt,
+        novarocks_spi::connector::ConnectorError,
+    > {
         let prepared = downcast_prepared(prepared).map_err(|_| {
             crate::engine::external_write_fence::invalid_fence_request(
                 "foreign ADD FILES prepared handle".to_string(),

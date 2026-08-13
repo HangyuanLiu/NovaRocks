@@ -41,9 +41,10 @@ use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
-    CreateStatementOperationRequest, DmlOperationId, DurableExternalFact, DurableMutationSummary,
-    ExternalFactOutcome, OperationKind, OperationMutationRequest, OperationPayload, OperationState,
-    OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
+    CreateStatementOperationRequest, DmlDirectMutationKind, DmlOperationId, DurableExternalFact,
+    DurableMutationSummary, ExternalFactOutcome, OperationKind, OperationMutationRequest,
+    OperationPayload, OperationState, OperationTarget, SourceScopeOwnership, StatementNextAction,
+    StoredOperation,
 };
 use crate::dml::service::DmlService;
 
@@ -205,8 +206,41 @@ fn execute_add_files_operation(
     // owner's late execute has to be refused at the catalog rather than
     // reported once the files are already claimed. ADD FILES always targets
     // main; it has no branch-qualified form.
-    let fence = active
-        .external_fence()?
+    stored = establish_and_record_fence(engine, active, stored, &prepared)?;
+
+    finish_outcome(
+        engine,
+        active,
+        stored,
+        &prepared,
+        engine.execute_add_files(prepared.handle.as_ref()),
+        true,
+    )
+}
+
+/// Establish this attempt's external fence and durably journal its receipt,
+/// before any file is registered.
+///
+/// Ordering, in full: mint the proposal from the *live* lease guard, refuse a
+/// receipt this journal could never hold, ask the provider to publish the
+/// marker, double-check that it acknowledged exactly the fence that was sealed,
+/// then persist the receipt through the fenced journal. The record binds this
+/// statement's immutable source scope, so a later owner can prove the fence was
+/// minted for the very source set it is reasoning about.
+fn establish_and_record_fence(
+    engine: &dyn AddFilesEngine,
+    active: &mut ActiveDmlOperation,
+    stored: StoredOperation,
+    prepared: &PreparedAddFiles,
+) -> Result<StoredOperation, DmlError> {
+    let proposal = active.external_fence()?;
+    let source_scope_digest = scope_digest(&prepared.facts);
+    active.preflight_direct_mutation_fence(
+        &proposal,
+        DmlDirectMutationKind::AddFiles,
+        Some(source_scope_digest.clone()),
+    )?;
+    let fence = proposal
         .seal(
             novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
                 prepared.facts.mutation_operation_id,
@@ -222,18 +256,22 @@ fn execute_add_files_operation(
             novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         )
         .map_err(DmlError::executor)?;
-    engine
-        .establish_add_files_external_fence(prepared.handle.as_ref(), fence)
+    let receipt = engine
+        .establish_add_files_external_fence(prepared.handle.as_ref(), fence.clone())
         .map_err(DmlError::executor)?;
-
-    finish_outcome(
-        engine,
-        active,
-        stored,
-        &prepared,
-        engine.execute_add_files(prepared.handle.as_ref()),
-        true,
+    proposal.validate_established_receipt(&fence, &receipt)?;
+    let record = crate::dml::reconcile::direct_mutation_fence_receipt_record(
+        DmlDirectMutationKind::AddFiles,
+        &fence,
+        &receipt,
+        Some(source_scope_digest),
     )
+    .map_err(DmlError::journal_corruption)?;
+    let recovery_due_at_ms = stored.recovery_due_at_ms;
+    active
+        .record_direct_mutation_fence(record, recovery_due_at_ms)
+        .map_err(|error| journal_error(error, stored.operation_id))?;
+    Ok(active.stored.clone())
 }
 
 fn finish_plan_failure(
@@ -1058,15 +1096,22 @@ mod tests {
     }
 
     impl AddFilesEngine for FakeEngine {
-        /// Accept the sealed fence: this fake owns no mutation authority to
-        /// establish it on. What these tests exercise is the
-        /// establish-before-dispatch ordering and the lifecycle around it.
+        /// Acknowledge the sealed fence the way a provider does: with a receipt
+        /// that names exactly this fence. What these tests exercise is the
+        /// establish-before-dispatch ordering, the frontend double check, and
+        /// the journalled receipt around it.
         fn establish_add_files_external_fence(
             &self,
             _prepared: &dyn novarocks::engine::add_files_engine::AddFilesPrepared,
-            _fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-        ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-            Ok(())
+            fence: novarocks_spi::connector::ConnectorExternalOperationFence,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorExternalFenceReceipt,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            novarocks_spi::connector::ConnectorExternalFenceReceipt::try_new(
+                &fence,
+                Bytes::from_static(b"add-files-fence-marker"),
+            )
         }
 
         fn classify_add_files(&self, sql: &str) -> Result<Option<AddFilesCommand>, String> {
@@ -1238,6 +1283,7 @@ mod tests {
         plan_is_durable: Arc<AtomicBool>,
         evidence_is_durable: Arc<AtomicBool>,
         preflight_calls: AtomicUsize,
+        direct_mutation_fences: Mutex<Vec<crate::dml::model::DmlDirectMutationFenceReceiptRecord>>,
     }
 
     impl FakeJournal {
@@ -1245,6 +1291,12 @@ mod tests {
             let operations = self.operations.lock().unwrap();
             assert_eq!(operations.len(), 1);
             operations.values().next().unwrap().clone()
+        }
+
+        fn recorded_direct_mutation_fences(
+            &self,
+        ) -> Vec<crate::dml::model::DmlDirectMutationFenceReceiptRecord> {
+            self.direct_mutation_fences.lock().unwrap().clone()
         }
     }
 
@@ -1360,6 +1412,36 @@ mod tests {
         ) -> Result<(), DmlError> {
             self.preflight_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        fn preflight_direct_mutation_fence(
+            &self,
+            request: &crate::dml::model::DmlDirectMutationFenceMutationRequest,
+        ) -> Result<(), DmlError> {
+            crate::dml::model::validate_direct_mutation_fence_receipt(&request.fence)
+                .map_err(DmlError::journal_corruption)
+        }
+
+        fn record_direct_mutation_fence_authorized(
+            &self,
+            request: crate::dml::model::DmlDirectMutationFenceMutationRequest,
+            _recovery_due_at_ms: Option<i64>,
+            _authority: crate::dml::journal::DmlMutationAuthority,
+        ) -> Result<StoredOperation, DmlError> {
+            crate::dml::model::validate_direct_mutation_fence_receipt(&request.fence)
+                .map_err(DmlError::journal_corruption)?;
+            let mut operations = self.operations.lock().unwrap();
+            let operation = operations
+                .get_mut(request.operation_id.as_uuid())
+                .expect("fenced DML operation must exist in this fake journal");
+            assert_eq!(operation.revision, request.expected_revision);
+            operation.revision += 1;
+            operation.last_mutation_id = request.mutation_id;
+            self.direct_mutation_fences
+                .lock()
+                .unwrap()
+                .push(request.fence);
+            Ok(operation.clone())
         }
         fn apply_add_files_mutation_authorized(
             &self,
@@ -1550,6 +1632,17 @@ mod tests {
         assert_eq!(record.source_ownership, SourceScopeOwnership::TableOwned);
         assert!(record.plan_artifact.is_some());
         assert!(record.receipt_artifact.is_some());
+
+        // The fence the provider acknowledged must be durable before any file
+        // is registered, and an ADD FILES fence must bind the immutable source
+        // scope it was minted for.
+        let fences = journal.recorded_direct_mutation_fences();
+        assert_eq!(fences.len(), 1, "one fence receipt per ADD FILES attempt");
+        assert_eq!(fences[0].operation_kind, DmlDirectMutationKind::AddFiles);
+        assert_eq!(
+            fences[0].source_scope_digest.as_deref(),
+            record.source_scope_digest.as_deref()
+        );
     }
 
     #[test]

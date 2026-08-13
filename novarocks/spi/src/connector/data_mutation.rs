@@ -834,6 +834,33 @@ pub trait ConnectorDataMutation: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorExecutionBindingKey;
 
+    /// Atomically establish or raise the external operation fence for one
+    /// direct data mutation, before any execute that can change external truth.
+    ///
+    /// This mirrors `ConnectorWriteControl::establish_external_fence` on
+    /// purpose: TRUNCATE and ADD FILES need the same external linearization
+    /// point as a distributed write, so the provider must *publish* a marker
+    /// here rather than let the caller remember a fence locally. A later
+    /// `execute` derives its assertion from that published marker, so an
+    /// implementation that returns a receipt without publishing anything leaves
+    /// every fenced mutation unable to commit.
+    ///
+    /// Implementations must compare the fence generation at the same external
+    /// linearization point as the later execute: a lower generation must not be
+    /// able to mutate afterwards, an identical request must be idempotent, and
+    /// a foreign operation must never reuse another operation's marker. A
+    /// conflict must be reported with `ConnectorError::external_fence`, never
+    /// downgraded to an unknown or unsupported result.
+    fn establish_external_fence(
+        &self,
+        _request: super::ConnectorExternalFenceRequest,
+    ) -> Result<super::ConnectorExternalFenceReceipt, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector data mutation does not implement external operation fencing",
+        ))
+    }
+
     fn plan_mutation(
         &self,
         request: ConnectorDataMutationPlanningRequest,
@@ -880,37 +907,67 @@ impl ConnectorDataMutationLease {
     /// Direct mutation changes external table truth exactly like a distributed
     /// write, so it uses the same fence value and the same "establish before
     /// dispatch" ordering; only the execution contract differs.
+    ///
+    /// The provider is what actually establishes the fence: it publishes the
+    /// marker its own `execute` will later assert against. The local cell only
+    /// records *what* this authority established, so that every terminal call
+    /// of one direct mutation carries the same fence value; it is never the
+    /// establishment itself. Remembering a fence the provider never published
+    /// would make the session look fenced while asserting nothing.
     pub fn establish_external_fence(
         &self,
         fence: super::ConnectorExternalOperationFence,
-    ) -> Result<(), ConnectorError> {
+        context: ConnectorRequestContext,
+    ) -> Result<super::ConnectorExternalFenceReceipt, ConnectorError> {
         fence.validate()?;
-        let mut slot = self.fence.lock().map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector data mutation fence lock was poisoned",
-            )
-        })?;
+        if let Some(established) = self.lock_fence()?.as_ref() {
+            fence.validate_monotonic_successor_of(established)?;
+        }
+        let receipt =
+            self.mutation
+                .establish_external_fence(super::ConnectorExternalFenceRequest {
+                    owner: self.key.clone(),
+                    fence: fence.clone(),
+                    context,
+                })?;
+        receipt.validate()?;
+        if !receipt.matches(&fence) {
+            return Err(ConnectorError::external_fence(
+                super::ConnectorExternalFenceFailure::ForeignOperation,
+                "connector provider returned an external fence receipt for another fence",
+            ));
+        }
+        let mut slot = self.lock_fence()?;
+        // Re-check under the write lock: a concurrent establishment may have
+        // raised this authority's fence while the provider call was in flight.
         if let Some(established) = slot.as_ref() {
             fence.validate_monotonic_successor_of(established)?;
         }
         *slot = Some(fence);
-        Ok(())
+        Ok(receipt)
     }
 
     /// The fencing decision every terminal call of this mutation must carry.
     pub fn fencing(&self) -> Result<super::ConnectorWriteFencing, ConnectorError> {
-        let slot = self.fence.lock().map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector data mutation fence lock was poisoned",
-            )
-        })?;
-        Ok(match slot.as_ref() {
+        Ok(match self.lock_fence()?.as_ref() {
             Some(fence) => super::ConnectorWriteFencing::Fenced(fence.clone()),
             None => super::ConnectorWriteFencing::NotFencedByThisPhase {
                 reason: "no external fence was established for this direct mutation",
             },
+        })
+    }
+
+    fn lock_fence(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, Option<super::ConnectorExternalOperationFence>>,
+        ConnectorError,
+    > {
+        self.fence.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector data mutation fence lock was poisoned",
+            )
         })
     }
 }

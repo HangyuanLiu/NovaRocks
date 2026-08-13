@@ -313,12 +313,18 @@ impl DataMutationSession {
     ///
     /// TRUNCATE and ADD FILES destroy or extend table content, so a superseded
     /// owner's late execute has to be refused at the catalog rather than
-    /// merely reported afterwards.
+    /// merely reported afterwards. The provider publishes the marker and
+    /// returns the receipt that acknowledges it; the receipt travels back out
+    /// so the frontend can journal proof of the fence before dispatch.
     pub fn establish_external_fence(
         &self,
         fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        self.lease.establish_external_fence(fence)
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExternalFenceReceipt,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        self.lease
+            .establish_external_fence(fence, self.context.clone())
     }
 
     pub(crate) fn plan_ref(&self) -> &novarocks_spi::connector::ConnectorDataMutationPlan {

@@ -20,22 +20,25 @@
 //! inspects provider payloads.
 
 use novarocks_spi::connector::{
-    ConnectorEstablishedWriteFence, ConnectorExternalFenceFailure,
-    ConnectorHistoricalWriteDisposition, ConnectorHistoricalWriteObservation,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorTableIdentity,
-    ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ConnectorWriteTargetRef,
-    ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorEstablishedWriteFence, ConnectorExternalFenceFailure, ConnectorExternalFenceReceipt,
+    ConnectorExternalOperationFence, ConnectorHistoricalWriteDisposition,
+    ConnectorHistoricalWriteObservation, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorTableIdentity, ConnectorWriteAbortOutcome, ConnectorWriteReceipt,
+    ConnectorWriteTargetRef, ExternalMutationEffect, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::dml::model::{
     ConnectorWriteFailureKind, ConnectorWriteFailureRecord, ConnectorWriteFinalizationRecord,
-    ConnectorWriteLifecycleRecord, ConnectorWriteReceiptWire, DML_EXTERNAL_FENCE_CODEC_VERSION,
-    DML_OPAQUE_PAYLOAD_LIMIT, DmlExternalFenceGeneration, DmlExternalFenceIdentity,
-    DmlExternalFenceReceiptRecord, DmlHistoricalCleanupState, DmlHistoricalWriteDisposition,
-    DmlHistoricalWriteResultRecord, DmlOpaquePayload, ExternalMutationEvidenceWire, OperationFact,
-    OperationState,
+    ConnectorWriteLifecycleRecord, ConnectorWriteReceiptWire,
+    DML_DIRECT_MUTATION_FENCE_CODEC_VERSION, DML_EXTERNAL_FENCE_CODEC_VERSION,
+    DML_OPAQUE_PAYLOAD_LIMIT, DmlDirectMutationFenceReceiptRecord, DmlDirectMutationKind,
+    DmlExternalFenceGeneration, DmlExternalFenceIdentity, DmlExternalFenceReceiptRecord,
+    DmlHistoricalCleanupState, DmlHistoricalWriteDisposition, DmlHistoricalWriteResultRecord,
+    DmlOpaquePayload, ExternalMutationEvidenceWire, OperationFact, OperationState,
+    validate_direct_mutation_fence_receipt,
 };
 use crate::dml::now_unix_millis;
 
@@ -145,9 +148,19 @@ fn failure_record(message: &str) -> ConnectorWriteFailureRecord {
 pub fn external_fence_receipt_record(
     established: &ConnectorEstablishedWriteFence,
 ) -> Result<DmlExternalFenceReceiptRecord, String> {
-    let fence = established.fence();
+    external_fence_receipt_record_parts(established.fence(), established.receipt())
+}
+
+/// Project a fence value and the provider receipt that acknowledged it.
+///
+/// Direct mutation establishes its fence through the data-mutation lease, which
+/// hands back the bare receipt rather than a write-authority pair, so the
+/// projection is shared at this level instead of being duplicated per family.
+pub fn external_fence_receipt_record_parts(
+    fence: &ConnectorExternalOperationFence,
+    receipt: &ConnectorExternalFenceReceipt,
+) -> Result<DmlExternalFenceReceiptRecord, String> {
     fence.validate().map_err(|error| error.to_string())?;
-    let receipt = established.receipt();
     receipt.validate().map_err(|error| error.to_string())?;
     if !receipt.matches(fence) {
         return Err(
@@ -204,6 +217,54 @@ pub fn external_fence_preflight_probe(
         receipt_digest: digest,
         receipt_payload: DmlOpaquePayload::try_new(vec![0xFF; DML_OPAQUE_PAYLOAD_LIMIT])?,
         established_at_ms: now_unix_millis(),
+    })
+}
+
+/// Project one confirmed direct-mutation fence into its durable journal record.
+///
+/// TRUNCATE and ADD FILES share the CP-3B fence carrier, so the record adds only
+/// the mutation family and — for ADD FILES alone — the immutable source scope
+/// the fence was minted for. Everything else is the same identity, generation
+/// scalars, digests, and bounded opaque provider receipt.
+pub fn direct_mutation_fence_receipt_record(
+    operation_kind: DmlDirectMutationKind,
+    fence: &ConnectorExternalOperationFence,
+    receipt: &ConnectorExternalFenceReceipt,
+    source_scope_digest: Option<String>,
+) -> Result<DmlDirectMutationFenceReceiptRecord, String> {
+    let record = DmlDirectMutationFenceReceiptRecord {
+        codec_version: DML_DIRECT_MUTATION_FENCE_CODEC_VERSION,
+        operation_kind,
+        fence: external_fence_receipt_record_parts(fence, receipt)?,
+        source_scope_digest,
+    };
+    validate_direct_mutation_fence_receipt(&record)?;
+    Ok(record)
+}
+
+/// The largest direct-mutation fence record this attempt could produce.
+///
+/// The caller preflights this probe *before* it asks the provider to publish a
+/// marker: only the bounded opaque provider payload can vary in size, so a
+/// maximum-size probe bounds every receipt the attempt can return. The ADD FILES
+/// source scope is already immutable at this point and is carried verbatim, so
+/// the probe has the exact shape the real record will have.
+pub fn direct_mutation_fence_preflight_probe(
+    operation_kind: DmlDirectMutationKind,
+    stand_in_write_operation_id: Uuid,
+    coordination_attempt_id: Uuid,
+    generation: DmlExternalFenceGeneration,
+    source_scope_digest: Option<String>,
+) -> Result<DmlDirectMutationFenceReceiptRecord, String> {
+    Ok(DmlDirectMutationFenceReceiptRecord {
+        codec_version: DML_DIRECT_MUTATION_FENCE_CODEC_VERSION,
+        operation_kind,
+        fence: external_fence_preflight_probe(
+            stand_in_write_operation_id,
+            coordination_attempt_id,
+            generation,
+        )?,
+        source_scope_digest,
     })
 }
 

@@ -42,10 +42,10 @@ use uuid::Uuid;
 use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::{DmlError, DmlErrorKind};
 use crate::dml::model::{
-    CreateStatementOperationRequest, DML_EXTERNAL_FACT_ENCODED_LIMIT, DmlOperationId,
-    DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, OperationKind,
-    OperationPayload, OperationState, OperationTarget, StatementNextAction, StoredOperation,
-    TruncateLifecyclePhase, TruncateLifecycleRecord,
+    CreateStatementOperationRequest, DML_EXTERNAL_FACT_ENCODED_LIMIT, DmlDirectMutationKind,
+    DmlOperationId, DurableExternalFact, DurableMutationSummary, ExternalFactOutcome,
+    OperationKind, OperationPayload, OperationState, OperationTarget, StatementNextAction,
+    StoredOperation, TruncateLifecyclePhase, TruncateLifecycleRecord,
 };
 use crate::dml::service::DmlService;
 
@@ -213,8 +213,38 @@ fn execute_truncate_operation(
     // refused at the catalog rather than reported after the fact. The frontend
     // seals it because only it holds the resource identity a fence binds; the
     // plan facts carry exactly the identity the provider signed.
-    let fence = active
-        .external_fence()?
+    stored = establish_and_record_fence(engine, active, stored, &prepared)?;
+
+    finish_outcome(
+        engine,
+        active,
+        stored,
+        &prepared,
+        engine.execute_truncate(prepared.handle.as_ref()),
+        true,
+    )
+}
+
+/// Establish this attempt's external fence and durably journal its receipt,
+/// before the destructive execute is dispatched.
+///
+/// Ordering, in full: mint the proposal from the *live* lease guard, refuse a
+/// receipt this journal could never hold, ask the provider to publish the
+/// marker, double-check that it acknowledged exactly the fence that was sealed,
+/// then persist the receipt through the fenced journal. Only a completely
+/// successful run licenses dispatch; every failure returns before `execute` is
+/// reached and leaves the operation recoverable for historical data-mutation
+/// recovery to classify.
+fn establish_and_record_fence(
+    engine: &dyn TruncateEngine,
+    active: &mut ActiveDmlOperation,
+    stored: StoredOperation,
+    prepared: &PreparedTruncate,
+) -> Result<StoredOperation, DmlError> {
+    let proposal = active.external_fence()?;
+    // TRUNCATE owns no source set at all, so it binds no source scope.
+    active.preflight_direct_mutation_fence(&proposal, DmlDirectMutationKind::Truncate, None)?;
+    let fence = proposal
         .seal(
             novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
                 prepared.facts.mutation_operation_id,
@@ -233,18 +263,22 @@ fn execute_truncate_operation(
             .map_err(DmlError::executor)?,
         )
         .map_err(DmlError::executor)?;
-    engine
-        .establish_truncate_external_fence(prepared.handle.as_ref(), fence)
+    let receipt = engine
+        .establish_truncate_external_fence(prepared.handle.as_ref(), fence.clone())
         .map_err(DmlError::executor)?;
-
-    finish_outcome(
-        engine,
-        active,
-        stored,
-        &prepared,
-        engine.execute_truncate(prepared.handle.as_ref()),
-        true,
+    proposal.validate_established_receipt(&fence, &receipt)?;
+    let record = crate::dml::reconcile::direct_mutation_fence_receipt_record(
+        DmlDirectMutationKind::Truncate,
+        &fence,
+        &receipt,
+        None,
     )
+    .map_err(DmlError::journal_corruption)?;
+    let recovery_due_at_ms = stored.recovery_due_at_ms;
+    active
+        .record_direct_mutation_fence(record, recovery_due_at_ms)
+        .map_err(|error| journal_error(error, stored.operation_id))?;
+    Ok(active.stored.clone())
 }
 
 fn finish_plan_failure(
