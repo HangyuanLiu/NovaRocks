@@ -420,7 +420,14 @@ pub struct OwnedRefresh {
     mv_id: i64,
     registry: Arc<MvRefreshOwnershipRegistry>,
     /// Held so the StateStore lease is renewed and released with the handle.
-    _guard: LeaseGuard,
+    ///
+    /// An `Option` so `Drop` can hand it over inside an entered runtime context:
+    /// `LeaseGuard::drop` releases by spawning, and silently skips releasing when
+    /// no runtime is current. On the MV refresh worker -- a plain OS thread --
+    /// that is always, so the lease would survive to its TTL and the next refresh
+    /// of the same target would contend with its own dead predecessor.
+    guard: Option<LeaseGuard>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl OwnedRefresh {
@@ -441,6 +448,10 @@ impl std::fmt::Debug for OwnedRefresh {
 impl Drop for OwnedRefresh {
     fn drop(&mut self) {
         self.registry.release(self.mv_id);
+        // Entering the runtime before dropping the guard is what makes the
+        // release actually happen; without it the guard's own Drop no-ops.
+        let _entered = self.runtime.enter();
+        drop(self.guard.take());
     }
 }
 
@@ -467,11 +478,12 @@ pub enum OwnershipRefusal {
 /// maps it to a retryable conflict, and the workers back off. Only genuine
 /// coordination unavailability is exceptional.
 pub async fn acquire_refresh_ownership(
-    coordination: &MvRefreshCoordination,
-    registry: &Arc<MvRefreshOwnershipRegistry>,
+    context: &MvRefreshOwnershipContext,
     mv_id: i64,
     resource: ConnectorMvRefreshResourceIdentity,
 ) -> Result<OwnedRefresh, OwnershipRefusal> {
+    let coordination = &context.coordination;
+    let registry = &context.registry;
     let admission = coordination
         .write_admission()
         .await
@@ -491,7 +503,8 @@ pub async fn acquire_refresh_ownership(
     Ok(OwnedRefresh {
         mv_id,
         registry: Arc::clone(registry),
-        _guard: guard,
+        guard: Some(guard),
+        runtime: context.runtime.clone(),
     })
 }
 
