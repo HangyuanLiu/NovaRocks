@@ -24,7 +24,10 @@ use std::task::Poll;
 use std::time::Duration;
 
 use novarocks::common::app_config::NovaRocksConfig;
+use novarocks::engine::frontend_capabilities as core_capabilities;
+use novarocks::engine::table_maintenance::BackgroundMaintenanceAttemptFactory;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
+use novarocks::query_execution::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
@@ -36,6 +39,20 @@ use crate::{
 };
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Clone)]
+struct FrontendBackgroundMaintenanceAttemptFactory {
+    role: novarocks::common::app_config::ClusterRole,
+    topology: novarocks::query_execution::backend::BackendTopologyService,
+}
+
+impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
+    fn begin_automatic_maintenance_attempt(
+        &self,
+    ) -> Result<novarocks::engine::table_maintenance::BackgroundMaintenanceAttempt, String> {
+        core_capabilities::background_maintenance_attempt(self.role, self.topology.clone())
+    }
+}
 
 #[derive(Clone)]
 pub struct FrontendServerConfig {
@@ -50,62 +67,6 @@ pub struct FrontendServerConfig {
     /// Typed StateStore host input. The FE remains the owner of opening and
     /// shutting down this host; the server only supplies the composition data.
     pub state_store_host_config: Option<StateStoreHostConfig>,
-}
-
-fn standalone_open_services(
-    system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog>,
-    host: &FrontendApplicationHost,
-    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-) -> novarocks::engine::StandaloneOpenServices {
-    novarocks::engine::StandaloneOpenServices::new(
-        host.execution_role(),
-        system_catalog,
-        host.view_service(),
-        host.statistics_service(),
-        host.table_maintenance_service(),
-        host.mv_repository(),
-        host.mv_application_service(),
-        host.query_execution_service(),
-        host.backend_query_event_sink(),
-        host.backend_topology_port(),
-        host.coordinator_report_endpoint_sink(),
-        host.query_control_service(),
-        host.connector_control_registry(),
-        host.connector_control_factory_resolver(),
-        0,
-    )
-    .with_catalog_application(
-        host.catalog_application_port(),
-        host.catalog_runtime_projection(),
-    )
-    .with_statistics_application(host.statistics_application_port())
-    .with_statistics_target_resolver_sink(host.statistics_application_port())
-    .with_statistics_table_reader_sink(host.statistics_application_port())
-    .with_statistics_attempt_executor_sink(host.statistics_application_port())
-    .with_mv_refresh_provider_activation_sink(host.mv_refresh_provider_activation_sink())
-    .with_mv_background_engine_sink(host.mv_background_engine_sink())
-    .with_mv_storage_observation(mv_storage_observation.clone())
-    // The frontend owns when MV state is restored at startup. The engine keeps
-    // its own implementation as the fallback for a composition without a
-    // frontend; both run through the same runner, so the step ordering is
-    // identical either way.
-    .with_mv_startup_restore(Arc::new(
-        crate::mv::startup_restore::FrontendMvStartupRestore::new(
-            host.connector_control_registry(),
-            host.catalog_runtime_projection(),
-            host.catalog_application_port(),
-            mv_storage_observation,
-            host.mv_repository(),
-            {
-                let application = host.mv_application_service();
-                Box::new(move || {
-                    application
-                        .recover_startup_mv_refreshes()
-                        .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
-                })
-            },
-        ),
-    ))
 }
 
 /// Opens the frontend services once for an externally composed server. The
@@ -125,16 +86,265 @@ pub async fn open_frontend_application_for_server(
     .await
 }
 
-/// Builds standalone services from a previously opened frontend host.
-pub fn standalone_open_services_for_server(
+/// Complete the one Frontend-owned startup graph and return a ready SQL
+/// session factory.  Every Core value constructed here is a closed domain
+/// capability; this function never creates an application aggregate or lets a
+/// request resolve services from the lifecycle host.
+pub fn build_frontend_query_session_factory(
     host: &FrontendApplicationHost,
+    system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog>,
+    exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-) -> novarocks::engine::StandaloneOpenServices {
-    standalone_open_services(
-        Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
-        host,
-        mv_storage_observation,
+) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+    let catalog_service = Arc::new(novarocks::engine::new_query_catalog_service());
+    let unified_statistics = Arc::new(novarocks::engine::UnifiedStatisticsResolver::default());
+    let catalog_application = host.catalog_application_port();
+    let catalog_projection = host.catalog_runtime_projection();
+    let connector_control = host.connector_control_registry();
+    let query_execution = host.query_execution_service();
+    let topology = host.backend_topology_port();
+    let role = host.execution_role();
+    let mv_repository = host.mv_repository();
+    let mv_application = host.mv_application_service();
+    let view_service = host.view_service();
+    let statistics_service = host.statistics_service();
+    let statistics_application = host.statistics_application_port();
+    let maintenance_service = host.table_maintenance_service();
+
+    core_capabilities::bind_catalog_runtime_projection(
+        catalog_projection.as_ref(),
+        Arc::clone(&catalog_service),
+        Arc::clone(&connector_control),
     )
+    .map_err(FrontendApplicationError::server)?;
+
+    let iceberg_mv_ports = novarocks::engine::IcebergMvCorePorts::new(
+        Arc::clone(&catalog_service),
+        Some(Arc::clone(&catalog_application)),
+        Arc::clone(&connector_control),
+        Arc::clone(&mv_repository),
+        Arc::clone(&mv_storage_observation),
+    );
+    if let Some(sink) = host.mv_refresh_provider_activation_sink() {
+        core_capabilities::bind_mv_refresh_provider_activation(
+            sink.as_ref(),
+            core_capabilities::MvRefreshProviderActivationPorts::new(
+                Arc::clone(&catalog_service),
+                Some(Arc::clone(&catalog_application)),
+                Arc::clone(&connector_control),
+                Arc::clone(&unified_statistics),
+                query_execution.clone(),
+                topology.clone(),
+                exchange_port,
+                Arc::clone(&mv_repository),
+                Arc::clone(&mv_storage_observation),
+            ),
+        )
+        .map_err(FrontendApplicationError::server)?;
+    }
+
+    let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
+        Arc::clone(&connector_control),
+        Arc::clone(&catalog_projection),
+        Arc::clone(&catalog_application),
+        Arc::clone(&mv_storage_observation),
+        Arc::clone(&mv_repository),
+        {
+            let application = Arc::clone(&mv_application);
+            Box::new(move || {
+                application
+                    .recover_startup_mv_refreshes()
+                    .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
+            })
+        },
+    );
+    novarocks::mv::startup_restore::run_mv_startup_restore(&startup_restore)
+        .map_err(FrontendApplicationError::server)?;
+
+    core_capabilities::bind_statistics_target_resolver(
+        statistics_application.as_ref(),
+        Arc::clone(&connector_control),
+    )
+    .map_err(FrontendApplicationError::server)?;
+    core_capabilities::bind_statistics_table_reader(
+        statistics_application.as_ref(),
+        Arc::clone(&connector_control),
+    )
+    .map_err(FrontendApplicationError::server)?;
+    core_capabilities::bind_statistics_attempt_executor(
+        statistics_application.as_ref(),
+        core_capabilities::StatisticsAttemptExecutorPorts::new(
+            role,
+            Arc::clone(&connector_control),
+            topology.clone(),
+            query_execution.clone(),
+            iceberg_mv_ports.clone(),
+        ),
+    )
+    .map_err(FrontendApplicationError::server)?;
+
+    let maintenance_ports = core_capabilities::MaintenanceCommandPorts::new(
+        Arc::clone(&catalog_service),
+        Some(Arc::clone(&catalog_application)),
+        Arc::clone(&connector_control),
+        Arc::clone(&mv_storage_observation),
+        query_execution.clone(),
+        Arc::clone(&maintenance_service),
+    );
+    let maintenance_engine = core_capabilities::background_maintenance_engine(
+        maintenance_ports.clone(),
+        Arc::new(FrontendBackgroundMaintenanceAttemptFactory {
+            role,
+            topology: topology.clone(),
+        }),
+    );
+    if let Err(error) = maintenance_service.start(Arc::clone(&maintenance_engine)) {
+        let primary = FrontendApplicationError::server(format!(
+            "start table maintenance service failed: {error}"
+        ));
+        return match maintenance_service.shutdown() {
+            Ok(()) => Err(primary),
+            Err(cleanup_error) => Err(primary.with_cleanup_context(format!(
+                "shutdown table maintenance service after startup failure: {cleanup_error}"
+            ))),
+        };
+    }
+    if let Some(sink) = host.mv_background_engine_sink() {
+        if let Err(error) = core_capabilities::bind_mv_background_engine(
+            sink.as_ref(),
+            core_capabilities::MvBackgroundPorts::new(
+                Arc::clone(&catalog_service),
+                Some(Arc::clone(&catalog_application)),
+                Arc::clone(&connector_control),
+                Arc::clone(&mv_repository),
+                Arc::clone(&mv_storage_observation),
+            ),
+            Arc::clone(&maintenance_engine),
+        ) {
+            let primary = FrontendApplicationError::server(format!(
+                "bind frontend MV background engine failed: {error}"
+            ));
+            return match maintenance_service.shutdown() {
+                Ok(()) => Err(primary),
+                Err(cleanup_error) => Err(primary.with_cleanup_context(format!(
+                    "shutdown table maintenance service after MV background bind failure: {cleanup_error}"
+                ))),
+            };
+        }
+    }
+
+    let query_compiler =
+        core_capabilities::query_compiler(core_capabilities::QueryCompilerPorts::new(
+            Arc::clone(&catalog_service),
+            Some(Arc::clone(&catalog_application)),
+            Arc::clone(&connector_control),
+            Arc::clone(&unified_statistics),
+            query_execution.clone(),
+            topology.clone(),
+            exchange_port,
+            view_service.clone(),
+            system_catalog,
+            Arc::clone(&mv_repository),
+            Arc::clone(&mv_storage_observation),
+        ));
+    let session_catalog_resolver =
+        core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(
+            Arc::clone(&catalog_service),
+            Some(Arc::clone(&catalog_application)),
+            Arc::clone(&connector_control),
+        ));
+    let catalog_command_executor =
+        core_capabilities::catalog_command_executor(core_capabilities::CatalogCommandPorts::new(
+            Arc::clone(&catalog_service),
+            Some(Arc::clone(&catalog_application)),
+            Arc::clone(&connector_control),
+            Arc::clone(&mv_repository),
+            Arc::clone(&mv_storage_observation),
+            view_service,
+        ));
+    let statistics_command_executor = core_capabilities::statistics_command_executor(
+        core_capabilities::StatisticsCommandPorts::new(
+            Arc::clone(&catalog_service),
+            Arc::clone(&connector_control),
+            Arc::clone(&unified_statistics),
+            statistics_service,
+            statistics_application,
+            query_execution.clone(),
+        ),
+    );
+    let backend_command_executor = core_capabilities::backend_command_executor(
+        core_capabilities::BackendCommandPorts::new(topology.clone()),
+    );
+    let view_command_executor =
+        core_capabilities::view_command_executor(core_capabilities::ViewCommandPorts::new(
+            Arc::clone(&catalog_service),
+            Some(Arc::clone(&catalog_application)),
+            Arc::clone(&connector_control),
+            host.view_service(),
+        ));
+    let iceberg_ref_command_executor = core_capabilities::iceberg_ref_command_executor(
+        core_capabilities::IcebergRefCommandPorts::new(
+            Arc::clone(&connector_control),
+            Arc::clone(&mv_storage_observation),
+        ),
+    );
+    let mv_command_executor =
+        core_capabilities::mv_command_executor(core_capabilities::MvCommandPorts::new(
+            Arc::clone(&catalog_service),
+            Some(Arc::clone(&catalog_application)),
+            Arc::clone(&connector_control),
+            Arc::clone(&unified_statistics),
+            Arc::clone(&mv_repository),
+            mv_application,
+            Arc::clone(&mv_storage_observation),
+            query_execution.clone(),
+        ));
+    let maintenance_command_executor =
+        core_capabilities::maintenance_command_executor(maintenance_ports);
+    let maintenance_read_command_executor =
+        core_capabilities::maintenance_read_command_executor(maintenance_service);
+    let dml_engines = core_capabilities::dml_engines(core_capabilities::DmlEnginePorts::new(
+        Arc::clone(&catalog_service),
+        Some(catalog_application),
+        connector_control,
+        unified_statistics,
+        mv_storage_observation,
+        query_execution.clone(),
+    ));
+    host.ctas_recovery_binding()
+        .install_ctas_engine(Arc::clone(&dml_engines.ctas))
+        .map_err(|error| {
+            FrontendApplicationError::server(format!(
+                "bind CTAS recovery before controller start: {error}"
+            ))
+        })?;
+
+    Ok(Arc::new(
+        crate::query::FrontendQueryService::new_with_recovery_bound(
+            session_catalog_resolver,
+            query_compiler,
+            catalog_command_executor,
+            statistics_command_executor,
+            backend_command_executor,
+            view_command_executor,
+            iceberg_ref_command_executor,
+            mv_command_executor,
+            maintenance_command_executor,
+            maintenance_read_command_executor,
+            host.query_control_service(),
+            query_execution,
+            role,
+            topology,
+            host.dml_service(),
+            dml_engines.insert,
+            dml_engines.delete,
+            dml_engines.mutation,
+            dml_engines.add_files,
+            dml_engines.ctas,
+            dml_engines.truncate,
+            host.optimizer_query_mem_limit_bytes(),
+        ),
+    ))
 }
 
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
@@ -161,91 +371,12 @@ pub async fn run_frontend_server_until_shutdown<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
-        Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
-    let execution = resolve_frontend_execution_config(&config)?;
-    let optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
-    let backend = cluster_backend_open_config(&config.config)?;
-    let connector_factories = config.connector_control_factories.clone();
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    run_frontend_server_until_shutdown_with_ports(
-        config,
-        shutdown,
-        move |state_store| {
-            let connector_factories = connector_factories.clone();
-            async move {
-                FrontendApplicationHost::open_with_factories(
-                    state_store,
-                    execution,
-                    backend,
-                    connector_factories,
-                )
-                .await
-            }
-        },
-        move |host| {
-            (
-                standalone_open_services(
-                    system_catalog,
-                    host,
-                    Arc::clone(&mv_storage_observation),
-                ),
-                host.dml_service(),
-                host.terminal_ingress(),
-            )
-        },
-        move |config, (mut services, dml, terminal_ingress), shutdown| async move {
-            let mut report_server = FrontendReportServerHandle::start(
-                &config.config.server.host,
-                config.config.server.grpc_port,
-                terminal_ingress,
-            )
-            .map_err(FrontendApplicationError::server)?;
-            services.exchange_port = report_server.bound_addr().port();
-            let query_control = services.query_control.clone();
-            let query_execution = services.query_execution.clone();
-            let topology = services.backend_topology.clone();
-            let role = services.execution_role;
-            let server_result = novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
-                config.config,
-                config.config_path,
-                config.port_override,
-                services,
-                move |engine| {
-                    let insert_engine = engine.insert_engine();
-                    let delete_engine = engine.delete_engine();
-                    let mutation_engine = engine.mutation_engine();
-                    let ctas_engine = engine.ctas_engine();
-                    let truncate_engine = engine.truncate_engine();
-                    let add_files_engine = engine.add_files_engine();
-                    Ok(Arc::new(crate::query::FrontendQueryService::new(
-                        engine,
-                        query_control,
-                        query_execution,
-                        role,
-                        topology,
-                        dml,
-                        insert_engine,
-                        delete_engine,
-                        mutation_engine,
-                        add_files_engine,
-                        ctas_engine,
-                        truncate_engine,
-                        optimizer_query_mem_limit_bytes,
-                    )))
-                },
-                shutdown,
-            )
-            .await
-            .map_err(|error| {
-                FrontendApplicationError::server(format!("standalone server failed: {error}"))
-            });
-            let stop_result = report_server.stop().map_err(FrontendApplicationError::server);
-            combine_server_and_shutdown(server_result, stop_result)
-        },
-        |host| async move { host.shutdown().await },
-    )
-    .await
+    let host = open_frontend_application_for_server(&config).await?;
+    let server_result =
+        serve_ready_frontend_session_factory(config, &host, mv_storage_observation, shutdown).await;
+    let shutdown_result = host.shutdown().await;
+    combine_server_and_shutdown(server_result, shutdown_result)
 }
 
 async fn run_frontend_server_with_signal<S, E>(
@@ -256,91 +387,61 @@ where
     S: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
+    let host = open_frontend_application_for_server(&config).await?;
+    let server_result = run_server_until_signal(config, (), signal, |config, (), shutdown| {
+        serve_ready_frontend_session_factory(config, &host, mv_storage_observation, shutdown)
+    })
+    .await;
+    let shutdown_result = host.shutdown().await;
+    combine_server_and_shutdown(server_result, shutdown_result)
+}
+
+async fn serve_ready_frontend_session_factory<F>(
+    config: FrontendServerConfig,
+    host: &FrontendApplicationHost,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    shutdown: F,
+) -> Result<(), FrontendApplicationError>
+where
+    F: Future<Output = ()> + Send,
+{
+    let mut report_server = FrontendReportServerHandle::start(
+        &config.config.server.host,
+        config.config.server.grpc_port,
+        host.terminal_ingress(),
+    )
+    .map_err(FrontendApplicationError::server)?;
+    let exchange_port = report_server.bound_addr().port();
+    host.coordinator_report_endpoint_sink()
+        .set_bound_port(exchange_port);
     let system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
-    let execution = resolve_frontend_execution_config(&config)?;
-    let optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
-    let backend = cluster_backend_open_config(&config.config)?;
-    let connector_factories = config.connector_control_factories.clone();
-    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    run_frontend_server_with_signal_and_ports(
-        config,
-        signal,
-        move |state_store| {
-            let connector_factories = connector_factories.clone();
-            async move {
-                FrontendApplicationHost::open_with_factories(
-                    state_store,
-                    execution,
-                    backend,
-                    connector_factories,
-                )
-                .await
-            }
-        },
-        move |host| {
-            (
-                standalone_open_services(
-                    system_catalog,
-                    host,
-                    Arc::clone(&mv_storage_observation),
-                ),
-                host.dml_service(),
-                host.terminal_ingress(),
-            )
-        },
-        move |config, (mut services, dml, terminal_ingress), shutdown| async move {
-            let mut report_server = FrontendReportServerHandle::start(
-                &config.config.server.host,
-                config.config.server.grpc_port,
-                terminal_ingress,
-            )
+    let session_factory = match build_frontend_query_session_factory(
+        host,
+        system_catalog,
+        exchange_port,
+        mv_storage_observation,
+    ) {
+        Ok(factory) => factory,
+        Err(error) => {
+            let stop_result = report_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
+            return combine_server_and_shutdown(Err(error), stop_result);
+        }
+    };
+    let listener =
+        novarocks::server::resolve_mysql_listener_settings(&config.config, config.port_override)
             .map_err(FrontendApplicationError::server)?;
-            services.exchange_port = report_server.bound_addr().port();
-            let query_control = services.query_control.clone();
-            let query_execution = services.query_execution.clone();
-            let topology = services.backend_topology.clone();
-            let role = services.execution_role;
-            let server_result = novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
-                config.config,
-                config.config_path,
-                config.port_override,
-                services,
-                move |engine| {
-                    let insert_engine = engine.insert_engine();
-                    let delete_engine = engine.delete_engine();
-                    let mutation_engine = engine.mutation_engine();
-                    let ctas_engine = engine.ctas_engine();
-                    let truncate_engine = engine.truncate_engine();
-                    let add_files_engine = engine.add_files_engine();
-                    Ok(Arc::new(crate::query::FrontendQueryService::new(
-                        engine,
-                        query_control,
-                        query_execution,
-                        role,
-                        topology,
-                        dml,
-                        insert_engine,
-                        delete_engine,
-                        mutation_engine,
-                        add_files_engine,
-                        ctas_engine,
-                        truncate_engine,
-                        optimizer_query_mem_limit_bytes,
-                    )))
-                },
-                shutdown,
-            )
+    let server_result =
+        novarocks::server::run_mysql_server_until_shutdown(listener, session_factory, shutdown)
             .await
-            .map_err(|error| {
-                FrontendApplicationError::server(format!("standalone server failed: {error}"))
-            });
-            let stop_result = report_server.stop().map_err(FrontendApplicationError::server);
-            combine_server_and_shutdown(server_result, stop_result)
-        },
-        |host| async move { host.shutdown().await },
-    )
-    .await
+            .map_err(FrontendApplicationError::server);
+    let stop_result = report_server
+        .stop()
+        .map_err(FrontendApplicationError::server);
+    combine_server_and_shutdown(server_result, stop_result)
 }
 
 fn resolve_frontend_execution_config(
@@ -403,6 +504,7 @@ fn resolve_frontend_execution_config(
     Ok(execution)
 }
 
+#[cfg(test)]
 async fn run_frontend_server_until_shutdown_with_ports<
     F,
     Host,
@@ -441,6 +543,7 @@ where
     combine_server_and_shutdown(server_result, shutdown_result)
 }
 
+#[cfg(test)]
 async fn run_frontend_server_with_signal_and_ports<
     S,
     E,
@@ -614,13 +717,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown,
-        run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
-        standalone_open_services,
+        FrontendServerConfig, build_frontend_query_session_factory, run_frontend_server,
+        run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
+        run_frontend_server_with_signal_and_ports,
     };
     use crate::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
         FrontendExecutionConfig,
+    };
+    use novarocks::{
+        catalog_application::CatalogAdmission, query_execution::session::QuerySessionOpenRequest,
     };
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
@@ -732,48 +838,22 @@ mod tests {
                 .await
                 .expect("open catalog attachment repository");
 
-        let services = standalone_open_services(
-            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+        let session_factory = build_frontend_query_session_factory(
             &host,
+            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            0,
             Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
-        );
-        assert!(
-            services.catalog_application.is_some(),
-            "production composition must install the frontend catalog application"
-        );
-        assert!(
-            services.catalog_runtime_projection.is_some(),
-            "production composition must install the catalog runtime projection"
-        );
-        let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
-            novarocks::engine::StandaloneOptions::default(),
-            config,
-            services,
         )
-        .expect("open engine with the frontend catalog authority");
-
-        let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
-        let context = novarocks::query_execution::request_context::RequestContext::admit(
-            novarocks::query_execution::request_context::RequestAdmission::new(
-                None,
-                "db1".to_string(),
-                novarocks::common::app_config::ClusterRole::AllInOne,
-                novarocks::query_execution::backend::BackendTopologySnapshot::empty(1),
-                None,
-                cancellation.view(),
-                novarocks::query_execution::request_context::SessionOptimizerSettings::default(),
-            ),
-        );
+        .expect("build ready frontend session factory");
+        let session = session_factory
+            .open_session(QuerySessionOpenRequest::new(1, "cp2-cutover"))
+            .expect("open frontend query session");
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
 
-        engine
-            .command_executor()
-            .execute(
-                r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#,
-                &context,
-                None,
-            )
+        session
+            .execute_batch(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
+            .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
         let created = attachments
             .get(&instance_id)
@@ -782,13 +862,18 @@ mod tests {
             .expect("CREATE CATALOG must commit to the StateStore attachment keyspace");
         assert_eq!(created.attachment.provider_id.as_str(), "iceberg");
         assert_eq!(created.attachment.display_name, "warehouse");
-        engine
-            .require_external_catalog_ready("warehouse")
-            .expect("the committed attachment is admitted by this frontend");
+        assert!(matches!(
+            host.catalog_application_port().admit_catalog(&instance_id),
+            CatalogAdmission::Ready(_)
+        ));
+        session
+            .execute_batch("SET CATALOG warehouse")
+            .await
+            .expect("the committed attachment is admitted by this frontend session");
 
-        engine
-            .command_executor()
-            .execute("DROP CATALOG warehouse", &context, None)
+        session
+            .execute_batch("DROP CATALOG warehouse")
+            .await
             .expect("DROP CATALOG deletes the durable StateStore attachment");
         assert!(
             attachments
@@ -798,19 +883,26 @@ mod tests {
                 .is_none(),
             "DROP CATALOG must remove the durable attachment"
         );
+        assert!(matches!(
+            host.catalog_application_port().admit_catalog(&instance_id),
+            CatalogAdmission::Absent
+        ));
         assert_eq!(
-            engine
-                .require_external_catalog_ready("warehouse")
+            session
+                .execute_batch("SET CATALOG warehouse")
+                .await
                 .expect_err("a dropped catalog stops being admitted")
                 .kind(),
-            novarocks::catalog_application::CatalogApplicationErrorKind::NotFound
+            novarocks::query_execution::session::QueryServiceErrorKind::BadDatabase
         );
 
-        // The engine and this test's probe both hold StateStore references; the
+        // The ready session factory and this test's probe both hold StateStore references; the
         // host owns closing the deployment lock, so release them first.
         drop(attachments);
         drop(store);
-        drop(engine);
+        session.close();
+        drop(session);
+        drop(session_factory);
         host.shutdown().await.expect("host shutdown");
     }
 
@@ -867,43 +959,36 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
-        let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
-            novarocks::engine::StandaloneOptions::default(),
-            config,
-            standalone_open_services(
-                Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
-                &host,
-                Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
-            ),
+        let session_factory = build_frontend_query_session_factory(
+            &host,
+            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            0,
+            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
         )
-        .expect("open engine with frontend-owned application services");
-
-        let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
-        let context = novarocks::query_execution::request_context::RequestContext::admit(
-            novarocks::query_execution::request_context::RequestAdmission::new(
-                None,
-                "db1".to_string(),
-                novarocks::common::app_config::ClusterRole::AllInOne,
-                novarocks::query_execution::backend::BackendTopologySnapshot::empty(1),
-                None,
-                cancellation.view(),
-                novarocks::query_execution::request_context::SessionOptimizerSettings::default(),
-            ),
-        );
-        let error = engine
-            .command_executor()
-            .execute("SHOW ANALYZE JOBS", &context, None)
+        .expect("build ready frontend session factory");
+        let session = session_factory
+            .open_session(QuerySessionOpenRequest::new(2, "statistics-binding"))
+            .expect("open frontend query session");
+        let error = session
+            .execute_batch("SHOW ANALYZE JOBS")
+            .await
             .expect_err("a host without StateStore must reach the frontend statistics service");
         assert!(
-            error.contains("statistics job commands require a configured frontend StateStore"),
+            error
+                .message()
+                .contains("statistics job commands require a configured frontend StateStore"),
             "statistics application port was not injected: {error}"
         );
         assert!(
-            !error.contains("statistics application service is unavailable"),
+            !error
+                .message()
+                .contains("statistics application service is unavailable"),
             "Core default statistics application port must not be used: {error}"
         );
 
-        drop(engine);
+        session.close();
+        drop(session);
+        drop(session_factory);
         host.shutdown()
             .await
             .expect("shutdown frontend application host");

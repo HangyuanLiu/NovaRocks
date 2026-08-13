@@ -92,7 +92,11 @@ pub(crate) fn connector_request_context(
     )
 }
 
-pub(crate) fn connector_request_context_for_query(
+/// Freeze connector request facts from the admitted frontend statement.
+///
+/// Frontend-owned typed command capabilities use this same constructor so
+/// provider requests share the statement cancellation identity and options.
+pub fn connector_request_context_for_query(
     query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
     cancellation: crate::query_execution::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
@@ -539,19 +543,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
-    fn standalone_catalog_service_keeps_internal_entry_after_backend_registration() {
-        let state = Arc::new(crate::engine::StandaloneState::default());
-        super::register_standalone_backends(&state);
-
-        let registry = state
-            .catalog_service
-            .registry()
-            .read()
-            .expect("catalog service registry");
-        assert!(registry.get_catalog("default_catalog").is_ok());
-    }
-
-    #[test]
     fn spi5b_sql_target_columns_exclude_connector_hidden_read_fields() {
         let schema = Schema::new(vec![
             Field::new("value", DataType::Int64, false),
@@ -850,6 +841,17 @@ impl ConnectorRegistry {
         self.mv_backends.insert(backend.name(), backend);
     }
 
+    /// Install the Iceberg MV capability into this explicit registry leaf.
+    ///
+    /// The caller supplies the complete Core port set captured by Frontend
+    /// composition. This method intentionally does not accept application
+    /// state or synthesize provider/default dependencies.
+    pub fn register_iceberg_mv_backend(&mut self, ports: crate::engine::IcebergMvCorePorts) {
+        self.register_mv_backend(Arc::new(
+            crate::engine::mv::iceberg_backend::IcebergMvBackend::new_with_ports(ports),
+        ));
+    }
+
     pub(crate) fn mv_backend(&self, name: &str) -> Result<Arc<dyn MvBackend>, String> {
         self.mv_backends
             .get(name)
@@ -921,18 +923,6 @@ impl novarocks_spi::connector::ConnectorControlResolver for FixtureControlResolv
         novarocks_spi::connector::ConnectorError,
     > {
         self.registry.acquire_fixture_control(instance_id)
-    }
-}
-
-pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
-    {
-        let mut connectors = state
-            .connectors
-            .write()
-            .expect("standalone connector registry write lock");
-        connectors.register_mv_backend(Arc::new(
-            crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
-        ));
     }
 }
 

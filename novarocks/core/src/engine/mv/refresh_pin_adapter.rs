@@ -17,20 +17,26 @@
 
 use std::sync::Arc;
 
-use crate::engine::StandaloneState;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
+use crate::mv::storage_observation::MvStorageObservationPort;
 use novarocks_catalog::identifier::TableIdentity;
-use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 
-pub(crate) fn capture_refresh_snapshot_pin(
-    state: &Arc<StandaloneState>,
+/// Capture refresh pins from the exact connector-control and storage-observation
+/// capabilities selected by the caller.  This keeps an EXPLAIN or foreground
+/// refresh attempt from reconstructing application state just to re-observe
+/// a base table.
+pub(crate) fn capture_refresh_snapshot_pin_with_ports(
+    connector_control: &dyn ConnectorControlResolver,
+    storage_observation: &dyn MvStorageObservationPort,
     base_refs: &[TableIdentity],
     connector_context: &ConnectorRequestContext,
 ) -> Result<RefreshSnapshotPin, String> {
     let mut entries = Vec::with_capacity(base_refs.len());
     for base_ref in base_refs {
-        let observed = crate::engine::mv::refresh_io::observe_current_refresh_base(
-            state,
+        let observed = crate::engine::mv::refresh_io::observe_current_refresh_base_with_ports(
+            connector_control,
+            storage_observation,
             base_ref,
             connector_context,
         )?;

@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 
-use crate::engine::StandaloneState;
+use crate::engine::CatalogServiceSource;
+use crate::engine::domain::DmlExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::ObjectName;
 
@@ -125,7 +125,11 @@ pub trait StatisticsEngine: Send + Sync {
     ) -> Result<Vec<CollectedColumnStatistics>, String>;
 }
 
-impl StatisticsEngine for Arc<StandaloneState> {
+/// Foreground DML only needs the local-schema observation capability after a
+/// write.  Durable `ANALYZE` collection is deliberately routed through the
+/// separately composed statistics kernel; it must not synthesize an execution
+/// context from a DML command.
+impl StatisticsEngine for DmlExecutionKernel {
     fn resolve_table_columns(
         &self,
         target: &StatisticsTableTarget,
@@ -158,10 +162,13 @@ impl StatisticsEngine for Arc<StandaloneState> {
 
     fn collect_table_statistics(
         &self,
-        target: &StatisticsTableTarget,
-        columns: &[String],
+        _target: &StatisticsTableTarget,
+        _columns: &[String],
     ) -> Result<Vec<CollectedColumnStatistics>, String> {
-        collect_statistics_through_engine(self, target, columns)
+        Err(
+            "table statistics collection requires the composed statistics execution kernel"
+                .to_string(),
+        )
     }
 }
 
@@ -316,12 +323,12 @@ fn object_name_from_parts(parts: &[String]) -> Result<ObjectName, String> {
 }
 
 fn table_columns_from_local_catalog(
-    state: &Arc<StandaloneState>,
+    source: &impl CatalogServiceSource,
     database: &str,
     table: &str,
 ) -> Result<Vec<StatisticsColumn>, String> {
-    let catalog = state
-        .catalog_service
+    let catalog = source
+        .catalog_service()
         .local()
         .read()
         .expect("standalone catalog read lock");
@@ -337,22 +344,22 @@ fn table_columns_from_local_catalog(
 }
 
 fn table_columns_for_materialized_target(
-    state: &Arc<StandaloneState>,
+    source: &impl CatalogServiceSource,
     current_database: &str,
     name: &ObjectName,
 ) -> Result<Vec<StatisticsColumn>, String> {
     let (database, table) = resolve_database_and_table(name, current_database)?;
-    table_columns_from_local_catalog(state, &database, &table)
+    table_columns_from_local_catalog(source, &database, &table)
 }
 
 fn optional_table_columns_from_local_catalog(
-    state: &Arc<StandaloneState>,
+    source: &impl CatalogServiceSource,
     database: &str,
     table: &str,
 ) -> Result<Option<Vec<StatisticsColumn>>, String> {
     normalize_name(database)?;
     normalize_name(table)?;
-    match table_columns_from_local_catalog(state, database, table) {
+    match table_columns_from_local_catalog(source, database, table) {
         Ok(columns) => Ok(Some(columns)),
         Err(error)
             if error.starts_with("unknown database:") || error.starts_with("unknown table:") =>
@@ -361,56 +368,6 @@ fn optional_table_columns_from_local_catalog(
         }
         Err(error) => Err(error),
     }
-}
-
-fn collect_statistics_through_engine(
-    state: &Arc<StandaloneState>,
-    target: &StatisticsTableTarget,
-    columns: &[String],
-) -> Result<Vec<CollectedColumnStatistics>, String> {
-    let name = object_name_from_parts(&target.name_parts)?;
-    let (database, table) = resolve_database_and_table(&name, &target.current_database)?;
-    // Persistent connector statistics are collected through the pinned
-    // frontend-owned statistics application path. This legacy in-engine
-    // aggregation helper deliberately does not create or publish a second
-    // Iceberg statistics artifact.
-    let ndv_by_name = std::collections::HashMap::<String, f64>::new();
-    let mut output = Vec::with_capacity(columns.len());
-    for column in columns {
-        let sql = format!(
-            "select count(*) as row_count, min(`{}`) as min_value, max(`{}`) as max_value from `{}`.`{}`",
-            column.replace('`', "``"),
-            column.replace('`', "``"),
-            database.replace('`', "``"),
-            table.replace('`', "``")
-        );
-        let query = crate::sql::parser::parse_normalized_sql_raw(&sql)
-            .map_err(|error| format!("statistics aggregate parse failed: {error}"))?;
-        let sqlparser::ast::Statement::Query(query) = query else {
-            return Err("statistics aggregate did not parse as query".to_string());
-        };
-        let result = crate::engine::execute_query_with_catalog_service(
-            state,
-            target.current_catalog.as_deref(),
-            &database,
-            &query,
-            None,
-        )?;
-        let row_count = result_cell(&result, 0, 0)
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0);
-        output.push(CollectedColumnStatistics {
-            column_name: normalize_name(column)?,
-            row_count,
-            min: result_cell(&result, 1, 0).unwrap_or_default(),
-            max: result_cell(&result, 2, 0).unwrap_or_default(),
-            ndv: ndv_by_name
-                .get(&column.to_lowercase())
-                .map(|value| (value.round() as i64).to_string())
-                .unwrap_or_else(|| row_count.to_string()),
-        });
-    }
-    Ok(output)
 }
 
 fn resolve_database_and_table(
@@ -432,69 +389,19 @@ fn normalize_name(name: &str) -> Result<String, String> {
     novarocks_catalog::identifier::normalize_identifier(name.trim().trim_matches('`'))
 }
 
-fn result_cell(result: &QueryResult, column_idx: usize, row_idx: usize) -> Option<String> {
-    let chunk = result.chunks.first()?;
-    let array = chunk.batch.column(column_idx);
-    array_value_to_string(array, row_idx).ok().flatten()
-}
-
-fn array_value_to_string(array: &ArrayRef, row: usize) -> Result<Option<String>, String> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    macro_rules! primitive {
-        ($ty:ty) => {
-            if let Some(array) = array.as_any().downcast_ref::<$ty>() {
-                return Ok(Some(array.value(row).to_string()));
-            }
-        };
-    }
-    primitive!(arrow::array::Int8Array);
-    primitive!(arrow::array::Int16Array);
-    primitive!(arrow::array::Int32Array);
-    primitive!(arrow::array::Int64Array);
-    primitive!(arrow::array::UInt8Array);
-    primitive!(arrow::array::UInt16Array);
-    primitive!(arrow::array::UInt32Array);
-    primitive!(arrow::array::UInt64Array);
-    primitive!(arrow::array::Float32Array);
-    primitive!(arrow::array::Float64Array);
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(Some(array.value(row).to_string()));
-    }
-    if let Some(array) = array
-        .as_any()
-        .downcast_ref::<arrow::array::LargeStringArray>()
-    {
-        return Ok(Some(array.value(row).to_string()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<arrow::array::BooleanArray>() {
-        return Ok(Some(array.value(row).to_string()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<arrow::array::Date32Array>() {
-        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
-        let date = epoch + chrono::Duration::days(i64::from(array.value(row)));
-        return Ok(Some(date.format("%Y-%m-%d").to_string()));
-    }
-    if let Some(array) = array
-        .as_any()
-        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-    {
-        let micros = array.value(row);
-        let seconds = micros.div_euclid(1_000_000);
-        let subsecond_micros = micros.rem_euclid(1_000_000) as u32;
-        let datetime =
-            chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, subsecond_micros * 1000)
-                .ok_or_else(|| format!("invalid timestamp micros: {micros}"))?
-                .naive_utc();
-        return Ok(Some(datetime.format("%Y-%m-%d %H:%M:%S").to_string()));
-    }
-    Ok(Some(format!("{array:?}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestCatalogSource {
+        catalog_service: Arc<crate::engine::QueryCatalogService>,
+    }
+
+    impl CatalogServiceSource for TestCatalogSource {
+        fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService> {
+            &self.catalog_service
+        }
+    }
 
     #[derive(Default)]
     struct FakeStatisticsEngine;
@@ -538,7 +445,9 @@ mod tests {
     fn statistics_engine_resolves_qualified_table_columns_outside_current_database() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let state = Arc::new(StandaloneState::default());
+        let state = TestCatalogSource {
+            catalog_service: Arc::new(crate::engine::new_query_catalog_service()),
+        };
         {
             let mut catalog = state
                 .catalog_service

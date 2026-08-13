@@ -82,12 +82,12 @@ pub(crate) trait DataMutationCacheFinalizer {
     ) -> Result<(), ConnectorError>;
 }
 
-impl DataMutationCacheFinalizer for crate::engine::StandaloneState {
+impl DataMutationCacheFinalizer for crate::engine::domain::DmlExecutionKernel {
     fn invalidate_generic_table(
         &self,
         table: &ConnectorTableIdentity,
     ) -> Result<(), ConnectorError> {
-        self.catalog_service
+        self.catalog_service()
             .invalidate_table(
                 table.instance_id.as_str(),
                 table.namespace.as_ref(),

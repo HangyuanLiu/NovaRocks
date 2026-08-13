@@ -23,7 +23,6 @@ use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
 };
 
-use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::mv::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -76,8 +75,15 @@ pub(crate) fn reject_if_iceberg_mv_properties(
     Ok(())
 }
 
-pub(crate) fn reject_if_iceberg_mv_table(
-    state: &Arc<StandaloneState>,
+/// Reject a user mutation of an Iceberg-backed materialized-view table.
+///
+/// The guard deliberately accepts only the exact-generation control resolver
+/// and the storage-observation port. Command kernels use this entry directly;
+/// they must not reconstruct an application facade or obtain a provider through
+/// the retired connector registry.
+pub(crate) fn reject_if_iceberg_mv_table_with_ports(
+    connector_control: &dyn ConnectorControlResolver,
+    storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
 ) -> Result<(), String> {
@@ -87,9 +93,8 @@ pub(crate) fn reject_if_iceberg_mv_table(
 
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
-    let exact_lease =
-        ConnectorControlResolver::acquire_current(state.connector_control.as_ref(), &instance_id)
-            .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
+    let exact_lease = ConnectorControlResolver::acquire_current(connector_control, &instance_id)
+        .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
     let context =
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
     let identity = ConnectorTableIdentity {
@@ -109,8 +114,7 @@ pub(crate) fn reject_if_iceberg_mv_table(
             "connector loaded a different table while checking the MV mutation guard".to_string(),
         );
     }
-    if state
-        .mv_storage_observation
+    if storage_observation
         .observe_lake_package(&exact_lease, &metadata, context)
         .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
         .is_some()
@@ -129,8 +133,11 @@ pub(crate) fn reject_if_iceberg_mv_table(
 /// Preserve the frontend-owned MV dependency policy before a provider schema
 /// mutation. Physical schema and equality-delete validation remain provider
 /// responsibilities.
-pub(crate) fn reject_drop_column_mv_dependencies(
-    state: &Arc<StandaloneState>,
+/// Apply the MV dependency policy using only the durable MV repository.
+/// DML kernels call this form directly rather than reaching through a
+/// standalone aggregate.
+pub(crate) fn reject_drop_column_mv_dependencies_with_repository(
+    repository: &dyn crate::mv::repository::MvRepository,
     target: &TargetBackend,
     column_path: &crate::engine::statement::ColumnPath,
 ) -> Result<(), String> {
@@ -141,8 +148,7 @@ pub(crate) fn reject_drop_column_mv_dependencies(
     let target_key = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
     let target_key_lower = target_key.to_ascii_lowercase();
     let target = MvDependencyTarget::from_backend(target)?;
-    for definition in state
-        .mv_repository
+    for definition in repository
         .list_definitions()
         .map_err(|error| format!("load materialized view metadata failed: {error}"))?
     {

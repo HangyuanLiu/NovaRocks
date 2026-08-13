@@ -34,7 +34,14 @@ use novarocks::engine::insert_engine::InsertEngine;
 use novarocks::engine::mutation_engine::MutationEngine;
 use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
-    PreparedQueryOperation, StandaloneCommandExecutor, StandaloneNovaRocks, StatementResult,
+    CoreQueryCompiler, PreparedQueryOperation, SessionCatalogResolver, StatementResult,
+    backend_command::BackendCommandExecutor,
+    catalog_command::CatalogCommandExecutor,
+    iceberg_ref_command::IcebergRefCommandExecutor,
+    maintenance_command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor},
+    mv_command::MvCommandExecutor,
+    statistics_command::StatisticsCommandExecutor,
+    view_command::ViewCommandExecutor,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -60,7 +67,7 @@ use crate::dml::DmlService;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
-trait CoreCommandRoute {
+pub trait CoreCommandRoute: Send + Sync {
     fn execute(
         &self,
         sql: &str,
@@ -69,14 +76,112 @@ trait CoreCommandRoute {
     ) -> Result<StatementResult, String>;
 }
 
-impl CoreCommandRoute for StandaloneCommandExecutor {
+#[derive(Clone)]
+struct TypedCommandRoute {
+    catalog: CatalogCommandExecutor,
+    statistics: StatisticsCommandExecutor,
+    backend: BackendCommandExecutor,
+    view: ViewCommandExecutor,
+    iceberg_ref: IcebergRefCommandExecutor,
+    mv: MvCommandExecutor,
+    maintenance: MaintenanceCommandExecutor,
+    maintenance_read: MaintenanceReadCommandExecutor,
+}
+
+impl TypedCommandRoute {
+    fn new(
+        catalog: CatalogCommandExecutor,
+        statistics: StatisticsCommandExecutor,
+        backend: BackendCommandExecutor,
+        view: ViewCommandExecutor,
+        iceberg_ref: IcebergRefCommandExecutor,
+        mv: MvCommandExecutor,
+        maintenance: MaintenanceCommandExecutor,
+        maintenance_read: MaintenanceReadCommandExecutor,
+    ) -> Self {
+        Self {
+            catalog,
+            statistics,
+            backend,
+            view,
+            iceberg_ref,
+            mv,
+            maintenance,
+            maintenance_read,
+        }
+    }
+}
+
+impl CoreCommandRoute for TypedCommandRoute {
     fn execute(
         &self,
         sql: &str,
         context: &RequestContext,
         query_options: QueryOptions,
     ) -> Result<StatementResult, String> {
-        StandaloneCommandExecutor::execute(self, sql, context, Some(query_options))
+        let connector_context = novarocks::connector::connector_request_context_for_query(
+            Some(&query_options),
+            context.execution().cancellation().clone(),
+        )?;
+        match self.catalog.try_execute(
+            sql,
+            context.session().current_catalog(),
+            context.session().current_database(),
+            &connector_context,
+        )? {
+            Some(result) => Ok(result),
+            None => match self.statistics.try_execute(
+                sql,
+                context.session().current_catalog(),
+                context.session().current_database(),
+            )? {
+                Some(result) => Ok(result),
+                None => match self.backend.try_execute(sql, context.execution().role())? {
+                    Some(result) => Ok(result),
+                    None => match self.view.try_execute(
+                        sql,
+                        context.session().current_catalog(),
+                        context.session().current_database(),
+                        &connector_context,
+                    )? {
+                        Some(result) => Ok(result),
+                        None => match self.iceberg_ref.try_execute(
+                            sql,
+                            context.session().current_database(),
+                            &connector_context,
+                        )? {
+                            Some(result) => Ok(result),
+                            None => match self.mv.try_execute(
+                                sql,
+                                context.session().current_catalog(),
+                                context.session().current_database(),
+                                &connector_context,
+                                context.execution(),
+                            )? {
+                                Some(result) => Ok(result),
+                                None => match self.maintenance.try_execute(
+                                    sql,
+                                    context.session().current_catalog(),
+                                    context.session().current_database(),
+                                    context.execution(),
+                                    &connector_context,
+                                )? {
+                                    Some(result) => Ok(result),
+                                    None => match self.maintenance_read.try_execute(
+                                        sql,
+                                        context.session().current_catalog(),
+                                        context.session().current_database(),
+                                    )? {
+                                        Some(result) => Ok(result),
+                                        None => Err("unsupported SQL command for the frontend capability router".to_string()),
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
     }
 }
 
@@ -186,7 +291,9 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
-    engine: StandaloneNovaRocks,
+    session_catalog_resolver: SessionCatalogResolver,
+    query_compiler: CoreQueryCompiler,
+    command_executor: Arc<dyn CoreCommandRoute>,
     query_control: QueryControlService,
     query_execution: QueryExecutionService,
     role: ClusterRole,
@@ -204,8 +311,18 @@ pub struct FrontendQueryService {
 }
 
 impl FrontendQueryService {
-    pub fn new(
-        engine: StandaloneNovaRocks,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_recovery_bound(
+        session_catalog_resolver: SessionCatalogResolver,
+        query_compiler: CoreQueryCompiler,
+        catalog_command_executor: CatalogCommandExecutor,
+        statistics_command_executor: StatisticsCommandExecutor,
+        backend_command_executor: BackendCommandExecutor,
+        view_command_executor: ViewCommandExecutor,
+        iceberg_ref_command_executor: IcebergRefCommandExecutor,
+        mv_command_executor: MvCommandExecutor,
+        maintenance_command_executor: MaintenanceCommandExecutor,
+        maintenance_read_command_executor: MaintenanceReadCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -219,9 +336,19 @@ impl FrontendQueryService {
         truncate_engine: Arc<dyn TruncateEngine>,
         optimizer_query_mem_limit_bytes: u64,
     ) -> Self {
-        dml.install_ctas_recovery(Arc::clone(&ctas_engine));
         Self {
-            engine,
+            session_catalog_resolver,
+            query_compiler,
+            command_executor: Arc::new(TypedCommandRoute::new(
+                catalog_command_executor,
+                statistics_command_executor,
+                backend_command_executor,
+                view_command_executor,
+                iceberg_ref_command_executor,
+                mv_command_executor,
+                maintenance_command_executor,
+                maintenance_read_command_executor,
+            )),
             query_control,
             query_execution,
             role,
@@ -369,7 +496,8 @@ impl FrontendQuerySession {
             .strip_prefix("CATALOG ")
             .or_else(|| assignment.strip_prefix("catalog "))
         {
-            let catalog = resolve_catalog_name(&self.service.engine, catalog.trim())?;
+            let catalog =
+                resolve_catalog_name(&self.service.session_catalog_resolver, catalog.trim())?;
             let mut state = self.state.lock().map_err(poisoned_state)?;
             state.current_catalog = catalog;
             return Ok(true);
@@ -410,13 +538,13 @@ impl FrontendQuerySession {
             .to_ascii_lowercase();
         let value = raw_value.trim().trim_matches('\'').trim_matches('"');
         if name == "catalog" {
-            let catalog = resolve_catalog_name(&self.service.engine, value)?;
+            let catalog = resolve_catalog_name(&self.service.session_catalog_resolver, value)?;
             let mut state = self.state.lock().map_err(poisoned_state)?;
             state.current_catalog = catalog;
             if state.current_catalog.is_none()
                 && !self
                     .service
-                    .engine
+                    .session_catalog_resolver
                     .database_exists(&state.current_database)
                     .map_err(internal_error)?
             {
@@ -560,8 +688,8 @@ impl FrontendQuerySession {
             cancellation.clone(),
             optimizer_settings,
         ));
-        let compiler = self.service.engine.query_compiler();
-        let command_executor = self.service.engine.command_executor();
+        let compiler = self.service.query_compiler.clone();
+        let command_executor = Arc::clone(&self.service.command_executor);
         let query_execution = self.service.query_execution.clone();
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
@@ -609,7 +737,7 @@ impl FrontendQuerySession {
                             Some(query_options),
                         )
                     },
-                    &command_executor,
+                    command_executor.as_ref(),
                     &sql,
                     &context,
                     query_options,
@@ -685,10 +813,14 @@ impl QuerySession for FrontendQuerySession {
             .map_err(poisoned_state)?
             .current_catalog
             .clone();
-        let engine = self.service.engine.clone();
+        let session_catalog_resolver = self.service.session_catalog_resolver.clone();
         let schema = schema.to_string();
         let context = task::spawn_blocking(move || {
-            resolve_database_context(&engine, current_catalog.as_deref(), &schema)
+            resolve_database_context(
+                &session_catalog_resolver,
+                current_catalog.as_deref(),
+                &schema,
+            )
         })
         .await
         .map_err(|error| internal_error(error.to_string()))??;
@@ -751,7 +883,7 @@ struct DatabaseContext {
 }
 
 fn resolve_catalog_name(
-    engine: &StandaloneNovaRocks,
+    resolver: &SessionCatalogResolver,
     catalog: &str,
 ) -> Result<Option<String>, QueryServiceError> {
     let normalized = normalize_identifier(catalog).map_err(classify_engine_error)?;
@@ -761,7 +893,7 @@ fn resolve_catalog_name(
     // Session catalog context is an admission decision, not a local binding
     // lookup: a catalog whose durable attachment is absent is unknown, while one
     // this process has not materialized yet is unavailable.
-    engine
+    resolver
         .require_external_catalog_ready(&normalized)
         .map_err(|error| {
             let kind = match error.kind() {
@@ -776,7 +908,7 @@ fn resolve_catalog_name(
 }
 
 fn resolve_database_context(
-    engine: &StandaloneNovaRocks,
+    resolver: &SessionCatalogResolver,
     current_catalog: Option<&str>,
     schema: &str,
 ) -> Result<DatabaseContext, QueryServiceError> {
@@ -789,7 +921,7 @@ fn resolve_database_context(
             let database = normalize_identifier(database).map_err(classify_engine_error)?;
             match current_catalog {
                 Some(catalog)
-                    if engine
+                    if resolver
                         .iceberg_namespace_exists(catalog, &database)
                         .map_err(classify_engine_error)? =>
                 {
@@ -802,7 +934,7 @@ fn resolve_database_context(
                     QueryServiceErrorKind::BadDatabase,
                     format!("unknown database `{schema}`"),
                 )),
-                None if engine
+                None if resolver
                     .database_exists(&database)
                     .map_err(classify_engine_error)? =>
                 {
@@ -818,11 +950,11 @@ fn resolve_database_context(
             }
         }
         [catalog, database] => {
-            let catalog = resolve_catalog_name(engine, catalog)?;
+            let catalog = resolve_catalog_name(resolver, catalog)?;
             let database = normalize_identifier(database).map_err(classify_engine_error)?;
             match catalog {
                 Some(catalog)
-                    if engine
+                    if resolver
                         .iceberg_namespace_exists(&catalog, &database)
                         .map_err(classify_engine_error)? =>
                 {
@@ -831,7 +963,7 @@ fn resolve_database_context(
                         database,
                     })
                 }
-                None if engine
+                None if resolver
                     .database_exists(&database)
                     .map_err(classify_engine_error)? =>
                 {

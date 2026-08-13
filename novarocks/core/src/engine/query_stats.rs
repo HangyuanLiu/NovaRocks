@@ -27,6 +27,9 @@ use novarocks_spi::connector::{
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
+use crate::engine::domain::{
+    DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel, StatisticsExecutionKernel,
+};
 use crate::engine::query_planning::bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
     QueryTableBindingStore, parse_time_travel_overlay_identity,
@@ -68,35 +71,47 @@ impl QueryStatisticsContext {
         Self::none()
     }
 
-    pub(crate) fn from_standalone_state_with_bindings(
-        state: &Arc<super::StandaloneState>,
+    pub(crate) fn from_statistics_resolver_with_bindings(
+        resolver: &impl QueryStatisticsResolver,
         bindings: Arc<QueryTableBindingStore>,
     ) -> Self {
         Self {
             snapshot: Arc::new(project_statistics_snapshot(
-                state.unified_statistics.as_ref(),
+                resolver.unified_statistics(),
                 &bindings,
             )),
             bindings: Some(bindings),
-            resolver: Some(Arc::clone(&state.unified_statistics)),
-        }
-    }
-
-    pub(crate) fn from_optional_state_with_bindings(
-        state: Option<&Arc<super::StandaloneState>>,
-        bindings: Option<Arc<QueryTableBindingStore>>,
-    ) -> Self {
-        match (state, bindings) {
-            (Some(state), Some(bindings)) => {
-                Self::from_standalone_state_with_bindings(state, bindings)
-            }
-            // A caller without resolution pins must not resolve `latest` a
-            // second time. Keep normal missing-statistics fallback instead.
-            (Some(_), None) => Self::none(),
-            (None, _) => Self::none(),
+            resolver: Some(Arc::clone(resolver.unified_statistics_arc())),
         }
     }
 }
+
+/// Query planning needs only frozen statistics evidence.  This trait avoids
+/// taking the full application state while preserving the no-latest-lookup
+/// rule in `QueryStatisticsContext`.
+pub(crate) trait QueryStatisticsResolver {
+    fn unified_statistics(&self) -> &UnifiedStatisticsResolver;
+    fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver>;
+}
+
+macro_rules! impl_kernel_statistics_resolver {
+    ($kernel:ty) => {
+        impl QueryStatisticsResolver for $kernel {
+            fn unified_statistics(&self) -> &UnifiedStatisticsResolver {
+                self.unified_statistics().as_ref()
+            }
+
+            fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver> {
+                self.unified_statistics()
+            }
+        }
+    };
+}
+
+impl_kernel_statistics_resolver!(QueryPreparationKernel);
+impl_kernel_statistics_resolver!(DmlExecutionKernel);
+impl_kernel_statistics_resolver!(MvExecutionKernel);
+impl_kernel_statistics_resolver!(StatisticsExecutionKernel);
 
 /// Project every admission-frozen connector observation into SQL values before
 /// optimization begins.  This is the one application boundary that may touch
