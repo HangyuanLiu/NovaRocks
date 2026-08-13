@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-08-13
 provenance:
-  - "mechanism: service-owned runtime-filter terminal observation; PR number to be backfilled after merge"
+  - "mechanism: service-owned runtime-filter terminal observation; PR #741"
   - "discussion: 2026-08-13 Backend attempt-local observation and typed terminal transfer"
 code-anchors:
   - "novarocks/backend/src/runtime_filter/observation.rs (RuntimeFilterObservationStore)"
