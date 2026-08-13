@@ -33,7 +33,7 @@ CREATE TABLE ${case_db}.tab1 (
 
 -- query 2
 -- Negative: cannot DROP c1.element itself (path is empty after the 'element' segment).
--- @expect_error=drop path is empty
+-- @expect_error=Iceberg LIST element cannot be added or dropped
 ALTER TABLE ${case_db}.tab1 DROP COLUMN c1.element;
 
 -- query 3

@@ -1823,7 +1823,7 @@ impl From<ConnectorReadPurpose> for IcebergReadPurposeV1 {
     }
 }
 
-fn projected_schema(
+pub(crate) fn projected_schema(
     table: &IcebergTablePayload,
     projection: &[usize],
 ) -> Result<SchemaRef, ConnectorError> {
@@ -1863,6 +1863,9 @@ fn projected_schema(
         .map_err(corrupt)?,
         None => storage,
     };
+    // Hidden columns are annotated exactly as `load_table` annotates them: the
+    // admitted projection is compared against this schema field for field.
+    let storage = annotate_hidden_fields(storage, &table.hidden_columns);
     let mut fields = storage.fields().to_vec();
     let mut metadata_fields = metadata_arrow_fields(&table.metadata_columns)?;
     if table.row_mutation_frozen_source {

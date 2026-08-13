@@ -35,7 +35,7 @@ CREATE TABLE ${case_db}.tab1 (
 
 -- query 2
 -- Negative: cannot ADD COLUMN under a non-struct path (v1 is an INT, not a STRUCT).
--- @expect_error=parent path must point to a STRUCT
+-- @expect_error=nested Iceberg schema changes currently require a struct parent
 ALTER TABLE ${case_db}.tab1 ADD COLUMN c1.v1.v5 INT;
 
 -- query 3
@@ -55,7 +55,7 @@ ALTER TABLE ${case_db}.tab1 ADD COLUMN c1.val1 INT;
 
 -- query 6
 -- Negative: cannot DROP COLUMN a non-existent nested field.
--- @expect_error=column path 'c1.v2.v5' not found
+-- @expect_error=Iceberg column `v5` does not exist
 ALTER TABLE ${case_db}.tab1 DROP COLUMN c1.v2.v5;
 
 -- query 7

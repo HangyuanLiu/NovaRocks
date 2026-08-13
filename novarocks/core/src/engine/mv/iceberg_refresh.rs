@@ -9699,11 +9699,15 @@ fn ensure_imv_change_stream_effect(
     };
     let row_lineage_output = match route_mode {
         ImvChangeStreamEffectMode::Constant(_) => None,
+        // A row reuses a target row exactly when it carries that row's
+        // locator. Row lineage cannot decide this: an aggregate refresh
+        // assigns `_row_id` to a brand-new group as well, and a row routed to
+        // the delete half without a locator has nothing to delete.
         ImvChangeStreamEffectMode::ByRowLineage => Some(
             output_column_by_name(
                 &refresh_plan.output_columns,
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                "reuse/fresh route row-lineage column",
+                novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
+                "reuse/fresh route target locator column",
             )?
             .clone(),
         ),

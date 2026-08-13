@@ -59,7 +59,7 @@ ALTER TABLE reorder_nested ALTER COLUMN address.zip BEFORE address.street;
 
 -- query 9
 -- Cross-parent reference must be rejected.
--- @expect_error=AFTER target 'id' not found in same parent
+-- @expect_error=Iceberg column `id` does not exist
 ALTER TABLE reorder_nested ALTER COLUMN address.street AFTER id;
 
 -- query 10

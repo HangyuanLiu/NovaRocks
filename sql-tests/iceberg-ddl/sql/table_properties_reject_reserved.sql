@@ -25,7 +25,7 @@ DROP TABLE IF EXISTS p;
 CREATE TABLE p (id INT) TBLPROPERTIES ("format-version" = "2");
 
 -- query 2
--- @expect_error=format-version is reserved
+-- @expect_error=Iceberg table property `format-version` is reserved
 ALTER TABLE p SET TBLPROPERTIES ('format-version' = '3');
 
 -- query 3

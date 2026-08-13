@@ -981,6 +981,7 @@ fn alter_schema(
     {
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
+    reject_reserved_schema_change(change)?;
     let mut next_id = metadata
         .last_column_id()
         .checked_add(1)
@@ -1020,6 +1021,39 @@ fn alter_schema(
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
     Ok(())
+}
+
+/// Row lineage is owned by the table format, so a schema change may not touch
+/// its reserved columns even on a table that materializes them. The rejection
+/// names the reason rather than reporting the column as absent.
+fn reject_reserved_schema_change(change: &ConnectorSchemaChange) -> Result<(), ConnectorError> {
+    fn reserved(name: &str) -> bool {
+        name.eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_ROW_ID_COL)
+            || name.eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL)
+    }
+
+    let mut names: Vec<&str> = Vec::new();
+    match change {
+        ConnectorSchemaChange::AddColumn { column, .. } => names.push(column.name.as_ref()),
+        ConnectorSchemaChange::DropColumn { path }
+        | ConnectorSchemaChange::ModifyColumn { path, .. }
+        | ConnectorSchemaChange::SetColumnNullability { path, .. }
+        | ConnectorSchemaChange::ReorderColumn { path, .. }
+        | ConnectorSchemaChange::SetColumnComment { path, .. } => {
+            names.extend(path.segments.last().map(Arc::as_ref))
+        }
+        ConnectorSchemaChange::RenameColumn { path, to } => {
+            names.extend(path.segments.last().map(Arc::as_ref));
+            names.push(to.as_ref());
+        }
+    }
+    match names.into_iter().find(|name| reserved(name)) {
+        Some(name) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!("Iceberg schema evolution cannot modify reserved column `{name}`"),
+        )),
+        None => Ok(()),
+    }
 }
 
 fn apply_schema_change(
@@ -1125,6 +1159,70 @@ fn apply_schema_change(
     }
 }
 
+/// The children a path segment descends into. A LIST exposes its `element`
+/// field and a MAP its `key` / `value` fields under their own names, so the
+/// next path segment resolves by name exactly as a struct field does.
+fn composite_children(field_type: &Type) -> Result<Vec<Arc<NestedField>>, ConnectorError> {
+    match field_type {
+        Type::Struct(struct_type) => Ok(struct_type.fields().to_vec()),
+        Type::List(list_type) => Ok(vec![list_type.element_field.clone()]),
+        Type::Map(map_type) => Ok(vec![
+            map_type.key_field.clone(),
+            map_type.value_field.clone(),
+        ]),
+        _ => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "nested Iceberg schema changes currently require a struct parent",
+        )),
+    }
+}
+
+/// Rebuild a composite type around updated children. A LIST or MAP has a fixed
+/// child shape, so adding or dropping one is rejected rather than silently
+/// producing a type Iceberg cannot represent.
+fn rebuild_composite(
+    field_type: &Type,
+    children: Vec<Arc<NestedField>>,
+) -> Result<Type, ConnectorError> {
+    match field_type {
+        Type::Struct(_) => {
+            if children.is_empty() {
+                return Err(invalid(
+                    "cannot drop last field of STRUCT: a STRUCT must have at least one field",
+                ));
+            }
+            Ok(Type::Struct(StructType::new(children)))
+        }
+        Type::List(list_type) => {
+            let [element] = children.as_slice() else {
+                return Err(invalid(
+                    "Iceberg LIST element cannot be added or dropped".to_string(),
+                ));
+            };
+            Ok(Type::List(crate::iceberg::spec::ListType {
+                element_field: element.clone(),
+                ..list_type.clone()
+            }))
+        }
+        Type::Map(map_type) => {
+            let [key, value] = children.as_slice() else {
+                return Err(invalid(
+                    "Iceberg MAP key or value cannot be added or dropped".to_string(),
+                ));
+            };
+            Ok(Type::Map(crate::iceberg::spec::MapType {
+                key_field: key.clone(),
+                value_field: value.clone(),
+                ..map_type.clone()
+            }))
+        }
+        _ => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "nested Iceberg schema changes currently require a struct parent",
+        )),
+    }
+}
+
 fn update_parent(
     fields: &[Arc<NestedField>],
     parent: &[Arc<str>],
@@ -1135,14 +1233,23 @@ fn update_parent(
     }
     let index = field_index(fields, &parent[0])?;
     let mut field = (*fields[index]).clone();
-    let Type::Struct(struct_type) = field.field_type.as_ref() else {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "nested Iceberg schema changes currently require a struct parent",
-        ));
-    };
-    let nested = update_parent(struct_type.fields(), &parent[1..], update)?;
-    field.field_type = Box::new(Type::Struct(StructType::new(nested)));
+    let children = composite_children(field.field_type.as_ref())?;
+    let nested = update_parent(&children, &parent[1..], update)?;
+    let rebuilt = rebuild_composite(field.field_type.as_ref(), nested).map_err(|error| {
+        // Name the struct whose last field a drop would have removed.
+        if error
+            .to_string()
+            .contains("cannot drop last field of STRUCT")
+        {
+            invalid(format!(
+                "cannot drop last field of STRUCT '{}': a STRUCT must have at least one field",
+                field.name
+            ))
+        } else {
+            error
+        }
+    })?;
+    field.field_type = Box::new(rebuilt);
     let mut result = fields.to_vec();
     result[index] = Arc::new(field);
     Ok(result)
@@ -1207,7 +1314,10 @@ fn widen_type(current: &Type, target: Type) -> Result<Type, ConnectorError> {
     }
     match (current, &target) {
         (Type::Primitive(PrimitiveType::Int), Type::Primitive(PrimitiveType::Long))
-        | (Type::Primitive(PrimitiveType::Float), Type::Primitive(PrimitiveType::Double)) => {
+        | (Type::Primitive(PrimitiveType::Float), Type::Primitive(PrimitiveType::Double))
+        // A date widens into either timestamp precision without losing a value.
+        | (Type::Primitive(PrimitiveType::Date), Type::Primitive(PrimitiveType::Timestamp))
+        | (Type::Primitive(PrimitiveType::Date), Type::Primitive(PrimitiveType::TimestampNs)) => {
             Ok(target)
         }
         (
@@ -1219,7 +1329,27 @@ fn widen_type(current: &Type, target: Type) -> Result<Type, ConnectorError> {
                 precision: target_precision,
                 scale: target_scale,
             }),
-        ) if current_scale == target_scale && target_precision >= current_precision => Ok(target),
+        ) => {
+            // Iceberg admits a decimal precision increase and nothing else, so
+            // each rejection says which rule the change broke.
+            if current_scale != target_scale {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    format!(
+                        "decimal scale change is not allowed (current decimal({current_precision},{current_scale}), new decimal({target_precision},{target_scale}))"
+                    ),
+                ));
+            }
+            if target_precision <= current_precision {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    format!(
+                        "decimal precision must strictly increase (current decimal({current_precision},{current_scale}), new decimal({target_precision},{target_scale}))"
+                    ),
+                ));
+            }
+            Ok(target)
+        }
         _ => Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             format!("unsupported Iceberg type evolution from {current} to {target}"),
