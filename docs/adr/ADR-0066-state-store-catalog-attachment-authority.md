@@ -1,5 +1,5 @@
 ---
-id: ADR-0064
+id: ADR-0066
 title: "StateStore-owned catalog attachment authority with a derived per-FE runtime projection"
 domain: [catalog-attachment]
 status: active

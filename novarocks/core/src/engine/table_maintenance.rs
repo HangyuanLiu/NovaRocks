@@ -127,6 +127,18 @@ impl MaintenanceAttemptCancellationSource {
     }
 }
 
+/// What the engine could get back when asking about a dead generation's work.
+///
+/// `Unsupported` is a first-class answer, not an error to be papered over: a
+/// provider without a historical inspector leaves the operation unresolved,
+/// and the caller must not fall back to the ordinary exact-generation
+/// reconcile — the exact generation is the thing that no longer exists.
+#[derive(Clone, Debug)]
+pub enum HistoricalMaintenanceInspection {
+    Unsupported(String),
+    Observed(Box<novarocks_spi::connector::ConnectorHistoricalMaintenanceObservation>),
+}
+
 /// Read-only cancellation view shared by all provider calls in one durable
 /// maintenance attempt.
 #[derive(Clone, Debug, Default)]
@@ -414,6 +426,24 @@ pub trait TableMaintenanceEngine: Send + Sync {
         _attempt: &MaintenanceAttemptContext,
     ) -> Result<DistributedRewriteMaintenanceSession, String> {
         self.plan_distributed_rewrite(target, operation_id, intent)
+    }
+
+    // Design: ADR-0067 (docs/adr/ADR-0067-historical-maintenance-recovery-is-a-separate-capability.md)
+    /// Ask the *live* connector generation what it can prove about work a dead
+    /// generation left behind.
+    ///
+    /// The descriptor names the dead binding as evidence only. Engines that do
+    /// not implement this report it as unsupported so the caller keeps the
+    /// operation unresolved.
+    fn inspect_historical_maintenance(
+        &self,
+        _target: &MaintenanceTarget,
+        _descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
+        _attempt: &MaintenanceAttemptContext,
+    ) -> Result<HistoricalMaintenanceInspection, String> {
+        Ok(HistoricalMaintenanceInspection::Unsupported(
+            TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string(),
+        ))
     }
 
     fn stage_distributed_rewrite_cohort(
@@ -770,6 +800,46 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
             prepared,
             &MaintenanceAttemptContext::uncancelled(),
         )
+    }
+
+    fn inspect_historical_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<HistoricalMaintenanceInspection, String> {
+        use novarocks_spi::connector::ConnectorHistoricalMaintenanceResolver;
+
+        let state = self.shared_for_table_maintenance()?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        // Acquiring the live inspector is where "this provider cannot do
+        // historical recovery" is decided. Anything else -- a lost lease, a
+        // corrupt descriptor -- is a real failure the caller must see.
+        let lease = match state
+            .connector_control
+            .acquire_current_historical_maintenance(&instance_id)
+        {
+            Ok(lease) => lease,
+            Err(error)
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unsupported =>
+            {
+                return Ok(HistoricalMaintenanceInspection::Unsupported(
+                    error.to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "acquire historical maintenance recovery capability: {error}"
+                ));
+            }
+        };
+        let observation = lease
+            .inspect(descriptor, attempt.connector_request_context()?)
+            .map_err(|error| format!("inspect historical maintenance operation: {error}"))?;
+        Ok(HistoricalMaintenanceInspection::Observed(Box::new(
+            observation,
+        )))
     }
 
     fn recover_cleanup_for_reconcile_with_attempt_context(

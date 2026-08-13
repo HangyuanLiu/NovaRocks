@@ -166,7 +166,7 @@ exact-version delete 为线性化点，发布本地 control generation 才让 SQ
 generation；`Absent`（未知）与 `Unavailable`（本机未物化）永远分开，store 不可用时 DDL 与超预算的 read
 admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。
 
-- ADR-0064 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
+- ADR-0066 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
 
 ### frontend-dml
 
@@ -212,6 +212,7 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 - ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（active）
 - ADR-0057 — MV 维护事实为何按「是否需要 provider runtime IO」切成观测口投影与 SPI capability 两条通道（active）
 - ADR-0065 — 同一张表的维护为何以单个 per-table lease attempt 为唯一派发权威、并在同事务内校验 fence（active）
+- ADR-0067 — 收敛已死 generation 的维护为何是独立 provider capability，而不是放宽 exact-generation reconcile（active）
 
 ### crate-boundary
 

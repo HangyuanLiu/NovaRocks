@@ -25,6 +25,7 @@ mod domain_facts;
 mod error;
 mod execution;
 mod handle;
+mod historical_maintenance_recovery;
 mod identity;
 mod metadata;
 mod metadata_maintenance;
@@ -107,6 +108,20 @@ pub use execution::{
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+pub use historical_maintenance_recovery::{
+    ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceArtifact,
+    ConnectorHistoricalMaintenanceCleanupReceipt, ConnectorHistoricalMaintenanceCleanupRequest,
+    ConnectorHistoricalMaintenanceContinuation, ConnectorHistoricalMaintenanceDescriptor,
+    ConnectorHistoricalMaintenanceDisposition, ConnectorHistoricalMaintenanceFamily,
+    ConnectorHistoricalMaintenanceLease, ConnectorHistoricalMaintenanceObservation,
+    ConnectorHistoricalMaintenanceOutcome, ConnectorHistoricalMaintenanceProof,
+    ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
+    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_ARTIFACT_BYTES,
+    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_ARTIFACTS,
+    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_CONTINUATION_BYTES,
+    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_PROOF_BYTES,
+    validate_historical_maintenance_recovery_owner,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
 pub use metadata::{

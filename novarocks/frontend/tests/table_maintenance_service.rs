@@ -606,9 +606,19 @@ async fn startup_reconciles_only_the_persisted_exact_generation() {
     assert_eq!(recovered[0].owner(), &owner);
     assert_eq!(recovered[0].operation_id(), operation_id);
     assert!(engine.requests().is_empty());
+    let operation = repository.list().await.unwrap().remove(0);
     assert_eq!(
-        repository.list().await.unwrap()[0].state,
+        operation.state,
         MetadataMaintenanceOperationState::Unresolved
+    );
+    // The exact generation could not reconcile it and this engine offers no
+    // historical inspector, so the reason must name both dead ends. Silently
+    // recording only the first would send a reader looking for a generation
+    // that can never come back.
+    let reason = operation.error_message.unwrap_or_default();
+    assert!(
+        reason.contains("no historical recovery capability"),
+        "unresolved reason must say the historical inspector is missing: {reason}"
     );
     service.shutdown().unwrap();
 }

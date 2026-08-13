@@ -22,9 +22,10 @@ use super::{
     ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
     ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
     ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
@@ -235,6 +236,7 @@ pub struct ConnectorControlBinding {
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
+    historical_maintenance_recovery: Option<Arc<dyn ConnectorHistoricalMaintenanceRecovery>>,
     mv_publication_fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
@@ -420,6 +422,7 @@ impl ConnectorControlBinding {
             write,
             statistics,
             staged_publication_recovery: None,
+            historical_maintenance_recovery: None,
             mv_publication_fencing: None,
             view_metadata: None,
         })
@@ -711,6 +714,35 @@ impl ConnectorControlBinding {
         self.staged_publication_recovery.as_ref()
     }
 
+    /// Installs the provider-owned inspector for maintenance a dead
+    /// generation left behind.
+    ///
+    /// It is a separate slot from the ordinary maintenance capabilities on
+    /// purpose: those require the exact generation that created the operation,
+    /// which is precisely what recovery no longer has. Keeping them apart is
+    /// what stops a caller from silently treating historical inspection as an
+    /// ordinary reconcile.
+    pub fn try_with_historical_maintenance_recovery(
+        mut self,
+        recovery: Option<Arc<dyn ConnectorHistoricalMaintenanceRecovery>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(recovery) = &recovery {
+            super::historical_maintenance_recovery::validate_historical_maintenance_recovery_owner(
+                &self.descriptor,
+                self.incarnation,
+                recovery.as_ref(),
+            )?;
+        }
+        self.historical_maintenance_recovery = recovery;
+        Ok(self)
+    }
+
+    pub fn historical_maintenance_recovery(
+        &self,
+    ) -> Option<&Arc<dyn ConnectorHistoricalMaintenanceRecovery>> {
+        self.historical_maintenance_recovery.as_ref()
+    }
+
     /// Installs the provider-owned external MV publication fence.
     ///
     /// It is a builder for the same reason staged-publication recovery is: it
@@ -780,6 +812,7 @@ pub trait ConnectorControlRegistry:
     + ConnectorMetadataMaintenanceResolver
     + ConnectorDistributedRewriteResolver
     + ConnectorCleanupMaintenanceResolver
+    + ConnectorHistoricalMaintenanceResolver
     + ConnectorStatisticsResolver
 {
     fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError>;

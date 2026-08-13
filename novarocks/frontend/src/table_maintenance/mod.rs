@@ -26,16 +26,22 @@ use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
 use novarocks::engine::table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceAttemptCancellationSource,
-    MaintenanceRequestContext, MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission,
-    TableMaintenanceEngine, TableMaintenanceService,
+    HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
+    MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
+    MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_spi::connector::{
     BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
-    ConnectorMutationOperationId, ConnectorWriteOperationId, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, PreparedBatch,
+    ConnectorMutationOperationId, ConnectorTableIdentity, ConnectorWriteOperationId,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome, PreparedBatch,
+};
+use novarocks_spi::connector::{
+    ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceArtifact,
+    ConnectorHistoricalMaintenanceDescriptor, ConnectorHistoricalMaintenanceDisposition,
+    ConnectorHistoricalMaintenanceFamily, ConnectorHistoricalMaintenanceObservation,
+    ConnectorHistoricalMaintenanceOutcome,
 };
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::coordination::WriteAdmission;
@@ -1308,30 +1314,151 @@ impl FrontendTableMaintenanceService {
                 })?;
                 Ok(())
             })();
+            // The ordinary reconcile above needs the exact generation that
+            // created the operation. When that generation is still alive it is
+            // the better answer, since it holds the original session. When it
+            // is gone, fall through to historical inspection rather than
+            // declaring the operation stuck forever.
             if let Err(error) = result {
-                self.block_on(repository.mark_unresolved_fenced(
-                    operation.operation_id,
+                let reason = self.converge_historical_metadata(
+                    repository,
+                    engine,
+                    &operation,
+                    &cancellation.context(),
+                    &attempt,
+                    &authority,
+                    &validator,
                     error,
-                    now_unix_millis(),
-                    authority,
-                    validator,
-                ))
-                .map_err(|store| {
-                    format!("mark metadata maintenance operation unresolved failed: {store}")
-                })?;
+                )?;
+                if let Some(reason) = reason {
+                    self.block_on(repository.mark_unresolved_fenced(
+                        operation.operation_id,
+                        reason,
+                        now_unix_millis(),
+                        authority,
+                        validator,
+                    ))
+                    .map_err(|store| {
+                        format!("mark metadata maintenance operation unresolved failed: {store}")
+                    })?;
+                }
             }
         }
         Ok(())
     }
 
-    fn recover_distributed_rewrite_operations(&self) -> Result<(), String> {
+    /// Second chance for a metadata operation whose exact generation is gone.
+    ///
+    /// Returns the reason to stay unresolved, or `None` once the operation is
+    /// finalized. The original reconcile failure is carried into every
+    /// unresolved reason: a reader needs to know both why the exact path failed
+    /// and what the historical inspection could not settle.
+    #[allow(clippy::too_many_arguments)]
+    fn converge_historical_metadata(
+        &self,
+        repository: &Arc<MetadataMaintenanceOperationRepository>,
+        engine: &dyn TableMaintenanceEngine,
+        operation: &model::MetadataMaintenanceOperation,
+        attempt_context: &novarocks::engine::table_maintenance::MaintenanceAttemptContext,
+        attempt: &MaintenanceAttemptGuard,
+        authority: &MaintenanceAuthorityV1,
+        validator: &MaintenanceFenceValidator,
+        exact_failure: String,
+    ) -> Result<Option<String>, String> {
+        let descriptor = match historical_descriptor(
+            &operation.target,
+            &operation.owner,
+            ConnectorHistoricalMaintenanceFamily::MetadataMaintenance,
+            metadata_maintenance_kind_name(operation.kind),
+            operation.operation_id,
+            operation.request_digest,
+            operation.plan_digest,
+            Some(operation.base_state_digest),
+            // A metadata maintenance operation that reached this recovery path
+            // already had its plan committed, so the provider call may have
+            // happened. It is never continued, only classified.
+            ConnectorHistoricalDispatchFacts {
+                dispatch_started: true,
+                batch_ordinal: None,
+                receipt_digest: None,
+            },
+            // The provider needs the immutable plan it wrote to recompute the
+            // marker it would have committed under. Without it there is nothing
+            // to look for in the table.
+            metadata_plan_artifact(self, repository, operation.operation_id)?,
+            attempt.attempt_id(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        let observation = match engine.inspect_historical_maintenance(
+            &operation.target,
+            descriptor,
+            attempt_context,
+        ) {
+            Ok(HistoricalMaintenanceInspection::Observed(observation)) => observation,
+            Ok(HistoricalMaintenanceInspection::Unsupported(reason)) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; no historical recovery capability: {reason}"
+                )));
+            }
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        match observation.disposition {
+            ConnectorHistoricalMaintenanceDisposition::Applied => {
+                let payload = observation.proof.payload().to_vec();
+                self.block_on(repository.finish_fenced(
+                    operation.operation_id,
+                    MetadataMaintenanceOpaquePayload {
+                        digest: metadata_maintenance_payload_digest(&payload),
+                        payload,
+                    },
+                    now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(validator),
+                ))
+                .map_err(|error| {
+                    format!("finish historically recovered metadata maintenance failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::NotApplied
+            | ConnectorHistoricalMaintenanceDisposition::NotDispatched => {
+                self.block_on(
+                    repository.fail_fenced(
+                        operation.operation_id,
+                        "metadata maintenance did not reach the table; it is safe to run again"
+                            .to_string(),
+                        now_unix_millis(),
+                        authority.clone(),
+                        Arc::clone(validator),
+                    ),
+                )
+                .map_err(|error| {
+                    format!("fail historically recovered metadata maintenance failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::PartiallyApplied
+            | ConnectorHistoricalMaintenanceDisposition::Ambiguous => Ok(Some(format!(
+                "{exact_failure}; historical inspection could not decide whether the metadata \
+                 maintenance committed"
+            ))),
+        }
+    }
+
+    fn recover_distributed_rewrite_operations(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+    ) -> Result<(), String> {
         let Some(repository) = &self.distributed_rewrite_repository else {
             return Ok(());
         };
-        // A rewrite lease is generation-fenced. After a frontend restart the
-        // old incarnation is intentionally unavailable, so this owner must
-        // not substitute the current binding or resubmit staged work. Keep
-        // the durable fence visible for an exact-generation recovery design.
+        // A rewrite lease is generation-fenced, and after a frontend restart
+        // the incarnation that held it is gone for good. This owner therefore
+        // never substitutes the current binding for the old one: it asks the
+        // live generation what it can prove about what the dead one did, and
+        // converges only on that proof.
         for operation in self
             .block_on(repository.list_recovery_candidates())
             .map_err(|error| {
@@ -1348,16 +1475,124 @@ impl FrontendTableMaintenanceService {
                 Arc::clone(&validator),
             ))
             .map_err(|error| format!("adopt distributed rewrite operation failed: {error}"))?;
-            self.block_on(repository.mark_unresolved_fenced(
+            let cancellation = self.attempt_cancellation(&attempt);
+
+            let inspection = historical_descriptor(
+                &operation.target,
+                &operation.owner,
+                ConnectorHistoricalMaintenanceFamily::DistributedRewrite,
+                distributed_rewrite_kind_name(operation.kind),
                 operation.operation_id,
-                "distributed rewrite requires its original exact connector generation after frontend restart".to_string(),
-                now_unix_millis(),
-                authority,
-                validator,
-            ))
-            .map_err(|error| format!("mark distributed rewrite operation unresolved failed: {error}"))?;
+                operation.request_digest,
+                operation.plan_digest,
+                Some(operation.base_state_digest),
+                rewrite_dispatch_facts(operation.state),
+                // Every cohort attempt recorded the provider artifact it
+                // produced. Those handles are the only durable trace of what
+                // the dead generation staged, so the inspector gets all of
+                // them rather than being asked to rediscover the work.
+                rewrite_attempt_artifacts(self, repository, operation.operation_id)?,
+                attempt.attempt_id(),
+            )
+            .and_then(|descriptor| {
+                engine.inspect_historical_maintenance(
+                    &operation.target,
+                    descriptor,
+                    &cancellation.context(),
+                )
+            });
+
+            let unresolved_reason = match inspection {
+                Err(reason) => Some(reason),
+                Ok(HistoricalMaintenanceInspection::Unsupported(reason)) => Some(format!(
+                    "distributed rewrite has no historical recovery capability: {reason}"
+                )),
+                Ok(HistoricalMaintenanceInspection::Observed(observation)) => self
+                    .converge_historical_rewrite(
+                        repository,
+                        &operation,
+                        observation.as_ref(),
+                        &authority,
+                        &validator,
+                    )?,
+            };
+            if let Some(reason) = unresolved_reason {
+                self.block_on(repository.mark_unresolved_fenced(
+                    operation.operation_id,
+                    reason,
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("mark distributed rewrite operation unresolved failed: {error}")
+                })?;
+            }
         }
         Ok(())
+    }
+
+    /// Turn a proven historical observation into a durable terminal state.
+    ///
+    /// Returns the reason to stay unresolved, or `None` once the operation has
+    /// been finalized. Only `Applied` and `NotApplied` are terminal: everything
+    /// else means the evidence did not decide, and guessing here would either
+    /// lose a committed rewrite or replay one.
+    fn converge_historical_rewrite(
+        &self,
+        repository: &Arc<DistributedRewriteOperationRepository>,
+        operation: &model::DistributedRewriteOperation,
+        observation: &ConnectorHistoricalMaintenanceObservation,
+        authority: &MaintenanceAuthorityV1,
+        validator: &MaintenanceFenceValidator,
+    ) -> Result<Option<String>, String> {
+        match observation.disposition {
+            ConnectorHistoricalMaintenanceDisposition::Applied => {
+                // The provider's own proof becomes the durable receipt, so a
+                // later reader sees why this operation was declared finished
+                // without the generation that ran it.
+                let payload = observation.proof.payload().to_vec();
+                self.block_on(repository.finish_fenced(
+                    operation.operation_id,
+                    DistributedRewriteOpaquePayload {
+                        digest: distributed_rewrite_payload_digest(&payload),
+                        payload,
+                    },
+                    now_unix_millis(),
+                    authority.clone(),
+                    Arc::clone(validator),
+                ))
+                .map_err(|error| {
+                    format!("finish historically recovered distributed rewrite failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::NotApplied
+            | ConnectorHistoricalMaintenanceDisposition::NotDispatched => {
+                self.block_on(
+                    repository.fail_fenced(
+                        operation.operation_id,
+                        "distributed rewrite did not reach the table; it is safe to run again"
+                            .to_string(),
+                        now_unix_millis(),
+                        authority.clone(),
+                        Arc::clone(validator),
+                    ),
+                )
+                .map_err(|error| {
+                    format!("fail historically recovered distributed rewrite failed: {error}")
+                })?;
+                Ok(None)
+            }
+            ConnectorHistoricalMaintenanceDisposition::PartiallyApplied => Ok(Some(
+                "distributed rewrite is partially applied; it needs an operator decision"
+                    .to_string(),
+            )),
+            ConnectorHistoricalMaintenanceDisposition::Ambiguous => Ok(Some(
+                "historical inspection could not decide whether the distributed rewrite committed"
+                    .to_string(),
+            )),
+        }
     }
 
     fn recover_cleanup_operations(
@@ -1451,27 +1686,192 @@ impl FrontendTableMaintenanceService {
                 }
                 Ok(())
             })();
+            // Same shape as metadata: the exact generation is the better
+            // reconciler while it exists, and historical inspection is what
+            // remains once it does not. Cleanup is the one family where this
+            // must never widen into re-execution -- a dispatched batch may
+            // already have deleted files.
             if let Err(error) = result {
-                self.block_on(repository.mark_unresolved_fenced(
-                    operation.operation_id,
+                let reason = self.converge_historical_cleanup(
+                    repository,
+                    engine,
+                    &operation,
+                    &cancellation.context(),
+                    &attempt,
+                    &authority,
+                    &validator,
                     error,
-                    now_unix_millis(),
-                    authority,
-                    validator,
-                ))
-                .map_err(|store| {
-                    format!("mark orphan cleanup operation unresolved failed: {store}")
-                })?;
+                )?;
+                if let Some(reason) = reason {
+                    self.block_on(repository.mark_unresolved_fenced(
+                        operation.operation_id,
+                        reason,
+                        now_unix_millis(),
+                        authority,
+                        validator,
+                    ))
+                    .map_err(|store| {
+                        format!("mark orphan cleanup operation unresolved failed: {store}")
+                    })?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Classify a destructive cleanup batch whose exact generation is gone.
+    ///
+    /// This never prepares, plans or executes anything. It reads what the old
+    /// attempt provably did to the exact batch already recorded, writes that
+    /// down, and leaves anything it cannot prove unresolved. `Unknown` deletes
+    /// stay unknown: retrying them is precisely the failure mode the immutable
+    /// manifest and single-dispatch contract exist to prevent.
+    #[allow(clippy::too_many_arguments)]
+    fn converge_historical_cleanup(
+        &self,
+        repository: &Arc<CleanupOperationRepository>,
+        engine: &dyn TableMaintenanceEngine,
+        operation: &model::CleanupOperation,
+        attempt_context: &novarocks::engine::table_maintenance::MaintenanceAttemptContext,
+        attempt: &MaintenanceAttemptGuard,
+        authority: &MaintenanceAuthorityV1,
+        validator: &MaintenanceFenceValidator,
+        exact_failure: String,
+    ) -> Result<Option<String>, String> {
+        let ordinal = if operation.state == CleanupOperationState::ReconcilePending {
+            operation.next_batch_ordinal.saturating_sub(1)
+        } else {
+            operation.next_batch_ordinal
+        };
+        let checkpoint = match self.block_on(repository.load_batch(operation.operation_id, ordinal))
+        {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => return Ok(Some(exact_failure)),
+            Err(error) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; load orphan cleanup recovery batch failed: {error}"
+                )));
+            }
+        };
+        let descriptor = match historical_descriptor(
+            &operation.target,
+            &operation.owner,
+            ConnectorHistoricalMaintenanceFamily::Cleanup,
+            novarocks_spi::connector::REMOVE_UNREFERENCED_OBJECTS_KIND,
+            operation.operation_id,
+            operation.request_digest,
+            operation.plan_digest,
+            None,
+            ConnectorHistoricalDispatchFacts {
+                dispatch_started: true,
+                batch_ordinal: Some(u32::from(checkpoint.ordinal)),
+                receipt_digest: Some(checkpoint.prepared_handle_digest),
+            },
+            // The prepared batch is the exact, immutable set of candidates the
+            // old attempt dispatched, and the plan says where its manifest
+            // lives. Recovery classifies that set and nothing wider.
+            match cleanup_recovery_artifacts(self, repository, operation, &checkpoint) {
+                Ok(artifacts) => artifacts,
+                Err(error) => return Ok(Some(format!("{exact_failure}; {error}"))),
+            },
+            attempt.attempt_id(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        let observation = match engine.inspect_historical_maintenance(
+            &operation.target,
+            descriptor,
+            attempt_context,
+        ) {
+            Ok(HistoricalMaintenanceInspection::Observed(observation)) => observation,
+            Ok(HistoricalMaintenanceInspection::Unsupported(reason)) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; no historical recovery capability: {reason}"
+                )));
+            }
+            Err(reason) => return Ok(Some(format!("{exact_failure}; {reason}"))),
+        };
+        let ConnectorHistoricalMaintenanceOutcome::Cleanup {
+            deleted_count,
+            already_absent_count,
+            skipped_count: _,
+            failed_count,
+            unknown_count,
+        } = observation.outcome
+        else {
+            return Ok(Some(format!(
+                "{exact_failure}; historical inspection answered a non-cleanup outcome"
+            )));
+        };
+        if unknown_count > 0
+            || matches!(
+                observation.disposition,
+                ConnectorHistoricalMaintenanceDisposition::Ambiguous
+            )
+        {
+            return Ok(Some(format!(
+                "{exact_failure}; historical inspection left {unknown_count} cleanup candidates \
+                 unknown"
+            )));
+        }
+        // The durable checkpoint counts a bounded batch, so a count that does
+        // not fit is corrupt evidence rather than a very large batch.
+        let counts: Vec<u32> = match [
+            deleted_count,
+            already_absent_count,
+            failed_count,
+            unknown_count,
+        ]
+        .into_iter()
+        .map(u32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(counts) => counts,
+            Err(_) => {
+                return Ok(Some(format!(
+                    "{exact_failure}; historical inspection reported cleanup counts outside the \
+                     durable batch range"
+                )));
+            }
+        };
+        let mut resolved = checkpoint;
+        let proof = observation.proof.payload().to_vec();
+        resolved.receipt_handle_digest = Some(cleanup_payload_digest(&proof));
+        resolved.receipt_handle = Some(proof);
+        resolved.deleted_count = counts[0];
+        resolved.already_absent_count = counts[1];
+        resolved.failed_count = counts[2];
+        resolved.unknown_count = counts[3];
+        let operation = self
+            .block_on(repository.checkpoint_reconciled_batch_fenced(
+                operation.operation_id,
+                resolved,
+                authority.clone(),
+                Arc::clone(validator),
+            ))
+            .map_err(|error| {
+                format!("persist historically reconciled orphan cleanup batch failed: {error}")
+            })?;
+        if operation.next_batch_ordinal == operation.batch_count.unwrap_or(0) {
+            self.block_on(repository.finish_fenced(
+                operation.operation_id,
+                now_unix_millis(),
+                authority.clone(),
+                Arc::clone(validator),
+            ))
+            .map_err(|error| {
+                format!("persist historically recovered orphan cleanup terminal failed: {error}")
+            })?;
+        }
+        Ok(None)
     }
 }
 
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
         self.recover_metadata_operations(engine.as_ref())?;
-        self.recover_distributed_rewrite_operations()?;
+        self.recover_distributed_rewrite_operations(engine.as_ref())?;
         self.recover_cleanup_operations(engine.as_ref())?;
         let mut worker = self
             .worker
@@ -1710,6 +2110,176 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
         *worker = WorkerLifecycle::Stopped(result.clone());
         result
+    }
+}
+
+/// The immutable inputs an inspector needs to classify one cleanup batch: the
+/// plan that says where the candidate manifest lives, and the prepared batch
+/// naming the exact candidates the old attempt dispatched.
+fn cleanup_recovery_artifacts(
+    service: &FrontendTableMaintenanceService,
+    repository: &Arc<CleanupOperationRepository>,
+    operation: &model::CleanupOperation,
+    checkpoint: &CleanupBatchCheckpoint,
+) -> Result<Vec<ConnectorHistoricalMaintenanceArtifact>, String> {
+    let stored = service
+        .block_on(repository.load_plan(operation.operation_id))
+        .map_err(|error| format!("load orphan cleanup recovery plan failed: {error}"))?
+        .ok_or_else(|| "orphan cleanup recovery plan is missing".to_string())?;
+    let plan = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "cleanup-plan",
+        bytes::Bytes::from(stored.artifact_handle),
+    )
+    .map_err(|error| format!("build cleanup recovery plan artifact failed: {error}"))?;
+    let prepared = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "cleanup-prepared-batch",
+        bytes::Bytes::from(checkpoint.prepared_handle.clone()),
+    )
+    .map_err(|error| format!("build cleanup recovery batch artifact failed: {error}"))?;
+    // The manifest digest is what lets the inspector prove it read the same
+    // candidate list the old attempt froze, rather than whatever is at that
+    // location now.
+    let manifest = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "cleanup-manifest-digest",
+        bytes::Bytes::copy_from_slice(&stored.manifest_digest),
+    )
+    .map_err(|error| format!("build cleanup recovery manifest artifact failed: {error}"))?;
+    Ok(vec![plan, prepared, manifest])
+}
+
+/// Load every cohort attempt artifact a rewrite recorded.
+fn rewrite_attempt_artifacts(
+    service: &FrontendTableMaintenanceService,
+    repository: &Arc<DistributedRewriteOperationRepository>,
+    operation_id: uuid::Uuid,
+) -> Result<Vec<ConnectorHistoricalMaintenanceArtifact>, String> {
+    let attempts = service
+        .block_on(repository.load_attempts(operation_id))
+        .map_err(|error| format!("load distributed rewrite recovery attempts failed: {error}"))?;
+    let mut artifacts = Vec::with_capacity(attempts.len());
+    for attempt in attempts {
+        if attempt.artifact_handle.is_empty() {
+            continue;
+        }
+        artifacts.push(
+            ConnectorHistoricalMaintenanceArtifact::try_new(
+                "distributed-rewrite-attempt",
+                bytes::Bytes::from(attempt.artifact_handle),
+            )
+            .map_err(|error| {
+                format!("build distributed rewrite recovery artifact failed: {error}")
+            })?,
+        );
+    }
+    Ok(artifacts)
+}
+
+/// The provider's own name for a distributed rewrite operation.
+const fn distributed_rewrite_kind_name(kind: DistributedRewriteOperationKind) -> &'static str {
+    match kind {
+        DistributedRewriteOperationKind::RewriteDataFiles => {
+            novarocks_spi::connector::REWRITE_DATA_FILES_KIND
+        }
+        DistributedRewriteOperationKind::RewritePositionDeleteFiles => {
+            novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND
+        }
+    }
+}
+
+/// The provider's own name for a metadata maintenance operation.
+const fn metadata_maintenance_kind_name(kind: MetadataMaintenanceOperationKind) -> &'static str {
+    match kind {
+        MetadataMaintenanceOperationKind::RewriteMetadataLayout => {
+            novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND
+        }
+        MetadataMaintenanceOperationKind::ExpireTableVersions => {
+            novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND
+        }
+    }
+}
+
+/// Load the durable metadata-maintenance plan as a provider artifact.
+fn metadata_plan_artifact(
+    service: &FrontendTableMaintenanceService,
+    repository: &Arc<MetadataMaintenanceOperationRepository>,
+    operation_id: uuid::Uuid,
+) -> Result<Vec<ConnectorHistoricalMaintenanceArtifact>, String> {
+    let Some(stored) = service
+        .block_on(repository.load_plan(operation_id))
+        .map_err(|error| format!("load metadata maintenance recovery plan failed: {error}"))?
+    else {
+        return Ok(Vec::new());
+    };
+    let artifact = ConnectorHistoricalMaintenanceArtifact::try_new(
+        "metadata-maintenance-plan",
+        bytes::Bytes::from(stored.payload),
+    )
+    .map_err(|error| format!("build metadata maintenance recovery artifact failed: {error}"))?;
+    Ok(vec![artifact])
+}
+
+/// Build the neutral descriptor that names one historical operation.
+///
+/// The old owner is recorded as the binding that did the work; it is evidence,
+/// never something to resolve or revive.
+#[allow(clippy::too_many_arguments)]
+fn historical_descriptor(
+    target: &MaintenanceTarget,
+    owner: &MetadataMaintenanceExactOwner,
+    family: ConnectorHistoricalMaintenanceFamily,
+    operation_kind: &str,
+    operation_id: uuid::Uuid,
+    request_digest: [u8; 32],
+    plan_digest: Option<[u8; 32]>,
+    base_state_digest: Option<[u8; 32]>,
+    dispatch: ConnectorHistoricalDispatchFacts,
+    artifacts: Vec<ConnectorHistoricalMaintenanceArtifact>,
+    recovery_attempt: uuid::Uuid,
+) -> Result<ConnectorHistoricalMaintenanceDescriptor, String> {
+    let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+        format!("historical maintenance target names an invalid connector instance: {error}")
+    })?;
+    let historical_instance = ConnectorInstanceId::parse(&owner.instance_id).map_err(|error| {
+        format!("historical maintenance owner names an invalid connector instance: {error}")
+    })?;
+    ConnectorHistoricalMaintenanceDescriptor::try_new(
+        ConnectorExecutionBindingKey {
+            instance_id: historical_instance,
+            incarnation: ConnectorInstanceIncarnation::from_bytes(*owner.incarnation_id.as_bytes()),
+        },
+        ConnectorTableIdentity {
+            instance_id,
+            namespace: target.namespace.clone().into(),
+            table: target.table.clone().into(),
+        },
+        family,
+        operation_kind,
+        *operation_id.as_bytes(),
+        request_digest,
+        plan_digest,
+        base_state_digest,
+        artifacts,
+        dispatch,
+        *recovery_attempt.as_bytes(),
+    )
+    .map_err(|error| format!("build historical maintenance descriptor failed: {error}"))
+}
+
+/// Whether a rewrite in this state can still have been invisible to the table.
+///
+/// Everything from staging onward may have reached the connector, so it is
+/// reported as dispatched and can never be continued, only classified.
+const fn rewrite_dispatch_facts(
+    state: model::DistributedRewriteOperationState,
+) -> ConnectorHistoricalDispatchFacts {
+    ConnectorHistoricalDispatchFacts {
+        dispatch_started: !matches!(
+            state,
+            model::DistributedRewriteOperationState::Pending
+                | model::DistributedRewriteOperationState::Planned
+        ),
+        batch_ordinal: None,
+        receipt_digest: None,
     }
 }
 
