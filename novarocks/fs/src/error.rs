@@ -25,6 +25,7 @@ pub enum FileErrorKind {
     Invalid,
     Unsupported,
     NotFound,
+    AlreadyExists,
     Permission,
     Corrupt,
     ResourceExhausted,

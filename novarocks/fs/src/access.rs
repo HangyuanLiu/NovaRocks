@@ -44,6 +44,12 @@ pub enum FsScheme {
     Hdfs,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalCreateOutcome {
+    Created,
+    AlreadyExists,
+}
+
 impl FsScheme {
     pub fn is_object_store(self) -> bool {
         self == Self::ObjectStore
@@ -336,6 +342,50 @@ impl FsAccessHandle {
             .iter()
             .map(ResolvedFsPath::operator_relative_path)
             .collect()
+    }
+
+    /// Atomically create one authorized path without replacing an existing file.
+    ///
+    /// Design: ADR-0069 makes native conditional storage creation the publication
+    /// fence; this method must never emulate it with an existence check plus write.
+    pub async fn create_if_absent(
+        &self,
+        path_index: usize,
+        payload: Bytes,
+        cancellation: &FileCancellation,
+    ) -> FileResult<ConditionalCreateOutcome> {
+        cancellation.check()?;
+        let path = self.paths.get(path_index).ok_or_else(|| {
+            FileError::invalid(format!("file path index out of bounds: {path_index}"))
+        })?;
+        if !self
+            .operator
+            .info()
+            .full_capability()
+            .write_with_if_not_exists
+        {
+            return Err(FileError::unsupported(
+                "filesystem does not support native conditional create",
+            ));
+        }
+
+        let result = self
+            .operator
+            .write_with(path.operator_relative_path(), payload)
+            .if_not_exists(true)
+            .await;
+        cancellation.check()?;
+        match result {
+            Ok(_) => Ok(ConditionalCreateOutcome::Created),
+            Err(error) => {
+                let error = map_conditional_create_error("conditionally create file", error);
+                if error.kind() == FileErrorKind::AlreadyExists {
+                    Ok(ConditionalCreateOutcome::AlreadyExists)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 }
 
@@ -1022,12 +1072,23 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
 fn map_opendal_error(operation: &str, error: opendal::Error) -> FileError {
     let kind = match error.kind() {
         opendal::ErrorKind::NotFound => FileErrorKind::NotFound,
+        opendal::ErrorKind::AlreadyExists => FileErrorKind::AlreadyExists,
         opendal::ErrorKind::PermissionDenied => FileErrorKind::Permission,
         opendal::ErrorKind::Unsupported => FileErrorKind::Unsupported,
         opendal::ErrorKind::RateLimited
         | opendal::ErrorKind::Unexpected
         | opendal::ErrorKind::ConditionNotMatch => FileErrorKind::Transient,
         _ => FileErrorKind::Internal,
+    };
+    FileError::with_source(kind, operation, error)
+}
+
+fn map_conditional_create_error(operation: &str, error: opendal::Error) -> FileError {
+    let kind = match error.kind() {
+        opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch => {
+            FileErrorKind::AlreadyExists
+        }
+        _ => return map_opendal_error(operation, error),
     };
     FileError::with_source(kind, operation, error)
 }

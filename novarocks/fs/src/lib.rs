@@ -34,8 +34,8 @@ mod resources;
 mod runtime;
 
 pub use access::{
-    BoundFile, FileIdentity, FsAccessHandle, FsAccessResolver, FsLocation, FsScheme,
-    ObjectStoreConfig, ResolvedFsPath, is_object_store_location_parse_only,
+    BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
+    FsLocation, FsScheme, ObjectStoreConfig, ResolvedFsPath, is_object_store_location_parse_only,
     parse_object_store_path_parse_only,
 };
 pub use cache::{
