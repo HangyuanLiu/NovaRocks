@@ -135,8 +135,7 @@ pub struct LakeRebuildContext<'a> {
     /// lease to enumerate namespaces with.
     pub catalog_runtime_projection:
         Option<&'a Arc<crate::catalog_application::CatalogRuntimeProjection>>,
-    pub catalog_application:
-        Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    pub catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
     pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
     pub mv_storage_observation: &'a dyn crate::mv::storage_observation::MvStorageObservationPort,
     pub mv_repository: &'a dyn crate::mv::repository::MvRepository,

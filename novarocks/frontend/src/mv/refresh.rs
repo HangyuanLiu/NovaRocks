@@ -195,6 +195,55 @@ pub(super) fn execute(
         ));
     }
 
+    // Take cluster-wide ownership of this target before any durable state.
+    //
+    // The order is load-bearing: the repository consults the ownership registry
+    // as its fence source, so registering must precede the first durable
+    // transition. Resolving the resource through `planning_lease`'s binding --
+    // the same generation the refresh was admitted under -- keeps the lease keyed
+    // by the identity this attempt actually observed.
+    //
+    // Ownership is sticky per target, so this is usually a no-op returning the
+    // lease a previous refresh of the same MV already won.
+    let _owned = match &dependencies.ownership {
+        Some(context) => {
+            let resource = super::coordination::resolve_target_resource_for(
+                planning_lease.binding(),
+                ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: refresh.finalize.target.database.as_str().into(),
+                    table: refresh.finalize.target.name.as_str().into(),
+                },
+                &connector_context,
+            )
+            .map_err(|error| unavailable(error.to_string()))?;
+            let owned =
+                context.block_on_acquisition(super::coordination::acquire_refresh_ownership(
+                    context,
+                    refresh.finalize.mv_id,
+                    resource,
+                ));
+            match owned {
+                Ok(owned) => Some(owned),
+                // Contention is not a fault: another frontend is refreshing this
+                // target right now, and doing it twice is the thing being
+                // prevented. Surfaced as a retryable conflict.
+                Err(refusal) => {
+                    return Err(MvApplicationError::new(
+                        // The cluster-wide analogue of the process-local
+                        // activity gate: this target is already being refreshed,
+                        // just by a different frontend.
+                        MvApplicationErrorKind::AlreadyActive,
+                        format!(
+                            "another frontend currently owns this materialized view's                              refresh ({refusal:?})"
+                        ),
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
     let base_snapshots = required_base_snapshots(&refresh.finalize)?;
     let base_table_uuids = refresh.finalize.base_table_uuids.clone();
     let has_external_actions = matches!(&refresh.work, PreparedMvRefreshWork::DataProducing { .. });

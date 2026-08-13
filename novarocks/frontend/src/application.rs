@@ -507,19 +507,22 @@ impl FrontendApplicationHost {
                         None
                     }
                 };
-                // The fence source is deliberately NOT installed yet. The refresh
-                // path registers ownership, but the scheduler-driven and recovery
-                // paths do not, and the registry fails closed for unregistered
-                // targets -- installing it here refuses their durable transitions
-                // and the MV never refreshes. Verified: doing so fails
-                // cluster_mvp's mvx3 recovery and both mvx4 scheduler tests.
+                // Installing the registry as the repository's fence source is what
+                // makes ownership binding: every durable refresh transition then
+                // proves ownership inside its own transaction, so a superseded
+                // owner's write fails at commit rather than racing.
                 //
-                // Install this only in the same change that makes every write path
-                // acquire ownership first.
-                match StateStoreMvRepository::open_with_catalog_attachment_observations(
+                // This must land together with the refresh path's acquisition, and
+                // it does -- the registry is fail-closed for unregistered targets,
+                // so installing it without acquisition refuses every refresh in the
+                // cluster. `installing_a_fence_source_without_registration_stops_\
+                // every_refresh` guards that combination.
+                let refresh_fence = ownership.as_ref().map(|context| context.registry());
+                match StateStoreMvRepository::open_with_observations_and_refresh_fence(
                     store,
                     tokio::runtime::Handle::current(),
                     attachment_observations,
+                    refresh_fence,
                 )
                 .await
                 {

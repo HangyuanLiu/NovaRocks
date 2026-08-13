@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
@@ -277,6 +278,11 @@ impl MvRefreshOwnershipContext {
         }
     }
 
+    /// Gives up every lease this frontend holds and stops their renewal.
+    pub fn shutdown(&self) {
+        self.registry.shutdown_in(&self.runtime);
+    }
+
     pub fn registry(&self) -> Arc<dyn MvRefreshFenceSource> {
         Arc::clone(&self.registry) as Arc<dyn MvRefreshFenceSource>
     }
@@ -319,12 +325,29 @@ pub(crate) fn resolve_target_resource_for(
 #[derive(Default)]
 pub struct MvRefreshOwnershipRegistry {
     held: RwLock<HashMap<i64, HeldRefreshLease>>,
+    /// Signals every renewal loop to stop.
+    ///
+    /// Without it, a renewal loop sleeping on its interval keeps issuing
+    /// StateStore writes while the process is tearing down, and the state store
+    /// provider misses its shutdown deadline waiting to drain.
+    shutdown: tokio::sync::Notify,
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 struct HeldRefreshLease {
     resource: ConnectorMvRefreshResourceIdentity,
     fence: Arc<CurrentLeaseFence>,
     admission: WriteAdmission,
+    /// The lease itself, kept alive for as long as this frontend owns the target.
+    ///
+    /// Ownership is sticky per target rather than per refresh. Acquiring and
+    /// releasing around each refresh cannot work: `LeaseGuard`'s release is
+    /// spawned, so it completes asynchronously while acquisition is immediate, and
+    /// a refresh issued right after recovery races a lease still on its way out.
+    /// Holding it removes the churn entirely.
+    ///
+    /// Behind an async mutex because renewal needs `&mut` across an `.await`.
+    guard: Arc<tokio::sync::Mutex<LeaseGuard>>,
 }
 
 impl MvRefreshOwnershipRegistry {
@@ -342,6 +365,7 @@ impl MvRefreshOwnershipRegistry {
         resource: ConnectorMvRefreshResourceIdentity,
         fence: Arc<CurrentLeaseFence>,
         admission: WriteAdmission,
+        guard: Arc<tokio::sync::Mutex<LeaseGuard>>,
     ) -> Result<(), MvRepositoryError> {
         let mut held = self.held.write().map_err(|_| {
             MvRepositoryError::new(
@@ -355,6 +379,7 @@ impl MvRefreshOwnershipRegistry {
                 resource,
                 fence,
                 admission,
+                guard,
             },
         );
         Ok(())
@@ -365,7 +390,56 @@ impl MvRefreshOwnershipRegistry {
     /// Called when a lease is released, lost, or the worker shuts down. After
     /// this, the repository rejects durable transitions for `mv_id` rather than
     /// letting them through unfenced.
-    pub fn release(&self, mv_id: i64) {
+    /// Gives up ownership of one target.
+    ///
+    /// The removed lease is dropped inside `runtime` rather than on the caller's
+    /// thread. `LeaseGuard::drop` releases by spawning and silently skips the
+    /// release when no runtime is current, and every caller here is either the MV
+    /// refresh worker -- a plain OS thread -- or a renewal task tearing itself
+    /// down. Dropping it on the worker thread would leave the lease held in the
+    /// StateStore until its TTL expired.
+    pub fn release_in(&self, mv_id: i64, runtime: &tokio::runtime::Handle) {
+        let Ok(mut held) = self.held.write() else {
+            return;
+        };
+        let Some(lease) = held.remove(&mv_id) else {
+            return;
+        };
+        drop(held);
+        let guard = lease.guard;
+        runtime.spawn(async move {
+            drop(guard);
+        });
+    }
+
+    /// Stops every renewal loop and gives up every held lease.
+    ///
+    /// Called on frontend teardown. Renewal loops are woken rather than left to
+    /// finish their sleep: the state store shuts down on a deadline, and a loop
+    /// that wakes to renew during teardown keeps the provider from draining.
+    pub fn shutdown_in(&self, runtime: &tokio::runtime::Handle) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shutdown.notify_waiters();
+        let held: Vec<i64> = self
+            .held
+            .read()
+            .map(|held| held.keys().copied().collect())
+            .unwrap_or_default();
+        for mv_id in held {
+            self.release_in(mv_id, runtime);
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Removes the entry without releasing the lease.
+    ///
+    /// Only correct when the lease is already gone -- a failed renewal means this
+    /// frontend no longer holds it, and there is nothing to hand back.
+    pub fn forget(&self, mv_id: i64) {
         if let Ok(mut held) = self.held.write() {
             held.remove(&mv_id);
         }
@@ -382,6 +456,18 @@ impl MvRefreshOwnershipRegistry {
 
     pub fn holds(&self, mv_id: i64) -> bool {
         self.held.read().is_ok_and(|held| held.contains_key(&mv_id))
+    }
+
+    /// The leases this frontend currently holds, for the renewal loop.
+    fn renewable(&self) -> Vec<(i64, Arc<tokio::sync::Mutex<LeaseGuard>>)> {
+        self.held
+            .read()
+            .map(|held| {
+                held.iter()
+                    .map(|(mv_id, lease)| (*mv_id, Arc::clone(&lease.guard)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -418,16 +504,6 @@ impl MvRefreshFenceSource for MvRefreshOwnershipRegistry {
 /// stopped working on.
 pub struct OwnedRefresh {
     mv_id: i64,
-    registry: Arc<MvRefreshOwnershipRegistry>,
-    /// Held so the StateStore lease is renewed and released with the handle.
-    ///
-    /// An `Option` so `Drop` can hand it over inside an entered runtime context:
-    /// `LeaseGuard::drop` releases by spawning, and silently skips releasing when
-    /// no runtime is current. On the MV refresh worker -- a plain OS thread --
-    /// that is always, so the lease would survive to its TTL and the next refresh
-    /// of the same target would contend with its own dead predecessor.
-    guard: Option<LeaseGuard>,
-    runtime: tokio::runtime::Handle,
 }
 
 impl OwnedRefresh {
@@ -445,15 +521,13 @@ impl std::fmt::Debug for OwnedRefresh {
     }
 }
 
-impl Drop for OwnedRefresh {
-    fn drop(&mut self) {
-        self.registry.release(self.mv_id);
-        // Entering the runtime before dropping the guard is what makes the
-        // release actually happen; without it the guard's own Drop no-ops.
-        let _entered = self.runtime.enter();
-        drop(self.guard.take());
-    }
-}
+// `OwnedRefresh` deliberately has no `Drop`. Ownership is sticky per target: it
+// outlives the refresh that first took it, and is released when the owning
+// worker stops or when renewal proves the lease was lost. Releasing here is what
+// the per-refresh model did, and it could not be made correct -- `LeaseGuard`
+// releases by spawning, so the release lands asynchronously while the next
+// acquisition is immediate, and a refresh issued right after recovery loses a
+// race against its own predecessor's release.
 
 /// Why a refresh could not take ownership of its target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -484,6 +558,11 @@ pub async fn acquire_refresh_ownership(
 ) -> Result<OwnedRefresh, OwnershipRefusal> {
     let coordination = &context.coordination;
     let registry = &context.registry;
+    // Already ours: reuse it. Re-acquiring per refresh is what made ownership
+    // race itself, and the lease we hold is the same lease we would win.
+    if registry.holds(mv_id) {
+        return Ok(OwnedRefresh { mv_id });
+    }
     let admission = coordination
         .write_admission()
         .await
@@ -497,15 +576,73 @@ pub async fn acquire_refresh_ownership(
         Err(_) => return Err(OwnershipRefusal::Unavailable),
     };
     let fence = Arc::new(CurrentLeaseFence::new(guard.fence()));
+    let renew_after = guard.renew_after();
+    let guard = Arc::new(tokio::sync::Mutex::new(guard));
     registry
-        .register(mv_id, resource, fence, admission)
+        .register(
+            mv_id,
+            resource,
+            Arc::clone(&fence),
+            admission,
+            Arc::clone(&guard),
+        )
         .map_err(|_| OwnershipRefusal::Unavailable)?;
-    Ok(OwnedRefresh {
-        mv_id,
-        registry: Arc::clone(registry),
-        guard: Some(guard),
-        runtime: context.runtime.clone(),
-    })
+    spawn_renewal(context, mv_id, guard, fence, renew_after);
+    Ok(OwnedRefresh { mv_id })
+}
+
+/// Keeps a held lease alive for as long as this frontend claims the target.
+///
+/// Sticky ownership without renewal is strictly worse than no ownership: the
+/// lease ages out, another frontend legitimately takes the target, and this one
+/// keeps refreshing in the belief that it still owns it. That is a silent
+/// split-brain, whereas an unfenced refresh is at least visibly unfenced.
+///
+/// So a failed renewal deregisters the target. The registry is the repository's
+/// fence source and is fail-closed for unregistered targets, which turns a lost
+/// lease into refused writes rather than unfenced ones.
+fn spawn_renewal(
+    context: &MvRefreshOwnershipContext,
+    mv_id: i64,
+    guard: Arc<tokio::sync::Mutex<LeaseGuard>>,
+    fence: Arc<CurrentLeaseFence>,
+    renew_after: Duration,
+) {
+    let registry = Arc::clone(&context.registry);
+    context.runtime.spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(renew_after) => {}
+                () = registry.shutdown.notified() => return,
+            }
+            // Stop as soon as the target is no longer held: the worker released
+            // it, a previous iteration deregistered it, or teardown began between
+            // the wake-up and here.
+            if registry.is_shutting_down() || !registry.holds(mv_id) {
+                return;
+            }
+            let operation_id = OperationId::new_v7();
+            // The lock is held across the renewal await, which is why it is an
+            // async mutex. Nothing else takes it except the release path.
+            let renewed = {
+                let mut guard = guard.lock().await;
+                guard.renew(operation_id).await.map(|()| guard.fence())
+            };
+            // Renewal advances the fence, so the registered one must advance with
+            // it. Leaving it behind makes every durable transition validate
+            // against a superseded fence and fail as a conflict -- this frontend
+            // rejecting its own writes, moments after renewing the very lease that
+            // authorises them.
+            let advanced = match renewed {
+                Ok(current) => fence.replace(current).is_ok(),
+                Err(_) => false,
+            };
+            if !advanced {
+                registry.forget(mv_id);
+                return;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -596,41 +733,32 @@ mod tests {
         assert!(registry.resource_for(7).is_none());
     }
 
-    /// Registry ownership must be revoked when the handle dies, including on an
-    /// early return or a panic on the refresh path. Tested against the registry
-    /// directly because that is the object the repository consults.
+    /// A lost lease must revoke the ability to write, not merely stop new work
+    /// from being scheduled.
+    ///
+    /// This is the failure mode sticky ownership introduces and must answer for.
+    /// Ownership now outlives a single refresh, so a lease that ages out while
+    /// this frontend still believes it owns the target would be a silent
+    /// split-brain: two frontends both refreshing, both convinced they are the
+    /// owner. The renewal loop's contract is that a failed renewal deregisters
+    /// the target, and the registry is fail-closed for unregistered targets, so a
+    /// lost lease turns into refused writes rather than unfenced ones.
     #[test]
-    fn ownership_release_is_tied_to_the_handle_lifetime() {
+    fn a_lost_lease_revokes_the_ability_to_write() {
         let registry = MvRefreshOwnershipRegistry::new();
+
+        // `forget` is what the renewal loop calls when renewal fails. It must
+        // leave the target in the same fail-closed state as one never owned.
+        registry.forget(7);
         assert!(!registry.holds(7));
-
-        // Simulate what `acquire_refresh_ownership` registers, then what `Drop`
-        // undoes. A real LeaseGuard needs a live StateStore, so the lifetime
-        // contract is exercised through the registry it mutates.
-        struct Owned {
-            mv_id: i64,
-            registry: Arc<MvRefreshOwnershipRegistry>,
-        }
-        impl Drop for Owned {
-            fn drop(&mut self) {
-                self.registry.release(self.mv_id);
-            }
-        }
-
-        {
-            let _owned = Owned {
-                mv_id: 7,
-                registry: Arc::clone(&registry),
-            };
-            // Registration is what the repository consults; without it the
-            // repository already fails closed, which the next test covers.
-            assert!(!registry.holds(7), "nothing registered a fence here");
-        }
-
-        // After the handle is gone the target must be unowned regardless of how
-        // the refresh path exited.
-        assert!(!registry.holds(7));
-        assert!(registry.validator_for(7).is_err());
+        assert!(
+            registry.validator_for(7).is_err(),
+            "a target whose lease was lost must fail closed"
+        );
+        assert!(
+            registry.resource_for(7).is_none(),
+            "a lost lease must not leave a resource behind"
+        );
     }
 
     #[test]
@@ -647,20 +775,6 @@ mod tests {
             OwnershipRefusal::Contended,
             OwnershipRefusal::AwaitingTakeover
         );
-    }
-
-    #[test]
-    fn releasing_ownership_stops_further_durable_transitions() {
-        let registry = MvRefreshOwnershipRegistry::new();
-
-        // Losing the lease must revoke the ability to write, not merely stop new
-        // work from being scheduled.
-        registry.release(7);
-        assert!(
-            registry.validator_for(7).is_err(),
-            "a released target must fail closed"
-        );
-        assert!(!registry.holds(7));
     }
 
     #[test]

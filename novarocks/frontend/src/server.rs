@@ -93,6 +93,7 @@ fn standalone_open_services(
         crate::mv::startup_restore::FrontendMvStartupRestore::new(
             host.connector_control_registry(),
             host.catalog_runtime_projection(),
+            host.catalog_application_port(),
             mv_storage_observation,
             host.mv_repository(),
             {
