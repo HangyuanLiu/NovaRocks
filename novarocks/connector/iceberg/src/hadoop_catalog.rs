@@ -37,6 +37,8 @@ use crate::iceberg::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(test)]
+use novarocks_fs::FileError;
 use novarocks_fs::{ConditionalCreateOutcome, FileCancellation, FileErrorKind, ObjectStoreConfig};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -69,6 +71,7 @@ pub(crate) struct HadoopCreateResult {
 pub(crate) enum HadoopCreateFailureKind {
     Invalid,
     Unsupported,
+    Uncommitted,
     Unknown,
 }
 
@@ -103,6 +106,16 @@ pub(crate) enum HadoopCreateReconciliation {
     Foreign,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HadoopCatalogTestFault {
+    BeforeConditionalRequest,
+    AfterConditionalResponseLoss,
+    BeforeHintWrite,
+    AfterHintWriteResponseLoss,
+    AuthoritativeV1Read,
+}
+
 #[derive(Debug)]
 pub struct HadoopFileSystemCatalog {
     file_io: FileIO,
@@ -110,6 +123,8 @@ pub struct HadoopFileSystemCatalog {
     object_store_config: Option<ObjectStoreConfig>,
     /// Maps `"namespace/table"` to the current metadata file location.
     tables: Mutex<HashMap<String, String>>,
+    #[cfg(test)]
+    test_faults: std::sync::Mutex<Vec<HadoopCatalogTestFault>>,
 }
 
 impl HadoopFileSystemCatalog {
@@ -128,7 +143,30 @@ impl HadoopFileSystemCatalog {
             warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
             object_store_config,
             tables: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_faults: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn inject_test_fault(&self, fault: HadoopCatalogTestFault) {
+        self.test_faults
+            .lock()
+            .expect("Hadoop catalog test fault lock")
+            .push(fault);
+    }
+
+    #[cfg(test)]
+    fn take_test_fault(&self, fault: HadoopCatalogTestFault) -> bool {
+        let mut faults = self
+            .test_faults
+            .lock()
+            .expect("Hadoop catalog test fault lock");
+        let Some(position) = faults.iter().position(|candidate| *candidate == fault) else {
+            return false;
+        };
+        faults.remove(position);
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -202,9 +240,26 @@ impl HadoopFileSystemCatalog {
 
     /// Write `version-hint.text` with the given version number.
     async fn write_version_hint(&self, table_location: &str, version: u32) -> Result<()> {
+        #[cfg(test)]
+        if self.take_test_fault(HadoopCatalogTestFault::BeforeHintWrite) {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "injected failure before Hadoop version-hint write",
+            ));
+        }
         let path = Self::version_hint_path(table_location);
         let output = self.file_io.new_output(&path)?;
-        output.write(format!("{}\n", version).into()).await
+        let result = output.write(format!("{}\n", version).into()).await;
+        #[cfg(test)]
+        if result.is_ok()
+            && self.take_test_fault(HadoopCatalogTestFault::AfterHintWriteResponseLoss)
+        {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "injected response loss after Hadoop version-hint write",
+            ));
+        }
+        result
     }
 
     /// Persist table metadata at `v{version}.metadata.json` and update
@@ -394,16 +449,37 @@ impl HadoopFileSystemCatalog {
             .ensure_parent_directory()
             .await
             .map_err(|message| HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Unknown,
+                kind: HadoopCreateFailureKind::Uncommitted,
                 facts: Some(attempt.facts.clone()),
                 message: format!("create Hadoop metadata directory: {message}"),
             })?;
+
+        #[cfg(test)]
+        if self.take_test_fault(HadoopCatalogTestFault::BeforeConditionalRequest) {
+            return Err(HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Uncommitted,
+                facts: Some(attempt.facts.clone()),
+                message: "injected failure before Hadoop conditional create request".to_string(),
+            });
+        }
 
         let cancellation = FileCancellation::new();
         let conditional = access
             .handle()
             .create_if_absent(0, attempt.metadata_bytes.clone(), &cancellation)
             .await;
+        #[cfg(test)]
+        let conditional = match conditional {
+            Ok(ConditionalCreateOutcome::Created)
+                if self.take_test_fault(HadoopCatalogTestFault::AfterConditionalResponseLoss) =>
+            {
+                Err(FileError::new(
+                    FileErrorKind::Transient,
+                    "injected response loss after Hadoop conditional create",
+                ))
+            }
+            result => result,
+        };
         let (disposition, metadata, authoritative_metadata_digest) = match conditional {
             Ok(ConditionalCreateOutcome::Created) => (
                 HadoopCreateDisposition::Created,
@@ -474,6 +550,14 @@ impl HadoopFileSystemCatalog {
         attempt: &HadoopCreateAttempt,
     ) -> std::result::Result<(HadoopCreateDisposition, TableMetadata, String), HadoopCreateFailure>
     {
+        #[cfg(test)]
+        if self.take_test_fault(HadoopCatalogTestFault::AuthoritativeV1Read) {
+            return Err(HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Unknown,
+                facts: Some(attempt.facts.clone()),
+                message: "injected authoritative Hadoop v1 reread failure".to_string(),
+            });
+        }
         let input = self
             .file_io
             .new_input(&attempt.facts.metadata_location)
@@ -635,6 +719,7 @@ impl Catalog for HadoopFileSystemCatalog {
                 let kind = match failure.kind {
                     HadoopCreateFailureKind::Invalid => ErrorKind::DataInvalid,
                     HadoopCreateFailureKind::Unsupported => ErrorKind::FeatureUnsupported,
+                    HadoopCreateFailureKind::Uncommitted => ErrorKind::Unexpected,
                     HadoopCreateFailureKind::Unknown => ErrorKind::Unexpected,
                 };
                 Error::new(kind, failure.message)
@@ -990,5 +1075,250 @@ mod tests {
         let loaded = restored.load_table(&ident).await.expect("load from v1");
         assert_eq!(created.table.metadata().uuid(), loaded.metadata().uuid());
         assert!(restored.file_io.exists(&hint).await.expect("repaired hint"));
+    }
+
+    #[tokio::test]
+    async fn fault_before_conditional_request_leaves_no_v1() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        let v1 = HadoopFileSystemCatalog::metadata_path(&catalog.table_location(&ident), 1);
+        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
+        catalog.inject_test_fault(HadoopCatalogTestFault::BeforeConditionalRequest);
+
+        let failure = catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-before-request".to_string(),
+            )
+            .await
+            .expect_err("injected pre-request failure");
+
+        assert_eq!(failure.kind, HadoopCreateFailureKind::Uncommitted);
+        assert!(!catalog.file_io.exists(&v1).await.expect("probe v1"));
+        assert!(!catalog.file_io.exists(&hint).await.expect("probe hint"));
+    }
+
+    #[tokio::test]
+    async fn lost_conditional_response_is_attributed_by_authoritative_v1() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        catalog.inject_test_fault(HadoopCatalogTestFault::AfterConditionalResponseLoss);
+
+        let created = catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-response-loss".to_string(),
+            )
+            .await
+            .expect("authoritative reread attributes committed v1");
+
+        assert_eq!(created.disposition, HadoopCreateDisposition::Created);
+        assert_eq!(created.facts.table_uuid, created.authoritative_table_uuid);
+        assert_eq!(
+            created.facts.metadata_digest,
+            created.authoritative_metadata_digest
+        );
+        assert!(created.finalization_failure.is_none());
+        assert!(
+            catalog
+                .file_io
+                .exists(&created.facts.metadata_location)
+                .await
+                .expect("probe committed v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_before_hint_write_is_committed_and_v1_recovers() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        catalog.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
+
+        let created = catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-hint-before".to_string(),
+            )
+            .await
+            .expect("v1 commit survives hint failure");
+        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
+        assert_eq!(created.disposition, HadoopCreateDisposition::Created);
+        assert!(created.finalization_failure.is_some());
+        assert!(
+            catalog
+                .file_io
+                .exists(&created.facts.metadata_location)
+                .await
+                .expect("probe committed v1")
+        );
+        assert!(!catalog.file_io.exists(&hint).await.expect("probe hint"));
+
+        let restored = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        let loaded = restored
+            .load_table(&ident)
+            .await
+            .expect("recover table from canonical v1");
+        assert_eq!(
+            loaded.metadata().uuid().to_string(),
+            created.facts.table_uuid
+        );
+        assert!(restored.file_io.exists(&hint).await.expect("repaired hint"));
+    }
+
+    #[tokio::test]
+    async fn lost_hint_response_remains_committed_with_durable_hint() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        catalog.inject_test_fault(HadoopCatalogTestFault::AfterHintWriteResponseLoss);
+
+        let created = catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-hint-response-loss".to_string(),
+            )
+            .await
+            .expect("v1 commit survives lost hint response");
+        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
+        assert_eq!(created.disposition, HadoopCreateDisposition::Created);
+        assert!(created.finalization_failure.is_some());
+        assert!(catalog.file_io.exists(&hint).await.expect("durable hint"));
+
+        let restored = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        let loaded = restored
+            .load_table(&ident)
+            .await
+            .expect("load through durable hint");
+        assert_eq!(
+            loaded.metadata().uuid().to_string(),
+            created.facts.table_uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_authoritative_reread_after_response_loss_stays_unknown() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        let attempt = catalog
+            .prepare_create_attempt(
+                &namespace,
+                test_creation("events"),
+                "operation-reread-failure".to_string(),
+            )
+            .expect("prepare create attempt");
+        let facts = attempt.facts.clone();
+        catalog.inject_test_fault(HadoopCatalogTestFault::AfterConditionalResponseLoss);
+        catalog.inject_test_fault(HadoopCatalogTestFault::AuthoritativeV1Read);
+
+        let failure = catalog
+            .publish_create_attempt(attempt)
+            .await
+            .expect_err("unreadable authoritative v1 cannot be guessed committed");
+        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
+        assert_eq!(failure.kind, HadoopCreateFailureKind::Unknown);
+        assert!(
+            catalog
+                .file_io
+                .exists(&facts.metadata_location)
+                .await
+                .expect("v1 was durably created")
+        );
+        assert!(!catalog.file_io.exists(&hint).await.expect("probe hint"));
+    }
+
+    #[tokio::test]
+    async fn failed_hint_repair_never_deletes_committed_v1() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let creator = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        creator.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
+        let created = creator
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-repair".to_string(),
+            )
+            .await
+            .expect("commit v1 without hint");
+        let original_v1 = creator
+            .file_io
+            .new_input(&created.facts.metadata_location)
+            .expect("open committed v1")
+            .read()
+            .await
+            .expect("read committed v1");
+
+        let restored = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        restored.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
+        assert!(
+            restored
+                .table_exists(&ident)
+                .await
+                .expect("v1 remains authoritative when hint repair fails")
+        );
+        let after_repair = restored
+            .file_io
+            .new_input(&created.facts.metadata_location)
+            .expect("open v1 after failed repair")
+            .read()
+            .await
+            .expect("read v1 after failed repair");
+        let hint = HadoopFileSystemCatalog::version_hint_path(&restored.table_location(&ident));
+        assert_eq!(after_repair, original_v1);
+        assert!(!restored.file_io.exists(&hint).await.expect("probe hint"));
+        let loaded = restored
+            .load_table(&ident)
+            .await
+            .expect("cache populated from v1 despite failed hint repair");
+        assert_eq!(
+            loaded.metadata().uuid().to_string(),
+            created.facts.table_uuid
+        );
     }
 }

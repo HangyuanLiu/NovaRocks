@@ -1167,7 +1167,7 @@ fn map_file_error(error: FileError) -> ConnectorError {
         FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
         FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
         FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
-        FileErrorKind::Internal => ConnectorErrorKind::Internal,
+        FileErrorKind::AlreadyExists | FileErrorKind::Internal => ConnectorErrorKind::Internal,
     };
     ConnectorError::new(kind, "StarRocks direct storage I/O failed")
 }

@@ -2040,13 +2040,15 @@ fn hadoop_create_evidence(
     table: &ConnectorTableIdentity,
     facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
 ) -> Result<ExternalMutationEvidence, ConnectorError> {
+    let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
+    let table_name = normalize_identifier(&table.table).map_err(invalid)?;
     evidence(
         provider,
         request.operation_id,
         request.operation.kind(),
         IcebergMutationEvidenceTarget::HadoopCreate {
-            namespace: table.namespace.to_string(),
-            table: table.table.to_string(),
+            namespace,
+            table: table_name,
             expected_uuid: facts.table_uuid.clone(),
             metadata_location: facts.metadata_location.clone(),
             metadata_digest: facts.metadata_digest.clone(),
@@ -2533,6 +2535,9 @@ fn map_hadoop_create_failure(
         }
         crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => {
             ConnectorErrorKind::Unsupported
+        }
+        crate::hadoop_catalog::HadoopCreateFailureKind::Uncommitted => {
+            ConnectorErrorKind::Unavailable
         }
         crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => ConnectorErrorKind::Unavailable,
     };
