@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use novarocks::engine::ctas_engine::CtasEngine;
 use novarocks::engine::statistics::{EmptyStatisticsService, StatisticsService};
 use tokio::runtime::Handle;
 
 use crate::coordination::FrontendCoordinationRuntime;
 use crate::dml::coordination::{ActiveDmlOperation, DmlCoordinator};
+use crate::dml::ctas::recovery::{CtasRecoveryProfile, CtasRecoveryProgress};
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
@@ -36,6 +38,7 @@ use crate::dml::statement_recovery::{
     HistoricalDataMutationRecoveryResolver, StatementRecoveryProfile, StatementRecoveryProgress,
     direct_mutation_kind, is_authority_loss,
 };
+use crate::dml::write_recovery::HistoricalWriteRecoveryResolver;
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
 /// admission) and drives write transactions. Constructed from narrow handles —
@@ -51,6 +54,14 @@ pub struct DmlService {
     /// service without it defers statement-family recovery instead of
     /// classifying anything.
     statement_recovery: Option<StatementRecoveryProfile>,
+    ctas_recovery: RwLock<Option<Arc<dyn CtasEngine>>>,
+    ctas_write_recovery: RwLock<Option<Arc<dyn HistoricalWriteRecoveryResolver>>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DmlRecoveryProgress {
+    Statement(StatementRecoveryProgress),
+    Ctas(CtasRecoveryProgress),
 }
 
 impl DmlService {
@@ -77,6 +88,8 @@ impl DmlService {
             coordinator: None,
             allow_unfenced_focused_test_support: true,
             statement_recovery: None,
+            ctas_recovery: RwLock::new(None),
+            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -99,6 +112,8 @@ impl DmlService {
             coordinator: Some(DmlCoordinator::new(frontend, runtime)),
             allow_unfenced_focused_test_support: false,
             statement_recovery: None,
+            ctas_recovery: RwLock::new(None),
+            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -115,6 +130,25 @@ impl DmlService {
         self.statement_recovery = Some(StatementRecoveryProfile::new(resolver));
     }
 
+    /// Install the current-generation Core CTAS historical reverse port.
+    /// The bounded controller may start before this late-bound dependency;
+    /// until installation, CTAS candidates are safely deferred.
+    pub fn install_ctas_recovery(&self, engine: Arc<dyn CtasEngine>) {
+        *self
+            .ctas_recovery
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine);
+    }
+
+    /// Install the current-generation CP-3B historical write resolver used by
+    /// CTAS takeover before any retained staged target may be cleaned up.
+    pub fn install_ctas_write_recovery(&self, resolver: Arc<dyn HistoricalWriteRecoveryResolver>) {
+        *self
+            .ctas_write_recovery
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
+    }
+
     /// Build a service with a custom admission gate (CP-3 fencing).
     pub(crate) fn with_admission(
         journal: Option<Arc<dyn OperationJournal>>,
@@ -128,6 +162,8 @@ impl DmlService {
             coordinator: None,
             allow_unfenced_focused_test_support: true,
             statement_recovery: None,
+            ctas_recovery: RwLock::new(None),
+            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -210,36 +246,63 @@ impl DmlService {
     /// Drive one claimed recovery candidate through its family profile.
     ///
     /// The claim is taken under the candidate's exact operation lease, exactly
-    /// as the blanket deferral took it. A direct data-mutation family
-    /// (TRUNCATE, ADD FILES) converges through the CP-3C profile when one is
-    /// installed; every other family keeps the bounded deferral until its own
-    /// profile lands. The lease is released either way.
+    /// as the blanket deferral took it. CTAS converges through CP-3D, direct
+    /// mutations through CP-3C, and unsupported families keep the bounded
+    /// deferral. The lease is released either way.
     pub(crate) fn drive_recovery_candidate(
         &self,
         candidate: DmlRecoveryCandidate,
         now_ms: i64,
         deferred_due_at_ms: i64,
-    ) -> Result<Option<StatementRecoveryProgress>, DmlError> {
-        let Some(profile) = self.statement_recovery.as_ref() else {
-            self.defer_recovery_candidate(candidate, deferred_due_at_ms)?;
-            return Ok(None);
-        };
+    ) -> Result<Option<DmlRecoveryProgress>, DmlError> {
         let Some(mut active) = self.claim_recovery_candidate(candidate)? else {
             return Ok(None);
         };
         // The scan candidate carries no family, so the decision is taken from
-        // the claimed operation itself.
-        if direct_mutation_kind(active.stored.operation_kind).is_none() {
-            let result = active.reschedule_recovery_due(Some(deferred_due_at_ms));
-            let release = active.release();
-            return result.and(release).map(|()| None);
-        }
-        let result = profile.drive(&mut active, now_ms);
+        // the claimed operation itself. CTAS and direct mutations share this
+        // one bounded scheduler but retain independent typed profiles.
+        let result = if active.stored.operation_kind
+            == crate::dml::model::OperationKind::CreateTableAsSelect
+        {
+            let engine = self
+                .ctas_recovery
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            match engine {
+                Some(engine) => {
+                    let write_recovery = self
+                        .ctas_write_recovery
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    CtasRecoveryProfile::new(engine, write_recovery)
+                }
+                .drive(&mut active, now_ms)
+                .map(|progress| Some(DmlRecoveryProgress::Ctas(progress))),
+                None => active
+                    .reschedule_recovery_due(Some(deferred_due_at_ms))
+                    .map(|()| None),
+            }
+        } else if direct_mutation_kind(active.stored.operation_kind).is_some() {
+            match self.statement_recovery.as_ref() {
+                Some(profile) => profile
+                    .drive(&mut active, now_ms)
+                    .map(|progress| Some(DmlRecoveryProgress::Statement(progress))),
+                None => active
+                    .reschedule_recovery_due(Some(deferred_due_at_ms))
+                    .map(|()| None),
+            }
+        } else {
+            active
+                .reschedule_recovery_due(Some(deferred_due_at_ms))
+                .map(|()| None)
+        };
         // The lease is released whichever way the cycle went: a profile failure
         // must never strand the operation under a dead owner.
         let release = active.release();
         match result {
-            Ok(progress) => release.map(|()| Some(progress)),
+            Ok(progress) => release.map(|()| progress),
             Err(error) => {
                 // Losing the lease mid-cycle is an ordinary takeover, not a
                 // fault: the new owner re-drives the same immutable request.

@@ -49,11 +49,12 @@ use crate::dml::journal::{
 use crate::dml::model::{
     AddFilesMutationRequest, DML_COORDINATION_RESOURCE_CODEC_VERSION,
     DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DmlCoordinationClaimRequest, DmlCoordinationProvenance,
-    DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
-    DmlDirectMutationKind, DmlExternalFenceGeneration, DmlExternalFenceMutationRequest,
-    DmlExternalFenceReceiptRecord, DmlFencingTokenV1, DmlHistoricalWriteRecoveryRecord,
-    DmlOperationId, DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest,
-    OperationPayload, OperationState, StoredOperation, operation_requires_recovery_scan,
+    DmlCtasRecoveryMutationRequest, DmlCtasRecoveryRecord, DmlDirectMutationFenceMutationRequest,
+    DmlDirectMutationFenceReceiptRecord, DmlDirectMutationKind, DmlExternalFenceGeneration,
+    DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord, DmlFencingTokenV1,
+    DmlHistoricalWriteRecoveryRecord, DmlOperationId, DmlRecoveryDueRescheduleRequest,
+    OperationFact, OperationMutationRequest, OperationPayload, OperationState, StoredOperation,
+    operation_requires_recovery_scan,
 };
 use crate::dml::now_unix_millis;
 
@@ -981,6 +982,33 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
+    /// Validate and persist the provider-neutral CTAS recovery side record
+    /// under the same live operation authority as the top-level saga.
+    pub(crate) fn record_ctas_recovery(
+        &mut self,
+        recovery: DmlCtasRecoveryRecord,
+        recovery_due_at_ms: Option<i64>,
+    ) -> Result<(), DmlError> {
+        let request = DmlCtasRecoveryMutationRequest {
+            operation_id: self.operation_id(),
+            expected_revision: self.stored.revision,
+            mutation_id: Uuid::now_v7(),
+            recovery,
+        };
+        self.journal
+            .preflight_ctas_recovery(&request)
+            .map_err(|error| error.with_operation_id(self.operation_id()))?;
+        self.stored = self
+            .journal
+            .record_ctas_recovery_authorized(
+                request,
+                recovery_due_at_ms,
+                self.external_fence_journal_authority()?,
+            )
+            .map_err(|error| error.with_operation_id(self.operation_id()))?;
+        Ok(())
+    }
+
     fn external_fence_journal_authority(&self) -> Result<DmlMutationAuthority, DmlError> {
         #[cfg(test)]
         if self.authority.is_none()
@@ -1144,6 +1172,15 @@ impl ActiveDmlOperation {
     }
 
     pub(crate) fn journal_authority(&self) -> Result<DmlMutationAuthority, DmlError> {
+        #[cfg(test)]
+        if self.authority.is_none()
+            && let Some(testing) = self.testing_fence.as_ref()
+        {
+            return DmlMutationAuthority::try_new(
+                testing.proposal.coordination_attempt_id(),
+                Arc::clone(&testing.validator),
+            );
+        }
         self.authority
             .as_ref()
             .ok_or_else(|| {
@@ -1165,10 +1202,9 @@ impl ActiveDmlOperation {
     /// The recovery due this mutation must keep.
     ///
     /// A terminal statement result may only drop the due once nothing else
-    /// still needs the bounded recovery scan. CP-3B adds a second obligation
-    /// the operation state cannot express: an open historical write recovery
-    /// cycle, including a pending proof-bound cleanup, must survive a terminal
-    /// user-visible outcome (spec D5).
+    /// still needs the bounded recovery scan. CP-3B and CP-3D add obligations
+    /// the operation state cannot express: open historical write recovery and
+    /// retained CTAS staging must survive a terminal user-visible outcome.
     fn effective_recovery_due(
         &self,
         state: OperationState,
@@ -1177,7 +1213,12 @@ impl ActiveDmlOperation {
     ) -> Result<Option<i64>, DmlError> {
         if state.is_finished() {
             let historical = self.open_historical_write_recovery()?;
-            if !operation_requires_recovery_scan(state, payload, historical.as_ref()) {
+            let ctas = self.open_ctas_recovery()?;
+            if !operation_requires_recovery_scan(state, payload, historical.as_ref())
+                && ctas
+                    .as_ref()
+                    .is_none_or(|record| !record.requires_recovery_scan())
+            {
                 return Ok(None);
             }
         }
@@ -1199,6 +1240,15 @@ impl ActiveDmlOperation {
             .journal
             .load_historical_write_recovery(self.operation_id())
         {
+            Ok(record) => Ok(record),
+            Err(error) if error.kind() == DmlErrorKind::JournalUnavailable => Ok(None),
+            Err(error) => Err(error.with_operation_id(self.operation_id())),
+        }
+    }
+
+    /// The open CTAS recovery record, if this journal keeps one.
+    fn open_ctas_recovery(&self) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
+        match self.journal.load_ctas_recovery(self.operation_id()) {
             Ok(record) => Ok(record),
             Err(error) if error.kind() == DmlErrorKind::JournalUnavailable => Ok(None),
             Err(error) => Err(error.with_operation_id(self.operation_id())),

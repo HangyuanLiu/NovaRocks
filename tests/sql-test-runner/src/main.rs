@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod be_log_directive;
 mod benchmark_bootstrap;
 mod cluster;
-mod be_log_directive;
 mod config;
 mod fault_injection;
+mod fenced_catalog;
 mod iceberg_orphan_fixture;
 mod parser;
 mod results;
@@ -395,7 +396,10 @@ fn endpoint_reachable(endpoint: &str) -> bool {
 /// object-store endpoint is not reachable. Without this probe, the first
 /// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
 fn ensure_iceberg_object_store_prereqs(runner_config: &RunnerConfig) -> Result<()> {
-    if !runner_config.values.contains_key("iceberg_catalog_warehouse") {
+    if !runner_config
+        .values
+        .contains_key("iceberg_catalog_warehouse")
+    {
         return Ok(());
     }
     let endpoint = runner_config
@@ -1005,7 +1009,10 @@ fn run_explain_directive_checks(
     }
     let explain_text = exec.map(|e| e.text_output).unwrap_or_default();
     for needle in &step.meta.explain_contains {
-        if rewrite_contains_as_not_contains.iter().any(|value| value == needle) {
+        if rewrite_contains_as_not_contains
+            .iter()
+            .any(|value| value == needle)
+        {
             if explain_text.contains(needle.as_str()) {
                 return Err(format!(
                     "@explain_contains rewrite assertion failed.\\n  expected substring to be absent: {}\\n  EXPLAIN VERBOSE output:\\n{}",
@@ -1593,14 +1600,16 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             &step.meta,
             Arc::clone(&ctx.server_handle),
         );
-        let _cleanup_fault_guard = fault_injection::cleanup_fault_step_guard(
-            &step.meta,
-            Arc::clone(&ctx.server_handle),
-        );
+        let _cleanup_fault_guard =
+            fault_injection::cleanup_fault_step_guard(&step.meta, Arc::clone(&ctx.server_handle));
         let orphan_fixture = match step.meta.iceberg_orphan_fixture.as_deref() {
             Some(table) => match iceberg_orphan_fixture::install(table) {
                 Ok(fixture) => {
-                    let _ = writeln!(log, "    @iceberg_orphan_fixture installed {}", fixture.location());
+                    let _ = writeln!(
+                        log,
+                        "    @iceberg_orphan_fixture installed {}",
+                        fixture.location()
+                    );
                     Some(fixture)
                 }
                 Err(error) => {
@@ -1611,7 +1620,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             },
             None if step.meta.iceberg_orphan_fixture_absent => {
                 case_failed = true;
-                let _ = writeln!(log, "    ❌ @iceberg_orphan_fixture_absent requires @iceberg_orphan_fixture");
+                let _ = writeln!(
+                    log,
+                    "    ❌ @iceberg_orphan_fixture_absent requires @iceberg_orphan_fixture"
+                );
                 break;
             }
             None => None,
@@ -1818,8 +1830,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         &ctx.server_handle,
                         &mut target_session,
                         &mut log,
-                    )
-                    {
+                    ) {
                         case_failed = true;
                         let _ = writeln!(log, "    ❌ {error:#}");
                         continue;
@@ -2129,8 +2140,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &ctx.server_handle,
                             &mut target_session,
                             &mut log,
-                        )
-                        {
+                        ) {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ {error:#}");
                             continue;
@@ -2463,12 +2473,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 .lock()
                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
                 .and_then(|mut server_handle| {
-                    server_handle
-                        .await_query_execution_resource_convergence(
-                            &baseline,
-                            fault_injection::permits_terminal_retention(&step.meta),
-                            convergence_deadline,
-                        )
+                    server_handle.await_query_execution_resource_convergence(
+                        &baseline,
+                        fault_injection::permits_terminal_retention(&step.meta),
+                        convergence_deadline,
+                    )
                 });
             match resource_result {
                 Ok(()) => {
@@ -2870,7 +2879,9 @@ fn restart_frontend_after_step(
     if server.be_count() == 0 {
         bail!("@restart_fe_after_step requires a runner-owned cross-process frontend");
     }
-    server.restart_fe().context("restart frontend after successful SQL step")?;
+    server
+        .restart_fe()
+        .context("restart frontend after successful SQL step")?;
     drop(server);
     session
         .reconnect()
@@ -2995,23 +3006,35 @@ fn selected_cases_require_cleanup_faults(
         let suite = suite_configs
             .get(suite_name)
             .with_context(|| format!("selected suite {suite_name} is missing"))?;
-        let sql_dir = resolve_path(cli.sql_dir.as_deref(), base_dir)
-            .unwrap_or_else(|| suite.sql_dir.clone());
-        let sql_glob = cli.sql_glob.clone().unwrap_or_else(|| suite.sql_glob.clone());
+        let sql_dir =
+            resolve_path(cli.sql_dir.as_deref(), base_dir).unwrap_or_else(|| suite.sql_dir.clone());
+        let sql_glob = cli
+            .sql_glob
+            .clone()
+            .unwrap_or_else(|| suite.sql_glob.clone());
         let mut files = list_sql_files(&sql_dir, &sql_glob)?;
-        let available = files.iter().filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
-            .map(ToOwned::to_owned).collect::<HashSet<_>>();
+        let available = files
+            .iter()
+            .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
         let only = parse_selector_list(cli.only.as_deref(), &available, "--only")?;
         let skip = parse_selector_list(cli.skip.as_deref(), &available, "--skip")?;
         files.retain(|path| {
-            let Some(case_id) = path.file_stem().and_then(|stem| stem.to_str()) else { return false; };
+            let Some(case_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                return false;
+            };
             (only.is_empty() || only.contains(case_id)) && !skip.contains(case_id)
         });
-        if let Some(limit) = cli.limit { files.truncate(limit.min(files.len())); }
+        if let Some(limit) = cli.limit {
+            files.truncate(limit.min(files.len()));
+        }
         for path in files {
             let sql = fs::read_to_string(&path)
                 .with_context(|| format!("read cleanup fault preflight {}", path.display()))?;
-            if sql_text_has_cleanup_fault_directive(&sql) { return Ok(true); }
+            if sql_text_has_cleanup_fault_directive(&sql) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -3076,7 +3099,7 @@ fn run() -> Result<i32> {
     let cli = Cli::parse();
     let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
-    let runner_config = load_runner_config(config_path.as_deref())?;
+    let mut runner_config = load_runner_config(config_path.as_deref())?;
 
     ensure_iceberg_object_store_prereqs(&runner_config)?;
 
@@ -3093,6 +3116,7 @@ fn run() -> Result<i32> {
             return Ok(1);
         }
     };
+    let _fenced_catalog_fixture = start_fenced_catalog_fixture(&mut runner_config, &suite_names)?;
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
@@ -3749,6 +3773,64 @@ fn run() -> Result<i32> {
     finish_run_with_server_cleanup(server_handle, primary_result)
 }
 
+fn start_fenced_catalog_fixture(
+    runner_config: &mut RunnerConfig,
+    selected_suites: &[String],
+) -> Result<Option<fenced_catalog::FixtureHandle>> {
+    let enabled = runner_config
+        .values
+        .get("fenced_catalog.enabled")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if !enabled {
+        return Ok(None);
+    }
+    let allowed_suites = runner_config
+        .values
+        .get("fenced_catalog.suites")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    if allowed_suites.is_empty() {
+        bail!("fenced_catalog.enabled requires an explicit fenced_catalog.suites allowlist");
+    }
+    if let Some(disallowed) = selected_suites
+        .iter()
+        .find(|suite| !allowed_suites.contains(suite.as_str()))
+    {
+        bail!(
+            "fenced catalog fixture is acceptance-only; selected suite {disallowed} is not in fenced_catalog.suites"
+        );
+    }
+    let downstream = runner_config
+        .values
+        .get("iceberg_rest_uri")
+        .cloned()
+        .or_else(|| std::env::var("NOVAROCKS_ICEBERG_REST_URI").ok())
+        .context("fenced_catalog.enabled requires iceberg_rest_uri")?;
+    let sqlite = runner_config
+        .values
+        .get("fenced_catalog.sqlite_path")
+        .map(PathBuf::from)
+        .or_else(|| {
+            runner_config
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.join("fenced-catalog.sqlite"))
+        })
+        .context("fenced_catalog.enabled requires a runner config path or sqlite_path")?;
+    let fixture = fenced_catalog::FixtureHandle::start(downstream, sqlite)?;
+    runner_config
+        .values
+        .insert("iceberg_rest_uri".to_string(), fixture.uri().to_string());
+    Ok(Some(fixture))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cluster::{
@@ -3764,11 +3846,10 @@ mod tests {
     use crate::{
         AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
         bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
-        execute_target_session_sql_with,
-        expected_engine_error_code_diff_result, expected_engine_error_code_result,
-        finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
-        statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
-        validate_selected_suite_cluster,
+        execute_target_session_sql_with, expected_engine_error_code_diff_result,
+        expected_engine_error_code_result, finish_expected_error_step,
+        sql_text_has_query_lifecycle_fault_directive, statement_starts_dml_operation,
+        validate_dml_cluster_jobs, validate_fault_injection_jobs, validate_selected_suite_cluster,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3896,7 +3977,11 @@ mod tests {
     fn alter_job_poll_uses_structured_state_and_preserves_failure_message() {
         let execution = |state: &str, message: &str| QueryExecution {
             header: vec!["JobId".to_string(), "State".to_string(), "Msg".to_string()],
-            rows: vec![vec!["1".to_string(), state.to_string(), message.to_string()]],
+            rows: vec![vec![
+                "1".to_string(),
+                state.to_string(),
+                message.to_string(),
+            ]],
             text_output: format!("JobId\tState\tMsg\n1\t{state}\t{message}"),
             elapsed: Duration::ZERO,
         };
@@ -4956,5 +5041,41 @@ enable_path_style_access = true
             ImvStatelessLevel::Baseline,
             ImvStatelessLevel::Package
         ));
+    }
+
+    #[test]
+    fn fenced_catalog_fixture_rejects_an_unlisted_ordinary_suite() {
+        let mut config = crate::types::RunnerConfig::default();
+        config
+            .values
+            .insert("fenced_catalog.enabled".to_string(), "true".to_string());
+        config.values.insert(
+            "fenced_catalog.suites".to_string(),
+            "ctas-takeover".to_string(),
+        );
+        let result = super::start_fenced_catalog_fixture(
+            &mut config,
+            &["iceberg-compatibility".to_string()],
+        );
+        let error = match result {
+            Ok(_) => panic!("ordinary compatibility suite must not use the fenced fixture"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("acceptance-only"));
+    }
+
+    #[test]
+    fn fenced_catalog_fixture_requires_an_explicit_suite_allowlist() {
+        let mut config = crate::types::RunnerConfig::default();
+        config
+            .values
+            .insert("fenced_catalog.enabled".to_string(), "true".to_string());
+        let result =
+            super::start_fenced_catalog_fixture(&mut config, &["ctas-takeover".to_string()]);
+        let error = match result {
+            Ok(_) => panic!("enabled fixture must fail closed without a suite allowlist"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires an explicit"));
     }
 }

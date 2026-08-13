@@ -219,6 +219,7 @@ impl FrontendQueryService {
         truncate_engine: Arc<dyn TruncateEngine>,
         optimizer_query_mem_limit_bytes: u64,
     ) -> Self {
+        dml.install_ctas_recovery(Arc::clone(&ctas_engine));
         Self {
             engine,
             query_control,

@@ -18,6 +18,42 @@
   durable CTAS saga never classifies REST dispatch certainty from strings or
   the generic `Unexpected` error kind.
 
+- Added the versioned catalog-native CTAS fenced staged-publication extension.
+  `RestCatalog` installs it only when the real `/v1/config` response advertises
+  `fenced-staged-publication=1`; a user property with that name cannot enable
+  it. The extension reuses the resolved URI/prefix and the same authenticated,
+  header-configured, redacting `HttpClient` as standard REST operations.
+
+- Added typed `advance_fence`, `stage`, `inspect`, `publish`, and `abort`
+  calls under
+  `/v1/{prefix}/extensions/fenced-staged-publication/<operation>`. The bounded
+  wire types carry stable saga/action identity, ordered generation, sealed
+  digests, staged proof/locator, write completion, create policy, and terminal
+  provenance. Errors preserve local `Unsupported`, typed stale/identity/digest
+  conflicts, `KnownNotDispatched`, `PossiblyDispatched`,
+  `CommittedResponseInvalid`, and `Ambiguous`; advertised endpoint 404s or
+  invalid error bodies never become `NotCreated` or generic `Unsupported`.
+  Only strict status-plus-kind protocol pairs produce typed `Unsupported` or
+  `Conflict`; authentication, redirect, rate-limit, missing-endpoint, and
+  mismatched status/kind responses fail closed as `Ambiguous`.
+
+- The wire preserves the full lexicographically ordered generation triple
+  (`control-plane-incarnation`, `resource-epoch`, `fence-generation`) rather
+  than collapsing ownership into one counter. Stage and publish also carry the
+  explicit create policy sealed by its digest. A successful stage response
+  embeds the standard REST `LoadTableResult`; `RestCatalog` materializes that
+  result with the same runtime context and FileIO configuration, without a
+  second stage dispatch or client.
+
+- Publication success is a tagged `Published` or `NoOp` disposition, so
+  `IF NOT EXISTS` never collapses into a generic success. Historical `NoOp`
+  may retain an unpublished staged locator for proof-bound cleanup, while an
+  ambiguous observation carries a typed diagnostic and only optional opaque
+  proof. Every response body,
+  including 4xx and 5xx bodies, is content-length checked and incrementally
+  limited to 64 KiB before decoding. Opaque locators, proofs, receipts,
+  provenance, and provider payloads are redacted from `Debug` output.
+
 ## Validation
 
 This extracted crate's manifest resolves `iceberg = "0.9.0"` from crates.io

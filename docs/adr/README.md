@@ -109,6 +109,7 @@ code-anchors:
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 - ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
 - ADR-0069 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
+- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（active）
 
 #### 历史
 
@@ -187,6 +188,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0054 — Frontend DML 为何使用 operation-scoped StateStore authority、且不把它宣称为 external commit fencing（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 - ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
+- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（active）
 
 #### 历史
 

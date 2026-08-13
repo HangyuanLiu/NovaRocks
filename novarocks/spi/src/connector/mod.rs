@@ -18,6 +18,7 @@
 mod cleanup_maintenance;
 mod context;
 mod control;
+mod ctas_staged_publication;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
@@ -65,6 +66,28 @@ pub use control::{
     ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlPlanningLease,
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
+};
+pub use ctas_staged_publication::{
+    CONNECTOR_CTAS_STAGED_PUBLICATION_CONTRACT_VERSION, ConnectorCtasAbortDisposition,
+    ConnectorCtasAbortRequest, ConnectorCtasAbortResult, ConnectorCtasActionId,
+    ConnectorCtasAdvanceFenceRequest, ConnectorCtasConflictKind, ConnectorCtasFailure,
+    ConnectorCtasOperationId, ConnectorCtasProofPurpose, ConnectorCtasPublicationFence,
+    ConnectorCtasPublicationFenceReceipt, ConnectorCtasPublicationProof,
+    ConnectorCtasPublicationReceipt, ConnectorCtasPublishDisposition, ConnectorCtasPublishRequest,
+    ConnectorCtasPublishResult, ConnectorCtasStageRequest, ConnectorCtasStageResult,
+    ConnectorCtasStagedLocator, ConnectorCtasStagedPublication,
+    ConnectorCtasStagedPublicationCapability, ConnectorCtasStagedPublicationLease,
+    ConnectorCtasStagedTableDefinition, ConnectorHistoricalCtasAction,
+    ConnectorHistoricalCtasCheckpoint, ConnectorHistoricalCtasCleanupReceipt,
+    ConnectorHistoricalCtasCleanupRequest, ConnectorHistoricalCtasDescriptor,
+    ConnectorHistoricalCtasDispatchState, ConnectorHistoricalCtasDisposition,
+    ConnectorHistoricalCtasObservation, ConnectorHistoricalCtasStagedPublicationRecovery,
+    MAX_CONNECTOR_CTAS_DURABLE_WIRE_BYTES, MAX_CONNECTOR_CTAS_PUBLICATION_CHECKPOINTS,
+    MAX_CONNECTOR_CTAS_PUBLICATION_PAYLOAD_BYTES, connector_ctas_abort_request_digest,
+    connector_ctas_advance_fence_request_digest, connector_ctas_publish_request_digest,
+    connector_ctas_stage_request_digest, connector_ctas_staged_table_definition_digest,
+    connector_historical_ctas_descriptor_digest, connector_historical_ctas_observation_digest,
+    validate_ctas_staged_publication_owner, validate_historical_ctas_staged_publication_owner,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

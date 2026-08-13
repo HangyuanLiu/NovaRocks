@@ -160,10 +160,26 @@ impl IcebergControlProvider {
     pub(crate) fn staged_write_table_handle(
         &self,
         table: &crate::iceberg::table::Table,
+        staging_operation: ConnectorMutationOperationId,
         context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorTableHandle, ConnectorError> {
         self.validate_context(context)?;
-        let metadata = table.metadata();
+        let table_metadata = table.metadata();
+        let data_prefix = crate::catalog_control::staged_create::fenced_staging_data_prefix(
+            table_metadata.location(),
+            staging_operation,
+        );
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(
+            table_metadata.clone(),
+            None,
+        )
+        .set_properties(HashMap::from([(
+            "write.data.path".to_string(),
+            data_prefix,
+        )]))
+        .and_then(crate::iceberg::spec::TableMetadataBuilder::build)
+        .map(|result| result.metadata)
+        .map_err(|error| corrupt(format!("bind staged Iceberg data prefix: {error}")))?;
         let ident = table.identifier();
         let payload = IcebergTablePayload {
             namespace: ident.namespace.to_url_string(),
@@ -177,12 +193,12 @@ impl IcebergControlProvider {
                 schema_id: metadata.current_schema_id(),
                 location: metadata.location().to_string(),
                 schema: iceberg_schema_def(metadata.current_schema()),
-                serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
+                serialized_metadata: Some(serde_json::to_string(&metadata).map_err(|error| {
                     corrupt(format!("serialize staged Iceberg table metadata: {error}"))
                 })?),
                 serialized_metadata_rows: None,
             }),
-            metadata_columns: metadata_column_names(metadata),
+            metadata_columns: metadata_column_names(&metadata),
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,

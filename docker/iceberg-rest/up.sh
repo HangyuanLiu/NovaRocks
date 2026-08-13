@@ -41,6 +41,12 @@ spark_v3_smoke_sql="$runtime_dir/spark-iceberg-v3-smoke.sql"
 spark_sql_script="$SCRIPT_DIR/spark-sql.sh"
 config_file="${NOVA_ENV_CONFIG_FILE:-$SCRIPT_DIR/shared.env}"
 prepare_only=false
+caller_fenced_catalog_is_set=false
+caller_fenced_catalog=""
+if [[ -v NOVA_ENV_FENCED_CATALOG ]]; then
+  caller_fenced_catalog_is_set=true
+  caller_fenced_catalog="$NOVA_ENV_FENCED_CATALOG"
+fi
 
 for arg in "$@"; do
   case "$arg" in
@@ -60,6 +66,9 @@ if [[ -f "$config_file" ]]; then
   # shellcheck disable=SC1090
   source "$config_file"
   set +a
+fi
+if [[ "$caller_fenced_catalog_is_set" == "true" ]]; then
+  NOVA_ENV_FENCED_CATALOG="$caller_fenced_catalog"
 fi
 
 shared_docker="${NOVA_ENV_SHARED_DOCKER:-true}"
@@ -141,6 +150,7 @@ configured_rest_port="${NOVA_ENV_REST_PORT:-8181}"
 configured_spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-4040}"
 configured_spark_version="${NOVA_ENV_SPARK_VERSION:-3.5.5-java17}"
 configured_iceberg_version="${NOVA_ENV_ICEBERG_VERSION:-1.11.0}"
+configured_fenced_catalog="${NOVA_ENV_FENCED_CATALOG:-false}"
 
 if [[ -f "$exports_file" ]]; then
   # shellcheck disable=SC1090
@@ -426,6 +436,13 @@ iceberg_catalog_warehouse = $iceberg_warehouse
 iceberg_test_warehouse = $iceberg_test_warehouse
 iceberg_rest_uri = $rest_uri
 iceberg_rest_warehouse = $rest_warehouse
+
+[fenced_catalog]
+# Test-only catalog-native CTAS protocol proxy. It is never composed into a
+# NovaRocks production process and remains disabled for ordinary REST suites.
+enabled = $configured_fenced_catalog
+suites = ctas-takeover
+sqlite_path = $runtime_dir/fenced-catalog.sqlite
 EOF
 
 cat > "$runtime_dir/ice-rest-catalog.sql" <<EOF
@@ -527,6 +544,8 @@ export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone.toml"
 export NOVAROCKS_STANDALONE_SCHEDULER_CONFIG="$runtime_dir/standalone-scheduler.toml"
 export NOVAROCKS_STATE_STORE_PATH="$runtime_dir/frontend-state.sqlite"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
+export NOVA_ENV_FENCED_CATALOG="$configured_fenced_catalog"
+export NOVAROCKS_FENCED_CATALOG_STATE="$runtime_dir/fenced-catalog.sqlite"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
 export NOVAROCKS_SPARK_IMAGE="$spark_image"
 export NOVA_ENV_SPARK_VERSION="$spark_version"
@@ -560,7 +579,9 @@ cat > "$manifest_file" <<EOF
   "iceberg_rest": {
     "uri": "$rest_uri",
     "warehouse": "$rest_warehouse",
-    "server_default_warehouse": "$compose_rest_warehouse"
+    "server_default_warehouse": "$compose_rest_warehouse",
+    "fenced_fixture_enabled": $configured_fenced_catalog,
+    "fenced_fixture_state": "$runtime_dir/fenced-catalog.sqlite"
   },
   "spark": {
     "image": "$spark_image",

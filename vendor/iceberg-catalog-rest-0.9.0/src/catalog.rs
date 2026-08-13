@@ -17,6 +17,11 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
+#[path = "ctas_fenced_publication.rs"]
+mod ctas_fenced_publication;
+
+pub use ctas_fenced_publication::*;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
@@ -354,6 +359,9 @@ struct RestContext {
     ///
     /// It's could be different from the user config.
     config: RestCatalogConfig,
+    /// Properties advertised by `/v1/config`, excluding all user-supplied
+    /// properties. Extension capability gates must only consult this map.
+    server_properties: HashMap<String, String>,
 }
 
 /// Rest catalog implementation.
@@ -436,10 +444,15 @@ impl RestCatalog {
             .get_or_try_init(|| async {
                 let client = HttpClient::new(&self.user_config)?;
                 let catalog_config = RestCatalog::load_config(&client, &self.user_config).await?;
+                let server_properties = catalog_config.merged_properties();
                 let config = self.user_config.clone().merge_with_config(catalog_config);
                 let client = client.update_with(&config)?;
 
-                Ok(RestContext { config, client })
+                Ok(RestContext {
+                    config,
+                    client,
+                    server_properties,
+                })
             })
             .await
     }
@@ -627,6 +640,91 @@ impl RestCatalog {
         })
     }
 
+    /// Materialize the standard REST staged-table result returned inside the
+    /// fenced CTAS extension without creating another client or dispatching a
+    /// second stage request.
+    pub async fn materialize_ctas_staged_table(
+        &self,
+        table_ident: TableIdent,
+        staged_table: serde_json::Value,
+    ) -> Result<StagedTableCreate> {
+        let response: LoadTableResult = serde_json::from_value(staged_table).map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Invalid staged table result in CTAS extension response",
+            )
+            .with_source(error)
+        })?;
+        let config = response
+            .config
+            .into_iter()
+            .chain(self.user_config.props.clone())
+            .collect();
+        let file_io_location = response
+            .metadata_location
+            .as_deref()
+            .unwrap_or_else(|| response.metadata.location());
+        let file_io = self
+            .load_file_io(Some(file_io_location), Some(config))
+            .await?;
+        let table_builder = Table::builder()
+            .identifier(table_ident)
+            .file_io(file_io)
+            .metadata(response.metadata);
+        let table = match response.metadata_location {
+            Some(metadata_location) => table_builder.metadata_location(metadata_location).build(),
+            None => table_builder.build(),
+        }?;
+        let initialization_updates = table.metadata().staged_create_initialization_updates()?;
+        Ok(StagedTableCreate {
+            table,
+            initialization_updates,
+        })
+    }
+
+    /// Encode one standard REST staged-create request as a bounded extension
+    /// payload. The fence-aware catalog owns dispatch and linearization; this
+    /// helper only reuses the exact request shape of ordinary REST staging.
+    pub async fn encode_ctas_stage_provider_payload(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<String> {
+        let body = serde_json::to_value(CreateTableRequest {
+            name: creation.name,
+            location: creation.location,
+            schema: creation.schema,
+            partition_spec: creation.partition_spec,
+            write_order: creation.sort_order,
+            stage_create: Some(true),
+            properties: creation.properties,
+        })?;
+        encode_ctas_downstream_action(
+            Method::POST,
+            self.context().await?.config.tables_endpoint(namespace),
+            body,
+        )
+    }
+
+    /// Encode one standard REST assert-create commit for execution inside the
+    /// fence-aware catalog transaction. No downstream request is sent here.
+    pub async fn encode_ctas_publish_provider_payload(
+        &self,
+        mut commit: TableCommit,
+    ) -> Result<String> {
+        let identifier = commit.identifier().clone();
+        let body = serde_json::to_value(CommitTableRequest {
+            identifier: Some(identifier.clone()),
+            requirements: commit.take_requirements(),
+            updates: commit.take_updates(),
+        })?;
+        encode_ctas_downstream_action(
+            Method::POST,
+            self.context().await?.config.table_endpoint(&identifier),
+            body,
+        )
+    }
+
     /// Submit one staged table commit without reloading the invisible table.
     /// The typed result preserves conflict, pre-dispatch, uncertain-dispatch,
     /// and committed-but-unreadable response states.
@@ -799,6 +897,37 @@ impl RestCatalog {
     pub async fn regenerate_token(&self) -> Result<()> {
         self.context().await?.client.regenerate_token().await
     }
+}
+
+fn encode_ctas_downstream_action(
+    method: Method,
+    absolute_url: String,
+    body: serde_json::Value,
+) -> Result<String> {
+    let url = Url::parse(&absolute_url).map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Invalid REST endpoint for CTAS downstream action",
+        )
+        .with_source(error)
+    })?;
+    let mut path = url.path().to_string();
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    serde_json::to_string(&serde_json::json!({
+        "method": method.as_str(),
+        "path": path,
+        "body": body,
+    }))
+    .map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Failed to encode CTAS downstream REST action",
+        )
+        .with_source(error)
+    })
 }
 
 /// All requests and expected responses are derived from the REST catalog API spec:

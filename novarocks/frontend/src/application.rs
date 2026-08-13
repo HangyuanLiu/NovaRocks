@@ -431,8 +431,13 @@ impl FrontendApplicationHost {
             // separately installed historical facet, so it is given the
             // control registry rather than any process-global state.
             dml.install_statement_recovery(
-                crate::dml::statement_recovery::control_registry_resolver(connector_control),
+                crate::dml::statement_recovery::control_registry_resolver(Arc::clone(
+                    &connector_control,
+                )),
             );
+            dml.install_ctas_write_recovery(crate::dml::write_recovery::control_registry_resolver(
+                connector_control,
+            ));
             dml
         }));
         if host.coordination.is_some() {

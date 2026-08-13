@@ -43,18 +43,19 @@ use crate::dml::model::{
     DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
     DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DML_OPERATION_SCHEMA_VERSION,
     DML_RECOVERY_DUE_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE, DML_RECOVERY_SHARD_COUNT,
-    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest,
-    DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
-    DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord,
-    DmlHistoricalDataMutationRecoveryMutationRequest, DmlHistoricalDataMutationRecoveryRecord,
-    DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord, DmlOperationId,
-    DmlRecoveryCandidate, DmlRecoveryDueRescheduleRequest, DurableExternalFact,
-    ExternalFactOutcome, OperationFact, OperationKind, OperationMutationRequest, OperationPayload,
-    OperationState, OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
-    operation_requires_recovery_scan, operation_requires_recovery_scan_with_direct_mutation,
-    validate_direct_mutation_fence_receipt, validate_direct_mutation_fence_transition,
-    validate_external_fence_receipt, validate_external_fence_transition,
-    validate_historical_data_mutation_recovery,
+    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest, DmlCtasRecoveryMutationRequest,
+    DmlCtasRecoveryRecord, DmlDirectMutationFenceMutationRequest,
+    DmlDirectMutationFenceReceiptRecord, DmlExternalFenceMutationRequest,
+    DmlExternalFenceReceiptRecord, DmlHistoricalDataMutationRecoveryMutationRequest,
+    DmlHistoricalDataMutationRecoveryRecord, DmlHistoricalWriteRecoveryMutationRequest,
+    DmlHistoricalWriteRecoveryRecord, DmlOperationId, DmlRecoveryCandidate,
+    DmlRecoveryDueRescheduleRequest, DurableExternalFact, ExternalFactOutcome, OperationFact,
+    OperationKind, OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
+    SourceScopeOwnership, StatementNextAction, StoredOperation, operation_requires_recovery_scan,
+    operation_requires_recovery_scan_with_direct_mutation, validate_ctas_recovery,
+    validate_ctas_recovery_transition, validate_direct_mutation_fence_receipt,
+    validate_direct_mutation_fence_transition, validate_external_fence_receipt,
+    validate_external_fence_transition, validate_historical_data_mutation_recovery,
     validate_historical_data_mutation_recovery_transition, validate_historical_write_recovery,
     validate_historical_write_recovery_transition, validate_operation_transition,
     validate_statement_operation_transition,
@@ -72,6 +73,7 @@ const HISTORICAL_WRITE_RECOVERY_PREFIX: &[u8] =
 const DIRECT_MUTATION_FENCE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/direct-mutation-fences/";
 const HISTORICAL_DATA_MUTATION_RECOVERY_PREFIX: &[u8] =
     b"novarocks/frontend/dml/v1/historical-data-mutation-recoveries/";
+const CTAS_RECOVERY_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/ctas-recoveries/";
 const ADD_FILES_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Operation states in which an external operation fence receipt may still be
@@ -270,7 +272,7 @@ impl StateStoreOperationJournal {
         };
         validate_operation(&operation)?;
         // A statement operation is being created, so no side record can exist.
-        validate_recovery_due_scope(&operation, None, None)?;
+        validate_recovery_due_scope(&operation, None, None, None)?;
         let operation_id = operation.operation_id;
         let mutation_id = operation.last_mutation_id;
         let operation_key = operation_key(operation_id)?;
@@ -474,6 +476,10 @@ impl StateStoreOperationJournal {
                         Ok(direct_mutation) => direct_mutation,
                         Err(error) => return Ok(Err(error)),
                     };
+                    let ctas = match load_ctas_recovery_in(transaction, operation_id).await {
+                        Ok(ctas) => ctas,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     let previous = operation.clone();
                     operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
                     operation.revision = match operation.revision.checked_add(1) {
@@ -501,12 +507,18 @@ impl StateStoreOperationJournal {
                         operation_id,
                         None,
                         direct_mutation.as_ref(),
+                        ctas.as_ref(),
                         operation.recovery_due_at_ms,
                     ) {
                         return Ok(Err(error));
                     }
                     if let Err(error) =
-                        validate_recovery_due_scope(&operation, None, direct_mutation.as_ref())
+                        validate_recovery_due_scope(
+                            &operation,
+                            None,
+                            direct_mutation.as_ref(),
+                            ctas.as_ref(),
+                        )
                     {
                         return Ok(Err(error));
                     }
@@ -690,12 +702,18 @@ impl StateStoreOperationJournal {
                         operation_id,
                         None,
                         direct_mutation.as_ref(),
+                        None,
                         operation.recovery_due_at_ms,
                     ) {
                         return Ok(Err(error));
                     }
                     if let Err(error) =
-                        validate_recovery_due_scope(&operation, None, direct_mutation.as_ref())
+                        validate_recovery_due_scope(
+                            &operation,
+                            None,
+                            direct_mutation.as_ref(),
+                            None,
+                        )
                     {
                         return Ok(Err(error));
                     }
@@ -1111,6 +1129,23 @@ impl StateStoreOperationJournal {
         .await
     }
 
+    async fn record_ctas_recovery_async(
+        &self,
+        request: DmlCtasRecoveryMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.apply_side_record_mutation_async(
+            request.operation_id,
+            request.expected_revision,
+            request.mutation_id,
+            recovery_due_at_ms,
+            DmlSideRecord::CtasRecovery(Box::new(request.recovery)),
+            authority,
+        )
+        .await
+    }
+
     /// Publish one CP-3B or CP-3C side record atomically with the operation
     /// revision it belongs to.
     ///
@@ -1235,10 +1270,20 @@ impl StateStoreOperationJournal {
                             Err(error) => return Ok(Err(error)),
                         },
                     };
+                    let ctas = match &side {
+                        DmlSideRecord::CtasRecovery(recovery) => {
+                            Some(recovery.as_ref().clone())
+                        }
+                        _ => match load_ctas_recovery_in(transaction, operation_id).await {
+                            Ok(ctas) => ctas,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                    };
                     if let Err(error) = validate_historical_retention(
                         operation_id,
                         historical.as_ref(),
                         direct_mutation.as_ref(),
+                        ctas.as_ref(),
                         recovery_due_at_ms,
                     ) {
                         return Ok(Err(error));
@@ -1263,6 +1308,7 @@ impl StateStoreOperationJournal {
                         &operation,
                         historical.as_ref(),
                         direct_mutation.as_ref(),
+                        ctas.as_ref(),
                     ) {
                         return Ok(Err(error));
                     }
@@ -1352,6 +1398,17 @@ impl StateStoreOperationJournal {
         self.load_side_record(&key)
             .await?
             .map(|value| decode_historical_data_mutation_recovery(&key, value))
+            .transpose()
+    }
+
+    async fn load_ctas_recovery_async(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
+        let key = ctas_recovery_key(operation_id)?;
+        self.load_side_record(&key)
+            .await?
+            .map(|value| decode_ctas_recovery(&key, value))
             .transpose()
     }
 
@@ -1466,10 +1523,15 @@ impl StateStoreOperationJournal {
                         Ok(direct_mutation) => direct_mutation,
                         Err(error) => return Ok(Err(error)),
                     };
+                    let ctas = match load_ctas_recovery_in(transaction, operation_id).await {
+                        Ok(ctas) => ctas,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     if let Err(error) = validate_historical_retention(
                         operation_id,
                         historical.as_ref(),
                         direct_mutation.as_ref(),
+                        ctas.as_ref(),
                         recovery_due_at_ms,
                     ) {
                         return Ok(Err(error));
@@ -1497,6 +1559,7 @@ impl StateStoreOperationJournal {
                         &operation,
                         historical.as_ref(),
                         direct_mutation.as_ref(),
+                        ctas.as_ref(),
                     ) {
                         return Ok(Err(error));
                     }
@@ -2209,6 +2272,32 @@ impl OperationJournal for StateStoreOperationJournal {
             .map(|_| ())
     }
 
+    fn record_ctas_recovery_authorized(
+        &self,
+        request: DmlCtasRecoveryMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.record_ctas_recovery_async(request, recovery_due_at_ms, authority))
+    }
+
+    fn load_ctas_recovery(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
+        self.blocking(self.load_ctas_recovery_async(operation_id))
+    }
+
+    fn preflight_ctas_recovery(
+        &self,
+        request: &DmlCtasRecoveryMutationRequest,
+    ) -> Result<(), DmlError> {
+        validate_ctas_recovery(&request.recovery).map_err(DmlError::journal_corruption)?;
+        DmlSideRecord::CtasRecovery(Box::new(request.recovery.clone()))
+            .encode(self.store.limits().max_value_bytes)
+            .map(|_| ())
+    }
+
     fn recovery_candidates(
         &self,
         shard: u8,
@@ -2338,10 +2427,10 @@ impl StateStoreOperationJournal {
     }
 }
 
-/// One CP-3B or CP-3C durable record that lives beside its DML operation.
+/// One CP-3B, CP-3C, or CP-3D durable record that lives beside its DML operation.
 ///
 /// Every kind is published in the same StateStore transaction that advances the
-/// operation revision, so the operation record itself keeps its v7 shape and a
+/// operation revision, so the operation record itself keeps its v8 shape and a
 /// fenced mutation is the only way to change any of them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DmlSideRecord {
@@ -2349,6 +2438,7 @@ enum DmlSideRecord {
     HistoricalWriteRecovery(Box<DmlHistoricalWriteRecoveryRecord>),
     DirectMutationFence(Box<DmlDirectMutationFenceReceiptRecord>),
     HistoricalDataMutationRecovery(Box<DmlHistoricalDataMutationRecoveryRecord>),
+    CtasRecovery(Box<DmlCtasRecoveryRecord>),
 }
 
 impl DmlSideRecord {
@@ -2358,6 +2448,7 @@ impl DmlSideRecord {
             Self::HistoricalWriteRecovery(_) => "historical write recovery",
             Self::DirectMutationFence(_) => "direct mutation fence receipt",
             Self::HistoricalDataMutationRecovery(_) => "historical data mutation recovery",
+            Self::CtasRecovery(_) => "CTAS recovery",
         }
     }
 
@@ -2369,6 +2460,7 @@ impl DmlSideRecord {
             Self::HistoricalDataMutationRecovery(_) => {
                 "record frontend DML historical data mutation recovery"
             }
+            Self::CtasRecovery(_) => "record frontend CTAS recovery",
         }
     }
 
@@ -2380,6 +2472,7 @@ impl DmlSideRecord {
             Self::HistoricalDataMutationRecovery(_) => {
                 historical_data_mutation_recovery_key(operation_id)
             }
+            Self::CtasRecovery(_) => ctas_recovery_key(operation_id),
         }
     }
 
@@ -2395,6 +2488,9 @@ impl DmlSideRecord {
                 decode_historical_data_mutation_recovery(key, value)
                     .map(|record| Self::HistoricalDataMutationRecovery(Box::new(record)))
             }
+            Self::CtasRecovery(_) => {
+                decode_ctas_recovery(key, value).map(|record| Self::CtasRecovery(Box::new(record)))
+            }
         }
     }
 
@@ -2404,6 +2500,7 @@ impl DmlSideRecord {
             Self::HistoricalWriteRecovery(record) => serde_json::to_vec(record.as_ref()),
             Self::DirectMutationFence(record) => serde_json::to_vec(record.as_ref()),
             Self::HistoricalDataMutationRecovery(record) => serde_json::to_vec(record.as_ref()),
+            Self::CtasRecovery(record) => serde_json::to_vec(record.as_ref()),
         }
         .map_err(DmlError::journal_corruption)?;
         if encoded.len() > max_value_bytes {
@@ -2529,8 +2626,128 @@ impl DmlSideRecord {
                 validate_historical_data_mutation_recovery_transition(existing, recovery)
                     .map_err(DmlError::journal_corruption)
             }
+            (Self::CtasRecovery(recovery), existing) => {
+                let existing = match existing {
+                    Some(Self::CtasRecovery(existing)) => Some(existing.as_ref()),
+                    Some(_) => {
+                        return Err(DmlError::journal_corruption(
+                            "CTAS recovery key holds another record kind",
+                        ));
+                    }
+                    None => None,
+                };
+                if operation.operation_kind != OperationKind::CreateTableAsSelect {
+                    return Err(DmlError::journal_corruption(format!(
+                        "DML operation {} cannot accept a CTAS recovery record",
+                        operation.operation_id
+                    )));
+                }
+                let OperationPayload::CtasSaga(saga) = &operation.payload else {
+                    return Err(DmlError::journal_corruption(format!(
+                        "DML operation {} has no CTAS saga payload",
+                        operation.operation_id
+                    )));
+                };
+                validate_ctas_recovery_against_saga(recovery, saga)?;
+                if recovery.recovery_attempt_id != authority.coordination_attempt_id() {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} CTAS recovery belongs to another coordination attempt",
+                        operation.operation_id
+                    )));
+                }
+                validate_ctas_recovery_transition(existing, recovery)
+                    .map_err(DmlError::journal_corruption)
+            }
         }
     }
+}
+
+fn validate_ctas_recovery_against_saga(
+    recovery: &DmlCtasRecoveryRecord,
+    saga: &CtasSagaRecord,
+) -> Result<(), DmlError> {
+    use crate::dml::model::{DmlCtasActionKind, DmlCtasDispatchCertainty};
+
+    let mut chains = [
+        (
+            DmlCtasActionKind::AdvanceFence,
+            recovery
+                .catalog_fence_history
+                .iter()
+                .chain(recovery.catalog_fence.iter())
+                .map(|fence| fence.action_id)
+                .collect(),
+        ),
+        (DmlCtasActionKind::Stage, vec![saga.prepare_operation_id]),
+        (DmlCtasActionKind::Write, vec![saga.write_operation_id]),
+        (DmlCtasActionKind::Publish, vec![saga.publish_operation_id]),
+        (
+            DmlCtasActionKind::Abort,
+            vec![saga.abort_staging_operation_id],
+        ),
+    ];
+    let mut child_ids = BTreeSet::from([
+        saga.prepare_operation_id,
+        saga.write_operation_id,
+        saga.publish_operation_id,
+        saga.abort_staging_operation_id,
+    ]);
+    for supersession in &recovery.child_supersessions {
+        let chain = chains
+            .iter_mut()
+            .find(|(action, _)| *action == supersession.action)
+            .expect("all CTAS actions have a base child");
+        if chain.1.last().copied() != Some(supersession.predecessor_child_operation_id) {
+            return Err(DmlError::journal_corruption(
+                "CTAS child supersession does not continue the durable action chain",
+            ));
+        }
+        if !child_ids.insert(supersession.successor_child_operation_id) {
+            return Err(DmlError::journal_corruption(
+                "CTAS child supersession reuses an operation id",
+            ));
+        }
+        chain.1.push(supersession.successor_child_operation_id);
+    }
+    for checkpoint in &recovery.dispatch_checkpoints {
+        let belongs_to_action = chains
+            .iter()
+            .find(|(action, _)| *action == checkpoint.action)
+            .map(|(_, children)| children.contains(&checkpoint.child_operation_id))
+            .expect("all CTAS actions have a base child");
+        if !belongs_to_action {
+            return Err(DmlError::journal_corruption(
+                "CTAS dispatch checkpoint is not bound to its action supersession chain",
+            ));
+        }
+    }
+    for observation in &recovery.historical_observations {
+        if observation.action == DmlCtasActionKind::Write {
+            return Err(DmlError::journal_corruption(
+                "CTAS catalog recovery cannot classify the distributed write child",
+            ));
+        }
+        let possibly_dispatched = observation.action == DmlCtasActionKind::AdvanceFence
+            && recovery
+                .catalog_fence_history
+                .iter()
+                .chain(recovery.catalog_fence.iter())
+                .any(|fence| {
+                    fence.action_id == observation.child_operation_id
+                        && fence.receipt_payload.is_some()
+                })
+            || recovery.dispatch_checkpoints.iter().any(|checkpoint| {
+                checkpoint.action == observation.action
+                    && checkpoint.child_operation_id == observation.child_operation_id
+                    && checkpoint.dispatch_certainty == DmlCtasDispatchCertainty::PossiblyDispatched
+            });
+        if !possibly_dispatched {
+            return Err(DmlError::journal_corruption(
+                "CTAS historical observation requires a possibly-dispatched action checkpoint",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn external_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
@@ -2547,6 +2764,10 @@ fn direct_mutation_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlErr
 
 fn historical_data_mutation_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(HISTORICAL_DATA_MUTATION_RECOVERY_PREFIX, operation_id)
+}
+
+fn ctas_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
+    key_for(CTAS_RECOVERY_PREFIX, operation_id)
 }
 
 fn decode_external_fence(
@@ -2593,6 +2814,14 @@ fn decode_historical_data_mutation_recovery(
     Ok(record)
 }
 
+fn decode_ctas_recovery(key: &Key, value: Value) -> Result<DmlCtasRecoveryRecord, DmlError> {
+    decode_key(CTAS_RECOVERY_PREFIX, key)?;
+    let record: DmlCtasRecoveryRecord =
+        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+    validate_ctas_recovery(&record).map_err(DmlError::journal_corruption)?;
+    Ok(record)
+}
+
 /// Read the durable historical write recovery record inside an open
 /// transaction, so a fenced mutation can weigh it before it changes anything.
 async fn load_historical_write_recovery_in(
@@ -2629,6 +2858,21 @@ async fn load_historical_data_mutation_recovery_in(
     decode_historical_data_mutation_recovery(&key, record.value).map(Some)
 }
 
+async fn load_ctas_recovery_in(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: DmlOperationId,
+) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
+    let key = ctas_recovery_key(operation_id)?;
+    let Some(record) = transaction
+        .get(&key)
+        .await
+        .map_err(DmlError::journal_unavailable)?
+    else {
+        return Ok(None);
+    };
+    decode_ctas_recovery(&key, record.value).map(Some)
+}
+
 /// Refuse to drop the bounded recovery scan while a durable historical recovery
 /// record still needs it.
 ///
@@ -2641,6 +2885,7 @@ fn validate_historical_retention(
     operation_id: DmlOperationId,
     historical: Option<&DmlHistoricalWriteRecoveryRecord>,
     direct_mutation: Option<&DmlHistoricalDataMutationRecoveryRecord>,
+    ctas: Option<&DmlCtasRecoveryRecord>,
     recovery_due_at_ms: Option<i64>,
 ) -> Result<(), DmlError> {
     if recovery_due_at_ms.is_some() {
@@ -2662,6 +2907,13 @@ fn validate_historical_retention(
             recovery.phase.as_str()
         )));
     }
+    if let Some(recovery) = ctas
+        && recovery.requires_recovery_scan()
+    {
+        return Err(DmlError::journal_unresolved(format!(
+            "DML operation {operation_id} cannot drop its recovery due while CTAS catalog recovery or cleanup retention is still open"
+        )));
+    }
     Ok(())
 }
 
@@ -2675,13 +2927,14 @@ fn validate_recovery_due_scope(
     operation: &StoredOperation,
     historical: Option<&DmlHistoricalWriteRecoveryRecord>,
     direct_mutation: Option<&DmlHistoricalDataMutationRecoveryRecord>,
+    ctas: Option<&DmlCtasRecoveryRecord>,
 ) -> Result<(), DmlError> {
     let required = operation_requires_recovery_scan_with_direct_mutation(
         operation.state,
         &operation.payload,
         historical,
         direct_mutation,
-    );
+    ) || ctas.is_some_and(DmlCtasRecoveryRecord::requires_recovery_scan);
     if required != operation.recovery_due_at_ms.is_some() {
         return Err(DmlError::journal_corruption(format!(
             "DML operation {} has inconsistent recovery due eligibility",

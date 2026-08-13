@@ -935,23 +935,17 @@ struct HistoricalWriteFacts {
     recovery_attempt_id: Uuid,
 }
 
-/// Rebuild the historical facts, proving every reconstructed identity against
-/// the digests the durable fence receipt already sealed.
-fn historical_write_facts(
-    stored: &StoredOperation,
+pub(crate) fn reconstruct_historical_write_fence(
     fence_record: &DmlExternalFenceReceiptRecord,
-    proposal: &DmlExternalFenceProposal,
-    durable: Option<&DmlHistoricalWriteRecoveryRecord>,
-) -> Result<HistoricalWriteFacts, String> {
-    let connector_operation_id =
-        ConnectorWriteOperationId::from_bytes(*fence_record.identity.write_operation_id.as_bytes());
-    let table = table_identity(&stored.target)?;
-    let target_ref = target_ref(&stored.target)?;
-
-    // Rebuilding the fence value and comparing it against the sealed digest is
-    // what proves the reconstructed table and target ref are the exact fenced
-    // resource. A mismatch means the frontend cannot name what was fenced, and
-    // guessing is forbidden.
+    connector_operation_id: ConnectorWriteOperationId,
+    table: ConnectorTableIdentity,
+    target_ref: ConnectorWriteTargetRef,
+) -> Result<ConnectorHistoricalWriteFence, String> {
+    if fence_record.identity.write_operation_id
+        != Uuid::from_bytes(connector_operation_id.to_bytes())
+    {
+        return Err("the durable fence receipt belongs to another write operation".to_string());
+    }
     let historical_fence_value = ConnectorExternalOperationFence::try_new(
         ConnectorClusterIdentity::try_from_digest(digest_bytes(
             &fence_record.identity.cluster_identity_digest,
@@ -966,8 +960,8 @@ fn historical_write_facts(
         .map_err(|error| error.to_string())?,
         connector_operation_id,
         *fence_record.identity.coordination_attempt_id.as_bytes(),
-        table.clone(),
-        target_ref.clone(),
+        table,
+        target_ref,
     )
     .map_err(|error| error.to_string())?;
     if hex::encode(historical_fence_value.digest()) != fence_record.fence_digest {
@@ -986,9 +980,33 @@ fn historical_write_facts(
             "the durable external fence receipt digest does not seal its payload".to_string(),
         );
     }
-    let historical_fence =
-        ConnectorHistoricalWriteFence::established(&historical_receipt, historical_fence_value)
-            .map_err(|error| error.to_string())?;
+    ConnectorHistoricalWriteFence::established(&historical_receipt, historical_fence_value)
+        .map_err(|error| error.to_string())
+}
+
+/// Rebuild the historical facts, proving every reconstructed identity against
+/// the digests the durable fence receipt already sealed.
+fn historical_write_facts(
+    stored: &StoredOperation,
+    fence_record: &DmlExternalFenceReceiptRecord,
+    proposal: &DmlExternalFenceProposal,
+    durable: Option<&DmlHistoricalWriteRecoveryRecord>,
+) -> Result<HistoricalWriteFacts, String> {
+    let connector_operation_id =
+        ConnectorWriteOperationId::from_bytes(*fence_record.identity.write_operation_id.as_bytes());
+    let table = table_identity(&stored.target)?;
+    let target_ref = target_ref(&stored.target)?;
+
+    // Rebuilding the fence value and comparing it against the sealed digest is
+    // what proves the reconstructed table and target ref are the exact fenced
+    // resource. A mismatch means the frontend cannot name what was fenced, and
+    // guessing is forbidden.
+    let historical_fence = reconstruct_historical_write_fence(
+        fence_record,
+        connector_operation_id,
+        table.clone(),
+        target_ref.clone(),
+    )?;
 
     // The raised fence is minted from the live lease of *this* recovery attempt
     // and must strictly supersede the historical one; otherwise the historical
