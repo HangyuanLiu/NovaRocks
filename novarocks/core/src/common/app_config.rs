@@ -246,9 +246,6 @@ pub struct NovaRocksConfig {
     pub runtime: RuntimeConfig,
 
     #[serde(default)]
-    pub metadata: Option<MetadataConfig>,
-
-    #[serde(default)]
     pub state_store: Option<StateStoreAppConfig>,
 
     #[serde(default)]
@@ -316,7 +313,6 @@ impl Default for NovaRocksConfig {
             sys_log_roll_num: default_sys_log_roll_num(),
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
-            metadata: None,
             state_store: None,
             foundationdb_client: None,
             standalone_server: None,
@@ -385,20 +381,6 @@ impl Default for ServerConfig {
             grpc_port: default_grpc_port(),
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct MetadataConfig {
-    #[serde(default)]
-    pub provider: MetadataProviderConfig,
-    pub path: PathBuf,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MetadataProviderConfig {
-    #[default]
-    Sqlite,
 }
 
 /// Shared object-store credentials loaded independently by every backend at
@@ -1540,13 +1522,11 @@ impl Default for CacheConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use novarocks_state_store::config::StateStoreProviderConfig;
 
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
-        StandaloneServerConfig, validate_query_control_config,
+        DEFAULT_MEM_LIMIT_SPEC, NovaRocksConfig, RuntimeConfig, StandaloneServerConfig,
+        validate_query_control_config,
     };
 
     #[test]
@@ -1909,22 +1889,6 @@ mv_partition_state_max_entries = 11
         assert_eq!(cfg.mv_refresh_max_touched_groups, 7);
         assert_eq!(cfg.mv_refresh_max_affected_partitions, 3);
         assert_eq!(cfg.mv_partition_state_max_entries, 11);
-    }
-
-    #[test]
-    fn test_metadata_config_parses_sqlite_provider() {
-        let toml = r#"
-[metadata]
-provider = "sqlite"
-path = "meta/catalog.db"
-
-[standalone_server]
-mysql_port = 19030
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse config");
-        let metadata = cfg.metadata.expect("metadata config");
-        assert_eq!(metadata.provider, MetadataProviderConfig::Sqlite);
-        assert_eq!(metadata.path, PathBuf::from("meta/catalog.db"));
     }
 
     #[test]

@@ -534,6 +534,8 @@ fn insert_value_to_literal(value: &InsertValue) -> Literal {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::common::app_config::ClusterRole;
     use crate::common::types::UniqueId;
@@ -541,7 +543,9 @@ mod tests {
     use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::outcome::QueryExecutionResult;
     use crate::query_execution::request_context::{RequestAdmission, RequestContext};
-    use crate::query_execution::write::WriteCommitInput;
+    use crate::query_execution::write::{
+        WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
+    };
     use crate::runtime::query_result::QueryResult;
     use crate::sql::optimizer::options::SessionOptimizerSettings;
 
@@ -558,6 +562,32 @@ mod tests {
         ));
         cancellation.request(QueryCancellationReason::ClientDisconnected);
         request.execution().clone()
+    }
+
+    fn write_abort_with_staged_report() -> WriteAbortInput {
+        let write_id = UniqueId::new(10, 20);
+        let writer_key = WriterKey {
+            query_id: write_id,
+            fragment_instance_id: UniqueId::new(101, 201),
+            backend_num: 0,
+        };
+        WriteAbortInput {
+            write_id,
+            reason: "query timed out waiting for write final reports".to_string(),
+            completed_writer_outputs: vec![WriterCommitInput {
+                writer_id: 0,
+                fragment_id: 0,
+                writer_key,
+                connector_staged_report_frames: vec![
+                    novarocks_protocol::novarocks::ConnectorStagedReportFrame::default(),
+                ],
+                load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
+                loaded_rows: 11,
+                loaded_bytes: 110,
+                filtered_rows: 0,
+            }],
+            incomplete_writers: Vec::new(),
+        }
     }
 
     #[test]
@@ -684,10 +714,7 @@ mod tests {
         let report = iceberg_write_report_from_result(QueryExecutionResult {
             query_result: QueryResult::empty(),
             write_commit: None,
-            write_abort: Some(
-                crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file(
-                ),
-            ),
+            write_abort: Some(write_abort_with_staged_report()),
             connector_completion: None,
             fragment_profiles: Vec::new(),
         });
@@ -705,8 +732,7 @@ mod tests {
 
     #[test]
     fn query_execution_result_does_not_treat_empty_commit_info_as_staged_file() {
-        let mut abort =
-            crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file();
+        let mut abort = write_abort_with_staged_report();
         abort.completed_writer_outputs[0]
             .connector_staged_report_frames
             .clear();

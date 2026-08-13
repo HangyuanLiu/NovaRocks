@@ -21,7 +21,6 @@ pub mod catalog_application;
 pub mod common;
 pub mod connector;
 pub mod engine;
-pub mod meta;
 pub mod mv;
 pub mod protocol;
 pub mod query_execution;

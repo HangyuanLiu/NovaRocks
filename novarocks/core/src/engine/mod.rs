@@ -16,12 +16,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::OnceLock;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock, Weak};
-#[cfg(test)]
-use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -38,8 +34,6 @@ use crate::runtime::query_result::{
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
-use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
-use crate::meta::repository::job::JobMetaRepository;
 #[cfg(test)]
 use crate::mv::application::UnavailableMvApplicationService;
 use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
@@ -84,7 +78,6 @@ pub mod table_maintenance;
 pub mod truncate_engine;
 pub mod view;
 pub(crate) mod virtual_table;
-pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
@@ -380,7 +373,6 @@ pub(crate) struct StandaloneState {
     /// `[standalone_server] mv_partition_state_max_entries`, frozen at engine
     /// open so MV refresh does not reach for a process-global config.
     pub(crate) mv_partition_state_max_entries: usize,
-    pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
     /// Provider-neutral MV metadata boundary. Production wiring is installed by
     /// the frontend host; the core default deliberately rejects MV operations.
     pub(crate) mv_repository: Arc<dyn MvRepository>,
@@ -389,8 +381,6 @@ pub(crate) struct StandaloneState {
     /// Server-composed exact-generation storage observation boundary.
     pub(crate) mv_storage_observation:
         Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
-    pub(crate) iceberg_operation_repo: IcebergOperationRepository,
-    pub(crate) job_repo: JobMetaRepository,
     pub(crate) exchange_port: u16,
     /// Frontend-owned view application service, injected at engine open.
     pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
@@ -444,14 +434,11 @@ impl Default for StandaloneState {
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
             mv_partition_state_max_entries: DEFAULT_MV_PARTITION_STATE_MAX_ENTRIES,
-            metadata_provider: None,
             mv_repository: Arc::new(UnavailableMvRepository),
             mv_application_service: Arc::new(UnavailableMvApplicationService),
             mv_storage_observation: Arc::new(
                 crate::mv::storage_observation::UnavailableMvStorageObservationPort,
             ),
-            iceberg_operation_repo: IcebergOperationRepository,
-            job_repo: JobMetaRepository,
             exchange_port: 0,
             view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
             table_maintenance_service: std::sync::Arc::new(
@@ -1556,8 +1543,8 @@ impl StandaloneNovaRocks {
     ///
     /// Installs `cfg` as the process-wide active config (replacing any prior
     /// global config) and then proceeds with the normal engine-open body.
-    /// `opts.config_path` is preserved for resolving relative paths (e.g.
-    /// SQLite metadata DB paths) but is **not** re-read from disk.
+    /// `opts.config_path` identifies the already-loaded config but is **not**
+    /// re-read from disk.
     pub fn open_with_config(
         opts: StandaloneOptions,
         cfg: novarocks_config::NovaRocksConfig,
@@ -1574,16 +1561,11 @@ impl StandaloneNovaRocks {
     /// Common engine-open body.  Called after the process-wide config has
     /// already been installed by the caller.
     fn open_body(
-        opts: StandaloneOptions,
+        _opts: StandaloneOptions,
         cfg: &novarocks_config::NovaRocksConfig,
         services: StandaloneOpenServices,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
-        let metadata_backend = resolve_metadata_backend(&opts, cfg)?;
-        let metadata_provider = metadata_backend
-            .as_ref()
-            .map(open_metadata_provider)
-            .transpose()?;
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits(cfg);
         let mv_partition_state_max_entries = cfg
             .standalone_server
@@ -1624,11 +1606,9 @@ impl StandaloneNovaRocks {
             ),
             mv_refresh_pruning_limits,
             mv_partition_state_max_entries,
-            metadata_provider: metadata_provider.clone(),
             mv_repository,
             mv_application_service,
             mv_storage_observation,
-            job_repo: JobMetaRepository,
             exchange_port,
             system_catalog,
             view_service,
@@ -1650,7 +1630,6 @@ impl StandaloneNovaRocks {
             #[cfg(test)]
             _test_guard,
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
-            iceberg_operation_repo: IcebergOperationRepository,
         });
         register_connector_backends(&inner);
         // Bind before restore: the Frontend controller may already have
@@ -1672,7 +1651,7 @@ impl StandaloneNovaRocks {
                 ),
             ))?;
         }
-        restore_metadata_if_needed(&inner, mv_startup_restore.as_ref())?;
+        restore_application_state_if_needed(&inner, mv_startup_restore.as_ref())?;
         let engine = Self { inner };
         if let Some(sink) = statistics_target_resolver_sink {
             sink.bind_statistics_target_resolver(engine.statistics_target_resolver())?;
@@ -3807,41 +3786,6 @@ fn require_backend_management_role(
 // Local parquet table helpers
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Metadata persistence
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ResolvedMetadataBackend {
-    provider: crate::common::app_config::MetadataProviderConfig,
-    path: PathBuf,
-}
-
-fn resolve_metadata_backend(
-    opts: &StandaloneOptions,
-    cfg: &novarocks_config::NovaRocksConfig,
-) -> Result<Option<ResolvedMetadataBackend>, String> {
-    if let Some(metadata) = cfg.metadata.as_ref() {
-        return Ok(Some(ResolvedMetadataBackend {
-            provider: metadata.provider,
-            path: resolve_relative_path(&metadata.path, opts.config_path.as_deref())?,
-        }));
-    }
-    Ok(None)
-}
-
-fn open_metadata_provider(
-    backend: &ResolvedMetadataBackend,
-) -> Result<Arc<dyn crate::meta::MetaStoreProvider>, String> {
-    match backend.provider {
-        crate::common::app_config::MetadataProviderConfig::Sqlite => {
-            let provider = crate::meta::SqliteMetaStoreProvider::open(&backend.path)
-                .map_err(|err| format!("open sqlite metadata provider failed: {err}"))?;
-            Ok(Arc::new(provider))
-        }
-    }
-}
-
 /// Matches the `[standalone_server] mv_partition_state_max_entries` default.
 pub(crate) const DEFAULT_MV_PARTITION_STATE_MAX_ENTRIES: usize = 10_000;
 
@@ -3855,20 +3799,6 @@ fn resolve_mv_refresh_pruning_limits(
             max_affected_partitions: config.mv_refresh_max_affected_partitions,
         })
         .unwrap_or_default()
-}
-
-fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<PathBuf, String> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(config_path) = config_path
-        && let Some(base_dir) = config_path.parent()
-    {
-        return Ok(base_dir.join(path));
-    }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(path))
-        .map_err(|e| format!("read current directory failed: {e}"))
 }
 
 /// Projects aggregate engine state into the explicit inputs a lake rebuild needs.
@@ -3922,7 +3852,7 @@ impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_>
     }
 }
 
-fn restore_metadata_if_needed(
+fn restore_application_state_if_needed(
     state: &Arc<StandaloneState>,
     installed: Option<&Arc<dyn crate::mv::startup_restore::MvStartupRestore>>,
 ) -> Result<(), String> {
@@ -6240,7 +6170,6 @@ mod tests {
     use novarocks_execution::runtime::query_options::QueryOptions;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7174,21 +7103,6 @@ mod tests {
         out
     }
 
-    fn write_test_metadata_config(dir: &TempDir, metadata_path: &str) -> PathBuf {
-        let config_path = dir.path().join("novarocks.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"[metadata]
-provider = "sqlite"
-path = "{metadata_path}"
-"#
-            ),
-        )
-        .expect("write metadata config");
-        config_path
-    }
-
     fn assert_backend_topology_column_contract(result: &QueryResult) {
         assert_eq!(
             result
@@ -7371,96 +7285,6 @@ path = "{metadata_path}"
                 .get_catalog("ice")
                 .is_ok(),
             "publishing the local runtime must expose the SQL catalog name"
-        );
-    }
-
-    #[test]
-    fn metadata_backend_resolves_metadata_path_relative_to_config_parent() {
-        let _runtime_guard = lock_runtime_test_state();
-        let dir = TempDir::new().expect("create config dir");
-        let config_dir = dir.path().join("conf");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
-        let config_path = config_dir.join("novarocks.toml");
-        std::fs::write(
-            &config_path,
-            r#"[metadata]
-provider = "sqlite"
-path = "meta/catalog.db"
-"#,
-        )
-        .expect("write config");
-
-        let cfg = crate::novarocks_config::load_from_path(&config_path).expect("load config");
-        let backend = super::resolve_metadata_backend(
-            &StandaloneOptions {
-                config_path: Some(config_path.clone()),
-            },
-            &cfg,
-        )
-        .expect("resolve backend")
-        .expect("metadata backend");
-
-        assert_eq!(
-            backend.provider,
-            crate::common::app_config::MetadataProviderConfig::Sqlite
-        );
-        assert_eq!(backend.path, config_dir.join("meta/catalog.db"));
-    }
-
-    #[test]
-    fn metadata_backend_is_absent_without_metadata_config() {
-        let _runtime_guard = lock_runtime_test_state();
-        let dir = TempDir::new().expect("create config dir");
-        let config_path = dir.path().join("novarocks.toml");
-        std::fs::write(
-            &config_path,
-            r#"[standalone_server]
-mysql_port = 19030
-"#,
-        )
-        .expect("write config");
-
-        let cfg = crate::novarocks_config::load_from_path(&config_path).expect("load config");
-        let backend = super::resolve_metadata_backend(
-            &StandaloneOptions {
-                config_path: Some(config_path.clone()),
-            },
-            &cfg,
-        )
-        .expect("resolve backend");
-        assert!(backend.is_none());
-    }
-
-    #[test]
-    fn standalone_state_retains_metadata_provider_from_metadata_config() {
-        let dir = TempDir::new().expect("create config dir");
-        let config_path = dir.path().join("novarocks.toml");
-        std::fs::write(
-            &config_path,
-            r#"[metadata]
-provider = "sqlite"
-path = "meta/catalog.db"
-"#,
-        )
-        .expect("write config");
-
-        let engine = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("open engine");
-
-        assert!(engine.inner.metadata_provider.is_some());
-        assert_eq!(
-            engine
-                .inner
-                .metadata_provider
-                .as_ref()
-                .expect("metadata provider")
-                .provider_name(),
-            "sqlite"
         );
     }
 
