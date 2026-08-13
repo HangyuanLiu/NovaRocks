@@ -1,5 +1,5 @@
 ---
-id: ADR-0070
+id: ADR-0071
 title: "Distributed test orchestration has one cluster harness"
 domain: [crate-boundary]
 status: active
@@ -8,6 +8,7 @@ superseded-by: null
 date: 2026-08-13
 provenance:
   - "discussion: 2026-08-13 layered test ownership and distributed scenario composition"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/897"
 code-anchors:
   - "tests/cluster-harness/src/lib.rs (CrossProcessClusterOptions, CrossProcessServerHandle::launch)"
   - "tests/sql-test-runner/src/cluster.rs (launch_server)"

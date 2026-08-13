@@ -57,7 +57,7 @@ pub(crate) fn launch_server(
     query_lifecycle_faults_enabled: bool,
     cleanup_faults_enabled: bool,
 ) -> Result<Box<dyn ServerHandle>> {
-    // Design: ADR-0070 (docs/adr/ADR-0070-distributed-test-orchestration-has-one-cluster-harness.md)
+    // Design: ADR-0071 (docs/adr/ADR-0071-distributed-test-orchestration-has-one-cluster-harness.md)
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
         ClusterMode::CrossProcess => Ok(Box::new(CrossProcessServerHandle::launch(

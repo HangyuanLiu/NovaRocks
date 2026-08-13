@@ -54,7 +54,7 @@ pub struct CrossProcessRuntime {
 ///
 /// Consumers resolve environment and runner-specific configuration before
 /// constructing this value. The harness owns only the distributed runtime.
-// Design: ADR-0070 (docs/adr/ADR-0070-distributed-test-orchestration-has-one-cluster-harness.md)
+// Design: ADR-0071 (docs/adr/ADR-0071-distributed-test-orchestration-has-one-cluster-harness.md)
 #[derive(Debug, Clone)]
 pub struct CrossProcessClusterOptions {
     pub binary: PathBuf,
