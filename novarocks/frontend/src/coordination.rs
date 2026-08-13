@@ -20,17 +20,113 @@
 //! Domain services consume this runtime. They never bootstrap a second holder
 //! or change the global restore/write-open state themselves.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use novarocks_spi::state_store::StateStore;
+use novarocks_spi::state_store::{StateStore, WriteTransaction};
 use novarocks_state_store::OperationId;
 use novarocks_state_store::coordination::{
     ClockHealth, CoordinationError, CoordinationErrorKind, HolderId, IncarnationGate, LeaseClock,
-    LeaseManager, LeaseSettings, WriteAdmission,
+    LeaseFence, LeaseManager, LeaseSettings, WriteAdmission,
 };
 use uuid::Uuid;
+
+/// Closure a fenced owner hands to a repository so the exact lease fence is
+/// validated **inside the same write transaction** as the writes it guards.
+///
+/// Checking a lease outside the transaction is not fencing: between the check
+/// and the commit, another host can take the lease over. Passing the validation
+/// in as a closure is what makes "stale owner cannot write" a property of the
+/// commit rather than of the caller's timing.
+pub type FenceValidator = Arc<
+    dyn for<'txn> Fn(
+            &'txn mut dyn WriteTransaction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'txn>>
+        + Send
+        + Sync,
+>;
+
+/// Holds the lease fence an owner currently possesses.
+///
+/// Renewal advances the fence in place, so validators already handed to a
+/// repository keep validating against the *current* fence instead of a snapshot
+/// taken when the validator was built.
+pub(crate) struct CurrentLeaseFence {
+    fence: Arc<RwLock<LeaseFence>>,
+}
+
+impl CurrentLeaseFence {
+    pub(crate) fn new(fence: LeaseFence) -> Self {
+        Self {
+            fence: Arc::new(RwLock::new(fence)),
+        }
+    }
+
+    pub(crate) fn validator(&self) -> FenceValidator {
+        let current = Arc::clone(&self.fence);
+        Arc::new(move |transaction| {
+            let fence = match current.read() {
+                Ok(fence) => fence.clone(),
+                Err(_) => {
+                    return Box::pin(async { Err(FENCE_LOCK_POISONED.to_string()) });
+                }
+            };
+            Box::pin(async move {
+                fence
+                    .validate_in(transaction)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    /// Composes a global write-admission assertion with the lease fence so both
+    /// land in one commit. Used where a caller must prove it is both inside an
+    /// open write epoch and still the resource's owner.
+    pub(crate) fn validator_with_admission(&self, admission: WriteAdmission) -> FenceValidator {
+        let current = Arc::clone(&self.fence);
+        Arc::new(move |transaction| {
+            let admission = admission.clone();
+            let fence = match current.read() {
+                Ok(fence) => fence.clone(),
+                Err(_) => {
+                    return Box::pin(async { Err(FENCE_LOCK_POISONED.to_string()) });
+                }
+            };
+            Box::pin(async move {
+                admission
+                    .validate_in(transaction)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                fence
+                    .validate_in(transaction)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    pub(crate) fn replace(&self, fence: LeaseFence) -> Result<(), String> {
+        *self
+            .fence
+            .write()
+            .map_err(|_| FENCE_LOCK_POISONED.to_string())? = fence;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Consumed by the refresh worker's renewal loop (CP-5B T3).
+    pub(crate) fn fence(&self) -> Result<LeaseFence, String> {
+        self.fence
+            .read()
+            .map(|fence| fence.clone())
+            .map_err(|_| FENCE_LOCK_POISONED.to_string())
+    }
+}
+
+pub(crate) const FENCE_LOCK_POISONED: &str = "frontend lease fence lock poisoned";
 
 pub(crate) const FRONTEND_LEASE_DURATION: Duration = Duration::from_secs(15);
 pub(crate) const FRONTEND_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);

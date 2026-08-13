@@ -251,7 +251,7 @@ async fn run_worker(
         };
         match acquired {
             Some(AcquireOutcome::Acquired(mut guard)) => {
-                let current_fence = CurrentLeaseFence::new(guard.fence());
+                let current_fence = crate::coordination::CurrentLeaseFence::new(guard.fence());
                 let fence = current_fence.validator();
                 process_cancellation_requests(&repository, now_unix_millis(), &fence).await?;
                 recover_incomplete(&repository, now_unix_millis(), &fence).await?;
@@ -396,7 +396,7 @@ async fn reconcile_publishing(
     repository: &StatisticsJobRepository,
     executor: &Weak<dyn StatisticsAttemptExecutor>,
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
-    current_fence: &CurrentLeaseFence,
+    current_fence: &crate::coordination::CurrentLeaseFence,
     fence: &FenceValidator,
     stop: &AtomicBool,
 ) -> Result<(), String> {
@@ -477,7 +477,7 @@ async fn process_submitted(
     repository: &StatisticsJobRepository,
     executor: &Weak<dyn StatisticsAttemptExecutor>,
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
-    current_fence: &CurrentLeaseFence,
+    current_fence: &crate::coordination::CurrentLeaseFence,
     claim_fence: &FenceValidator,
     fence: &FenceValidator,
     stop: &AtomicBool,
@@ -697,7 +697,7 @@ fn retry_backoff(attempt: u32) -> Duration {
 
 async fn run_with_lease_renewal<T, F>(
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
-    current_fence: &CurrentLeaseFence,
+    current_fence: &crate::coordination::CurrentLeaseFence,
     work: F,
 ) -> Result<T, StatisticsAttemptError>
 where
@@ -728,7 +728,9 @@ where
                         format!("statistics worker lease renewal failed: {error}"),
                     ));
                 }
-                current_fence.replace(guard.fence())?;
+                current_fence.replace(guard.fence()).map_err(|message| {
+                    StatisticsAttemptError::permanent(StatisticsJobErrorKind::Internal, message)
+                })?;
             }
         }
     }
@@ -798,7 +800,7 @@ impl StatisticsAnalyzeWorkerCoordination {
 
     async fn admit_submitted_claims(
         &self,
-        current_fence: &CurrentLeaseFence,
+        current_fence: &crate::coordination::CurrentLeaseFence,
     ) -> Result<FenceValidator, CoordinationError> {
         let admission = self.frontend.admit_writes().await?;
         Ok(current_fence.validator_with_admission(admission))
@@ -818,72 +820,5 @@ impl StatisticsAnalyzeWorkerCoordination {
                     .map_err(|error| error.to_string())
             })
         })
-    }
-}
-
-struct CurrentLeaseFence {
-    fence: Arc<RwLock<LeaseFence>>,
-}
-
-impl CurrentLeaseFence {
-    fn new(fence: LeaseFence) -> Self {
-        Self {
-            fence: Arc::new(RwLock::new(fence)),
-        }
-    }
-
-    fn validator(&self) -> FenceValidator {
-        let current = Arc::clone(&self.fence);
-        Arc::new(move |transaction| {
-            let fence = match current.read() {
-                Ok(fence) => fence.clone(),
-                Err(_) => {
-                    return Box::pin(async {
-                        Err("statistics worker fence lock poisoned".to_string())
-                    });
-                }
-            };
-            Box::pin(async move {
-                fence
-                    .validate_in(transaction)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        })
-    }
-
-    fn validator_with_admission(&self, admission: WriteAdmission) -> FenceValidator {
-        let current = Arc::clone(&self.fence);
-        Arc::new(move |transaction| {
-            let admission = admission.clone();
-            let fence = match current.read() {
-                Ok(fence) => fence.clone(),
-                Err(_) => {
-                    return Box::pin(async {
-                        Err("statistics worker fence lock poisoned".to_string())
-                    });
-                }
-            };
-            Box::pin(async move {
-                admission
-                    .validate_in(transaction)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                fence
-                    .validate_in(transaction)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        })
-    }
-
-    fn replace(&self, fence: LeaseFence) -> Result<(), StatisticsAttemptError> {
-        *self.fence.write().map_err(|_| {
-            StatisticsAttemptError::permanent(
-                StatisticsJobErrorKind::Internal,
-                "statistics worker fence lock poisoned",
-            )
-        })? = fence;
-        Ok(())
     }
 }

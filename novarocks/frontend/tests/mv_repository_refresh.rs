@@ -19,11 +19,12 @@ use novarocks::mv::persistence::refresh::{
 };
 use novarocks::mv::repository::{
     BeginFrontendMvRecoveryCycleRequest, FinalizeMvRefreshWithPartitionsRequest,
-    FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryErrorKind,
+    FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
     RecordFrontendMvRecoveryCleanupOutcomeRequest, RecordFrontendMvRecoveryObservationRequest,
 };
 use novarocks_frontend::mv::repository::{
-    BeginFrontendMvRefreshIntentRequest, StateStoreMvRepository,
+    BeginFrontendMvRefreshIntentRequest, FenceValidator, MvRefreshFenceSource,
+    StateStoreMvRepository,
 };
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{
@@ -1001,4 +1002,159 @@ fn finalize_with_partitions_returns_not_found_for_missing_partition_mv() {
         })
         .expect_err("missing partition MV");
     assert_eq!(error.kind(), MvRepositoryErrorKind::NotFound);
+}
+
+/// A fence source standing in for an owner that has been superseded: it hands
+/// back a validator that always rejects, exactly as a stale `LeaseFence` does
+/// once another frontend has taken the resource over.
+struct SupersededOwner;
+
+impl MvRefreshFenceSource for SupersededOwner {
+    fn validator_for(&self, _mv_id: i64) -> Result<FenceValidator, MvRepositoryError> {
+        Ok(Arc::new(|_transaction| {
+            Box::pin(async { Err("lease fence superseded".to_string()) })
+        }))
+    }
+}
+
+/// A fence source for an owner this process does not hold at all. Returning an
+/// error here — rather than `None` — is the fail-closed path: "I lost the lease"
+/// must never be indistinguishable from "there is no fencing configured".
+struct NotTheOwner;
+
+impl MvRefreshFenceSource for NotTheOwner {
+    fn validator_for(&self, mv_id: i64) -> Result<FenceValidator, MvRepositoryError> {
+        Err(MvRepositoryError::new(
+            MvRepositoryErrorKind::Conflict,
+            format!("this frontend does not own mv {mv_id}"),
+        ))
+    }
+}
+
+fn fenced_repository(
+    fence: Arc<dyn MvRefreshFenceSource>,
+) -> (
+    tempfile::TempDir,
+    tokio::runtime::Runtime,
+    StateStoreHost,
+    Arc<StateStoreMvRepository>,
+) {
+    let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let runtime = tokio::runtime::Runtime::new().expect("repository runtime");
+    let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
+    let host = runtime
+        .block_on(StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "mv-refresh-fence-test".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: temp.path().join("state-store.sqlite"),
+                            deployment_owner: "mv-refresh-fence-test".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+                topology_revision: Bytes::from_static(b"mv-refresh-fence-test-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        ))
+        .expect("open SQLite StateStore host");
+    let repository = runtime
+        .block_on(
+            StateStoreMvRepository::open_with_observations_and_refresh_fence(
+                host.state_store().expect("host exposes StateStore"),
+                runtime.handle().clone(),
+                None,
+                Some(fence),
+            ),
+        )
+        .expect("open fenced MV repository");
+    (temp, runtime, host, repository)
+}
+
+fn fence_intent_request(mv_id: i64) -> BeginFrontendMvRefreshIntentRequest {
+    BeginFrontendMvRefreshIntentRequest {
+        refresh_id: 9101,
+        mv_id,
+        target_catalog: "ice".to_string(),
+        target_namespace: "sales".to_string(),
+        target_table: "daily_fenced".to_string(),
+        staging_branch: "__nova_mv_fenced".to_string(),
+        expected_main_snapshot_id: Some(7),
+        base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+        base_table_uuids: BTreeMap::from([(
+            "ice.sales.orders".to_string(),
+            "orders-uuid".to_string(),
+        )]),
+        marker_token: "marker".to_string(),
+        prepare_external_actions: true,
+        ledger: frontend_ledger(),
+    }
+}
+
+#[test]
+fn superseded_owner_cannot_begin_a_refresh_intent() {
+    let (_temp, _runtime, _host, repository) = fenced_repository(Arc::new(SupersededOwner));
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_fenced"),
+        )
+        .expect("create definition");
+
+    let error = repository
+        .begin_frontend_refresh_intent(fence_intent_request(definition.mv_id))
+        .expect_err("a superseded owner must not create a durable refresh intent");
+
+    // The rejection has to come from the transaction, not from a service-level
+    // precheck, which is why this is asserted against the repository directly.
+    assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict, "{error}");
+
+    // And nothing may have been written: the definition must still be idle.
+    let reloaded = repository
+        .load_by_id(definition.mv_id)
+        .expect("reload definition")
+        .expect("definition present");
+    assert!(
+        !reloaded.refresh_in_progress && reloaded.active_refresh_id.is_none(),
+        "a fence-rejected intent must leave no durable trace"
+    );
+}
+
+#[test]
+fn a_frontend_that_owns_nothing_cannot_begin_a_refresh_intent() {
+    let (_temp, _runtime, _host, repository) = fenced_repository(Arc::new(NotTheOwner));
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_fenced"),
+        )
+        .expect("create definition");
+
+    let error = repository
+        .begin_frontend_refresh_intent(fence_intent_request(definition.mv_id))
+        .expect_err("an unowned target must not accept a refresh intent");
+    assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict, "{error}");
+}
+
+#[test]
+fn definition_ddl_stays_outside_the_refresh_ownership_fence() {
+    // Creating an MV is catalog DDL guarded by the attachment observation, not
+    // by refresh execution ownership. A frontend that owns no refresh lease must
+    // still be able to define one, or CREATE MATERIALIZED VIEW would require a
+    // lease on a target that does not exist yet.
+    let (_temp, _runtime, _host, repository) = fenced_repository(Arc::new(SupersededOwner));
+    repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_fenced"),
+        )
+        .expect("definition DDL must not require a refresh lease");
 }

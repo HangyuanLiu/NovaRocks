@@ -55,6 +55,9 @@ use novarocks_state_store::metrics::StateStoreMetrics;
 use uuid::Uuid;
 
 use crate::catalog_attachment::{CatalogAttachmentVersioned, assert_attachment_versions};
+// Re-exported because `MvRefreshFenceSource` is a public trait whose method
+// returns this type: an implementor outside this module must be able to name it.
+pub use crate::coordination::FenceValidator;
 
 use self::codec::{
     DecodedMvRecord, MvRecordKind, MvSequence, decode_definition, decode_record, encode_definition,
@@ -75,6 +78,26 @@ pub struct StateStoreMvRepository {
     runtime: tokio::runtime::Handle,
     runner_metrics: StateStoreMetrics,
     catalog_attachment_observations: Option<Arc<dyn CatalogAttachmentObservationSource>>,
+    refresh_fence: Option<Arc<dyn MvRefreshFenceSource>>,
+}
+
+/// Supplies the exact lease fence a refresh owner must prove *inside the same
+/// write transaction* as the durable transition it is making.
+///
+/// This exists because checking ownership outside the transaction is not
+/// fencing: between a service-level check and the commit, another frontend can
+/// take the lease over, and the superseded owner's write still lands. Injecting
+/// the validator here — rather than passing it through ~26 method signatures —
+/// mirrors how [`CatalogAttachmentObservationSource`] threads CP-2's attachment
+/// assertion into the same commits, so both fences are composed by one
+/// transaction owner instead of two coordinators.
+///
+/// A source returns an error for a target this process does not currently own.
+/// That is the fail-closed path: losing the lease must stop durable writes, not
+/// downgrade them to unfenced ones.
+pub trait MvRefreshFenceSource: Send + Sync {
+    /// The validator for the current owner of this MV's refresh resource.
+    fn validator_for(&self, mv_id: i64) -> Result<FenceValidator, MvRepositoryError>;
 }
 
 /// Supplies the Ready attachment observations that an application admitted
@@ -103,6 +126,26 @@ impl StateStoreMvRepository {
         runtime: tokio::runtime::Handle,
         catalog_attachment_observations: Option<Arc<dyn CatalogAttachmentObservationSource>>,
     ) -> Result<Arc<Self>, MvRepositoryError> {
+        Self::open_with_observations_and_refresh_fence(
+            store,
+            runtime,
+            catalog_attachment_observations,
+            None,
+        )
+        .await
+    }
+
+    /// Opens the repository with both fences installed.
+    ///
+    /// The production frontend composition supplies a refresh fence source; a
+    /// composition without one leaves refresh transitions unfenced, which is
+    /// only valid where a single owner is structurally guaranteed.
+    pub async fn open_with_observations_and_refresh_fence(
+        store: Arc<dyn StateStore>,
+        runtime: tokio::runtime::Handle,
+        catalog_attachment_observations: Option<Arc<dyn CatalogAttachmentObservationSource>>,
+        refresh_fence: Option<Arc<dyn MvRefreshFenceSource>>,
+    ) -> Result<Arc<Self>, MvRepositoryError> {
         let repository = Arc::new(Self {
             runner_metrics: StateStoreMetrics::new(
                 novarocks_spi::state_store::StateStoreProviderId::new("frontend-mv"),
@@ -110,9 +153,45 @@ impl StateStoreMvRepository {
             store,
             runtime,
             catalog_attachment_observations,
+            refresh_fence,
         });
         repository.validate_open_state().await?;
         Ok(repository)
+    }
+
+    /// Resolves the fence this process must prove for `mv_id`'s next durable
+    /// refresh transition.
+    ///
+    /// `Ok(None)` means no fence source is installed at all. An installed source
+    /// that cannot produce a validator is an error, never a silent `None`:
+    /// "I lost the lease" and "there is no fencing here" must not collapse into
+    /// the same outcome.
+    fn refresh_fence_for(&self, mv_id: i64) -> Result<Option<FenceValidator>, MvRepositoryError> {
+        match &self.refresh_fence {
+            Some(source) => source.validator_for(mv_id).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Same resolution keyed by a refresh instead of its MV.
+    ///
+    /// A refresh's owning `mv_id` is immutable, so reading it before the
+    /// transaction cannot go stale in a way that matters: the fence itself is
+    /// still validated inside the transaction.
+    async fn refresh_fence_for_refresh(
+        &self,
+        refresh_id: i64,
+    ) -> Result<Option<FenceValidator>, MvRepositoryError> {
+        if self.refresh_fence.is_none() {
+            return Ok(None);
+        }
+        let refresh = self.load_refresh_async(refresh_id).await?.ok_or_else(|| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::NotFound,
+                format!("mv refresh {refresh_id} not found"),
+            )
+        })?;
+        self.refresh_fence_for(refresh.mv_id)
     }
 
     fn capture_catalog_attachment_observations(
@@ -1115,6 +1194,7 @@ impl StateStoreMvRepository {
         self.require_definition_async(mv_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1123,7 +1203,9 @@ impl StateStoreMvRepository {
             move |transaction| {
                 let base_snapshots = base_snapshots.clone();
                 let base_table_uuids = base_table_uuids.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut definition) =
                         load_definition_transaction(transaction, mv_id).await?;
                     definition.last_refresh_snapshots = base_snapshots;
@@ -1150,6 +1232,7 @@ impl StateStoreMvRepository {
         self.require_definition_async(request.mv_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(request.mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1157,7 +1240,9 @@ impl StateStoreMvRepository {
             "update MV refresh metadata",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut definition) =
                         load_definition_transaction(transaction, request.mv_id).await?;
                     definition.refresh_policy = request.refresh_policy;
@@ -1189,6 +1274,7 @@ impl StateStoreMvRepository {
         let operation_id = Uuid::now_v7();
         let page_size = self.store.limits().max_page_size;
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1196,7 +1282,9 @@ impl StateStoreMvRepository {
             "begin MV refresh",
             move |transaction| {
                 let target_snapshots = target_snapshots.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, mv_id).await?;
                     if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
@@ -1240,6 +1328,7 @@ impl StateStoreMvRepository {
         let operation_id = Uuid::now_v7();
         let page_size = self.store.limits().max_page_size;
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(request.mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1247,7 +1336,9 @@ impl StateStoreMvRepository {
             "begin Iceberg MV refresh",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, request.mv_id).await?;
                     if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
@@ -1320,6 +1411,7 @@ impl StateStoreMvRepository {
         let operation_id = Uuid::now_v7();
         let recovery_cleanup_operation_id = Uuid::now_v7().as_bytes().to_vec();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(request.mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1328,7 +1420,9 @@ impl StateStoreMvRepository {
             move |transaction| {
                 let request = request.clone();
                 let recovery_cleanup_operation_id = recovery_cleanup_operation_id.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, request.mv_id).await?;
                     if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
@@ -1416,6 +1510,7 @@ impl StateStoreMvRepository {
         validate_frontend_refresh_action(&action)?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1423,7 +1518,9 @@ impl StateStoreMvRepository {
             "record frontend-owned MV refresh action",
             move |transaction| {
                 let action = action.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                        validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, refresh_id).await?;
                     if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
@@ -1538,6 +1635,7 @@ impl StateStoreMvRepository {
         self.require_refresh_async(request.refresh_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1545,7 +1643,9 @@ impl StateStoreMvRepository {
             "record MV staging commit",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, request.refresh_id).await?;
                     if refresh.state == MvRefreshState::StagingCommitted {
@@ -1585,6 +1685,7 @@ impl StateStoreMvRepository {
         self.require_refresh_async(request.refresh_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1592,7 +1693,9 @@ impl StateStoreMvRepository {
             "record MV publish commit",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, request.refresh_id).await?;
                     if refresh.state == MvRefreshState::PublishCommitted {
@@ -1635,6 +1738,7 @@ impl StateStoreMvRepository {
         self.require_refresh_async(refresh_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1642,7 +1746,9 @@ impl StateStoreMvRepository {
             "record MV external commit",
             move |transaction| {
                 let outcome = outcome.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, refresh_id).await?;
                     expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
@@ -1669,13 +1775,16 @@ impl StateStoreMvRepository {
         self.require_refresh_async(refresh_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
             operation_id,
             "mark MV refresh commit unknown",
             move |transaction| {
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, refresh_id).await?;
                     if matches!(
@@ -1720,6 +1829,7 @@ impl StateStoreMvRepository {
             Vec::new()
         };
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1728,7 +1838,9 @@ impl StateStoreMvRepository {
             move |transaction| {
                 let request = request.clone();
                 let existing_partitions = existing_partitions.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let replace_partition_contract = request.partition_spec.is_some();
                     finalize_refresh_transaction(transaction, operation_id, request).await?;
                     if replace_partition_contract {
@@ -1749,6 +1861,7 @@ impl StateStoreMvRepository {
         self.require_refresh_async(request.refresh_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1756,7 +1869,9 @@ impl StateStoreMvRepository {
             "finalize frontend MV refresh without external actions",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     finalize_frontend_refresh_without_external_actions_transaction(
                         transaction,
                         operation_id,
@@ -1787,6 +1902,9 @@ impl StateStoreMvRepository {
             None => Vec::new(),
         };
         let store = Arc::clone(&self.store);
+        let refresh_fence = self
+            .refresh_fence_for_refresh(request.refresh.refresh_id)
+            .await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1795,7 +1913,9 @@ impl StateStoreMvRepository {
             move |transaction| {
                 let request = request.clone();
                 let existing_partitions = existing_partitions.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     finalize_refresh_transaction(transaction, operation_id, request.refresh)
                         .await?;
                     if let Some(partitions) = request.partitions {
@@ -1821,6 +1941,7 @@ impl StateStoreMvRepository {
         self.require_refresh_async(request.refresh_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1828,7 +1949,9 @@ impl StateStoreMvRepository {
             "record MV external commit and finalize",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, request.refresh_id).await?;
                     expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
@@ -1852,13 +1975,16 @@ impl StateStoreMvRepository {
     async fn clear_refresh_progress_async(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
             operation_id,
             "clear MV refresh progress",
             move |transaction| {
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let definition_key =
                         definition_by_id_key(mv_id).map_err(invalid_state_store)?;
                     let Some(definition_record) = transaction.get(&definition_key).await? else {
@@ -1982,6 +2108,7 @@ impl StateStoreMvRepository {
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -1989,7 +2116,9 @@ impl StateStoreMvRepository {
             "begin frontend MV recovery inspection",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                        validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, request.refresh_id).await?;
                     if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
@@ -2041,6 +2170,7 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -2048,7 +2178,9 @@ impl StateStoreMvRepository {
             "record frontend MV recovery observation",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, request.refresh_id).await?;
                     let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
@@ -2093,6 +2225,7 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -2100,7 +2233,9 @@ impl StateStoreMvRepository {
             "record unresolved frontend MV recovery",
             move |transaction| {
                 let reason = reason.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, refresh_id).await?;
                     let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
@@ -2133,6 +2268,7 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(request.refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -2140,7 +2276,9 @@ impl StateStoreMvRepository {
             "record frontend MV recovery cleanup outcome",
             move |transaction| {
                 let request = request.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, request.refresh_id).await?;
                     let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
@@ -2192,6 +2330,9 @@ impl StateStoreMvRepository {
             Vec::new()
         };
         let store = Arc::clone(&self.store);
+        let refresh_fence = self
+            .refresh_fence_for_refresh(request.finalize.refresh_id)
+            .await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -2200,7 +2341,9 @@ impl StateStoreMvRepository {
             move |transaction| {
                 let request = request.clone();
                 let existing_partitions = existing_partitions.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                        validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (refresh_record, mut refresh) =
                         load_refresh_transaction(transaction, request.finalize.refresh_id).await?;
                     if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
@@ -2288,13 +2431,16 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for_refresh(refresh_id).await?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
             operation_id,
             "abort recovered uncommitted MV refresh",
             move |transaction| {
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                        validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (refresh_record, mut refresh) = load_refresh_transaction(transaction, refresh_id).await?;
                     let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
                         conflict_state_store("frontend MV recovery has not begun")
@@ -2415,6 +2561,7 @@ impl StateStoreMvRepository {
             .list_partition_state_records_async(request.mv_id)
             .await?;
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(request.mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -2423,7 +2570,9 @@ impl StateStoreMvRepository {
             move |transaction| {
                 let request = request.clone();
                 let existing_partitions = existing_partitions.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     replace_partition_states_transaction(
                         transaction,
                         operation_id,
@@ -2447,6 +2596,7 @@ impl StateStoreMvRepository {
             .list_partition_state_records_async(request.mv_id)
             .await?;
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(request.mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -2455,7 +2605,9 @@ impl StateStoreMvRepository {
             move |transaction| {
                 let request = request.clone();
                 let existing_partitions = existing_partitions.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     record_failed_partition_states_transaction(
                         transaction,
                         operation_id,
@@ -2473,6 +2625,7 @@ impl StateStoreMvRepository {
         let operation_id = Uuid::now_v7();
         let existing_partitions = self.list_partition_state_records_async(mv_id).await?;
         let store = Arc::clone(&self.store);
+        let refresh_fence = self.refresh_fence_for(mv_id)?;
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
@@ -2480,7 +2633,9 @@ impl StateStoreMvRepository {
             "clear MV partition states",
             move |transaction| {
                 let existing_partitions = existing_partitions.clone();
+                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let key = definition_by_id_key(mv_id).map_err(invalid_state_store)?;
                     let Some(record) = transaction.get(&key).await? else {
                         return Ok(false);
@@ -3158,6 +3313,28 @@ pub(crate) async fn ensure_no_catalog_references_transaction(
                 "catalog has materialized view dependencies",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Validates a refresh owner's exact lease fence inside the caller's own write
+/// transaction.
+///
+/// Called before any write in every durable refresh transition, including ones
+/// that would rewrite an identical value: after a takeover, a superseded owner
+/// must not be able to refresh observed state even idempotently, because doing
+/// so would make the new owner's view of "who last observed this" wrong.
+async fn validate_refresh_fence(
+    transaction: &mut dyn WriteTransaction,
+    fence: Option<&FenceValidator>,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    if let Some(fence) = fence {
+        fence(transaction).await.map_err(|_| {
+            novarocks_spi::state_store::StateStoreError::new(
+                novarocks_spi::state_store::StateStoreErrorKind::Conflict,
+                "MV refresh ownership fence rejected this transaction",
+            )
+        })?;
     }
     Ok(())
 }
