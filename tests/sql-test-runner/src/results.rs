@@ -71,7 +71,7 @@ pub fn unescape_cell(cell: &str) -> String {
 }
 
 pub fn split_row(line: &str) -> Vec<String> {
-    line.split('\t').map(|cell| unescape_cell(cell)).collect()
+    line.split('\t').map(unescape_cell).collect()
 }
 
 pub fn parse_result_set(lines: &[String]) -> ResultSet {
@@ -594,16 +594,28 @@ pub fn step_retry_interval(step: &SqlStep) -> Duration {
     Duration::from_millis(step.meta.retry_interval_ms.unwrap_or(1000))
 }
 
-pub fn write_mismatch_artifacts(
-    root_dir: &Path,
-    suite_name: &str,
-    artifact_id: &str,
-    expected_header: &[String],
-    expected_rows: &[Vec<String>],
-    actual_header: &[String],
-    actual_rows: &[Vec<String>],
-    reason: &str,
-) -> Result<()> {
+pub struct MismatchArtifacts<'a> {
+    pub root_dir: &'a Path,
+    pub suite_name: &'a str,
+    pub artifact_id: &'a str,
+    pub expected_header: &'a [String],
+    pub expected_rows: &'a [Vec<String>],
+    pub actual_header: &'a [String],
+    pub actual_rows: &'a [Vec<String>],
+    pub reason: &'a str,
+}
+
+pub fn write_mismatch_artifacts(request: MismatchArtifacts<'_>) -> Result<()> {
+    let MismatchArtifacts {
+        root_dir,
+        suite_name,
+        artifact_id,
+        expected_header,
+        expected_rows,
+        actual_header,
+        actual_rows,
+        reason,
+    } = request;
     let out_dir = root_dir.join(suite_name).join(artifact_id);
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("create dir failed: {}", out_dir.display()))?;

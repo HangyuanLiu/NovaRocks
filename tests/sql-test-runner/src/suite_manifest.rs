@@ -24,18 +24,10 @@ use std::path::Path;
 
 /// Suite metadata deliberately controls discovery only. Cluster mode and
 /// cardinality are runner CLI concerns, so a suite cannot select a runtime.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SuiteManifest {
     pub explicit_only: bool,
-}
-
-impl Default for SuiteManifest {
-    fn default() -> Self {
-        Self {
-            explicit_only: false,
-        }
-    }
 }
 
 impl SuiteManifest {

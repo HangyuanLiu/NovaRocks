@@ -575,6 +575,17 @@ pub struct ManagedProcess {
     stopped: bool,
 }
 
+struct SpawnRequest {
+    label: String,
+    command: Command,
+    marker: ReadyMarker,
+    timeout: Duration,
+    log_path: PathBuf,
+    log_writer: Option<Box<dyn Write + Send>>,
+    poison_stdout_tail: bool,
+    one_shot_deadline: Option<Instant>,
+}
+
 impl std::fmt::Debug for ManagedProcess {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -596,16 +607,16 @@ impl ManagedProcess {
     ) -> Result<()> {
         let started = Instant::now();
         let deadline = started.checked_add(timeout).unwrap_or(started);
-        let mut process = Self::spawn_impl(
+        let mut process = Self::spawn_impl(SpawnRequest {
             label,
             command,
             marker,
             timeout,
             log_path,
-            None,
-            false,
-            Some(deadline),
-        )?;
+            log_writer: None,
+            poison_stdout_tail: false,
+            one_shot_deadline: Some(deadline),
+        })?;
         process.wait_for_successful_exit(deadline, timeout)
     }
 
@@ -616,7 +627,16 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
     ) -> Result<Self> {
-        Self::spawn_impl(label, command, marker, timeout, log_path, None, false, None)
+        Self::spawn_impl(SpawnRequest {
+            label,
+            command,
+            marker,
+            timeout,
+            log_path,
+            log_writer: None,
+            poison_stdout_tail: false,
+            one_shot_deadline: None,
+        })
     }
 
     #[cfg(test)]
@@ -628,16 +648,16 @@ impl ManagedProcess {
         log_path: PathBuf,
         log_writer: Box<dyn Write + Send>,
     ) -> Result<Self> {
-        Self::spawn_impl(
+        Self::spawn_impl(SpawnRequest {
             label,
             command,
             marker,
             timeout,
             log_path,
-            Some(log_writer),
-            false,
-            None,
-        )
+            log_writer: Some(log_writer),
+            poison_stdout_tail: false,
+            one_shot_deadline: None,
+        })
     }
 
     #[cfg(test)]
@@ -648,19 +668,29 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
     ) -> Result<Self> {
-        Self::spawn_impl(label, command, marker, timeout, log_path, None, true, None)
+        Self::spawn_impl(SpawnRequest {
+            label,
+            command,
+            marker,
+            timeout,
+            log_path,
+            log_writer: None,
+            poison_stdout_tail: true,
+            one_shot_deadline: None,
+        })
     }
 
-    fn spawn_impl(
-        label: String,
-        mut command: Command,
-        marker: ReadyMarker,
-        timeout: Duration,
-        log_path: PathBuf,
-        log_writer: Option<Box<dyn Write + Send>>,
-        poison_stdout_tail: bool,
-        one_shot_deadline: Option<Instant>,
-    ) -> Result<Self> {
+    fn spawn_impl(request: SpawnRequest) -> Result<Self> {
+        let SpawnRequest {
+            label,
+            mut command,
+            marker,
+            timeout,
+            log_path,
+            log_writer,
+            poison_stdout_tail,
+            one_shot_deadline,
+        } = request;
         let started = Instant::now();
         let deadline =
             one_shot_deadline.unwrap_or_else(|| started.checked_add(timeout).unwrap_or(started));
@@ -776,7 +806,7 @@ impl ManagedProcess {
             if self.stopped {
                 return Ok(false);
             }
-            return Ok(self.leader_exit_status_observed()?.is_none());
+            Ok(self.leader_exit_status_observed()?.is_none())
         }
         #[cfg(not(unix))]
         {
@@ -985,7 +1015,7 @@ impl ManagedProcess {
                 );
             }
             self.finish_group_with_signal(SIGKILL, "wait after SIGKILL timeout", cleanup_deadline)?;
-            return self.ensure_output_io_ok("stop process");
+            self.ensure_output_io_ok("stop process")
         }
 
         #[cfg(not(unix))]
@@ -1020,7 +1050,7 @@ impl ManagedProcess {
                 "wait after immediate SIGKILL",
                 cleanup_deadline,
             )?;
-            return self.ensure_output_io_ok("kill process");
+            self.ensure_output_io_ok("kill process")
         }
         #[cfg(not(unix))]
         {
@@ -1810,7 +1840,7 @@ fn read_tail(buffer: &Arc<Mutex<String>>, poisoned: &str) -> String {
 mod tests {
     use super::{
         FileReadinessSnapshot, ManagedProcess, ProcessGroupOwnership, ReadinessBaseline,
-        ReadyMarker, WaitSiginfo, run_reader_with_panic_boundary, spawn_reader,
+        ReadyMarker, SpawnRequest, WaitSiginfo, run_reader_with_panic_boundary, spawn_reader,
         unsupported_runtime_exit_status, wait_siginfo_abi_supported,
     };
     use std::fs;
@@ -3423,21 +3453,21 @@ mod tests {
         let timeout = Duration::from_millis(120);
         let started = Instant::now();
         let deadline = started + timeout;
-        let mut process = ManagedProcess::spawn_impl(
-            "reader deadline one-shot fixture".to_string(),
-            shell("printf 'PASS_MARKER\\n'; sleep 0.03; printf 'late\\n' >&2; exit 0"),
-            ReadyMarker::StdoutContains("PASS_MARKER".to_string()),
+        let mut process = ManagedProcess::spawn_impl(SpawnRequest {
+            label: "reader deadline one-shot fixture".to_string(),
+            command: shell("printf 'PASS_MARKER\\n'; sleep 0.03; printf 'late\\n' >&2; exit 0"),
+            marker: ReadyMarker::StdoutContains("PASS_MARKER".to_string()),
             timeout,
-            temp.path().join("fixture.log"),
-            Some(Box::new(BlockAfterFirstWrite {
+            log_path: temp.path().join("fixture.log"),
+            log_writer: Some(Box::new(BlockAfterFirstWrite {
                 writes: 0,
                 release: Arc::clone(&release),
                 file: fs::File::create(temp.path().join("fixture.log"))
                     .expect("create fixture log"),
             })),
-            false,
-            Some(deadline),
-        )
+            poison_stdout_tail: false,
+            one_shot_deadline: Some(deadline),
+        })
         .expect("marker must arrive within the deadline");
 
         let error = process

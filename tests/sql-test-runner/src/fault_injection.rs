@@ -63,8 +63,10 @@ impl ActiveQueryFaultState {
     }
 }
 
+pub(crate) type SharedServerHandle = Arc<Mutex<Box<dyn ServerHandle>>>;
+
 pub(crate) struct FragmentFailureStepGuard {
-    target: Option<(Arc<Mutex<Box<dyn ServerHandle>>>, usize)>,
+    target: Option<(SharedServerHandle, usize)>,
 }
 
 pub(crate) fn fragment_failure_step_guard(

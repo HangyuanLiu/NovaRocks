@@ -165,40 +165,7 @@ pub struct QueryMeta {
     pub be_log_exact_fragment_cancellation: Option<usize>,
 }
 
-/// Runner-visible QLC-3 startup boundaries. The backend and frontend consume
-/// the matching runner-owned fault files; the runner keeps this enum typed so
-/// malformed SQL directives fail during parsing instead of at execution time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryLifecyclePhase {
-    Staging,
-    Staged,
-    Starting,
-    Running,
-    TerminalRetained,
-}
-
-impl QueryLifecyclePhase {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "staging" => Some(Self::Staging),
-            "staged" => Some(Self::Staged),
-            "starting" => Some(Self::Starting),
-            "running" => Some(Self::Running),
-            "terminal-retained" => Some(Self::TerminalRetained),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Staging => "staging",
-            Self::Staged => "staged",
-            Self::Starting => "starting",
-            Self::Running => "running",
-            Self::TerminalRetained => "terminal-retained",
-        }
-    }
-}
+pub use novarocks_cluster_harness::QueryLifecyclePhase;
 
 impl QueryMeta {
     pub fn has_be_log_directives(&self) -> bool {

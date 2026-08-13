@@ -74,6 +74,7 @@ impl BeLogSnapshot {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot(
     meta: &QueryMeta,
     server_handle: &dyn ServerHandle,
@@ -81,6 +82,7 @@ pub(crate) fn snapshot(
     snapshot_with_deadline(meta, server_handle, step_evidence_deadline(meta))
 }
 
+#[cfg(test)]
 pub(crate) fn query_lifecycle_step_deadline(meta: &QueryMeta) -> Option<Instant> {
     is_query_lifecycle_step(meta).then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT)
 }
@@ -615,7 +617,10 @@ fn parse_legacy_submit_acceptance_markers(log: &str) -> Result<Vec<FragmentIdent
 }
 
 fn parse_fragment_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
+    #[cfg(test)]
     let mut accepted = parse_stage_fragment_acceptance_markers(log)?;
+    #[cfg(not(test))]
+    let accepted = parse_stage_fragment_acceptance_markers(log)?;
     #[cfg(test)]
     accepted.extend(parse_legacy_submit_acceptance_markers(log)?);
     Ok(accepted)
