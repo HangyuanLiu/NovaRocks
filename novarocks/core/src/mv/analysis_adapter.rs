@@ -284,7 +284,7 @@ pub(crate) fn analyze_mv_select_with_ports(
 ) -> Result<MvAnalysis, String> {
     let prepared =
         prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
-    let provider = crate::engine::build_catalog_service_provider(
+    let provider = crate::query_execution::compiler::build_catalog_service_provider(
         current_catalog,
         catalog_service,
         connector_control,

@@ -19,8 +19,8 @@
 
 use novarocks_spi::connector::ConnectorRequestContext;
 
-use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::query_execution::StatementResult;
+use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::view::{ViewRequestContext, ViewService, ViewStatementResult};
 
 #[derive(Clone)]
@@ -29,7 +29,7 @@ pub struct ViewCommandExecutor {
 }
 
 impl ViewCommandExecutor {
-    pub(crate) fn new(kernel: ViewExecutionKernel) -> Self {
+    pub fn new(kernel: ViewExecutionKernel) -> Self {
         Self { kernel }
     }
 

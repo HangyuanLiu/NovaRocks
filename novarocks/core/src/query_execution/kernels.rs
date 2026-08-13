@@ -44,7 +44,7 @@ use novarocks_spi::connector::ConnectorControlRegistry;
 /// Catalog state stays query-specific here.  DML/MV command execution receives
 /// only the leaf ports it uses rather than a reference back to this kernel.
 #[derive(Clone)]
-pub(crate) struct QueryPreparationKernel {
+pub struct QueryPreparationKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -62,7 +62,7 @@ pub(crate) struct QueryPreparationKernel {
 /// catalog, and the durable MV metadata reader.  In particular, it has no DML
 /// or MV mutation capability.
 #[derive(Clone)]
-pub(crate) struct SystemTableQueryKernel {
+pub struct SystemTableQueryKernel {
     catalog_service: Arc<QueryCatalogService>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     system_catalog: Arc<dyn SystemCatalog>,
@@ -70,7 +70,7 @@ pub(crate) struct SystemTableQueryKernel {
 }
 
 impl SystemTableQueryKernel {
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         system_catalog: Arc<dyn SystemCatalog>,
@@ -103,7 +103,7 @@ impl SystemTableQueryKernel {
 
 impl QueryPreparationKernel {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -157,7 +157,7 @@ impl QueryPreparationKernel {
 /// The CTAS recovery adapter must use this same connector-control generation;
 /// it is not a separate recovery context or scheduler.
 #[derive(Clone)]
-pub(crate) struct DmlExecutionKernel {
+pub struct DmlExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -167,7 +167,7 @@ pub(crate) struct DmlExecutionKernel {
 }
 
 impl DmlExecutionKernel {
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -216,7 +216,7 @@ impl DmlExecutionKernel {
 /// and enforce catalog-adjacent MV/view guards, but has no query execution,
 /// statistics, DML writer or MV refresh capability.
 #[derive(Clone)]
-pub(crate) struct CatalogCommandKernel {
+pub struct CatalogCommandKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -227,7 +227,7 @@ pub(crate) struct CatalogCommandKernel {
 
 impl CatalogCommandKernel {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -275,7 +275,7 @@ impl CatalogCommandKernel {
 /// The backend is injected directly; the obsolete string-keyed
 /// `ConnectorRegistry` is intentionally not represented here.
 #[derive(Clone)]
-pub(crate) struct MvExecutionKernel {
+pub struct MvExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -289,7 +289,7 @@ pub(crate) struct MvExecutionKernel {
 
 impl MvExecutionKernel {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -352,7 +352,7 @@ impl MvExecutionKernel {
 
 /// Typed statistics command and collection dependencies.
 #[derive(Clone)]
-pub(crate) struct StatisticsExecutionKernel {
+pub struct StatisticsExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
@@ -363,7 +363,7 @@ pub(crate) struct StatisticsExecutionKernel {
 
 impl StatisticsExecutionKernel {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
@@ -408,7 +408,7 @@ impl StatisticsExecutionKernel {
 
 /// View command dependencies.
 #[derive(Clone)]
-pub(crate) struct ViewExecutionKernel {
+pub struct ViewExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -416,7 +416,7 @@ pub(crate) struct ViewExecutionKernel {
 }
 
 impl ViewExecutionKernel {
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -449,7 +449,7 @@ impl ViewExecutionKernel {
 
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
-pub(crate) struct MaintenanceExecutionKernel {
+pub struct MaintenanceExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -459,7 +459,7 @@ pub(crate) struct MaintenanceExecutionKernel {
 }
 
 impl MaintenanceExecutionKernel {
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -504,12 +504,12 @@ impl MaintenanceExecutionKernel {
 
 /// FE-owned backend membership is intentionally a separate command capability.
 #[derive(Clone)]
-pub(crate) struct BackendManagementKernel {
+pub struct BackendManagementKernel {
     topology: BackendTopologyService,
 }
 
 impl BackendManagementKernel {
-    pub(crate) fn new(topology: BackendTopologyService) -> Self {
+    pub fn new(topology: BackendTopologyService) -> Self {
         Self { topology }
     }
 
@@ -530,7 +530,7 @@ pub struct SessionCatalogResolver {
 }
 
 impl SessionCatalogResolver {
-    pub(crate) fn new(
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,

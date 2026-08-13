@@ -19,9 +19,11 @@
 //! statement schema lookup, and catalog-service table invalidation.
 //! Ordinary SELECT external tables resolve through the query catalog materializer.
 
-use crate::engine::CatalogServiceSource;
 use crate::catalog_application::resolver::{CatalogAdmission, resolve_table_target};
-use crate::query_execution::kernels::{DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel};
+use crate::query_execution::compiler::CatalogServiceSource;
+use crate::query_execution::kernels::{
+    DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
+};
 use crate::sql::analyzer::iceberg_ref::{
     IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
     resolve_read_binding,

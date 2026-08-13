@@ -37,7 +37,7 @@ use crate::sql::mv_refresh::MvRefreshStatement;
 use novarocks_spi::connector::ConnectorRequestContext;
 
 #[derive(Clone)]
-pub(crate) struct StandaloneMvBackgroundEngine {
+pub struct StandaloneMvBackgroundEngine {
     ports: IcebergMvCorePorts,
     connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     repository: Arc<dyn crate::mv::repository::MvRepository>,
@@ -45,7 +45,7 @@ pub(crate) struct StandaloneMvBackgroundEngine {
 }
 
 impl StandaloneMvBackgroundEngine {
-    pub(crate) fn new_with_ports(
+    pub fn new_with_ports(
         ports: IcebergMvCorePorts,
         connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
         repository: Arc<dyn crate::mv::repository::MvRepository>,

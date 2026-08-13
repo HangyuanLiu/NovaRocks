@@ -452,7 +452,7 @@ fn plan_dml_change_stream_write(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     plan: &mut DmlChangeStreamWritePlan,
-) -> Result<crate::engine::PlannedIcebergChangeStreamWrite, String> {
+) -> Result<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite, String> {
     let keyed_assert = plan.pre_expand_keyed_assert.as_ref().map(|keyed_assert| {
         crate::sql::planner::physical::PreExpandKeyedAssertSpec {
             key_column_name: keyed_assert.key_column_name.clone(),
@@ -460,7 +460,7 @@ fn plan_dml_change_stream_write(
             message_prefix: keyed_assert.message_prefix.clone(),
         }
     });
-    crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_execution(
+    crate::query_execution::compiler::build_physical_plan_as_iceberg_change_stream_write_with_execution(
         state.connector_control().as_ref(),
         &plan.execution,
         &plan.producer,
@@ -1511,8 +1511,9 @@ fn build_update_mor_change_stream_write_plan(
         )?;
     }
 
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-    let analyzer_provider = crate::engine::build_catalog_service_provider(
+    let catalog_service_snapshot =
+        crate::query_execution::compiler::catalog_service_snapshot(state);
+    let analyzer_provider = crate::query_execution::compiler::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
         state.connector_control().as_ref(),
@@ -1537,7 +1538,7 @@ fn build_update_mor_change_stream_write_plan(
             write_planning_lease.clone(),
         )?;
     }
-    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh_with_statistics(
+    let planned = crate::query_execution::compiler::plan_query_for_iceberg_change_stream_refresh_with_statistics(
         state,
         &query,
         &analyzer_provider,
@@ -2174,7 +2175,7 @@ fn sql_string_literal(value: &str) -> String {
 struct MorUpdateChangeStreamExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
-    planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
+    planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
     registration_error: Option<String>,
@@ -2192,7 +2193,7 @@ struct MorUpdateChangeStreamExecutor {
 struct MorMergeChangeStreamExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
-    planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
+    planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
     registration_error: Option<String>,
@@ -2229,14 +2230,16 @@ impl MorUpdateChangeStreamExecutor {
             .expect("MOR UPDATE change-stream plan lock poisoned")
             .take()
             .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
-        let crate::engine::PlannedIcebergChangeStreamWrite {
+        let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
             prepared,
             native_bundle,
             topology,
             ..
         } = planned;
         #[cfg(test)]
-        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
+        if let Some(result) =
+            crate::query_execution::compiler::observe_change_stream_write_build_for_test(&topology)
+        {
             return Ok(result);
         }
         let writer_fragment_cohorts = topology
@@ -2350,14 +2353,16 @@ impl MorMergeChangeStreamExecutor {
             .expect("MOR MERGE change-stream plan lock poisoned")
             .take()
             .ok_or_else(|| "MOR MERGE change-stream plan was already consumed".to_string())?;
-        let crate::engine::PlannedIcebergChangeStreamWrite {
+        let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
             prepared,
             native_bundle,
             topology,
             ..
         } = planned;
         #[cfg(test)]
-        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
+        if let Some(result) =
+            crate::query_execution::compiler::observe_change_stream_write_build_for_test(&topology)
+        {
             return Ok(result);
         }
         let writer_fragment_cohorts = topology
@@ -3023,7 +3028,7 @@ fn run_one_cow_cohort(
                     frozen.identity,
                     frozen.read,
                 );
-            crate::engine::execute_query_as_iceberg_write_in_operation_with_query_local_overlays(
+            crate::query_execution::compiler::execute_query_as_iceberg_write_in_operation_with_query_local_overlays(
                 state,
                 Some(&target.catalog),
                 &target.namespace,
@@ -3039,7 +3044,7 @@ fn run_one_cow_cohort(
                 std::slice::from_ref(&overlay),
             )?
         }
-        None => crate::engine::execute_query_as_iceberg_write_in_operation_with_connector_context(
+        None => crate::query_execution::compiler::execute_query_as_iceberg_write_in_operation_with_connector_context(
             state,
             Some(&target.catalog),
             &target.namespace,
@@ -3432,9 +3437,10 @@ fn execute_exact_cow_match_query(
     let resolver = crate::query_execution::frozen_connector_read::FrozenConnectorReadResolver::new(
         binding, identity, read,
     );
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
+    let catalog_service_snapshot =
+        crate::query_execution::compiler::catalog_service_snapshot(state);
     let analyzer_catalog =
-        crate::engine::build_catalog_service_provider_with_bindings_and_query_local_overlays(
+        crate::query_execution::compiler::build_catalog_service_provider_with_bindings_and_query_local_overlays(
             Some(&target.catalog),
             &catalog_service_snapshot,
             state.connector_control().as_ref(),
@@ -4639,8 +4645,9 @@ fn build_merge_mor_change_stream_write_plan(
         )?;
     }
 
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-    let analyzer_provider = crate::engine::build_catalog_service_provider(
+    let catalog_service_snapshot =
+        crate::query_execution::compiler::catalog_service_snapshot(state);
+    let analyzer_provider = crate::query_execution::compiler::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
         state.connector_control().as_ref(),
@@ -4666,7 +4673,7 @@ fn build_merge_mor_change_stream_write_plan(
             write_planning_lease.clone(),
         )?;
     }
-    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh_with_statistics(
+    let planned = crate::query_execution::compiler::plan_query_for_iceberg_change_stream_refresh_with_statistics(
         state,
         &query,
         &analyzer_provider,
@@ -4911,16 +4918,16 @@ mod tests {
 
     fn test_dml_kernel() -> DmlExecutionKernel {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
-            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         DmlExecutionKernel::new(
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
-            crate::engine::test_query_execution_service_with_connector_control(Some(
-                connector_control,
-            )),
+            crate::query_execution::compiler::test_query_execution_service_with_connector_control(
+                Some(connector_control),
+            ),
         )
     }
 

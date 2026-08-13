@@ -38,14 +38,11 @@ use crate::runtime::query_result::{
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 
-pub use crate::catalog_application::query_catalog::{
-    QueryCatalogService, new_query_catalog_service,
-};
-pub use crate::connector::unified_statistics::UnifiedStatisticsResolver;
+use crate::catalog_application::query_catalog::{QueryCatalogService, new_query_catalog_service};
+use crate::connector::UnifiedStatisticsResolver;
 #[cfg(test)]
 use crate::mv::application::UnavailableMvApplicationService;
 use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
-pub use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::repository::MvRepository;
 #[cfg(test)]
 use crate::mv::repository::UnavailableMvRepository;
@@ -56,8 +53,7 @@ use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
-pub use domain::SessionCatalogResolver;
-pub mod frontend_capabilities;
+use crate::catalog_application::resolver as backend_resolver;
 use crate::catalog_application::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
@@ -66,7 +62,6 @@ use crate::catalog_application::statement::{
     looks_like_show_create_table, parse_alter_iceberg_properties_sql,
     parse_alter_partition_column_sql, parse_show_create_table,
 };
-use crate::catalog_application::resolver as backend_resolver;
 use crate::query_execution::kernels as domain;
 use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
@@ -1036,7 +1031,7 @@ pub struct CoreQueryCompiler {
 }
 
 impl CoreQueryCompiler {
-    pub(crate) fn from_domain_kernels(
+    pub fn from_domain_kernels(
         query: domain::QueryPreparationKernel,
         view: domain::ViewExecutionKernel,
         system_tables: domain::SystemTableQueryKernel,
@@ -3661,14 +3656,14 @@ mod tests {
     #[test]
     fn typed_statistics_statements_use_the_injected_application_port() {
         let port = Arc::new(RecordingStatisticsApplicationPort::default());
-        let executor = crate::engine::frontend_capabilities::statistics_command_executor(
-            crate::engine::frontend_capabilities::StatisticsCommandPorts::new(
-                Arc::new(crate::engine::new_query_catalog_service()),
-                Arc::new(crate::engine::TestConnectorControlRegistry::default()),
-                Arc::new(crate::engine::UnifiedStatisticsResolver::default()),
+        let executor = crate::statistics::command::StatisticsCommandExecutor::new(
+            crate::query_execution::kernels::StatisticsExecutionKernel::new(
+                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
+                Arc::new(crate::connector::UnifiedStatisticsResolver::default()),
                 Arc::new(crate::statistics::EmptyStatisticsService),
                 Arc::clone(&port) as Arc<dyn StatisticsApplicationPort>,
-                crate::engine::test_query_execution_service(),
+                crate::query_execution::compiler::test_query_execution_service(),
             ),
         );
 

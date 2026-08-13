@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use crate::query_execution::kernels::CatalogCommandKernel;
 use crate::query_execution::StatementResult;
+use crate::query_execution::kernels::CatalogCommandKernel;
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use bytes::Bytes;
@@ -53,7 +53,9 @@ use crate::sql::literal::sqlparser_expr_to_literal;
 pub(crate) trait CatalogDropContext:
     crate::catalog_application::resolver::CatalogAdmission
 {
-    fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService>;
+    fn catalog_service(
+        &self,
+    ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
     fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository;
     fn mv_storage_observation(
@@ -62,7 +64,9 @@ pub(crate) trait CatalogDropContext:
 }
 
 impl CatalogDropContext for CatalogCommandKernel {
-    fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService> {
+    fn catalog_service(
+        &self,
+    ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService> {
         self.catalog_service()
     }
 
@@ -688,8 +692,11 @@ pub(crate) fn execute_create_database_statement(
     current_catalog: Option<&str>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let target =
-        crate::catalog_application::resolver::resolve_namespace_target(context, name, current_catalog)?;
+    let target = crate::catalog_application::resolver::resolve_namespace_target(
+        context,
+        name,
+        current_catalog,
+    )?;
     let instance_id = mutation_instance_id(&target.catalog)?;
     crate::connector::mutation::execute_catalog_mutation(
         context.connector_control(),
@@ -1019,8 +1026,11 @@ pub(crate) fn execute_drop_database_statement(
     force: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let target =
-        crate::catalog_application::resolver::resolve_namespace_target(context, name, current_catalog)?;
+    let target = crate::catalog_application::resolver::resolve_namespace_target(
+        context,
+        name,
+        current_catalog,
+    )?;
     if target.backend_name == "iceberg" {
         ensure_no_iceberg_mv_targets_in_scope(context, &target.catalog, Some(&target.namespace))?;
         ensure_no_external_iceberg_dependents(context, &target.catalog, Some(&target.namespace))?;

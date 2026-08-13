@@ -288,7 +288,10 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         )?;
         let (kernel, target, base_snapshot_id) = match request.kind {
             MutationStatementKind::Update => {
-                let stmt = crate::catalog_application::statement::convert_sqlparser_update_to_custom(&raw)?;
+                let stmt =
+                    crate::catalog_application::statement::convert_sqlparser_update_to_custom(
+                        &raw,
+                    )?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_update_mutation(
                     self,
                     &stmt,
@@ -308,7 +311,8 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                 )
             }
             MutationStatementKind::Merge => {
-                let stmt = crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)?;
+                let stmt =
+                    crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_merge_mutation(
                     self,
                     &stmt,
@@ -533,16 +537,16 @@ mod tests {
 
     fn test_dml_kernel() -> crate::query_execution::kernels::DmlExecutionKernel {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
-            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         crate::query_execution::kernels::DmlExecutionKernel::new(
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
-            crate::engine::test_query_execution_service_with_connector_control(Some(
-                connector_control,
-            )),
+            crate::query_execution::compiler::test_query_execution_service_with_connector_control(
+                Some(connector_control),
+            ),
         )
     }
 

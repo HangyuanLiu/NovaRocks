@@ -657,7 +657,7 @@ pub(crate) struct RequestScopedMaintenanceEngine {
 }
 
 impl RequestScopedMaintenanceEngine {
-    pub(crate) fn new(
+    pub fn new(
         kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
         execution: crate::query_execution::request_context::QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -729,13 +729,13 @@ pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
 /// frontend-owned attempt factory. It never captures a state aggregate or a
 /// weak self reference.
 #[derive(Clone)]
-pub(crate) struct BackgroundMaintenanceEngine {
+pub struct BackgroundMaintenanceEngine {
     kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
     attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
 }
 
 impl BackgroundMaintenanceEngine {
-    pub(crate) fn new(
+    pub fn new(
         kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
         attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
     ) -> Self {
@@ -1508,7 +1508,7 @@ fn stage_frozen_rewrite_cohort_with_ports(
     let registration = session
         .execution_registration(cohort_id)
         .map_err(|error| format!("register frozen rewrite cohort: {error}"))?;
-    crate::engine::execute_frozen_rewrite_physical_plan_as_iceberg_staging_with_ports(
+    crate::query_execution::compiler::execute_frozen_rewrite_physical_plan_as_iceberg_staging_with_ports(
         connector_control,
         query_execution,
         physical_plan,

@@ -31,7 +31,7 @@ pub struct IcebergRefCommandExecutor {
 }
 
 impl IcebergRefCommandExecutor {
-    pub(crate) fn new(
+    pub fn new(
         connector_control: Arc<dyn ConnectorControlRegistry>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {

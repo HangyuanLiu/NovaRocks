@@ -15,12 +15,12 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::mv::application::{
     MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
     MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite, PreparedMvRefreshWrite,
 };
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
+use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
 
@@ -29,13 +29,13 @@ use crate::query_execution::request_context::QueryExecutionContext;
 /// It owns only the query-preparation kernel and MV leaf ports required to
 /// bind an already admitted write. It cannot recover a state aggregate or
 /// create a hidden all-in-one activation path.
-pub(crate) struct IcebergMvRefreshProviderActivation {
+pub struct IcebergMvRefreshProviderActivation {
     query_kernel: QueryPreparationKernel,
     ports: IcebergMvCorePorts,
 }
 
 impl IcebergMvRefreshProviderActivation {
-    pub(crate) fn new(query_kernel: QueryPreparationKernel, ports: IcebergMvCorePorts) -> Self {
+    pub fn new(query_kernel: QueryPreparationKernel, ports: IcebergMvCorePorts) -> Self {
         Self {
             query_kernel,
             ports,

@@ -37,10 +37,10 @@ use chrono::NaiveDateTime;
 use sqlparser::ast as sqlast;
 
 use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
-use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
@@ -205,11 +205,11 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
 
     fn run(&self) -> Result<QueryExecutionResult, String> {
         let distribution = if self.shuffle_by_first_output {
-            crate::engine::iceberg_write_shuffle_by_output_index(0)
+            crate::query_execution::compiler::iceberg_write_shuffle_by_output_index(0)
         } else {
             crate::sql::compiler::RootDistributionRequirement::Any
         };
-        let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
+        let result = crate::query_execution::compiler::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,

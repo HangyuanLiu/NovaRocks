@@ -56,7 +56,7 @@ pub(crate) struct ResolvedTable {
 ///
 /// Backends implement external storage-specific ownership behind this boundary;
 /// the trait does not define a native internal-table storage engine.
-pub(crate) trait MvBackend: Send + Sync {
+pub trait MvBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn create_mv(&self, req: CreateMvRequest) -> Result<(), String>;

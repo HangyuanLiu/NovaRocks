@@ -601,7 +601,7 @@ mod tests {
         observation: FakeObservation,
         compaction: CompactionAnswer,
     ) -> (
-        Arc<crate::engine::TestConnectorControlRegistry>,
+        Arc<crate::query_execution::compiler::TestConnectorControlRegistry>,
         Arc<FakeObservation>,
         Arc<CallLog>,
     ) {
@@ -636,7 +636,8 @@ mod tests {
                 None,
             )
             .expect("fake control binding");
-        let control = Arc::new(crate::engine::TestConnectorControlRegistry::default());
+        let control =
+            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         control.register(binding).expect("register fake binding");
         (control, Arc::new(observation), calls)
     }

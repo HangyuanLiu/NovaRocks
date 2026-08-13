@@ -19,8 +19,8 @@
 
 use std::sync::Arc;
 
-use crate::query_execution::kernels::MvExecutionKernel;
 use crate::query_execution::StatementResult;
+use crate::query_execution::kernels::MvExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 
 #[derive(Clone)]
@@ -29,7 +29,7 @@ pub struct MvCommandExecutor {
 }
 
 impl MvCommandExecutor {
-    pub(crate) fn new(kernel: MvExecutionKernel) -> Self {
+    pub fn new(kernel: MvExecutionKernel) -> Self {
         Self { kernel }
     }
 

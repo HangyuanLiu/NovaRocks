@@ -608,7 +608,8 @@ mod tests {
     /// touching the repository or provider observation ports.
     #[test]
     fn sweep_is_empty_without_a_ready_catalog_projection() {
-        let connector_control = crate::engine::TestConnectorControlRegistry::default();
+        let connector_control =
+            crate::query_execution::compiler::TestConnectorControlRegistry::default();
         let storage_observation =
             crate::mv::storage_observation::UnavailableMvStorageObservationPort;
         let repository = crate::mv::repository::UnavailableMvRepository;

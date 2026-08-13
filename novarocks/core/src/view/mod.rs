@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::engine::CatalogServiceSource;
+use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 pub mod view_command;
@@ -433,7 +433,7 @@ where
                 Arc::new(RwLock::new(self.catalog_service().local_snapshot())),
                 self.catalog_service().registry_snapshot(),
             );
-        let provider = crate::engine::build_catalog_service_provider(
+        let provider = crate::query_execution::compiler::build_catalog_service_provider(
             Some(catalog),
             &catalog_service_snapshot,
             self.connector_control(),

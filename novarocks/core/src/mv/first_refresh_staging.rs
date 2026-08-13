@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
-use crate::query_execution::kernels::QueryPreparationKernel;
-use crate::engine::iceberg_write_shuffle_by_output_name;
 use crate::mv::application::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
 };
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
+use crate::query_execution::compiler::iceberg_write_shuffle_by_output_name;
+use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
@@ -123,7 +123,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 return Err("MV first-refresh SQL activation expected a SQL artifact".to_string());
             };
             let query = parse_query_from_sql(physical_sql.sql())?;
-            crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
+            crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_binding(
                 query_kernel,
                 current_catalog.as_deref(),
                 &current_database,
@@ -230,7 +230,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                     "MV first-refresh join activation expected a logical SQL artifact".to_string(),
                 );
             };
-            crate::engine::prepare_logical_plan_as_iceberg_write_with_connector_binding(
+            crate::query_execution::compiler::prepare_logical_plan_as_iceberg_write_with_connector_binding(
                 query_kernel,
                 current_catalog.as_deref(),
                 &current_database,

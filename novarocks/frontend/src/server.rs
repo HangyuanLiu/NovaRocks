@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
+use crate::capabilities as core_capabilities;
 use novarocks::common::app_config::NovaRocksConfig;
-use novarocks::engine::frontend_capabilities as core_capabilities;
 use novarocks::maintenance::BackgroundMaintenanceAttemptFactory;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks::query_execution::session::QuerySessionFactory;
@@ -96,8 +96,9 @@ pub fn build_frontend_query_session_factory(
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 ) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
-    let catalog_service = Arc::new(novarocks::engine::new_query_catalog_service());
-    let unified_statistics = Arc::new(novarocks::engine::UnifiedStatisticsResolver::default());
+    let catalog_service =
+        Arc::new(novarocks::catalog_application::query_catalog::new_query_catalog_service());
+    let unified_statistics = Arc::new(novarocks::connector::UnifiedStatisticsResolver::default());
     let catalog_application = host.catalog_application_port();
     let catalog_projection = host.catalog_runtime_projection();
     let connector_control = host.connector_control_registry();
@@ -118,7 +119,7 @@ pub fn build_frontend_query_session_factory(
     )
     .map_err(FrontendApplicationError::server)?;
 
-    let iceberg_mv_ports = novarocks::engine::IcebergMvCorePorts::new(
+    let iceberg_mv_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
         Arc::clone(&catalog_service),
         Some(Arc::clone(&catalog_application)),
         Arc::clone(&connector_control),

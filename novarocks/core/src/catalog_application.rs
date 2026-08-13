@@ -32,7 +32,7 @@ use uuid::Uuid;
 pub mod command;
 pub mod iceberg_ref_command;
 pub mod information_schema;
-pub(crate) mod query_catalog;
+pub mod query_catalog;
 pub(crate) mod resolver;
 pub(crate) mod statement;
 pub mod system_catalog;
@@ -538,7 +538,7 @@ mod tests {
     }
 
     fn test_controls() -> Arc<dyn novarocks_spi::connector::ConnectorControlResolver> {
-        Arc::new(crate::engine::TestConnectorControlRegistry::default())
+        Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default())
             as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>
     }
 

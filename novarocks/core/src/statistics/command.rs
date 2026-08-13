@@ -23,8 +23,8 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::query_execution::kernels::StatisticsExecutionKernel;
 use crate::query_execution::StatementResult;
+use crate::query_execution::kernels::StatisticsExecutionKernel;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::statistics::application::{StatisticsApplicationResult, StatisticsTableTarget};
 use novarocks_catalog::identifier::normalize_identifier;
@@ -137,7 +137,7 @@ fn statistics_string_result(
 }
 
 impl StatisticsCommandExecutor {
-    pub(crate) fn new(kernel: StatisticsExecutionKernel) -> Self {
+    pub fn new(kernel: StatisticsExecutionKernel) -> Self {
         Self { kernel }
     }
 

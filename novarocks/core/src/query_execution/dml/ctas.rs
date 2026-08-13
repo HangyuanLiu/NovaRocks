@@ -356,8 +356,9 @@ fn plan_query_for_ctas_source(
             connector_context,
         )?;
     }
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-    let analyzer_provider = crate::engine::build_catalog_service_provider(
+    let catalog_service_snapshot =
+        crate::query_execution::compiler::catalog_service_snapshot(state);
+    let analyzer_provider = crate::query_execution::compiler::build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
         state.connector_control().as_ref(),
@@ -2151,16 +2152,16 @@ mod tests {
 
     fn test_dml_kernel() -> DmlExecutionKernel {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
-            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         DmlExecutionKernel::new(
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
-            crate::engine::test_query_execution_service_with_connector_control(Some(
-                connector_control,
-            )),
+            crate::query_execution::compiler::test_query_execution_service_with_connector_control(
+                Some(connector_control),
+            ),
         )
     }
 

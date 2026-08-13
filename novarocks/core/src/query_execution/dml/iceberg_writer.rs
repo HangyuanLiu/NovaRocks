@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Field;
 
-use crate::connector::backend::ResolvedTable;
 use crate::catalog_application::resolver::TargetBackend;
+use crate::connector::backend::ResolvedTable;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
@@ -457,7 +457,7 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
-        crate::engine::execute_query_as_iceberg_write_with_connector_context(
+        crate::query_execution::compiler::execute_query_as_iceberg_write_with_connector_context(
             &self.executor.state,
             Some(&self.executor.target.catalog),
             &self.executor.target.namespace,
@@ -488,7 +488,7 @@ impl PreparedIcebergWrite {
         let execution = executor.execution.as_ref().ok_or_else(|| {
             "prepared distributed Iceberg write requires an admitted execution context".to_string()
         })?;
-        crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_binding(
             &executor.state,
             Some(&executor.target.catalog),
             &executor.target.namespace,
@@ -1208,7 +1208,7 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
 }
 
 pub(crate) fn invalidate_iceberg_caches(
-    state: &impl crate::engine::CatalogServiceSource,
+    state: &impl crate::query_execution::compiler::CatalogServiceSource,
     target: &TargetBackend,
 ) -> Result<(), String> {
     state

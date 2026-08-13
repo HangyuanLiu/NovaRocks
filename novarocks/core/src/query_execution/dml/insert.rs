@@ -27,13 +27,13 @@ use std::sync::Arc;
 
 use novarocks_catalog::schema::ColumnDef;
 
-use crate::connector::backend::ResolvedTable;
 use crate::catalog_application::resolver::TargetBackend;
-use crate::query_execution::kernels::DmlExecutionKernel;
+use crate::connector::backend::ResolvedTable;
 use crate::query_execution::dml::external_write_fence::{
     ExternalWriteFenceProposal, external_fence_authority_unavailable, invalid_fence_request,
 };
 use crate::query_execution::dml::iceberg_writer;
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
 use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::statistics::StatisticsEngine;
@@ -568,16 +568,16 @@ mod tests {
 
     fn test_dml_kernel() -> DmlExecutionKernel {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
-            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         DmlExecutionKernel::new(
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
-            crate::engine::test_query_execution_service_with_connector_control(Some(
-                connector_control,
-            )),
+            crate::query_execution::compiler::test_query_execution_service_with_connector_control(
+                Some(connector_control),
+            ),
         )
     }
 

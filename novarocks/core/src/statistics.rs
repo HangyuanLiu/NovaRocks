@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::engine::CatalogServiceSource;
+use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::ObjectName;
@@ -400,11 +400,13 @@ mod tests {
     use super::*;
 
     struct TestCatalogSource {
-        catalog_service: Arc<crate::engine::QueryCatalogService>,
+        catalog_service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
     }
 
     impl CatalogServiceSource for TestCatalogSource {
-        fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService> {
+        fn catalog_service(
+            &self,
+        ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService> {
             &self.catalog_service
         }
     }
@@ -452,7 +454,9 @@ mod tests {
         use novarocks_catalog::schema::ColumnDef;
 
         let state = TestCatalogSource {
-            catalog_service: Arc::new(crate::engine::new_query_catalog_service()),
+            catalog_service: Arc::new(
+                crate::catalog_application::query_catalog::new_query_catalog_service(),
+            ),
         };
         {
             let mut catalog = state

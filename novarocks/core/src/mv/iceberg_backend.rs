@@ -21,12 +21,12 @@ use crate::connector::backend::MvBackend;
 use crate::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow};
 use crate::mv::model::MvStorageEngine;
 
-pub(crate) struct IcebergMvBackend {
+pub struct IcebergMvBackend {
     ports: crate::mv::iceberg_refresh::IcebergMvCorePorts,
 }
 
 impl IcebergMvBackend {
-    pub(crate) fn new_with_ports(ports: crate::mv::iceberg_refresh::IcebergMvCorePorts) -> Self {
+    pub fn new_with_ports(ports: crate::mv::iceberg_refresh::IcebergMvCorePorts) -> Self {
         Self { ports }
     }
 }

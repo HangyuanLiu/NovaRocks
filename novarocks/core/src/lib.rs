@@ -20,7 +20,6 @@ mod tests;
 pub mod catalog_application;
 pub mod common;
 pub mod connector;
-pub mod engine;
 pub mod maintenance;
 pub mod mv;
 pub mod protocol;
@@ -42,7 +41,7 @@ pub use common::types::FetchResult;
 /// The MV startup restore steps an application owner drives.
 ///
 /// A deliberately narrow re-export: the frontend needs exactly these four items
-/// to own startup orchestration, and widening `engine::mv` wholesale would expose
+/// to own startup orchestration, and widening the Core MV module wholesale would expose
 /// far more than that. The lake-reading code stays here because a production SQL
 /// procedure also calls it; what moves is who decides when it runs.
 pub mod mv_startup {

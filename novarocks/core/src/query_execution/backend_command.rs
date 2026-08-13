@@ -18,8 +18,8 @@
 //! Closed Frontend backend-membership command capability.
 
 use crate::common::app_config::ClusterRole;
-use crate::query_execution::kernels::BackendManagementKernel;
 use crate::query_execution::StatementResult;
+use crate::query_execution::kernels::BackendManagementKernel;
 
 #[derive(Clone)]
 pub struct BackendCommandExecutor {
@@ -37,7 +37,7 @@ fn require_backend_management_role(statement: &str, role: ClusterRole) -> Result
 }
 
 impl BackendCommandExecutor {
-    pub(crate) fn new(kernel: BackendManagementKernel) -> Self {
+    pub fn new(kernel: BackendManagementKernel) -> Self {
         Self { kernel }
     }
 

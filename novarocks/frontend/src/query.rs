@@ -25,15 +25,14 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use novarocks::common::app_config::ClusterRole;
-use novarocks::common::engine_error::{EngineError, EngineErrorCode};
 use novarocks::catalog_application::command::CatalogCommandExecutor;
 use novarocks::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-use novarocks::engine::SessionCatalogResolver;
-use novarocks::query_execution::backend_command::BackendCommandExecutor;
+use novarocks::common::app_config::ClusterRole;
+use novarocks::common::engine_error::{EngineError, EngineErrorCode};
 use novarocks::maintenance::command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor};
 use novarocks::mv::command::MvCommandExecutor;
 use novarocks::query_execution::backend::BackendTopologyService;
+use novarocks::query_execution::backend_command::BackendCommandExecutor;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
 use novarocks::query_execution::control::{
     QueryCancelOutcome, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
@@ -45,6 +44,7 @@ use novarocks::query_execution::dml::delete::DeleteEngine;
 use novarocks::query_execution::dml::insert::InsertEngine;
 use novarocks::query_execution::dml::mutation::MutationEngine;
 use novarocks::query_execution::dml::truncate::TruncateEngine;
+use novarocks::query_execution::kernels::SessionCatalogResolver;
 use novarocks::query_execution::request_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };

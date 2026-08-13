@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub(crate) mod backend;
+pub mod backend;
 pub mod cleanup_maintenance;
 pub(crate) mod data_mutation;
 pub mod distributed_rewrite_application;
@@ -28,7 +28,7 @@ pub(crate) mod stats;
 pub(crate) mod unified_statistics;
 pub(crate) mod write_target;
 
-pub(crate) use backend::MvBackend;
+pub use backend::MvBackend;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+pub use unified_statistics::UnifiedStatisticsResolver;
 
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorInstanceId, ConnectorListNamespacesRequest,
@@ -846,7 +847,10 @@ impl ConnectorRegistry {
     /// The caller supplies the complete Core port set captured by Frontend
     /// composition. This method intentionally does not accept application
     /// state or synthesize provider/default dependencies.
-    pub fn register_iceberg_mv_backend(&mut self, ports: crate::engine::IcebergMvCorePorts) {
+    pub fn register_iceberg_mv_backend(
+        &mut self,
+        ports: crate::mv::iceberg_refresh::IcebergMvCorePorts,
+    ) {
         self.register_mv_backend(Arc::new(
             crate::mv::iceberg_backend::IcebergMvBackend::new_with_ports(ports),
         ));

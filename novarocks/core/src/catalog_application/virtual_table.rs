@@ -451,9 +451,9 @@ mod tests {
     use crate::catalog_application::system_catalog::{
         SystemCatalog, SystemCatalogInputs, SystemTableData,
     };
-    use crate::engine::TestConnectorControlRegistry;
-    use crate::query_execution::kernels::SystemTableQueryKernel;
     use crate::mv::repository::UnavailableMvRepository;
+    use crate::query_execution::compiler::TestConnectorControlRegistry;
+    use crate::query_execution::kernels::SystemTableQueryKernel;
     use crate::sql::parser::dialect::StarRocksDialect;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};

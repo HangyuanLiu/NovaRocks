@@ -133,7 +133,9 @@ use novarocks_spi::connector::{
 /// immutable write artifact.  This deliberately names the individual
 /// dependencies instead of admitting the aggregate application state into a
 /// frontend-owned preparation path.
-trait IcebergMvRefreshSource: crate::engine::CatalogServiceSource + Send + Sync {
+trait IcebergMvRefreshSource:
+    crate::query_execution::compiler::CatalogServiceSource + Send + Sync
+{
     fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
     fn repository(&self) -> &dyn MvRepository;
@@ -1582,7 +1584,7 @@ impl IcebergMvCorePorts {
     }
 }
 
-impl crate::engine::CatalogServiceSource for IcebergMvCorePorts {
+impl crate::query_execution::compiler::CatalogServiceSource for IcebergMvCorePorts {
     fn catalog_service(&self) -> &Arc<QueryCatalogService> {
         &self.catalog_service
     }
@@ -2256,7 +2258,7 @@ fn prepare_iceberg_mv_create_with_ports(
         Some(current_catalog),
         current_database,
     );
-    let catalog_service = crate::engine::catalog_service_snapshot(ports);
+    let catalog_service = crate::query_execution::compiler::catalog_service_snapshot(ports);
     let analysis = crate::mv::analysis_adapter::analyze_mv_select_with_ports(
         Some(current_catalog),
         &catalog_service,
@@ -8221,7 +8223,8 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
     ),
     RefreshError,
 > {
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(query_kernel);
+    let catalog_service_snapshot =
+        crate::query_execution::compiler::catalog_service_snapshot(query_kernel);
     let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
         None,
         &catalog_service_snapshot,
@@ -9267,7 +9270,8 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         target_binding.lease(),
         connector_context,
     )?;
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(source);
+    let catalog_service_snapshot =
+        crate::query_execution::compiler::catalog_service_snapshot(source);
     let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
         source,
         connector_context,
@@ -9465,7 +9469,7 @@ fn prepare_imv_change_stream_writer(
         effect_output_ordinal,
         provider_routes,
     )?;
-    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_execution(
+    let planned = crate::query_execution::compiler::build_physical_plan_as_iceberg_change_stream_write_with_execution(
         query_kernel.connector_control().as_ref(),
         execution,
         &refresh_plan.optimized_tree,
@@ -9474,14 +9478,12 @@ fn prepare_imv_change_stream_writer(
         None,
         connector_context,
     )?;
-    crate::engine::prepare_planned_iceberg_change_stream_write(
+    crate::query_execution::compiler::prepare_planned_iceberg_change_stream_write(
         planned.prepared,
         planned.native_bundle,
         None,
         execution,
-        Some(crate::engine::DistributedConnectorWrite::Begin(
-            connector_write,
-        )),
+        Some(crate::query_execution::compiler::DistributedConnectorWrite::Begin(connector_write)),
     )
 }
 
@@ -9655,7 +9657,8 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 target_binding,
                 rewrite_evidence,
             )?;
-            let catalog_service_snapshot = crate::engine::catalog_service_snapshot(query_kernel);
+            let catalog_service_snapshot =
+                crate::query_execution::compiler::catalog_service_snapshot(query_kernel);
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
                 ports,
                 &connector_context,
@@ -9673,7 +9676,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 ),
                 base_overlays,
             );
-            crate::engine::plan_query_for_iceberg_change_stream_refresh_with_statistics(
+            crate::query_execution::compiler::plan_query_for_iceberg_change_stream_refresh_with_statistics(
                 query_kernel,
                 &query,
                 &analyzer_catalog,
@@ -9713,10 +9716,11 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 join_mode,
                 JoinIncrementalLogicalInput { plan, factory },
             )?;
-            let mut planned = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
-                logical.plan,
-                logical.factory,
-            )?;
+            let mut planned =
+                crate::query_execution::compiler::plan_logical_for_iceberg_change_stream_refresh(
+                    logical.plan,
+                    logical.factory,
+                )?;
             if let Some(change_stream) = logical.change_stream_override {
                 planned.change_stream = change_stream;
             }

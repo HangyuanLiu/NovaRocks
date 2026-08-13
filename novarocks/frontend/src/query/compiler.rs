@@ -20,8 +20,8 @@
 //! It preserves the Core kernel's sealed request and completion contracts while
 //! keeping Frontend admission independent from the Core `engine` namespace.
 
-use novarocks::engine::CoreQueryCompiler;
 use novarocks::query_execution::PreparedQueryOperation;
+use novarocks::query_execution::compiler::CoreQueryCompiler;
 use novarocks::query_execution::request_context::RequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 

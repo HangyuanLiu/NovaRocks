@@ -21,7 +21,6 @@ pub mod backend;
 pub mod backend_command;
 pub mod cancellation;
 pub mod completion;
-pub(crate) mod kernels;
 mod connector_binding;
 pub(crate) mod connector_write_transaction;
 pub mod contract;
@@ -32,6 +31,7 @@ pub mod fragment_transport;
 pub(crate) mod frozen_connector_read;
 #[cfg(test)]
 pub(crate) mod in_process_test;
+pub mod kernels;
 pub mod lifecycle;
 pub(crate) mod outcome;
 pub(crate) mod planning;
@@ -70,5 +70,6 @@ pub mod write_operation;
 pub mod write_plan;
 pub(crate) mod write_transaction;
 
+pub mod compiler;
 #[cfg(test)]
 mod tests;

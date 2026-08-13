@@ -35,7 +35,7 @@ pub struct MaintenanceCommandExecutor {
 }
 
 impl MaintenanceCommandExecutor {
-    pub(crate) fn new(kernel: crate::query_execution::kernels::MaintenanceExecutionKernel) -> Self {
+    pub fn new(kernel: crate::query_execution::kernels::MaintenanceExecutionKernel) -> Self {
         Self { kernel }
     }
 
@@ -75,7 +75,7 @@ pub struct MaintenanceReadCommandExecutor {
 }
 
 impl MaintenanceReadCommandExecutor {
-    pub(crate) fn new(service: Arc<dyn TableMaintenanceService>) -> Self {
+    pub fn new(service: Arc<dyn TableMaintenanceService>) -> Self {
         Self { service }
     }
 
