@@ -140,12 +140,15 @@ Useful files:
 - `novarocks.toml`: local runtime config
 - `novarocks.toml.example`: extended documented template
 
-Standalone mode is configured through `[standalone_server]`:
+Standalone mode is configured through `[standalone_server]`. A frontend role
+also uses `[state_store]` for its durable application state:
 
 ```toml
-[metadata]
+[state_store]
 provider = "sqlite"
-path = "meta/standalone.sqlite"
+path = "meta/frontend-state.sqlite"
+cluster_id = "local-cluster"
+deployment_owner = "fe-1"
 
 [standalone_server]
 mysql_port = 9030
@@ -158,8 +161,8 @@ access_key_secret = "admin123"
 enable_path_style_access = true
 ```
 
-`[metadata].path` stores native control metadata in SQLite. Persistent user
-tables belong to explicitly created external Iceberg catalogs;
+`[state_store]` is the frontend-owned durable control-plane store. Persistent
+user tables belong to explicitly created external Iceberg catalogs;
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.
 

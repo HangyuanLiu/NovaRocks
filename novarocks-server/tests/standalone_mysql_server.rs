@@ -186,7 +186,7 @@ fn run_curl_stream_load(
     String::from_utf8(output.stdout).expect("decode curl stdout")
 }
 
-fn write_standalone_metadata_config(mysql_port: u16) -> (TempDir, PathBuf) {
+fn write_standalone_state_store_config(mysql_port: u16) -> (TempDir, PathBuf) {
     let config_dir = TempDir::new().expect("create standalone server config dir");
     let config_path = config_dir.path().join("novarocks.toml");
     let state_store_path = config_dir.path().join("frontend-state.sqlite");
@@ -201,11 +201,7 @@ fn write_standalone_metadata_config(mysql_port: u16) -> (TempDir, PathBuf) {
     std::fs::write(
         &config_path,
         format!(
-            r#"[metadata]
-provider = "sqlite"
-path = "meta/catalog.db"
-
-[state_store]
+            r#"[state_store]
 provider = "sqlite"
 path = "{}"
 cluster_id = "standalone-mysql-server-test"
@@ -228,8 +224,8 @@ enable_path_style_access = true
     (config_dir, config_path)
 }
 
-fn standalone_server_args_with_metadata(mysql_port: u16) -> (TempDir, Vec<String>) {
-    let (config_dir, config_path) = write_standalone_metadata_config(mysql_port);
+fn standalone_server_args_with_state_store(mysql_port: u16) -> (TempDir, Vec<String>) {
+    let (config_dir, config_path) = write_standalone_state_store_config(mysql_port);
     let args = vec![
         "standalone".to_string(),
         "--config".to_string(),
@@ -343,7 +339,7 @@ fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
 fn standalone_mysql_server_supports_minimal_iceberg_flow() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -374,13 +370,17 @@ fn standalone_mysql_server_supports_minimal_iceberg_flow() {
         .query("select name from ice.db1.tbl where id = 2")
         .expect("filtered iceberg select");
     assert_eq!(filtered, vec![(Some("b".to_string()),)]);
+    assert!(
+        !config_dir.path().join("meta/catalog.db").exists(),
+        "the retired legacy metadata database must not be created"
+    );
 }
 
 #[test]
 fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -406,7 +406,7 @@ fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
 fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -463,7 +463,7 @@ fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
 fn standalone_mysql_server_supports_catalog_session_context() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -527,7 +527,7 @@ fn standalone_mysql_server_supports_catalog_session_context() {
 fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -600,7 +600,7 @@ fn standalone_mysql_server_rejects_default_catalog_persistent_table() {
 #[test]
 fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_happy");
 
     let mut server = ServerGuard::spawn(&args);
@@ -711,7 +711,7 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged() {
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_noop");
 
     let mut server = ServerGuard::spawn(&args);
@@ -752,7 +752,7 @@ fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged(
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_append");
 
     let mut server = ServerGuard::spawn(&args);
@@ -795,7 +795,7 @@ fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
 #[test]
 fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_show");
 
     let mut server = ServerGuard::spawn(&args);
@@ -850,7 +850,7 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
 #[test]
 fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_refresh_policy_ddl");
 
     let mut server = ServerGuard::spawn(&args);
@@ -914,7 +914,7 @@ fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
 #[test]
 fn standalone_mysql_server_mv_create_rejects_starrocks_storage_engine() {
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_reject_starrocks");
 
     let mut server = ServerGuard::spawn(&args);
@@ -951,7 +951,7 @@ fn standalone_mysql_server_mv_create_rejects_starrocks_storage_engine() {
 #[test]
 fn standalone_mysql_server_mv_reopen_preserves_iceberg_mv() {
     let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_metadata(port);
+    let (_config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_reopen");
 
     {

@@ -347,7 +347,7 @@ fn projection_first_refresh_stages_on_three_backend_processes() {
     let fe_grpc_port = fe_grpc.port;
     let state_root = tempfile::tempdir().expect("create frontend state root");
     let state_path = state_root.path().join("state.sqlite");
-    let metadata_path = state_root.path().join("metadata.sqlite");
+    let legacy_metadata_path = state_root.path().join("metadata.sqlite");
     let config_file = tempfile::NamedTempFile::new().expect("create frontend config");
     let backend_list = backends
         .endpoints
@@ -371,10 +371,6 @@ mysql_port = {}
 role = "fe"
 backends = [{}]
 
-[metadata]
-provider = "sqlite"
-path = "{}"
-
 [state_store]
 provider = "sqlite"
 path = "{}"
@@ -385,7 +381,6 @@ deployment_owner = "fe-1"
             fe_grpc_port,
             fe_mysql_port,
             backend_list,
-            metadata_path.display(),
             state_path.display(),
         ),
     )
@@ -703,4 +698,8 @@ deployment_owner = "fe-1"
         .block_on(server_task)
         .expect("join frontend server task");
     server_result.expect("shutdown frontend server");
+    assert!(
+        !legacy_metadata_path.exists(),
+        "the retired legacy metadata database must not be created"
+    );
 }

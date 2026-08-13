@@ -856,89 +856,25 @@ pub(crate) fn render_cross_process_config(
     toml::to_string(&value).context("serialize cross-process standalone config")
 }
 
-/// Render the per-process TOML config for cross-process mode, then override
-/// the IMV metadata store's SQLite path.
-///
-/// The override targets `[metadata].path` — the key read by
-/// `open_metadata_provider` via `MetadataConfig { provider, path }` — because
-/// that is where the IMV definition cache (and other standalone metadata)
-/// actually lives. This is deliberately **not** the retired
-/// `[standalone_server].metadata_db_path` internal-table key.
-///
-/// Used by the L2 cross-process empty-metadata statelessness harness to point
-/// a second FE launch at a fresh, empty SQLite path while keeping every other
-/// section (server ports and connector configuration) identical to a normal
-/// `render_cross_process_config` render — so the second launch talks to the
-/// same lake but starts with no cached IMV definitions.
-pub(crate) fn render_cross_process_config_with_metadata_db_override(
-    base_config: &str,
-    role: ClusterProcessRole,
-    be_index: usize,
-    runtime: &CrossProcessRuntime,
-    metadata_db_path: &str,
-) -> Result<String> {
-    let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
-
-    let mut value = rendered
-        .parse::<Value>()
-        .context("parse rendered cross-process config for metadata override")?;
-    let root = value.as_table_mut().ok_or_else(|| {
-        anyhow::anyhow!("rendered cross-process config root must be a TOML table")
-    })?;
-
-    let metadata = table_mut(root, "metadata");
-    metadata.insert(
-        "path".to_string(),
-        Value::String(metadata_db_path.to_string()),
-    );
-
-    toml::to_string(&value).context("serialize cross-process config with metadata db override")
-}
-
 fn render_cross_process_launch_config(
     base_config: &str,
     role: ClusterProcessRole,
     be_index: usize,
     runtime: &CrossProcessRuntime,
     runtime_dir: &Path,
-    metadata_mode: CrossProcessMetadataMode<'_>,
     query_lifecycle_faults_enabled: bool,
     cleanup_faults_enabled: bool,
 ) -> Result<String> {
-    let rendered = match metadata_mode {
-        CrossProcessMetadataMode::Isolated => {
-            let metadata_path = runtime_dir.join("metadata.sqlite");
-            let metadata_path = metadata_path
-                .to_str()
-                .context("cross-process runtime metadata path must be valid UTF-8")?;
-            render_cross_process_config_with_metadata_db_override(
-                base_config,
-                role,
-                be_index,
-                runtime,
-                metadata_path,
-            )
-        }
-        CrossProcessMetadataMode::Explicit(metadata_path) => {
-            render_cross_process_config_with_metadata_db_override(
-                base_config,
-                role,
-                be_index,
-                runtime,
-                metadata_path,
-            )
-        }
-    }?;
+    let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
     let mut value = rendered
         .parse::<Value>()
         .context("parse rendered cross-process launch config")?;
     let root = value
         .as_table_mut()
         .context("rendered cross-process launch config root must be a TOML table")?;
-    // `role = fe` persists backend membership in StateStore.  Isolating only
-    // `[metadata].path` leaves an ephemeral SQL-test FE restoring membership
-    // rows from a previous launch, whose dynamically allocated BE endpoints
-    // are necessarily stale.
+    // `role = fe` persists backend membership in StateStore. Every ephemeral
+    // SQL-test FE needs its own store so it cannot restore membership rows
+    // whose dynamically allocated BE endpoints belong to another launch.
     if role == ClusterProcessRole::Fe {
         let state_store = root
             .get_mut("state_store")
@@ -1299,15 +1235,6 @@ pub(crate) struct CrossProcessServerHandle {
     fe_log_history: String,
 }
 
-#[derive(Clone, Copy)]
-enum CrossProcessMetadataMode<'a> {
-    /// Ephemeral SQL-test clusters, including IMV L2 cluster A, must never
-    /// restore backend rows from another launch whose dynamically reserved
-    /// endpoints are already stale.
-    Isolated,
-    Explicit(&'a str),
-}
-
 struct RuntimeDirGuard {
     runtime_dir: Option<PathBuf>,
 }
@@ -1350,36 +1277,8 @@ impl CrossProcessServerHandle {
             cluster_size,
             repo_root,
             runner_config,
-            CrossProcessMetadataMode::Isolated,
             query_lifecycle_faults_enabled,
             cleanup_faults_enabled,
-        )
-    }
-
-    /// Same as [`Self::launch`], but every rendered process config (FE and
-    /// each BE) has its `[metadata].path` overridden to `metadata_db_path`
-    /// instead of inheriting the base config's value.
-    ///
-    /// This is the launch primitive the L2 cross-process empty-metadata
-    /// statelessness harness (`crate::imv_stateless`) uses for its second
-    /// cluster: same lake/object-store/warehouse config as the first launch,
-    /// but a fresh, empty SQLite metadata path, so the FE's IMV definition
-    /// cache starts empty and must be rebuilt from the lake at startup (see
-    /// `restore_metadata_if_needed` / `rebuild_imv_cache_from_lake` in
-    /// `src/engine/mod.rs`).
-    pub(crate) fn launch_with_metadata_db_override(
-        cluster_size: usize,
-        repo_root: &Path,
-        runner_config: &RunnerConfig,
-        metadata_db_path: &str,
-    ) -> Result<Self> {
-        Self::launch_impl(
-            cluster_size,
-            repo_root,
-            runner_config,
-            CrossProcessMetadataMode::Explicit(metadata_db_path),
-            false,
-            false,
         )
     }
 
@@ -1387,7 +1286,6 @@ impl CrossProcessServerHandle {
         cluster_size: usize,
         repo_root: &Path,
         runner_config: &RunnerConfig,
-        metadata_mode: CrossProcessMetadataMode<'_>,
         query_lifecycle_faults_enabled: bool,
         cleanup_faults_enabled: bool,
     ) -> Result<Self> {
@@ -1443,7 +1341,6 @@ impl CrossProcessServerHandle {
                 be_index,
                 &runtime,
                 runtime_dir.path(),
-                metadata_mode,
                 query_lifecycle_faults_enabled,
                 cleanup_faults_enabled,
             )
@@ -3128,10 +3025,6 @@ mod tests {
     }
 
     static BASE_CONFIG: &str = r#"
-[metadata]
-provider = "sqlite"
-path = "tmp/sql-tests.sqlite"
-
 [state_store]
 provider = "sqlite"
 cluster_id = "sql-tests-cross-process"
@@ -3161,17 +3054,12 @@ enable_path_style_access = true
         let be_value: toml::Value = be.parse().expect("parse be toml");
 
         assert_eq!(
-            fe_value["metadata"]["path"].as_str(),
-            Some("tmp/sql-tests.sqlite")
-        );
-        assert_eq!(
             fe_value["state_store"]["path"].as_str(),
             Some("tmp/sql-tests-state-store.sqlite")
         );
-        assert_ne!(
-            fe_value["metadata"]["path"].as_str(),
-            fe_value["state_store"]["path"].as_str(),
-            "MV StateStore must not share the legacy metadata SQLite path"
+        assert!(
+            fe_value.get("metadata").is_none(),
+            "FE rendering must not create a legacy metadata store"
         );
         assert_eq!(
             fe_value["connector"]["object_store"]["endpoint"].as_str(),
@@ -3201,13 +3089,13 @@ enable_path_style_access = true
         assert_eq!(fe_backends.len(), 1);
         assert_eq!(fe_backends[0].as_str(), Some("127.0.0.1:19070"));
 
-        assert_eq!(
-            be_value["metadata"]["path"].as_str(),
-            Some("tmp/sql-tests.sqlite")
-        );
         assert!(
             be_value.get("state_store").is_none(),
-            "BE rendering must not invent a separate MV StateStore"
+            "BE rendering must not own frontend StateStore"
+        );
+        assert!(
+            be_value.get("metadata").is_none(),
+            "BE rendering must not create a legacy metadata store"
         );
         assert_eq!(
             be_value["connector"]["object_store"]["endpoint"].as_str(),
@@ -3296,73 +3184,6 @@ enable_path_style_access = true
         );
     }
 
-    /// Locally-validated unit test for the M7 L2 harness helper: confirms the
-    /// override lands on `[metadata].path` (the key `open_metadata_provider`
-    /// actually reads via `MetadataConfig { provider, path }`) and leaves every
-    /// other section — server ports, cluster role/backends, and connector
-    /// object-store settings — exactly as `render_cross_process_config` would
-    /// have produced them. This is the piece the harness can prove correct without
-    /// a live cluster; the L2 e2e (two cross-process launches over the same
-    /// lake) is exercised in CI via `imv_stateless::run_imv_stateless_l2_case`.
-    #[test]
-    fn render_cross_process_config_with_metadata_db_override_overrides_only_metadata_path() {
-        let runtime = make_runtime_1be();
-
-        let fe = render_cross_process_config_with_metadata_db_override(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-            "/new/empty.sqlite",
-        )
-        .expect("render fe config with metadata override");
-        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
-
-        // The override key: [metadata].path, NOT
-        // [standalone_server].metadata_db_path (a retired internal-table key).
-        assert_eq!(
-            fe_value["metadata"]["path"].as_str(),
-            Some("/new/empty.sqlite")
-        );
-        assert_eq!(fe_value["metadata"]["provider"].as_str(), Some("sqlite"));
-        assert!(
-            fe_value
-                .get("standalone_server")
-                .and_then(|s| s.get("metadata_db_path"))
-                .is_none(),
-            "override must not write the legacy standalone_server.metadata_db_path key"
-        );
-
-        // Every other section must be untouched relative to a normal render.
-        let plain_fe =
-            render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
-                .expect("render plain fe config");
-        let plain_fe_value: toml::Value = plain_fe.parse().expect("parse plain fe toml");
-
-        assert_eq!(fe_value["server"], plain_fe_value["server"]);
-        assert_eq!(fe_value["cluster"], plain_fe_value["cluster"]);
-        assert_eq!(
-            fe_value["standalone_server"]["mysql_port"],
-            plain_fe_value["standalone_server"]["mysql_port"]
-        );
-        assert_eq!(fe_value["connector"], plain_fe_value["connector"]);
-
-        // BE role also gets the override, independent of FE.
-        let be = render_cross_process_config_with_metadata_db_override(
-            BASE_CONFIG,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-            "/new/empty.sqlite",
-        )
-        .expect("render be config with metadata override");
-        let be_value: toml::Value = be.parse().expect("parse be toml");
-        assert_eq!(
-            be_value["metadata"]["path"].as_str(),
-            Some("/new/empty.sqlite")
-        );
-    }
-
     #[test]
     fn ordinary_cross_process_launches_do_not_share_persisted_backend_rows() {
         let runtime = make_runtime_1be();
@@ -3375,7 +3196,6 @@ enable_path_style_access = true
             0,
             &runtime,
             first_runtime,
-            CrossProcessMetadataMode::Isolated,
             false,
             false,
         )
@@ -3388,7 +3208,6 @@ enable_path_style_access = true
             0,
             &runtime,
             second_runtime,
-            CrossProcessMetadataMode::Isolated,
             false,
             false,
         )
@@ -3397,21 +3216,15 @@ enable_path_style_access = true
         .unwrap();
 
         assert_eq!(
-            first["metadata"]["path"].as_str(),
-            first_runtime.join("metadata.sqlite").to_str()
-        );
-        assert_eq!(
             first["state_store"]["path"].as_str(),
             first_runtime.join("frontend-state.sqlite").to_str()
-        );
-        assert_eq!(
-            second["metadata"]["path"].as_str(),
-            second_runtime.join("metadata.sqlite").to_str()
         );
         assert_eq!(
             second["state_store"]["path"].as_str(),
             second_runtime.join("frontend-state.sqlite").to_str()
         );
+        assert!(first.get("metadata").is_none());
+        assert!(second.get("metadata").is_none());
         assert_ne!(
             first["state_store"]["path"], second["state_store"]["path"],
             "ephemeral clusters must not restore stale backend rows from another launch"
@@ -3425,94 +3238,6 @@ enable_path_style_access = true
             "ordinary cross-process config must not render debug knobs"
         );
     }
-
-
-    #[test]
-    fn imv_l2_metadata_isolation_preserves_shared_lake_fixture() {
-        let runtime = make_runtime_1be();
-        let cluster_a_runtime = Path::new("/tmp/novarocks-imv-l2-cluster-a");
-        let cluster_b_metadata = "/tmp/novarocks-imv-l2-cluster-b.sqlite";
-        let base = BASE_CONFIG.parse::<Value>().unwrap();
-
-        let cluster_a = render_cross_process_launch_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-            cluster_a_runtime,
-            CrossProcessMetadataMode::Isolated,
-            false,
-            false,
-        )
-        .unwrap()
-        .parse::<Value>()
-        .unwrap();
-        let cluster_b = render_cross_process_launch_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-            Path::new("/tmp/novarocks-imv-l2-cluster-b"),
-            CrossProcessMetadataMode::Explicit(cluster_b_metadata),
-            false,
-            false,
-        )
-        .unwrap()
-        .parse::<Value>()
-        .unwrap();
-
-        assert_eq!(
-            cluster_a["metadata"]["path"].as_str(),
-            cluster_a_runtime.join("metadata.sqlite").to_str(),
-            "cluster A must not inherit backend topology rows from the base metadata database"
-        );
-        assert_eq!(
-            cluster_b["metadata"]["path"].as_str(),
-            Some(cluster_b_metadata)
-        );
-        assert_ne!(cluster_a["metadata"]["path"], base["metadata"]["path"]);
-        assert_ne!(cluster_b["metadata"]["path"], base["metadata"]["path"]);
-        assert_ne!(cluster_a["metadata"]["path"], cluster_b["metadata"]["path"]);
-        assert_eq!(cluster_a["connector"], base["connector"]);
-        assert_eq!(cluster_b["connector"], base["connector"]);
-    }
-
-    #[test]
-    fn render_cross_process_config_with_metadata_override_does_not_add_runtime_selector() {
-        let runtime = make_runtime_1be();
-
-        let fe = render_cross_process_config_with_metadata_db_override(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-            "/new/empty.sqlite",
-        )
-        .expect("render fe config with metadata override");
-        let be = render_cross_process_config_with_metadata_db_override(
-            BASE_CONFIG,
-            ClusterProcessRole::Be,
-            0,
-            &runtime,
-            "/new/empty.sqlite",
-        )
-        .expect("render be config with metadata override");
-
-        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
-        let be_value: toml::Value = be.parse().expect("parse be toml");
-
-        assert_eq!(
-            fe_value["metadata"]["path"].as_str(),
-            Some("/new/empty.sqlite")
-        );
-        assert!(fe_value.get("runtime").is_none());
-        assert_eq!(
-            be_value["metadata"]["path"].as_str(),
-            Some("/new/empty.sqlite")
-        );
-        assert!(be_value.get("runtime").is_none());
-    }
-
     #[test]
     fn render_cross_process_config_empty_base_patches_fe_heartbeat_only() {
         let runtime = make_runtime_1be();

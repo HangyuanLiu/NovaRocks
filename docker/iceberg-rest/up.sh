@@ -352,10 +352,6 @@ grpc_port = $grpc_port
 [runtime]
 exchange_wait_ms = 300000
 
-[metadata]
-provider = "sqlite"
-path = "$runtime_dir/metadata.sqlite"
-
 [state_store]
 provider = "sqlite"
 path = "$runtime_dir/frontend-state.sqlite"
@@ -385,10 +381,6 @@ grpc_port = $grpc_port
 
 [runtime]
 exchange_wait_ms = 300000
-
-[metadata]
-provider = "sqlite"
-path = "$runtime_dir/metadata.sqlite"
 
 [state_store]
 provider = "sqlite"
