@@ -1920,7 +1920,7 @@ impl MvEngine for StandaloneMvEngine {
                 error,
             ));
         }
-        register_iceberg_mv_target_in_catalog(&self.state, &target)
+        register_iceberg_mv_target_in_catalog(&mv_target_restore_context(&self.state), &target)
             .map_err(|error| MvEngineError::new(MvEngineErrorKind::CatalogRegistration, error))?;
         self.preparations
             .lock()
@@ -4498,8 +4498,29 @@ fn aggregate_state_role_contract(
     }
 }
 
-pub(crate) fn register_iceberg_mv_target_in_catalog(
+/// Projects aggregate engine state into the two inputs a target restore needs.
+pub(crate) fn mv_target_restore_context(
     state: &Arc<StandaloneState>,
+) -> MvTargetRestoreContext<'_> {
+    MvTargetRestoreContext {
+        connector_control: state.connector_control.as_ref(),
+        mv_repository: state.mv_repository.as_ref(),
+    }
+}
+
+/// The state an Iceberg MV target restore reads, named explicitly rather than
+/// reached through aggregate engine state.
+///
+/// Same shape and motive as the lake rebuild's context: two inputs, both already
+/// reachable from a frontend composition, so restoring targets stops requiring
+/// the engine.
+pub(crate) struct MvTargetRestoreContext<'a> {
+    pub(crate) connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
+    pub(crate) mv_repository: &'a dyn crate::mv::repository::MvRepository,
+}
+
+pub(crate) fn register_iceberg_mv_target_in_catalog(
+    ctx: &MvTargetRestoreContext<'_>,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
     // SQLX-2 keeps provider tables out of the process-wide planner catalog.
@@ -4510,18 +4531,18 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("parse MV target connector identity: {error}"))?;
     novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-        state.connector_control.as_ref(),
+        ctx.connector_control,
         &instance_id,
     )
     .map_err(|error| format!("acquire MV target connector generation: {error}"))?;
     Ok(())
 }
 
-pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result<(), String> {
-    if !state.mv_repository.availability().is_available() {
+pub(crate) fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<(), String> {
+    if !ctx.mv_repository.availability().is_available() {
         return Ok(());
     }
-    for mv in state
+    for mv in ctx
         .mv_repository
         .list_definitions()
         .map_err(|e| format!("load MV definitions for iceberg restore failed: {e}"))?
@@ -4542,7 +4563,7 @@ pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result
                 .target_table
                 .ok_or_else(|| format!("iceberg MV {} missing target_table", mv.mv_id))?,
         };
-        register_iceberg_mv_target_in_catalog(state, &target)?;
+        register_iceberg_mv_target_in_catalog(ctx, &target)?;
     }
     Ok(())
 }

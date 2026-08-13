@@ -3898,7 +3898,9 @@ impl crate::mv::startup_restore::MvStartupRestore for EngineMvStartupRestore<'_>
     }
 
     fn restore_targets(&self) -> Result<(), String> {
-        crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(self.state)
+        crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(
+            &crate::engine::mv::iceberg_refresh::mv_target_restore_context(self.state),
+        )
     }
 
     fn recover_unfinished_refreshes(&self) -> Result<(), String> {
