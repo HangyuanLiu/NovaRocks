@@ -30,6 +30,9 @@ mod shell;
 mod suite_manifest;
 mod types;
 
+#[path = "../../../novarocks/core/src/common/engine_error_codes.rs"]
+mod engine_error_codes;
+
 use crate::benchmark_bootstrap::{
     BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
 };
@@ -41,8 +44,8 @@ use crate::config::{
 };
 use crate::parser::load_suite_hook;
 use crate::results::{
-    case_result_path, compare_result_sets, find_legacy_result_paths, load_expected_results,
-    normalize_explain_timing_rows, step_allows_missing_expected_result,
+    MismatchArtifacts, case_result_path, compare_result_sets, find_legacy_result_paths,
+    load_expected_results, normalize_explain_timing_rows, step_allows_missing_expected_result,
     step_has_implicit_skip_result, step_requires_recorded_result, step_retry_count,
     step_retry_interval, verify_text_assertions, write_mismatch_artifacts, write_result_file,
 };
@@ -518,16 +521,27 @@ fn classify_alter_job_poll(execution: &crate::types::QueryExecution) -> AlterJob
     }
 }
 
+struct WaitAlterRequest<'a> {
+    db_name: &'a str,
+    table_name: &'a str,
+    kind: &'a str,
+    max_retries: usize,
+    interval: Duration,
+}
+
 fn execute_wait_alter(
     session: &mut MysqlSession,
     query_timeout: u64,
-    db_name: &str,
-    table_name: &str,
-    kind: &str, // "COLUMN" or "ROLLUP"
-    max_retries: usize,
-    interval: Duration,
+    request: WaitAlterRequest<'_>,
     log: &mut String,
 ) -> (bool, Duration) {
+    let WaitAlterRequest {
+        db_name,
+        table_name,
+        kind,
+        max_retries,
+        interval,
+    } = request;
     // Test cases may scope @db as `catalog.db` to switch catalog before running
     // the wrapped statement. SHOW ALTER TABLE OPTIMIZE FROM <name> expects the
     // engine to receive each identifier part quoted independently — wrapping
@@ -554,34 +568,32 @@ fn execute_wait_alter(
         if let Some(ref exec) = execution {
             total_elapsed += exec.elapsed;
         }
-        if ok {
-            if let Some(exec) = &execution {
-                match classify_alter_job_poll(exec) {
-                    AlterJobPollState::Finished => {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
-                            kind.to_lowercase(),
-                            table_name,
-                            attempt + 1,
-                            max_retries,
-                        );
-                        return (true, total_elapsed);
-                    }
-                    AlterJobPollState::Failed(message) => {
-                        let _ = writeln!(
-                            log,
-                            "    ❌ wait_alter_{} on `{}` failed (attempt {}/{}): {}",
-                            kind.to_lowercase(),
-                            table_name,
-                            attempt + 1,
-                            max_retries,
-                            message,
-                        );
-                        return (false, total_elapsed);
-                    }
-                    AlterJobPollState::Pending => {}
+        if ok && let Some(exec) = &execution {
+            match classify_alter_job_poll(exec) {
+                AlterJobPollState::Finished => {
+                    let _ = writeln!(
+                        log,
+                        "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
+                        kind.to_lowercase(),
+                        table_name,
+                        attempt + 1,
+                        max_retries,
+                    );
+                    return (true, total_elapsed);
                 }
+                AlterJobPollState::Failed(message) => {
+                    let _ = writeln!(
+                        log,
+                        "    ❌ wait_alter_{} on `{}` failed (attempt {}/{}): {}",
+                        kind.to_lowercase(),
+                        table_name,
+                        attempt + 1,
+                        max_retries,
+                        message,
+                    );
+                    return (false, total_elapsed);
+                }
+                AlterJobPollState::Pending => {}
             }
         }
         if attempt + 1 < max_retries {
@@ -625,11 +637,13 @@ fn run_step_wait_alters(
             let (ok, elapsed) = execute_wait_alter(
                 session,
                 query_timeout,
-                db,
-                table_name,
-                kind,
-                default_retries,
-                Duration::from_secs(1),
+                WaitAlterRequest {
+                    db_name: db,
+                    table_name,
+                    kind,
+                    max_retries: default_retries,
+                    interval: Duration::from_secs(1),
+                },
                 log,
             );
             total += elapsed;
@@ -1418,29 +1432,29 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 log,
             };
         }
-        if ctx.reference_required {
-            if let Err(exc) = reset_case_database(
+        if ctx.reference_required
+            && let Err(exc) = reset_case_database(
                 &reference_case_db_admin_conn,
                 ctx.query_timeout,
                 db_name,
                 "reference",
-            ) {
-                drop_all_case_dbs(ctx, &case_dbs);
-                let _ = writeln!(
-                    log,
-                    "    ❌ failed to prepare reference case database {}: {:#}",
-                    db_name, exc
-                );
-                if ctx.fail_fast {
-                    abort.store(true, Ordering::Relaxed);
-                }
-                return CaseOutcome {
-                    case_id: case.case_id.clone(),
-                    status: CaseStatus::Fail,
-                    elapsed: case_elapsed,
-                    log,
-                };
+            )
+        {
+            drop_all_case_dbs(ctx, &case_dbs);
+            let _ = writeln!(
+                log,
+                "    ❌ failed to prepare reference case database {}: {:#}",
+                db_name, exc
+            );
+            if ctx.fail_fast {
+                abort.store(true, Ordering::Relaxed);
             }
+            return CaseOutcome {
+                case_id: case.case_id.clone(),
+                status: CaseStatus::Fail,
+                elapsed: case_elapsed,
+                log,
+            };
         }
     }
 
@@ -1704,15 +1718,16 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &err_msg,
                         );
                     } else {
-                        let execution = execution.expect("checked above");
+                        let Some(execution) = execution else {
+                            unreachable!("checked above");
+                        };
                         let (assertions_ok, assertions_reason) =
                             verify_text_assertions(step, &execution);
                         if !assertions_ok {
                             last_failure = format!("VERIFY FAILED: {}", assertions_reason);
-                        } else if !ctx.verify_enabled {
-                            passed_execution = Some(execution);
-                            break;
-                        } else if step.meta.skip_result_check || step_has_implicit_skip_result(step)
+                        } else if !ctx.verify_enabled
+                            || step.meta.skip_result_check
+                            || step_has_implicit_skip_result(step)
                         {
                             passed_execution = Some(execution);
                             break;
@@ -1878,18 +1893,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         // face is unchanged. Runs before @imv_equivalence_check so
                         // that, when both directives are present on a step, the
                         // equivalence oracle below validates the rebuilt MV.
-                        if let Some(directive) = step.meta.imv_stateless_rebuild.as_ref() {
-                            if let Err(reason) = run_imv_stateless_rebuild_check(
+                        if let Some(directive) = step.meta.imv_stateless_rebuild.as_ref()
+                            && let Err(reason) = run_imv_stateless_rebuild_check(
                                 directive,
                                 &mut target_session,
                                 ctx.query_timeout,
                                 step.meta.db.as_deref().or(primary_case_db),
                                 epsilon,
                                 &mut log,
-                            ) {
-                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
-                                case_failed = true;
-                            }
+                            )
+                        {
+                            let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                            case_failed = true;
                         }
                         // @imv_equivalence_check: assert MV incremental contents
                         // == a full recompute derived by running the MV's SelectText
@@ -1897,18 +1912,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         // Verify-mode only by design: diff mode compares against a
                         // reference engine (no full-recompute oracle here), and the
                         // check needs the MV's own SelectText which only verify drives.
-                        if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
-                            if let Err(reason) = run_imv_equivalence_check(
+                        if let Some(mv) = step.meta.imv_equivalence_check.as_deref()
+                            && let Err(reason) = run_imv_equivalence_check(
                                 mv,
                                 &mut target_session,
                                 ctx.query_timeout,
                                 step.meta.db.as_deref().or(primary_case_db),
                                 epsilon,
                                 &mut log,
-                            ) {
-                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
-                                case_failed = true;
-                            }
+                            )
+                        {
+                            let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                            case_failed = true;
                         }
                         // @explain_*: issue EXPLAIN VERBOSE and assert substrings.
                         let explain_requested = !step.meta.explain_contains.is_empty()
@@ -1982,29 +1997,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             .as_ref()
                             .and_then(|results| results.get(&step.query_number)),
                         last_execution.as_ref(),
-                    ) {
-                        if last_failure.starts_with("VERIFY FAILED: ") {
-                            let artifact_id =
-                                format!("{}-query{}", case.case_id, step.query_number);
-                            let reason = last_failure
-                                .trim_start_matches("VERIFY FAILED: ")
-                                .to_string();
-                            if let Err(exc) = write_mismatch_artifacts(
-                                root,
-                                &ctx.suite_name,
-                                &artifact_id,
-                                &expected.header,
-                                &expected.rows,
-                                &execution.header,
-                                &execution.rows,
-                                &reason,
-                            ) {
-                                let _ = writeln!(
-                                    log,
-                                    "    ⚠️ failed to write mismatch artifacts: {}",
-                                    exc
-                                );
-                            }
+                    ) && last_failure.starts_with("VERIFY FAILED: ")
+                    {
+                        let artifact_id = format!("{}-query{}", case.case_id, step.query_number);
+                        let reason = last_failure
+                            .trim_start_matches("VERIFY FAILED: ")
+                            .to_string();
+                        if let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
+                            root_dir: root,
+                            suite_name: &ctx.suite_name,
+                            artifact_id: &artifact_id,
+                            expected_header: &expected.header,
+                            expected_rows: &expected.rows,
+                            actual_header: &execution.header,
+                            actual_rows: &execution.rows,
+                            reason: &reason,
+                        }) {
+                            let _ =
+                                writeln!(log, "    ⚠️ failed to write mismatch artifacts: {}", exc);
                         }
                     }
                 }
@@ -2072,7 +2082,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     } else if !ok || execution.is_none() {
                         last_failure = format!("record source execute failed: {}", err_msg);
                     } else {
-                        let execution = execution.expect("checked above");
+                        let Some(execution) = execution else {
+                            unreachable!("checked above");
+                        };
                         let (assertions_ok, assertions_reason) =
                             verify_text_assertions(step, &execution);
                         if !assertions_ok {
@@ -2134,17 +2146,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(log, "    ❌ {}", last_failure);
                     }
                 } else if let Some(execution) = recorded_execution {
-                    if ctx.record_from == RecordFrom::Target {
-                        if let Err(error) = restart_frontend_after_step(
+                    if ctx.record_from == RecordFrom::Target
+                        && let Err(error) = restart_frontend_after_step(
                             step,
                             &ctx.server_handle,
                             &mut target_session,
                             &mut log,
-                        ) {
-                            case_failed = true;
-                            let _ = writeln!(log, "    ❌ {error:#}");
-                            continue;
-                        }
+                        )
+                    {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {error:#}");
+                        continue;
                     }
                     if step.meta.iceberg_orphan_fixture_absent {
                         let Some(fixture) = orphan_fixture.as_ref() else {
@@ -2392,7 +2404,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         );
                         let _ = writeln!(log, "    ❌ {}", failure);
                     } else {
-                        let execution_t = execution_t.expect("checked above");
+                        let Some(execution_t) = execution_t else {
+                            unreachable!("checked above");
+                        };
                         let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
                             let cmd = step
                                 .sql
@@ -2417,7 +2431,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             case_elapsed += execution_t.elapsed;
                             let _ = writeln!(log, "    ❌ reference execute failed: {}", err_r);
                         } else {
-                            let execution_r = execution_r.expect("checked above");
+                            let Some(execution_r) = execution_r else {
+                                unreachable!("checked above");
+                            };
                             let elapsed = execution_t.elapsed + execution_r.elapsed;
                             case_elapsed += elapsed;
 
@@ -2442,16 +2458,16 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 if let Some(root) = &ctx.actual_artifact_dir {
                                     let artifact_id =
                                         format!("{}-query{}", case.case_id, step.query_number);
-                                    if let Err(exc) = write_mismatch_artifacts(
-                                        root,
-                                        &ctx.suite_name,
-                                        &artifact_id,
-                                        &execution_r.header,
-                                        &execution_r.rows,
-                                        &execution_t.header,
-                                        &execution_t.rows,
-                                        &reason,
-                                    ) {
+                                    if let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
+                                        root_dir: root,
+                                        suite_name: &ctx.suite_name,
+                                        artifact_id: &artifact_id,
+                                        expected_header: &execution_r.header,
+                                        expected_rows: &execution_r.rows,
+                                        actual_header: &execution_t.header,
+                                        actual_rows: &execution_t.rows,
+                                        reason: &reason,
+                                    }) {
                                         let _ = writeln!(
                                             log,
                                             "    ⚠️ failed to write mismatch artifacts: {}",
@@ -2520,31 +2536,33 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 db_name, exc
             );
         }
-        if ctx.reference_required {
-            if let Err(exc) = drop_case_database(
+        if ctx.reference_required
+            && let Err(exc) = drop_case_database(
                 &reference_case_db_admin_conn,
                 ctx.query_timeout,
                 db_name,
                 "reference",
-            ) {
-                case_failed = true;
-                let _ = writeln!(
-                    log,
-                    "    ❌ failed to cleanup reference case database {}: {:#}",
-                    db_name, exc
-                );
-            }
+            )
+        {
+            case_failed = true;
+            let _ = writeln!(
+                log,
+                "    ❌ failed to cleanup reference case database {}: {:#}",
+                db_name, exc
+            );
         }
     }
 
-    if !case_failed && ctx.mode == Mode::Record && case_requires_result_file {
-        if let Some(path) = case_path.as_ref() {
-            if let Err(exc) = write_result_file(path, &recorded_results, multi_step) {
-                case_failed = true;
-                let _ = writeln!(log, "    ❌ failed to write expected result: {}", exc);
-            } else {
-                let _ = writeln!(log, "    ✅ RECORDED CASE -> {}", path.display());
-            }
+    if !case_failed
+        && ctx.mode == Mode::Record
+        && case_requires_result_file
+        && let Some(path) = case_path.as_ref()
+    {
+        if let Err(exc) = write_result_file(path, &recorded_results, multi_step) {
+            case_failed = true;
+            let _ = writeln!(log, "    ❌ failed to write expected result: {}", exc);
+        } else {
+            let _ = writeln!(log, "    ✅ RECORDED CASE -> {}", path.display());
         }
     }
 
@@ -3140,11 +3158,11 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
 
-    if let Some(eps) = cli.float_epsilon {
-        if eps <= 0.0 {
-            println!("❌ ERROR: --float-epsilon must be > 0");
-            return Ok(1);
-        }
+    if let Some(eps) = cli.float_epsilon
+        && eps <= 0.0
+    {
+        println!("❌ ERROR: --float-epsilon must be > 0");
+        return Ok(1);
     }
 
     let benchmark_bootstrap_options = BenchmarkBootstrapOptions {
@@ -3414,10 +3432,10 @@ fn run() -> Result<i32> {
                 !skip_set.contains(&case.case_id)
             });
 
-            if let Some(limit) = cli.limit {
-                if cases.len() > limit {
-                    cases.truncate(limit);
-                }
+            if let Some(limit) = cli.limit
+                && cases.len() > limit
+            {
+                cases.truncate(limit);
             }
 
             if cases.is_empty() {
@@ -3502,11 +3520,11 @@ fn run() -> Result<i32> {
                 return Ok(1);
             }
 
-            if cli.mode == Mode::Record {
-                if let Some(dir) = &result_dir {
-                    fs::create_dir_all(dir)
-                        .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
-                }
+            if cli.mode == Mode::Record
+                && let Some(dir) = &result_dir
+            {
+                fs::create_dir_all(dir)
+                    .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
             }
 
             if !cli.dry_run {

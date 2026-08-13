@@ -16,16 +16,13 @@
 // under the License.
 
 use crate::config::{case_placeholder_variables, parse_bool, substitute_placeholders};
+use crate::engine_error_codes::EngineErrorCode;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
-
-#[path = "../../../novarocks/core/src/common/engine_error_codes.rs"]
-mod engine_error_codes;
-use engine_error_codes::EngineErrorCode;
 
 /// Scan raw SQL content (before placeholder substitution) for `${case_db}` and
 /// `${case_db_N}` references.  Returns the resolved database names in order.

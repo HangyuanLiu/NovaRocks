@@ -1749,6 +1749,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-cluster-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mysql",
+ "novarocks-test-support",
+ "toml",
+]
+
+[[package]]
 name = "novarocks-test-support"
 version = "0.1.0"
 dependencies = [
@@ -2688,7 +2698,7 @@ dependencies = [
  "axum",
  "clap",
  "mysql",
- "novarocks-test-support",
+ "novarocks-cluster-harness",
  "opendal",
  "rayon",
  "regex",

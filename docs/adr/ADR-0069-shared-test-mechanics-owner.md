@@ -9,7 +9,7 @@ date: 2026-08-13
 provenance:
   - "discussion: 2026-08-13 shared process and TCP reservation test infrastructure"
 code-anchors:
-  - "novarocks/test-support/src/lib.rs (public test-mechanics surface)"
+  - "tests/test-support/src/lib.rs (public test-mechanics surface)"
 ---
 
 ## 问题

@@ -74,6 +74,7 @@ impl BeLogSnapshot {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot(
     meta: &QueryMeta,
     server_handle: &dyn ServerHandle,
@@ -81,6 +82,7 @@ pub(crate) fn snapshot(
     snapshot_with_deadline(meta, server_handle, step_evidence_deadline(meta))
 }
 
+#[cfg(test)]
 pub(crate) fn query_lifecycle_step_deadline(meta: &QueryMeta) -> Option<Instant> {
     is_query_lifecycle_step(meta).then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT)
 }
@@ -615,7 +617,10 @@ fn parse_legacy_submit_acceptance_markers(log: &str) -> Result<Vec<FragmentIdent
 }
 
 fn parse_fragment_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
+    #[cfg(test)]
     let mut accepted = parse_stage_fragment_acceptance_markers(log)?;
+    #[cfg(not(test))]
+    let accepted = parse_stage_fragment_acceptance_markers(log)?;
     #[cfg(test)]
     accepted.extend(parse_legacy_submit_acceptance_markers(log)?);
     Ok(accepted)
@@ -852,7 +857,6 @@ fn evaluate_log_evidence(
         }
     }
 
-
     for pattern in &step.meta.be_log_not_contains {
         let mut total = 0usize;
         for index in 0..endpoint_count {
@@ -865,9 +869,7 @@ fn evaluate_log_evidence(
                 "BE log unexpectedly contains forbidden step-scoped pattern {pattern:?} {total} time(s)"
             );
         }
-        successes.push(format!(
-            "    @be_log_not_contains PASS pattern={pattern:?}"
-        ));
+        successes.push(format!("    @be_log_not_contains PASS pattern={pattern:?}"));
     }
 
     for (pattern, required) in &step.meta.be_log_count_at_least {
@@ -1180,9 +1182,9 @@ mod tests {
         run(&step, &handle, &before, &mut log)
             .expect("pre-step markers must not fail a step-scoped assertion");
 
-        assert!(log.contains(
-            "@be_log_not_contains PASS pattern=\"NOVAROCKS_CONNECTOR_WRITER_OPENED\""
-        ));
+        assert!(
+            log.contains("@be_log_not_contains PASS pattern=\"NOVAROCKS_CONNECTOR_WRITER_OPENED\"")
+        );
     }
 
     #[test]
@@ -1199,9 +1201,11 @@ mod tests {
         let error = run(&step, &handle, &before, &mut log)
             .expect_err("post-step marker must fail the negative assertion");
 
-        assert!(error
-            .to_string()
-            .contains("unexpectedly contains forbidden step-scoped pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("unexpectedly contains forbidden step-scoped pattern")
+        );
     }
 
     #[test]

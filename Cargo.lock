@@ -3232,6 +3232,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-cluster-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mysql",
+ "novarocks-test-support",
+ "toml",
+]
+
+[[package]]
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [

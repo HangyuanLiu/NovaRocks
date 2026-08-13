@@ -63,8 +63,10 @@ impl ActiveQueryFaultState {
     }
 }
 
+pub(crate) type SharedServerHandle = Arc<Mutex<Box<dyn ServerHandle>>>;
+
 pub(crate) struct FragmentFailureStepGuard {
-    target: Option<(Arc<Mutex<Box<dyn ServerHandle>>>, usize)>,
+    target: Option<(SharedServerHandle, usize)>,
 }
 
 pub(crate) fn fragment_failure_step_guard(
@@ -114,7 +116,9 @@ pub(crate) fn cleanup_fault_step_guard(
 
 impl Drop for CleanupFaultStepGuard {
     fn drop(&mut self) {
-        let Some(server) = self.server.take() else { return; };
+        let Some(server) = self.server.take() else {
+            return;
+        };
         let mut server = match server.lock() {
             Ok(server) => server,
             Err(poisoned) => poisoned.into_inner(),
@@ -573,10 +577,7 @@ where
                 let counts = (0..server.be_count())
                     .map(|index| server.be_log_count(index, &pattern))
                     .collect::<Result<Vec<_>>>()?;
-                FaultBaseline::BeLogPattern {
-                    pattern,
-                    counts,
-                }
+                FaultBaseline::BeLogPattern { pattern, counts }
             }
             PostQueryFault::RestartBackendAfterInitAck(index) => {
                 if index >= server.be_count() {

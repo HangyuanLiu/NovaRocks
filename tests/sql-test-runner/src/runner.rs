@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::engine_error_codes::EngineErrorCode;
 use crate::types::ConnectionConfig;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
-
-#[path = "../../../novarocks/core/src/common/engine_error_codes.rs"]
-mod engine_error_codes;
-use engine_error_codes::EngineErrorCode;
 
 pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
     if expected_substring.trim().is_empty() {
@@ -34,9 +31,7 @@ pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
 
 pub fn extract_engine_error_code(actual: &str) -> Option<String> {
     let message = engine_error_message_body(actual);
-    let Some(candidate_start) = message.strip_prefix('[') else {
-        return None;
-    };
+    let candidate_start = message.strip_prefix('[')?;
     let close_idx = candidate_start.find(']')?;
     let candidate = &candidate_start[..close_idx];
     if EngineErrorCode::parse(candidate).is_some() {

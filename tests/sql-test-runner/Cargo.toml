@@ -41,7 +41,7 @@ anyhow = "1"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 mysql = "25.0.1"
-novarocks-test-support = { path = "../../novarocks/test-support" }
+novarocks-cluster-harness = { path = "../cluster-harness" }
 rayon = "1.10"
 regex = "1.10"
 serde = { version = "1", features = ["derive"] }
