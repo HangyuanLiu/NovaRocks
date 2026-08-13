@@ -123,6 +123,7 @@ struct AppState {
     client: reqwest::Client,
     operation_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     faults: Arc<Mutex<HashMap<String, Vec<Fault>>>>,
+    delay_entered: Arc<tokio::sync::Notify>,
     cleanup_backend: CleanupBackend,
 }
 
@@ -398,6 +399,7 @@ fn build_state(config: &FixtureConfig) -> Result<AppState> {
         client: reqwest::Client::builder().no_proxy().build()?,
         operation_locks: Arc::new(Mutex::new(HashMap::new())),
         faults: Arc::new(Mutex::new(HashMap::new())),
+        delay_entered: Arc::new(tokio::sync::Notify::new()),
         cleanup_backend: CleanupBackend::EnvironmentS3,
     })
 }
@@ -569,6 +571,7 @@ async fn operation_guard<T: HasOperation>(
 
 async fn apply_delay_fault(state: &AppState, operation_id: &str) {
     if take_fault(state, operation_id, Fault::DelayedOldRequest) {
+        state.delay_entered.notify_one();
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -2207,6 +2210,7 @@ mod tests {
     struct RunningServer {
         uri: String,
         task: JoinHandle<()>,
+        delay_entered: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl Drop for RunningServer {
@@ -2224,7 +2228,17 @@ mod tests {
         RunningServer {
             uri: format!("http://{address}"),
             task,
+            delay_entered: None,
         }
+    }
+
+    async fn start_fixture_router(
+        app: Router,
+        delay_entered: Arc<tokio::sync::Notify>,
+    ) -> RunningServer {
+        let mut server = start_router(app).await;
+        server.delay_entered = Some(delay_entered);
+        server
     }
 
     async fn downstream() -> RunningServer {
@@ -2306,7 +2320,9 @@ mod tests {
             downstream: downstream.to_string(),
             sqlite_path: sqlite_path.to_path_buf(),
         };
-        start_router(router(build_state(&config).unwrap())).await
+        let state = build_state(&config).unwrap();
+        let delay_entered = state.delay_entered.clone();
+        start_fixture_router(router(state), delay_entered).await
     }
 
     async fn fixture_with_cleanup_backend(
@@ -2321,7 +2337,8 @@ mod tests {
         };
         let mut state = build_state(&config).unwrap();
         state.cleanup_backend = cleanup_backend;
-        start_router(router(state)).await
+        let delay_entered = state.delay_entered.clone();
+        start_fixture_router(router(state), delay_entered).await
     }
 
     fn generation(value: u64) -> Value {
@@ -2979,11 +2996,15 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let old = post_json(
-            &client,
-            &second.uri,
-            "publish",
-            json!({
+        let delay_entered = second.delay_entered.as_ref().unwrap().notified();
+        let old_client = client.clone();
+        let old_uri = second.uri.clone();
+        let old = tokio::spawn(async move {
+            post_json(
+                &old_client,
+                &old_uri,
+                "publish",
+                json!({
                 "action":action(1,"publish","publish-a"),
                 "staged-locator":staged["staged-locator"],
                 "staged-proof":staged["staged-proof"],
@@ -2991,11 +3012,15 @@ mod tests {
                 "create-policy":"fail-if-exists",
                 "create-policy-digest":"policy-a",
                 "provider-payload":publish_payload("/commit", vec![])
-            }),
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let higher = advance(&client, &first.uri, 2);
-        let (old, higher) = tokio::join!(old, higher);
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), delay_entered)
+            .await
+            .expect("old publish entered delayed fault");
+        let higher = advance(&client, &first.uri, 2).await;
+        let old = old.await.expect("old publish task");
         assert_eq!(higher.status(), StatusCode::OK);
         assert_eq!(old.status(), StatusCode::PRECONDITION_FAILED);
     }
@@ -3014,10 +3039,17 @@ mod tests {
             StatusCode::OK
         );
         inject_fault(&client, &stage_second.uri, "delayed-old-request").await;
-        let old_stage = post_json(&client, &stage_second.uri, "stage", stage_request());
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let higher = advance(&client, &stage_first.uri, 2);
-        let (old_stage, higher) = tokio::join!(old_stage, higher);
+        let delay_entered = stage_second.delay_entered.as_ref().unwrap().notified();
+        let old_client = client.clone();
+        let old_uri = stage_second.uri.clone();
+        let old_stage = tokio::spawn(async move {
+            post_json(&old_client, &old_uri, "stage", stage_request()).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), delay_entered)
+            .await
+            .expect("old stage entered delayed fault");
+        let higher = advance(&client, &stage_first.uri, 2).await;
+        let old_stage = old_stage.await.expect("old stage task");
         assert_eq!(higher.status(), StatusCode::OK);
         assert_eq!(old_stage.status(), StatusCode::PRECONDITION_FAILED);
 
@@ -3047,10 +3079,17 @@ mod tests {
         );
         let staged = stage(&client, &abort_first.uri, 1).await;
         inject_fault(&client, &abort_second.uri, "delayed-old-request").await;
-        let old_abort = post_json(&client, &abort_second.uri, "abort", abort_request(&staged));
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let higher = advance(&client, &abort_first.uri, 2);
-        let (old_abort, higher) = tokio::join!(old_abort, higher);
+        let delay_entered = abort_second.delay_entered.as_ref().unwrap().notified();
+        let old_client = client.clone();
+        let old_uri = abort_second.uri.clone();
+        let old_abort = tokio::spawn(async move {
+            post_json(&old_client, &old_uri, "abort", abort_request(&staged)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), delay_entered)
+            .await
+            .expect("old abort entered delayed fault");
+        let higher = advance(&client, &abort_first.uri, 2).await;
+        let old_abort = old_abort.await.expect("old abort task");
         assert_eq!(higher.status(), StatusCode::OK);
         assert_eq!(old_abort.status(), StatusCode::PRECONDITION_FAILED);
     }
