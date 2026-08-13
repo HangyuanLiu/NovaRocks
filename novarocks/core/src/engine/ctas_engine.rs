@@ -29,17 +29,19 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorColumnDefinition, ConnectorMutationFailure, ConnectorPartitionTransform,
-    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateLease,
-    ConnectorStagedCreateOperationId, ConnectorStagedCreatePrepareOutcome,
-    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublishOutcome,
-    ConnectorStagedCreateReceipt, ConnectorStagedCreateReconcileOutcome,
-    ConnectorStagedCreateReconcilePhase, ConnectorStagedCreateReconcileRequest,
+    ConnectorColumnDefinition, ConnectorCtasAbortRequest, ConnectorCtasAbortResult,
+    ConnectorCtasActionId, ConnectorCtasAdvanceFenceRequest, ConnectorCtasFailure,
+    ConnectorCtasOperationId, ConnectorCtasPublicationFence, ConnectorCtasPublicationFenceReceipt,
+    ConnectorCtasPublicationProof, ConnectorCtasPublishRequest, ConnectorCtasPublishResult,
+    ConnectorCtasStageRequest, ConnectorCtasStagedLocator, ConnectorCtasStagedPublicationLease,
+    ConnectorCtasStagedTableDefinition, ConnectorHistoricalCtasCleanupReceipt,
+    ConnectorHistoricalCtasCleanupRequest, ConnectorHistoricalCtasDescriptor,
+    ConnectorHistoricalCtasObservation, ConnectorMutationFailure, ConnectorPartitionTransform,
     ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest,
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
     ConnectorWriteOperationId, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization,
+    CreatePolicy, ExternalMutationEvidence,
 };
 
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -54,10 +56,37 @@ pub struct CtasCommand {
     pub properties: BTreeMap<Arc<str>, Arc<str>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CtasTargetPrecheck {
-    Absent,
+pub enum CtasTargetPreflightOutcome {
+    Ready(PreparedCtasTargetPreflight),
     ExistsNoOp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CtasTargetPreflightFacts {
+    pub provider_id: String,
+    pub instance_id: String,
+    pub incarnation: [u8; 16],
+    pub capability_version: u32,
+    pub target_namespace: String,
+    pub target_table: String,
+}
+
+pub trait CtasPreparedTargetPreflight: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub struct PreparedCtasTargetPreflight {
+    pub facts: CtasTargetPreflightFacts,
+    pub handle: Arc<dyn CtasPreparedTargetPreflight>,
+}
+
+pub trait CtasPreparedCatalogAction: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub struct PreparedCtasCatalogAction {
+    pub input_digest: [u8; 32],
+    pub handle: Arc<dyn CtasPreparedCatalogAction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,12 +145,13 @@ pub struct CtasTargetFacts {
     pub instance_id: String,
     pub incarnation: [u8; 16],
     pub operation_id: [u8; 16],
-    pub handle_digest: Option<[u8; 32]>,
+    pub fence_digest: [u8; 32],
+    pub locator_digest: [u8; 32],
 }
 
 /// Opaque target session. A concrete core implementation retains the same
-/// exact `ConnectorStagedCreateLease` for prepare, publish, abort and explicit
-/// reconcile; the frontend can persist only the neutral facts.
+/// exact fenced-publication lease, fence, ordinary writer handle, opaque
+/// locator and proof for foreground stage, publish and abort.
 pub trait CtasPreparedTarget: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
@@ -131,30 +161,11 @@ pub struct PreparedCtasTarget {
     pub handle: Arc<dyn CtasPreparedTarget>,
 }
 
-pub enum CtasTargetPrepareOutcome {
-    Prepared {
-        target: PreparedCtasTarget,
-        receipt: ConnectorStagedCreateReceipt,
-        finalization: ExternalMutationFinalization,
-    },
-    Conflict {
-        failure: CtasFailure,
-    },
-    KnownUncommitted {
-        failure: CtasFailure,
-    },
-    CommitUnknown {
-        target: PreparedCtasTarget,
-        failure: CtasFailure,
-        evidence: ExternalMutationEvidence,
-    },
-    /// The connector violated the staged-create call contract after dispatch
-    /// may have occurred. The opaque target retains the exact leases for
-    /// operator-driven inspection; core must not silently discard it.
-    ContractUnknown {
-        target: PreparedCtasTarget,
-        failure: CtasFailure,
-    },
+pub struct CtasTargetStageResult {
+    pub target: PreparedCtasTarget,
+    pub locator: ConnectorCtasStagedLocator,
+    pub receipt: novarocks_spi::connector::ConnectorCtasPublicationReceipt,
+    pub proof: ConnectorCtasPublicationProof,
 }
 
 pub trait CtasPreparedWrite: Send + Sync {
@@ -189,26 +200,50 @@ pub enum CtasWriteOutcome {
 pub trait CtasEngine: Send + Sync {
     fn classify_ctas(&self, sql: &str) -> Result<Option<CtasCommand>, String>;
 
-    fn precheck_ctas_target(
+    /// Resolve the exact target and retain the current fenced-publication
+    /// generation before source preparation. Unsupported catalogs fail here;
+    /// Core never falls back to ordinary staged create.
+    fn preflight_ctas_target(
         &self,
         command: &CtasCommand,
         current_catalog: Option<&str>,
         current_database: &str,
-    ) -> Result<CtasTargetPrecheck, CtasFailure>;
+    ) -> Result<CtasTargetPreflightOutcome, CtasFailure>;
 
     /// Pure analyze/optimize. It must not execute the source, reserve a
     /// writer, prepare a staged table, or consult a new live topology.
     fn prepare_ctas_source(
         &self,
+        preflight: &dyn CtasPreparedTargetPreflight,
         request: PrepareCtasSourceRequest,
     ) -> Result<PreparedCtasSource, CtasFailure>;
+
+    /// Prepare an inert catalog action so Frontend can durably checkpoint the
+    /// exact request digest before dispatch.
+    fn prepare_ctas_fence_advance(
+        &self,
+        preflight: &dyn CtasPreparedTargetPreflight,
+        fence: ConnectorCtasPublicationFence,
+        action_id: ConnectorCtasActionId,
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure>;
+
+    fn advance_ctas_fence(
+        &self,
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure>;
 
     fn prepare_ctas_target(
         &self,
         source: &dyn CtasPreparedSource,
-        operation_id: ConnectorStagedCreateOperationId,
+        fence: ConnectorCtasPublicationFence,
+        stage_action_id: ConnectorCtasActionId,
         policy: CreatePolicy,
-    ) -> Result<CtasTargetPrepareOutcome, CtasFailure>;
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure>;
+
+    fn stage_ctas_target(
+        &self,
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<CtasTargetStageResult, ConnectorCtasFailure>;
 
     /// Bind the same optimized source artifact and admitted execution to the
     /// provider-issued staged table and SPI-4C1 sink. This call is inert.
@@ -232,28 +267,46 @@ pub trait CtasEngine: Send + Sync {
         evidence: ExternalMutationEvidence,
     ) -> CtasWriteOutcome;
 
-    fn publish_ctas(
+    fn prepare_publish_ctas(
         &self,
         target: &dyn CtasPreparedTarget,
-        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        action_id: ConnectorCtasActionId,
         completion: ConnectorWriteOperationCompletion,
-    ) -> Result<ConnectorStagedCreatePublishOutcome, CtasFailure>;
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure>;
+
+    fn publish_ctas(
+        &self,
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<ConnectorCtasPublishResult, ConnectorCtasFailure>;
+
+    fn prepare_abort_ctas(
+        &self,
+        target: &dyn CtasPreparedTarget,
+        action_id: ConnectorCtasActionId,
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure>;
 
     fn abort_ctas(
         &self,
-        target: &dyn CtasPreparedTarget,
-        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
-        completion: Option<ConnectorWriteOperationCompletion>,
-    ) -> Result<ConnectorStagedCreateAbortOutcome, CtasFailure>;
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<ConnectorCtasAbortResult, ConnectorCtasFailure>;
 
-    /// Explicit recovery only. The normal engine path never invokes this
-    /// automatically after an unknown outcome.
-    fn reconcile_ctas(
+    /// Current-generation recovery. No method accepts or reconstructs an old
+    /// foreground target session.
+    fn inspect_historical_ctas(
         &self,
-        target: &dyn CtasPreparedTarget,
-        phase: ConnectorStagedCreateReconcilePhase,
-        evidence: ExternalMutationEvidence,
-    ) -> Result<ConnectorStagedCreateReconcileOutcome, CtasFailure>;
+        descriptor: ConnectorHistoricalCtasDescriptor,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorHistoricalCtasObservation, ConnectorCtasFailure>;
+
+    fn advance_historical_ctas_fence(
+        &self,
+        request: ConnectorCtasAdvanceFenceRequest,
+    ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure>;
+
+    fn cleanup_historical_ctas(
+        &self,
+        request: ConnectorHistoricalCtasCleanupRequest,
+    ) -> Result<ConnectorHistoricalCtasCleanupReceipt, ConnectorCtasFailure>;
 }
 
 /// Core-private guard embedded in concrete prepared source/write handles.
@@ -398,18 +451,92 @@ fn prepare_planned_ctas_connector_write(
     .map_err(|error| error.to_string())
 }
 
-/// Concrete opaque target session used by the core implementation. The exact
-/// staged-create lease is retained for the full saga; no method reacquires a
-/// current generation. The SPI lease itself enforces unresolved-operation
-/// lockout after any unknown outcome.
-pub(crate) struct CoreCtasTargetSession {
-    lease: ConnectorStagedCreateLease,
+#[derive(Clone)]
+struct CoreCtasTargetPreflight {
+    target: crate::engine::backend_resolver::TargetBackend,
+    lease: ConnectorCtasStagedPublicationLease,
     write_lease: ConnectorWriteLease,
-    operation_id: ConnectorStagedCreateOperationId,
-    handle: Mutex<Option<ConnectorStagedTableHandle>>,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    established_fence: Arc<Mutex<Option<ConnectorCtasPublicationFence>>>,
+}
+
+impl CtasPreparedTargetPreflight for CoreCtasTargetPreflight {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+enum CoreCtasCatalogActionKind {
+    Advance {
+        preflight: CoreCtasTargetPreflight,
+        request: ConnectorCtasAdvanceFenceRequest,
+    },
+    Stage {
+        preflight: CoreCtasTargetPreflight,
+        request: ConnectorCtasStageRequest,
+        target_slot: Arc<Mutex<Option<Arc<CoreCtasTargetSession>>>>,
+    },
+    Publish {
+        lease: ConnectorCtasStagedPublicationLease,
+        request: ConnectorCtasPublishRequest,
+        state: Arc<Mutex<CoreCtasCatalogState>>,
+    },
+    Abort {
+        lease: ConnectorCtasStagedPublicationLease,
+        request: ConnectorCtasAbortRequest,
+        state: Arc<Mutex<CoreCtasCatalogState>>,
+    },
+}
+
+struct CoreCtasCatalogAction {
+    kind: CoreCtasCatalogActionKind,
+    dispatched: AtomicBool,
+}
+
+impl CtasPreparedCatalogAction for CoreCtasCatalogAction {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl CoreCtasCatalogAction {
+    fn begin_dispatch(&self) -> Result<(), ConnectorCtasFailure> {
+        self.dispatched
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| {
+                local_ctas_failure(CtasFailure {
+                    kind: CtasFailureKind::InvalidRequest,
+                    message: "prepared CTAS catalog action has already been dispatched".into(),
+                })
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoreCtasCatalogState {
+    Active,
+    NoOpCleanup,
+    Published,
+    Aborted,
+    HistoricalOnly,
+}
+
+/// Concrete opaque foreground target. It retains the exact fenced capability,
+/// writer lease, established fence, provider locator and stage proof. No
+/// method reacquires a current generation.
+pub(crate) struct CoreCtasTargetSession {
+    lease: ConnectorCtasStagedPublicationLease,
+    write_lease: ConnectorWriteLease,
+    fence: ConnectorCtasPublicationFence,
+    locator: ConnectorCtasStagedLocator,
+    proof: ConnectorCtasPublicationProof,
+    handle: ConnectorStagedTableHandle,
+    policy: CreatePolicy,
     context: novarocks_spi::connector::ConnectorRequestContext,
     write_plan_started: AtomicBool,
     write_unknown_latched: AtomicBool,
+    catalog_state: Arc<Mutex<CoreCtasCatalogState>>,
 }
 
 impl CtasPreparedTarget for CoreCtasTargetSession {
@@ -419,79 +546,56 @@ impl CtasPreparedTarget for CoreCtasTargetSession {
 }
 
 impl CoreCtasTargetSession {
-    pub(crate) fn prepare(
-        lease: ConnectorStagedCreateLease,
-        write_lease: ConnectorWriteLease,
-        request: ConnectorStagedCreatePrepareRequest,
-    ) -> Result<
-        (
-            Arc<Self>,
-            Result<ConnectorStagedCreatePrepareOutcome, novarocks_spi::connector::ConnectorError>,
-        ),
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let operation_id = request.operation_id;
-        if lease.owner() != write_lease.binding_key() {
-            return Err(novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "CTAS staged-create and writer leases do not share one exact generation",
-            ));
-        }
-        let context = request.context.clone();
-        let outcome = lease.prepare(request);
-        let handle = match &outcome {
-            Ok(ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. }) => {
-                Some(handle.clone())
-            }
-            Err(_)
-            | Ok(ConnectorStagedCreatePrepareOutcome::Conflict { .. })
-            | Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted { .. })
-            | Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. }) => None,
-        };
-        Ok((
-            Arc::new(Self {
-                lease,
-                write_lease,
-                operation_id,
-                handle: Mutex::new(handle),
-                context,
-                write_plan_started: AtomicBool::new(false),
-                write_unknown_latched: AtomicBool::new(false),
-            }),
-            outcome,
-        ))
+    fn from_stage(
+        preflight: &CoreCtasTargetPreflight,
+        request: &ConnectorCtasStageRequest,
+        result: &novarocks_spi::connector::ConnectorCtasStageResult,
+    ) -> Arc<Self> {
+        // Both invariants were validated before any source work when the
+        // preflight derived its exact-generation leases, and the SPI lease has
+        // already validated `result` before returning it. Keep post-dispatch
+        // session materialization infallible.
+        Arc::new(Self {
+            lease: preflight.lease.clone(),
+            write_lease: preflight.write_lease.clone(),
+            fence: request.fence.clone(),
+            locator: result.locator.clone(),
+            proof: result.proof.clone(),
+            handle: result.handle.clone(),
+            policy: request.create_policy,
+            context: request.context.clone(),
+            write_plan_started: AtomicBool::new(false),
+            write_unknown_latched: AtomicBool::new(false),
+            catalog_state: Arc::new(Mutex::new(CoreCtasCatalogState::Active)),
+        })
     }
 
     pub(crate) fn owner(&self) -> &novarocks_spi::connector::ConnectorExecutionBindingKey {
         self.lease.owner()
     }
 
-    pub(crate) const fn operation_id(&self) -> ConnectorStagedCreateOperationId {
-        self.operation_id
+    pub(crate) const fn operation_id(&self) -> ConnectorCtasOperationId {
+        self.fence.operation_id()
     }
 
-    pub(crate) fn handle_digest(&self) -> Option<[u8; 32]> {
-        self.handle
-            .lock()
-            .ok()
-            .and_then(|handle| handle.as_ref().map(ConnectorStagedTableHandle::digest))
+    pub(crate) const fn fence_digest(&self) -> [u8; 32] {
+        self.fence.digest()
     }
 
-    pub(crate) fn publish(
+    pub(crate) fn prepare_publish(
         &self,
-        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        action_id: ConnectorCtasActionId,
         completion: ConnectorWriteOperationCompletion,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorStagedCreatePublishOutcome, novarocks_spi::connector::ConnectorError> {
-        self.require_write_resolved()?;
-        let handle = self.exact_handle()?;
-        self.lease.publish(
-            novarocks_spi::connector::ConnectorStagedCreatePublishRequest {
-                operation_id,
-                handle,
-                completion,
-                context,
-            },
+    ) -> Result<ConnectorCtasPublishRequest, novarocks_spi::connector::ConnectorError> {
+        self.require_catalog_state(CoreCtasCatalogState::Active)?;
+        ConnectorCtasPublishRequest::try_new(
+            self.owner().clone(),
+            self.fence.clone(),
+            action_id,
+            self.locator.clone(),
+            completion.aggregate_digest(),
+            self.policy,
+            self.context.clone(),
         )
     }
 
@@ -500,7 +604,9 @@ impl CoreCtasTargetSession {
         completion: ConnectorWriteOperationCompletion,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
         self.require_write_resolved()?;
-        self.lease.bind_write(self.exact_handle()?, completion)
+        self.lease
+            .bind_write(self.handle.clone(), completion)
+            .map_err(ctas_spi_error)
     }
 
     pub(crate) fn reconcile_write_completion(
@@ -514,7 +620,8 @@ impl CoreCtasTargetSession {
             ));
         }
         self.lease
-            .reconcile_write_completion(self.exact_handle()?, completion)?;
+            .bind_write(self.handle.clone(), completion)
+            .map_err(ctas_spi_error)?;
         self.write_unknown_latched.store(false, Ordering::Release);
         Ok(())
     }
@@ -544,13 +651,16 @@ impl CoreCtasTargetSession {
         // turn that bridge result into a normal Provider-signed preparation:
         // generic CTAS orchestration must not retain its table payload or
         // provider-private plan payload.
-        let binding = self.lease.plan_write(ConnectorStagedWritePlanningRequest {
-            handle: self.exact_handle()?,
-            operation_id,
-            intent: ConnectorWriteIntent::Append,
-            input_schema: Arc::clone(&input_schema),
-            context,
-        })?;
+        let binding = self
+            .lease
+            .plan_write(ConnectorStagedWritePlanningRequest {
+                handle: self.handle.clone(),
+                operation_id,
+                intent: ConnectorWriteIntent::Append,
+                input_schema: Arc::clone(&input_schema),
+                context,
+            })
+            .map_err(ctas_spi_error)?;
         let outcome =
             self.write_lease
                 .control()
@@ -592,70 +702,22 @@ impl CoreCtasTargetSession {
         &self,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
         self.write_unknown_latched.store(true, Ordering::Release);
-        self.lease.mark_write_unknown(&self.exact_handle()?)
+        Ok(())
     }
 
-    pub(crate) fn abort(
+    pub(crate) fn prepare_abort(
         &self,
-        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
-        completion: Option<ConnectorWriteOperationCompletion>,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorStagedCreateAbortOutcome, novarocks_spi::connector::ConnectorError> {
-        self.require_write_resolved()?;
-        self.lease.abort(
-            novarocks_spi::connector::ConnectorStagedCreateAbortRequest {
-                operation_id,
-                handle: self.exact_handle()?,
-                completion,
-                context,
-            },
+        action_id: ConnectorCtasActionId,
+    ) -> Result<ConnectorCtasAbortRequest, novarocks_spi::connector::ConnectorError> {
+        self.require_catalog_cleanup_state()?;
+        ConnectorCtasAbortRequest::try_new(
+            self.owner().clone(),
+            self.fence.clone(),
+            action_id,
+            self.locator.clone(),
+            self.proof.clone(),
+            self.context.clone(),
         )
-    }
-
-    pub(crate) fn reconcile(
-        &self,
-        phase: ConnectorStagedCreateReconcilePhase,
-        evidence: ExternalMutationEvidence,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorStagedCreateReconcileOutcome, novarocks_spi::connector::ConnectorError>
-    {
-        let outcome = self
-            .lease
-            .reconcile(ConnectorStagedCreateReconcileRequest {
-                target_operation_id: self.operation_id,
-                phase,
-                evidence,
-                context,
-            })?;
-        if let ConnectorStagedCreateReconcileOutcome::Prepared { handle, .. } = &outcome {
-            *self.handle.lock().map_err(|error| {
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Internal,
-                    format!("CTAS staged target handle lock: {error}"),
-                )
-            })? = Some(handle.clone());
-        }
-        Ok(outcome)
-    }
-
-    fn exact_handle(
-        &self,
-    ) -> Result<ConnectorStagedTableHandle, novarocks_spi::connector::ConnectorError> {
-        self.handle
-            .lock()
-            .map_err(|error| {
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Internal,
-                    format!("CTAS staged target handle lock: {error}"),
-                )
-            })?
-            .clone()
-            .ok_or_else(|| {
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                    "CTAS staged target has no prepared provider handle",
-                )
-            })
     }
 
     fn require_write_resolved(&self) -> Result<(), novarocks_spi::connector::ConnectorError> {
@@ -667,6 +729,93 @@ impl CoreCtasTargetSession {
         }
         Ok(())
     }
+
+    fn require_catalog_state(
+        &self,
+        expected: CoreCtasCatalogState,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        self.require_write_resolved()?;
+        let actual = *self
+            .catalog_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if actual != expected {
+            return Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "CTAS catalog action requires {expected:?} state, current state is {actual:?}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_catalog_cleanup_state(
+        &self,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        self.require_write_resolved()?;
+        let actual = *self
+            .catalog_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(
+            actual,
+            CoreCtasCatalogState::Active | CoreCtasCatalogState::NoOpCleanup
+        ) {
+            return Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                format!("CTAS staged cleanup is forbidden in {actual:?} state"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn ctas_spi_error(failure: ConnectorCtasFailure) -> novarocks_spi::connector::ConnectorError {
+    novarocks_spi::connector::ConnectorError::new(
+        match failure.failure().kind() {
+            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest => {
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::NotFound => {
+                novarocks_spi::connector::ConnectorErrorKind::NotFound
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::AlreadyExists => {
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::PermissionDenied => {
+                novarocks_spi::connector::ConnectorErrorKind::PermissionDenied
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::Unauthenticated => {
+                novarocks_spi::connector::ConnectorErrorKind::PermissionDenied
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::Conflict => {
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported => {
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::Cancelled => {
+                novarocks_spi::connector::ConnectorErrorKind::Cancelled
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::DeadlineExceeded => {
+                novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::ResourceExhausted => {
+                novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable => {
+                novarocks_spi::connector::ConnectorErrorKind::Unavailable
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::CorruptData => {
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData
+            }
+            novarocks_spi::connector::ConnectorMutationFailureKind::Internal => {
+                novarocks_spi::connector::ConnectorErrorKind::Internal
+            }
+        },
+        failure.failure().message(),
+    )
 }
 
 impl CtasSourceExecutionGate {
@@ -779,6 +928,7 @@ fn internal_failure(message: impl Into<String>) -> CtasFailure {
 
 struct CorePreparedCtasSource {
     gate: Arc<CtasSourceExecutionGate>,
+    preflight: CoreCtasTargetPreflight,
     command: CtasCommand,
     target: crate::engine::backend_resolver::TargetBackend,
     current_catalog: Option<String>,
@@ -787,7 +937,7 @@ struct CorePreparedCtasSource {
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     output_schema: arrow::datatypes::SchemaRef,
     output_columns: Vec<ConnectorColumnDefinition>,
-    target_session: Mutex<Option<Arc<CoreCtasTargetSession>>>,
+    target_session: Arc<Mutex<Option<Arc<CoreCtasTargetSession>>>>,
     target_prepare_started: AtomicBool,
 }
 
@@ -833,6 +983,151 @@ fn downcast_source(
         .ok_or_else(|| internal_failure("CTAS source handle does not belong to the core engine"))
 }
 
+fn downcast_preflight(
+    preflight: &dyn CtasPreparedTargetPreflight,
+) -> Result<&CoreCtasTargetPreflight, CtasFailure> {
+    preflight
+        .as_any()
+        .downcast_ref::<CoreCtasTargetPreflight>()
+        .ok_or_else(|| internal_failure("CTAS target preflight does not belong to the core engine"))
+}
+
+fn downcast_catalog_action(
+    action: &dyn CtasPreparedCatalogAction,
+) -> Result<&CoreCtasCatalogAction, CtasFailure> {
+    action
+        .as_any()
+        .downcast_ref::<CoreCtasCatalogAction>()
+        .ok_or_else(|| internal_failure("CTAS catalog action does not belong to the core engine"))
+}
+
+fn prepared_catalog_action(
+    input_digest: [u8; 32],
+    kind: CoreCtasCatalogActionKind,
+) -> PreparedCtasCatalogAction {
+    PreparedCtasCatalogAction {
+        input_digest,
+        handle: Arc::new(CoreCtasCatalogAction {
+            kind,
+            dispatched: AtomicBool::new(false),
+        }),
+    }
+}
+
+fn validate_fence_for_preflight(
+    preflight: &CoreCtasTargetPreflight,
+    fence: &ConnectorCtasPublicationFence,
+) -> Result<(), CtasFailure> {
+    fence.validate().map_err(connector_failure)?;
+    if fence.target().instance_id != preflight.lease.owner().instance_id
+        || fence.target().namespace.as_ref() != preflight.target.namespace
+        || fence.target().table.as_ref() != preflight.target.table
+    {
+        return Err(CtasFailure {
+            kind: CtasFailureKind::InvalidRequest,
+            message: "CTAS publication fence names a foreign preflight target".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn derive_ctas_foreground_leases(
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<(ConnectorCtasStagedPublicationLease, ConnectorWriteLease), CtasFailure> {
+    // The fenced capability is intentionally derived first. An unsupported
+    // catalog therefore fails before writer admission or source preparation.
+    let lease = planning
+        .derive_ctas_staged_publication_lease()
+        .map_err(connector_failure)?;
+    let write_lease = planning.derive_write_lease().map_err(connector_failure)?;
+    if lease.owner() != write_lease.binding_key() {
+        return Err(CtasFailure {
+            kind: CtasFailureKind::Internal,
+            message: "CTAS fenced publication and writer leases do not share one exact generation"
+                .to_string(),
+        });
+    }
+    Ok((lease, write_lease))
+}
+
+fn historical_ctas_recovery(
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<
+    Arc<dyn novarocks_spi::connector::ConnectorHistoricalCtasStagedPublicationRecovery>,
+    ConnectorCtasFailure,
+> {
+    planning
+        .binding()
+        .historical_ctas_staged_publication_recovery()
+        .cloned()
+        .ok_or_else(|| {
+            local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::Unsupported,
+                message: "current connector generation has no historical CTAS recovery capability"
+                    .to_string(),
+            })
+        })
+}
+
+fn require_established_fence(
+    preflight: &CoreCtasTargetPreflight,
+    fence: &ConnectorCtasPublicationFence,
+) -> Result<(), CtasFailure> {
+    let established = preflight
+        .established_fence
+        .lock()
+        .map_err(|error| internal_failure(format!("CTAS established fence lock: {error}")))?;
+    if established.as_ref() != Some(fence) {
+        return Err(CtasFailure {
+            kind: CtasFailureKind::InvalidRequest,
+            message: "CTAS action requires the latest established publication fence".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn local_ctas_failure(failure: CtasFailure) -> ConnectorCtasFailure {
+    let kind = match failure.kind {
+        CtasFailureKind::InvalidRequest => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest
+        }
+        CtasFailureKind::NotFound => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::NotFound
+        }
+        CtasFailureKind::AlreadyExists | CtasFailureKind::Conflict => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::Conflict
+        }
+        CtasFailureKind::Unsupported => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported
+        }
+        CtasFailureKind::Cancelled => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::Cancelled
+        }
+        CtasFailureKind::DeadlineExceeded => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::DeadlineExceeded
+        }
+        CtasFailureKind::Unavailable => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable
+        }
+        CtasFailureKind::Internal => {
+            novarocks_spi::connector::ConnectorMutationFailureKind::Internal
+        }
+    };
+    ConnectorCtasFailure::KnownNotDispatched(
+        novarocks_spi::connector::ConnectorMutationFailure::new(kind, failure.message),
+    )
+}
+
+fn invalid_ctas_provider_response(
+    operation: &'static str,
+    error: novarocks_spi::connector::ConnectorError,
+) -> ConnectorCtasFailure {
+    ConnectorCtasFailure::CommittedResponseInvalid(ConnectorMutationFailure::new(
+        novarocks_spi::connector::ConnectorMutationFailureKind::CorruptData,
+        format!("historical CTAS {operation} returned an invalid response: {error}"),
+    ))
+}
+
 fn downcast_target(target: &dyn CtasPreparedTarget) -> Result<&CoreCtasTargetSession, CtasFailure> {
     target
         .as_any()
@@ -853,7 +1148,8 @@ fn target_facts(target: &CoreCtasTargetSession) -> CtasTargetFacts {
         instance_id: target.owner().instance_id.as_str().to_string(),
         incarnation: target.owner().incarnation.to_bytes(),
         operation_id: target.operation_id().to_bytes(),
-        handle_digest: target.handle_digest(),
+        fence_digest: target.fence_digest(),
+        locator_digest: target.locator.digest(),
     }
 }
 
@@ -918,7 +1214,7 @@ fn write_commit_unknown(
             let evidence = write_staging_evidence(session);
             if let Err(error) = prepared.target.mark_write_unknown() {
                 failure_message.push_str(&format!(
-                    "; retained staged-create lease also rejected write-unknown transition: {error}"
+                    "; retained fenced CTAS session also rejected write-unknown transition: {error}"
                 ));
             }
             *stored = Some(evidence);
@@ -1006,12 +1302,12 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         }))
     }
 
-    fn precheck_ctas_target(
+    fn preflight_ctas_target(
         &self,
         command: &CtasCommand,
         current_catalog: Option<&str>,
         current_database: &str,
-    ) -> Result<CtasTargetPrecheck, CtasFailure> {
+    ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
         let target = crate::engine::backend_resolver::resolve_table_target(
             self,
             &crate::sql::parser::ast::ObjectName {
@@ -1024,30 +1320,61 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         let context =
             crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
                 .map_err(internal_failure)?;
-        match crate::connector::metadata_table_exists(
-            self.connector_control.as_ref(),
-            context,
-            &target.catalog,
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(connector_failure)?;
+        let planning = self
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(connector_failure)?;
+        // Derive the mandatory capability before any source preparation. The
+        // retained lease is the only foreground route; ordinary staged create
+        // is intentionally not consulted.
+        let (lease, write_lease) = derive_ctas_foreground_leases(&planning)?;
+        let exists = crate::connector::metadata_table_exists_with_planning_lease(
+            planning.clone(),
+            context.clone(),
             &target.namespace,
             &target.table,
-        ) {
-            Ok(true) if command.if_not_exists => Ok(CtasTargetPrecheck::ExistsNoOp),
-            Ok(true) => Err(CtasFailure {
+        )
+        .map_err(internal_failure)?;
+        match exists {
+            true if command.if_not_exists => Ok(CtasTargetPreflightOutcome::ExistsNoOp),
+            true => Err(CtasFailure {
                 kind: CtasFailureKind::AlreadyExists,
                 message: format!("table {}.{} already exists", target.namespace, target.table),
             }),
-            Ok(false) => Ok(CtasTargetPrecheck::Absent),
-            Err(error) => Err(internal_failure(format!(
-                "check CTAS target {}.{}: {error}",
-                target.namespace, target.table
-            ))),
+            false => {
+                let binding = planning.binding();
+                let facts = CtasTargetPreflightFacts {
+                    provider_id: binding.descriptor().provider_id.as_str().to_string(),
+                    instance_id: binding.descriptor().instance_id.as_str().to_string(),
+                    incarnation: binding.incarnation().to_bytes(),
+                    capability_version: lease.capability().protocol_version(),
+                    target_namespace: target.namespace.clone(),
+                    target_table: target.table.clone(),
+                };
+                Ok(CtasTargetPreflightOutcome::Ready(
+                    PreparedCtasTargetPreflight {
+                        facts,
+                        handle: Arc::new(CoreCtasTargetPreflight {
+                            target,
+                            lease,
+                            write_lease,
+                            context,
+                            established_fence: Arc::new(Mutex::new(None)),
+                        }),
+                    },
+                ))
+            }
         }
     }
 
     fn prepare_ctas_source(
         &self,
+        preflight: &dyn CtasPreparedTargetPreflight,
         request: PrepareCtasSourceRequest,
     ) -> Result<PreparedCtasSource, CtasFailure> {
+        let preflight = downcast_preflight(preflight)?;
         let target = crate::engine::backend_resolver::resolve_table_target(
             self,
             &crate::sql::parser::ast::ObjectName {
@@ -1057,6 +1384,12 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
             &request.current_database,
         )
         .map_err(internal_failure)?;
+        if target != preflight.target {
+            return Err(CtasFailure {
+                kind: CtasFailureKind::InvalidRequest,
+                message: "CTAS source target does not match its exact preflight".to_string(),
+            });
+        }
         let dialect = crate::sql::parser::dialect::StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&request.command.source_sql)
@@ -1141,6 +1474,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
             facts,
             handle: Arc::new(CorePreparedCtasSource {
                 gate,
+                preflight: preflight.clone(),
                 command: request.command,
                 target,
                 current_catalog: request.current_catalog,
@@ -1149,18 +1483,70 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                 connector_context,
                 output_schema,
                 output_columns,
-                target_session: Mutex::new(None),
+                target_session: Arc::new(Mutex::new(None)),
                 target_prepare_started: AtomicBool::new(false),
             }),
         })
     }
 
+    fn prepare_ctas_fence_advance(
+        &self,
+        preflight: &dyn CtasPreparedTargetPreflight,
+        fence: ConnectorCtasPublicationFence,
+        action_id: ConnectorCtasActionId,
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
+        let preflight = downcast_preflight(preflight)?;
+        validate_fence_for_preflight(preflight, &fence)?;
+        let request =
+            ConnectorCtasAdvanceFenceRequest::try_new(fence, action_id, preflight.context.clone())
+                .map_err(connector_failure)?;
+        Ok(prepared_catalog_action(
+            request.input_digest,
+            CoreCtasCatalogActionKind::Advance {
+                preflight: preflight.clone(),
+                request,
+            },
+        ))
+    }
+
+    fn advance_ctas_fence(
+        &self,
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
+        let action = downcast_catalog_action(action).map_err(local_ctas_failure)?;
+        let CoreCtasCatalogActionKind::Advance { preflight, request } = &action.kind else {
+            return Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::InvalidRequest,
+                message: "CTAS catalog action is not an advance-fence action".to_string(),
+            }));
+        };
+        action.begin_dispatch()?;
+        // Serialize one preflight's successor check, catalog dispatch and
+        // local writeback. Otherwise a slower lower-generation reply could
+        // overwrite a newer established fence after both catalog calls had
+        // already succeeded.
+        let mut established = preflight
+            .established_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = established.as_ref() {
+            request
+                .fence
+                .validate_monotonic_successor_of(previous)
+                .map_err(|error| local_ctas_failure(connector_failure(error)))?;
+        }
+        let receipt = preflight.lease.advance_fence(request.clone())?;
+        *established = Some(request.fence.clone());
+        Ok(receipt)
+    }
+
     fn prepare_ctas_target(
         &self,
         source: &dyn CtasPreparedSource,
-        operation_id: ConnectorStagedCreateOperationId,
+        fence: ConnectorCtasPublicationFence,
+        stage_action_id: ConnectorCtasActionId,
         policy: CreatePolicy,
-    ) -> Result<CtasTargetPrepareOutcome, CtasFailure> {
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
         let source = downcast_source(source)?;
         if source
             .target_prepare_started
@@ -1172,79 +1558,66 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                 message: "CTAS source target preparation has already been attempted".to_string(),
             });
         }
-        let instance_id =
-            novarocks_spi::connector::ConnectorInstanceId::parse(&source.target.catalog)
-                .map_err(connector_failure)?;
-        let planning = self
-            .connector_control
-            .acquire_current(&instance_id)
-            .map_err(connector_failure)?;
-        let staged_lease = planning
-            .derive_staged_create_lease()
-            .map_err(connector_failure)?;
-        let write_lease = planning.derive_write_lease().map_err(connector_failure)?;
-        let owner = staged_lease.owner().clone();
-        let request = ConnectorStagedCreatePrepareRequest {
-            owner,
-            operation_id,
-            table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(source.target.namespace.as_str()),
-                table: Arc::from(source.target.table.as_str()),
-            },
-            columns: source.output_columns.clone(),
-            partitioning: source.command.partitioning.clone(),
-            properties: source.command.properties.clone(),
+        validate_fence_for_preflight(&source.preflight, &fence)?;
+        require_established_fence(&source.preflight, &fence)?;
+        let definition = ConnectorCtasStagedTableDefinition::try_new(
+            fence.target().clone(),
+            source.output_columns.clone(),
+            source.command.partitioning.clone(),
+            source.command.properties.clone(),
+        )
+        .map_err(connector_failure)?;
+        let request = ConnectorCtasStageRequest::try_new(
+            source.preflight.lease.owner().clone(),
+            fence,
+            stage_action_id,
+            definition,
             policy,
-            context: source.connector_context.clone(),
-        };
-        let (target, outcome) = CoreCtasTargetSession::prepare(staged_lease, write_lease, request)
-            .map_err(connector_failure)?;
-        *source
-            .target_session
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS target session lock: {error}")))? =
-            Some(Arc::clone(&target));
-        let prepared_target = || PreparedCtasTarget {
-            facts: target_facts(target.as_ref()),
-            handle: target.clone(),
-        };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Ok(CtasTargetPrepareOutcome::ContractUnknown {
-                    target: prepared_target(),
-                    failure: connector_failure(error),
-                });
-            }
-        };
-        Ok(match outcome {
-            ConnectorStagedCreatePrepareOutcome::Prepared {
-                receipt,
-                finalization,
-                ..
-            } => CtasTargetPrepareOutcome::Prepared {
-                target: prepared_target(),
-                receipt,
-                finalization,
+            Bytes::new(),
+            source.connector_context.clone(),
+        )
+        .map_err(connector_failure)?;
+        Ok(prepared_catalog_action(
+            request.input_digest,
+            CoreCtasCatalogActionKind::Stage {
+                preflight: source.preflight.clone(),
+                request,
+                target_slot: Arc::clone(&source.target_session),
             },
-            ConnectorStagedCreatePrepareOutcome::Conflict { failure } => {
-                CtasTargetPrepareOutcome::Conflict {
-                    failure: mutation_failure(failure),
-                }
-            }
-            ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } => {
-                CtasTargetPrepareOutcome::KnownUncommitted {
-                    failure: mutation_failure(failure),
-                }
-            }
-            ConnectorStagedCreatePrepareOutcome::CommitUnknown { failure, evidence } => {
-                CtasTargetPrepareOutcome::CommitUnknown {
-                    target: prepared_target(),
-                    failure: mutation_failure(failure),
-                    evidence,
-                }
-            }
+        ))
+    }
+
+    fn stage_ctas_target(
+        &self,
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<CtasTargetStageResult, ConnectorCtasFailure> {
+        let action = downcast_catalog_action(action).map_err(local_ctas_failure)?;
+        let CoreCtasCatalogActionKind::Stage {
+            preflight,
+            request,
+            target_slot,
+        } = &action.kind
+        else {
+            return Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::InvalidRequest,
+                message: "CTAS catalog action is not a stage action".to_string(),
+            }));
+        };
+        action.begin_dispatch()?;
+        require_established_fence(preflight, &request.fence).map_err(local_ctas_failure)?;
+        let result = preflight.lease.stage(request.clone())?;
+        let target = CoreCtasTargetSession::from_stage(preflight, request, &result);
+        *target_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&target));
+        Ok(CtasTargetStageResult {
+            target: PreparedCtasTarget {
+                facts: target_facts(target.as_ref()),
+                handle: target,
+            },
+            locator: result.locator,
+            receipt: result.receipt,
+            proof: result.proof,
         })
     }
 
@@ -1496,40 +1869,180 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         }
     }
 
-    fn publish_ctas(
+    fn prepare_publish_ctas(
         &self,
         target: &dyn CtasPreparedTarget,
-        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        action_id: ConnectorCtasActionId,
         completion: ConnectorWriteOperationCompletion,
-    ) -> Result<ConnectorStagedCreatePublishOutcome, CtasFailure> {
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
         let target = downcast_target(target)?;
-        target
-            .publish(operation_id, completion, target.context())
-            .map_err(connector_failure)
+        let request = target
+            .prepare_publish(action_id, completion)
+            .map_err(connector_failure)?;
+        Ok(prepared_catalog_action(
+            request.input_digest,
+            CoreCtasCatalogActionKind::Publish {
+                lease: target.lease.clone(),
+                request,
+                state: Arc::clone(&target.catalog_state),
+            },
+        ))
+    }
+
+    fn publish_ctas(
+        &self,
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<ConnectorCtasPublishResult, ConnectorCtasFailure> {
+        let action = downcast_catalog_action(action).map_err(local_ctas_failure)?;
+        let CoreCtasCatalogActionKind::Publish {
+            lease,
+            request,
+            state,
+        } = &action.kind
+        else {
+            return Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::InvalidRequest,
+                message: "CTAS catalog action is not a publish action".to_string(),
+            }));
+        };
+        action.begin_dispatch()?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state != CoreCtasCatalogState::Active {
+            return Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::InvalidRequest,
+                message: format!("CTAS publish is forbidden in {:?} state", *state),
+            }));
+        }
+        match lease.publish(request.clone()) {
+            Ok(result) => {
+                *state = match result.disposition {
+                    novarocks_spi::connector::ConnectorCtasPublishDisposition::Published => {
+                        CoreCtasCatalogState::Published
+                    }
+                    novarocks_spi::connector::ConnectorCtasPublishDisposition::NoOp => {
+                        CoreCtasCatalogState::NoOpCleanup
+                    }
+                };
+                Ok(result)
+            }
+            Err(failure) => {
+                if !matches!(failure, ConnectorCtasFailure::KnownNotDispatched(_)) {
+                    *state = CoreCtasCatalogState::HistoricalOnly;
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    fn prepare_abort_ctas(
+        &self,
+        target: &dyn CtasPreparedTarget,
+        action_id: ConnectorCtasActionId,
+    ) -> Result<PreparedCtasCatalogAction, CtasFailure> {
+        let target = downcast_target(target)?;
+        let request = target.prepare_abort(action_id).map_err(connector_failure)?;
+        Ok(prepared_catalog_action(
+            request.input_digest,
+            CoreCtasCatalogActionKind::Abort {
+                lease: target.lease.clone(),
+                request,
+                state: Arc::clone(&target.catalog_state),
+            },
+        ))
     }
 
     fn abort_ctas(
         &self,
-        target: &dyn CtasPreparedTarget,
-        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
-        completion: Option<ConnectorWriteOperationCompletion>,
-    ) -> Result<ConnectorStagedCreateAbortOutcome, CtasFailure> {
-        let target = downcast_target(target)?;
-        target
-            .abort(operation_id, completion, target.context())
-            .map_err(connector_failure)
+        action: &dyn CtasPreparedCatalogAction,
+    ) -> Result<ConnectorCtasAbortResult, ConnectorCtasFailure> {
+        let action = downcast_catalog_action(action).map_err(local_ctas_failure)?;
+        let CoreCtasCatalogActionKind::Abort {
+            lease,
+            request,
+            state,
+        } = &action.kind
+        else {
+            return Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::InvalidRequest,
+                message: "CTAS catalog action is not an abort action".to_string(),
+            }));
+        };
+        action.begin_dispatch()?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(
+            *state,
+            CoreCtasCatalogState::Active | CoreCtasCatalogState::NoOpCleanup
+        ) {
+            return Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::InvalidRequest,
+                message: format!("CTAS staged cleanup is forbidden in {:?} state", *state),
+            }));
+        }
+        match lease.abort(request.clone()) {
+            Ok(result) => {
+                *state = CoreCtasCatalogState::Aborted;
+                Ok(result)
+            }
+            Err(failure) => {
+                if !matches!(failure, ConnectorCtasFailure::KnownNotDispatched(_)) {
+                    *state = CoreCtasCatalogState::HistoricalOnly;
+                }
+                Err(failure)
+            }
+        }
     }
 
-    fn reconcile_ctas(
+    fn inspect_historical_ctas(
         &self,
-        target: &dyn CtasPreparedTarget,
-        phase: ConnectorStagedCreateReconcilePhase,
-        evidence: ExternalMutationEvidence,
-    ) -> Result<ConnectorStagedCreateReconcileOutcome, CtasFailure> {
-        let target = downcast_target(target)?;
-        target
-            .reconcile(phase, evidence, target.context())
-            .map_err(connector_failure)
+        descriptor: ConnectorHistoricalCtasDescriptor,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorHistoricalCtasObservation, ConnectorCtasFailure> {
+        let planning = self
+            .connector_control
+            .acquire_current(&descriptor.fence.target().instance_id)
+            .map_err(|error| local_ctas_failure(connector_failure(error)))?;
+        let recovery = historical_ctas_recovery(&planning)?;
+        let observation = recovery.inspect(descriptor.clone(), context)?;
+        observation
+            .validate_for(&descriptor)
+            .map_err(|error| invalid_ctas_provider_response("inspection", error))?;
+        Ok(observation)
+    }
+
+    fn advance_historical_ctas_fence(
+        &self,
+        request: ConnectorCtasAdvanceFenceRequest,
+    ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
+        let planning = self
+            .connector_control
+            .acquire_current(&request.fence.target().instance_id)
+            .map_err(|error| local_ctas_failure(connector_failure(error)))?;
+        let recovery = historical_ctas_recovery(&planning)?;
+        let receipt = recovery.advance_fence(request.clone())?;
+        receipt
+            .validate_for(&request)
+            .map_err(|error| invalid_ctas_provider_response("advance fence", error))?;
+        Ok(receipt)
+    }
+
+    fn cleanup_historical_ctas(
+        &self,
+        request: ConnectorHistoricalCtasCleanupRequest,
+    ) -> Result<ConnectorHistoricalCtasCleanupReceipt, ConnectorCtasFailure> {
+        let planning = self
+            .connector_control
+            .acquire_current(&request.descriptor.fence.target().instance_id)
+            .map_err(|error| local_ctas_failure(connector_failure(error)))?;
+        let recovery = historical_ctas_recovery(&planning)?;
+        let receipt = recovery.cleanup(request.clone())?;
+        receipt
+            .validate_for(&request)
+            .map_err(|error| invalid_ctas_provider_response("cleanup", error))?;
+        Ok(receipt)
     }
 }
 
@@ -1562,6 +2075,24 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .unwrap()
+    }
+
+    fn connector_context_with_deadline(deadline: Instant) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            deadline,
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap()
+    }
+
+    fn ctas_operation_id() -> ConnectorCtasOperationId {
+        ConnectorCtasOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap()
+    }
+
+    fn ctas_action_id() -> ConnectorCtasActionId {
+        ConnectorCtasActionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap()
     }
 
     fn execution() -> QueryExecutionContext {
@@ -1786,15 +2317,54 @@ mod tests {
         assert_eq!(execute_count.load(Ordering::SeqCst), 1);
     }
 
-    struct RecoveringCapability {
+    struct CountingFencedCapability {
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
-        reconciles: AtomicUsize,
-        publishes: AtomicUsize,
-        aborts: AtomicUsize,
+        calls: AtomicUsize,
     }
 
-    impl RecoveringCapability {
+    struct SerialAdvanceCapability {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl SerialAdvanceCapability {
+        fn new(
+            descriptor: ConnectorInstanceDescriptor,
+            incarnation: ConnectorInstanceIncarnation,
+        ) -> Self {
+            Self {
+                descriptor,
+                incarnation,
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+            }
+        }
+
+        fn owner(&self) -> ConnectorExecutionBindingKey {
+            ConnectorExecutionBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            }
+        }
+    }
+
+    impl CountingFencedCapability {
+        fn new(
+            descriptor: ConnectorInstanceDescriptor,
+            incarnation: ConnectorInstanceIncarnation,
+        ) -> Self {
+            Self {
+                descriptor,
+                incarnation,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
         fn owner(&self) -> ConnectorExecutionBindingKey {
             ConnectorExecutionBindingKey {
                 instance_id: self.descriptor.instance_id.clone(),
@@ -1802,131 +2372,171 @@ mod tests {
             }
         }
 
-        fn receipt(
-            &self,
-            operation_id: ConnectorStagedCreateOperationId,
-            phase: ConnectorStagedCreateReceiptPhase,
-        ) -> ConnectorStagedCreateReceipt {
-            ConnectorStagedCreateReceipt::try_new(
-                self.owner(),
-                operation_id,
-                phase,
-                ExternalMutationEffect::Applied,
-                Bytes::new(),
-            )
-            .unwrap()
-        }
-
-        fn evidence(
-            &self,
-            operation_id: ConnectorStagedCreateOperationId,
-        ) -> ExternalMutationEvidence {
-            ExternalMutationEvidence::try_new(
-                1,
-                self.descriptor.clone(),
-                self.incarnation,
-                operation_id,
-                "staged-create-prepare",
-                Bytes::from_static(b"prepare-unknown"),
-            )
-            .unwrap()
+        fn total_calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
         }
     }
 
-    impl ConnectorStagedCreate for RecoveringCapability {
+    impl ConnectorCtasStagedPublication for CountingFencedCapability {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
+
         fn incarnation(&self) -> ConnectorInstanceIncarnation {
             self.incarnation
         }
-        fn prepare(
+
+        fn capability(&self) -> ConnectorCtasStagedPublicationCapability {
+            ConnectorCtasStagedPublicationCapability::try_new(
+                CONNECTOR_CTAS_STAGED_PUBLICATION_CONTRACT_VERSION,
+            )
+            .unwrap()
+        }
+
+        fn advance_fence(
             &self,
-            request: ConnectorStagedCreatePrepareRequest,
-        ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
-            Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
+            _: ConnectorCtasAdvanceFenceRequest,
+        ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorCtasFailure::PossiblyDispatched(
+                ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Unavailable,
-                    "unknown",
+                    "injected uncertain CTAS mutation",
                 ),
-                evidence: self.evidence(request.operation_id),
-            })
+            ))
         }
-        fn publish(
+
+        fn stage(
             &self,
-            request: ConnectorStagedCreatePublishRequest,
-        ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
-            self.publishes.fetch_add(1, Ordering::SeqCst);
-            Ok(ConnectorStagedCreatePublishOutcome::Applied {
-                receipt: self.receipt(
-                    request.operation_id,
-                    ConnectorStagedCreateReceiptPhase::Published,
+            _: ConnectorCtasStageRequest,
+        ) -> Result<ConnectorCtasStageResult, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorCtasFailure::PossiblyDispatched(
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "injected uncertain CTAS mutation",
                 ),
-                finalization: ExternalMutationFinalization::Complete,
-            })
-        }
-        fn bind_write(
-            &self,
-            _: ConnectorStagedTableHandle,
-            _: ConnectorWriteOperationCompletion,
-        ) -> Result<(), ConnectorError> {
-            Ok(())
+            ))
         }
 
         fn plan_write(
             &self,
-            request: ConnectorStagedWritePlanningRequest,
-        ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorError> {
-            let table = ConnectorTableHandle::try_new(
-                request.handle.owner().instance_id.clone(),
-                Bytes::new(),
-            )?;
-            ConnectorStagedWritePlanningBinding::try_new(
-                &request.handle,
-                request.operation_id,
-                request.intent,
-                request.input_schema,
-                table,
-                Bytes::new(),
-                request.context,
-            )
+            _: ConnectorStagedWritePlanningRequest,
+        ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            unreachable!("test must reject before dispatch")
         }
+
+        fn bind_write(
+            &self,
+            _: ConnectorStagedTableHandle,
+            _: ConnectorWriteOperationCompletion,
+        ) -> Result<(), ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            unreachable!("test must reject before dispatch")
+        }
+
+        fn publish(
+            &self,
+            _: ConnectorCtasPublishRequest,
+        ) -> Result<ConnectorCtasPublishResult, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorCtasFailure::PossiblyDispatched(
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "injected uncertain CTAS mutation",
+                ),
+            ))
+        }
+
         fn abort(
             &self,
-            request: ConnectorStagedCreateAbortRequest,
-        ) -> Result<ConnectorStagedCreateAbortOutcome, ConnectorError> {
-            self.aborts.fetch_add(1, Ordering::SeqCst);
-            Ok(ConnectorStagedCreateAbortOutcome::Aborted {
-                receipt: self.receipt(
-                    request.operation_id,
-                    ConnectorStagedCreateReceiptPhase::Aborted,
+            _: ConnectorCtasAbortRequest,
+        ) -> Result<ConnectorCtasAbortResult, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorCtasFailure::PossiblyDispatched(
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "injected uncertain CTAS mutation",
                 ),
-                finalization: ExternalMutationFinalization::Complete,
-            })
-        }
-        fn reconcile(
-            &self,
-            request: ConnectorStagedCreateReconcileRequest,
-        ) -> Result<ConnectorStagedCreateReconcileOutcome, ConnectorError> {
-            self.reconciles.fetch_add(1, Ordering::SeqCst);
-            let operation_id = request.evidence.operation_id();
-            Ok(ConnectorStagedCreateReconcileOutcome::Prepared {
-                handle: ConnectorStagedTableHandle::try_new(
-                    self.owner(),
-                    operation_id,
-                    Bytes::from_static(b"recovered-handle"),
-                )?,
-                receipt: self.receipt(operation_id, ConnectorStagedCreateReceiptPhase::Prepared),
-                finalization: ExternalMutationFinalization::Complete,
-            })
+            ))
         }
     }
 
-    struct NoopWriteControl {
+    impl ConnectorCtasStagedPublication for SerialAdvanceCapability {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+            self.incarnation
+        }
+
+        fn capability(&self) -> ConnectorCtasStagedPublicationCapability {
+            ConnectorCtasStagedPublicationCapability::try_new(
+                CONNECTOR_CTAS_STAGED_PUBLICATION_CONTRACT_VERSION,
+            )
+            .unwrap()
+        }
+
+        fn advance_fence(
+            &self,
+            request: ConnectorCtasAdvanceFenceRequest,
+        ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ConnectorCtasPublicationFenceReceipt::try_new(
+                &request,
+                Bytes::from_static(b"fence-receipt"),
+            )
+            .expect("static test fence receipt"))
+        }
+
+        fn stage(
+            &self,
+            _: ConnectorCtasStageRequest,
+        ) -> Result<ConnectorCtasStageResult, ConnectorCtasFailure> {
+            unreachable!()
+        }
+
+        fn plan_write(
+            &self,
+            _: ConnectorStagedWritePlanningRequest,
+        ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorCtasFailure> {
+            unreachable!()
+        }
+
+        fn bind_write(
+            &self,
+            _: ConnectorStagedTableHandle,
+            _: ConnectorWriteOperationCompletion,
+        ) -> Result<(), ConnectorCtasFailure> {
+            unreachable!()
+        }
+
+        fn publish(
+            &self,
+            _: ConnectorCtasPublishRequest,
+        ) -> Result<ConnectorCtasPublishResult, ConnectorCtasFailure> {
+            unreachable!()
+        }
+
+        fn abort(
+            &self,
+            _: ConnectorCtasAbortRequest,
+        ) -> Result<ConnectorCtasAbortResult, ConnectorCtasFailure> {
+            unreachable!()
+        }
+    }
+
+    struct TestNoopWriteControl {
         owner: ConnectorExecutionBindingKey,
     }
 
-    impl ConnectorWriteControl for NoopWriteControl {
+    impl ConnectorWriteControl for TestNoopWriteControl {
         fn binding_key(&self) -> &ConnectorExecutionBindingKey {
             &self.owner
         }
@@ -1935,160 +2545,593 @@ mod tests {
             &self,
             _: ConnectorWritePlanningRequest,
         ) -> Result<ConnectorWritePlan, ConnectorError> {
-            unreachable!("write planning is not used by this target-session test")
+            unreachable!()
         }
 
         fn commit(
             &self,
             _: ConnectorWriteCommitRequest,
         ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            unreachable!("ordinary write commit is forbidden for CTAS")
+            unreachable!()
         }
 
         fn abort(
             &self,
             _: ConnectorWriteAbortRequest,
         ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-            unreachable!("writer abort is not used by this target-session test")
+            unreachable!()
         }
 
         fn reconcile(
             &self,
             _: ConnectorWriteReconcileRequest,
         ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            unreachable!("write reconcile is not used by this target-session test")
+            unreachable!()
         }
     }
 
-    fn completion(owner: ConnectorExecutionBindingKey) -> ConnectorWriteOperationCompletion {
-        let operation_id = ConnectorWriteOperationId::new();
-        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
-        let execution_id = ConnectorWriteExecutionId::new([11; 16], 1);
-        let writer = ConnectorWriterIdentity::new(
-            operation_id,
-            cohort_id,
-            execution_id,
-            [12; 16],
-            1,
-            0,
-            0,
-            owner.clone(),
-        );
-        let report = ConnectorStagedReport::try_new(
-            writer,
-            CONNECTOR_WRITE_CONTRACT_VERSION,
-            ConnectorWriterTerminalState::Staged,
-            ConnectorStagedReportSummary::default(),
-            Bytes::from_static(b"report"),
-        )
-        .unwrap();
-        let accepted = ConnectorWriteAttemptCompletion::try_new(
-            owner.clone(),
-            operation_id,
-            cohort_id,
-            execution_id,
-            [13; 32],
-            vec![report],
-            Bytes::new(),
-        )
-        .unwrap();
-        let sealed = ConnectorSealedWriteCohortSet::try_new(
-            operation_id,
-            vec![ConnectorWriteCohortDescriptor::new(
-                cohort_id,
-                ConnectorWriteIntent::Append,
-                [14; 32],
-            )],
-        )
-        .unwrap();
-        ConnectorWriteOperationCompletion::try_new(
-            owner,
-            sealed,
-            vec![
-                ConnectorWriteCohortCompletion::try_new(cohort_id, Some(accepted), vec![]).unwrap(),
-            ],
+    fn test_preflight(capability: Arc<CountingFencedCapability>) -> CoreCtasTargetPreflight {
+        let owner = capability.owner();
+        test_preflight_with_capability(owner, capability)
+    }
+
+    fn test_preflight_with_capability(
+        owner: ConnectorExecutionBindingKey,
+        capability: Arc<dyn ConnectorCtasStagedPublication>,
+    ) -> CoreCtasTargetPreflight {
+        CoreCtasTargetPreflight {
+            target: crate::engine::backend_resolver::TargetBackend {
+                backend_name: "iceberg",
+                catalog: owner.instance_id.as_str().to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+            },
+            lease: ConnectorCtasStagedPublicationLease::new(owner.clone(), capability, || {})
+                .unwrap(),
+            write_lease: ConnectorWriteLease::new(
+                owner.clone(),
+                Arc::new(TestNoopWriteControl { owner }),
+                || {},
+            )
+            .unwrap(),
+            context: connector_context(),
+            established_fence: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn test_fence(preflight: &CoreCtasTargetPreflight) -> ConnectorCtasPublicationFence {
+        ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster-a").unwrap(),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 1).unwrap(),
+            ctas_operation_id(),
+            ConnectorTableIdentity {
+                instance_id: preflight.lease.owner().instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
         )
         .unwrap()
     }
 
+    fn test_stage_authority(
+        preflight: &CoreCtasTargetPreflight,
+        fence: &ConnectorCtasPublicationFence,
+    ) -> (ConnectorCtasStagedLocator, ConnectorCtasPublicationProof) {
+        let stage_action_id = ctas_action_id();
+        let stage_input_digest = [7; 32];
+        let locator = ConnectorCtasStagedLocator::try_new(
+            preflight.lease.owner().clone(),
+            fence,
+            stage_action_id,
+            fence.digest(),
+            Bytes::from_static(b"staged-locator"),
+        )
+        .unwrap();
+        let proof = ConnectorCtasPublicationProof::try_new(
+            preflight.lease.owner().clone(),
+            fence,
+            ConnectorCtasProofPurpose::Stage,
+            Some(stage_action_id),
+            stage_input_digest,
+            Some(&locator),
+            Bytes::from_static(b"stage-proof"),
+        )
+        .unwrap();
+        (locator, proof)
+    }
+
+    struct CountingHistoricalCapability {
+        owner: ConnectorExecutionBindingKey,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ConnectorHistoricalCtasStagedPublicationRecovery for CountingHistoricalCapability {
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.owner
+        }
+
+        fn capability(&self) -> ConnectorCtasStagedPublicationCapability {
+            ConnectorCtasStagedPublicationCapability::try_new(
+                CONNECTOR_CTAS_STAGED_PUBLICATION_CONTRACT_VERSION,
+            )
+            .unwrap()
+        }
+
+        fn advance_fence(
+            &self,
+            _: ConnectorCtasAdvanceFenceRequest,
+        ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::Unavailable,
+                message: "historical fixture".to_string(),
+            }))
+        }
+
+        fn inspect(
+            &self,
+            _: ConnectorHistoricalCtasDescriptor,
+            _: ConnectorRequestContext,
+        ) -> Result<ConnectorHistoricalCtasObservation, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::Unavailable,
+                message: "historical fixture".to_string(),
+            }))
+        }
+
+        fn cleanup(
+            &self,
+            _: ConnectorHistoricalCtasCleanupRequest,
+        ) -> Result<ConnectorHistoricalCtasCleanupReceipt, ConnectorCtasFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(local_ctas_failure(CtasFailure {
+                kind: CtasFailureKind::Unavailable,
+                message: "historical fixture".to_string(),
+            }))
+        }
+    }
+
     #[test]
-    fn prepare_unknown_reconcile_prepared_retains_same_lease_for_publish() {
+    fn unsupported_preflight_stops_before_source_preparation() {
+        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            "rest",
+            Default::default(),
+            None,
+        );
+        let planning = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+        let source_preparations = AtomicUsize::new(0);
+        let failure = match derive_ctas_foreground_leases(&planning) {
+            Ok(_) => panic!("unsupported fixture must not derive fenced CTAS leases"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.kind, CtasFailureKind::Unsupported);
+        assert_eq!(source_preparations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn foreign_fence_is_rejected_before_catalog_dispatch() {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
             instance_id: ConnectorInstanceId::parse("rest").unwrap(),
         };
         let incarnation = ConnectorInstanceIncarnation::new();
-        let capability = Arc::new(RecoveringCapability {
-            descriptor: descriptor.clone(),
+        let capability = Arc::new(CountingFencedCapability::new(
+            descriptor.clone(),
             incarnation,
-            reconciles: AtomicUsize::new(0),
-            publishes: AtomicUsize::new(0),
-            aborts: AtomicUsize::new(0),
-        });
-        let lease =
-            ConnectorStagedCreateLease::new(capability.owner(), capability.clone(), || {}).unwrap();
-        let operation_id = ConnectorStagedCreateOperationId::new();
-        let request = ConnectorStagedCreatePrepareRequest {
-            owner: capability.owner(),
-            operation_id,
-            table: ConnectorTableIdentity {
+        ));
+        let preflight = test_preflight(capability.clone());
+        let foreign = ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster-a").unwrap(),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 1).unwrap(),
+            ctas_operation_id(),
+            ConnectorTableIdentity {
                 instance_id: descriptor.instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("other"),
+            },
+        )
+        .unwrap();
+        assert!(validate_fence_for_preflight(&preflight, &foreign).is_err());
+        assert_eq!(capability.total_calls(), 0);
+    }
+
+    #[test]
+    fn missing_established_fence_does_not_dispatch_stage() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("rest").unwrap(),
+        };
+        let incarnation = ConnectorInstanceIncarnation::new();
+        let capability = Arc::new(CountingFencedCapability::new(
+            descriptor.clone(),
+            incarnation,
+        ));
+        let preflight = test_preflight(capability.clone());
+        let fence = ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster-a").unwrap(),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 1).unwrap(),
+            ctas_operation_id(),
+            ConnectorTableIdentity {
+                instance_id: descriptor.instance_id,
                 namespace: Arc::from("db"),
                 table: Arc::from("t"),
             },
-            columns: vec![],
-            partitioning: vec![],
-            properties: Default::default(),
-            policy: CreatePolicy::FailIfExists,
-            context: connector_context(),
-        };
-        let write_lease = ConnectorWriteLease::new(
-            capability.owner(),
-            Arc::new(NoopWriteControl {
-                owner: capability.owner(),
-            }),
-            || {},
         )
         .unwrap();
-        let (session, outcome) =
-            CoreCtasTargetSession::prepare(lease, write_lease, request).unwrap();
-        let outcome = outcome.unwrap();
-        let ConnectorStagedCreatePrepareOutcome::CommitUnknown { evidence, .. } = outcome else {
-            panic!("expected unknown")
+        assert!(require_established_fence(&preflight, &fence).is_err());
+        assert_eq!(capability.total_calls(), 0);
+    }
+
+    #[test]
+    fn concurrent_fence_advances_cannot_regress_the_local_established_generation() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("rest").unwrap(),
         };
-        assert!(
-            session
-                .abort(
-                    ConnectorMutationOperationId::new(),
-                    None,
-                    connector_context()
-                )
-                .is_err(),
-            "unknown must forbid abort"
-        );
-        let outcome = session
-            .reconcile(
-                ConnectorStagedCreateReconcilePhase::Prepare,
-                evidence,
-                connector_context(),
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            ConnectorStagedCreateReconcileOutcome::Prepared { .. }
+        let incarnation = ConnectorInstanceIncarnation::new();
+        let capability = Arc::new(SerialAdvanceCapability::new(
+            descriptor.clone(),
+            incarnation,
         ));
-        assert!(session.handle_digest().is_some());
-        let completion = completion(capability.owner());
-        session.bind_write(completion.clone()).unwrap();
-        session
-            .publish(
-                ConnectorMutationOperationId::new(),
-                completion,
-                connector_context(),
+        let preflight = test_preflight_with_capability(capability.owner(), capability.clone());
+        let state = Arc::new(crate::engine::StandaloneState::default());
+        let operation_id = ctas_operation_id();
+        let target = ConnectorTableIdentity {
+            instance_id: descriptor.instance_id,
+            namespace: Arc::from("db"),
+            table: Arc::from("t"),
+        };
+        let lower = ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster-a").unwrap(),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 1).unwrap(),
+            operation_id,
+            target.clone(),
+        )
+        .unwrap();
+        let higher = ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster-a").unwrap(),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 2).unwrap(),
+            operation_id,
+            target,
+        )
+        .unwrap();
+        let lower_action =
+            CtasEngine::prepare_ctas_fence_advance(&state, &preflight, lower, ctas_action_id())
+                .unwrap();
+        let higher_action = CtasEngine::prepare_ctas_fence_advance(
+            &state,
+            &preflight,
+            higher.clone(),
+            ctas_action_id(),
+        )
+        .unwrap();
+
+        let lower_state = Arc::clone(&state);
+        let lower_thread = std::thread::spawn(move || {
+            CtasEngine::advance_ctas_fence(&lower_state, &*lower_action.handle).unwrap()
+        });
+        while capability.active.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let higher_state = Arc::clone(&state);
+        let higher_thread = std::thread::spawn(move || {
+            CtasEngine::advance_ctas_fence(&higher_state, &*higher_action.handle).unwrap()
+        });
+
+        lower_thread.join().unwrap();
+        higher_thread.join().unwrap();
+        assert_eq!(capability.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(capability.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            preflight
+                .established_fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(&higher)
+        );
+    }
+
+    #[test]
+    fn prepared_catalog_action_dispatches_at_most_once_after_unknown_outcome() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("rest").unwrap(),
+        };
+        let capability = Arc::new(CountingFencedCapability::new(
+            descriptor,
+            ConnectorInstanceIncarnation::new(),
+        ));
+        let preflight = test_preflight(capability.clone());
+        let fence = test_fence(&preflight);
+        let request =
+            ConnectorCtasAdvanceFenceRequest::try_new(fence, ctas_action_id(), connector_context())
+                .unwrap();
+        let action = prepared_catalog_action(
+            request.input_digest,
+            CoreCtasCatalogActionKind::Advance { preflight, request },
+        );
+        let state = Arc::new(crate::engine::StandaloneState::default());
+
+        assert!(matches!(
+            CtasEngine::advance_ctas_fence(&state, &*action.handle),
+            Err(ConnectorCtasFailure::PossiblyDispatched(_))
+        ));
+        assert!(matches!(
+            CtasEngine::advance_ctas_fence(&state, &*action.handle),
+            Err(ConnectorCtasFailure::KnownNotDispatched(_))
+        ));
+        assert_eq!(capability.total_calls(), 1);
+    }
+
+    #[test]
+    fn unknown_publish_latches_historical_only_and_blocks_abort_dispatch() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("rest").unwrap(),
+        };
+        let capability = Arc::new(CountingFencedCapability::new(
+            descriptor,
+            ConnectorInstanceIncarnation::new(),
+        ));
+        let preflight = test_preflight(capability.clone());
+        let fence = test_fence(&preflight);
+        let (locator, stage_proof) = test_stage_authority(&preflight, &fence);
+        let catalog_state = Arc::new(Mutex::new(CoreCtasCatalogState::Active));
+        let publish_request = ConnectorCtasPublishRequest::try_new(
+            preflight.lease.owner().clone(),
+            fence.clone(),
+            ctas_action_id(),
+            locator.clone(),
+            [8; 32],
+            CreatePolicy::FailIfExists,
+            connector_context(),
+        )
+        .unwrap();
+        let publish_action = prepared_catalog_action(
+            publish_request.input_digest,
+            CoreCtasCatalogActionKind::Publish {
+                lease: preflight.lease.clone(),
+                request: publish_request,
+                state: Arc::clone(&catalog_state),
+            },
+        );
+        let state = Arc::new(crate::engine::StandaloneState::default());
+
+        assert!(matches!(
+            CtasEngine::publish_ctas(&state, &*publish_action.handle),
+            Err(ConnectorCtasFailure::PossiblyDispatched(_))
+        ));
+        assert_eq!(
+            *catalog_state.lock().unwrap(),
+            CoreCtasCatalogState::HistoricalOnly
+        );
+        assert!(matches!(
+            CtasEngine::publish_ctas(&state, &*publish_action.handle),
+            Err(ConnectorCtasFailure::KnownNotDispatched(_))
+        ));
+
+        let abort_request = ConnectorCtasAbortRequest::try_new(
+            preflight.lease.owner().clone(),
+            fence,
+            ctas_action_id(),
+            locator,
+            stage_proof,
+            connector_context(),
+        )
+        .unwrap();
+        let abort_action = prepared_catalog_action(
+            abort_request.input_digest,
+            CoreCtasCatalogActionKind::Abort {
+                lease: preflight.lease.clone(),
+                request: abort_request,
+                state: Arc::clone(&catalog_state),
+            },
+        );
+        assert!(matches!(
+            CtasEngine::abort_ctas(&state, &*abort_action.handle),
+            Err(ConnectorCtasFailure::KnownNotDispatched(_))
+        ));
+        assert_eq!(capability.total_calls(), 1);
+    }
+
+    #[test]
+    fn staged_target_uses_the_live_stage_context_not_expired_preflight_context() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("rest").unwrap(),
+        };
+        let capability = Arc::new(CountingFencedCapability::new(
+            descriptor,
+            ConnectorInstanceIncarnation::new(),
+        ));
+        let mut preflight = test_preflight(capability);
+        preflight.context =
+            connector_context_with_deadline(Instant::now() - Duration::from_secs(1));
+        let fence = test_fence(&preflight);
+        let stage_action_id = ctas_action_id();
+        let live_context =
+            connector_context_with_deadline(Instant::now() + Duration::from_secs(120));
+        let definition = ConnectorCtasStagedTableDefinition::try_new(
+            fence.target().clone(),
+            vec![ConnectorColumnDefinition {
+                name: Arc::from("v"),
+                data_type: ConnectorDataType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            Vec::new(),
+            Default::default(),
+        )
+        .unwrap();
+        let request = ConnectorCtasStageRequest::try_new(
+            preflight.lease.owner().clone(),
+            fence.clone(),
+            stage_action_id,
+            definition,
+            CreatePolicy::FailIfExists,
+            Bytes::new(),
+            live_context.clone(),
+        )
+        .unwrap();
+        let locator = ConnectorCtasStagedLocator::try_new(
+            preflight.lease.owner().clone(),
+            &fence,
+            stage_action_id,
+            request.target_digest,
+            Bytes::from_static(b"staged-locator"),
+        )
+        .unwrap();
+        let result = ConnectorCtasStageResult::try_new(
+            &request,
+            locator.clone(),
+            ConnectorStagedTableHandle::try_new(
+                preflight.lease.owner().clone(),
+                ConnectorMutationOperationId::from_bytes(stage_action_id.to_bytes()),
+                Bytes::from_static(b"staged-handle"),
             )
-            .unwrap();
-        assert_eq!(capability.reconciles.load(Ordering::SeqCst), 1);
-        assert_eq!(capability.publishes.load(Ordering::SeqCst), 1);
-        assert_eq!(capability.aborts.load(Ordering::SeqCst), 0);
+            .unwrap(),
+            ConnectorCtasPublicationReceipt::try_new(
+                &fence,
+                stage_action_id,
+                request.input_digest,
+                Bytes::from_static(b"stage-receipt"),
+            )
+            .unwrap(),
+            ConnectorCtasPublicationProof::try_new(
+                preflight.lease.owner().clone(),
+                &fence,
+                ConnectorCtasProofPurpose::Stage,
+                Some(stage_action_id),
+                request.input_digest,
+                Some(&locator),
+                Bytes::from_static(b"stage-proof"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let target = CoreCtasTargetSession::from_stage(&preflight, &request, &result);
+        assert_eq!(target.context().deadline(), live_context.deadline());
+        assert_eq!(
+            target
+                .prepare_abort(ctas_action_id())
+                .unwrap()
+                .context
+                .deadline(),
+            live_context.deadline()
+        );
+    }
+
+    #[test]
+    fn foreign_locator_is_rejected_before_publish_dispatch() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("rest").unwrap(),
+        };
+        let incarnation = ConnectorInstanceIncarnation::new();
+        let capability = Arc::new(CountingFencedCapability::new(
+            descriptor.clone(),
+            incarnation,
+        ));
+        let preflight = test_preflight(capability.clone());
+        let fence = ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster-a").unwrap(),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 1).unwrap(),
+            ctas_operation_id(),
+            ConnectorTableIdentity {
+                instance_id: descriptor.instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+        )
+        .unwrap();
+        let foreign_owner = ConnectorExecutionBindingKey {
+            instance_id: preflight.lease.owner().instance_id.clone(),
+            incarnation: ConnectorInstanceIncarnation::new(),
+        };
+        let locator = ConnectorCtasStagedLocator::try_new(
+            foreign_owner,
+            &fence,
+            ctas_action_id(),
+            fence.digest(),
+            Bytes::from_static(b"foreign-locator"),
+        )
+        .unwrap();
+        let request = ConnectorCtasPublishRequest::try_new(
+            preflight.lease.owner().clone(),
+            fence,
+            ctas_action_id(),
+            locator,
+            [3; 32],
+            CreatePolicy::FailIfExists,
+            connector_context(),
+        );
+        assert!(request.is_err());
+        assert_eq!(capability.total_calls(), 0);
+    }
+
+    #[test]
+    fn historical_inspection_never_calls_ordinary_capability() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("rest").unwrap(),
+        };
+        let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
+        let ordinary = Arc::new(CountingFencedCapability::new(
+            descriptor.clone(),
+            incarnation,
+        ));
+        let historical_calls = Arc::new(AtomicUsize::new(0));
+        let historical = Arc::new(CountingHistoricalCapability {
+            owner: ordinary.owner(),
+            calls: Arc::clone(&historical_calls),
+        });
+        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
+            descriptor.provider_id.clone(),
+            descriptor.instance_id.as_str(),
+            Default::default(),
+            None,
+        )
+        .try_with_ctas_staged_publication(Some(ordinary.clone()))
+        .unwrap()
+        .try_with_historical_ctas_staged_publication_recovery(Some(historical))
+        .unwrap();
+        let planning = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+        let fence = ConnectorCtasPublicationFence::try_new(
+            ConnectorClusterIdentity::derive("cluster-a").unwrap(),
+            ConnectorExternalFenceGeneration::try_new(1, 1, 1).unwrap(),
+            ctas_operation_id(),
+            ConnectorTableIdentity {
+                instance_id: descriptor.instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+        )
+        .unwrap();
+        let descriptor = ConnectorHistoricalCtasDescriptor::try_new(
+            ordinary.owner(),
+            fence.clone(),
+            [1; 32],
+            fence.digest(),
+            CreatePolicy::FailIfExists,
+            None,
+            vec![ConnectorHistoricalCtasCheckpoint {
+                action_id: ctas_action_id(),
+                action: ConnectorHistoricalCtasAction::Stage,
+                dispatch: ConnectorHistoricalCtasDispatchState::Unknown,
+                input_digest: [2; 32],
+                evidence_digest: None,
+            }],
+            None,
+        )
+        .unwrap();
+        let recovery = historical_ctas_recovery(&planning).unwrap();
+        assert!(recovery.inspect(descriptor, connector_context()).is_err());
+        assert_eq!(historical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary.total_calls(), 0);
     }
 }

@@ -223,6 +223,10 @@ pub enum InspectCtasTargetResponse {
         /// Optional unpublished staging retained for proof-bound cleanup.
         #[serde(rename = "staged-locator", skip_serializing_if = "Option::is_none")]
         staged_locator: Option<String>,
+        /// Original stage proof paired with retained staging. It is absent
+        /// exactly when no unpublished staging remains.
+        #[serde(rename = "staged-proof", skip_serializing_if = "Option::is_none")]
+        staged_proof: Option<String>,
     },
     /// Guarded abort completed.
     Aborted {
@@ -279,6 +283,7 @@ impl fmt::Debug for InspectCtasTargetResponse {
                 provenance,
                 proof,
                 staged_locator,
+                staged_proof,
             } => f
                 .debug_struct("NoOp")
                 .field("provenance", &redacted_len(provenance))
@@ -287,6 +292,7 @@ impl fmt::Debug for InspectCtasTargetResponse {
                     "staged_locator",
                     &staged_locator.as_deref().map(redacted_len),
                 )
+                .field("staged_proof", &staged_proof.as_deref().map(redacted_len))
                 .finish(),
             Self::Aborted { provenance, proof } => f
                 .debug_struct("Aborted")
@@ -1299,6 +1305,7 @@ mod tests {
             provenance: "historical-no-op".to_string(),
             proof: "historical-proof".to_string(),
             staged_locator: Some("retained-staging".to_string()),
+            staged_proof: Some("retained-stage-proof".to_string()),
         };
         let encoded = serde_json::to_vec(&historical_no_op).unwrap();
         assert_eq!(

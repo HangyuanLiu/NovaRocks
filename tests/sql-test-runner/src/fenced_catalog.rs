@@ -903,6 +903,7 @@ async fn handle_inspect(state: &AppState, request: InspectRequest) -> Response {
             });
             if let Some(staged) = &record.staged {
                 response["staged-locator"] = Value::String(staged.locator.clone());
+                response["staged-proof"] = Value::String(staged.proof.clone());
             }
             json_response(StatusCode::OK, response)
         }
@@ -2849,6 +2850,7 @@ mod tests {
         .unwrap();
         assert_eq!(inspection["state"], "no-op");
         assert_eq!(inspection["staged-locator"], staged["staged-locator"]);
+        assert_eq!(inspection["staged-proof"], staged["staged-proof"]);
 
         let cleanup: Value = post_json(
             &client,

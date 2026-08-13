@@ -28,6 +28,7 @@ use crate::catalog_control::IcebergCatalogControlState;
 use crate::catalog_control::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
 use crate::catalog_control::ctas_fenced_publication::IcebergCtasFencedPublication;
 use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
+use crate::catalog_control::historical_ctas_recovery::IcebergHistoricalCtasRecovery;
 use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
 use crate::commit::IcebergWriteControl;
@@ -196,6 +197,13 @@ impl ConnectorControlFactory for IcebergControlFactory {
         } else {
             None
         };
+        let historical_ctas_recovery = if unpublished.runtime.has_ctas_fenced_publication() {
+            Some(Arc::new(IcebergHistoricalCtasRecovery::try_new(
+                Arc::clone(&provider),
+            )?))
+        } else {
+            None
+        };
         // One owner implements both MV control facets: fencing and attempt
         // discovery share the provider, the stable resource vocabulary, and the
         // same freshness requirement.
@@ -221,6 +229,12 @@ impl ConnectorControlFactory for IcebergControlFactory {
                 capability
                     as Arc<dyn novarocks_spi::connector::ConnectorCtasStagedPublication>
             }))?
+            .try_with_historical_ctas_staged_publication_recovery(
+                historical_ctas_recovery.map(|capability| {
+                    capability
+                        as Arc<dyn novarocks_spi::connector::ConnectorHistoricalCtasStagedPublicationRecovery>
+                }),
+            )?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
             .try_with_historical_maintenance_recovery(Some(Arc::new(
                 crate::catalog_control::historical_maintenance_recovery::IcebergHistoricalMaintenanceRecovery::new(
@@ -710,6 +724,12 @@ mod tests {
         server.join().expect("config server");
 
         assert!(creation.binding().ctas_staged_publication().is_some());
+        assert!(
+            creation
+                .binding()
+                .historical_ctas_staged_publication_recovery()
+                .is_some()
+        );
     }
 
     #[test]
@@ -741,5 +761,11 @@ mod tests {
         server.join().expect("config server");
 
         assert!(creation.binding().ctas_staged_publication().is_none());
+        assert!(
+            creation
+                .binding()
+                .historical_ctas_staged_publication_recovery()
+                .is_none()
+        );
     }
 }
