@@ -66,8 +66,7 @@ pub struct FrontendMvService {
     background: Mutex<Option<FrontendMvBackgroundRuntime>>,
     scheduler_config: FrontendMvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_service:
-        Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
+    table_maintenance_service: Option<Arc<dyn novarocks::maintenance::TableMaintenanceService>>,
     execution_role: novarocks::common::app_config::ClusterRole,
     topology: Option<BackendTopologyService>,
     /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
@@ -101,9 +100,7 @@ impl FrontendMvService {
         topology: BackendTopologyService,
         scheduler_config: FrontendMvSchedulerConfig,
         maintenance_config: MaintenanceCoordinatorConfig,
-        table_maintenance_service: Arc<
-            dyn novarocks::engine::table_maintenance::TableMaintenanceService,
-        >,
+        table_maintenance_service: Arc<dyn novarocks::maintenance::TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
         ownership: Option<super::coordination::MvRefreshOwnershipContext>,
     ) -> Self {
@@ -409,9 +406,8 @@ struct RefreshWorkerDependencies {
     role: novarocks::common::app_config::ClusterRole,
     scheduler_config: FrontendMvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_engine: Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceEngine>,
-    table_maintenance_service:
-        Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>,
+    table_maintenance_engine: Arc<dyn novarocks::maintenance::TableMaintenanceEngine>,
+    table_maintenance_service: Arc<dyn novarocks::maintenance::TableMaintenanceService>,
     activity_gate: MvActivityGate,
     maintenance_wakeup_tx: Option<mpsc::SyncSender<()>>,
     optimizer_query_mem_limit_bytes: u64,

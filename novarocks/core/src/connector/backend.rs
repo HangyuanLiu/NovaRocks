@@ -17,7 +17,7 @@
 
 //! Connector-agnostic metadata and materialized-view backend traits.
 
-use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow};
+use crate::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorTableHandle, StatisticsDataVersion};
 

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::StringArray;
 use bytes::Bytes;
-use novarocks::engine::table_maintenance::{
+use novarocks::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
     MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine,
     TableMaintenanceService,

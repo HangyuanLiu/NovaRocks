@@ -21,6 +21,7 @@ pub mod catalog_application;
 pub mod common;
 pub mod connector;
 pub mod engine;
+pub mod maintenance;
 pub mod mv;
 pub mod protocol;
 pub mod query_execution;
@@ -28,6 +29,8 @@ pub mod runtime;
 pub mod server;
 pub mod service;
 pub mod sql;
+pub mod statistics;
+pub mod view;
 pub use novarocks_version as version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
 pub use common::app_config as novarocks_config;
@@ -43,8 +46,6 @@ pub use common::types::FetchResult;
 /// far more than that. The lake-reading code stays here because a production SQL
 /// procedure also calls it; what moves is who decides when it runs.
 pub mod mv_startup {
-    pub use crate::engine::mv::iceberg_refresh::{
-        MvTargetRestoreContext, restore_iceberg_mv_targets,
-    };
-    pub use crate::engine::mv::lake_rebuild::{LakeRebuildContext, rebuild_imv_cache_from_lake};
+    pub use crate::mv::iceberg_refresh::{MvTargetRestoreContext, restore_iceberg_mv_targets};
+    pub use crate::mv::lake_rebuild::{LakeRebuildContext, rebuild_imv_cache_from_lake};
 }

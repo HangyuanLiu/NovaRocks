@@ -23,16 +23,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks::common::app_config::ClusterRole;
-use novarocks::engine::statistics::EmptyStatisticsService;
-use novarocks::engine::truncate_engine::{
+use novarocks::query_execution::backend::BackendTopologySnapshot;
+use novarocks::query_execution::cancellation::QueryCancellationSource;
+use novarocks::query_execution::dml::truncate::{
     PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateDispatchState, TruncateEffect,
     TruncateEngine, TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization,
     TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncatePlanSummary, TruncatePrepared,
     TruncateReceipt, parse_truncate_command,
 };
-use novarocks::query_execution::backend::BackendTopologySnapshot;
-use novarocks::query_execution::cancellation::QueryCancellationSource;
 use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
+use novarocks::statistics::EmptyStatisticsService;
 use novarocks_frontend::dml::model::{
     DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_OPERATION_SCHEMA_VERSION,
     DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
@@ -142,7 +142,7 @@ impl TruncateEngine for FakeTruncateEngine {
     /// provider's marker publication itself.
     fn establish_truncate_external_fence(
         &self,
-        _prepared: &dyn novarocks::engine::truncate_engine::TruncatePrepared,
+        _prepared: &dyn novarocks::query_execution::dml::truncate::TruncatePrepared,
         fence: novarocks_spi::connector::ConnectorExternalOperationFence,
     ) -> Result<
         novarocks_spi::connector::ConnectorExternalFenceReceipt,

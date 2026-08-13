@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::engine::table_maintenance::{MaintenanceActionOutcome, MaintenanceStatementResult};
+use novarocks::maintenance::{MaintenanceActionOutcome, MaintenanceStatementResult};
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_types::SlotId;

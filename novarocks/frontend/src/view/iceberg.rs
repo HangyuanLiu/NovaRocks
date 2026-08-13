@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::engine::view::{
+use novarocks::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewSqlDialect, ViewStatementResult,
     ViewTarget,
 };

@@ -1179,11 +1179,11 @@ pub(crate) fn execute_drop_table_statement(
             &target.table,
         )
     };
-    match crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+    match crate::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         context.connector_control(),
         context.mv_storage_observation(),
         &target,
-        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::DropTable,
+        crate::mv::iceberg_guard::IcebergMvUserMutation::DropTable,
     ) {
         Ok(()) => {}
         Err(err)

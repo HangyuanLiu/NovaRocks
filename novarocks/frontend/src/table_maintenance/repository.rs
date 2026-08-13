@@ -20,7 +20,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks::maintenance::{MaintenanceTarget, OptimizeJobState};
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteAttemptCheckpoint as SpiRewriteCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition as SpiRewriteDisposition, ConnectorInstanceId,

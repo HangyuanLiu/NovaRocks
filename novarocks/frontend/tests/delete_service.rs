@@ -23,12 +23,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::coordination_fixture::JournalInspect;
 use novarocks::common::app_config::ClusterRole;
-use novarocks::engine::delete_engine::{
+use novarocks::query_execution::backend::BackendTopologySnapshot;
+use novarocks::query_execution::cancellation::QueryCancellationSource;
+use novarocks::query_execution::dml::delete::{
     DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatementKind,
     DeleteWriteReport, PrepareDeleteRequest, PreparedDelete,
 };
-use novarocks::query_execution::backend::BackendTopologySnapshot;
-use novarocks::query_execution::cancellation::QueryCancellationSource;
 use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
 use novarocks_frontend::dml::model::DML_OPERATION_SCHEMA_VERSION;
 use novarocks_frontend::dml::{
@@ -93,8 +93,8 @@ impl DeleteEngine for FakeDeleteEngine {
     /// engine must expose a real write authority to fence against.
     fn establish_delete_external_fence(
         &self,
-        _prepared: &dyn novarocks::engine::delete_engine::DeletePrepared,
-        proposal: &dyn novarocks::engine::external_write_fence::ExternalWriteFenceProposal,
+        _prepared: &dyn novarocks::query_execution::dml::delete::DeletePrepared,
+        proposal: &dyn novarocks::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
     ) -> Result<
         novarocks_spi::connector::ConnectorEstablishedWriteFence,
         novarocks_spi::connector::ConnectorError,
@@ -285,7 +285,7 @@ fn non_delete_skips_engine_and_journal() {
     assert_eq!(
         DmlService::compose(
             None,
-            Arc::new(novarocks::engine::statistics::EmptyStatisticsService)
+            Arc::new(novarocks::statistics::EmptyStatisticsService)
         )
         .try_execute_delete(&engine, "SELECT 1", &context, None)
         .unwrap(),
@@ -300,7 +300,7 @@ fn delete_requires_journal_before_prepare() {
     let (context, _, _) = context();
     let error = DmlService::compose(
         None,
-        Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+        Arc::new(novarocks::statistics::EmptyStatisticsService),
     )
     .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
     .unwrap_err();
@@ -315,7 +315,7 @@ fn delete_uses_admitted_context_and_records_noop_as_known_empty() {
     let journal = Arc::clone(&coordination.journal);
     let service = DmlService::compose_with_coordination(
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+        Arc::new(novarocks::statistics::EmptyStatisticsService),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );
@@ -342,7 +342,7 @@ fn equality_delete_commits_and_finalizes_row_delta() {
     let journal = Arc::clone(&coordination.journal);
     let service = DmlService::compose_with_coordination(
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+        Arc::new(novarocks::statistics::EmptyStatisticsService),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );
@@ -375,7 +375,7 @@ fn aborted_delete_does_not_commit() {
     let journal = Arc::clone(&coordination.journal);
     let service = DmlService::compose_with_coordination(
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+        Arc::new(novarocks::statistics::EmptyStatisticsService),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );

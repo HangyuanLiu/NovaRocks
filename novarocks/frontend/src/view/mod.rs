@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::engine::view::{
+use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
+use novarocks::view::{
     ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult,
 };
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_spi::state_store::StateStore;

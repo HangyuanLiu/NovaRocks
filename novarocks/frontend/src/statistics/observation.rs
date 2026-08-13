@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::datatypes::DataType;
-use novarocks::engine::statistics::{
+use novarocks::statistics::{
     StatisticsColumn, StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral,
     StatisticsOverwriteMode,
 };

@@ -38,14 +38,14 @@ use crate::runtime::query_result::{
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 
-pub use crate::connector::unified_statistics::UnifiedStatisticsResolver;
-pub use crate::engine::mv::iceberg_refresh::IcebergMvCorePorts;
-pub use crate::engine::query_planning::catalog_runtime::{
+pub use crate::catalog_application::query_catalog::{
     QueryCatalogService, new_query_catalog_service,
 };
+pub use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 #[cfg(test)]
 use crate::mv::application::UnavailableMvApplicationService;
 use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
+pub use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::repository::MvRepository;
 #[cfg(test)]
 use crate::mv::repository::UnavailableMvRepository;
@@ -56,48 +56,15 @@ use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
-pub mod add_files_engine;
 pub(crate) mod aggregate;
 pub mod backend_command;
 pub(crate) mod backend_resolver;
 pub mod catalog_command;
-pub mod ctas_engine;
-pub mod delete_engine;
 pub(crate) mod domain;
 pub use domain::SessionCatalogResolver;
-pub mod external_write_fence;
 pub mod frontend_capabilities;
-pub(crate) mod iceberg_ctas;
-pub(crate) mod iceberg_maintenance;
 pub mod iceberg_ref_command;
-pub(crate) mod iceberg_ref_flow;
-pub(crate) mod information_schema;
-pub mod insert_engine;
-pub mod maintenance_command;
-pub mod mutation_engine;
-pub(crate) mod mutation_flow;
-pub(crate) mod mv;
-pub(crate) mod mv_background;
-pub mod mv_command;
-pub(crate) mod mv_first_refresh_staging;
-pub(crate) mod mv_flow;
-pub(crate) mod mv_maintenance;
-pub(crate) mod mv_rewrite_prep;
-pub(crate) mod query_planning;
-pub(crate) mod query_prep;
-pub(crate) mod query_stats;
-pub mod row_mutation;
 pub(crate) mod statement;
-pub mod statistics;
-pub mod statistics_application;
-pub mod statistics_command;
-pub mod system_catalog;
-pub mod table_maintenance;
-pub mod truncate_engine;
-pub mod view;
-pub mod view_command;
-pub(crate) mod virtual_table;
-mod write_transaction;
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
@@ -106,7 +73,9 @@ use self::statement::{
     looks_like_show_create_table, parse_alter_iceberg_properties_sql,
     parse_alter_partition_column_sql, parse_show_create_table,
 };
-use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
+use crate::query_execution::planning::time_travel::{
+    has_time_travel_refs, rewrite_time_travel_refs,
+};
 #[cfg(test)]
 use crate::sql::literal::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
 
@@ -151,7 +120,9 @@ pub(crate) fn catalog_service_snapshot(source: &impl CatalogServiceSource) -> Qu
 /// A Frontend-composed [`domain::DmlExecutionKernel`] rejects that fallback so
 /// foreground DML must arrive with its admitted request context.
 pub(crate) trait DmlQueryExecutionKernel:
-    CatalogServiceSource + query_prep::TimeTravelResolver + query_stats::QueryStatisticsResolver
+    CatalogServiceSource
+    + crate::query_execution::planning::time_travel::TimeTravelResolver
+    + crate::query_execution::planning::statistics::QueryStatisticsResolver
 {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     fn catalog_application(
@@ -223,7 +194,7 @@ pub(crate) fn build_catalog_service_provider<'a>(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
     catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
-) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
+) -> crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     build_catalog_service_provider_with_query_local_overlays(
         current_catalog,
         catalog_service,
@@ -245,9 +216,9 @@ pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
     controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
-    overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+    overlays: Vec<crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay>,
     catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
-) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
+) -> crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     let bindings = Arc::new(
         crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()
             .expect("query table binding scope allocation must not fail"),
@@ -269,11 +240,14 @@ pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overl
     controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
-    overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+    overlays: Vec<crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay>,
     catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
-) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
-    let loader = query_stats::iceberg_table_binding_loader(controls, connector_context);
-    crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+) -> crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'a> {
+    let loader = crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+        controls,
+        connector_context,
+    );
+    crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
         current_catalog,
         catalog_service,
         bindings,
@@ -1189,10 +1163,12 @@ impl CoreQueryCompiler {
                 )
             }
             sqlast::Statement::Query(ref query) => {
-                if let Some(result) = self::information_schema::try_query_materialized_views(
-                    &self.system_tables,
-                    query,
-                )? {
+                if let Some(result) =
+                    crate::catalog_application::information_schema::try_query_materialized_views(
+                        &self.system_tables,
+                        query,
+                    )?
+                {
                     return Ok(PreparedQueryOperation::Immediate(
                         PreparedImmediateQuery::new(result),
                     ));
@@ -1201,13 +1177,16 @@ impl CoreQueryCompiler {
                 self.view.view_service().rewrite_query(
                     &self.view,
                     &mut prepared,
-                    crate::engine::view::ViewRequestContext {
+                    crate::view::ViewRequestContext {
                         current_catalog,
                         current_database,
                         connector_context: Some(&connector_context),
                     },
                 )?;
-                self::virtual_table::rewrite_query(&self.system_tables, &mut prepared)?;
+                crate::catalog_application::virtual_table::rewrite_query(
+                    &self.system_tables,
+                    &mut prepared,
+                )?;
                 if has_time_travel_refs(&prepared) {
                     rewrite_time_travel_refs(
                         &self.query,
@@ -1636,14 +1615,11 @@ pub(crate) fn build_iceberg_create_table_ddl(
 // Custom statement dispatch
 // ---------------------------------------------------------------------------
 
-pub(crate) mod delete_predicate_translate;
-pub(crate) mod iceberg_writer;
-
 pub(crate) fn statistics_application_target(
     name: &crate::sql::parser::ast::ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<statistics_application::StatisticsTableTarget, String> {
+) -> Result<crate::statistics::application::StatisticsTableTarget, String> {
     let default_catalog = current_catalog.unwrap_or("default_catalog");
     let (catalog, namespace, table) = match name.parts.as_slice() {
         [table] => (default_catalog, current_database, table.as_str()),
@@ -1656,7 +1632,7 @@ pub(crate) fn statistics_application_target(
             ));
         }
     };
-    Ok(statistics_application::StatisticsTableTarget {
+    Ok(crate::statistics::application::StatisticsTableTarget {
         catalog: normalize_identifier(catalog)?,
         namespace: normalize_identifier(namespace)?,
         table: normalize_identifier(table)?,
@@ -1664,9 +1640,9 @@ pub(crate) fn statistics_application_target(
 }
 
 pub(crate) fn statistics_application_result(
-    result: statistics_application::StatisticsApplicationResult,
+    result: crate::statistics::application::StatisticsApplicationResult,
 ) -> Result<StatementResult, String> {
-    use statistics_application::StatisticsApplicationResult;
+    use crate::statistics::application::StatisticsApplicationResult;
 
     match result {
         StatisticsApplicationResult::JobSubmitted(_)
@@ -1879,7 +1855,7 @@ fn prepare_explain_query_with_ports(
     view_kernel.view_service().rewrite_query(
         view_kernel,
         &mut prepared,
-        crate::engine::view::ViewRequestContext {
+        crate::view::ViewRequestContext {
             current_catalog,
             current_database,
             connector_context: Some(connector_context),
@@ -2032,7 +2008,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overl
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
-    overlays: &[crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay],
+    overlays: &[crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay],
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     execute_query_as_iceberg_write_with_connector_binding(
         state,
@@ -2073,7 +2049,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
     crate::connector::validate_request_context(connector_context)?;
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
-    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         state,
         Arc::clone(&table_bindings),
     );
@@ -2094,7 +2070,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         &statistics,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            crate::engine::query_planning::sql_cancellation_observation(
+            crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
@@ -2237,7 +2213,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
     scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
-    query_local_overlays: &[crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay],
+    query_local_overlays: &[crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay],
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let maintenance_execution;
     let execution = match execution {
@@ -2284,7 +2260,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
             "SQL write catalog materializer replaced the admitted binding store".to_string(),
         );
     }
-    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         state,
         Arc::clone(&table_bindings),
     );
@@ -2308,7 +2284,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         None,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            crate::engine::query_planning::sql_cancellation_observation(
+            crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
@@ -2392,7 +2368,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
             "SQL write catalog materializer replaced the admitted binding store".to_string(),
         );
     }
-    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         state,
         Arc::clone(&table_bindings),
     );
@@ -2419,7 +2395,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         None,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            crate::engine::query_planning::sql_cancellation_observation(
+            crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
@@ -2768,7 +2744,7 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
 }
 
 pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
-    statistics_resolver: &impl query_stats::QueryStatisticsResolver,
+    statistics_resolver: &impl crate::query_execution::planning::statistics::QueryStatisticsResolver,
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     current_database: &str,
@@ -2781,7 +2757,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
             "distributed SQL compilation requires a frozen non-zero backend count".to_string()
         })?;
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         statistics_resolver,
         Arc::clone(&table_bindings),
     );
@@ -2800,7 +2776,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
         None,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            crate::engine::query_planning::sql_cancellation_observation(
+            crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
@@ -2866,7 +2842,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
 #[allow(clippy::too_many_arguments)]
 fn prepare_query_with_sql_compiler_kernel_with_ports(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'_>,
+    analyzer_catalog: &crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'_>,
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
@@ -2890,7 +2866,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
             "SQL compilation requires a non-empty admitted backend topology".to_string()
         })?;
     let table_bindings = analyzer_catalog.query_table_bindings();
-    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         query_kernel,
         table_bindings.clone(),
     );
@@ -2901,7 +2877,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     let mv_definitions =
         if allow_mv_rewrite_candidates && mv_repository.availability().is_available() {
             Some(
-                crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+                crate::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
                     mv_repository,
                     query_kernel.connector_control().as_ref(),
                     mv_storage_observation,
@@ -2931,14 +2907,14 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         mv_definitions.as_ref(),
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            crate::engine::query_planning::sql_cancellation_observation(
+            crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
     );
-    let planning_inputs = crate::engine::query_planning::QueryPlanningInputs {
+    let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
         compile_request: compiler_request,
-        post_compile: crate::engine::query_planning::PostCompilePlanningContext {
+        post_compile: crate::query_execution::planning::PostCompilePlanningContext {
             table_bindings,
             connector_controls: query_kernel.connector_control().as_ref(),
             connector_context,
@@ -2982,7 +2958,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
 #[allow(clippy::too_many_arguments)]
 fn explain_query_with_sql_compiler_kernel_with_ports(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'_>,
+    analyzer_catalog: &crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'_>,
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
@@ -2998,17 +2974,16 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             "SQL compilation requires a non-empty admitted backend topology".to_string()
         })?;
     let table_bindings = analyzer_catalog.query_table_bindings();
-    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         query_kernel,
         table_bindings.clone(),
     );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let mv_definitions =
-        crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-            mv_repository,
-            query_kernel.connector_control().as_ref(),
-            mv_storage_observation,
-        )?;
+    let mv_definitions = crate::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+        mv_repository,
+        query_kernel.connector_control().as_ref(),
+        mv_storage_observation,
+    )?;
     let intent = if logical {
         crate::sql::compiler::SqlCompileIntent::LogicalOnly
     } else {
@@ -3017,7 +2992,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             analyze: false,
         }
     };
-    let planning_inputs = crate::engine::query_planning::QueryPlanningInputs {
+    let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
         compile_request: crate::sql::compiler::SqlCompileRequest::new(
             crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
             intent,
@@ -3033,12 +3008,12 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             Some(&mv_definitions),
             crate::sql::compiler::SqlCompileControl::new(
                 execution.deadline(),
-                crate::engine::query_planning::sql_cancellation_observation(
+                crate::query_execution::planning::sql_cancellation_observation(
                     execution.cancellation().clone(),
                 ),
             ),
         ),
-        post_compile: crate::engine::query_planning::PostCompilePlanningContext {
+        post_compile: crate::query_execution::planning::PostCompilePlanningContext {
             table_bindings,
             connector_controls: query_kernel.connector_control().as_ref(),
             connector_context,
@@ -3530,7 +3505,7 @@ mod build_iceberg_create_table_ddl_tests {
 #[cfg(test)]
 mod tests {
     use super::QueryResult;
-    use crate::engine::statistics_application::{
+    use crate::statistics::application::{
         StatisticsApplicationCommand, StatisticsApplicationError, StatisticsApplicationPort,
         StatisticsApplicationResult, StatisticsJobView, StatisticsTableStatView,
         StatisticsTableTarget,
@@ -3696,7 +3671,7 @@ mod tests {
                 Arc::new(crate::engine::new_query_catalog_service()),
                 Arc::new(crate::engine::TestConnectorControlRegistry::default()),
                 Arc::new(crate::engine::UnifiedStatisticsResolver::default()),
-                Arc::new(crate::engine::statistics::EmptyStatisticsService),
+                Arc::new(crate::statistics::EmptyStatisticsService),
                 Arc::clone(&port) as Arc<dyn StatisticsApplicationPort>,
                 crate::engine::test_query_execution_service(),
             ),

@@ -27,24 +27,27 @@ use std::sync::Arc;
 use novarocks_spi::connector::ConnectorControlRegistry;
 
 use crate::catalog_application::CatalogApplicationPort;
+use crate::catalog_application::query_catalog::QueryCatalogService;
+use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::engine::domain;
-use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
-use crate::engine::statistics::StatisticsService;
-use crate::engine::statistics_application::StatisticsApplicationPort;
-use crate::engine::system_catalog::SystemCatalog;
-use crate::engine::table_maintenance::TableMaintenanceService;
-use crate::engine::view::ViewService;
 use crate::engine::{
-    CoreQueryCompiler, UnifiedStatisticsResolver, add_files_engine, backend_command,
-    catalog_command, ctas_engine, delete_engine, iceberg_ref_command, insert_engine,
-    maintenance_command, mutation_engine, mv_command, statistics_command, truncate_engine,
-    view_command,
+    CoreQueryCompiler, UnifiedStatisticsResolver, backend_command, catalog_command,
+    iceberg_ref_command,
 };
+use crate::maintenance::TableMaintenanceService;
+use crate::maintenance::command as maintenance_command;
 use crate::mv::application::MvApplicationService;
+use crate::mv::command as mv_command;
 use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::MvStorageObservationPort;
 use crate::query_execution::backend::BackendTopologyService;
+use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use crate::query_execution::service::QueryExecutionService;
+use crate::statistics::StatisticsService;
+use crate::statistics::application::StatisticsApplicationPort;
+use crate::statistics::command as statistics_command;
+use crate::view::ViewService;
+use crate::view::view_command;
 
 /// Leaf ports used by SQL query preparation.
 ///
@@ -177,12 +180,12 @@ impl DmlEnginePorts {
 /// CTAS engine before the sole recovery controller starts.
 #[derive(Clone)]
 pub struct DmlEngines {
-    pub insert: Arc<dyn insert_engine::InsertEngine>,
-    pub delete: Arc<dyn delete_engine::DeleteEngine>,
-    pub mutation: Arc<dyn mutation_engine::MutationEngine>,
-    pub ctas: Arc<dyn ctas_engine::CtasEngine>,
-    pub truncate: Arc<dyn truncate_engine::TruncateEngine>,
-    pub add_files: Arc<dyn add_files_engine::AddFilesEngine>,
+    pub insert: Arc<dyn insert::InsertEngine>,
+    pub delete: Arc<dyn delete::DeleteEngine>,
+    pub mutation: Arc<dyn mutation::MutationEngine>,
+    pub ctas: Arc<dyn ctas::CtasEngine>,
+    pub truncate: Arc<dyn truncate::TruncateEngine>,
+    pub add_files: Arc<dyn add_files::AddFilesEngine>,
 }
 
 /// Build all foreground DML engines from one DML-domain port set.
@@ -438,16 +441,15 @@ impl MvCommandPorts {
 }
 
 pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecutor {
-    let iceberg_ports = crate::engine::mv::iceberg_refresh::IcebergMvCorePorts::new(
+    let iceberg_ports = crate::mv::iceberg_refresh::IcebergMvCorePorts::new(
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
         Arc::clone(&ports.connector_control),
         Arc::clone(&ports.repository),
         Arc::clone(&ports.storage_observation),
     );
-    let backend = Arc::new(
-        crate::engine::mv::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports),
-    );
+    let backend =
+        Arc::new(crate::mv::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports));
     mv_command::MvCommandExecutor::new(domain::MvExecutionKernel::new(
         ports.catalog_service,
         ports.catalog_application,
@@ -612,7 +614,7 @@ pub fn mv_refresh_provider_activation(
         ports.mv_storage_observation,
     );
     Arc::new(
-        crate::engine::mv::iceberg_activation::IcebergMvRefreshProviderActivation::new(
+        crate::mv::iceberg_activation::IcebergMvRefreshProviderActivation::new(
             query_kernel,
             mv_ports,
         ),
@@ -629,25 +631,21 @@ pub fn bind_mv_refresh_provider_activation(
 
 /// Bind the short-lived, generation-fenced statistics target resolver.
 pub fn bind_statistics_target_resolver(
-    sink: &dyn crate::engine::statistics_application::StatisticsTargetResolverSink,
+    sink: &dyn crate::statistics::application::StatisticsTargetResolverSink,
     connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
     sink.bind_statistics_target_resolver(Arc::new(
-        crate::engine::statistics_application::ConnectorStatisticsTargetResolver::new(
-            connector_control,
-        ),
+        crate::statistics::application::ConnectorStatisticsTargetResolver::new(connector_control),
     ))
 }
 
 /// Bind the short-lived, generation-fenced statistics reader.
 pub fn bind_statistics_table_reader(
-    sink: &dyn crate::engine::statistics_application::StatisticsTableReaderSink,
+    sink: &dyn crate::statistics::application::StatisticsTableReaderSink,
     connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
     sink.bind_statistics_table_reader(Arc::new(
-        crate::engine::statistics_application::ConnectorStatisticsTableReader::new(
-            connector_control,
-        ),
+        crate::statistics::application::ConnectorStatisticsTableReader::new(connector_control),
     ))
 }
 
@@ -687,12 +685,12 @@ impl StatisticsAttemptExecutorPorts {
 /// `ConnectorRegistry` to Frontend composition.
 pub fn statistics_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
-) -> Arc<dyn crate::engine::statistics_application::StatisticsAttemptExecutor> {
+) -> Arc<dyn crate::statistics::application::StatisticsAttemptExecutor> {
     let mut registry = crate::connector::ConnectorRegistry::new();
     registry.register_iceberg_mv_backend(ports.iceberg_mv);
     Arc::new(
-        crate::engine::statistics_application::ConnectorStatisticsAttemptExecutor::new(
-            crate::engine::statistics_application::StatisticsAttemptExecutionPorts::new(
+        crate::statistics::application::ConnectorStatisticsAttemptExecutor::new(
+            crate::statistics::application::StatisticsAttemptExecutionPorts::new(
                 ports.execution_role,
                 Arc::new(std::sync::RwLock::new(registry)),
                 ports.connector_control,
@@ -707,7 +705,7 @@ pub fn statistics_attempt_executor(
 /// coordinator leaves are ready.  A missing sink remains a Frontend decision;
 /// this helper never supplies an in-memory job fallback.
 pub fn bind_statistics_attempt_executor(
-    sink: &dyn crate::engine::statistics_application::StatisticsAttemptExecutorSink,
+    sink: &dyn crate::statistics::application::StatisticsAttemptExecutorSink,
     ports: StatisticsAttemptExecutorPorts,
 ) -> Result<(), String> {
     sink.bind_statistics_attempt_executor(statistics_attempt_executor(ports))
@@ -718,14 +716,12 @@ pub fn bind_statistics_attempt_executor(
 /// obtains a fresh topology and cancellation scope through that factory.
 pub fn background_maintenance_engine(
     ports: MaintenanceCommandPorts,
-    attempt_factory: Arc<dyn crate::engine::table_maintenance::BackgroundMaintenanceAttemptFactory>,
-) -> Arc<dyn crate::engine::table_maintenance::TableMaintenanceEngine> {
-    Arc::new(
-        crate::engine::table_maintenance::BackgroundMaintenanceEngine::new(
-            ports.kernel(),
-            attempt_factory,
-        ),
-    )
+    attempt_factory: Arc<dyn crate::maintenance::BackgroundMaintenanceAttemptFactory>,
+) -> Arc<dyn crate::maintenance::TableMaintenanceEngine> {
+    Arc::new(crate::maintenance::BackgroundMaintenanceEngine::new(
+        ports.kernel(),
+        attempt_factory,
+    ))
 }
 
 /// Capture one automatic-maintenance attempt from the Frontend's live role
@@ -734,7 +730,7 @@ pub fn background_maintenance_engine(
 pub fn background_maintenance_attempt(
     role: crate::common::app_config::ClusterRole,
     topology: BackendTopologyService,
-) -> Result<crate::engine::table_maintenance::BackgroundMaintenanceAttempt, String> {
+) -> Result<crate::maintenance::BackgroundMaintenanceAttempt, String> {
     let topology = topology.snapshot().map_err(|error| error.to_string())?;
     let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
     let execution = crate::query_execution::request_context::QueryExecutionContext::new(
@@ -746,12 +742,10 @@ pub fn background_maintenance_attempt(
     );
     let connector_context =
         crate::connector::connector_request_context_for_execution(None, &execution)?;
-    Ok(
-        crate::engine::table_maintenance::BackgroundMaintenanceAttempt::new(
-            execution,
-            connector_context,
-        ),
-    )
+    Ok(crate::maintenance::BackgroundMaintenanceAttempt::new(
+        execution,
+        connector_context,
+    ))
 }
 
 /// Leaf ports for the Frontend-owned MV background worker.
@@ -786,7 +780,7 @@ impl MvBackgroundPorts {
 /// runtime after restore and maintenance recovery have completed.
 pub fn mv_background_bindings(
     ports: MvBackgroundPorts,
-    table_maintenance_engine: Arc<dyn crate::engine::table_maintenance::TableMaintenanceEngine>,
+    table_maintenance_engine: Arc<dyn crate::maintenance::TableMaintenanceEngine>,
 ) -> crate::mv::background::MvBackgroundBindings {
     let iceberg_ports = crate::engine::IcebergMvCorePorts::new(
         ports.catalog_service,
@@ -797,7 +791,7 @@ pub fn mv_background_bindings(
     );
     crate::mv::background::MvBackgroundBindings {
         engine: Arc::new(
-            crate::engine::mv_background::StandaloneMvBackgroundEngine::new_with_ports(
+            crate::mv::background_engine::StandaloneMvBackgroundEngine::new_with_ports(
                 iceberg_ports,
                 ports.connector_control,
                 ports.repository,
@@ -813,7 +807,7 @@ pub fn mv_background_bindings(
 pub fn bind_mv_background_engine(
     sink: &dyn crate::mv::background::MvBackgroundEngineSink,
     ports: MvBackgroundPorts,
-    table_maintenance_engine: Arc<dyn crate::engine::table_maintenance::TableMaintenanceEngine>,
+    table_maintenance_engine: Arc<dyn crate::maintenance::TableMaintenanceEngine>,
 ) -> Result<(), crate::mv::background::MvBackgroundEngineError> {
     sink.bind_mv_background_engine(mv_background_bindings(ports, table_maintenance_engine))
 }

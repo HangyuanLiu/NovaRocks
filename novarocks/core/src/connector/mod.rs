@@ -848,7 +848,7 @@ impl ConnectorRegistry {
     /// state or synthesize provider/default dependencies.
     pub fn register_iceberg_mv_backend(&mut self, ports: crate::engine::IcebergMvCorePorts) {
         self.register_mv_backend(Arc::new(
-            crate::engine::mv::iceberg_backend::IcebergMvBackend::new_with_ports(ports),
+            crate::mv::iceberg_backend::IcebergMvBackend::new_with_ports(ports),
         ));
     }
 

@@ -6,11 +6,11 @@ mod statement;
 
 use std::sync::RwLock;
 
-use novarocks::engine::statistics::{
+use novarocks::runtime::query_result::QueryResult;
+use novarocks::statistics::{
     StatisticsEngine, StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
     StatisticsStatementResult,
 };
-use novarocks::runtime::query_result::QueryResult;
 
 use self::model::StatisticsState;
 
@@ -88,7 +88,7 @@ impl StatisticsService for FrontendStatisticsService {
         &self,
         database: &str,
         table: &str,
-    ) -> Result<Option<novarocks::engine::statistics::CatalogTableStatistics>, String> {
+    ) -> Result<Option<novarocks::statistics::CatalogTableStatistics>, String> {
         provider::catalog_table_statistics(self, database, table)
     }
 }

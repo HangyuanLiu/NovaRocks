@@ -25,7 +25,7 @@ use novarocks::common::cleanup_fault::{CleanupFaultKind, claim_configured as cla
 use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
-use novarocks::engine::table_maintenance::{
+use novarocks::maintenance::{
     HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
     MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
@@ -1359,7 +1359,7 @@ impl FrontendTableMaintenanceService {
         repository: &Arc<MetadataMaintenanceOperationRepository>,
         engine: &dyn TableMaintenanceEngine,
         operation: &model::MetadataMaintenanceOperation,
-        attempt_context: &novarocks::engine::table_maintenance::MaintenanceAttemptContext,
+        attempt_context: &novarocks::maintenance::MaintenanceAttemptContext,
         attempt: &MaintenanceAttemptGuard,
         authority: &MaintenanceAuthorityV1,
         validator: &MaintenanceFenceValidator,
@@ -1732,7 +1732,7 @@ impl FrontendTableMaintenanceService {
         repository: &Arc<CleanupOperationRepository>,
         engine: &dyn TableMaintenanceEngine,
         operation: &model::CleanupOperation,
-        attempt_context: &novarocks::engine::table_maintenance::MaintenanceAttemptContext,
+        attempt_context: &novarocks::maintenance::MaintenanceAttemptContext,
         attempt: &MaintenanceAttemptGuard,
         authority: &MaintenanceAuthorityV1,
         validator: &MaintenanceFenceValidator,

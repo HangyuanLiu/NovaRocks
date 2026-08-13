@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorRequestContext;
 
-use crate::engine::table_maintenance::{MaintenanceTarget, TableMaintenanceEngine};
+use crate::maintenance::{MaintenanceTarget, TableMaintenanceEngine};
 use crate::mv::application::{MvRefreshAttemptIdentity, PreparedMvRefresh};
 use crate::mv::model::MvTarget;
 

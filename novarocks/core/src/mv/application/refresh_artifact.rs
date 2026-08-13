@@ -296,7 +296,7 @@ pub(crate) struct MvFirstRefreshLogicalContext {
     /// store. `None` identifies artifact modes that have not admitted a
     /// logical join input and therefore cannot use this handoff.
     pub(crate) frozen_base_overlays:
-        Option<Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>>,
+        Option<Vec<crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay>>,
 }
 
 /// Application envelope for a join first-refresh artifact.

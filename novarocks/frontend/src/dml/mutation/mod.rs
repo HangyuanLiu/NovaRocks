@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks::engine::mutation_engine::{
+use novarocks::query_execution::dml::mutation::{
     MutationAbort, MutationCommit, MutationEngine, MutationStageOutcome, MutationStatementKind,
     PrepareMutationRequest, PreparedMutation, parse_merge_statement, parse_update_statement,
 };
@@ -217,12 +217,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks::common::app_config::ClusterRole;
-    use novarocks::engine::mutation_engine::{
+    use novarocks::query_execution::backend::BackendTopologySnapshot;
+    use novarocks::query_execution::cancellation::QueryCancellationSource;
+    use novarocks::query_execution::dml::mutation::{
         MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
         PreparedMutation,
     };
-    use novarocks::query_execution::backend::BackendTopologySnapshot;
-    use novarocks::query_execution::cancellation::QueryCancellationSource;
     use novarocks::query_execution::request_context::{
         RequestAdmission, RequestContext, SessionOptimizerSettings,
     };
@@ -252,7 +252,7 @@ mod tests {
         ) -> Result<PreparedMutation, String> {
             self.events.lock().expect("events").push("prepare");
             Ok(PreparedMutation {
-                operation: novarocks::engine::mutation_engine::MutationOperation {
+                operation: novarocks::query_execution::dml::mutation::MutationOperation {
                     kind: request.kind,
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),

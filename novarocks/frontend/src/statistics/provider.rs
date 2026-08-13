@@ -1,4 +1,4 @@
-use novarocks::engine::statistics::{CatalogColumnStatistics, CatalogTableStatistics};
+use novarocks::statistics::{CatalogColumnStatistics, CatalogTableStatistics};
 
 use super::FrontendStatisticsService;
 use super::model::TableKey;

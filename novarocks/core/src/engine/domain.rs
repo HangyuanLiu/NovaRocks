@@ -24,19 +24,19 @@
 use std::sync::Arc;
 
 use crate::catalog_application::CatalogApplicationPort;
+use crate::catalog_application::query_catalog::QueryCatalogService;
+use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::connector::MvBackend;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
-use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
-use crate::engine::statistics::StatisticsService;
-use crate::engine::statistics_application::StatisticsApplicationPort;
-use crate::engine::system_catalog::SystemCatalog;
-use crate::engine::table_maintenance::TableMaintenanceService;
-use crate::engine::view::ViewService;
+use crate::maintenance::TableMaintenanceService;
 use crate::mv::application::MvApplicationService;
 use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::MvStorageObservationPort;
 use crate::query_execution::backend::BackendTopologyService;
 use crate::query_execution::service::QueryExecutionService;
+use crate::statistics::StatisticsService;
+use crate::statistics::application::StatisticsApplicationPort;
+use crate::view::ViewService;
 use novarocks_spi::connector::ConnectorControlRegistry;
 
 /// Query compilation and distributed-query preparation dependencies.

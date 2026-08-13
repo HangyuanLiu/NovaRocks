@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::engine::statistics::{
+use novarocks::statistics::{
     StatisticsEngine, StatisticsRequestContext, StatisticsStatementResult, StatisticsTableTarget,
 };
 
@@ -222,7 +222,7 @@ fn handle_analyze_statement(
 fn publish_collected_statistics(
     service: &FrontendStatisticsService,
     key: &TableKey,
-    collected: Vec<novarocks::engine::statistics::CollectedColumnStatistics>,
+    collected: Vec<novarocks::statistics::CollectedColumnStatistics>,
     status_columns: &str,
 ) -> Result<(), String> {
     let rows = collected

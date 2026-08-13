@@ -27,28 +27,24 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
-use novarocks::engine::add_files_engine::AddFilesEngine;
-use novarocks::engine::ctas_engine::CtasEngine;
-use novarocks::engine::delete_engine::DeleteEngine;
-use novarocks::engine::insert_engine::InsertEngine;
-use novarocks::engine::mutation_engine::MutationEngine;
-use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
-    CoreQueryCompiler, SessionCatalogResolver,
-    backend_command::BackendCommandExecutor,
-    catalog_command::CatalogCommandExecutor,
-    iceberg_ref_command::IcebergRefCommandExecutor,
-    maintenance_command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor},
-    mv_command::MvCommandExecutor,
-    statistics_command::StatisticsCommandExecutor,
-    view_command::ViewCommandExecutor,
+    SessionCatalogResolver, backend_command::BackendCommandExecutor,
+    catalog_command::CatalogCommandExecutor, iceberg_ref_command::IcebergRefCommandExecutor,
 };
+use novarocks::maintenance::command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor};
+use novarocks::mv::command::MvCommandExecutor;
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
 use novarocks::query_execution::control::{
     QueryCancelOutcome, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
     StatementFinishOutcome,
 };
+use novarocks::query_execution::dml::add_files::AddFilesEngine;
+use novarocks::query_execution::dml::ctas::CtasEngine;
+use novarocks::query_execution::dml::delete::DeleteEngine;
+use novarocks::query_execution::dml::insert::InsertEngine;
+use novarocks::query_execution::dml::mutation::MutationEngine;
+use novarocks::query_execution::dml::truncate::TruncateEngine;
 use novarocks::query_execution::request_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
@@ -59,12 +55,17 @@ use novarocks::query_execution::session::{
 };
 use novarocks::query_execution::{PreparedQueryOperation, StatementResult};
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks::statistics::command::StatisticsCommandExecutor;
+use novarocks::view::view_command::ViewCommandExecutor;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use tokio::task;
 
 use crate::dml::DmlService;
+use crate::query::compiler::FrontendQueryCompiler;
+
+pub(crate) mod compiler;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
@@ -293,7 +294,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 #[derive(Clone)]
 pub struct FrontendQueryService {
     session_catalog_resolver: SessionCatalogResolver,
-    query_compiler: CoreQueryCompiler,
+    query_compiler: FrontendQueryCompiler,
     command_executor: Arc<dyn CoreCommandRoute>,
     query_control: QueryControlService,
     query_execution: QueryExecutionService,
@@ -315,7 +316,7 @@ impl FrontendQueryService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_recovery_bound(
         session_catalog_resolver: SessionCatalogResolver,
-        query_compiler: CoreQueryCompiler,
+        query_compiler: FrontendQueryCompiler,
         catalog_command_executor: CatalogCommandExecutor,
         statistics_command_executor: StatisticsCommandExecutor,
         backend_command_executor: BackendCommandExecutor,
@@ -1368,25 +1369,25 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks::engine::delete_engine::{
+    use novarocks::query_execution::backend::BackendTopologySnapshot;
+    use novarocks::query_execution::cancellation::QueryCancellationSource;
+    use novarocks::query_execution::dml::delete::{
         DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport,
         PrepareDeleteRequest, PreparedDelete,
     };
-    use novarocks::engine::insert_engine::{
+    use novarocks::query_execution::dml::insert::{
         IcebergInsertCommit, IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert,
         PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
     };
-    use novarocks::engine::mutation_engine::{
+    use novarocks::query_execution::dml::mutation::{
         MutationAbort, MutationCommit, MutationEngine, MutationPrepared, MutationStageOutcome,
         PrepareMutationRequest, PreparedMutation,
     };
-    use novarocks::engine::statistics::{
+    use novarocks::query_execution::request_context::QueryExecutionContext;
+    use novarocks::statistics::{
         CollectedColumnStatistics, EmptyStatisticsService, StatisticsColumn, StatisticsEngine,
         StatisticsTableTarget,
     };
-    use novarocks::query_execution::backend::BackendTopologySnapshot;
-    use novarocks::query_execution::cancellation::QueryCancellationSource;
-    use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_catalog::schema::ColumnDef;
 
     #[derive(Default)]

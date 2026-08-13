@@ -25,7 +25,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
+use novarocks::catalog_application::system_catalog::{
+    SystemCatalog, SystemCatalogInputs, SystemTableData,
+};
 use novarocks_catalog::schema::ColumnDef;
 
 const INFORMATION_SCHEMA_DB: &str = "information_schema";

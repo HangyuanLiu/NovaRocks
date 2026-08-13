@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use novarocks::engine::delete_engine::{
+use novarocks::query_execution::dml::delete::{
     DeleteCommit, DeleteEngine, DeleteStatementKind, DeleteWriteReport, PrepareDeleteRequest,
     PreparedDelete, parse_delete_statement, parse_equality_delete_statement,
 };

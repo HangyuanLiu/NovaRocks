@@ -23,7 +23,7 @@
 //! and the optional same-session reconcile-once call.
 
 use bytes::Bytes;
-use novarocks::engine::truncate_engine::{
+use novarocks::query_execution::dml::truncate::{
     PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateDispatchState, TruncateEffect,
     TruncateEngine, TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization,
     TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncateReceipt,
