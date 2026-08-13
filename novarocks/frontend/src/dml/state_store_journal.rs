@@ -43,15 +43,21 @@ use crate::dml::model::{
     DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
     DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DML_OPERATION_SCHEMA_VERSION,
     DML_RECOVERY_DUE_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE, DML_RECOVERY_SHARD_COUNT,
-    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest, DmlExternalFenceMutationRequest,
-    DmlExternalFenceReceiptRecord, DmlHistoricalWriteRecoveryMutationRequest,
-    DmlHistoricalWriteRecoveryRecord, DmlOperationId, DmlRecoveryCandidate,
-    DmlRecoveryDueRescheduleRequest, DurableExternalFact, ExternalFactOutcome, OperationFact,
-    OperationKind, OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
-    SourceScopeOwnership, StatementNextAction, StoredOperation, operation_requires_recovery_scan,
+    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest,
+    DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
+    DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord,
+    DmlHistoricalDataMutationRecoveryMutationRequest, DmlHistoricalDataMutationRecoveryRecord,
+    DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord, DmlOperationId,
+    DmlRecoveryCandidate, DmlRecoveryDueRescheduleRequest, DurableExternalFact,
+    ExternalFactOutcome, OperationFact, OperationKind, OperationMutationRequest, OperationPayload,
+    OperationState, OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
+    operation_requires_recovery_scan, operation_requires_recovery_scan_with_direct_mutation,
+    validate_direct_mutation_fence_receipt, validate_direct_mutation_fence_transition,
     validate_external_fence_receipt, validate_external_fence_transition,
-    validate_historical_write_recovery, validate_historical_write_recovery_transition,
-    validate_operation_transition, validate_statement_operation_transition,
+    validate_historical_data_mutation_recovery,
+    validate_historical_data_mutation_recovery_transition, validate_historical_write_recovery,
+    validate_historical_write_recovery_transition, validate_operation_transition,
+    validate_statement_operation_transition,
 };
 use crate::dml::now_unix_millis;
 
@@ -63,11 +69,17 @@ const ADD_FILES_SOURCE_SCOPE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/add-fil
 const EXTERNAL_FENCE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/external-fences/";
 const HISTORICAL_WRITE_RECOVERY_PREFIX: &[u8] =
     b"novarocks/frontend/dml/v1/historical-write-recoveries/";
+const DIRECT_MUTATION_FENCE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/direct-mutation-fences/";
+const HISTORICAL_DATA_MUTATION_RECOVERY_PREFIX: &[u8] =
+    b"novarocks/frontend/dml/v1/historical-data-mutation-recoveries/";
 const ADD_FILES_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Operation states in which an external operation fence receipt may still be
 /// attached. A fence must be confirmed before any writer or commit dispatch, so
 /// an operation that already carries an external outcome cannot accept one.
+///
+/// TRUNCATE and ADD FILES seal their fence in `Preparing` or `Committing`, so
+/// the direct-mutation receipt shares this rule instead of restating it.
 const EXTERNAL_FENCE_ALLOWED_STATES: [OperationState; 4] = [
     OperationState::Preparing,
     OperationState::Writing,
@@ -257,7 +269,8 @@ impl StateStoreOperationJournal {
             finished_at_ms: None,
         };
         validate_operation(&operation)?;
-        validate_recovery_due_scope(&operation, None)?;
+        // A statement operation is being created, so no side record can exist.
+        validate_recovery_due_scope(&operation, None, None)?;
         let operation_id = operation.operation_id;
         let mutation_id = operation.last_mutation_id;
         let operation_key = operation_key(operation_id)?;
@@ -452,6 +465,15 @@ impl StateStoreOperationJournal {
                     {
                         return Ok(Err(error));
                     }
+                    let direct_mutation = match load_historical_data_mutation_recovery_in(
+                        transaction,
+                        operation_id,
+                    )
+                    .await
+                    {
+                        Ok(direct_mutation) => direct_mutation,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     let previous = operation.clone();
                     operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
                     operation.revision = match operation.revision.checked_add(1) {
@@ -472,9 +494,20 @@ impl StateStoreOperationJournal {
                         operation.finished_at_ms = Some(operation.updated_at_ms);
                     }
                     // Statement families do not own a CP-3B historical write
-                    // recovery record, so the exact obligation is the operation
-                    // record alone.
-                    if let Err(error) = validate_recovery_due_scope(&operation, None) {
+                    // recovery record, but TRUNCATE and ADD FILES do own a
+                    // CP-3C historical data-mutation recovery, so a terminal
+                    // statement result must not drop that obligation.
+                    if let Err(error) = validate_historical_retention(
+                        operation_id,
+                        None,
+                        direct_mutation.as_ref(),
+                        operation.recovery_due_at_ms,
+                    ) {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) =
+                        validate_recovery_due_scope(&operation, None, direct_mutation.as_ref())
+                    {
                         return Ok(Err(error));
                     }
                     let operation_value =
@@ -622,6 +655,15 @@ impl StateStoreOperationJournal {
                     {
                         return Ok(Err(error));
                     }
+                    let direct_mutation = match load_historical_data_mutation_recovery_in(
+                        transaction,
+                        operation_id,
+                    )
+                    .await
+                    {
+                        Ok(direct_mutation) => direct_mutation,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     let previous = operation.clone();
                     operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
                     operation.revision = match operation.revision.checked_add(1) {
@@ -641,8 +683,20 @@ impl StateStoreOperationJournal {
                         return Ok(Err(error));
                     }
                     // ADD FILES does not own a CP-3B historical write recovery
-                    // record, so the exact obligation is the operation alone.
-                    if let Err(error) = validate_recovery_due_scope(&operation, None) {
+                    // record, but it does own a CP-3C historical data-mutation
+                    // recovery whose source-scope obligation outlives the
+                    // user-visible statement result.
+                    if let Err(error) = validate_historical_retention(
+                        operation_id,
+                        None,
+                        direct_mutation.as_ref(),
+                        operation.recovery_due_at_ms,
+                    ) {
+                        return Ok(Err(error));
+                    }
+                    if let Err(error) =
+                        validate_recovery_due_scope(&operation, None, direct_mutation.as_ref())
+                    {
                         return Ok(Err(error));
                     }
                     // `run_side_effect_free` can report a closure error after
@@ -1023,8 +1077,42 @@ impl StateStoreOperationJournal {
         .await
     }
 
-    /// Publish one CP-3B side record atomically with the operation revision it
-    /// belongs to.
+    async fn record_direct_mutation_fence_async(
+        &self,
+        request: DmlDirectMutationFenceMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.apply_side_record_mutation_async(
+            request.operation_id,
+            request.expected_revision,
+            request.mutation_id,
+            recovery_due_at_ms,
+            DmlSideRecord::DirectMutationFence(Box::new(request.fence)),
+            authority,
+        )
+        .await
+    }
+
+    async fn record_historical_data_mutation_recovery_async(
+        &self,
+        request: DmlHistoricalDataMutationRecoveryMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.apply_side_record_mutation_async(
+            request.operation_id,
+            request.expected_revision,
+            request.mutation_id,
+            recovery_due_at_ms,
+            DmlSideRecord::HistoricalDataMutationRecovery(Box::new(request.recovery)),
+            authority,
+        )
+        .await
+    }
+
+    /// Publish one CP-3B or CP-3C side record atomically with the operation
+    /// revision it belongs to.
     ///
     /// The single StateStore transaction validates the dynamic latest lease
     /// fence, the expected operation revision, and the persisted coordination
@@ -1121,22 +1209,36 @@ impl StateStoreOperationJournal {
                     }
                     // Writing a historical recovery record supersedes whatever
                     // was durable, so a mutation that resolves the recovery may
-                    // release the bounded scan in the same transaction.
+                    // release the bounded scan in the same transaction. Every
+                    // other side record must read both durable recoveries.
                     let historical = match &side {
                         DmlSideRecord::HistoricalWriteRecovery(recovery) => {
                             Some(recovery.as_ref().clone())
                         }
-                        DmlSideRecord::ExternalFence(_) => {
-                            match load_historical_write_recovery_in(transaction, operation_id).await
-                            {
-                                Ok(historical) => historical,
-                                Err(error) => return Ok(Err(error)),
-                            }
+                        _ => match load_historical_write_recovery_in(transaction, operation_id).await
+                        {
+                            Ok(historical) => historical,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                    };
+                    let direct_mutation = match &side {
+                        DmlSideRecord::HistoricalDataMutationRecovery(recovery) => {
+                            Some(recovery.as_ref().clone())
                         }
+                        _ => match load_historical_data_mutation_recovery_in(
+                            transaction,
+                            operation_id,
+                        )
+                        .await
+                        {
+                            Ok(direct_mutation) => direct_mutation,
+                            Err(error) => return Ok(Err(error)),
+                        },
                     };
                     if let Err(error) = validate_historical_retention(
                         operation_id,
                         historical.as_ref(),
+                        direct_mutation.as_ref(),
                         recovery_due_at_ms,
                     ) {
                         return Ok(Err(error));
@@ -1157,9 +1259,11 @@ impl StateStoreOperationJournal {
                     if let Err(error) = validate_operation(&operation) {
                         return Ok(Err(error));
                     }
-                    if let Err(error) =
-                        validate_recovery_due_scope(&operation, historical.as_ref())
-                    {
+                    if let Err(error) = validate_recovery_due_scope(
+                        &operation,
+                        historical.as_ref(),
+                        direct_mutation.as_ref(),
+                    ) {
                         return Ok(Err(error));
                     }
                     let operation_value =
@@ -1226,6 +1330,28 @@ impl StateStoreOperationJournal {
         self.load_side_record(&key)
             .await?
             .map(|value| decode_historical_write_recovery(&key, value))
+            .transpose()
+    }
+
+    async fn load_direct_mutation_fence_async(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlDirectMutationFenceReceiptRecord>, DmlError> {
+        let key = direct_mutation_fence_key(operation_id)?;
+        self.load_side_record(&key)
+            .await?
+            .map(|value| decode_direct_mutation_fence(&key, value))
+            .transpose()
+    }
+
+    async fn load_historical_data_mutation_recovery_async(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlHistoricalDataMutationRecoveryRecord>, DmlError> {
+        let key = historical_data_mutation_recovery_key(operation_id)?;
+        self.load_side_record(&key)
+            .await?
+            .map(|value| decode_historical_data_mutation_recovery(&key, value))
             .transpose()
     }
 
@@ -1331,9 +1457,19 @@ impl StateStoreOperationJournal {
                             Ok(historical) => historical,
                             Err(error) => return Ok(Err(error)),
                         };
+                    let direct_mutation = match load_historical_data_mutation_recovery_in(
+                        transaction,
+                        operation_id,
+                    )
+                    .await
+                    {
+                        Ok(direct_mutation) => direct_mutation,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     if let Err(error) = validate_historical_retention(
                         operation_id,
                         historical.as_ref(),
+                        direct_mutation.as_ref(),
                         recovery_due_at_ms,
                     ) {
                         return Ok(Err(error));
@@ -1357,9 +1493,11 @@ impl StateStoreOperationJournal {
                     if let Err(error) = validate_operation(&operation) {
                         return Ok(Err(error));
                     }
-                    if let Err(error) =
-                        validate_recovery_due_scope(&operation, historical.as_ref())
-                    {
+                    if let Err(error) = validate_recovery_due_scope(
+                        &operation,
+                        historical.as_ref(),
+                        direct_mutation.as_ref(),
+                    ) {
                         return Ok(Err(error));
                     }
                     let value = match encode_operation_with_limit(&operation, max_value_bytes) {
@@ -2009,6 +2147,68 @@ impl OperationJournal for StateStoreOperationJournal {
             .map(|_| ())
     }
 
+    fn record_direct_mutation_fence_authorized(
+        &self,
+        request: DmlDirectMutationFenceMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.record_direct_mutation_fence_async(
+            request,
+            recovery_due_at_ms,
+            authority,
+        ))
+    }
+
+    fn record_historical_data_mutation_recovery_authorized(
+        &self,
+        request: DmlHistoricalDataMutationRecoveryMutationRequest,
+        recovery_due_at_ms: Option<i64>,
+        authority: DmlMutationAuthority,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.record_historical_data_mutation_recovery_async(
+            request,
+            recovery_due_at_ms,
+            authority,
+        ))
+    }
+
+    fn load_direct_mutation_fence(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlDirectMutationFenceReceiptRecord>, DmlError> {
+        self.blocking(self.load_direct_mutation_fence_async(operation_id))
+    }
+
+    fn load_historical_data_mutation_recovery(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<DmlHistoricalDataMutationRecoveryRecord>, DmlError> {
+        self.blocking(self.load_historical_data_mutation_recovery_async(operation_id))
+    }
+
+    fn preflight_direct_mutation_fence(
+        &self,
+        request: &DmlDirectMutationFenceMutationRequest,
+    ) -> Result<(), DmlError> {
+        validate_direct_mutation_fence_receipt(&request.fence)
+            .map_err(DmlError::journal_corruption)?;
+        DmlSideRecord::DirectMutationFence(Box::new(request.fence.clone()))
+            .encode(self.store.limits().max_value_bytes)
+            .map(|_| ())
+    }
+
+    fn preflight_historical_data_mutation_recovery(
+        &self,
+        request: &DmlHistoricalDataMutationRecoveryMutationRequest,
+    ) -> Result<(), DmlError> {
+        validate_historical_data_mutation_recovery(&request.recovery)
+            .map_err(DmlError::journal_corruption)?;
+        DmlSideRecord::HistoricalDataMutationRecovery(Box::new(request.recovery.clone()))
+            .encode(self.store.limits().max_value_bytes)
+            .map(|_| ())
+    }
+
     fn recovery_candidates(
         &self,
         shard: u8,
@@ -2138,15 +2338,17 @@ impl StateStoreOperationJournal {
     }
 }
 
-/// One CP-3B durable record that lives beside its DML operation.
+/// One CP-3B or CP-3C durable record that lives beside its DML operation.
 ///
-/// Both kinds are published in the same StateStore transaction that advances the
-/// operation revision, so the operation record itself keeps its v6 shape and a
-/// fenced mutation is the only way to change either record.
+/// Every kind is published in the same StateStore transaction that advances the
+/// operation revision, so the operation record itself keeps its v7 shape and a
+/// fenced mutation is the only way to change any of them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DmlSideRecord {
     ExternalFence(Box<DmlExternalFenceReceiptRecord>),
     HistoricalWriteRecovery(Box<DmlHistoricalWriteRecoveryRecord>),
+    DirectMutationFence(Box<DmlDirectMutationFenceReceiptRecord>),
+    HistoricalDataMutationRecovery(Box<DmlHistoricalDataMutationRecoveryRecord>),
 }
 
 impl DmlSideRecord {
@@ -2154,6 +2356,8 @@ impl DmlSideRecord {
         match self {
             Self::ExternalFence(_) => "external fence receipt",
             Self::HistoricalWriteRecovery(_) => "historical write recovery",
+            Self::DirectMutationFence(_) => "direct mutation fence receipt",
+            Self::HistoricalDataMutationRecovery(_) => "historical data mutation recovery",
         }
     }
 
@@ -2161,6 +2365,10 @@ impl DmlSideRecord {
         match self {
             Self::ExternalFence(_) => "record frontend DML external fence receipt",
             Self::HistoricalWriteRecovery(_) => "record frontend DML historical write recovery",
+            Self::DirectMutationFence(_) => "record frontend DML direct mutation fence receipt",
+            Self::HistoricalDataMutationRecovery(_) => {
+                "record frontend DML historical data mutation recovery"
+            }
         }
     }
 
@@ -2168,6 +2376,10 @@ impl DmlSideRecord {
         match self {
             Self::ExternalFence(_) => external_fence_key(operation_id),
             Self::HistoricalWriteRecovery(_) => historical_write_recovery_key(operation_id),
+            Self::DirectMutationFence(_) => direct_mutation_fence_key(operation_id),
+            Self::HistoricalDataMutationRecovery(_) => {
+                historical_data_mutation_recovery_key(operation_id)
+            }
         }
     }
 
@@ -2177,6 +2389,12 @@ impl DmlSideRecord {
                 .map(|record| Self::ExternalFence(Box::new(record))),
             Self::HistoricalWriteRecovery(_) => decode_historical_write_recovery(key, value)
                 .map(|record| Self::HistoricalWriteRecovery(Box::new(record))),
+            Self::DirectMutationFence(_) => decode_direct_mutation_fence(key, value)
+                .map(|record| Self::DirectMutationFence(Box::new(record))),
+            Self::HistoricalDataMutationRecovery(_) => {
+                decode_historical_data_mutation_recovery(key, value)
+                    .map(|record| Self::HistoricalDataMutationRecovery(Box::new(record)))
+            }
         }
     }
 
@@ -2184,6 +2402,8 @@ impl DmlSideRecord {
         let encoded = match self {
             Self::ExternalFence(record) => serde_json::to_vec(record.as_ref()),
             Self::HistoricalWriteRecovery(record) => serde_json::to_vec(record.as_ref()),
+            Self::DirectMutationFence(record) => serde_json::to_vec(record.as_ref()),
+            Self::HistoricalDataMutationRecovery(record) => serde_json::to_vec(record.as_ref()),
         }
         .map_err(DmlError::journal_corruption)?;
         if encoded.len() > max_value_bytes {
@@ -2248,6 +2468,67 @@ impl DmlSideRecord {
                 validate_historical_write_recovery_transition(existing, recovery)
                     .map_err(DmlError::journal_corruption)
             }
+            (Self::DirectMutationFence(fence), existing) => {
+                let existing = match existing {
+                    Some(Self::DirectMutationFence(existing)) => Some(existing.as_ref()),
+                    Some(_) => {
+                        return Err(DmlError::journal_corruption(
+                            "DML direct mutation fence key holds another record kind",
+                        ));
+                    }
+                    None => None,
+                };
+                if fence.fence.identity.coordination_attempt_id
+                    != authority.coordination_attempt_id()
+                {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} direct mutation fence receipt was minted by another coordination attempt",
+                        operation.operation_id
+                    )));
+                }
+                if operation.operation_kind != fence.operation_kind.operation_kind() {
+                    return Err(DmlError::journal_corruption(format!(
+                        "DML operation {} cannot accept a {} fence receipt",
+                        operation.operation_id,
+                        fence.operation_kind.as_str()
+                    )));
+                }
+                if !EXTERNAL_FENCE_ALLOWED_STATES.contains(&operation.state) {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} cannot accept a direct mutation fence receipt in state {}",
+                        operation.operation_id,
+                        operation.state.as_str()
+                    )));
+                }
+                validate_direct_mutation_fence_transition(existing, fence)
+                    .map_err(DmlError::journal_corruption)
+            }
+            (Self::HistoricalDataMutationRecovery(recovery), existing) => {
+                let existing = match existing {
+                    Some(Self::HistoricalDataMutationRecovery(existing)) => Some(existing.as_ref()),
+                    Some(_) => {
+                        return Err(DmlError::journal_corruption(
+                            "DML historical data mutation recovery key holds another record kind",
+                        ));
+                    }
+                    None => None,
+                };
+                if recovery.recovery_attempt_id != authority.coordination_attempt_id() {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} historical data mutation recovery belongs to another coordination attempt",
+                        operation.operation_id
+                    )));
+                }
+                if operation.operation_kind != recovery.request.operation_kind.operation_kind() {
+                    return Err(DmlError::journal_corruption(format!(
+                        "DML operation {} cannot accept a {} historical data mutation recovery",
+                        operation.operation_id,
+                        recovery.request.operation_kind.as_str()
+                    )));
+                }
+                validate_historical_data_mutation_recovery_transition(existing, recovery)
+                    .map_err(DmlError::journal_corruption)
+            }
         }
     }
 }
@@ -2258,6 +2539,14 @@ fn external_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
 
 fn historical_write_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(HISTORICAL_WRITE_RECOVERY_PREFIX, operation_id)
+}
+
+fn direct_mutation_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
+    key_for(DIRECT_MUTATION_FENCE_PREFIX, operation_id)
+}
+
+fn historical_data_mutation_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
+    key_for(HISTORICAL_DATA_MUTATION_RECOVERY_PREFIX, operation_id)
 }
 
 fn decode_external_fence(
@@ -2282,6 +2571,28 @@ fn decode_historical_write_recovery(
     Ok(record)
 }
 
+fn decode_direct_mutation_fence(
+    key: &Key,
+    value: Value,
+) -> Result<DmlDirectMutationFenceReceiptRecord, DmlError> {
+    decode_key(DIRECT_MUTATION_FENCE_PREFIX, key)?;
+    let record: DmlDirectMutationFenceReceiptRecord =
+        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+    validate_direct_mutation_fence_receipt(&record).map_err(DmlError::journal_corruption)?;
+    Ok(record)
+}
+
+fn decode_historical_data_mutation_recovery(
+    key: &Key,
+    value: Value,
+) -> Result<DmlHistoricalDataMutationRecoveryRecord, DmlError> {
+    decode_key(HISTORICAL_DATA_MUTATION_RECOVERY_PREFIX, key)?;
+    let record: DmlHistoricalDataMutationRecoveryRecord =
+        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+    validate_historical_data_mutation_recovery(&record).map_err(DmlError::journal_corruption)?;
+    Ok(record)
+}
+
 /// Read the durable historical write recovery record inside an open
 /// transaction, so a fenced mutation can weigh it before it changes anything.
 async fn load_historical_write_recovery_in(
@@ -2299,27 +2610,55 @@ async fn load_historical_write_recovery_in(
     decode_historical_write_recovery(&key, record.value).map(Some)
 }
 
-/// Refuse to drop the bounded recovery scan while a durable historical write
-/// recovery still needs it.
+/// Read the durable historical data-mutation recovery record inside an open
+/// transaction. Every fenced mutation of a TRUNCATE or ADD FILES operation must
+/// weigh it, otherwise a terminal statement result could silently drop an open
+/// provider inspection or an ADD FILES source-scope obligation.
+async fn load_historical_data_mutation_recovery_in(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: DmlOperationId,
+) -> Result<Option<DmlHistoricalDataMutationRecoveryRecord>, DmlError> {
+    let key = historical_data_mutation_recovery_key(operation_id)?;
+    let Some(record) = transaction
+        .get(&key)
+        .await
+        .map_err(DmlError::journal_unavailable)?
+    else {
+        return Ok(None);
+    };
+    decode_historical_data_mutation_recovery(&key, record.value).map(Some)
+}
+
+/// Refuse to drop the bounded recovery scan while a durable historical recovery
+/// record still needs it.
 ///
 /// A terminal user-visible statement result must not discard an outstanding
-/// external finalization or proof-bound cleanup obligation. `historical` is the
-/// record that will be durable after this mutation, so a mutation that resolves
-/// the recovery may release the scan in the same transaction.
+/// external finalization, a proof-bound cleanup, or an ADD FILES source-scope
+/// obligation. Both arguments are the records that will be durable after this
+/// mutation, so a mutation that resolves a recovery may release the scan in the
+/// same transaction.
 fn validate_historical_retention(
     operation_id: DmlOperationId,
     historical: Option<&DmlHistoricalWriteRecoveryRecord>,
+    direct_mutation: Option<&DmlHistoricalDataMutationRecoveryRecord>,
     recovery_due_at_ms: Option<i64>,
 ) -> Result<(), DmlError> {
     if recovery_due_at_ms.is_some() {
         return Ok(());
     }
-    let Some(recovery) = historical else {
-        return Ok(());
-    };
-    if recovery.requires_recovery_scan() {
+    if let Some(recovery) = historical
+        && recovery.requires_recovery_scan()
+    {
         return Err(DmlError::journal_unresolved(format!(
             "DML operation {operation_id} cannot drop its recovery due while historical write recovery phase {} is still open",
+            recovery.phase.as_str()
+        )));
+    }
+    if let Some(recovery) = direct_mutation
+        && recovery.requires_recovery_scan()
+    {
+        return Err(DmlError::journal_unresolved(format!(
+            "DML operation {operation_id} cannot drop its recovery due while historical data mutation recovery phase {} is still open",
             recovery.phase.as_str()
         )));
     }
@@ -2327,7 +2666,7 @@ fn validate_historical_retention(
 }
 
 /// Enforce that the recovery due matches exactly the obligations the operation
-/// and its CP-3B historical recovery record still carry.
+/// and its CP-3B/CP-3C historical recovery records still carry.
 ///
 /// `validate_operation` can only prove the "an obligation always keeps a due"
 /// half, because a decoded operation cannot see its side records. This is the
@@ -2335,9 +2674,14 @@ fn validate_historical_retention(
 fn validate_recovery_due_scope(
     operation: &StoredOperation,
     historical: Option<&DmlHistoricalWriteRecoveryRecord>,
+    direct_mutation: Option<&DmlHistoricalDataMutationRecoveryRecord>,
 ) -> Result<(), DmlError> {
-    let required =
-        operation_requires_recovery_scan(operation.state, &operation.payload, historical);
+    let required = operation_requires_recovery_scan_with_direct_mutation(
+        operation.state,
+        &operation.payload,
+        historical,
+        direct_mutation,
+    );
     if required != operation.recovery_due_at_ms.is_some() {
         return Err(DmlError::journal_corruption(format!(
             "DML operation {} has inconsistent recovery due eligibility",
