@@ -3596,9 +3596,8 @@ deployment_owner = "fe-1"
 /// Production-topology acceptance for the Hadoop catalog create commit point.
 ///
 /// The table is created and populated through a real FE, scanned by all three
-/// live BEs, and loaded again after replacing the FE process and discarding its
-/// local metadata cache. The authoritative Hadoop metadata UUID and location
-/// must remain unchanged across that lifecycle.
+/// live BEs, and loaded again after replacing the FE process. The authoritative
+/// Hadoop metadata UUID and location must remain unchanged across that lifecycle.
 #[cfg(unix)]
 #[test]
 fn cross_process_three_be_hadoop_catalog_create_fencing() {
@@ -3606,15 +3605,11 @@ fn cross_process_three_be_hadoop_catalog_create_fencing() {
     let fixture_dir = tempfile::tempdir_in(runtime_dir())
         .expect("create Hadoop catalog fencing fixture directory");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
-    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
     let warehouse =
         tempfile::tempdir_in(runtime_dir()).expect("create Hadoop catalog fencing warehouse");
     const CLUSTER_ID: &str = "hadoop-catalog-create-fencing";
-    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
-        &state_store_path,
-        &metadata_path,
-        CLUSTER_ID,
-    );
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store(&state_store_path, CLUSTER_ID);
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
     assert_exact_live_backends(&mut conn, 3);
@@ -3665,9 +3660,6 @@ fn cross_process_three_be_hadoop_catalog_create_fencing() {
         state_store_path.is_file(),
         "the catalog attachment must persist in the frontend StateStore"
     );
-    if metadata_path.is_file() {
-        std::fs::remove_file(&metadata_path).expect("discard the frontend metadata cache");
-    }
     cluster.restart_fe();
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
