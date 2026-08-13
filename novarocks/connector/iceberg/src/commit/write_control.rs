@@ -3727,7 +3727,7 @@ const ICEBERG_FENCE_RECEIPT_VERSION: u8 = 1;
 /// The frontend stores these bytes opaquely and never decodes them; only a later
 /// generation of this provider reads them back, to name the marker an earlier
 /// attempt published without having to re-derive the ref naming rules.
-fn encode_fence_receipt_payload(assertion: &IcebergFenceAssertion) -> Bytes {
+pub(crate) fn encode_fence_receipt_payload(assertion: &IcebergFenceAssertion) -> Bytes {
     let mut payload = Vec::new();
     payload.push(ICEBERG_FENCE_RECEIPT_VERSION);
     payload.extend_from_slice(&assertion.fence_snapshot_id().to_be_bytes());
@@ -3748,7 +3748,7 @@ fn encode_fence_receipt_payload(assertion: &IcebergFenceAssertion) -> Bytes {
 /// `Ambiguous` and `Failed` are deliberately *not* fence failures: they mean we
 /// could not determine the fence state, which must stay a plain error so the
 /// caller keeps the operation unresolved instead of concluding anything.
-fn fence_failure_to_connector_error(error: FenceError) -> ConnectorError {
+pub(crate) fn fence_failure_to_connector_error(error: FenceError) -> ConnectorError {
     let message = error.to_string();
     match error {
         FenceError::Superseded { .. } => {

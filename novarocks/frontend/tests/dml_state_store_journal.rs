@@ -30,15 +30,20 @@ use novarocks_frontend::dml::journal::{
 use novarocks_frontend::dml::model::{
     CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
     DML_COORDINATION_RESOURCE_CODEC_VERSION, DML_CTAS_FACT_ENCODED_LIMIT,
-    DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
-    DML_EXTERNAL_FENCE_CODEC_VERSION, DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION,
-    DML_OPAQUE_PAYLOAD_LIMIT, DML_OPERATION_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE,
+    DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_DIRECT_MUTATION_FENCE_CODEC_VERSION,
+    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FENCE_CODEC_VERSION,
+    DML_HISTORICAL_DATA_MUTATION_RECOVERY_CODEC_VERSION,
+    DML_HISTORICAL_WRITE_RECOVERY_CODEC_VERSION, DML_OPAQUE_PAYLOAD_LIMIT,
+    DML_OPERATION_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE,
 };
 use novarocks_frontend::dml::model::{
-    DmlCoordinationClaimRequest, DmlCoordinationProvenance, DmlExternalFenceGeneration,
+    DmlCoordinationClaimRequest, DmlCoordinationProvenance, DmlDirectMutationFenceMutationRequest,
+    DmlDirectMutationFenceReceiptRecord, DmlDirectMutationKind, DmlExternalFenceGeneration,
     DmlExternalFenceIdentity, DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord,
-    DmlFencingTokenV1, DmlHistoricalCleanupState, DmlHistoricalDispatchCertainty,
-    DmlHistoricalRecoveryPhase, DmlHistoricalWriteDisposition,
+    DmlFencingTokenV1, DmlHistoricalCleanupState, DmlHistoricalDataMutationDisposition,
+    DmlHistoricalDataMutationRecoveryMutationRequest, DmlHistoricalDataMutationRecoveryRecord,
+    DmlHistoricalDataMutationRequestRecord, DmlHistoricalDataMutationResultRecord,
+    DmlHistoricalDispatchCertainty, DmlHistoricalRecoveryPhase, DmlHistoricalWriteDisposition,
     DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord,
     DmlHistoricalWriteRequestRecord, DmlHistoricalWriteResultRecord, DmlOpaquePayload,
     DmlRecoveryDueRescheduleRequest,
@@ -481,7 +486,7 @@ async fn admitted_claim_and_authority_validation_share_state_store_transactions(
         )
         .unwrap();
     assert_eq!(claimed.schema_version, DML_OPERATION_SCHEMA_VERSION);
-    assert_eq!(DML_OPERATION_SCHEMA_VERSION, 6);
+    assert_eq!(DML_OPERATION_SCHEMA_VERSION, 7);
     assert_eq!(claimed.revision, 2);
     assert_eq!(claimed.recovery_due_at_ms, Some(500));
     assert_eq!(
@@ -3527,7 +3532,11 @@ async fn sqlite_cp1_superseded_holder_cannot_write_cp3b_side_records() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn v5_operation_record_read_fails_without_migration_or_dual_format_decode() {
+async fn v6_operation_record_read_fails_without_migration_or_dual_format_decode() {
+    assert_eq!(
+        DML_OPERATION_SCHEMA_VERSION, 7,
+        "CP-3C cuts the DML operation schema from v6 to v7"
+    );
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.sqlite");
     let (_host, store, journal) = open_store(&path).await;
@@ -3536,7 +3545,7 @@ async fn v5_operation_record_read_fails_without_migration_or_dual_format_decode(
     raw_put(
         store.as_ref(),
         key(OPERATION_PREFIX, operation_id),
-        raw_operation(operation_id, 5),
+        raw_operation(operation_id, 6),
     )
     .await;
     raw_put(
@@ -3552,17 +3561,17 @@ async fn v5_operation_record_read_fails_without_migration_or_dual_format_decode(
             .expect("journal open must not scan or migrate operation records");
     let error = reopened
         .load(DmlOperationId::from(operation_id))
-        .expect_err("a v5 operation record must not be decoded by v6 code");
+        .expect_err("a v6 operation record must not be decoded by v7 code");
     assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
     assert!(
         error
             .to_string()
-            .contains("unsupported frontend DML operation schema version: 5"),
+            .contains("unsupported frontend DML operation schema version: 6"),
         "the hard cut must name the rejected version: {error}"
     );
     let scan_error = reopened
         .list_unfinished()
-        .expect_err("a v5 record must not be silently skipped by the unfinished scan");
+        .expect_err("a v6 record must not be silently skipped by the unfinished scan");
     assert_eq!(scan_error.kind(), DmlErrorKind::JournalCorruption);
 }
 
@@ -3827,5 +3836,1519 @@ async fn historical_write_recovery_reopens_the_scan_for_an_already_terminal_oper
             .load_historical_write_recovery(operation_id)
             .unwrap(),
         Some(resolved_record)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CP-3C: direct data-mutation fence receipts and historical data-mutation
+// recovery.
+// ---------------------------------------------------------------------------
+
+fn add_files_scope() -> String {
+    "3d".repeat(32)
+}
+
+fn truncate_preparing() -> OperationPayload {
+    OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+        phase: TruncateLifecyclePhase::Preparing,
+        connector_operation_id: Uuid::now_v7(),
+        provider_id: Some("iceberg".to_string()),
+        connector_instance_id: Some("iceberg-rest".to_string()),
+        connector_incarnation: Some("09".repeat(16)),
+        target_ref: "main".to_string(),
+        request_digest: Some("request".to_string()),
+        plan_digest: None,
+        state_digest: None,
+        plan_summary: None,
+        outcome: None,
+        next_action: StatementNextAction::None,
+    })
+}
+
+fn truncate_failed() -> OperationPayload {
+    OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+        phase: TruncateLifecyclePhase::Failed,
+        connector_operation_id: Uuid::now_v7(),
+        provider_id: Some("iceberg".to_string()),
+        connector_instance_id: Some("iceberg-rest".to_string()),
+        connector_incarnation: Some("09".repeat(16)),
+        target_ref: "main".to_string(),
+        request_digest: Some("request".to_string()),
+        plan_digest: None,
+        state_digest: None,
+        plan_summary: None,
+        outcome: Some(DurableExternalFact {
+            outcome: ExternalFactOutcome::KnownUncommitted,
+            receipt: None,
+            evidence: None,
+            finalization_failure: None,
+            failure: Some("old owner disappeared".to_string()),
+        }),
+        next_action: StatementNextAction::None,
+    })
+}
+
+fn direct_mutation_payload(kind: DmlDirectMutationKind) -> OperationPayload {
+    match kind {
+        DmlDirectMutationKind::Truncate => truncate_preparing(),
+        DmlDirectMutationKind::AddFiles => add_files_preparing(),
+    }
+}
+
+/// Create and claim a TRUNCATE or ADD FILES operation so it can accept a
+/// direct-mutation fence receipt. Both families seal their fence in `Preparing`.
+fn claim_direct_mutation(
+    journal: &StateStoreOperationJournal,
+    kind: DmlDirectMutationKind,
+    attempt: Uuid,
+    validator: Arc<TestTransactionValidator>,
+) -> (DmlOperationId, StoredOperation) {
+    let operation_id = DmlOperationId::new_v7();
+    let created = journal
+        .create_statement_operation_admitted(
+            statement_request(
+                operation_id,
+                Uuid::now_v7(),
+                kind.operation_kind(),
+                direct_mutation_payload(kind),
+            ),
+            Arc::new(TestTransactionValidator::default()),
+        )
+        .unwrap();
+    let claimed = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: created.revision,
+                mutation_id: Uuid::now_v7(),
+                provenance: coordination_provenance(Uuid::now_v7(), attempt, 300),
+                recovery_due_at_ms: 18_300,
+            },
+            DmlMutationAuthority::try_new(attempt, validator).unwrap(),
+        )
+        .unwrap();
+    (operation_id, claimed)
+}
+
+fn direct_mutation_fence(
+    kind: DmlDirectMutationKind,
+    mutation_operation_id: Uuid,
+    coordination_attempt_id: Uuid,
+    generation: DmlExternalFenceGeneration,
+    source_scope_digest: Option<String>,
+) -> DmlDirectMutationFenceReceiptRecord {
+    DmlDirectMutationFenceReceiptRecord {
+        codec_version: DML_DIRECT_MUTATION_FENCE_CODEC_VERSION,
+        operation_kind: kind,
+        fence: external_fence(mutation_operation_id, coordination_attempt_id, generation),
+        source_scope_digest,
+    }
+}
+
+fn data_mutation_request(
+    kind: DmlDirectMutationKind,
+    mutation_operation_id: Uuid,
+    old_coordination_attempt_id: Uuid,
+    old_fence: Option<DmlDirectMutationFenceReceiptRecord>,
+    source_scope_digest: Option<String>,
+) -> DmlHistoricalDataMutationRequestRecord {
+    DmlHistoricalDataMutationRequestRecord {
+        old_provider_id: "iceberg".to_string(),
+        old_connector_instance_id: "iceberg-rest".to_string(),
+        old_connector_incarnation: "5e".repeat(16),
+        old_coordination_attempt_id: Some(old_coordination_attempt_id),
+        old_fence,
+        operation_kind: kind,
+        mutation_operation_id,
+        request_digest: "8b".repeat(32),
+        plan_digest: Some("7a".repeat(32)),
+        state_digest: Some("6f".repeat(32)),
+        source_scope_digest,
+        dispatch_certainty: DmlHistoricalDispatchCertainty::PossiblyDispatched,
+        dispatched_at_ms: Some(900),
+    }
+}
+
+fn data_mutation_requested(
+    recovery_attempt_id: Uuid,
+    request: DmlHistoricalDataMutationRequestRecord,
+) -> DmlHistoricalDataMutationRecoveryRecord {
+    DmlHistoricalDataMutationRecoveryRecord {
+        codec_version: DML_HISTORICAL_DATA_MUTATION_RECOVERY_CODEC_VERSION,
+        phase: DmlHistoricalRecoveryPhase::Requested,
+        recovery_attempt_id,
+        recovery_cycle: 1,
+        request,
+        raised_fence: None,
+        result: None,
+        next_action: StatementNextAction::Reconcile,
+        requested_at_ms: 1_000,
+        updated_at_ms: 1_000,
+    }
+}
+
+fn data_mutation_result(
+    disposition: DmlHistoricalDataMutationDisposition,
+    source_scope_digest: Option<String>,
+    cleanup: DmlHistoricalCleanupState,
+    source_scope_retained: bool,
+) -> DmlHistoricalDataMutationResultRecord {
+    DmlHistoricalDataMutationResultRecord {
+        disposition,
+        observation_digest: "9c".repeat(32),
+        source_scope_digest,
+        evidence_payload: None,
+        proof_payload: Some(
+            DmlOpaquePayload::try_new(b"opaque provider direct mutation proof".to_vec()).unwrap(),
+        ),
+        continuation_payload: None,
+        cleanup,
+        source_scope_retained,
+        failure: None,
+        observed_at_ms: 1_200,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_mutation_fence_receipt_round_trips_and_only_advances_its_generation() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (host, store, journal) = open_store(&path).await;
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let (operation_id, claimed) = claim_direct_mutation(
+        &journal,
+        DmlDirectMutationKind::Truncate,
+        attempt,
+        validator.clone(),
+    );
+
+    let mutation_operation_id = Uuid::now_v7();
+    let fence = direct_mutation_fence(
+        DmlDirectMutationKind::Truncate,
+        mutation_operation_id,
+        attempt,
+        fence_generation(1, 7, 1),
+        None,
+    );
+    let fenced_request = DmlDirectMutationFenceMutationRequest {
+        operation_id,
+        expected_revision: claimed.revision,
+        mutation_id: Uuid::now_v7(),
+        fence: fence.clone(),
+    };
+    journal
+        .preflight_direct_mutation_fence(&fenced_request)
+        .unwrap();
+    let fenced = journal
+        .record_direct_mutation_fence_authorized(fenced_request, Some(18_400), authority())
+        .unwrap();
+    assert_eq!(fenced.revision, claimed.revision + 1);
+    assert_eq!(fenced.state, OperationState::Preparing);
+    assert_eq!(fenced.recovery_due_at_ms, Some(18_400));
+    assert_eq!(
+        journal.load_direct_mutation_fence(operation_id).unwrap(),
+        Some(fence.clone())
+    );
+    // The direct-mutation receipt owns its own durable key: it must never be
+    // mistaken for a distributed-write fence.
+    assert_eq!(journal.load_external_fence(operation_id).unwrap(), None);
+
+    // A lower generation must never replace a confirmed fence.
+    let lower = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::Truncate,
+                    mutation_operation_id,
+                    attempt,
+                    fence_generation(1, 6, 9),
+                    None,
+                ),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(lower.kind(), DmlErrorKind::JournalCorruption);
+    assert!(lower.to_string().contains("must not move backwards"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), fenced);
+
+    // A different receipt at the same generation cannot reuse the marker.
+    let mut same_generation = direct_mutation_fence(
+        DmlDirectMutationKind::Truncate,
+        mutation_operation_id,
+        attempt,
+        fence_generation(1, 7, 1),
+        None,
+    );
+    same_generation.fence.receipt_digest = "0f".repeat(32);
+    let reused = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: same_generation,
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(reused.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        reused
+            .to_string()
+            .contains("without advancing its generation")
+    );
+
+    // A marker minted for another direct mutation cannot be adopted either.
+    let crossed = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::Truncate,
+                    Uuid::now_v7(),
+                    attempt,
+                    fence_generation(1, 7, 2),
+                    None,
+                ),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(crossed.kind(), DmlErrorKind::JournalCorruption);
+    assert!(crossed.to_string().contains("cannot be reused across"));
+
+    // A strictly higher generation is the only legal replacement.
+    let raised = direct_mutation_fence(
+        DmlDirectMutationKind::Truncate,
+        mutation_operation_id,
+        attempt,
+        fence_generation(1, 7, 2),
+        None,
+    );
+    let advanced = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: raised.clone(),
+            },
+            Some(18_500),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(advanced.revision, fenced.revision + 1);
+
+    // The receipt survives a real StateStore restart byte for byte, and `open`
+    // must not mutate anything it reads back.
+    drop(journal);
+    drop(store);
+    drop(host);
+    let (_host, _store, recovered) = open_store(&path).await;
+    assert_eq!(recovered.load(operation_id).unwrap().unwrap(), advanced);
+    assert_eq!(
+        recovered.load_direct_mutation_fence(operation_id).unwrap(),
+        Some(raised)
+    );
+    assert_eq!(
+        recovered
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_files_direct_mutation_fence_binds_its_immutable_source_scope() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let (operation_id, claimed) = claim_direct_mutation(
+        &journal,
+        DmlDirectMutationKind::AddFiles,
+        attempt,
+        validator.clone(),
+    );
+    let mutation_operation_id = Uuid::now_v7();
+    let scope = add_files_scope();
+
+    // ADD FILES without a source scope binding fails closed at preflight.
+    let unbound = DmlDirectMutationFenceMutationRequest {
+        operation_id,
+        expected_revision: claimed.revision,
+        mutation_id: Uuid::now_v7(),
+        fence: direct_mutation_fence(
+            DmlDirectMutationKind::AddFiles,
+            mutation_operation_id,
+            attempt,
+            fence_generation(1, 7, 1),
+            None,
+        ),
+    };
+    let error = journal
+        .preflight_direct_mutation_fence(&unbound)
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        error
+            .to_string()
+            .contains("must bind its immutable source scope digest")
+    );
+    let error = journal
+        .record_direct_mutation_fence_authorized(unbound, Some(18_400), authority())
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        journal.load_direct_mutation_fence(operation_id).unwrap(),
+        None
+    );
+
+    // A TRUNCATE-family receipt cannot land on an ADD FILES operation.
+    let wrong_family = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::Truncate,
+                    mutation_operation_id,
+                    attempt,
+                    fence_generation(1, 7, 1),
+                    None,
+                ),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(wrong_family.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        wrong_family
+            .to_string()
+            .contains("cannot accept a TRUNCATE fence receipt")
+    );
+
+    // A TRUNCATE receipt has no source set at all, so binding one is refused.
+    let (truncate_id, truncate_claimed) = claim_direct_mutation(
+        &journal,
+        DmlDirectMutationKind::Truncate,
+        attempt,
+        validator.clone(),
+    );
+    let error = journal
+        .preflight_direct_mutation_fence(&DmlDirectMutationFenceMutationRequest {
+            operation_id: truncate_id,
+            expected_revision: truncate_claimed.revision,
+            mutation_id: Uuid::now_v7(),
+            fence: direct_mutation_fence(
+                DmlDirectMutationKind::Truncate,
+                Uuid::now_v7(),
+                attempt,
+                fence_generation(1, 7, 1),
+                Some(scope.clone()),
+            ),
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must not bind a source scope digest")
+    );
+
+    // The bound receipt is durable.
+    let fence = direct_mutation_fence(
+        DmlDirectMutationKind::AddFiles,
+        mutation_operation_id,
+        attempt,
+        fence_generation(1, 7, 1),
+        Some(scope.clone()),
+    );
+    let fenced = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: fence.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(
+        journal.load_direct_mutation_fence(operation_id).unwrap(),
+        Some(fence)
+    );
+
+    // Even a strictly higher generation cannot rebind another source scope: the
+    // ADD FILES source set never expands or moves.
+    let rebound = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: fenced.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::AddFiles,
+                    mutation_operation_id,
+                    attempt,
+                    fence_generation(1, 8, 1),
+                    Some("4e".repeat(32)),
+                ),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(rebound.kind(), DmlErrorKind::JournalCorruption);
+    assert!(rebound.to_string().contains("cannot rebind another scope"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), fenced);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_data_mutation_recovery_round_trips_and_keeps_its_due_until_resolved() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (host, store, journal) = open_store(&path).await;
+    let attempt = Uuid::now_v7();
+    let old_attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let (operation_id, claimed) = claim_direct_mutation(
+        &journal,
+        DmlDirectMutationKind::AddFiles,
+        attempt,
+        validator.clone(),
+    );
+    let shard = (0..journal.recovery_shard_count())
+        .find(|shard| {
+            journal
+                .recovery_candidates(*shard, i64::MAX)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.operation_id == operation_id)
+        })
+        .unwrap();
+
+    let mutation_operation_id = Uuid::now_v7();
+    let scope = add_files_scope();
+    let old_fence = direct_mutation_fence(
+        DmlDirectMutationKind::AddFiles,
+        mutation_operation_id,
+        old_attempt,
+        fence_generation(1, 7, 3),
+        Some(scope.clone()),
+    );
+    let request_record = data_mutation_request(
+        DmlDirectMutationKind::AddFiles,
+        mutation_operation_id,
+        old_attempt,
+        Some(old_fence),
+        Some(scope.clone()),
+    );
+    let requested = data_mutation_requested(attempt, request_record);
+    let mutation = DmlHistoricalDataMutationRecoveryMutationRequest {
+        operation_id,
+        expected_revision: claimed.revision,
+        mutation_id: Uuid::now_v7(),
+        recovery: requested.clone(),
+    };
+    journal
+        .preflight_historical_data_mutation_recovery(&mutation)
+        .unwrap();
+    let opened = journal
+        .record_historical_data_mutation_recovery_authorized(mutation, Some(18_400), authority())
+        .unwrap();
+    assert_eq!(opened.revision, claimed.revision + 1);
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        Some(requested.clone())
+    );
+    assert!(
+        requested.retains_source_scope(),
+        "an ADD FILES recovery without a provider result must retain its source scope"
+    );
+
+    // A raised fence must be strictly above the old attempt's fence.
+    let too_low = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::FenceRaised,
+        raised_fence: Some(direct_mutation_fence(
+            DmlDirectMutationKind::AddFiles,
+            mutation_operation_id,
+            attempt,
+            fence_generation(1, 7, 3),
+            Some(scope.clone()),
+        )),
+        updated_at_ms: 1_100,
+        ..requested.clone()
+    };
+    let error = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: opened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: too_low,
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert!(error.to_string().contains("strictly above"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), opened);
+
+    let fence_raised = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::FenceRaised,
+        raised_fence: Some(direct_mutation_fence(
+            DmlDirectMutationKind::AddFiles,
+            mutation_operation_id,
+            attempt,
+            fence_generation(1, 8, 1),
+            Some(scope.clone()),
+        )),
+        updated_at_ms: 1_100,
+        ..requested.clone()
+    };
+    let raised = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: opened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: fence_raised.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap();
+
+    let cleanup_pending = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::CleanupPending,
+        result: Some(data_mutation_result(
+            DmlHistoricalDataMutationDisposition::CleanupRequired,
+            Some(scope.clone()),
+            DmlHistoricalCleanupState::Pending,
+            true,
+        )),
+        next_action: StatementNextAction::AbortStaging,
+        updated_at_ms: 1_200,
+        ..fence_raised.clone()
+    };
+    let pending = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: raised.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: cleanup_pending.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        Some(cleanup_pending.clone())
+    );
+
+    // A terminal user-visible ADD FILES result must not drop the pending
+    // guarded cleanup by clearing the recovery due.
+    let dropped = journal
+        .mutate_statement_operation_authorized(
+            OperationMutationRequest {
+                operation_id,
+                expected_revision: pending.revision,
+                mutation_id: Uuid::now_v7(),
+                state: OperationState::FailedKnownUncommitted,
+                payload: add_files_preparing(),
+            },
+            None,
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(dropped.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(dropped.to_string().contains("CLEANUP_PENDING"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), pending);
+
+    // Forgetting the cleanup outcome inside the recovery record is refused too.
+    let forgotten = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Resolved,
+        result: None,
+        next_action: StatementNextAction::None,
+        updated_at_ms: 1_300,
+        ..fence_raised.clone()
+    };
+    let error = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: pending.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: forgotten,
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), pending);
+
+    // Completing the guarded cleanup resolves the record and releases the scan.
+    let resolved_record = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Resolved,
+        result: Some(data_mutation_result(
+            DmlHistoricalDataMutationDisposition::CleanupRequired,
+            Some(scope.clone()),
+            DmlHistoricalCleanupState::Completed,
+            true,
+        )),
+        next_action: StatementNextAction::None,
+        updated_at_ms: 1_400,
+        ..cleanup_pending.clone()
+    };
+    let resolved = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: pending.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: resolved_record.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap();
+    assert!(
+        journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.operation_id == operation_id)
+    );
+
+    let finished = journal
+        .mutate_statement_operation_authorized(
+            OperationMutationRequest {
+                operation_id,
+                expected_revision: resolved.revision,
+                mutation_id: Uuid::now_v7(),
+                state: OperationState::FailedKnownUncommitted,
+                payload: add_files_preparing(),
+            },
+            None,
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(finished.recovery_due_at_ms, None);
+    assert!(
+        journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A resolved recovery cannot be reopened, and it survives a restart.
+    let reopened = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: finished.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: DmlHistoricalDataMutationRecoveryRecord {
+                    recovery_cycle: 2,
+                    updated_at_ms: 1_500,
+                    ..cleanup_pending
+                },
+            },
+            Some(18_600),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(reopened.kind(), DmlErrorKind::JournalCorruption);
+    assert!(reopened.to_string().contains("cannot be reopened"));
+
+    drop(journal);
+    drop(store);
+    drop(host);
+    let (_host, _store, recovered) = open_store(&path).await;
+    assert_eq!(recovered.load(operation_id).unwrap().unwrap(), finished);
+    assert_eq!(
+        recovered
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        Some(resolved_record)
+    );
+    assert_eq!(
+        recovered
+            .load_historical_write_recovery(operation_id)
+            .unwrap(),
+        None,
+        "a direct mutation recovery must not be read back as a distributed write recovery"
+    );
+    assert_eq!(
+        recovered.load_direct_mutation_fence(operation_id).unwrap(),
+        None,
+        "the raised recovery fence must not be mistaken for the attempt's own fence"
+    );
+    assert!(
+        recovered
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty(),
+        "reopening the journal must not resurrect a resolved recovery"
+    );
+    assert!(recovered.list_unfinished().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_data_mutation_result_is_bound_to_its_immutable_add_files_source_scope() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let (operation_id, claimed) = claim_direct_mutation(
+        &journal,
+        DmlDirectMutationKind::AddFiles,
+        attempt,
+        validator.clone(),
+    );
+    let mutation_operation_id = Uuid::now_v7();
+    let scope = add_files_scope();
+    let requested = data_mutation_requested(
+        attempt,
+        data_mutation_request(
+            DmlDirectMutationKind::AddFiles,
+            mutation_operation_id,
+            Uuid::now_v7(),
+            None,
+            Some(scope.clone()),
+        ),
+    );
+    let opened = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: requested.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap();
+    let fence_raised = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::FenceRaised,
+        raised_fence: Some(direct_mutation_fence(
+            DmlDirectMutationKind::AddFiles,
+            mutation_operation_id,
+            attempt,
+            fence_generation(1, 8, 1),
+            Some(scope.clone()),
+        )),
+        updated_at_ms: 1_100,
+        ..requested
+    };
+    let raised = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: opened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: fence_raised.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap();
+
+    let write_result = |recovery: DmlHistoricalDataMutationRecoveryRecord| {
+        journal.record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: raised.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery,
+            },
+            Some(18_400),
+            authority(),
+        )
+    };
+
+    // A result bound to another source scope belongs to another operation.
+    let crossed = write_result(DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Inspected,
+        result: Some(data_mutation_result(
+            DmlHistoricalDataMutationDisposition::Applied,
+            Some("4e".repeat(32)),
+            DmlHistoricalCleanupState::NotRequired,
+            false,
+        )),
+        next_action: StatementNextAction::RetryFinalize,
+        updated_at_ms: 1_200,
+        ..fence_raised.clone()
+    })
+    .unwrap_err();
+    assert_eq!(crossed.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        crossed
+            .to_string()
+            .contains("bound to a different source scope than its sealed request"),
+        "{crossed}"
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), raised);
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        Some(fence_raised.clone())
+    );
+
+    // Dropping the binding entirely is the same refusal.
+    let unbound = write_result(DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Inspected,
+        result: Some(data_mutation_result(
+            DmlHistoricalDataMutationDisposition::Applied,
+            None,
+            DmlHistoricalCleanupState::NotRequired,
+            false,
+        )),
+        next_action: StatementNextAction::RetryFinalize,
+        updated_at_ms: 1_200,
+        ..fence_raised.clone()
+    })
+    .unwrap_err();
+    assert_eq!(unbound.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        unbound
+            .to_string()
+            .contains("bound to a different source scope than its sealed request")
+    );
+
+    // Evidence absence is never proof: an inconclusive disposition must keep the
+    // source-scope reservation held.
+    let released = write_result(DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Unresolved,
+        result: Some(data_mutation_result(
+            DmlHistoricalDataMutationDisposition::Ambiguous,
+            Some(scope.clone()),
+            DmlHistoricalCleanupState::NotRequired,
+            false,
+        )),
+        next_action: StatementNextAction::ManualInspect,
+        updated_at_ms: 1_200,
+        ..fence_raised.clone()
+    })
+    .unwrap_err();
+    assert_eq!(released.kind(), DmlErrorKind::JournalCorruption);
+    assert!(
+        released
+            .to_string()
+            .contains("must retain its ADD FILES source scope"),
+        "{released}"
+    );
+
+    // A continuation is only meaningful once the mutation is proven NOT_APPLIED.
+    let mut ambiguous_result = data_mutation_result(
+        DmlHistoricalDataMutationDisposition::Ambiguous,
+        Some(scope.clone()),
+        DmlHistoricalCleanupState::NotRequired,
+        true,
+    );
+    ambiguous_result.continuation_payload =
+        Some(DmlOpaquePayload::try_new(b"opaque continuation".to_vec()).unwrap());
+    let premature = write_result(DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Unresolved,
+        result: Some(ambiguous_result),
+        next_action: StatementNextAction::ManualInspect,
+        updated_at_ms: 1_200,
+        ..fence_raised.clone()
+    })
+    .unwrap_err();
+    assert!(
+        premature
+            .to_string()
+            .contains("only valid for a proven NOT_APPLIED disposition")
+    );
+
+    // The unresolved answer with the scope retained is durable and keeps the
+    // recovery scannable.
+    let unresolved_record = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Unresolved,
+        result: Some(data_mutation_result(
+            DmlHistoricalDataMutationDisposition::Ambiguous,
+            Some(scope.clone()),
+            DmlHistoricalCleanupState::NotRequired,
+            true,
+        )),
+        next_action: StatementNextAction::ManualInspect,
+        updated_at_ms: 1_200,
+        ..fence_raised.clone()
+    };
+    let unresolved = write_result(unresolved_record.clone()).unwrap();
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        Some(unresolved_record.clone())
+    );
+    assert!(unresolved_record.retains_source_scope());
+    assert!(unresolved_record.requires_recovery_scan());
+
+    // A later cycle may prove NOT_APPLIED, which is the only inconclusive-free
+    // way to release the reservation and to hand out a continuation.
+    let mut proven = data_mutation_result(
+        DmlHistoricalDataMutationDisposition::NotApplied,
+        Some(scope),
+        DmlHistoricalCleanupState::NotRequired,
+        false,
+    );
+    proven.continuation_payload =
+        Some(DmlOpaquePayload::try_new(b"opaque continuation".to_vec()).unwrap());
+    let resolved_record = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Resolved,
+        result: Some(proven),
+        next_action: StatementNextAction::None,
+        updated_at_ms: 1_300,
+        ..unresolved_record
+    };
+    let resolved = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: unresolved.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: resolved_record.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(resolved.revision, unresolved.revision + 1);
+    assert!(!resolved_record.retains_source_scope());
+    assert!(!resolved_record.requires_recovery_scan());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cp3c_side_records_reject_a_stale_attempt_and_a_wrong_expected_revision() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let (operation_id, claimed) = claim_direct_mutation(
+        &journal,
+        DmlDirectMutationKind::Truncate,
+        attempt,
+        validator.clone(),
+    );
+    let mutation_operation_id = Uuid::now_v7();
+
+    // A stale coordination attempt cannot install a fence receipt.
+    let stale_attempt = Uuid::now_v7();
+    let stale_validator = Arc::new(TestTransactionValidator::default());
+    let stale = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::Truncate,
+                    mutation_operation_id,
+                    stale_attempt,
+                    fence_generation(1, 7, 1),
+                    None,
+                ),
+            },
+            Some(18_400),
+            DmlMutationAuthority::try_new(stale_attempt, stale_validator.clone()).unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(stale.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(stale.to_string().contains("another coordination attempt"));
+    assert_eq!(stale_validator.calls(), 1);
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed);
+    assert_eq!(
+        journal.load_direct_mutation_fence(operation_id).unwrap(),
+        None
+    );
+
+    // A fence minted by a foreign attempt is refused even under live authority.
+    let foreign = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::Truncate,
+                    mutation_operation_id,
+                    Uuid::now_v7(),
+                    fence_generation(1, 7, 1),
+                    None,
+                ),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(foreign.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(
+        foreign
+            .to_string()
+            .contains("was minted by another coordination attempt")
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed);
+
+    // A wrong expected revision cannot change durable state either.
+    let wrong_revision = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision + 5,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::Truncate,
+                    mutation_operation_id,
+                    attempt,
+                    fence_generation(1, 7, 1),
+                    None,
+                ),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(wrong_revision.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(wrong_revision.to_string().contains("revision changed"));
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed);
+    assert_eq!(
+        journal.load_direct_mutation_fence(operation_id).unwrap(),
+        None
+    );
+
+    // The same two rejections hold for a historical data-mutation recovery.
+    let recovery = data_mutation_requested(
+        attempt,
+        data_mutation_request(
+            DmlDirectMutationKind::Truncate,
+            mutation_operation_id,
+            Uuid::now_v7(),
+            None,
+            None,
+        ),
+    );
+    let wrong_revision = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision + 5,
+                mutation_id: Uuid::now_v7(),
+                recovery: recovery.clone(),
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(wrong_revision.kind(), DmlErrorKind::JournalUnresolved);
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+
+    let foreign_recovery = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: DmlHistoricalDataMutationRecoveryRecord {
+                    recovery_attempt_id: Uuid::now_v7(),
+                    ..recovery
+                },
+            },
+            Some(18_400),
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(foreign_recovery.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(
+        foreign_recovery
+            .to_string()
+            .contains("belongs to another coordination attempt")
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed);
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_data_mutation_recovery_reopens_the_scan_for_a_terminal_truncate() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let attempt = Uuid::now_v7();
+    let validator = Arc::new(TestTransactionValidator::default());
+    let authority = || DmlMutationAuthority::try_new(attempt, validator.clone()).unwrap();
+    let (operation_id, claimed) = claim_direct_mutation(
+        &journal,
+        DmlDirectMutationKind::Truncate,
+        attempt,
+        validator.clone(),
+    );
+
+    // The statement already failed and left the recovery scan.
+    let terminal = journal
+        .mutate_statement_operation_authorized(
+            OperationMutationRequest {
+                operation_id,
+                expected_revision: claimed.revision,
+                mutation_id: Uuid::now_v7(),
+                state: OperationState::FailedKnownUncommitted,
+                payload: truncate_failed(),
+            },
+            None,
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(terminal.recovery_due_at_ms, None);
+    assert!(
+        (0..journal.recovery_shard_count()).all(|shard| journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty()),
+        "a terminal TRUNCATE leaves the scan"
+    );
+
+    // Opening a historical data-mutation recovery puts it back into the scan
+    // even though the user-visible statement result is already terminal.
+    let recovery = data_mutation_requested(
+        attempt,
+        data_mutation_request(
+            DmlDirectMutationKind::Truncate,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            None,
+            None,
+        ),
+    );
+    let reopened = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: terminal.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: recovery.clone(),
+            },
+            Some(20_000),
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(reopened.state, OperationState::FailedKnownUncommitted);
+    assert_eq!(reopened.recovery_due_at_ms, Some(20_000));
+    let shard = (0..journal.recovery_shard_count())
+        .find(|shard| {
+            journal
+                .recovery_candidates(*shard, i64::MAX)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.operation_id == operation_id)
+        })
+        .expect("an open historical data mutation recovery must keep the operation scannable");
+    assert!(journal.list_unfinished().unwrap().is_empty());
+
+    // Opening it without a due is refused: the obligation cannot be invisible.
+    let unscanned = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: reopened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: DmlHistoricalDataMutationRecoveryRecord {
+                    updated_at_ms: 1_100,
+                    ..recovery.clone()
+                },
+            },
+            None,
+            authority(),
+        )
+        .unwrap_err();
+    assert_eq!(unscanned.kind(), DmlErrorKind::JournalUnresolved);
+    assert!(
+        unscanned.to_string().contains(
+            "cannot drop its recovery due while historical data mutation recovery phase REQUESTED"
+        ),
+        "{unscanned}"
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), reopened);
+
+    // Resolving it releases the scan in the same fenced mutation.
+    let resolved_record = DmlHistoricalDataMutationRecoveryRecord {
+        phase: DmlHistoricalRecoveryPhase::Resolved,
+        raised_fence: Some(direct_mutation_fence(
+            DmlDirectMutationKind::Truncate,
+            recovery.request.mutation_operation_id,
+            attempt,
+            fence_generation(1, 9, 1),
+            None,
+        )),
+        result: Some(data_mutation_result(
+            DmlHistoricalDataMutationDisposition::NotApplied,
+            None,
+            DmlHistoricalCleanupState::NotRequired,
+            false,
+        )),
+        next_action: StatementNextAction::None,
+        updated_at_ms: 1_400,
+        ..recovery
+    };
+    let resolved = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: reopened.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: resolved_record.clone(),
+            },
+            None,
+            authority(),
+        )
+        .unwrap();
+    assert_eq!(resolved.recovery_due_at_ms, None);
+    assert!(
+        journal
+            .recovery_candidates(shard, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        Some(resolved_record)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_cp1_superseded_holder_cannot_write_cp3c_side_records() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    gate.bootstrap(OperationId::new_v7()).await.unwrap();
+    let operation_id = DmlOperationId::new_v7();
+    journal
+        .create_statement_operation_admitted(
+            statement_request(
+                operation_id,
+                Uuid::now_v7(),
+                OperationKind::Truncate,
+                truncate_preparing(),
+            ),
+            Arc::new(TestTransactionValidator::default()),
+        )
+        .unwrap();
+
+    let clock = Arc::new(ManualDmlLeaseClock::new(500_000, 20_000));
+    let holder_a = Uuid::now_v7();
+    let holder_b = Uuid::now_v7();
+    let manager_a = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_a),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let manager_b = LeaseManager::new(
+        Arc::clone(&store),
+        holder_id(holder_b),
+        clock.clone(),
+        lease_settings(),
+    )
+    .unwrap();
+    let resource = dml_operation_resource_key(operation_id).unwrap();
+    let attempt_a = Uuid::now_v7();
+    let attempt_b = Uuid::now_v7();
+    let guard_a = Arc::new(AsyncMutex::new(acquired(
+        manager_a
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_a).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+    let claimed_a = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: 1,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(holder_a, attempt_a, &guard_a, clock.wall_ms() as i64)
+                    .await,
+                recovery_due_at_ms: 500_100,
+            },
+            current_authority(attempt_a, Arc::clone(&guard_a), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+
+    clock.advance_wall(16_001);
+    assert!(matches!(
+        manager_b
+            .acquire(
+                resource.clone(),
+                AttemptId::try_from(attempt_b).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(2_000);
+    let guard_b = Arc::new(AsyncMutex::new(acquired(
+        manager_b
+            .acquire(
+                resource,
+                AttemptId::try_from(attempt_b).unwrap(),
+                OperationId::new_v7(),
+            )
+            .await
+            .unwrap(),
+    )));
+
+    // Holder A still believes it owns the TRUNCATE. Its direct-mutation fence
+    // receipt must be refused by the latest live fence, not by a snapshot it
+    // captured when it acquired the lease.
+    let mutation_operation_id = Uuid::now_v7();
+    let rejection = Arc::new(Mutex::new(None));
+    let error = journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: direct_mutation_fence(
+                    DmlDirectMutationKind::Truncate,
+                    mutation_operation_id,
+                    attempt_a,
+                    fence_generation(1, 7, 1),
+                    None,
+                ),
+            },
+            Some(500_200),
+            current_authority(attempt_a, Arc::clone(&guard_a), Arc::clone(&rejection)),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed_a);
+    assert_eq!(
+        journal.load_direct_mutation_fence(operation_id).unwrap(),
+        None
+    );
+
+    let recovery_rejection = Arc::new(Mutex::new(None));
+    let error = journal
+        .record_historical_data_mutation_recovery_authorized(
+            DmlHistoricalDataMutationRecoveryMutationRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                recovery: data_mutation_requested(
+                    attempt_a,
+                    data_mutation_request(
+                        DmlDirectMutationKind::Truncate,
+                        mutation_operation_id,
+                        Uuid::now_v7(),
+                        None,
+                        None,
+                    ),
+                ),
+            },
+            Some(500_200),
+            current_authority(
+                attempt_a,
+                Arc::clone(&guard_a),
+                Arc::clone(&recovery_rejection),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert_eq!(
+        *recovery_rejection.lock().unwrap(),
+        Some(CoordinationErrorKind::FenceLost)
+    );
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), claimed_a);
+    assert_eq!(
+        journal
+            .load_historical_data_mutation_recovery(operation_id)
+            .unwrap(),
+        None
+    );
+
+    // The new owner re-claims and installs its own strictly higher fence.
+    let claimed_b = journal
+        .claim_operation(
+            DmlCoordinationClaimRequest {
+                operation_id,
+                expected_revision: claimed_a.revision,
+                mutation_id: Uuid::now_v7(),
+                provenance: real_provenance(holder_b, attempt_b, &guard_b, clock.wall_ms() as i64)
+                    .await,
+                recovery_due_at_ms: 516_100,
+            },
+            current_authority(attempt_b, Arc::clone(&guard_b), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+    let fence_b = direct_mutation_fence(
+        DmlDirectMutationKind::Truncate,
+        mutation_operation_id,
+        attempt_b,
+        fence_generation(1, 8, 1),
+        None,
+    );
+    journal
+        .record_direct_mutation_fence_authorized(
+            DmlDirectMutationFenceMutationRequest {
+                operation_id,
+                expected_revision: claimed_b.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: fence_b.clone(),
+            },
+            Some(516_200),
+            current_authority(attempt_b, Arc::clone(&guard_b), Arc::new(Mutex::new(None))),
+        )
+        .unwrap();
+    assert_eq!(
+        journal.load_direct_mutation_fence(operation_id).unwrap(),
+        Some(fence_b)
     );
 }

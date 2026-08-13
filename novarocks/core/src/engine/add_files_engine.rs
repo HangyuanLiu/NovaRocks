@@ -196,6 +196,26 @@ pub trait AddFilesEngine: Send + Sync {
         request: PlanAddFilesRequest,
     ) -> Result<PreparedAddFiles, AddFilesPlanError>;
 
+    /// Establish this attempt's external fence before dispatch and return the
+    /// provider receipt that acknowledges the published marker.
+    ///
+    /// The default fails closed: an engine that cannot expose its mutation
+    /// authority must not register files into a table.
+    fn establish_add_files_external_fence(
+        &self,
+        _prepared: &dyn AddFilesPrepared,
+        _fence: novarocks_spi::connector::ConnectorExternalOperationFence,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExternalFenceReceipt,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(
+            crate::engine::external_write_fence::external_fence_authority_unavailable(
+                "ADD FILES engine does not expose an external operation fence authority",
+            ),
+        )
+    }
+
     fn execute_add_files(&self, prepared: &dyn AddFilesPrepared) -> AddFilesOutcome;
 
     fn reconcile_add_files(
@@ -216,6 +236,27 @@ impl AddFilesPrepared for CorePreparedAddFiles {
 }
 
 impl AddFilesEngine for Arc<StandaloneState> {
+    fn establish_add_files_external_fence(
+        &self,
+        prepared: &dyn AddFilesPrepared,
+        fence: novarocks_spi::connector::ConnectorExternalOperationFence,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExternalFenceReceipt,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let prepared = downcast_prepared(prepared).map_err(|_| {
+            crate::engine::external_write_fence::invalid_fence_request(
+                "foreign ADD FILES prepared handle".to_string(),
+            )
+        })?;
+        let session = prepared.session.lock().map_err(|error| {
+            crate::engine::external_write_fence::invalid_fence_request(format!(
+                "ADD FILES prepared session lock: {error}"
+            ))
+        })?;
+        session.establish_external_fence(fence)
+    }
+
     fn classify_add_files(&self, sql: &str) -> Result<Option<AddFilesCommand>, String> {
         classify_add_files(sql)
     }

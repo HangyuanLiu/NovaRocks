@@ -26,6 +26,7 @@ mod error;
 mod execution;
 mod external_write_fence;
 mod handle;
+mod historical_data_mutation_recovery;
 mod historical_maintenance_recovery;
 mod historical_write_recovery;
 mod identity;
@@ -117,6 +118,21 @@ pub use external_write_fence::{
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+pub use historical_data_mutation_recovery::{
+    ConnectorHistoricalDataMutationApplication, ConnectorHistoricalDataMutationCheckpoint,
+    ConnectorHistoricalDataMutationCleanupReceipt, ConnectorHistoricalDataMutationCleanupRequest,
+    ConnectorHistoricalDataMutationContinuation, ConnectorHistoricalDataMutationDescriptor,
+    ConnectorHistoricalDataMutationDispatchState, ConnectorHistoricalDataMutationDisposition,
+    ConnectorHistoricalDataMutationFamily, ConnectorHistoricalDataMutationFence,
+    ConnectorHistoricalDataMutationFenceFacts, ConnectorHistoricalDataMutationFenceRaiseRequest,
+    ConnectorHistoricalDataMutationIdentity, ConnectorHistoricalDataMutationObservation,
+    ConnectorHistoricalDataMutationOutcomeFacts, ConnectorHistoricalDataMutationPhase,
+    ConnectorHistoricalDataMutationProof, ConnectorHistoricalDataMutationRecovery,
+    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_CHECKPOINTS,
+    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_CONTINUATION_BYTES,
+    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_PROOF_BYTES,
+    validate_historical_data_mutation_recovery_owner,
 };
 pub use historical_maintenance_recovery::{
     ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceArtifact,

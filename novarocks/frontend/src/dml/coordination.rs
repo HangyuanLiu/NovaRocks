@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use async_trait::async_trait;
 use novarocks_spi::connector::{
     ConnectorClusterIdentity, ConnectorError, ConnectorEstablishedWriteFence,
-    ConnectorExternalFenceGeneration, ConnectorExternalOperationFence, ConnectorTableIdentity,
-    ConnectorWriteOperationId, ConnectorWriteTargetRef,
+    ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,
+    ConnectorExternalOperationFence, ConnectorTableIdentity, ConnectorWriteOperationId,
+    ConnectorWriteTargetRef,
 };
 use novarocks_spi::state_store::{StateStore, TransactionId, WriteTransaction};
 use novarocks_state_store::OperationId;
@@ -48,10 +49,11 @@ use crate::dml::journal::{
 use crate::dml::model::{
     AddFilesMutationRequest, DML_COORDINATION_RESOURCE_CODEC_VERSION,
     DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DmlCoordinationClaimRequest, DmlCoordinationProvenance,
-    DmlExternalFenceGeneration, DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord,
-    DmlFencingTokenV1, DmlHistoricalWriteRecoveryRecord, DmlOperationId,
-    DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest, OperationPayload,
-    OperationState, StoredOperation, operation_requires_recovery_scan,
+    DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
+    DmlDirectMutationKind, DmlExternalFenceGeneration, DmlExternalFenceMutationRequest,
+    DmlExternalFenceReceiptRecord, DmlFencingTokenV1, DmlHistoricalWriteRecoveryRecord,
+    DmlOperationId, DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest,
+    OperationPayload, OperationState, StoredOperation, operation_requires_recovery_scan,
 };
 use crate::dml::now_unix_millis;
 
@@ -407,15 +409,28 @@ impl DmlExternalFenceProposal {
         &self,
         established: &ConnectorEstablishedWriteFence,
     ) -> Result<(), DmlError> {
-        let fence = established.fence();
+        self.validate_established_receipt(established.fence(), established.receipt())
+    }
+
+    /// The same double check for a provider that returns the bare receipt.
+    ///
+    /// Direct mutation establishes its fence through the data-mutation lease,
+    /// which hands back only the receipt, so the caller supplies the fence it
+    /// sealed. The check itself is identical and deliberately shared: a
+    /// TRUNCATE must not be able to journal a receipt for some other fence and
+    /// then dispatch.
+    pub fn validate_established_receipt(
+        &self,
+        fence: &ConnectorExternalOperationFence,
+        receipt: &ConnectorExternalFenceReceipt,
+    ) -> Result<(), DmlError> {
         fence
             .validate()
             .map_err(|error| self.mismatch(format!("fence is not sealed: {error}")))?;
-        established
-            .receipt()
+        receipt
             .validate()
             .map_err(|error| self.mismatch(format!("fence receipt is not sealed: {error}")))?;
-        if !established.receipt().matches(fence) {
+        if !receipt.matches(fence) {
             return Err(self.mismatch("fence receipt acknowledges another fence"));
         }
         let expected_cluster = ConnectorClusterIdentity::derive(&self.cluster_id)
@@ -893,6 +908,71 @@ impl ActiveDmlOperation {
         self.stored = self
             .journal
             .record_external_fence_authorized(
+                request,
+                recovery_due_at_ms,
+                self.external_fence_journal_authority()?,
+            )
+            .map_err(|error| error.with_operation_id(self.operation_id()))?;
+        Ok(())
+    }
+
+    /// Refuse a direct-mutation fence this journal could never hold, before any
+    /// external marker can exist.
+    ///
+    /// TRUNCATE and ADD FILES publish a real provider marker, so establishing
+    /// first and failing to record afterwards would leave external truth fenced
+    /// with no durable frontend proof — exactly the ambiguity historical
+    /// data-mutation recovery must not have to guess about.
+    pub(crate) fn preflight_direct_mutation_fence(
+        &self,
+        proposal: &DmlExternalFenceProposal,
+        operation_kind: DmlDirectMutationKind,
+        source_scope_digest: Option<String>,
+    ) -> Result<(), DmlError> {
+        let probe = crate::dml::reconcile::direct_mutation_fence_preflight_probe(
+            operation_kind,
+            *self.operation_id().as_uuid(),
+            proposal.coordination_attempt_id(),
+            proposal.generation(),
+            source_scope_digest,
+        )
+        .map_err(DmlError::journal_corruption)?;
+        self.journal
+            .preflight_direct_mutation_fence(&DmlDirectMutationFenceMutationRequest {
+                operation_id: self.operation_id(),
+                expected_revision: self.stored.revision,
+                mutation_id: Uuid::now_v7(),
+                fence: probe,
+            })
+            .map_err(|error| error.with_operation_id(self.operation_id()))
+    }
+
+    /// Persist the confirmed direct-mutation fence receipt of this attempt.
+    ///
+    /// The journal validates the dynamic latest lease fence, the expected
+    /// operation revision, and the coordination attempt inside the same
+    /// StateStore transaction that writes the receipt, so a superseded holder
+    /// can never install one.
+    pub(crate) fn record_direct_mutation_fence(
+        &mut self,
+        fence: DmlDirectMutationFenceReceiptRecord,
+        recovery_due_at_ms: Option<i64>,
+    ) -> Result<(), DmlError> {
+        let request = DmlDirectMutationFenceMutationRequest {
+            operation_id: self.operation_id(),
+            expected_revision: self.stored.revision,
+            mutation_id: Uuid::now_v7(),
+            fence,
+        };
+        // Reject a receipt this journal could never encode before it is treated
+        // as durable. A fence that cannot be recorded must not license
+        // dispatch.
+        self.journal
+            .preflight_direct_mutation_fence(&request)
+            .map_err(|error| error.with_operation_id(self.operation_id()))?;
+        self.stored = self
+            .journal
+            .record_direct_mutation_fence_authorized(
                 request,
                 recovery_due_at_ms,
                 self.external_fence_journal_authority()?,
