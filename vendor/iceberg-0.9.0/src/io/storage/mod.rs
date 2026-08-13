@@ -72,6 +72,18 @@ pub trait Storage: Debug + Send + Sync {
     /// Check if a file exists at the given path
     async fn exists(&self, path: &str) -> Result<bool>;
 
+    /// List direct child directories relative to the given directory.
+    ///
+    /// The default preserves source compatibility for third-party storage
+    /// implementations. Catalogs that require directory discovery fail closed
+    /// when the backend does not advertise it.
+    async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
+        Err(crate::Error::new(
+            crate::ErrorKind::FeatureUnsupported,
+            format!("storage does not support directory listing below {path}"),
+        ))
+    }
+
     /// Get metadata from an input path
     async fn metadata(&self, path: &str) -> Result<FileMetadata>;
 

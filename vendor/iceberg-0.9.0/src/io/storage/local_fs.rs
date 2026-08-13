@@ -95,6 +95,34 @@ impl Storage for LocalFsStorage {
         Ok(path.exists())
     }
 
+    async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
+        let path = Self::normalize_path(path);
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to inspect directory {}: {error}", path.display()),
+                ));
+            }
+        };
+        let mut directories = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to inspect directory {}: {error}", path.display()),
+                )
+            })?;
+            if entry.path().is_dir() {
+                directories.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        directories.sort();
+        Ok(directories)
+    }
+
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let path = Self::normalize_path(path);
         let metadata = fs::metadata(&path).map_err(|e| {

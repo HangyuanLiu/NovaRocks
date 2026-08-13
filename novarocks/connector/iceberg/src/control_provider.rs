@@ -298,6 +298,13 @@ impl ConnectorMetadata for IcebergControlProvider {
         self.ensure_owner(&request.table.instance_id)?;
         let (table_name, metadata_table_type) =
             resolve_table_request(&request.table.table, request.resolution)?;
+        // A metadata load is the Provider's observation boundary for catalog
+        // truth. External engines can evolve a REST/Hadoop table without going
+        // through this process, so a process-lifetime physical cache entry must
+        // not seal an obsolete schema or snapshot into a new SQL statement.
+        self.runtime
+            .control_state()
+            .invalidate_table(&request.table.namespace, &table_name);
         let loaded = self
             .runtime
             .load_table_classified(&request.table.namespace, &table_name)
@@ -305,10 +312,9 @@ impl ConnectorMetadata for IcebergControlProvider {
         let metadata = loaded.table.metadata();
         let definition_schema = metadata.current_schema().clone();
         let table_comment = metadata.properties().get("comment").cloned();
-        let mut base_schema = Arc::new(
-            crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
-                .map_err(|error| corrupt(format!("convert Iceberg schema to Arrow: {error}")))?,
-        );
+        let mut base_schema =
+            crate::schema_mapping::sql_read_schema_from_iceberg(metadata.current_schema())
+                .map_err(corrupt)?;
         let hidden_columns = hidden_internal_columns(metadata.properties());
         base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
         // Carry the same frozen field facts a scan output schema carries, so the
@@ -1672,10 +1678,9 @@ impl IcebergControlProvider {
             .load_table_classified(&table.namespace, &table.table)
             .map_err(classified_control_error)?;
         let metadata = physical.table.metadata();
-        let storage = Arc::new(
-            crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
-                .map_err(|error| corrupt(format!("convert Iceberg schema to Arrow: {error}")))?,
-        );
+        let storage =
+            crate::schema_mapping::sql_read_schema_from_iceberg(metadata.current_schema())
+                .map_err(corrupt)?;
         let schema = crate::distributed_rewrite::frozen_rewrite_scan_schema(
             operation_kind,
             storage,
@@ -1834,24 +1839,26 @@ pub(crate) fn projected_schema(
         .ok_or_else(|| corrupt("Iceberg table handle has no serialized metadata"))?;
     let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
-    let storage_schema = if table.row_mutation_frozen_source {
-        let snapshot_id = table
-            .table_info
-            .as_ref()
-            .and_then(|table| table.current_snapshot_id)
-            .ok_or_else(|| corrupt("Iceberg frozen row-mutation source has no base snapshot"))?;
+    let table_info = table
+        .table_info
+        .as_ref()
+        .ok_or_else(|| corrupt("Iceberg table handle has no frozen table descriptor"))?;
+    let storage_schema = if table.row_mutation_frozen_source
+        || table_info.schema_id != metadata.current_schema_id()
+    {
+        let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
+            corrupt("Iceberg exact table source has no snapshot for its frozen schema")
+        })?;
         metadata
             .snapshot_by_id(snapshot_id)
-            .ok_or_else(|| corrupt("Iceberg frozen row-mutation base snapshot is absent"))?
+            .ok_or_else(|| corrupt("Iceberg exact table source snapshot is absent"))?
             .schema(&metadata)
-            .map_err(|error| corrupt(format!("resolve frozen row-mutation schema: {error}")))?
+            .map_err(|error| corrupt(format!("resolve exact table source schema: {error}")))?
     } else {
         metadata.current_schema().clone()
     };
-    let storage = Arc::new(
-        crate::iceberg::arrow::schema_to_arrow_schema(&storage_schema)
-            .map_err(|error| corrupt(format!("convert Iceberg schema to Arrow: {error}")))?,
-    );
+    let storage =
+        crate::schema_mapping::sql_read_schema_from_iceberg(&storage_schema).map_err(corrupt)?;
     // Field IDs survive the Arrow conversion but initial defaults do not, so the
     // frozen schema has to re-stamp them before the scan schema leaves the
     // provider. Readers backfill a missing column from that metadata.

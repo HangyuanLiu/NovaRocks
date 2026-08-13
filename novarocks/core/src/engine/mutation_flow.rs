@@ -2548,16 +2548,22 @@ fn build_cow_update_distributed_write(
 fn ordered_route_inputs(
     route: &novarocks_spi::connector::ConnectorRowMutationRoute,
 ) -> Result<Vec<novarocks_spi::connector::ConnectorMutationRouteInput>, String> {
-    let mut inputs = route.input_ordinals().to_vec();
-    inputs.sort_by_key(|input| input.input_ordinal());
-    if inputs
+    let inputs_by_token = route
+        .input_ordinals()
         .iter()
-        .enumerate()
-        .any(|(ordinal, input)| input.input_ordinal() as usize != ordinal)
-    {
-        return Err("COW route input ordinals are not dense from zero".to_string());
-    }
-    Ok(inputs)
+        .map(|input| (input.token(), *input))
+        .collect::<HashMap<_, _>>();
+    route
+        .input()
+        .fields()
+        .into_iter()
+        .map(|field| {
+            inputs_by_token
+                .get(&field.token())
+                .copied()
+                .ok_or_else(|| "COW route input shape has no signed ordinal binding".to_string())
+        })
+        .collect()
 }
 
 fn route_field_by_token(

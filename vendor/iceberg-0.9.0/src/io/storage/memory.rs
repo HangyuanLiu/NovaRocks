@@ -106,6 +106,30 @@ impl Storage for MemoryStorage {
         Ok(data.contains_key(&normalized))
     }
 
+    async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
+        let normalized = Self::normalize_path(path);
+        let prefix = if normalized.ends_with('/') {
+            normalized
+        } else {
+            format!("{normalized}/")
+        };
+        let data = self.data.read().map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to acquire read lock: {error}"),
+            )
+        })?;
+        let mut directories = data
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix))
+            .filter_map(|relative| relative.split_once('/').map(|(directory, _)| directory))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        directories.sort();
+        directories.dedup();
+        Ok(directories)
+    }
+
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let normalized = Self::normalize_path(path);
         let data = self.data.read().map_err(|e| {

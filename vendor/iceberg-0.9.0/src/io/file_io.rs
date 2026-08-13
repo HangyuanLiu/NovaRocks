@@ -149,6 +149,11 @@ impl FileIO {
         self.get_storage()?.exists(path.as_ref()).await
     }
 
+    /// List direct child directories relative to the given directory.
+    pub async fn list_directories(&self, path: impl AsRef<str>) -> Result<Vec<String>> {
+        self.get_storage()?.list_directories(path.as_ref()).await
+    }
+
     /// Creates input file.
     ///
     /// # Arguments

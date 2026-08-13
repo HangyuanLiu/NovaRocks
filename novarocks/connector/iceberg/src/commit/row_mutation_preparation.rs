@@ -40,7 +40,7 @@ use crate::commit::write_shared::{
     exact_requested_write_fields_at_schema, snapshot_token, write_target_schema,
     write_target_snapshot_id,
 };
-use crate::control_provider::{IcebergTablePayload, metadata_arrow_fields};
+use crate::control_provider::{IcebergTablePayload, metadata_arrow_fields, projected_schema};
 use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 
@@ -194,9 +194,11 @@ pub(crate) fn prepare_row_mutation(
     match_table_info.current_snapshot_id = target_snapshot_id;
     match_table_info.schema_id = target_iceberg_schema.schema_id();
     match_table_info.schema = crate::schema_facts::iceberg_schema_def(&target_iceberg_schema);
-    let mut match_source_fields = target_schema.fields().to_vec();
-    match_source_fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
-    let match_source_schema = Arc::new(Schema::new(match_source_fields));
+    // Sign the schema produced by this exact opaque handle instead of
+    // rebuilding it from generic writer fields. The Provider's composition is
+    // the sole owner of field IDs, defaults, hidden annotations, and physical
+    // read carriers, and frozen read admission compares every one of them.
+    let match_source_schema = projected_schema(&match_source_payload, &[])?;
     let match_source = ConnectorTableHandle::try_new(
         owner.instance_id.clone(),
         encode_payload(
@@ -794,7 +796,7 @@ mod tests {
             "row-mutation match source",
         )
         .expect("decode match source");
-        let match_info = match_source.table_info.expect("match table info");
+        let match_info = match_source.table_info.as_ref().expect("match table info");
         assert_eq!(match_info.current_snapshot_id, Some(41));
         assert_eq!(match_info.schema_id, 0);
         let prepared_names = preparation
@@ -819,6 +821,12 @@ mod tests {
         assert_eq!(preparation.match_source_schema().field(0).name(), "id");
         assert_eq!(preparation.match_source_schema().field(1).name(), "name");
         assert_eq!(preparation.match_source_schema().field(2).name(), "_file");
+        assert_eq!(
+            preparation.match_source_schema().as_ref(),
+            projected_schema(&match_source, &[])
+                .expect("project exact match source")
+                .as_ref()
+        );
     }
 
     #[test]
