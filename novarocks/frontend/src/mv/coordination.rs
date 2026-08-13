@@ -248,6 +248,11 @@ pub fn permits_side_effect(state: RefreshOwnershipState, effect: RefreshSideEffe
 pub struct MvRefreshOwnershipContext {
     pub coordination: MvRefreshCoordination,
     pub registry: Arc<MvRefreshOwnershipRegistry>,
+    /// An explicit runtime handle, because the MV refresh worker is a plain OS
+    /// thread with no ambient Tokio context. Relying on `Handle::current()` there
+    /// panics and takes the worker down, which presents as refreshes silently
+    /// never happening rather than as an error.
+    runtime: tokio::runtime::Handle,
 }
 
 impl MvRefreshOwnershipContext {
@@ -255,7 +260,21 @@ impl MvRefreshOwnershipContext {
         Ok(Self {
             coordination: MvRefreshCoordination::open(store).await?,
             registry: MvRefreshOwnershipRegistry::new(),
+            runtime: tokio::runtime::Handle::current(),
         })
+    }
+
+    /// Drives an acquisition to completion from either kind of caller.
+    ///
+    /// Manual refresh arrives on a Tokio worker, where blocking the thread
+    /// directly would panic; the scheduler and recovery workers are plain OS
+    /// threads with no runtime at all. Handling both is why the handle is carried
+    /// rather than discovered.
+    pub fn block_on_acquisition<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
+            Err(_) => self.runtime.block_on(future),
+        }
     }
 
     pub fn registry(&self) -> Arc<dyn MvRefreshFenceSource> {
