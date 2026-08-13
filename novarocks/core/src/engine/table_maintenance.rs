@@ -23,6 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use sqlparser::keywords::Keyword;
@@ -95,6 +96,57 @@ impl AutomaticMaintenanceContext {
             .ok_or_else(|| {
                 "automatic maintenance deadline elapsed before durable dispatch".to_string()
             })
+    }
+}
+
+/// Write capability for one frontend-owned maintenance execution attempt.
+///
+/// This cancellation is deliberately provider-neutral. The frontend keeps the
+/// source and passes only [`MaintenanceAttemptContext`] through the engine
+/// port, so a lost coordination lease can stop subsequent connector work
+/// without exposing a lease, repository, or provider object to Core.
+#[derive(Clone, Debug, Default)]
+pub struct MaintenanceAttemptCancellationSource {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl MaintenanceAttemptCancellationSource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn context(&self) -> MaintenanceAttemptContext {
+        MaintenanceAttemptContext {
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+
+    /// Returns true only for the first cancellation request.
+    pub fn cancel(&self) -> bool {
+        !self.cancelled.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// Read-only cancellation view shared by all provider calls in one durable
+/// maintenance attempt.
+#[derive(Clone, Debug, Default)]
+pub struct MaintenanceAttemptContext {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl MaintenanceAttemptContext {
+    pub fn uncancelled() -> Self {
+        Self::default()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn connector_request_context(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
+        crate::connector::connector_request_context(None, Arc::clone(&self.cancelled))
     }
 }
 
@@ -227,6 +279,19 @@ pub trait TableMaintenanceEngine: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
+    /// Context-aware planning entrypoint used by a fenced frontend attempt.
+    /// Existing engine implementations remain source-compatible: until they
+    /// override this method, the legacy planning method is used.
+    fn plan_metadata_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorMutationOperationId,
+        intent: MetadataMaintenanceIntent,
+        _attempt: &MaintenanceAttemptContext,
+    ) -> Result<MetadataMaintenanceSession, String> {
+        self.plan_metadata_maintenance(target, operation_id, intent)
+    }
+
     fn execute_planned_metadata_maintenance(
         &self,
         _session: MetadataMaintenanceSession,
@@ -242,6 +307,15 @@ pub trait TableMaintenanceEngine: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
+    fn reconcile_metadata_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorMetadataMaintenancePlan,
+        _attempt: &MaintenanceAttemptContext,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        self.reconcile_metadata_maintenance(target, plan)
+    }
+
     /// Plan a provider-neutral FE-only orphan cleanup operation. The returned
     /// session owns its exact connector generation for the durable frontend
     /// operation; no BE or generic action route participates.
@@ -254,6 +328,16 @@ pub trait TableMaintenanceEngine: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
+    fn plan_cleanup_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        _attempt: &MaintenanceAttemptContext,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.plan_cleanup_maintenance(target, operation_id, older_than_ms)
+    }
+
     fn recover_cleanup_for_reconcile(
         &self,
         _target: &MaintenanceTarget,
@@ -261,6 +345,16 @@ pub trait TableMaintenanceEngine: Send + Sync {
         _prepared: PreparedBatch,
     ) -> Result<CleanupMaintenanceSession, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn recover_cleanup_for_reconcile_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorCleanupPlan,
+        prepared: PreparedBatch,
+        _attempt: &MaintenanceAttemptContext,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.recover_cleanup_for_reconcile(target, plan, prepared)
     }
 
     fn prepare_cleanup_batch(
@@ -310,6 +404,16 @@ pub trait TableMaintenanceEngine: Send + Sync {
         _intent: DistributedRewriteIntent,
     ) -> Result<DistributedRewriteMaintenanceSession, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn plan_distributed_rewrite_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        intent: DistributedRewriteIntent,
+        _attempt: &MaintenanceAttemptContext,
+    ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        self.plan_distributed_rewrite(target, operation_id, intent)
     }
 
     fn stage_distributed_rewrite_cohort(
@@ -543,6 +647,21 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         operation_id: ConnectorMutationOperationId,
         intent: MetadataMaintenanceIntent,
     ) -> Result<MetadataMaintenanceSession, String> {
+        self.plan_metadata_maintenance_with_attempt_context(
+            target,
+            operation_id,
+            intent,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn plan_metadata_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorMutationOperationId,
+        intent: MetadataMaintenanceIntent,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<MetadataMaintenanceSession, String> {
         let state = self.shared_for_table_maintenance()?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| error.to_string())?;
@@ -556,10 +675,7 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
                 table: target.table.clone().into(),
             },
             intent,
-            crate::connector::connector_request_context(
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            attempt.connector_request_context()?,
         )
     }
 
@@ -575,6 +691,19 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         target: &MaintenanceTarget,
         plan: ConnectorMetadataMaintenancePlan,
     ) -> Result<CompletedMetadataMaintenance, String> {
+        self.reconcile_metadata_maintenance_with_attempt_context(
+            target,
+            plan,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn reconcile_metadata_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorMetadataMaintenancePlan,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<CompletedMetadataMaintenance, String> {
         let state = self.shared_for_table_maintenance()?;
         crate::connector::metadata_maintenance::reconcile_metadata_maintenance_session(
             state.connector_control.as_ref(),
@@ -586,10 +715,7 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
                 table: target.table.clone().into(),
             },
             plan,
-            crate::connector::connector_request_context(
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            attempt.connector_request_context()?,
         )
     }
 
@@ -598,6 +724,21 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         target: &MaintenanceTarget,
         operation_id: ConnectorCleanupOperationId,
         older_than_ms: i64,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.plan_cleanup_maintenance_with_attempt_context(
+            target,
+            operation_id,
+            older_than_ms,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn plan_cleanup_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        attempt: &MaintenanceAttemptContext,
     ) -> Result<CleanupMaintenanceSession, String> {
         let state = self.shared_for_table_maintenance()?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
@@ -612,10 +753,7 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
                 table: target.table.clone().into(),
             },
             older_than_ms,
-            crate::connector::connector_request_context(
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            attempt.connector_request_context()?,
         )
         .map_err(|error| format!("plan orphan cleanup operation: {error}"))
     }
@@ -625,6 +763,21 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         target: &MaintenanceTarget,
         plan: ConnectorCleanupPlan,
         prepared: PreparedBatch,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.recover_cleanup_for_reconcile_with_attempt_context(
+            target,
+            plan,
+            prepared,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn recover_cleanup_for_reconcile_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorCleanupPlan,
+        prepared: PreparedBatch,
+        attempt: &MaintenanceAttemptContext,
     ) -> Result<CleanupMaintenanceSession, String> {
         let state = self.shared_for_table_maintenance()?;
         CleanupMaintenanceSession::recover_for_reconcile(
@@ -637,10 +790,7 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
             },
             plan,
             prepared,
-            crate::connector::connector_request_context(
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            attempt.connector_request_context()?,
         )
         .map_err(|error| format!("recover orphan cleanup operation: {error}"))
     }
@@ -701,6 +851,34 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         let state = self.shared_for_table_maintenance()?;
         let execution = crate::engine::capture_maintenance_execution(&state)?;
         let context = crate::connector::connector_request_context_for_execution(None, &execution)?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
+            &state.query_execution,
+            state.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: target.namespace.clone().into(),
+                table: target.table.clone().into(),
+            },
+            operation_id,
+            intent,
+            execution,
+            context,
+        )
+    }
+
+    fn plan_distributed_rewrite_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        intent: DistributedRewriteIntent,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        let state = self.shared_for_table_maintenance()?;
+        let execution = crate::engine::capture_maintenance_execution(&state)?;
+        let context = attempt.connector_request_context()?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| error.to_string())?;
         crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
@@ -934,5 +1112,39 @@ fn consume_word(parser: &mut Parser<'_>, expected: &str) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod maintenance_attempt_context_tests {
+    use super::{MaintenanceAttemptCancellationSource, MaintenanceAttemptContext};
+
+    #[test]
+    fn source_context_and_connector_request_share_one_cancellation_flag() {
+        let source = MaintenanceAttemptCancellationSource::new();
+        let attempt = source.context();
+        let cloned = attempt.clone();
+        let connector = attempt
+            .connector_request_context()
+            .expect("connector request context");
+
+        assert!(!attempt.is_cancelled());
+        assert!(!connector.cancellation().is_cancelled());
+        assert!(source.cancel());
+        assert!(!source.cancel());
+        assert!(attempt.is_cancelled());
+        assert!(cloned.is_cancelled());
+        assert!(connector.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn uncancelled_attempts_do_not_share_state() {
+        let first = MaintenanceAttemptContext::uncancelled();
+        let second_source = MaintenanceAttemptCancellationSource::new();
+        let second = second_source.context();
+
+        assert!(second_source.cancel());
+        assert!(!first.is_cancelled());
+        assert!(second.is_cancelled());
     }
 }

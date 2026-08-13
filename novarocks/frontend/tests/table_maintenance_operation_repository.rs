@@ -22,14 +22,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::MaintenanceTarget;
+use novarocks_frontend::table_maintenance::coordination::MaintenanceFenceValidator;
 use novarocks_frontend::table_maintenance::model::{
     CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
     DistributedRewriteOperationKind, DistributedRewriteOperationState,
-    DistributedRewritePlanPayload, MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
-    MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
-    MetadataMaintenanceOperationState, MetadataMaintenancePlanPayload, OptimizeJobCreate,
+    DistributedRewritePlanPayload, MaintenanceAuthorityV1, MetadataMaintenanceExactOwner,
+    MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperationCreate,
+    MetadataMaintenanceOperationKind, MetadataMaintenanceOperationState,
+    MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use novarocks_frontend::table_maintenance::repository::{
     CleanupOperationRepository, DistributedRewriteOperationRepository,
@@ -38,6 +40,7 @@ use novarocks_frontend::table_maintenance::repository::{
     metadata_maintenance_payload_digest,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
+use novarocks_state_store::coordination::{ControlPlaneIncarnation, FencingToken, ResourceEpoch};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
@@ -180,6 +183,18 @@ fn opaque(payload: &[u8]) -> MetadataMaintenanceOpaquePayload {
     }
 }
 
+fn fenced_authority() -> MaintenanceAuthorityV1 {
+    let token = FencingToken::new(
+        "table-maintenance-operation-repository-test",
+        ControlPlaneIncarnation::new(1).unwrap(),
+        ResourceEpoch::new(1).unwrap(),
+    )
+    .unwrap()
+    .encode_v1()
+    .unwrap();
+    MaintenanceAuthorityV1::try_new(Uuid::now_v7(), token.to_vec()).unwrap()
+}
+
 fn rewrite_create(operation_id: Uuid) -> DistributedRewriteOperationCreate {
     let request_payload = br#"{"operation":"rewrite-data-files"}"#.to_vec();
     DistributedRewriteOperationCreate {
@@ -300,6 +315,61 @@ async fn persists_plan_before_running_and_releases_terminal_fence() {
 }
 
 #[tokio::test]
+async fn fenced_metadata_transitions_reject_a_stale_attempt() {
+    let (_temp, _store, repository) = fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository.create(create(operation_id)).await.unwrap();
+    let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let authority = fenced_authority();
+    let plan_payload = b"fenced-plan".to_vec();
+    repository
+        .start_fenced(
+            operation_id,
+            MetadataMaintenancePlanPayload {
+                plan_digest: [4; 32],
+                payload_digest: metadata_maintenance_payload_digest(&plan_payload),
+                payload: plan_payload,
+                summary: [1, 2, 3, 4, 5],
+            },
+            11,
+            authority.clone(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+
+    let error = repository
+        .mark_reconcile_pending_fenced(
+            operation_id,
+            opaque(b"late-provider-response"),
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+
+    let reconciled = repository
+        .mark_reconcile_pending_fenced(
+            operation_id,
+            opaque(b"late-provider-response"),
+            authority.clone(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciled.state,
+        MetadataMaintenanceOperationState::ReconcilePending
+    );
+    let finished = repository
+        .finish_fenced(operation_id, opaque(b"receipt"), 12, authority, validator)
+        .await
+        .unwrap();
+    assert_eq!(finished.state, MetadataMaintenanceOperationState::Finished);
+}
+
+#[tokio::test]
 async fn same_operation_replays_only_the_same_request() {
     let (_temp, _store, repository) = fixture().await;
     let operation_id = Uuid::now_v7();
@@ -368,6 +438,104 @@ async fn v1_optimize_and_v2_metadata_operations_are_mutually_exclusive() {
         .unwrap();
     let error = repository.create(create(Uuid::now_v7())).await.unwrap_err();
     assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
+}
+
+#[tokio::test]
+async fn v1_child_rewrite_copies_the_claimed_authority_without_a_second_lease() {
+    let (_temp, store, repository) = rewrite_fixture().await;
+    let optimize = OptimizeJobRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    let parent = optimize
+        .create(OptimizeJobCreate {
+            target: target(),
+            base_snapshot_id: 1,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let authority = fenced_authority();
+    optimize
+        .claim_fenced(parent.job_id, 11, authority.clone(), Arc::clone(&validator))
+        .await
+        .unwrap();
+
+    let request = rewrite_create(Uuid::now_v7());
+    let error = repository
+        .create_for_claimed_optimize_job_fenced(
+            request.clone(),
+            parent.job_id,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+
+    let child = repository
+        .create_for_claimed_optimize_job_fenced(
+            request,
+            parent.job_id,
+            authority.clone(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+    assert_eq!(child.state, DistributedRewriteOperationState::Pending);
+
+    let plan_payload = b"v1-child-plan".to_vec();
+    let error = repository
+        .plan_fenced(
+            child.operation_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload.clone(),
+                cohort_count: 1,
+            },
+            12,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    let planned = repository
+        .plan_fenced(
+            child.operation_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload,
+                cohort_count: 1,
+            },
+            12,
+            authority.clone(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+    assert_eq!(planned.state, DistributedRewriteOperationState::Planned);
+    let error = repository
+        .start_staging_fenced(
+            child.operation_id,
+            13,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    let staging = repository
+        .start_staging_fenced(child.operation_id, 13, authority, validator)
+        .await
+        .unwrap();
+    assert_eq!(staging.state, DistributedRewriteOperationState::Staging);
 }
 
 #[tokio::test]
@@ -615,6 +783,40 @@ async fn cleanup_persists_only_bounded_artifact_handles_and_releases_terminal_fe
         .create(rewrite_create(Uuid::now_v7()))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn fenced_cleanup_plan_rejects_a_stale_attempt() {
+    let (_temp, _store, repository) = cleanup_fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository
+        .create(cleanup_create(operation_id))
+        .await
+        .unwrap();
+    let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let authority = fenced_authority();
+    let planned = repository
+        .plan_fenced(
+            operation_id,
+            cleanup_plan(),
+            11,
+            authority,
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+    assert_eq!(planned.state, CleanupOperationState::Planned);
+    let error = repository
+        .plan_fenced(
+            operation_id,
+            cleanup_plan(),
+            11,
+            fenced_authority(),
+            validator,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
 }
 
 #[tokio::test]

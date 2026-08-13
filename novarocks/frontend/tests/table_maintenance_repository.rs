@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks_frontend::table_maintenance::coordination::{
+    MaintenanceAuthorityFailure, MaintenanceFenceValidator,
+};
+use novarocks_frontend::table_maintenance::model::MaintenanceAuthorityV1;
 use novarocks_frontend::table_maintenance::model::{OptimizeJobCreate, OptimizeJobOutcome};
 use novarocks_frontend::table_maintenance::repository::{
     OptimizeJobRepository, RepositoryErrorKind,
@@ -34,8 +38,11 @@ use novarocks_spi::state_store::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, WriteTransaction,
 };
+use novarocks_state_store::coordination::{
+    ControlPlaneIncarnation, CoordinationError, FencingToken, IncarnationGate, ResourceEpoch,
+};
 use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
@@ -256,6 +263,83 @@ async fn claim_atomically_moves_pending_job_to_running() {
     assert_eq!(raw_prefix_count(store.as_ref(), "operations/").await, 2);
 }
 
+fn test_authority() -> MaintenanceAuthorityV1 {
+    let token = FencingToken::new(
+        "table-maintenance-repository-test",
+        ControlPlaneIncarnation::new(1).expect("test incarnation"),
+        ResourceEpoch::new(1).expect("test epoch"),
+    )
+    .expect("test fencing token")
+    .encode_v1()
+    .expect("encode test fencing token");
+    MaintenanceAuthorityV1::try_new(Uuid::now_v7(), token.to_vec()).expect("test authority")
+}
+
+#[tokio::test]
+async fn fenced_claim_validates_authority_in_the_mutating_transaction() {
+    let (_temp, _store, repository) = fixture().await;
+    let created = repository
+        .create(create_request("ice", "db", "fenced", 10, 100))
+        .await
+        .expect("create optimize job");
+    let rejecting: MaintenanceFenceValidator = Arc::new(|_| {
+        Box::pin(async {
+            Err(MaintenanceAuthorityFailure::Coordination(
+                CoordinationError::clock_unsafe(),
+            ))
+        })
+    });
+
+    let error = repository
+        .claim_fenced(created.job_id, 200, test_authority(), rejecting)
+        .await
+        .expect_err("failed fence must reject the claim transaction");
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    assert_eq!(
+        repository.list_pending().await.unwrap(),
+        vec![created.clone()]
+    );
+
+    let accepting: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let durable_authority = test_authority();
+    let claimed = repository
+        .claim_fenced(
+            created.job_id,
+            201,
+            durable_authority.clone(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect("validated fence may claim")
+        .expect("pending job is claimed");
+    assert_eq!(claimed.state, OptimizeJobState::Running);
+
+    let stale = repository
+        .record_outcome_fenced(
+            created.job_id,
+            outcome(11),
+            test_authority(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect_err("another attempt must not write a claimed job");
+    assert_eq!(stale.kind(), RepositoryErrorKind::AuthorityLost);
+
+    repository
+        .record_outcome_fenced(
+            created.job_id,
+            outcome(11),
+            durable_authority.clone(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect("durable attempt records outcome");
+    repository
+        .finish_fenced(created.job_id, 202, durable_authority, accepting)
+        .await
+        .expect("durable attempt finishes job");
+}
+
 #[tokio::test]
 async fn recorded_outcome_is_preserved_when_finish_clears_running_and_active_indexes() {
     let (_temp, store, repository) = fixture().await;
@@ -324,50 +408,68 @@ async fn fail_preserves_error_and_clears_running_and_active_indexes() {
 }
 
 #[tokio::test]
-async fn restart_reconcile_fails_running_jobs_and_leaves_pending_jobs_claimable() {
-    let (_temp, store, repository) = fixture().await;
-    let running = repository
-        .create(create_request("ice", "db", "running", 10, 100))
+async fn recovery_returns_an_undispatched_claim_and_fails_a_dispatched_one() {
+    let (_temp, _store, repository) = fixture().await;
+    let accepting: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    let undispatched = repository
+        .create(create_request("ice", "db", "undispatched", 10, 100))
         .await
-        .expect("create running job");
-    let pending = repository
-        .create(create_request("ice", "db", "pending", 20, 101))
-        .await
-        .expect("create pending job");
+        .expect("create undispatched job");
     repository
-        .claim(running.job_id, 200)
+        .claim_fenced(
+            undispatched.job_id,
+            200,
+            test_authority(),
+            Arc::clone(&accepting),
+        )
         .await
         .unwrap()
         .unwrap();
 
-    assert_eq!(repository.reconcile_startup(300).await.unwrap(), 1);
+    // A different attempt takes the target over. Nothing was dispatched, so the
+    // job goes back to the queue instead of being failed.
+    repository
+        .release_undispatched_fenced(
+            undispatched.job_id,
+            test_authority(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .expect("undispatched claim is releasable");
+    let released = repository
+        .list_pending()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.job_id == undispatched.job_id)
+        .expect("released job is claimable again");
+    assert_eq!(released.state, OptimizeJobState::Pending);
+    assert_eq!(released.started_at_ms, None);
+    assert_eq!(released.dispatched_child, None);
 
-    let jobs = repository.list().await.unwrap();
-    let reconciled = jobs
-        .iter()
-        .find(|job| job.job_id == running.job_id)
+    // A lost fence cannot recover anything.
+    let rejecting: MaintenanceFenceValidator = Arc::new(|_| {
+        Box::pin(async {
+            Err(MaintenanceAuthorityFailure::Coordination(
+                CoordinationError::clock_unsafe(),
+            ))
+        })
+    });
+    repository
+        .claim_fenced(
+            undispatched.job_id,
+            201,
+            test_authority(),
+            Arc::clone(&accepting),
+        )
+        .await
+        .unwrap()
         .unwrap();
-    assert_eq!(reconciled.state, OptimizeJobState::Failed);
-    assert!(
-        reconciled
-            .error_message
-            .as_deref()
-            .unwrap()
-            .contains("restart")
-    );
-    let still_pending = jobs
-        .iter()
-        .find(|job| job.job_id == pending.job_id)
-        .unwrap();
-    assert_eq!(still_pending.state, OptimizeJobState::Pending);
-    assert!(
-        repository
-            .claim(pending.job_id, 400)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(!raw_key_exists(store.as_ref(), &raw_key("state/running/0000000000000001")).await);
+    let error = repository
+        .release_undispatched_fenced(undispatched.job_id, test_authority(), rejecting)
+        .await
+        .expect_err("a lost fence must not recover a claimed job");
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
 }
 
 #[tokio::test]
@@ -407,11 +509,11 @@ async fn restart_reconcile_finishes_running_job_with_durable_outcome_and_clears_
     let restarted = OptimizeJobRepository::open(Arc::clone(&restarted_store))
         .await
         .expect("reopen optimize job repository");
-    assert_eq!(
-        restarted.reconcile_startup(300).await.unwrap(),
-        1,
-        "one durable running job must be reconciled"
-    );
+    let accepting: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+    restarted
+        .finish_recovered_fenced(created.job_id, 300, test_authority(), accepting)
+        .await
+        .expect("a durable outcome is finalized by the recovering attempt");
 
     let finished = restarted.list().await.unwrap().remove(0);
     assert_eq!(finished.state, OptimizeJobState::Finished);
@@ -828,11 +930,37 @@ async fn commit_unknown_recovery_accepts_legal_successor_without_mutation_retry(
 }
 
 #[tokio::test]
+async fn admitted_create_fails_closed_when_the_gate_leaves_write_open() {
+    let (_temp, store, repository) = fixture().await;
+    let gate = IncarnationGate::new(Arc::clone(&store));
+    let snapshot = gate.bootstrap(OperationId::new_v7()).await.unwrap();
+    let admission = gate.admit_writes().await.unwrap();
+    let created = repository
+        .create_admitted(
+            create_request("ice", "db", "admitted", 10, 100),
+            admission.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.state, OptimizeJobState::Pending);
+
+    gate.begin_restore(&snapshot, OperationId::new_v7())
+        .await
+        .unwrap();
+    let error = repository
+        .create_admitted(create_request("ice", "db", "closed", 11, 101), admission)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AuthorityLost);
+    assert_eq!(repository.list().await.unwrap(), vec![created]);
+}
+
+#[tokio::test]
 async fn repository_open_fails_fast_on_unknown_job_schema_version() {
     let temp = TempDir::new().unwrap();
     let store = open_sqlite(&temp.path().join("state.sqlite")).await;
     let payload = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "job_id": 1,
         "target": {
             "catalog": "ice",

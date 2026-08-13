@@ -31,6 +31,7 @@ use novarocks_spi::state_store::{
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
     WriteTransaction,
 };
+use novarocks_state_store::coordination::WriteAdmission;
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use serde::de::DeserializeOwned;
@@ -38,20 +39,24 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::coordination::MaintenanceFenceValidator;
 use super::model::{
-    CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_SCHEMA_VERSION,
-    CleanupBatchCheckpoint, CleanupOperation, CleanupOperationCreate, CleanupOperationState,
-    CleanupPlanPayload, DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES,
-    DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES, DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
-    DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
-    DistributedRewriteOpaquePayload, DistributedRewriteOperation,
-    DistributedRewriteOperationCreate, DistributedRewriteOperationState,
-    DistributedRewritePlanPayload, METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES,
-    METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION, MetadataMaintenanceExactOwner,
-    MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
+    CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION,
+    CLEANUP_OPERATION_SCHEMA_VERSION, CleanupBatchCheckpoint, CleanupOperation,
+    CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
+    DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES, DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES,
+    DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION,
+    DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION, DistributedRewriteAttemptCheckpoint,
+    DistributedRewriteAttemptDisposition, DistributedRewriteOpaquePayload,
+    DistributedRewriteOperation, DistributedRewriteOperationCreate,
+    DistributedRewriteOperationState, DistributedRewritePlanPayload,
+    METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES, METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION,
+    METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION, MaintenanceAuthorityV1,
+    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationState,
-    MetadataMaintenancePlanPayload, OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate,
-    OptimizeJobOutcome, StoredCleanupBatchV4, StoredCleanupOperationV4, StoredCleanupPlanV4,
+    MetadataMaintenancePlanPayload, OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION,
+    OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate, OptimizeJobOutcome,
+    StoredCleanupBatchV4, StoredCleanupOperationV4, StoredCleanupPlanV4,
     StoredCleanupTransactionActionV4, StoredCleanupTransactionV4,
     StoredDistributedRewriteAttemptV3, StoredDistributedRewriteOperationV3,
     StoredDistributedRewritePayloadKindV3, StoredDistributedRewritePayloadV3,
@@ -96,6 +101,36 @@ const CLEANUP_STATE_PREFIX: &str = "novarocks/frontend/table-maintenance/v4/clea
 const CLEANUP_TRANSACTION_PREFIX: &str =
     "novarocks/frontend/table-maintenance/v4/cleanup/transactions/";
 
+fn is_optimize_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION | OPTIMIZE_JOB_SCHEMA_VERSION
+    )
+}
+
+fn is_metadata_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION
+            | METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION
+    )
+}
+
+fn is_rewrite_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION
+            | DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+    )
+}
+
+fn is_cleanup_schema_version(version: u8) -> bool {
+    matches!(
+        version,
+        CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION | CLEANUP_OPERATION_SCHEMA_VERSION
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryErrorKind {
     AlreadyActive,
@@ -103,6 +138,7 @@ pub enum RepositoryErrorKind {
     InvalidTransition,
     Corruption,
     CommitUnknown,
+    AuthorityLost,
     Store,
 }
 
@@ -130,6 +166,10 @@ impl RepositoryError {
 
     fn store(message: impl Into<String>) -> Self {
         Self::new(RepositoryErrorKind::Store, message)
+    }
+
+    fn authority_lost(message: impl Into<String>) -> Self {
+        Self::new(RepositoryErrorKind::AuthorityLost, message)
     }
 
     fn with_context(self, context: impl fmt::Display) -> Self {
@@ -197,7 +237,9 @@ impl OptimizeJobRepository {
             "create frontend optimize job",
             |transaction| {
                 let request = request.clone();
-                Box::pin(async move { apply_create(transaction, operation_id, request).await })
+                Box::pin(
+                    async move { apply_create(transaction, operation_id, request, None).await },
+                )
             },
         )
         .await;
@@ -222,6 +264,34 @@ impl OptimizeJobRepository {
                 &format!("create optimize job for {context}"),
                 failure,
             )),
+        }
+    }
+
+    /// Validates application-owned write admission in the same transaction as
+    /// the pending record/index creation.
+    pub async fn create_admitted(
+        &self,
+        request: OptimizeJobCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<OptimizeJob> {
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "admitted create frontend optimize job",
+            |transaction| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_create(transaction, operation_id, request, Some(&admission)).await
+                })
+            },
+        )
+        .await;
+        match result {
+            Ok(success) => success.value,
+            Err(failure) => Err(format_run_failure("admitted create optimize job", failure)),
         }
     }
 
@@ -274,6 +344,18 @@ impl OptimizeJobRepository {
             .await
     }
 
+    /// Jobs a previous attempt claimed but never terminalized. The RUNNING
+    /// index bounds the scan; recovery decides per job under its own attempt.
+    pub async fn list_running(&self) -> RepositoryResult<Vec<OptimizeJob>> {
+        self.list_indexed_jobs(RUNNING_PREFIX, OptimizeJobState::Running)
+            .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn claim(&self, job_id: i64, now_ms: i64) -> RepositoryResult<Option<OptimizeJob>> {
         validate_job_id(job_id, "claim optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -283,9 +365,9 @@ impl OptimizeJobRepository {
             operation_id,
             "claim frontend optimize job",
             |transaction| {
-                Box::pin(
-                    async move { apply_claim(transaction, operation_id, job_id, now_ms).await },
-                )
+                Box::pin(async move {
+                    apply_claim(transaction, operation_id, job_id, now_ms, None).await
+                })
             },
         )
         .await;
@@ -320,6 +402,76 @@ impl OptimizeJobRepository {
         }
     }
 
+    /// Claims a pending V1 job and installs the caller's durable authority in
+    /// the same transaction as the state/index transition. The validator is
+    /// dynamic: it must read the latest lease fence at transaction time.
+    pub async fn claim_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<Option<OptimizeJob>> {
+        validate_job_id(job_id, "fenced claim optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced claim frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_claim(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+
+        match result {
+            Ok(success) => success.value,
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                let recovered = self
+                    .resolve_commit_unknown(
+                        transaction_id,
+                        operation_id,
+                        StoredOptimizeOperationActionV1::Claim,
+                        Some(job_id),
+                        &format!("fenced claim optimize job {job_id}"),
+                        error,
+                    )
+                    .await?;
+                if recovered.state != OptimizeJobState::Running {
+                    return Err(RepositoryError::corruption(format!(
+                        "fenced claim optimize job {job_id} authoritative result is not RUNNING"
+                    )));
+                }
+                Ok(Some(recovered))
+            }
+            Err(failure) => Err(format_run_failure(
+                &format!("fenced claim optimize job {job_id}"),
+                failure,
+            )),
+        }
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn record_outcome(
         &self,
         job_id: i64,
@@ -335,7 +487,7 @@ impl OptimizeJobRepository {
             |transaction| {
                 let outcome = outcome.clone();
                 Box::pin(async move {
-                    apply_record_outcome(transaction, operation_id, job_id, outcome).await
+                    apply_record_outcome(transaction, operation_id, job_id, outcome, None).await
                 })
             },
         )
@@ -350,6 +502,189 @@ impl OptimizeJobRepository {
         .await
     }
 
+    /// Recovery-only takeover: finalize a job whose outcome the previous
+    /// attempt already recorded. The caller proves it holds the live lease;
+    /// the stale attempt bound to the record is irrelevant and is replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_recovered_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "finish recovered optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "finish recovered frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_recovered_terminal(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        None,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Finish,
+            job_id,
+            "finish recovered optimize job",
+        )
+        .await
+    }
+
+    /// Recovery-only takeover: fail a job that already dispatched external work
+    /// whose outcome this frontend cannot prove.
+    pub async fn fail_recovered_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        message: String,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fail recovered optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fail recovered frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                let message = message.clone();
+                Box::pin(async move {
+                    apply_recovered_terminal(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        Some(message),
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Fail,
+            job_id,
+            "fail recovered optimize job",
+        )
+        .await
+    }
+
+    /// Recovery-only transition: hand a claimed-but-undispatched job back to
+    /// the PENDING queue so any frontend can execute it under a new attempt.
+    pub async fn release_undispatched_fenced(
+        &self,
+        job_id: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "release undispatched optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "release undispatched frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_release_undispatched(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Claim,
+            job_id,
+            "release undispatched optimize job",
+        )
+        .await
+    }
+
+    pub async fn record_outcome_fenced(
+        &self,
+        job_id: i64,
+        outcome: OptimizeJobOutcome,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fenced record optimize job outcome")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced record frontend optimize job outcome",
+            |transaction| {
+                let outcome = outcome.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_record_outcome(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        outcome,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::RecordOutcome,
+            job_id,
+            "fenced record outcome for optimize job",
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(&self, job_id: i64, now_ms: i64) -> RepositoryResult<()> {
         validate_job_id(job_id, "finish optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -359,9 +694,9 @@ impl OptimizeJobRepository {
             operation_id,
             "finish frontend optimize job",
             |transaction| {
-                Box::pin(
-                    async move { apply_finish(transaction, operation_id, job_id, now_ms).await },
-                )
+                Box::pin(async move {
+                    apply_finish(transaction, operation_id, job_id, now_ms, None).await
+                })
             },
         )
         .await;
@@ -375,6 +710,52 @@ impl OptimizeJobRepository {
         .await
     }
 
+    pub async fn finish_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fenced finish optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced finish frontend optimize job",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_finish(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Finish,
+            job_id,
+            "fenced finish optimize job",
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail(&self, job_id: i64, now_ms: i64, message: String) -> RepositoryResult<()> {
         validate_job_id(job_id, "fail optimize job")?;
         let operation_id = OperationId::new_v7();
@@ -386,7 +767,7 @@ impl OptimizeJobRepository {
             |transaction| {
                 let message = message.clone();
                 Box::pin(async move {
-                    apply_fail(transaction, operation_id, job_id, now_ms, message).await
+                    apply_fail(transaction, operation_id, job_id, now_ms, message, None).await
                 })
             },
         )
@@ -401,25 +782,48 @@ impl OptimizeJobRepository {
         .await
     }
 
-    pub async fn reconcile_startup(&self, now_ms: i64) -> RepositoryResult<usize> {
-        let running = self
-            .list_indexed_jobs(RUNNING_PREFIX, OptimizeJobState::Running)
-            .await?;
-        let mut reconciled = 0;
-        for job in running {
-            if job.outcome.is_some() {
-                self.finish(job.job_id, now_ms).await?;
-            } else {
-                self.fail(
-                    job.job_id,
-                    now_ms,
-                    "optimize job failed during frontend restart reconciliation".to_string(),
-                )
-                .await?;
-            }
-            reconciled += 1;
-        }
-        Ok(reconciled)
+    pub async fn fail_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        message: String,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "fenced fail optimize job")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "fenced fail frontend optimize job",
+            |transaction| {
+                let message = message.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_fail(
+                        transaction,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        message,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::Fail,
+            job_id,
+            "fenced fail optimize job",
+        )
+        .await
     }
 
     async fn list_indexed_jobs(
@@ -590,6 +994,7 @@ impl OptimizeJobRepository {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn recover_operation(
         &self,
         transaction_id: TransactionId,
@@ -708,7 +1113,15 @@ async fn apply_create(
     transaction: &mut dyn WriteTransaction,
     operation_id: OperationId,
     request: OptimizeJobCreate,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<OptimizeJob> {
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
+    }
     let active_key = match active_target_key(&request.target) {
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
@@ -805,7 +1218,7 @@ async fn apply_create(
                     Ok(counter) => counter,
                     Err(error) => return Ok(Err(error)),
                 };
-            if counter.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION || counter.last_job_id < 0 {
+            if !is_optimize_schema_version(counter.schema_version) || counter.last_job_id < 0 {
                 return Ok(Err(RepositoryError::corruption(
                     "optimize job counter is corrupt",
                 )));
@@ -831,6 +1244,8 @@ async fn apply_create(
         started_at_ms: None,
         finished_at_ms: None,
         last_operation_id: *operation_id.as_uuid(),
+        authority: None,
+        dispatched_child: None,
     };
     let counter = StoredOptimizeCounterV1 {
         schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
@@ -883,11 +1298,49 @@ async fn apply_create(
     Ok(Ok(OptimizeJob::from(&stored)))
 }
 
+fn validate_authority(authority: &MaintenanceAuthorityV1) -> RepositoryResult<()> {
+    authority
+        .validate()
+        .map_err(|error| RepositoryError::corruption(format!("invalid durable authority: {error}")))
+}
+
+async fn validate_fenced_authority(
+    transaction: &mut dyn WriteTransaction,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> RepositoryResult<()> {
+    validate_authority(authority)?;
+    validator(transaction).await.map_err(|error| {
+        RepositoryError::authority_lost(format!("maintenance authority lost: {error}"))
+    })
+}
+
+// Design: ADR-0065 (docs/adr/ADR-0065-per-table-maintenance-lease-attempt-authority.md)
+async fn validate_bound_fenced_authority(
+    transaction: &mut dyn WriteTransaction,
+    durable: Option<&MaintenanceAuthorityV1>,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> RepositoryResult<()> {
+    let Some(durable) = durable else {
+        return Err(RepositoryError::authority_lost(
+            "maintenance operation has no durable authority",
+        ));
+    };
+    if durable != authority {
+        return Err(RepositoryError::authority_lost(
+            "maintenance operation authority does not match this attempt",
+        ));
+    }
+    validate_fenced_authority(transaction, authority, validator).await
+}
+
 async fn apply_claim(
     transaction: &mut dyn WriteTransaction,
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<Option<OptimizeJob>> {
     let Some(mut job) = (match load_job_from_transaction(transaction, job_id).await? {
         Ok(job) => job,
@@ -915,6 +1368,14 @@ async fn apply_claim(
     if let Err(error) = require_active_index(transaction, &job.stored, "claim optimize job").await?
     {
         return Ok(Err(error));
+    }
+
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+            return Ok(Err(error));
+        }
+        job.stored.schema_version = OPTIMIZE_JOB_SCHEMA_VERSION;
+        job.stored.authority = Some(authority.clone());
     }
 
     job.stored.state = StoredOptimizeJobStateV1::Running;
@@ -959,11 +1420,148 @@ async fn apply_claim(
     Ok(Ok(Some(OptimizeJob::from(&job.stored))))
 }
 
+/// Terminalize a job left RUNNING by a previous attempt.
+///
+/// `message` selects the terminal state: `None` finalizes a job whose outcome
+/// is already durable, `Some` fails a job whose external effect this frontend
+/// cannot prove. Both are takeovers, so the live lease is the authority and the
+/// record is rebound to the recovering attempt.
+async fn apply_recovered_terminal(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: OperationId,
+    job_id: i64,
+    now_ms: i64,
+    message: Option<String>,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<()> {
+    let mut job = match require_running_job(transaction, job_id, "recover optimize job").await? {
+        Ok(job) => job,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    job.stored.schema_version = OPTIMIZE_JOB_SCHEMA_VERSION;
+    job.stored.authority = Some(authority.clone());
+    let action = match message {
+        Some(message) => {
+            job.stored.state = StoredOptimizeJobStateV1::Failed;
+            job.stored.error_message = Some(message);
+            StoredOptimizeOperationActionV1::Fail
+        }
+        None => {
+            if job.stored.outcome.is_none() {
+                return Ok(Err(RepositoryError::new(
+                    RepositoryErrorKind::InvalidTransition,
+                    format!("recover optimize job {job_id} failed: outcome has not been recorded"),
+                )));
+            }
+            job.stored.state = StoredOptimizeJobStateV1::Finished;
+            job.stored.error_message = None;
+            StoredOptimizeOperationActionV1::Finish
+        }
+    };
+    job.stored.finished_at_ms = Some(now_ms);
+    job.stored.last_operation_id = *operation_id.as_uuid();
+    terminalize_job(transaction, operation_id, action, job).await
+}
+
+/// Return a claimed-but-never-dispatched job to PENDING under the recovering
+/// attempt. This is only legal while `dispatched_child` is absent: the job has
+/// produced no external effect, so re-running it is not a replay.
+///
+/// Recovery is a takeover, so the caller's authority is validated against the
+/// live lease rather than against the stale attempt bound to the record. A
+/// frontend that lost the lease fails this check exactly like any other
+/// authority-bearing transition.
+async fn apply_release_undispatched(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: OperationId,
+    job_id: i64,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<()> {
+    let mut job = match require_running_job(
+        transaction,
+        job_id,
+        "release undispatched optimize job",
+    )
+    .await?
+    {
+        Ok(job) => job,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if job.stored.dispatched_child.is_some() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "optimize job already dispatched a distributed rewrite",
+        )));
+    }
+    if job.stored.outcome.is_some() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "optimize job already recorded an outcome",
+        )));
+    }
+    job.stored.state = StoredOptimizeJobStateV1::Pending;
+    job.stored.started_at_ms = None;
+    // The next executor takes a new attempt; leaving the old provenance would
+    // let a stale fence look current to a later fenced transition.
+    job.stored.authority = None;
+    job.stored.last_operation_id = *operation_id.as_uuid();
+    let value = match encode_job(&job.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let key = match job_key(job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let running_key = match state_key(RUNNING_PREFIX, job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let pending_key = match state_key(PENDING_PREFIX, job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let index_value = match encode_index_value(job_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (operation_key, operation_value) = match operation_record(
+        operation_id,
+        StoredOptimizeOperationActionV1::Claim,
+        &job.stored,
+    ) {
+        Ok(record) => record,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(key, value, Precondition::Version(job.version))
+        .await?;
+    transaction
+        .delete(running_key, Precondition::Present)
+        .await?;
+    transaction
+        .put(pending_key, index_value, Precondition::Absent)
+        .await?;
+    transaction
+        .put(operation_key, operation_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(()))
+}
+
 async fn apply_record_outcome(
     transaction: &mut dyn WriteTransaction,
     operation_id: OperationId,
     job_id: i64,
     outcome: OptimizeJobOutcome,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<()> {
     let mut job =
         match require_running_job(transaction, job_id, "record optimize job outcome").await? {
@@ -976,6 +1574,17 @@ async fn apply_record_outcome(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            job.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     let key = match job_key(job_id) {
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
@@ -1002,11 +1611,23 @@ async fn apply_finish(
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<()> {
     let mut job = match require_running_job(transaction, job_id, "finish optimize job").await? {
         Ok(job) => job,
         Err(error) => return Ok(Err(error)),
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            job.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if job.stored.outcome.is_none() {
         return Ok(Err(RepositoryError::new(
             RepositoryErrorKind::InvalidTransition,
@@ -1032,11 +1653,23 @@ async fn apply_fail(
     job_id: i64,
     now_ms: i64,
     message: String,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<()> {
     let mut job = match require_running_job(transaction, job_id, "fail optimize job").await? {
         Ok(job) => job,
         Err(error) => return Ok(Err(error)),
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            job.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     job.stored.state = StoredOptimizeJobStateV1::Failed;
     job.stored.error_message = Some(message);
     job.stored.finished_at_ms = Some(now_ms);
@@ -1218,7 +1851,7 @@ fn decode_job_record(record: StateRecord) -> RepositoryResult<StoredOptimizeJobV
 }
 
 fn validate_stored_job(stored: &StoredOptimizeJobV1) -> RepositoryResult<()> {
-    if stored.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION {
+    if !is_optimize_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(format!(
             "unsupported optimize job schema version: {}",
             stored.schema_version
@@ -1300,7 +1933,7 @@ fn operation_record(
 }
 
 fn validate_operation_marker(marker: &StoredOptimizeOperationV1) -> RepositoryResult<()> {
-    if marker.schema_version != OPTIMIZE_JOB_SCHEMA_VERSION {
+    if !is_optimize_schema_version(marker.schema_version) {
         return Err(RepositoryError::corruption(
             "optimize operation marker has an unsupported schema version",
         ));
@@ -1586,7 +2219,49 @@ impl MetadataMaintenanceOperationRepository {
             |transaction| {
                 let request = request.clone();
                 Box::pin(async move {
-                    apply_metadata_create(transaction, transaction_operation_id, request).await
+                    apply_metadata_create(transaction, transaction_operation_id, request, None)
+                        .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Create,
+            request.operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn create_admitted(
+        &self,
+        request: MetadataMaintenanceOperationCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_create(&request)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!(
+            "admitted create metadata maintenance operation {}",
+            request.operation_id
+        );
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "admitted create frontend metadata maintenance operation",
+            |transaction| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_metadata_create(
+                        transaction,
+                        transaction_operation_id,
+                        request,
+                        Some(&admission),
+                    )
+                    .await
                 })
             },
         )
@@ -1603,6 +2278,11 @@ impl MetadataMaintenanceOperationRepository {
 
     /// Atomically persists the opaque plan and changes PENDING to RUNNING.
     /// The returned record is the only state that authorizes provider execute.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn start(
         &self,
         operation_id: Uuid,
@@ -1630,6 +2310,7 @@ impl MetadataMaintenanceOperationRepository {
                         operation_id,
                         plan,
                         now_ms,
+                        None,
                     )
                     .await
                 })
@@ -1646,6 +2327,62 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    /// Persists the plan checkpoint and binds the attempt that owns all later
+    /// provider-facing transitions for this metadata operation.
+    pub async fn start_fenced(
+        &self,
+        operation_id: Uuid,
+        plan: MetadataMaintenancePlanPayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &plan.payload,
+            plan.payload_digest,
+            "metadata maintenance plan payload",
+        )?;
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("fenced start metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced start frontend metadata maintenance operation",
+            |transaction| {
+                let plan = plan.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_start(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        plan,
+                        now_ms,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Start,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_reconcile_pending(
         &self,
         operation_id: Uuid,
@@ -1672,6 +2409,7 @@ impl MetadataMaintenanceOperationRepository {
                         transaction_operation_id,
                         operation_id,
                         evidence,
+                        None,
                     )
                     .await
                 })
@@ -1688,6 +2426,103 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    /// Take a stalled metadata operation over: prove the caller holds the live
+    /// lease, then rebind the record to the caller's attempt so its later
+    /// fenced transitions validate normally. The previous attempt's provenance
+    /// is replaced, never trusted.
+    pub async fn adopt_authority_fenced(
+        &self,
+        operation_id: Uuid,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("adopt metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "adopt frontend metadata maintenance operation",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_adopt(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Start,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        evidence: MetadataMaintenanceOpaquePayload,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &evidence.payload,
+            evidence.digest,
+            "metadata maintenance reconcile evidence",
+        )?;
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context =
+            format!("fenced reconcile-pending metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced record frontend metadata maintenance reconcile evidence",
+            |transaction| {
+                let evidence = evidence.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_reconcile_pending(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        evidence,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::ReconcilePending,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(
         &self,
         operation_id: Uuid,
@@ -1709,6 +2544,37 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    pub async fn finish_fenced(
+        &self,
+        operation_id: Uuid,
+        receipt: MetadataMaintenanceOpaquePayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &receipt.payload,
+            receipt.digest,
+            "metadata maintenance receipt",
+        )?;
+        validate_authority(&authority)?;
+        self.transition_terminal_fenced(
+            operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Finish,
+            Some(receipt),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail(
         &self,
         operation_id: Uuid,
@@ -1726,8 +2592,35 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    pub async fn fail_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_error(&message)?;
+        validate_authority(&authority)?;
+        self.transition_terminal_fenced(
+            operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Fail,
+            None,
+            Some(message),
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     /// An unresolved operation retains its table fence.  A later incarnation
     /// must not silently turn it into a current-generation operation.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_unresolved(
         &self,
         operation_id: Uuid,
@@ -1751,6 +2644,53 @@ impl MetadataMaintenanceOperationRepository {
                         operation_id,
                         message,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Unresolve,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_error(&message)?;
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context =
+            format!("fenced mark metadata maintenance operation {operation_id} unresolved");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced mark frontend metadata maintenance operation unresolved",
+            |transaction| {
+                let message = message.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_unresolved(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        message,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -2057,6 +2997,56 @@ impl MetadataMaintenanceOperationRepository {
                         receipt,
                         message,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            action,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_terminal_fenced(
+        &self,
+        operation_id: Uuid,
+        action: StoredMetadataMaintenanceTransactionActionV2,
+        receipt: Option<MetadataMaintenanceOpaquePayload>,
+        message: Option<String>,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("fenced terminal metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "fenced terminal frontend metadata maintenance operation",
+            |transaction| {
+                let receipt = receipt.clone();
+                let message = message.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_metadata_terminal(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        action,
+                        receipt,
+                        message,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -2208,9 +3198,17 @@ async fn apply_metadata_create(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
     request: MetadataMaintenanceOperationCreate,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     if let Err(error) = validate_metadata_create(&request) {
         return Ok(Err(error));
+    }
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
     }
     let existing = match load_metadata_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
@@ -2308,6 +3306,7 @@ async fn apply_metadata_create(
         created_at_ms: request.created_at_ms,
         started_at_ms: None,
         finished_at_ms: None,
+        authority: None,
     };
     let operation_key = match metadata_operation_key(request.operation_id) {
         Ok(key) => key,
@@ -2369,12 +3368,77 @@ async fn apply_metadata_create(
     Ok(Ok(MetadataMaintenanceOperation::from(&stored)))
 }
 
+/// Rebind a metadata operation to the caller's attempt after a takeover.
+///
+/// The live lease is the authority here; the stale attempt recorded by a dead
+/// frontend is replaced rather than compared. The business state is untouched,
+/// so this cannot skip a transition or fabricate progress.
+async fn apply_metadata_adopt(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    let loaded = match load_metadata_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!("adopt metadata maintenance operation {operation_id} failed: not found"),
+        )));
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if operation.stored.state.is_terminal() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "a terminal metadata maintenance operation cannot be adopted",
+        )));
+    }
+    operation.stored.schema_version = METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION;
+    operation.stored.authority = Some(authority.clone());
+    // Adoption only replaces provenance: the state indexes and the active
+    // target fence stay exactly where they are.
+    let operation_key = match metadata_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_metadata_operation(&operation.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match metadata_transaction_record(
+        transaction_operation_id,
+        StoredMetadataMaintenanceTransactionActionV2::Start,
+        &operation.stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(
+            operation_key,
+            operation_value,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)))
+}
+
 async fn apply_metadata_start(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     plan: MetadataMaintenancePlanPayload,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2388,6 +3452,21 @@ async fn apply_metadata_start(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Err(error) = validate_authority(authority) {
+            return Ok(Err(error));
+        }
+        if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+            return Ok(Err(error));
+        }
+        if let Some(durable) = operation.stored.authority.as_ref()
+            && durable != authority
+        {
+            return Ok(Err(RepositoryError::authority_lost(
+                "metadata maintenance durable authority does not match attempt",
+            )));
+        }
+    }
     if operation.stored.state == MetadataMaintenanceOperationState::Running
         && operation.stored.plan_digest == Some(plan.plan_digest)
         && metadata_payload_matches(
@@ -2418,6 +3497,9 @@ async fn apply_metadata_start(
         return Ok(Err(error));
     }
     operation.stored.state = MetadataMaintenanceOperationState::Running;
+    if let Some((authority, _)) = fenced {
+        operation.stored.authority = Some(authority.clone());
+    }
     operation.stored.plan_digest = Some(plan.plan_digest);
     operation.stored.plan_summary = Some(plan.summary);
     operation.stored.started_at_ms = Some(now_ms);
@@ -2451,6 +3533,7 @@ async fn apply_metadata_reconcile_pending(
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     evidence: MetadataMaintenanceOpaquePayload,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2464,6 +3547,17 @@ async fn apply_metadata_reconcile_pending(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state == MetadataMaintenanceOperationState::ReconcilePending
         && metadata_payload_matches(
             transaction,
@@ -2520,6 +3614,7 @@ async fn apply_metadata_reconcile_pending(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_metadata_terminal(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
@@ -2528,6 +3623,7 @@ async fn apply_metadata_terminal(
     receipt: Option<MetadataMaintenanceOpaquePayload>,
     message: Option<String>,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2541,6 +3637,17 @@ async fn apply_metadata_terminal(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     let target_state = match action {
         StoredMetadataMaintenanceTransactionActionV2::Finish => {
             MetadataMaintenanceOperationState::Finished
@@ -2629,6 +3736,7 @@ async fn apply_metadata_unresolved(
     operation_id: Uuid,
     message: String,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let loaded = match load_metadata_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -2642,6 +3750,17 @@ async fn apply_metadata_unresolved(
             ),
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state == MetadataMaintenanceOperationState::Unresolved {
         return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
     }
@@ -2931,7 +4050,7 @@ fn validate_metadata_error(message: &str) -> RepositoryResult<()> {
 fn validate_metadata_operation(
     stored: &StoredMetadataMaintenanceOperationV2,
 ) -> RepositoryResult<()> {
-    if stored.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION {
+    if !is_metadata_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "metadata maintenance operation has unsupported schema version",
         ));
@@ -3022,7 +4141,7 @@ fn encode_metadata_payload(
 fn validate_stored_metadata_payload(
     stored: &StoredMetadataMaintenancePayloadV2,
 ) -> RepositoryResult<()> {
-    if stored.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION {
+    if !is_metadata_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "metadata maintenance payload has unsupported schema version",
         ));
@@ -3055,7 +4174,7 @@ fn metadata_transaction_record(
 fn validate_metadata_transaction_marker(
     marker: &StoredMetadataMaintenanceTransactionV2,
 ) -> RepositoryResult<()> {
-    if marker.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION
+    if !is_metadata_schema_version(marker.schema_version)
         || marker.operation_id != marker.post_operation.operation_id
     {
         return Err(RepositoryError::corruption(
@@ -3254,10 +4373,55 @@ impl DistributedRewriteOperationRepository {
         self.create_inner(request, None).await
     }
 
+    pub async fn create_admitted(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_create(&request)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let operation_id = request.operation_id;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "admitted create frontend distributed rewrite operation",
+            |transaction| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_rewrite_create(
+                        transaction,
+                        transaction_operation_id,
+                        request,
+                        None,
+                        None,
+                        Some(&admission),
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_rewrite_result(
+            result,
+            transaction_operation_id,
+            StoredDistributedRewriteTransactionActionV3::Create,
+            operation_id,
+            "admitted create distributed rewrite operation",
+        )
+        .await
+    }
+
     /// Create the rewrite operation owned by an already-claimed v1 OPTIMIZE
     /// job. The v1 active-target index remains an external fence; this narrow
     /// path merely proves, in the same transaction, that it belongs to the
     /// running job that is creating its child rewrite operation.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn create_for_claimed_optimize_job(
         &self,
         request: DistributedRewriteOperationCreate,
@@ -3267,10 +4431,38 @@ impl DistributedRewriteOperationRepository {
             .await
     }
 
+    /// Creates a V3 child under the exact authority installed on its claimed
+    /// V1 parent. A child never acquires a second table lease.
+    pub async fn create_for_claimed_optimize_job_fenced(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        claimed_optimize_job_id: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_authority(&authority)?;
+        self.create_inner_fenced(
+            request,
+            Some(claimed_optimize_job_id),
+            Some((authority, validator)),
+        )
+        .await
+    }
+
     async fn create_inner(
         &self,
         request: DistributedRewriteOperationCreate,
         claimed_optimize_job_id: Option<i64>,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.create_inner_fenced(request, claimed_optimize_job_id, None)
+            .await
+    }
+
+    async fn create_inner_fenced(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        claimed_optimize_job_id: Option<i64>,
+        fenced: Option<(MaintenanceAuthorityV1, MaintenanceFenceValidator)>,
     ) -> RepositoryResult<DistributedRewriteOperation> {
         validate_rewrite_create(&request)?;
         let transaction_operation_id = OperationId::new_v7();
@@ -3282,12 +4474,17 @@ impl DistributedRewriteOperationRepository {
             "create frontend distributed rewrite operation",
             |transaction| {
                 let request = request.clone();
+                let fenced = fenced.clone();
                 Box::pin(async move {
                     apply_rewrite_create(
                         transaction,
                         transaction_operation_id,
                         request,
                         claimed_optimize_job_id,
+                        fenced
+                            .as_ref()
+                            .map(|(authority, validator)| (authority, validator)),
+                        None,
                     )
                     .await
                 })
@@ -3304,6 +4501,11 @@ impl DistributedRewriteOperationRepository {
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn plan(
         &self,
         operation_id: Uuid,
@@ -3331,10 +4533,51 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Plan(plan)),
             None,
             now_ms,
+            None,
         )
         .await
     }
 
+    pub async fn plan_fenced(
+        &self,
+        operation_id: Uuid,
+        plan: DistributedRewritePlanPayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &plan.payload,
+            plan.payload_digest,
+            "distributed rewrite plan payload",
+        )?;
+        validate_authority(&authority)?;
+        if plan.cohort_count as usize
+            > novarocks_spi::connector::MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS
+        {
+            return Err(RepositoryError::new(
+                RepositoryErrorKind::Store,
+                "distributed rewrite plan exceeds cohort limit",
+            ));
+        }
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Plan,
+            &[DistributedRewriteOperationState::Pending],
+            DistributedRewriteOperationState::Planned,
+            Some(RewriteTransitionPayload::Plan(plan)),
+            None,
+            now_ms,
+            Some((authority, validator)),
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn start_staging(
         &self,
         operation_id: Uuid,
@@ -3348,10 +4591,16 @@ impl DistributedRewriteOperationRepository {
             None,
             None,
             now_ms,
+            None,
         )
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn checkpoint_attempt(
         &self,
         operation_id: Uuid,
@@ -3366,10 +4615,16 @@ impl DistributedRewriteOperationRepository {
             None,
             Some(checkpoint),
             0,
+            None,
         )
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_abort_pending(
         &self,
         operation_id: Uuid,
@@ -3388,10 +4643,16 @@ impl DistributedRewriteOperationRepository {
             None,
             None,
             now_ms,
+            None,
         )
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_commit_pending(
         &self,
         operation_id: Uuid,
@@ -3405,10 +4666,16 @@ impl DistributedRewriteOperationRepository {
             None,
             None,
             now_ms,
+            None,
         )
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_reconcile_pending(
         &self,
         operation_id: Uuid,
@@ -3428,10 +4695,16 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Evidence(evidence)),
             None,
             now_ms,
+            None,
         )
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(
         &self,
         operation_id: Uuid,
@@ -3456,10 +4729,16 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Receipt(receipt)),
             None,
             now_ms,
+            None,
         )
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail(
         &self,
         operation_id: Uuid,
@@ -3480,10 +4759,16 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Error(message)),
             None,
             now_ms,
+            None,
         )
         .await
     }
 
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_unresolved(
         &self,
         operation_id: Uuid,
@@ -3504,6 +4789,254 @@ impl DistributedRewriteOperationRepository {
             Some(RewriteTransitionPayload::Error(message)),
             None,
             now_ms,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_staging_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::StartStaging,
+            &[DistributedRewriteOperationState::Planned],
+            DistributedRewriteOperationState::Staging,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn checkpoint_attempt_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: DistributedRewriteAttemptCheckpoint,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_checkpoint(&checkpoint)?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Checkpoint,
+            &[DistributedRewriteOperationState::Staging],
+            DistributedRewriteOperationState::Staging,
+            None,
+            Some(checkpoint),
+            0,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    /// Take a stalled distributed rewrite over: prove the live lease, rebind the
+    /// record's attempt, and leave the business state untouched.
+    pub async fn adopt_authority_fenced(
+        &self,
+        operation_id: Uuid,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_authority(&authority)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("adopt distributed rewrite operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "adopt frontend distributed rewrite operation",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_rewrite_adopt(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_rewrite_result(
+            result,
+            transaction_operation_id,
+            StoredDistributedRewriteTransactionActionV3::Checkpoint,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn mark_abort_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::AbortPending,
+            &[
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+            ],
+            DistributedRewriteOperationState::AbortPending,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn mark_commit_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::CommitPending,
+            &[DistributedRewriteOperationState::Staging],
+            DistributedRewriteOperationState::CommitPending,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        evidence: DistributedRewriteOpaquePayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &evidence.payload,
+            evidence.digest,
+            "distributed rewrite evidence",
+        )?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::ReconcilePending,
+            &[DistributedRewriteOperationState::CommitPending],
+            DistributedRewriteOperationState::ReconcilePending,
+            Some(RewriteTransitionPayload::Evidence(evidence)),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn finish_fenced(
+        &self,
+        operation_id: Uuid,
+        receipt: DistributedRewriteOpaquePayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &receipt.payload,
+            receipt.digest,
+            "distributed rewrite receipt",
+        )?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Finish,
+            &[
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::AbortPending,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+            ],
+            DistributedRewriteOperationState::Finished,
+            Some(RewriteTransitionPayload::Receipt(receipt)),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn fail_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_error(&message)?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Fail,
+            &[
+                DistributedRewriteOperationState::Pending,
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::AbortPending,
+            ],
+            DistributedRewriteOperationState::Failed,
+            Some(RewriteTransitionPayload::Error(message)),
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_error(&message)?;
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Unresolve,
+            &[
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+                DistributedRewriteOperationState::AbortPending,
+            ],
+            DistributedRewriteOperationState::Unresolved,
+            Some(RewriteTransitionPayload::Error(message)),
+            None,
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -3723,6 +5256,7 @@ impl DistributedRewriteOperationRepository {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_transition(
         &self,
         operation_id: Uuid,
@@ -3732,6 +5266,7 @@ impl DistributedRewriteOperationRepository {
         payload: Option<RewriteTransitionPayload>,
         checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
         now_ms: i64,
+        fenced: Option<(MaintenanceAuthorityV1, MaintenanceFenceValidator)>,
     ) -> RepositoryResult<DistributedRewriteOperation> {
         let transaction_operation_id = OperationId::new_v7();
         let result = run_side_effect_free(
@@ -3743,6 +5278,7 @@ impl DistributedRewriteOperationRepository {
                 let payload = payload.clone();
                 let checkpoint = checkpoint.clone();
                 let allowed = allowed.to_vec();
+                let fenced = fenced.clone();
                 Box::pin(async move {
                     apply_rewrite_transition(
                         transaction,
@@ -3754,6 +5290,9 @@ impl DistributedRewriteOperationRepository {
                         payload,
                         checkpoint,
                         now_ms,
+                        fenced
+                            .as_ref()
+                            .map(|(authority, validator)| (authority, validator)),
                     )
                     .await
                 })
@@ -3766,6 +5305,33 @@ impl DistributedRewriteOperationRepository {
             action,
             operation_id,
             "transition distributed rewrite operation",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_transition_fenced(
+        &self,
+        operation_id: Uuid,
+        action: StoredDistributedRewriteTransactionActionV3,
+        allowed: &[DistributedRewriteOperationState],
+        next: DistributedRewriteOperationState,
+        payload: Option<RewriteTransitionPayload>,
+        checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_authority(&authority)?;
+        self.rewrite_transition(
+            operation_id,
+            action,
+            allowed,
+            next,
+            payload,
+            checkpoint,
+            now_ms,
+            Some((authority, validator)),
         )
         .await
     }
@@ -3827,9 +5393,18 @@ async fn apply_rewrite_create(
     transaction_operation_id: OperationId,
     request: DistributedRewriteOperationCreate,
     claimed_optimize_job_id: Option<i64>,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<DistributedRewriteOperation> {
     if let Err(error) = validate_rewrite_create(&request) {
         return Ok(Err(error));
+    }
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
     }
     let existing = match load_rewrite_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
@@ -3874,7 +5449,7 @@ async fn apply_rewrite_create(
             )));
         }
         let active_job = match load_job_from_transaction(transaction, active_job_id).await? {
-            Ok(Some(job)) => job.stored,
+            Ok(Some(job)) => job,
             Ok(None) => {
                 return Ok(Err(RepositoryError::corruption(format!(
                     "create distributed rewrite operation failed: active optimize job {active_job_id} is missing"
@@ -3882,12 +5457,47 @@ async fn apply_rewrite_create(
             }
             Err(error) => return Ok(Err(error)),
         };
+        let active_job_version = active_job.version.clone();
+        let mut active_job = active_job.stored;
         if active_job.target != StoredMaintenanceTargetV1::from(&request.target)
             || active_job.state != StoredOptimizeJobStateV1::Running
         {
             return Ok(Err(RepositoryError::corruption(format!(
                 "create distributed rewrite operation failed: active optimize job {active_job_id} is not the claimed running target"
             ))));
+        }
+        if let Some((authority, validator)) = fenced
+            && let Err(error) = validate_bound_fenced_authority(
+                transaction,
+                active_job.authority.as_ref(),
+                authority,
+                validator,
+            )
+            .await
+        {
+            return Ok(Err(error));
+        }
+        // Record the dispatch link in this same transaction. After a crash the
+        // recovery owner reads it to know an external rewrite may already have
+        // happened, instead of guessing from the absence of an outcome.
+        if active_job.dispatched_child.is_none() {
+            active_job.dispatched_child = Some(request.operation_id);
+            active_job.schema_version = OPTIMIZE_JOB_SCHEMA_VERSION;
+            let job_value = match encode_job(&active_job) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            let job_record_key = match job_key(active_job_id) {
+                Ok(key) => key,
+                Err(error) => return Ok(Err(error)),
+            };
+            transaction
+                .put(
+                    job_record_key,
+                    job_value,
+                    Precondition::Version(active_job_version),
+                )
+                .await?;
         }
     } else if let Some(claimed_job_id) = claimed_optimize_job_id {
         return Ok(Err(RepositoryError::corruption(format!(
@@ -3929,6 +5539,7 @@ async fn apply_rewrite_create(
         created_at_ms: request.created_at_ms,
         started_at_ms: None,
         finished_at_ms: None,
+        authority: fenced.map(|(authority, _)| authority.clone()),
     };
     let operation_key = rewrite_operation_key(request.operation_id)?;
     let pending_key = rewrite_state_key(
@@ -3983,6 +5594,7 @@ async fn apply_rewrite_create(
     Ok(Ok(DistributedRewriteOperation::from(&stored)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_rewrite_transition(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
@@ -3993,6 +5605,7 @@ async fn apply_rewrite_transition(
     payload: Option<RewriteTransitionPayload>,
     checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<DistributedRewriteOperation> {
     let loaded = match load_rewrite_operation(transaction, operation_id).await? {
         Ok(value) => value,
@@ -4004,6 +5617,20 @@ async fn apply_rewrite_transition(
             format!("distributed rewrite operation {operation_id} not found"),
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Some(durable) = operation.stored.authority.as_ref() {
+            if let Err(error) =
+                validate_bound_fenced_authority(transaction, Some(durable), authority, validator)
+                    .await
+            {
+                return Ok(Err(error));
+            }
+        } else if let Err(error) =
+            validate_fenced_authority(transaction, authority, validator).await
+        {
+            return Ok(Err(error));
+        }
+    }
     if operation.stored.state == next {
         if let Some(RewriteTransitionPayload::Plan(plan)) = &payload {
             if operation.stored.plan_digest == Some(plan.plan_digest)
@@ -4041,6 +5668,9 @@ async fn apply_rewrite_transition(
     .await?
     {
         return Ok(Err(error));
+    }
+    if let Some((authority, _)) = fenced {
+        operation.stored.authority = Some(authority.clone());
     }
     let mut extra = None;
     match payload {
@@ -4091,16 +5721,15 @@ async fn apply_rewrite_transition(
     if next == DistributedRewriteOperationState::Finished {
         operation.stored.finished_at_ms = Some(now_ms);
     }
-    if next == DistributedRewriteOperationState::AbortPending
+    if (next == DistributedRewriteOperationState::AbortPending
         || next == DistributedRewriteOperationState::CommitPending
         || next == DistributedRewriteOperationState::ReconcilePending
-        || next == DistributedRewriteOperationState::Staging
+        || next == DistributedRewriteOperationState::Staging)
+        && operation.stored.started_at_ms.is_none()
     {
-        if operation.stored.started_at_ms.is_none() {
-            return Ok(Err(RepositoryError::corruption(
-                "active distributed rewrite operation has no durable plan",
-            )));
-        }
+        return Ok(Err(RepositoryError::corruption(
+            "active distributed rewrite operation has no durable plan",
+        )));
     }
     operation.stored.state = next;
     rewrite_transition_state(
@@ -4116,6 +5745,7 @@ async fn apply_rewrite_transition(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_transition_state(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
@@ -4190,6 +5820,118 @@ async fn rewrite_transition_state(
     Ok(Ok(DistributedRewriteOperation::from(&operation.stored)))
 }
 
+/// Rebind a distributed rewrite to the caller's attempt after a takeover.
+async fn apply_rewrite_adopt(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<DistributedRewriteOperation> {
+    let loaded = match load_rewrite_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!("adopt distributed rewrite operation {operation_id} failed: not found"),
+        )));
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if operation.stored.state.is_terminal() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "a terminal distributed rewrite cannot be adopted",
+        )));
+    }
+    operation.stored.schema_version = DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION;
+    operation.stored.authority = Some(authority.clone());
+    let operation_key = match rewrite_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_rewrite_operation(&operation.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match rewrite_transaction_record(
+        transaction_operation_id,
+        StoredDistributedRewriteTransactionActionV3::Checkpoint,
+        &operation.stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(
+            operation_key,
+            operation_value,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(DistributedRewriteOperation::from(&operation.stored)))
+}
+
+/// Rebind a cleanup operation to the caller's attempt after a takeover.
+async fn apply_cleanup_adopt(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    operation_id: Uuid,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<CleanupOperation> {
+    let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            "cleanup operation not found",
+        )));
+    };
+    if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+        return Ok(Err(error));
+    }
+    if operation.stored.state.is_terminal() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "a terminal cleanup operation cannot be adopted",
+        )));
+    }
+    operation.stored.schema_version = CLEANUP_OPERATION_SCHEMA_VERSION;
+    operation.stored.authority = Some(authority.clone());
+    let operation_key = match cleanup_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_cleanup_operation(&operation.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match cleanup_transaction_record(
+        transaction_id,
+        StoredCleanupTransactionActionV4::Checkpoint,
+        &operation.stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(
+            operation_key,
+            operation_value,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(CleanupOperation::from(&operation.stored)))
+}
+
 async fn load_rewrite_operation(
     transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
     operation_id: Uuid,
@@ -4232,7 +5974,7 @@ async fn require_rewrite_state_and_active(
     };
     let decoded: StoredSharedActiveFenceV3 =
         decode_rewrite_json(active.value.as_bytes(), "shared maintenance active fence")?;
-    if decoded.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+    if !is_rewrite_schema_version(decoded.schema_version)
         || decoded.family != SharedMaintenanceOperationFamilyV3::DistributedRewrite
         || decoded.operation_id != operation.operation_id
     {
@@ -4335,7 +6077,7 @@ fn validate_rewrite_error(message: &str) -> RepositoryResult<()> {
 fn validate_rewrite_operation(
     stored: &StoredDistributedRewriteOperationV3,
 ) -> RepositoryResult<()> {
-    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+    if !is_rewrite_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "distributed rewrite operation has unsupported schema version",
         ));
@@ -4451,7 +6193,7 @@ fn decode_rewrite_payload(
 ) -> RepositoryResult<StoredDistributedRewritePayloadV3> {
     let stored: StoredDistributedRewritePayloadV3 =
         decode_rewrite_json(record.value.as_bytes(), "distributed rewrite payload")?;
-    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+    if !is_rewrite_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "distributed rewrite payload has unsupported schema version",
         ));
@@ -4468,7 +6210,7 @@ fn decode_rewrite_attempt(
 ) -> RepositoryResult<StoredDistributedRewriteAttemptV3> {
     let stored: StoredDistributedRewriteAttemptV3 =
         decode_rewrite_json(record.value.as_bytes(), "distributed rewrite attempt")?;
-    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+    if !is_rewrite_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "distributed rewrite attempt has unsupported schema version",
         ));
@@ -4657,9 +6399,31 @@ impl CleanupOperationRepository {
             "create frontend connector cleanup operation",
             move |transaction, transaction_id| {
                 let request = request.clone();
-                Box::pin(
-                    async move { apply_cleanup_create(transaction, transaction_id, request).await },
-                )
+                Box::pin(async move {
+                    apply_cleanup_create(transaction, transaction_id, request, None).await
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn create_admitted(
+        &self,
+        request: CleanupOperationCreate,
+        admission: WriteAdmission,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_create(&request)?;
+        self.cleanup_mutation(
+            request.operation_id,
+            StoredCleanupTransactionActionV4::Create,
+            "admitted create frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                let request = request.clone();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    apply_cleanup_create(transaction, transaction_id, request, Some(&admission))
+                        .await
+                })
             },
         )
         .await
@@ -4668,6 +6432,11 @@ impl CleanupOperationRepository {
     /// Persist the provider's frozen manifest before any batch can be
     /// prepared. A zero-candidate plan is still durable and is finished by the
     /// ordinary terminal transition.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn plan(
         &self,
         operation_id: Uuid,
@@ -4682,8 +6451,49 @@ impl CleanupOperationRepository {
             move |transaction, transaction_id| {
                 let plan = plan.clone();
                 Box::pin(async move {
-                    apply_cleanup_plan(transaction, transaction_id, operation_id, plan, now_ms)
-                        .await
+                    apply_cleanup_plan(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        plan,
+                        now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn plan_fenced(
+        &self,
+        operation_id: Uuid,
+        plan: CleanupPlanPayload,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_plan(&plan)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Plan,
+            "fenced persist frontend connector cleanup plan",
+            move |transaction, transaction_id| {
+                let plan = plan.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_plan(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        plan,
+                        now_ms,
+                        Some((&authority, &validator)),
+                    )
+                    .await
                 })
             },
         )
@@ -4692,6 +6502,11 @@ impl CleanupOperationRepository {
 
     /// Persist prepare evidence before dispatch. The returned RUNNING record
     /// is the only record that authorizes a destructive provider call.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn prepare_batch(
         &self,
         operation_id: Uuid,
@@ -4712,6 +6527,44 @@ impl CleanupOperationRepository {
                         operation_id,
                         checkpoint,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Fenced twin of [`Self::prepare_batch`]. This is the transition that
+    /// authorizes a destructive provider call, so it must prove the caller
+    /// still holds the attempt inside the same transaction.
+    pub async fn prepare_batch_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, false)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Prepare,
+            "fenced persist frontend connector cleanup prepared batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_prepare(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -4723,6 +6576,11 @@ impl CleanupOperationRepository {
     /// Atomically records the provider receipt summary and advances the exact
     /// batch ordinal. Any unknown count moves the operation to reconcile-only
     /// state; a caller may not dispatch another batch from that state.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn checkpoint_batch(
         &self,
         operation_id: Uuid,
@@ -4736,8 +6594,47 @@ impl CleanupOperationRepository {
             move |transaction, transaction_id| {
                 let checkpoint = checkpoint.clone();
                 Box::pin(async move {
-                    apply_cleanup_checkpoint(transaction, transaction_id, operation_id, checkpoint)
-                        .await
+                    apply_cleanup_checkpoint(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Fenced twin of [`Self::checkpoint_batch`].
+    pub async fn checkpoint_batch_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, true)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "fenced checkpoint frontend connector cleanup batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_checkpoint(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        Some((&authority, &validator)),
+                    )
+                    .await
                 })
             },
         )
@@ -4747,6 +6644,11 @@ impl CleanupOperationRepository {
     /// Replace the receipt for the already-dispatched batch after an exact
     /// generation reconcile. This transition never advances the ordinal and
     /// therefore cannot authorize a second delete.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn checkpoint_reconciled_batch(
         &self,
         operation_id: Uuid,
@@ -4765,6 +6667,7 @@ impl CleanupOperationRepository {
                         transaction_id,
                         operation_id,
                         checkpoint,
+                        None,
                     )
                     .await
                 })
@@ -4773,6 +6676,44 @@ impl CleanupOperationRepository {
         .await
     }
 
+    /// Fenced twin of [`Self::checkpoint_reconciled_batch`].
+    pub async fn checkpoint_reconciled_batch_fenced(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, true)?;
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "fenced checkpoint reconciled frontend connector cleanup batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_reconciled_checkpoint(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        Some((&authority, &validator)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_reconcile_pending(
         &self,
         operation_id: Uuid,
@@ -4789,6 +6730,62 @@ impl CleanupOperationRepository {
         .await
     }
 
+    /// Take a stalled cleanup operation over: prove the live lease, rebind the
+    /// record's attempt, and leave the prepared-batch state untouched.
+    pub async fn adopt_authority_fenced(
+        &self,
+        operation_id: Uuid,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "adopt frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_adopt(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::ReconcilePending,
+            &[CleanupOperationState::Running],
+            CleanupOperationState::ReconcilePending,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn resume_running(
         &self,
         operation_id: Uuid,
@@ -4805,6 +6802,31 @@ impl CleanupOperationRepository {
         .await
     }
 
+    pub async fn resume_running_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Resume,
+            &[CleanupOperationState::ReconcilePending],
+            CleanupOperationState::Running,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn finish(
         &self,
         operation_id: Uuid,
@@ -4824,8 +6846,36 @@ impl CleanupOperationRepository {
         .await
     }
 
+    pub async fn finish_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Finish,
+            &[
+                CleanupOperationState::Planned,
+                CleanupOperationState::Running,
+            ],
+            CleanupOperationState::Finished,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     /// Failure is legal only before the first prepared batch. After prepare,
     /// uncertain external effects are reconciled rather than failed closed.
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn fail_before_dispatch(
         &self,
         operation_id: Uuid,
@@ -4847,6 +6897,36 @@ impl CleanupOperationRepository {
         .await
     }
 
+    pub async fn fail_before_dispatch_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_error(&message)?;
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Fail,
+            &[
+                CleanupOperationState::Pending,
+                CleanupOperationState::Planned,
+            ],
+            CleanupOperationState::Failed,
+            Some(message),
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
+    /// Unfenced base transition. Production owners must use the `_fenced`
+    /// variant: without a durable attempt and an in-transaction fence a
+    /// frontend that already lost the table can still write back here.
+    /// Retained for focused repository tests of the transition machinery.
+    #[doc(hidden)]
     pub async fn mark_unresolved(
         &self,
         operation_id: Uuid,
@@ -4864,6 +6944,31 @@ impl CleanupOperationRepository {
             CleanupOperationState::Unresolved,
             Some(message),
             now_ms,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved_fenced(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_error(&message)?;
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::Unresolve,
+            &[
+                CleanupOperationState::Running,
+                CleanupOperationState::ReconcilePending,
+            ],
+            CleanupOperationState::Unresolved,
+            Some(message),
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -5001,6 +7106,47 @@ impl CleanupOperationRepository {
                         next,
                         error,
                         now_ms,
+                        None,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn cleanup_transition_fenced(
+        &self,
+        operation_id: Uuid,
+        action: StoredCleanupTransactionActionV4,
+        allowed: &'static [CleanupOperationState],
+        next: CleanupOperationState,
+        error: Option<String>,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_authority(&authority)?;
+        self.cleanup_mutation(
+            operation_id,
+            action,
+            "fenced transition frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                let error = error.clone();
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                Box::pin(async move {
+                    apply_cleanup_transition(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        action,
+                        allowed,
+                        next,
+                        error,
+                        now_ms,
+                        Some((&authority, &validator)),
                     )
                     .await
                 })
@@ -5123,9 +7269,17 @@ async fn apply_cleanup_create(
     transaction: &mut dyn WriteTransaction,
     transaction_id: OperationId,
     request: CleanupOperationCreate,
+    admission: Option<&WriteAdmission>,
 ) -> TransactionResult<CleanupOperation> {
     if let Err(error) = validate_cleanup_create(&request) {
         return Ok(Err(error));
+    }
+    if let Some(admission) = admission
+        && let Err(error) = admission.validate_in(transaction).await
+    {
+        return Ok(Err(RepositoryError::authority_lost(format!(
+            "maintenance write admission lost: {error}"
+        ))));
     }
     if let Some(existing) = load_cleanup_operation(transaction, request.operation_id).await?? {
         if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
@@ -5175,6 +7329,7 @@ async fn apply_cleanup_create(
         created_at_ms: request.created_at_ms,
         started_at_ms: None,
         finished_at_ms: None,
+        authority: None,
     };
     let (marker_key, marker_value) = cleanup_transaction_record(
         transaction_id,
@@ -5221,6 +7376,7 @@ async fn apply_cleanup_plan(
     operation_id: Uuid,
     plan: CleanupPlanPayload,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     if let Err(error) = validate_cleanup_plan(&plan) {
         return Ok(Err(error));
@@ -5231,6 +7387,20 @@ async fn apply_cleanup_plan(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced {
+        if let Some(durable) = operation.stored.authority.as_ref() {
+            if let Err(error) =
+                validate_bound_fenced_authority(transaction, Some(durable), authority, validator)
+                    .await
+            {
+                return Ok(Err(error));
+            }
+        } else if let Err(error) =
+            validate_fenced_authority(transaction, authority, validator).await
+        {
+            return Ok(Err(error));
+        }
+    }
     if operation.stored.state == CleanupOperationState::Planned
         && operation.stored.plan_digest == Some(plan.plan_digest)
     {
@@ -5250,6 +7420,9 @@ async fn apply_cleanup_plan(
     )
     .await??;
     operation.stored.plan_digest = Some(plan.plan_digest);
+    if let Some((authority, _)) = fenced {
+        operation.stored.authority = Some(authority.clone());
+    }
     operation.stored.manifest_digest = Some(plan.manifest_digest);
     operation.stored.candidate_count = Some(plan.candidate_count);
     operation.stored.batch_count = Some(plan.batch_count);
@@ -5277,6 +7450,7 @@ async fn apply_cleanup_prepare(
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
     _now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -5284,6 +7458,17 @@ async fn apply_cleanup_prepare(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if !matches!(
         operation.stored.state,
         CleanupOperationState::Planned | CleanupOperationState::Running
@@ -5349,6 +7534,7 @@ async fn apply_cleanup_checkpoint(
     transaction_id: OperationId,
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -5356,6 +7542,17 @@ async fn apply_cleanup_checkpoint(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state != CleanupOperationState::Running {
         return Ok(Err(RepositoryError::new(
             RepositoryErrorKind::InvalidTransition,
@@ -5435,6 +7632,7 @@ async fn apply_cleanup_reconciled_checkpoint(
     transaction_id: OperationId,
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -5442,6 +7640,17 @@ async fn apply_cleanup_reconciled_checkpoint(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state != CleanupOperationState::ReconcilePending
         || !matches!(
             operation.stored.next_batch_ordinal,
@@ -5509,6 +7718,7 @@ async fn apply_cleanup_reconciled_checkpoint(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_cleanup_transition(
     transaction: &mut dyn WriteTransaction,
     transaction_id: OperationId,
@@ -5518,6 +7728,7 @@ async fn apply_cleanup_transition(
     next: CleanupOperationState,
     error: Option<String>,
     now_ms: i64,
+    fenced: Option<(&MaintenanceAuthorityV1, &MaintenanceFenceValidator)>,
 ) -> TransactionResult<CleanupOperation> {
     let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
         return Ok(Err(RepositoryError::new(
@@ -5525,6 +7736,17 @@ async fn apply_cleanup_transition(
             "cleanup operation not found",
         )));
     };
+    if let Some((authority, validator)) = fenced
+        && let Err(error) = validate_bound_fenced_authority(
+            transaction,
+            operation.stored.authority.as_ref(),
+            authority,
+            validator,
+        )
+        .await
+    {
+        return Ok(Err(error));
+    }
     if operation.stored.state == next {
         return Ok(Ok(CleanupOperation::from(&operation.stored)));
     }
@@ -5669,7 +7891,7 @@ async fn require_cleanup_active(
     };
     let fence: StoredSharedActiveFenceV3 =
         decode_rewrite_json(active.value.as_bytes(), "shared cleanup active fence")?;
-    if fence.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+    if !is_rewrite_schema_version(fence.schema_version)
         || fence.family != SharedMaintenanceOperationFamilyV3::Cleanup
         || fence.operation_id != operation.operation_id
     {
@@ -5763,7 +7985,7 @@ fn validate_cleanup_error(error: &str) -> RepositoryResult<()> {
     Ok(())
 }
 fn validate_cleanup_operation(stored: &StoredCleanupOperationV4) -> RepositoryResult<()> {
-    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+    if !is_cleanup_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "cleanup operation has unsupported schema version",
         ));
@@ -5874,7 +8096,7 @@ fn encode_cleanup_plan(plan: &CleanupPlanPayload, operation_id: Uuid) -> Reposit
 }
 fn decode_cleanup_plan(record: StateRecord) -> RepositoryResult<StoredCleanupPlanV4> {
     let stored: StoredCleanupPlanV4 = decode_cleanup_json(record.value.as_bytes(), "cleanup plan")?;
-    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+    if !is_cleanup_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "cleanup plan has unsupported schema version",
         ));
@@ -5917,7 +8139,7 @@ fn encode_cleanup_batch(
 fn decode_cleanup_batch(record: StateRecord) -> RepositoryResult<StoredCleanupBatchV4> {
     let stored: StoredCleanupBatchV4 =
         decode_cleanup_json(record.value.as_bytes(), "cleanup batch")?;
-    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+    if !is_cleanup_schema_version(stored.schema_version) {
         return Err(RepositoryError::corruption(
             "cleanup batch has unsupported schema version",
         ));

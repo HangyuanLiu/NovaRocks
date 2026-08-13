@@ -15,24 +15,76 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
 use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
 use novarocks_spi::connector::ConnectorWriteExecutionId;
+use novarocks_state_store::coordination::FencingToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const OPTIMIZE_JOB_SCHEMA_VERSION: u8 = 1;
-pub const METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION: u8 = 2;
+pub const OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION: u8 = 1;
+pub const OPTIMIZE_JOB_SCHEMA_VERSION: u8 = 2;
+pub const METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 2;
+pub const METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION: u8 = 3;
 pub const METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// E2 stores only bounded, credential-free handles in StateStore.  The
 /// provider-owned immutable manifest and reports live in object storage.
-pub const DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION: u8 = 3;
+pub const DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 3;
+pub const DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION: u8 = 4;
 pub const DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES: usize = 64 * 1024;
 /// V4 cleanup records retain only bounded, credential-free provider artifact
 /// handles. Candidate locations and object identities remain provider-owned.
-pub const CLEANUP_OPERATION_SCHEMA_VERSION: u8 = 4;
+pub const CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 4;
+pub const CLEANUP_OPERATION_SCHEMA_VERSION: u8 = 5;
 pub const CLEANUP_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const CLEANUP_MAX_BATCHES: u16 = 256;
+pub const MAINTENANCE_FENCING_TOKEN_MAX_BYTES: usize = 8 * 1024;
+
+/// Durable execution authority for one table-maintenance attempt.
+///
+/// The token is preserved in its StateStore coordination v1 wire form so a
+/// repository record remains provider-neutral and can prove which exact lease
+/// epoch was allowed to write it. `try_new` rejects non-canonical or
+/// unbounded provenance rather than accepting a best-effort replacement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceAuthorityV1 {
+    pub attempt_id: Uuid,
+    pub fencing_token_v1: Vec<u8>,
+}
+
+impl MaintenanceAuthorityV1 {
+    pub fn try_new(attempt_id: Uuid, fencing_token_v1: Vec<u8>) -> Result<Self, String> {
+        let authority = Self {
+            attempt_id,
+            fencing_token_v1,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.attempt_id.get_version_num() != 7
+            || self.attempt_id.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err("maintenance authority attempt id must be UUIDv7".to_string());
+        }
+        if self.fencing_token_v1.is_empty()
+            || self.fencing_token_v1.len() > MAINTENANCE_FENCING_TOKEN_MAX_BYTES
+        {
+            return Err("maintenance authority fencing token has invalid length".to_string());
+        }
+        let token = FencingToken::decode_v1(Bytes::copy_from_slice(&self.fencing_token_v1))
+            .map_err(|error| format!("maintenance authority fencing token is invalid: {error}"))?;
+        let canonical = token.encode_v1().map_err(|error| {
+            format!("encode maintenance authority fencing token failed: {error}")
+        })?;
+        if canonical.as_ref() != self.fencing_token_v1.as_slice() {
+            return Err("maintenance authority fencing token is non-canonical".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptimizeJobCreate {
@@ -61,6 +113,9 @@ pub struct OptimizeJob {
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+    /// Set once this job has dispatched a distributed rewrite. Recovery must
+    /// never re-execute a job that already has one.
+    pub dispatched_child: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -101,6 +156,16 @@ pub struct StoredOptimizeJobV1 {
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
     pub last_operation_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<MaintenanceAuthorityV1>,
+    /// The distributed-rewrite operation this claimed job already dispatched.
+    ///
+    /// Recovery needs to tell "claimed but never dispatched" from "dispatched
+    /// and the external outcome is unknown". Only the second case is unsafe to
+    /// run again, so the link is written in the same transaction that creates
+    /// the child. `None` on a RUNNING record proves no child exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_child: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -206,6 +271,7 @@ impl From<&StoredOptimizeJobV1> for OptimizeJob {
             created_at_ms: value.created_at_ms,
             started_at_ms: value.started_at_ms,
             finished_at_ms: value.finished_at_ms,
+            dispatched_child: value.dispatched_child,
         }
     }
 }
@@ -328,6 +394,8 @@ pub(crate) struct StoredMetadataMaintenanceOperationV2 {
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<MaintenanceAuthorityV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -521,6 +589,8 @@ pub(crate) struct StoredDistributedRewriteOperationV3 {
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<MaintenanceAuthorityV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -712,6 +782,8 @@ pub(crate) struct StoredCleanupOperationV4 {
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<MaintenanceAuthorityV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
