@@ -440,11 +440,6 @@ pub struct NativeQueryExecutionResourceSnapshot {
     pub active_fragments: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct FragmentFinishReportDecision {
-    pub(crate) include_runtime_filter_profile: bool,
-}
-
 pub(crate) struct FinstCancelResult {
     pub(crate) query_id: Option<QueryId>,
     pub(crate) finsts: Vec<UniqueId>,
@@ -1469,39 +1464,14 @@ impl QueryContextManager {
     }
 
     pub(crate) fn finish_fragment(&self, query_id: QueryId) {
-        let decision = self.finish_fragment_internal(query_id);
-        let _ = decision;
-    }
-
-    pub(crate) fn finish_fragment_for_report(
-        &self,
-        query_id: QueryId,
-    ) -> FragmentFinishReportDecision {
         self.finish_fragment_internal(query_id)
     }
 
     pub(crate) fn finish_fragment_execution(&self, execution: QueryExecutionKey) {
-        let decision =
-            self.finish_fragment_internal_execution(execution.query_id(), Some(execution));
-        let _ = decision;
-    }
-
-    pub(crate) fn finish_fragment_for_report_execution(
-        &self,
-        execution: QueryExecutionKey,
-    ) -> FragmentFinishReportDecision {
         self.finish_fragment_internal_execution(execution.query_id(), Some(execution))
     }
 
-    pub(crate) fn cleanup_after_fragment_report(
-        &self,
-        query_id: QueryId,
-        decision: FragmentFinishReportDecision,
-    ) {
-        let _ = (query_id, decision);
-    }
-
-    fn finish_fragment_internal(&self, query_id: QueryId) -> FragmentFinishReportDecision {
+    fn finish_fragment_internal(&self, query_id: QueryId) {
         self.finish_fragment_internal_execution(query_id, None)
     }
 
@@ -1509,7 +1479,7 @@ impl QueryContextManager {
         &self,
         query_id: QueryId,
         execution: Option<QueryExecutionKey>,
-    ) -> FragmentFinishReportDecision {
+    ) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if execution.is_some_and(|execution| {
             !guard
@@ -1517,45 +1487,32 @@ impl QueryContextManager {
                 .get(&query_id)
                 .is_some_and(|ctx| ctx.matches_execution(execution))
         }) {
-            return FragmentFinishReportDecision {
-                include_runtime_filter_profile: false,
-            };
+            return;
         }
         let Some(mut ctx) = guard.active.remove(&query_id) else {
-            return FragmentFinishReportDecision {
-                include_runtime_filter_profile: true,
-            };
+            return;
         };
         let no_active_fragments = ctx.count_down_fragments();
         if !no_active_fragments {
             guard.active.insert(query_id, ctx);
-            return FragmentFinishReportDecision::default();
+            return;
         }
         // Native lifecycle completion has already transferred its terminal fact
         // into the control plane. Do not retain the heavy execution context for
         // a legacy report-delivery retry window: a later attempt for the same
         // query id must be able to own the slot independently.
         if execution.is_some_and(|execution| execution.native_attempt_id().is_some()) {
-            let decision = FragmentFinishReportDecision {
-                include_runtime_filter_profile: true,
-            };
             drop(guard);
             drop(ctx);
-            return decision;
+            return;
         }
         if ctx.is_dead() {
-            let decision = FragmentFinishReportDecision {
-                include_runtime_filter_profile: true,
-            };
             drop(guard);
             drop(ctx);
-            return decision;
+            return;
         }
         ctx.extend_delivery_lifetime();
         guard.second_chance.insert(query_id, ctx);
-        FragmentFinishReportDecision {
-            include_runtime_filter_profile: true,
-        }
     }
 }
 
@@ -1767,17 +1724,13 @@ mod sender_error_tests {
 }
 
 #[cfg(test)]
-mod runtime_filter_lifecycle_cleanup_tests {
+mod native_lifecycle_cleanup_tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
-    use super::{
-        FragmentFinishReportDecision, QueryContext, QueryContextManager, QueryContextManagerInner,
-        QueryId,
-    };
+    use super::{QueryContext, QueryContextManager, QueryContextManagerInner, QueryId};
     use crate::common::types::UniqueId;
-    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 
     fn test_manager() -> QueryContextManager {
         QueryContextManager {
@@ -1823,13 +1776,10 @@ mod runtime_filter_lifecycle_cleanup_tests {
             .expect("remaining fragment query")
             .total_fragments = Some(1);
 
-        let decision = mgr.finish_fragment_for_report(query_id);
+        mgr.finish_fragment(query_id);
         mgr.unregister_finst(first);
-        mgr.cleanup_after_fragment_report(query_id, decision);
         assert_eq!(mgr.fragment_counts_for_test(query_id), None);
         assert_eq!(mgr.query_id_by_finst(first), None);
-        RuntimeFilterLifecycleRegistry::global()
-            .remove_query(QueryKey::from_hi_lo(query_id.high(), query_id.low()));
     }
 }
 

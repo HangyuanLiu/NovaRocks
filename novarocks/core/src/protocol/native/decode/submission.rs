@@ -639,7 +639,6 @@ mod tests {
     use crate::runtime::fragment_test_io_exchange::test_exchange_snapshot;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
-    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::runtime::exchange::ExchangeKey;
@@ -705,12 +704,7 @@ mod tests {
         }
     }
 
-    fn assert_runtime_state_absent(
-        query: QueryId,
-        finst: UniqueId,
-        exchange_key: ExchangeKey,
-        rf_key: QueryKey,
-    ) {
+    fn assert_runtime_state_absent(query: QueryId, finst: UniqueId, exchange_key: ExchangeKey) {
         let manager = query_context_manager();
         assert!(manager.query_mem_tracker(query).is_none());
         assert!(manager.query_id_by_finst(finst).is_none());
@@ -719,11 +713,6 @@ mod tests {
         };
         assert!(matches!(error.kind, FetchErrorKind::NotFound));
         assert!(test_exchange_snapshot(exchange_key).is_none());
-        assert!(
-            RuntimeFilterLifecycleRegistry::global()
-                .snapshot(rf_key)
-                .is_none()
-        );
     }
 
     #[test]
@@ -961,8 +950,7 @@ mod tests {
             finst_id_lo: finst.low(),
             node_id: 77,
         };
-        let rf_key = QueryKey::from_hi_lo(query.high(), query.low());
-        assert_runtime_state_absent(query_id, finst, exchange_key, rf_key);
+        assert_runtime_state_absent(query_id, finst, exchange_key);
 
         let malformed = plan::PlanFragment {
             root: None,
@@ -976,6 +964,6 @@ mod tests {
             "plan_fragment.root"
         );
 
-        assert_runtime_state_absent(query_id, finst, exchange_key, rf_key);
+        assert_runtime_state_absent(query_id, finst, exchange_key);
     }
 }

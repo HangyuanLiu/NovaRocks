@@ -28,9 +28,7 @@ use crate::exec::node::runtime_filter::{
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::profile::{
-    OperatorProfiles, ProfileUnit, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS,
-};
+use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::compute::filter_record_batch;
 
@@ -196,40 +194,31 @@ impl NativeOrderedLiveConsumerSet {
     }
 
     pub(crate) fn poll_and_apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
-        self.poll_and_apply_chunk_profiled(chunk, None)
+        self.poll_and_apply_chunk_observed(chunk, None)
     }
 
-    pub(crate) fn poll_and_apply_chunk_profiled(
+    pub(crate) fn poll_and_apply_chunk_observed(
         &self,
         chunk: Chunk,
-        profiles: Option<&OperatorProfiles>,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
     ) -> Result<Option<Chunk>, String> {
         self.poll_updates()?;
-        self.apply_latest_chunk_profiled(chunk, profiles)
+        self.apply_latest_chunk_observed(chunk, event_sink)
     }
 
     pub(crate) fn poll_updates(&self) -> Result<(), String> {
         self.poll()
     }
 
-    pub(crate) fn apply_latest_chunk_profiled(
+    pub(crate) fn apply_latest_chunk_observed(
         &self,
         chunk: Chunk,
-        profiles: Option<&OperatorProfiles>,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
     ) -> Result<Option<Chunk>, String> {
         let (output, effects) = self.apply_chunk_inner(chunk)?;
-        if let Some(profiles) = profiles {
+        if let Some(event_sink) = event_sink {
             for effect in effects {
-                profiles.common.counter_add(
-                    RUNTIME_FILTER_INPUT_ROWS,
-                    ProfileUnit::Unit,
-                    i64::try_from(effect.input_rows()).unwrap_or(i64::MAX),
-                );
-                profiles.common.counter_add(
-                    RUNTIME_FILTER_OUTPUT_ROWS,
-                    ProfileUnit::Unit,
-                    i64::try_from(effect.output_rows()).unwrap_or(i64::MAX),
-                );
+                event_sink.record(FragmentEvent::RuntimeFilterRowEffect(effect));
             }
         }
         Ok(output)
@@ -703,27 +692,18 @@ impl RuntimeFilterConsumerSet {
     }
 
     pub(crate) fn apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
-        self.apply_chunk_profiled(chunk, None)
+        self.apply_chunk_observed(chunk, None)
     }
 
-    pub(crate) fn apply_chunk_profiled(
+    pub(crate) fn apply_chunk_observed(
         &self,
         chunk: Chunk,
-        profiles: Option<&OperatorProfiles>,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
     ) -> Result<Option<Chunk>, String> {
         let (output, effects) = self.apply_chunk_inner(chunk)?;
-        if let Some(profiles) = profiles {
+        if let Some(event_sink) = event_sink {
             for effect in effects {
-                profiles.common.counter_add(
-                    RUNTIME_FILTER_INPUT_ROWS,
-                    ProfileUnit::Unit,
-                    i64::try_from(effect.input_rows()).unwrap_or(i64::MAX),
-                );
-                profiles.common.counter_add(
-                    RUNTIME_FILTER_OUTPUT_ROWS,
-                    ProfileUnit::Unit,
-                    i64::try_from(effect.output_rows()).unwrap_or(i64::MAX),
-                );
+                event_sink.record(FragmentEvent::RuntimeFilterRowEffect(effect));
             }
         }
         Ok(output)
@@ -1101,7 +1081,7 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
             consumers: self.consumers.clone(),
             output: None,
             finishing: false,
-            profiles: None,
+            event_sink: Arc::new(NoopFragmentEventSink),
         })
     }
 }
@@ -1111,7 +1091,7 @@ struct NativeRuntimeFilterProcessor {
     consumers: RuntimeFilterConsumerSet,
     output: Option<Chunk>,
     finishing: bool,
-    profiles: Option<OperatorProfiles>,
+    event_sink: Arc<dyn FragmentEventSink>,
 }
 
 impl Operator for NativeRuntimeFilterProcessor {
@@ -1119,8 +1099,8 @@ impl Operator for NativeRuntimeFilterProcessor {
         &self.name
     }
 
-    fn set_profiles(&mut self, profiles: OperatorProfiles) {
-        self.profiles = Some(profiles);
+    fn set_fragment_event_sink(&mut self, event_sink: Arc<dyn FragmentEventSink>) {
+        self.event_sink = event_sink;
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
@@ -1160,7 +1140,7 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
         )?;
         self.output = self
             .consumers
-            .apply_chunk_profiled(chunk, self.profiles.as_ref())?;
+            .apply_chunk_observed(chunk, Some(&self.event_sink))?;
         Ok(())
     }
 

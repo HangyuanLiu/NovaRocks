@@ -346,6 +346,7 @@ impl NativeFragmentService {
         let event_sink = crate::fragment::lifecycle_fragment_event_sink(
             Arc::clone(&self.lifecycle),
             execution_id,
+            fragment_instance_id,
             profiler.clone(),
         );
         let dormant = prepare_fragment(
@@ -494,6 +495,7 @@ impl NativeFragmentService {
         let event_sink = crate::fragment::lifecycle_fragment_event_sink(
             Arc::clone(&self.lifecycle),
             execution_id,
+            fragment_instance_id,
             profiler.clone(),
         );
         let dormant = prepare_fragment(
@@ -1017,6 +1019,7 @@ mod tests {
                     crate::fragment::lifecycle_fragment_event_sink(
                         Arc::clone(&service.lifecycle),
                         execution_id,
+                        fragment_instance_id,
                         None,
                     ),
                 )

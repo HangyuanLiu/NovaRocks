@@ -61,6 +61,9 @@ pub(crate) struct QueryLifecycleEntryState {
     /// Published with a successful Init and owned by this full execution
     /// attempt. No process-global context owns a second Service.
     pub(crate) runtime_filter: Option<Arc<RuntimeFilterParticipant>>,
+    /// True after a non-empty RF install succeeds. It distinguishes a real
+    /// RF-less participant from an illegal cleanup-before-capture state.
+    pub(crate) runtime_filter_installed: bool,
     pub(crate) runtime_filter_close_in_flight: bool,
     pub(crate) ever_initialized: bool,
     pub(crate) terminated_at: Option<Instant>,
@@ -76,6 +79,9 @@ pub(crate) struct QueryLifecycleEntryState {
     /// synthesizes explicit IncompleteDrain facts.
     pub(crate) failure_drain_scheduled: bool,
     pub(crate) terminal_facts: BTreeMap<UniqueId, FragmentTerminalSnapshot>,
+    /// First-wins latch covering capture, canonical encoding, and retained
+    /// record installation. Expensive capture never runs under this lock.
+    pub(crate) terminal_freeze_in_flight: bool,
     pub(crate) terminal_record: Option<ImmutableQueryTerminalRecord>,
     pub(crate) pre_start_deadline: Option<Instant>,
     pub(crate) last_heartbeat: Option<Instant>,
@@ -118,6 +124,7 @@ impl QueryLifecycleEntry {
                 init_outcome: None,
                 termination_reason: None,
                 runtime_filter: None,
+                runtime_filter_installed: false,
                 runtime_filter_close_in_flight: false,
                 ever_initialized: false,
                 terminated_at: None,
@@ -127,6 +134,7 @@ impl QueryLifecycleEntry {
                 local_drained_emitted: false,
                 failure_drain_scheduled: false,
                 terminal_facts: BTreeMap::new(),
+                terminal_freeze_in_flight: false,
                 terminal_record: None,
                 pre_start_deadline: None,
                 last_heartbeat: None,

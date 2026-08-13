@@ -52,6 +52,13 @@ pub use stage::{
 };
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
-    QUERY_TERMINAL_SNAPSHOT_VERSION_V1, QueryTerminalProfileContributionV1, QueryTerminalSet,
-    QueryTerminalSnapshot, QueryTerminalSnapshotDigest,
+    QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1, QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
+    QueryTerminalProfileContributionV1, QueryTerminalRuntimeFilterChannelInstallStateV1,
+    QueryTerminalRuntimeFilterChannelKeyV1, QueryTerminalRuntimeFilterChannelTerminalStateV1,
+    QueryTerminalRuntimeFilterChannelV1, QueryTerminalRuntimeFilterConsumerKeyV1,
+    QueryTerminalRuntimeFilterConsumerV1, QueryTerminalRuntimeFilterProducerStreamKeyV1,
+    QueryTerminalRuntimeFilterProducerStreamV1, QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+    QueryTerminalRuntimeFilterSubscriptionTerminalV1,
+    QueryTerminalRuntimeFilterTransportRouteKeyV1, QueryTerminalRuntimeFilterTransportRouteV1,
+    QueryTerminalSet, QueryTerminalSnapshot, QueryTerminalSnapshotDigest,
 };

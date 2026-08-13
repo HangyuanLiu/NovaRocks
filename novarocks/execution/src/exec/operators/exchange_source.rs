@@ -40,7 +40,7 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::exchange;
-use crate::runtime::fragment::io::ExchangeReceiverKey;
+use crate::runtime::fragment::io::{ExchangeReceiverKey, FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::UniqueId;
 use tracing::debug;
@@ -104,7 +104,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             logged_first_none: false,
             arena: Arc::clone(&self.arena),
             native_runtime_filter_consumers: Some(self.runtime_filter_execution.consumers.clone()),
-            profiles: None,
+            event_sink: Arc::new(NoopFragmentEventSink),
             receiver_mem_tracker_ready: false,
         })
     }
@@ -126,7 +126,7 @@ struct ExchangeSourceOperator {
     logged_first_none: bool,
     arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    event_sink: Arc<dyn FragmentEventSink>,
     receiver_mem_tracker_ready: bool,
 }
 
@@ -135,8 +135,8 @@ impl Operator for ExchangeSourceOperator {
         &self.name
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
-        self.profiles = Some(profiles);
+    fn set_fragment_event_sink(&mut self, event_sink: Arc<dyn FragmentEventSink>) {
+        self.event_sink = event_sink;
     }
 
     fn prepare(&mut self) -> Result<(), String> {
@@ -278,7 +278,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
                         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
                             consumers.acquire_configured()?;
                             let Some(chunk) =
-                                consumers.apply_chunk_profiled(chunk, self.profiles.as_ref())?
+                                consumers.apply_chunk_observed(chunk, Some(&self.event_sink))?
                             else {
                                 continue;
                             };

@@ -1435,11 +1435,12 @@ fn conflicting_terminal_snapshot(
         first.profile().cloned(),
     )
     .map_err(|error| error.to_string())?;
-    QueryTerminalSnapshot::new(
+    QueryTerminalSnapshot::new_with_profile_contribution(
         snapshot.execution_id(),
         snapshot.backend().clone(),
         snapshot.init_digest(),
         fragments,
+        snapshot.profile_contribution().clone(),
     )
     .map_err(|error| error.to_string())
 }

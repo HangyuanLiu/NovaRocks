@@ -44,7 +44,8 @@ use super::{
     BackendParticipantIdentity, BackendProducerInstall, BackendProducerStreamIdentity,
     BackendReducedLogicalDomain, BackendReducedLogicalSnapshot, BackendReductionApply,
     BackendReductionState, BackendReductionStateError, BackendRouteEdgeId,
-    BackendRuntimeFilterEventObserver, BackendSubscriptionError, BackendSubscriptionGroup,
+    BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendSubscriptionError,
+    BackendSubscriptionGroup, MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE,
 };
 
 /// A Backend-owned encoded delivery ready for the participant's route authority.
@@ -203,6 +204,7 @@ pub(crate) struct BackendRuntimeFilterSession {
     availability: Option<Mutex<BackendCoverageState>>,
     terminal: Option<Mutex<BackendCoverageState>>,
     materialized_delivery_sink: Mutex<Option<Arc<dyn BackendMaterializedDeliverySink>>>,
+    events: Arc<dyn BackendRuntimeFilterEventObserver>,
 }
 
 impl BackendRuntimeFilterSession {
@@ -271,6 +273,16 @@ impl BackendRuntimeFilterSession {
             );
         }
 
+        for binding_id in channel.producers().keys().chain(channel.consumers().keys()) {
+            events.record(BackendRuntimeFilterEvent::ChannelPlanned {
+                channel: BackendChannelIdentity::new(
+                    participant,
+                    *binding_id,
+                    channel.channel_id(),
+                ),
+            });
+        }
+
         Ok(Self {
             policy,
             participant,
@@ -282,6 +294,7 @@ impl BackendRuntimeFilterSession {
             availability,
             terminal,
             materialized_delivery_sink: Mutex::new(None),
+            events,
         })
     }
 
@@ -544,6 +557,10 @@ impl BackendRuntimeFilterSession {
             binding.terminal = Some(BackendProducerBindingTerminal::Failed);
         }
         self.mark_impossible(install.coverage_witness());
+        self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelUnavailable {
+            channel,
+            reason: UnavailableReason::ProducerFailed,
+        });
         for consumer in self.consumers.values() {
             for route in &consumer.routes {
                 consumer
@@ -579,8 +596,32 @@ impl BackendRuntimeFilterSession {
             })?;
         consumer
             .subscriptions
-            .publish(route_edge_id, outcome, terminal)
-            .map_err(subscription_violation)
+            .publish(route_edge_id, outcome.clone(), terminal)
+            .map_err(subscription_violation)?;
+        match &outcome {
+            SnapshotAcquireOutcome::Published(snapshot) => {
+                let version = snapshot.logical_version();
+                self.record_channel_event(|channel| {
+                    BackendRuntimeFilterEvent::LogicalVersionPublished { channel, version }
+                });
+                if terminal == Some(LiveTerminal::Completed) {
+                    self.record_channel_event(|channel| {
+                        BackendRuntimeFilterEvent::ChannelCompleted { channel, version }
+                    });
+                }
+            }
+            SnapshotAcquireOutcome::Unavailable(reason) => {
+                let reason = *reason;
+                self.record_channel_event(|channel| {
+                    BackendRuntimeFilterEvent::ChannelUnavailable { channel, reason }
+                });
+            }
+            SnapshotAcquireOutcome::Cancelled => self.record_channel_event(|channel| {
+                BackendRuntimeFilterEvent::ChannelCancelled { channel }
+            }),
+            SnapshotAcquireOutcome::Unsupported(_) | SnapshotAcquireOutcome::TimedOut => {}
+        }
+        Ok(())
     }
 
     /// Materialize a reduced semantic snapshot into each accepted Backend
@@ -592,6 +633,12 @@ impl BackendRuntimeFilterSession {
         terminal: Option<LiveTerminal>,
     ) -> Result<(), RuntimeFilterContractViolation> {
         let logical_version = self.materialized_logical_version(snapshot);
+        self.record_channel_event(
+            |channel| BackendRuntimeFilterEvent::LogicalVersionPublished {
+                channel,
+                version: logical_version,
+            },
+        );
         for consumer in self.consumers.values() {
             let outcome = match (snapshot.domain(), consumer.contract.contract()) {
                 (
@@ -678,7 +725,26 @@ impl BackendRuntimeFilterSession {
                     .subscriptions
                     .publish(*route, outcome.clone(), terminal)
                     .map_err(subscription_violation)?;
+                if self.owns_outbound_materialization_route(*route) {
+                    self.events
+                        .record(BackendRuntimeFilterEvent::LoopbackDelivered {
+                            channel: BackendChannelIdentity::new(
+                                self.participant,
+                                consumer.contract.binding_id(),
+                                self.channel.channel_id(),
+                            ),
+                            consumer_binding_id: consumer.contract.binding_id(),
+                            route_edge_id: *route,
+                            version: logical_version,
+                        });
+                }
             }
+        }
+        if terminal == Some(LiveTerminal::Completed) {
+            self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelCompleted {
+                channel,
+                version: logical_version,
+            });
         }
         self.dispatch_outbound_snapshot(snapshot, terminal)?;
         Ok(())
@@ -688,6 +754,21 @@ impl BackendRuntimeFilterSession {
         &self,
         terminal: LiveTerminal,
     ) -> Result<(), RuntimeFilterContractViolation> {
+        match terminal {
+            LiveTerminal::CompletedWithoutArtifact => {
+                self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelUnavailable {
+                    channel,
+                    reason: UnavailableReason::IncompleteCoverage,
+                })
+            }
+            LiveTerminal::Unavailable(reason) => self.record_channel_event(|channel| {
+                BackendRuntimeFilterEvent::ChannelUnavailable { channel, reason }
+            }),
+            LiveTerminal::Cancelled => self.record_channel_event(|channel| {
+                BackendRuntimeFilterEvent::ChannelCancelled { channel }
+            }),
+            LiveTerminal::Completed => {}
+        }
         for consumer in self.consumers.values() {
             for route in &consumer.routes {
                 if !self.owns_outbound_materialization_route(*route) {
@@ -701,6 +782,30 @@ impl BackendRuntimeFilterSession {
         }
         self.dispatch_outbound_terminal(terminal)?;
         Ok(())
+    }
+
+    pub(crate) fn record_cancelled_if_open(&self) {
+        self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelCancelled {
+            channel,
+        });
+    }
+
+    fn record_channel_event(
+        &self,
+        event: impl Fn(BackendChannelIdentity) -> BackendRuntimeFilterEvent,
+    ) {
+        for binding_id in self
+            .channel
+            .producers()
+            .keys()
+            .chain(self.channel.consumers().keys())
+        {
+            self.events.record(event(BackendChannelIdentity::new(
+                self.participant,
+                *binding_id,
+                self.channel.channel_id(),
+            )));
+        }
     }
 
     fn owns_outbound_materialization_route(&self, route: BackendRouteEdgeId) -> bool {
@@ -899,6 +1004,12 @@ impl BackendRuntimeFilterSession {
             return Err(contract_violation(
                 RuntimeFilterContractViolationKind::InvalidPartitionCount,
                 "producer requires a non-zero local partition count",
+            ));
+        }
+        if request.local_partition_count() > MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE {
+            return Err(contract_violation(
+                RuntimeFilterContractViolationKind::InvalidPartitionCount,
+                "producer local partition count exceeds the Backend observation bound",
             ));
         }
         if !install
@@ -1133,8 +1244,15 @@ fn validate_open_partition(
 }
 
 fn reduction_violation(error: BackendReductionStateError) -> RuntimeFilterContractViolation {
+    let kind = match &error {
+        BackendReductionStateError::Install(BackendInstallPolicyError::ContributionTooLarge)
+        | BackendReductionStateError::Reducer(super::ReducerError::SizeOverflow) => {
+            RuntimeFilterContractViolationKind::ResourceLimit
+        }
+        _ => RuntimeFilterContractViolationKind::ContractMismatch,
+    };
     contract_violation(
-        RuntimeFilterContractViolationKind::ContractMismatch,
+        kind,
         format!("Backend reduction rejected the Execution contribution: {error:?}"),
     )
 }

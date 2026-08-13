@@ -16,12 +16,15 @@
 // under the License.
 
 use novarocks_execution::runtime::profile::{
-    ProfileNode, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS, RuntimeProfileTree,
+    ProfileNode, ProfileUnit, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS,
+    RuntimeProfile, RuntimeProfileTree,
 };
 use std::collections::HashMap;
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
+use crate::query_execution::lifecycle::{
+    FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryTerminalSnapshot,
+};
 use crate::query_execution::outcome::FragmentProfileSet;
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
@@ -34,13 +37,39 @@ const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
 /// deliberately does not impose a non-empty production invariant.
 pub struct ProfileTerminalBuilder {
     profiles: Vec<RuntimeProfileTree>,
+    runtime_filter_totals: RuntimeFilterProfileTotals,
 }
 
 impl ProfileTerminalBuilder {
     pub fn new() -> Self {
         Self {
             profiles: Vec::new(),
+            runtime_filter_totals: RuntimeFilterProfileTotals::default(),
         }
+    }
+
+    /// Applies the immutable runtime-filter contribution for one accepted
+    /// lifecycle participant. The terminal set owns participant de-duplication;
+    /// this builder only performs deterministic profile projection.
+    pub fn apply_profile_contribution(
+        &mut self,
+        snapshot: &QueryTerminalSnapshot,
+    ) -> Result<(), DistributedQueryError> {
+        let contribution = snapshot.profile_contribution();
+        if contribution.is_empty() {
+            return Ok(());
+        }
+
+        let participant_totals = RuntimeFilterProfileTotals::from_snapshot(snapshot)?;
+        let execution_totals = self
+            .runtime_filter_totals
+            .checked_merged(participant_totals)?;
+        execution_totals.validate_profile_range()?;
+
+        self.profiles
+            .push(runtime_filter_profile_tree(snapshot, participant_totals)?);
+        self.runtime_filter_totals = execution_totals;
+        Ok(())
     }
 
     /// Profiles are a terminal contribution when profiling is enabled.  A
@@ -69,6 +98,392 @@ impl ProfileTerminalBuilder {
     pub fn finish(self) -> FragmentProfileSet {
         FragmentProfileSet::new(self.profiles)
     }
+}
+
+const RUNTIME_FILTER_SCAN_UNITS_PRUNED: &str = "RuntimeFilterScanUnitsPruned";
+const RUNTIME_FILTER_SCAN_UNITS_KEPT: &str = "RuntimeFilterScanUnitsKept";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED: &str = "RuntimeFilterScanUnitsNotEvaluated";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut";
+const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED: &str =
+    "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeFilterProfileTotals {
+    has_row_evaluation: bool,
+    input_rows: u64,
+    output_rows: u64,
+    has_scan_evaluation: bool,
+    scan_pruned: u64,
+    scan_kept: u64,
+    scan_not_evaluated: u64,
+    scan_not_evaluated_unit_facts_missing: u64,
+    scan_not_evaluated_column_facts_missing: u64,
+    scan_not_evaluated_data_type_unsupported: u64,
+    scan_not_evaluated_predicate_capability_unsupported: u64,
+    scan_not_evaluated_resource_unavailable: u64,
+    scan_not_evaluated_snapshot_unavailable: u64,
+    scan_not_evaluated_snapshot_timed_out: u64,
+    scan_not_evaluated_snapshot_not_published: u64,
+}
+
+impl RuntimeFilterProfileTotals {
+    fn from_snapshot(snapshot: &QueryTerminalSnapshot) -> Result<Self, DistributedQueryError> {
+        let mut totals = Self::default();
+        for consumer in snapshot.profile_contribution().consumers() {
+            totals.has_row_evaluation |= consumer.row_evaluations() != 0;
+            totals.has_scan_evaluation |=
+                consumer.scan_evaluated() != 0 || consumer.scan_not_evaluated() != 0;
+            checked_add_profile_counter(
+                &mut totals.input_rows,
+                consumer.input_rows(),
+                RUNTIME_FILTER_INPUT_ROWS,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.output_rows,
+                consumer.output_rows(),
+                RUNTIME_FILTER_OUTPUT_ROWS,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_pruned,
+                consumer.scan_pruned(),
+                RUNTIME_FILTER_SCAN_UNITS_PRUNED,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_kept,
+                consumer.scan_kept(),
+                RUNTIME_FILTER_SCAN_UNITS_KEPT,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated,
+                consumer.scan_not_evaluated(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
+            )?;
+            let reasons = consumer.scan_not_evaluated_reasons();
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_unit_facts_missing,
+                reasons.unit_facts_missing(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_column_facts_missing,
+                reasons.column_facts_missing(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_data_type_unsupported,
+                reasons.data_type_unsupported(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_predicate_capability_unsupported,
+                reasons.predicate_capability_unsupported(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_resource_unavailable,
+                reasons.resource_unavailable(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_snapshot_unavailable,
+                reasons.snapshot_unavailable(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_snapshot_timed_out,
+                reasons.snapshot_timed_out(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
+            )?;
+            checked_add_profile_counter(
+                &mut totals.scan_not_evaluated_snapshot_not_published,
+                reasons.snapshot_not_published(),
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
+            )?;
+        }
+        totals.validate_profile_range()?;
+        Ok(totals)
+    }
+
+    fn checked_merged(self, other: Self) -> Result<Self, DistributedQueryError> {
+        Ok(Self {
+            has_row_evaluation: self.has_row_evaluation || other.has_row_evaluation,
+            input_rows: checked_profile_counter_sum(
+                self.input_rows,
+                other.input_rows,
+                RUNTIME_FILTER_INPUT_ROWS,
+            )?,
+            output_rows: checked_profile_counter_sum(
+                self.output_rows,
+                other.output_rows,
+                RUNTIME_FILTER_OUTPUT_ROWS,
+            )?,
+            has_scan_evaluation: self.has_scan_evaluation || other.has_scan_evaluation,
+            scan_pruned: checked_profile_counter_sum(
+                self.scan_pruned,
+                other.scan_pruned,
+                RUNTIME_FILTER_SCAN_UNITS_PRUNED,
+            )?,
+            scan_kept: checked_profile_counter_sum(
+                self.scan_kept,
+                other.scan_kept,
+                RUNTIME_FILTER_SCAN_UNITS_KEPT,
+            )?,
+            scan_not_evaluated: checked_profile_counter_sum(
+                self.scan_not_evaluated,
+                other.scan_not_evaluated,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
+            )?,
+            scan_not_evaluated_unit_facts_missing: checked_profile_counter_sum(
+                self.scan_not_evaluated_unit_facts_missing,
+                other.scan_not_evaluated_unit_facts_missing,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
+            )?,
+            scan_not_evaluated_column_facts_missing: checked_profile_counter_sum(
+                self.scan_not_evaluated_column_facts_missing,
+                other.scan_not_evaluated_column_facts_missing,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
+            )?,
+            scan_not_evaluated_data_type_unsupported: checked_profile_counter_sum(
+                self.scan_not_evaluated_data_type_unsupported,
+                other.scan_not_evaluated_data_type_unsupported,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
+            )?,
+            scan_not_evaluated_predicate_capability_unsupported: checked_profile_counter_sum(
+                self.scan_not_evaluated_predicate_capability_unsupported,
+                other.scan_not_evaluated_predicate_capability_unsupported,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
+            )?,
+            scan_not_evaluated_resource_unavailable: checked_profile_counter_sum(
+                self.scan_not_evaluated_resource_unavailable,
+                other.scan_not_evaluated_resource_unavailable,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
+            )?,
+            scan_not_evaluated_snapshot_unavailable: checked_profile_counter_sum(
+                self.scan_not_evaluated_snapshot_unavailable,
+                other.scan_not_evaluated_snapshot_unavailable,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
+            )?,
+            scan_not_evaluated_snapshot_timed_out: checked_profile_counter_sum(
+                self.scan_not_evaluated_snapshot_timed_out,
+                other.scan_not_evaluated_snapshot_timed_out,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
+            )?,
+            scan_not_evaluated_snapshot_not_published: checked_profile_counter_sum(
+                self.scan_not_evaluated_snapshot_not_published,
+                other.scan_not_evaluated_snapshot_not_published,
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
+            )?,
+        })
+    }
+
+    fn validate_profile_range(self) -> Result<(), DistributedQueryError> {
+        for (name, value) in [
+            (RUNTIME_FILTER_INPUT_ROWS, self.input_rows),
+            (RUNTIME_FILTER_OUTPUT_ROWS, self.output_rows),
+            (RUNTIME_FILTER_SCAN_UNITS_PRUNED, self.scan_pruned),
+            (RUNTIME_FILTER_SCAN_UNITS_KEPT, self.scan_kept),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
+                self.scan_not_evaluated,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
+                self.scan_not_evaluated_unit_facts_missing,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
+                self.scan_not_evaluated_column_facts_missing,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
+                self.scan_not_evaluated_data_type_unsupported,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
+                self.scan_not_evaluated_predicate_capability_unsupported,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
+                self.scan_not_evaluated_resource_unavailable,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
+                self.scan_not_evaluated_snapshot_unavailable,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
+                self.scan_not_evaluated_snapshot_timed_out,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
+                self.scan_not_evaluated_snapshot_not_published,
+            ),
+        ] {
+            profile_counter_value(name, value)?;
+        }
+        Ok(())
+    }
+}
+
+fn runtime_filter_profile_tree(
+    snapshot: &QueryTerminalSnapshot,
+    totals: RuntimeFilterProfileTotals,
+) -> Result<RuntimeProfileTree, DistributedQueryError> {
+    let execution_id = snapshot.execution_id();
+    let backend = snapshot.backend();
+    let participant = RuntimeProfile::new(format!(
+        "RuntimeFilterParticipant (backend_id={}, start_epoch={})",
+        backend.backend_id(),
+        backend.start_epoch()
+    ));
+    participant.add_info_string("QueryId", execution_id.query_id().to_string());
+    participant.add_info_string("AttemptId", execution_id.attempt_id().get().to_string());
+    participant.add_info_string("BackendId", backend.backend_id().to_string());
+    participant.add_info_string("BackendStartEpoch", backend.start_epoch().to_string());
+
+    let common = participant.child(COMMON_METRICS);
+    if totals.has_row_evaluation {
+        common.counter_set(
+            RUNTIME_FILTER_INPUT_ROWS,
+            ProfileUnit::Unit,
+            profile_counter_value(RUNTIME_FILTER_INPUT_ROWS, totals.input_rows)?,
+        );
+        common.counter_set(
+            RUNTIME_FILTER_OUTPUT_ROWS,
+            ProfileUnit::Unit,
+            profile_counter_value(RUNTIME_FILTER_OUTPUT_ROWS, totals.output_rows)?,
+        );
+    }
+    if totals.has_scan_evaluation {
+        for (name, value) in [
+            (RUNTIME_FILTER_SCAN_UNITS_PRUNED, totals.scan_pruned),
+            (RUNTIME_FILTER_SCAN_UNITS_KEPT, totals.scan_kept),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
+                totals.scan_not_evaluated,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
+                totals.scan_not_evaluated_unit_facts_missing,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
+                totals.scan_not_evaluated_column_facts_missing,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
+                totals.scan_not_evaluated_data_type_unsupported,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
+                totals.scan_not_evaluated_predicate_capability_unsupported,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
+                totals.scan_not_evaluated_resource_unavailable,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
+                totals.scan_not_evaluated_snapshot_unavailable,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
+                totals.scan_not_evaluated_snapshot_timed_out,
+            ),
+            (
+                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
+                totals.scan_not_evaluated_snapshot_not_published,
+            ),
+        ] {
+            common.counter_set(name, ProfileUnit::Unit, profile_counter_value(name, value)?);
+        }
+    }
+
+    for channel in snapshot.profile_contribution().channels() {
+        let channel_key = channel.key();
+        let channel_profile = participant.child(format!(
+            "RuntimeFilterChannel (channel_binding_id={}, channel_id={})",
+            channel_key.channel_binding_id(),
+            channel_key.channel_id()
+        ));
+        channel_profile.add_info_string(
+            "LatestPublishedLogicalVersion",
+            channel
+                .latest_published_logical_version()
+                .map_or_else(|| "none".to_string(), |version| version.to_string()),
+        );
+        for consumer in snapshot
+            .profile_contribution()
+            .consumers()
+            .iter()
+            .filter(|consumer| consumer.key().channel() == channel_key)
+        {
+            let key = consumer.key();
+            let consumer_profile = channel_profile.child(format!(
+                "RuntimeFilterConsumer (consumer_binding_id={}, fragment_instance_id={})",
+                key.consumer_binding_id(),
+                key.fragment_instance_id()
+            ));
+            consumer_profile.add_info_string(
+                "LatestDeliveredLogicalVersion",
+                consumer
+                    .latest_delivered_logical_version()
+                    .map_or_else(|| "none".to_string(), |version| version.to_string()),
+            );
+            consumer_profile.add_info_string(
+                "LatestAppliedLogicalVersion",
+                consumer
+                    .latest_applied_logical_version()
+                    .map_or_else(|| "none".to_string(), |version| version.to_string()),
+            );
+        }
+    }
+
+    Ok(participant.to_native_tree())
+}
+
+fn checked_add_profile_counter(
+    current: &mut u64,
+    delta: u64,
+    name: &str,
+) -> Result<(), DistributedQueryError> {
+    *current = checked_profile_counter_sum(*current, delta, name)?;
+    Ok(())
+}
+
+fn checked_profile_counter_sum(
+    left: u64,
+    right: u64,
+    name: &str,
+) -> Result<u64, DistributedQueryError> {
+    left.checked_add(right).ok_or_else(|| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            format!("runtime-filter terminal profile counter {name} overflowed u64"),
+        )
+    })
+}
+
+fn profile_counter_value(name: &str, value: u64) -> Result<i64, DistributedQueryError> {
+    i64::try_from(value).map_err(|_| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            format!("runtime-filter terminal profile counter {name} exceeds i64"),
+        )
+    })
 }
 
 impl Default for ProfileTerminalBuilder {
@@ -641,12 +1056,184 @@ mod tests {
     use super::{
         ActualMetrics, COMMON_METRICS, DICT_HYDRATED_COLUMNS, DICT_HYDRATED_ROWS,
         DICT_INPUT_COLUMNS, DICT_INPUT_ROWS, DICT_KEPT_COLUMNS, DICT_KEPT_ROWS,
-        DICT_UNSUPPORTED_COLUMNS, UNIQUE_METRICS, collect_actuals_by_plan_node_id,
-        collect_actuals_by_plan_node_id_from_profile_trees, collect_actuals_by_plan_node_id_multi,
+        DICT_UNSUPPORTED_COLUMNS, ProfileTerminalBuilder, UNIQUE_METRICS,
+        collect_actuals_by_plan_node_id, collect_actuals_by_plan_node_id_from_profile_trees,
+        collect_actuals_by_plan_node_id_multi,
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
+    use crate::common::types::UniqueId;
+    use crate::query_execution::contract::QueryId;
+    use crate::query_execution::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
+        QueryExecutionId, QueryTerminalProfileContributionV1,
+        QueryTerminalRuntimeFilterChannelInstallStateV1, QueryTerminalRuntimeFilterChannelKeyV1,
+        QueryTerminalRuntimeFilterChannelTerminalStateV1, QueryTerminalRuntimeFilterChannelV1,
+        QueryTerminalRuntimeFilterConsumerKeyV1, QueryTerminalRuntimeFilterConsumerV1,
+        QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+        QueryTerminalRuntimeFilterSubscriptionTerminalV1, QueryTerminalSnapshot,
+    };
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler, RuntimeProfileTree};
+
+    fn runtime_filter_snapshot(
+        backend_id: u64,
+        channel_binding_id: u32,
+        input_rows: u64,
+        output_rows: u64,
+    ) -> QueryTerminalSnapshot {
+        let channel_key =
+            QueryTerminalRuntimeFilterChannelKeyV1::new(channel_binding_id, backend_id as u32);
+        let contribution = QueryTerminalProfileContributionV1::try_new(
+            vec![QueryTerminalRuntimeFilterChannelV1::new(
+                channel_key,
+                QueryTerminalRuntimeFilterChannelInstallStateV1::Installed,
+                QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed,
+                Some(1),
+                1,
+                1,
+                0,
+                0,
+            )],
+            Vec::new(),
+            Vec::new(),
+            vec![QueryTerminalRuntimeFilterConsumerV1::new(
+                QueryTerminalRuntimeFilterConsumerKeyV1::new(
+                    channel_key,
+                    channel_binding_id + 100,
+                    UniqueId::new(backend_id as i64, channel_binding_id as i64),
+                ),
+                Some(1),
+                Some(1),
+                QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed,
+                1,
+                input_rows,
+                output_rows,
+                2,
+                1,
+                1,
+                1,
+                QueryTerminalRuntimeFilterScanNotEvaluatedV1::new(0, 0, 0, 0, 1, 0, 0, 0),
+            )],
+        )
+        .expect("valid runtime-filter contribution");
+        QueryTerminalSnapshot::new_with_profile_contribution(
+            QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
+                .expect("execution id"),
+            ParticipantBackendIdentity::new(
+                backend_id,
+                QueryControlEndpoint::new(
+                    "127.0.0.1",
+                    19_000_u16
+                        .checked_add(backend_id as u16)
+                        .expect("test port"),
+                )
+                .expect("backend endpoint"),
+                1,
+            )
+            .expect("backend identity"),
+            ParticipantManifestDigest::new([backend_id as u8; 32]),
+            Vec::new(),
+            contribution,
+        )
+        .expect("terminal snapshot")
+    }
+
+    #[test]
+    fn profile_terminal_builder_projects_participants_in_order_and_sums_effects() {
+        let mut builder = ProfileTerminalBuilder::new();
+        builder
+            .apply_profile_contribution(&runtime_filter_snapshot(1, 11, 40, 10))
+            .expect("first participant contribution");
+        builder
+            .apply_profile_contribution(&runtime_filter_snapshot(2, 22, 60, 20))
+            .expect("second participant contribution");
+
+        let profiles = builder.finish().into_profiles();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles[0].root.name,
+            "RuntimeFilterParticipant (backend_id=1, start_epoch=1)"
+        );
+        assert_eq!(
+            profiles[1].root.name,
+            "RuntimeFilterParticipant (backend_id=2, start_epoch=1)"
+        );
+        assert!(profiles[0].root.children.iter().any(|node| {
+            node.name == "RuntimeFilterChannel (channel_binding_id=11, channel_id=1)"
+                && node.children.iter().any(|consumer| {
+                    consumer
+                        .name
+                        .starts_with("RuntimeFilterConsumer (consumer_binding_id=111,")
+                })
+        }));
+
+        let apply = super::collect_native_runtime_filter_apply_from_profile_trees(&profiles)
+            .expect("row effects produce RuntimeFilterApply");
+        assert_eq!((apply.input_rows, apply.output_rows), (100, 30));
+        let scans = super::sum_profile_counters_by_name_from_profile_trees(
+            &profiles,
+            &[
+                super::RUNTIME_FILTER_SCAN_UNITS_PRUNED,
+                super::RUNTIME_FILTER_SCAN_UNITS_KEPT,
+                super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
+                super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
+            ],
+        );
+        assert_eq!(
+            scans[super::RUNTIME_FILTER_SCAN_UNITS_PRUNED],
+            2,
+            "participant scan counters are summed"
+        );
+        assert_eq!(scans[super::RUNTIME_FILTER_SCAN_UNITS_KEPT], 2);
+        assert_eq!(scans[super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED], 2);
+        assert_eq!(
+            scans[super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE],
+            2
+        );
+    }
+
+    #[test]
+    fn profile_terminal_builder_ignores_canonical_empty_contribution() {
+        let snapshot = QueryTerminalSnapshot::new_without_runtime_filters(
+            QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
+                .expect("execution id"),
+            ParticipantBackendIdentity::new(
+                1,
+                QueryControlEndpoint::new("127.0.0.1", 19_001).expect("backend endpoint"),
+                1,
+            )
+            .expect("backend identity"),
+            ParticipantManifestDigest::new([1; 32]),
+            Vec::new(),
+        )
+        .expect("terminal snapshot");
+        let mut builder = ProfileTerminalBuilder::new();
+
+        builder
+            .apply_profile_contribution(&snapshot)
+            .expect("empty contribution is valid");
+
+        assert!(builder.finish().into_profiles().is_empty());
+    }
+
+    #[test]
+    fn profile_terminal_builder_rejects_cross_participant_i64_overflow() {
+        let mut builder = ProfileTerminalBuilder::new();
+        builder
+            .apply_profile_contribution(&runtime_filter_snapshot(1, 11, i64::MAX as u64, 0))
+            .expect("maximum profile counter is representable");
+
+        let error = builder
+            .apply_profile_contribution(&runtime_filter_snapshot(2, 22, 1, 0))
+            .expect_err("cross-participant sum must not saturate or truncate");
+
+        assert!(
+            error
+                .message()
+                .contains("RuntimeFilterInputRows exceeds i64")
+        );
+        assert_eq!(builder.finish().into_profiles().len(), 1);
+    }
 
     #[test]
     fn native_runtime_filter_apply_sums_common_metrics_across_fragments() {

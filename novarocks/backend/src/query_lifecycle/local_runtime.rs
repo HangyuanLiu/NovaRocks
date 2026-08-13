@@ -47,7 +47,7 @@ impl NativeQueryLifecycleLocalRuntime {
 }
 
 impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
-    fn terminate_query(
+    fn quiesce_query(
         &self,
         execution_id: QueryExecutionId,
         expected_instances: &[UniqueId],
@@ -61,10 +61,6 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
         );
         let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
         self.controls.cancel_many(&fragment_instance_ids, detail);
-        // Query lifecycle is the sole terminal authority for execution
-        // leases. Releasing here covers Finalize, Abort, deadline, KILL QUERY
-        // and BE shutdown without a second connector-specific release RPC.
-        let _ = self.execution_host.release_query(execution_id);
         if fragment_failure_test_markers_enabled() {
             for finst_id in fragment_instance_ids {
                 eprintln!(
@@ -76,6 +72,13 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
                 );
             }
         }
+    }
+
+    fn release_query_resources(&self, execution_id: QueryExecutionId) {
+        // Query lifecycle is the sole terminal authority for execution
+        // leases. Capture of the immutable participant contribution must have
+        // completed before this release can destroy connector-owned state.
+        let _ = self.execution_host.release_query(execution_id);
     }
 }
 

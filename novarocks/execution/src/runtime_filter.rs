@@ -475,6 +475,7 @@ pub enum RuntimeFilterContractViolationKind {
     ContractMismatch,
     RoleMismatch,
     InvalidPartitionCount,
+    ResourceLimit,
     SessionClosed,
 }
 
