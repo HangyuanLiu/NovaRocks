@@ -17,13 +17,14 @@
 
 //! Backend Service event vocabulary.
 //!
-//! Events are emitted to an observer at the point of state transition. They
-//! are not an observation store: production installs [`DiscardBackendRuntimeFilterEventObserver`]
-//! and RFO-8 owns any bounded retention or terminal handoff.
+//! Events are emitted at the point of state transition. The participant-owned
+//! emitter folds them into bounded observation state before notifying an
+//! optional diagnostic observer.
 
 use novarocks_execution::runtime_filter::{
     ArtifactUnsupportedReason, LiveTerminal, LogicalVersion, RuntimeFilterBindingId,
     UnavailableReason,
+    scan_domain::{RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitNotEvaluatedReason},
 };
 
 use super::{BackendAcceptStatus, BackendTransportFailOpenReason};
@@ -79,6 +80,18 @@ pub(crate) enum BackendRuntimeFilterEvent {
         sequence: u64,
     },
     ContributionDuplicateIgnored {
+        stream: BackendProducerStreamIdentity,
+        sequence: u64,
+    },
+    ContributionStaleIgnored {
+        stream: BackendProducerStreamIdentity,
+        sequence: u64,
+    },
+    ContributionConflictRejected {
+        stream: BackendProducerStreamIdentity,
+        sequence: u64,
+    },
+    ContributionResourceLimitRejected {
         stream: BackendProducerStreamIdentity,
         sequence: u64,
     },
@@ -141,15 +154,30 @@ pub(crate) enum BackendRuntimeFilterEvent {
         route_edge_id: BackendRouteEdgeId,
         version: LogicalVersion,
     },
+    ConsumerRowsEvaluated {
+        identity: BackendConsumerSubscriptionIdentity,
+        logical_version: LogicalVersion,
+        input_rows: u64,
+        output_rows: u64,
+    },
+    ConsumerScanUnitEvaluated {
+        identity: BackendConsumerSubscriptionIdentity,
+        logical_version: LogicalVersion,
+        decision: RuntimeFilterScanUnitDecision,
+    },
+    ConsumerScanUnitNotEvaluated {
+        identity: BackendConsumerSubscriptionIdentity,
+        observed_version: Option<LogicalVersion>,
+        reason: RuntimeFilterScanUnitNotEvaluatedReason,
+    },
 }
 
 pub(crate) trait BackendRuntimeFilterEventObserver: Send + Sync {
     fn record(&self, event: BackendRuntimeFilterEvent);
 }
 
-/// The production observer intentionally drops full Service events. Retention,
-/// aggregation and terminal handoff belong to RFO-8, not this physical-domain
-/// migration.
+/// A no-op diagnostic observer. Production observation is owned by the
+/// participant emitter and never depends on this optional side channel.
 #[derive(Default)]
 pub(crate) struct DiscardBackendRuntimeFilterEventObserver;
 

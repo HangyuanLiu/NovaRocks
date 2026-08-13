@@ -365,6 +365,109 @@ message QueryTerminalFragmentSnapshot {
   bytes statistics_payload = 12;
 }
 
+enum QueryTerminalRuntimeFilterChannelInstallStateV1 {
+  QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_INSTALL_STATE_V1_UNSPECIFIED = 0;
+  QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_INSTALL_STATE_V1_INSTALLED = 1;
+}
+
+enum QueryTerminalRuntimeFilterChannelTerminalStateV1 {
+  QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_UNSPECIFIED = 0;
+  QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_OPEN = 1;
+  QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_COMPLETED = 2;
+  QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_UNAVAILABLE = 3;
+  QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_CANCELLED = 4;
+}
+
+enum QueryTerminalRuntimeFilterSubscriptionTerminalV1 {
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_UNSPECIFIED = 0;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_PENDING = 1;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_ACQUIRED = 2;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_TIMED_OUT = 3;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_UNAVAILABLE = 4;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_UNSUPPORTED = 5;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_CANCELLED = 6;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_COMPLETED = 7;
+  QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_COMPLETED_WITHOUT_ARTIFACT = 8;
+}
+
+message QueryTerminalRuntimeFilterChannelV1 {
+  uint32 channel_binding_id = 1;
+  uint32 channel_id = 2;
+  QueryTerminalRuntimeFilterChannelInstallStateV1 install_state = 3;
+  QueryTerminalRuntimeFilterChannelTerminalStateV1 terminal_state = 4;
+  optional uint64 latest_published_logical_version = 5;
+  uint64 published_count = 6;
+  uint64 completed_count = 7;
+  uint64 unavailable_count = 8;
+  uint64 cancelled_count = 9;
+}
+
+message QueryTerminalRuntimeFilterProducerStreamV1 {
+  uint32 channel_binding_id = 1;
+  uint32 channel_id = 2;
+  novarocks.common.UniqueId producer_fragment_instance_id = 3;
+  uint32 partition_id = 4;
+  optional uint64 latest_accepted_sequence = 5;
+  uint64 accepted_count = 6;
+  uint64 duplicate_count = 7;
+  uint64 stale_count = 8;
+  uint64 conflict_count = 9;
+  uint64 resource_limit_count = 10;
+}
+
+message QueryTerminalRuntimeFilterTransportRouteV1 {
+  uint32 channel_binding_id = 1;
+  uint32 channel_id = 2;
+  uint64 route_edge_id = 3;
+  uint64 sent_count = 4;
+  uint64 sent_bytes = 5;
+  uint64 retried_count = 6;
+  uint64 retried_bytes = 7;
+  uint64 acked_count = 8;
+  uint64 acked_bytes = 9;
+  uint64 fail_open_count = 10;
+  uint64 fail_open_bytes = 11;
+}
+
+message QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
+  uint64 unit_facts_missing = 1;
+  uint64 column_facts_missing = 2;
+  uint64 data_type_unsupported = 3;
+  uint64 predicate_capability_unsupported = 4;
+  uint64 resource_unavailable = 5;
+  uint64 snapshot_unavailable = 6;
+  uint64 snapshot_timed_out = 7;
+  uint64 snapshot_not_published = 8;
+}
+
+message QueryTerminalRuntimeFilterConsumerV1 {
+  uint32 channel_binding_id = 1;
+  uint32 channel_id = 2;
+  uint32 consumer_binding_id = 3;
+  novarocks.common.UniqueId fragment_instance_id = 4;
+  optional uint64 latest_delivered_logical_version = 5;
+  optional uint64 latest_applied_logical_version = 6;
+  QueryTerminalRuntimeFilterSubscriptionTerminalV1 subscription_terminal = 7;
+  uint64 row_evaluations = 8;
+  uint64 input_rows = 9;
+  uint64 output_rows = 10;
+  uint64 scan_evaluated = 11;
+  uint64 scan_kept = 12;
+  uint64 scan_pruned = 13;
+  uint64 scan_not_evaluated = 14;
+  QueryTerminalRuntimeFilterScanNotEvaluatedV1 scan_not_evaluated_reasons = 15;
+}
+
+// Process-neutral, canonical participant-local runtime-filter observation.
+// Every repeated section is interpreted as a sorted unique keyed set.
+message QueryTerminalProfileContributionV1 {
+  uint32 version = 1;
+  repeated QueryTerminalRuntimeFilterChannelV1 channels = 2;
+  repeated QueryTerminalRuntimeFilterProducerStreamV1 producer_streams = 3;
+  repeated QueryTerminalRuntimeFilterTransportRouteV1 transport_routes = 4;
+  repeated QueryTerminalRuntimeFilterConsumerV1 consumers = 5;
+}
+
 message QueryTerminalSnapshot {
   uint32 version = 1;
   QueryExecutionId execution_id = 2;
@@ -372,6 +475,7 @@ message QueryTerminalSnapshot {
   bytes init_digest = 4;
   bytes digest = 5;
   repeated QueryTerminalFragmentSnapshot fragments = 6;
+  QueryTerminalProfileContributionV1 profile_contribution = 7;
 }
 
 message ReportQueryTerminalRequest {

@@ -96,6 +96,8 @@ struct RecordingLocalRuntimeState {
             String,
         )>,
     >,
+    releases: Mutex<Vec<QueryExecutionId>>,
+    lifecycle_order: Mutex<Vec<(&'static str, QueryExecutionId)>>,
     install_gate: Mutex<InstallGate>,
     install_gate_changed: Condvar,
     fail_install: Mutex<bool>,
@@ -209,6 +211,18 @@ impl RecordingLocalRuntime {
         self.state.abort_calls.lock().expect("abort calls").len()
     }
 
+    fn release_calls(&self) -> usize {
+        self.state.releases.lock().expect("release calls").len()
+    }
+
+    fn lifecycle_order(&self) -> Vec<(&'static str, QueryExecutionId)> {
+        self.state
+            .lifecycle_order
+            .lock()
+            .expect("lifecycle order")
+            .clone()
+    }
+
     fn fail_install(&self) {
         *self.state.fail_install.lock().expect("fail install") = true;
     }
@@ -223,19 +237,37 @@ impl RecordingLocalRuntime {
 }
 
 impl QueryLifecycleLocalRuntime for RecordingLocalRuntime {
-    fn terminate_query(
+    fn quiesce_query(
         &self,
         execution_id: QueryExecutionId,
         expected_instances: &[UniqueId],
         reason: QueryTerminationReason,
         detail: &str,
     ) {
+        self.state
+            .lifecycle_order
+            .lock()
+            .expect("lifecycle order")
+            .push(("quiesce", execution_id));
         self.state.terminations.lock().expect("terminations").push((
             execution_id,
             expected_instances.to_vec(),
             reason,
             detail.to_string(),
         ));
+    }
+
+    fn release_query_resources(&self, execution_id: QueryExecutionId) {
+        self.state
+            .lifecycle_order
+            .lock()
+            .expect("lifecycle order")
+            .push(("release", execution_id));
+        self.state
+            .releases
+            .lock()
+            .expect("release calls")
+            .push(execution_id);
     }
 }
 
@@ -276,6 +308,11 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
         let state = Arc::clone(&self.state);
         Ok(
             participant.with_close_hook_for_test(Arc::new(move |_participant, _reason| {
+                state
+                    .lifecycle_order
+                    .lock()
+                    .expect("lifecycle order")
+                    .push(("close", execution_id));
                 state
                     .abort_calls
                     .lock()
@@ -666,6 +703,35 @@ fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> Query
         QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
     )
     .expect("valid fragment participant manifest");
+    QueryInitRequest::from_manifest(manifest)
+}
+
+fn fragment_runtime_filter_init_request_fixture(
+    query_low: i64,
+    expected: &[UniqueId],
+) -> QueryInitRequest {
+    let execution_id = execution_id(query_low, ATTEMPT_1);
+    let manifest = ParticipantManifest::new(
+        execution_id,
+        ParticipantBackendIdentity::new(
+            LOCAL_BACKEND_ID,
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
+            LOCAL_START_EPOCH,
+        )
+        .expect("valid backend identity"),
+        [
+            ParticipantRole::FragmentExecutor,
+            ParticipantRole::RuntimeFilterService,
+        ],
+        expected.iter().copied(),
+        ParticipantQueryOptions::new(QueryOptions::default()),
+        10_000,
+        [],
+        Some(runtime_filter_contribution(execution_id, 3)),
+        Duration::from_secs(30),
+        QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
+    )
+    .expect("valid fragment and runtime-filter participant manifest");
     QueryInitRequest::from_manifest(manifest)
 }
 
@@ -1625,6 +1691,70 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
     assert_eq!(metrics.terminal_facts, 1);
     assert_eq!(metrics.terminal_records_frozen, 1);
     assert_eq!(metrics.terminal_locally_drained, 0);
+}
+
+#[test]
+fn failure_drain_sweep_does_not_close_runtime_filter_before_terminal_capture() {
+    let runtime = RecordingLocalRuntime::default();
+    let mut config = registry_config(8);
+    config.terminal_drain_timeout = Duration::from_secs(5);
+    let clock = Arc::new(ManualClock::default());
+    let registry =
+        QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
+            LOCAL_BACKEND_ID,
+            LOCAL_START_EPOCH,
+            Arc::new(runtime.clone()),
+            config,
+            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            Arc::new(RecordingMetricsSink::default()),
+            Arc::new(RejectedTerminalFallback),
+            Arc::new(runtime.clone()),
+        );
+    let failed = UniqueId::new(76, 20);
+    let pending = UniqueId::new(76, 21);
+    let request = fragment_runtime_filter_init_request_fixture(76_020, &[failed, pending]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _attachment = attach_control(&registry, &request);
+    for fragment in [failed, pending] {
+        registry
+            .admit_fragment(execution_id, fragment)
+            .expect("fragment permit")
+            .commit()
+            .expect("fragment admission commits");
+    }
+    registry.record_fragment_terminal(
+        execution_id,
+        failed,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "pipeline worker failed",
+        )),
+    );
+
+    registry.sweep_expired(clock.now());
+    assert_eq!(
+        runtime.runtime_filter_abort_calls(),
+        0,
+        "sweep must leave the participant alive while failure drain is pending"
+    );
+
+    registry.record_fragment_terminal(execution_id, pending, &FragmentOutcome::Succeeded);
+    wait_for_failed_terminal_freeze(&registry);
+    assert_eq!(runtime.runtime_filter_abort_calls(), 1);
+    assert_eq!(runtime.release_calls(), 1);
+    assert_eq!(
+        runtime.lifecycle_order(),
+        vec![
+            ("quiesce", execution_id),
+            ("release", execution_id),
+            ("close", execution_id),
+        ],
+        "terminal capture and retention must complete between quiesce and resource release"
+    );
 }
 
 #[test]

@@ -5,8 +5,8 @@
 
 //! Backend ingress dedupe for at-least-once envelopes.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::sync::{Condvar, Mutex};
 
 use novarocks_execution::runtime_filter::LogicalVersion;
 
@@ -27,6 +27,7 @@ pub(crate) enum BackendContributionAdmission {
 pub(crate) enum BackendDeliveryAdmission {
     Fresh,
     Duplicate,
+    Conflict,
     ResourceLimit,
 }
 
@@ -36,15 +37,24 @@ pub(crate) enum BackendDeliveryAdmission {
 pub(crate) struct BackendIngressDedupe {
     max_identities_per_channel: usize,
     state: Mutex<BackendIngressDedupeState>,
+    changed: Condvar,
 }
 
 #[derive(Default)]
 struct BackendIngressDedupeState {
     contributions:
         BTreeMap<BackendChannelIdentity, BTreeMap<BackendContributionRouteIdentity, [u8; 32]>>,
-    deliveries: BTreeMap<BackendChannelIdentity, BTreeSet<BackendDeliveryRouteIdentity>>,
-    versions:
-        BTreeMap<BackendChannelIdentity, BTreeMap<(BackendRouteEdgeId, LogicalVersion), bool>>,
+    deliveries: BTreeMap<BackendChannelIdentity, BTreeMap<BackendDeliveryRouteIdentity, [u8; 32]>>,
+    versions: BTreeMap<
+        BackendChannelIdentity,
+        BTreeMap<(BackendRouteEdgeId, LogicalVersion), ([u8; 32], bool)>,
+    >,
+    pending_deliveries:
+        BTreeMap<BackendChannelIdentity, BTreeMap<BackendDeliveryRouteIdentity, [u8; 32]>>,
+    pending_versions: BTreeMap<
+        BackendChannelIdentity,
+        BTreeMap<(BackendRouteEdgeId, LogicalVersion), ([u8; 32], bool)>,
+    >,
 }
 
 impl BackendIngressDedupe {
@@ -56,6 +66,7 @@ impl BackendIngressDedupe {
         Self {
             max_identities_per_channel,
             state: Mutex::new(BackendIngressDedupeState::default()),
+            changed: Condvar::new(),
         }
     }
 
@@ -80,46 +91,170 @@ impl BackendIngressDedupe {
         }
     }
 
-    pub(crate) fn admit_delivery(
+    pub(crate) fn reserve_delivery(
         &self,
         route: BackendDeliveryRouteIdentity,
-        version: LogicalVersion,
+        version: Option<LogicalVersion>,
         final_artifact: bool,
+        exact_digest: [u8; 32],
+        content_digest: [u8; 32],
     ) -> BackendDeliveryAdmission {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let channel = route.channel();
-        if state
-            .deliveries
-            .get(&channel)
-            .is_some_and(|delivery| delivery.contains(&route))
-        {
-            return BackendDeliveryAdmission::Duplicate;
+        loop {
+            if let Some(existing) = state
+                .deliveries
+                .get(&channel)
+                .and_then(|delivery| delivery.get(&route))
+            {
+                return if *existing == exact_digest {
+                    BackendDeliveryAdmission::Duplicate
+                } else {
+                    BackendDeliveryAdmission::Conflict
+                };
+            }
+            if let Some(existing) = state
+                .pending_deliveries
+                .get(&channel)
+                .and_then(|delivery| delivery.get(&route))
+            {
+                if *existing != exact_digest {
+                    return BackendDeliveryAdmission::Conflict;
+                }
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+                continue;
+            }
+            let retained = state
+                .deliveries
+                .get(&channel)
+                .map_or(0, BTreeMap::len)
+                .checked_add(
+                    state
+                        .pending_deliveries
+                        .get(&channel)
+                        .map_or(0, BTreeMap::len),
+                )
+                .unwrap_or(usize::MAX);
+            if retained >= self.max_identities_per_channel {
+                return BackendDeliveryAdmission::ResourceLimit;
+            }
+            if let Some(version) = version {
+                let key = (route.route_edge_id(), version);
+                if let Some((existing_digest, was_final)) = state
+                    .versions
+                    .get(&channel)
+                    .and_then(|values| values.get(&key))
+                {
+                    if *existing_digest != content_digest {
+                        return BackendDeliveryAdmission::Conflict;
+                    }
+                    if *was_final || !final_artifact {
+                        state
+                            .deliveries
+                            .entry(channel)
+                            .or_default()
+                            .insert(route, exact_digest);
+                        return BackendDeliveryAdmission::Duplicate;
+                    }
+                }
+                if let Some((pending_digest, _)) = state
+                    .pending_versions
+                    .get(&channel)
+                    .and_then(|values| values.get(&key))
+                {
+                    if *pending_digest != content_digest {
+                        return BackendDeliveryAdmission::Conflict;
+                    }
+                    state = self
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(|error| error.into_inner());
+                    continue;
+                }
+                state
+                    .pending_versions
+                    .entry(channel)
+                    .or_default()
+                    .insert(key, (content_digest, final_artifact));
+            }
+            state
+                .pending_deliveries
+                .entry(channel)
+                .or_default()
+                .insert(route, exact_digest);
+            return BackendDeliveryAdmission::Fresh;
         }
-        if state
+    }
+
+    pub(crate) fn commit_delivery(
+        &self,
+        route: BackendDeliveryRouteIdentity,
+        version: Option<LogicalVersion>,
+        final_artifact: bool,
+        exact_digest: [u8; 32],
+        content_digest: [u8; 32],
+    ) {
+        let channel = route.channel();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        remove_pending_delivery(&mut state, route, version);
+        state
             .deliveries
-            .get(&channel)
-            .is_some_and(|delivery| delivery.len() >= self.max_identities_per_channel)
-        {
-            return BackendDeliveryAdmission::ResourceLimit;
+            .entry(channel)
+            .or_default()
+            .insert(route, exact_digest);
+        if let Some(version) = version {
+            let entry = state
+                .versions
+                .entry(channel)
+                .or_default()
+                .entry((route.route_edge_id(), version))
+                .or_insert((content_digest, false));
+            debug_assert_eq!(entry.0, content_digest);
+            entry.1 |= final_artifact;
         }
-        let versions = state.versions.entry(channel).or_default();
-        if let Some(was_final) = versions.get(&(route.route_edge_id(), version)) {
-            // A final artifact is a strict upgrade of the same logical version;
-            // a non-final replay stays duplicate. The distinct transport identity
-            // is still retained to make future retries idempotent.
-            if *was_final || !final_artifact {
-                state.deliveries.entry(channel).or_default().insert(route);
-                return BackendDeliveryAdmission::Duplicate;
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn abort_delivery(
+        &self,
+        route: BackendDeliveryRouteIdentity,
+        version: Option<LogicalVersion>,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        remove_pending_delivery(&mut state, route, version);
+        self.changed.notify_all();
+    }
+}
+
+fn remove_pending_delivery(
+    state: &mut BackendIngressDedupeState,
+    route: BackendDeliveryRouteIdentity,
+    version: Option<LogicalVersion>,
+) {
+    let channel = route.channel();
+    if let Some(deliveries) = state.pending_deliveries.get_mut(&channel) {
+        deliveries.remove(&route);
+        if deliveries.is_empty() {
+            state.pending_deliveries.remove(&channel);
+        }
+    }
+    if let Some(version) = version {
+        if let Some(versions) = state.pending_versions.get_mut(&channel) {
+            versions.remove(&(route.route_edge_id(), version));
+            if versions.is_empty() {
+                state.pending_versions.remove(&channel);
             }
         }
-        versions.insert((route.route_edge_id(), version), final_artifact);
-        state.deliveries.entry(channel).or_default().insert(route);
-        BackendDeliveryAdmission::Fresh
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, mpsc};
+
     use novarocks_execution::runtime_filter::{
         PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
     };
@@ -161,7 +296,7 @@ mod tests {
 
     #[test]
     fn final_artifact_is_one_allowed_logical_upgrade() {
-        let dedupe = BackendIngressDedupe::new(3);
+        let dedupe = BackendIngressDedupe::new(5);
         let make = |sequence| {
             BackendDeliveryRouteIdentity::new(
                 channel(),
@@ -170,16 +305,78 @@ mod tests {
             )
         };
         assert_eq!(
-            dedupe.admit_delivery(make(1), LogicalVersion::FIRST, false),
+            dedupe.reserve_delivery(
+                make(1),
+                Some(LogicalVersion::FIRST),
+                false,
+                [1; 32],
+                [9; 32]
+            ),
             BackendDeliveryAdmission::Fresh
         );
+        dedupe.commit_delivery(
+            make(1),
+            Some(LogicalVersion::FIRST),
+            false,
+            [1; 32],
+            [9; 32],
+        );
         assert_eq!(
-            dedupe.admit_delivery(make(2), LogicalVersion::FIRST, false),
+            dedupe.reserve_delivery(
+                make(2),
+                Some(LogicalVersion::FIRST),
+                false,
+                [2; 32],
+                [9; 32]
+            ),
             BackendDeliveryAdmission::Duplicate
         );
         assert_eq!(
-            dedupe.admit_delivery(make(3), LogicalVersion::FIRST, true),
+            dedupe.reserve_delivery(make(3), Some(LogicalVersion::FIRST), true, [3; 32], [9; 32]),
             BackendDeliveryAdmission::Fresh
         );
+        assert_eq!(
+            dedupe.reserve_delivery(make(3), Some(LogicalVersion::FIRST), true, [4; 32], [9; 32]),
+            BackendDeliveryAdmission::Conflict
+        );
+        dedupe.commit_delivery(make(3), Some(LogicalVersion::FIRST), true, [3; 32], [9; 32]);
+        assert_eq!(
+            dedupe.reserve_delivery(make(4), Some(LogicalVersion::FIRST), true, [5; 32], [8; 32]),
+            BackendDeliveryAdmission::Conflict
+        );
+    }
+
+    #[test]
+    fn retry_waits_for_reservation_and_retries_after_abort() {
+        let dedupe = Arc::new(BackendIngressDedupe::new(2));
+        let route = BackendDeliveryRouteIdentity::new(
+            channel(),
+            BackendRouteEdgeId::new(10),
+            BackendTransportSequence::new(1),
+        );
+        assert_eq!(
+            dedupe.reserve_delivery(route, Some(LogicalVersion::FIRST), false, [1; 32], [9; 32],),
+            BackendDeliveryAdmission::Fresh
+        );
+
+        let (sent, received) = mpsc::channel();
+        let retry = Arc::clone(&dedupe);
+        let waiter = std::thread::spawn(move || {
+            let admission =
+                retry.reserve_delivery(route, Some(LogicalVersion::FIRST), false, [1; 32], [9; 32]);
+            sent.send(admission).expect("report retry admission");
+        });
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        dedupe.abort_delivery(route, Some(LogicalVersion::FIRST));
+        assert_eq!(
+            received.recv().expect("retry admission after abort"),
+            BackendDeliveryAdmission::Fresh
+        );
+        dedupe.abort_delivery(route, Some(LogicalVersion::FIRST));
+        waiter.join().expect("retry waiter");
     }
 }

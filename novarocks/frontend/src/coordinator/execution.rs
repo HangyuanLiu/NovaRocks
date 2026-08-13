@@ -1046,8 +1046,11 @@ impl FrontendDistributedQueryCoordinator {
             DistributedQueryIntent::Profile => {
                 let result = expected_output.into_query_result(batches)?;
                 let mut builder = ProfileTerminalBuilder::new();
-                for fragment in terminal_set.fragments() {
-                    builder.apply_terminal(fragment)?;
+                for snapshot in terminal_set.snapshots() {
+                    builder.apply_profile_contribution(snapshot)?;
+                    for fragment in snapshot.fragments() {
+                        builder.apply_terminal(fragment)?;
+                    }
                 }
                 parts.completion.profile(result, builder.finish())
             }

@@ -35,6 +35,8 @@ use super::{
 };
 
 pub const QUERY_TERMINAL_SNAPSHOT_VERSION_V1: u32 = 1;
+pub const QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1: u32 = 1;
+const QUERY_TERMINAL_PROFILE_SECTION_MAX_ENTRIES: usize = 16_384;
 const QUERY_TERMINAL_SNAPSHOT_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.terminal-snapshot.v1\0";
 
@@ -175,10 +177,904 @@ impl FragmentTerminalSnapshot {
     }
 }
 
-/// Reserved typed carrier.  V1 deliberately has no query-scoped profile
-/// contribution; RFD-8A adds a concrete versioned value rather than opaque data.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct QueryTerminalProfileContributionV1;
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryTerminalRuntimeFilterChannelKeyV1 {
+    channel_binding_id: u32,
+    channel_id: u32,
+}
+
+impl QueryTerminalRuntimeFilterChannelKeyV1 {
+    pub const fn new(channel_binding_id: u32, channel_id: u32) -> Self {
+        Self {
+            channel_binding_id,
+            channel_id,
+        }
+    }
+
+    pub const fn channel_binding_id(self) -> u32 {
+        self.channel_binding_id
+    }
+
+    pub const fn channel_id(self) -> u32 {
+        self.channel_id
+    }
+
+    fn validate(self) -> Result<(), QueryLifecycleError> {
+        if self.channel_binding_id == 0 || self.channel_id == 0 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter channel identity must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryTerminalRuntimeFilterChannelInstallStateV1 {
+    Installed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryTerminalRuntimeFilterChannelTerminalStateV1 {
+    Open,
+    Completed,
+    Unavailable,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTerminalRuntimeFilterChannelV1 {
+    key: QueryTerminalRuntimeFilterChannelKeyV1,
+    install_state: QueryTerminalRuntimeFilterChannelInstallStateV1,
+    terminal_state: QueryTerminalRuntimeFilterChannelTerminalStateV1,
+    latest_published_logical_version: Option<u64>,
+    published_count: u64,
+    completed_count: u64,
+    unavailable_count: u64,
+    cancelled_count: u64,
+}
+
+impl QueryTerminalRuntimeFilterChannelV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        key: QueryTerminalRuntimeFilterChannelKeyV1,
+        install_state: QueryTerminalRuntimeFilterChannelInstallStateV1,
+        terminal_state: QueryTerminalRuntimeFilterChannelTerminalStateV1,
+        latest_published_logical_version: Option<u64>,
+        published_count: u64,
+        completed_count: u64,
+        unavailable_count: u64,
+        cancelled_count: u64,
+    ) -> Self {
+        Self {
+            key,
+            install_state,
+            terminal_state,
+            latest_published_logical_version,
+            published_count,
+            completed_count,
+            unavailable_count,
+            cancelled_count,
+        }
+    }
+
+    pub const fn key(&self) -> QueryTerminalRuntimeFilterChannelKeyV1 {
+        self.key
+    }
+    pub const fn install_state(&self) -> QueryTerminalRuntimeFilterChannelInstallStateV1 {
+        self.install_state
+    }
+    pub const fn terminal_state(&self) -> QueryTerminalRuntimeFilterChannelTerminalStateV1 {
+        self.terminal_state
+    }
+    pub const fn latest_published_logical_version(&self) -> Option<u64> {
+        self.latest_published_logical_version
+    }
+    pub const fn published_count(&self) -> u64 {
+        self.published_count
+    }
+    pub const fn completed_count(&self) -> u64 {
+        self.completed_count
+    }
+    pub const fn unavailable_count(&self) -> u64 {
+        self.unavailable_count
+    }
+    pub const fn cancelled_count(&self) -> u64 {
+        self.cancelled_count
+    }
+
+    fn validate(&self) -> Result<(), QueryLifecycleError> {
+        self.key.validate()?;
+        validate_optional_nonzero(
+            self.latest_published_logical_version,
+            "terminal runtime-filter latest published logical version must be nonzero",
+        )?;
+        if (self.published_count == 0) != self.latest_published_logical_version.is_none() {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter published count and latest version disagree",
+            ));
+        }
+        let terminal_count = checked_sum(
+            [
+                self.completed_count,
+                self.unavailable_count,
+                self.cancelled_count,
+            ],
+            "terminal runtime-filter channel counters overflow",
+        )?;
+        let valid_terminal = match self.terminal_state {
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Open => terminal_count == 0,
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed => {
+                terminal_count == 1 && self.completed_count == 1
+            }
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable => {
+                terminal_count == 1 && self.unavailable_count == 1
+            }
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled => {
+                terminal_count == 1 && self.cancelled_count == 1
+            }
+        };
+        if !valid_terminal {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter channel state and terminal counters disagree",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryTerminalRuntimeFilterProducerStreamKeyV1 {
+    channel: QueryTerminalRuntimeFilterChannelKeyV1,
+    producer_fragment_instance_id: UniqueId,
+    partition_id: u32,
+}
+
+impl QueryTerminalRuntimeFilterProducerStreamKeyV1 {
+    pub const fn new(
+        channel: QueryTerminalRuntimeFilterChannelKeyV1,
+        producer_fragment_instance_id: UniqueId,
+        partition_id: u32,
+    ) -> Self {
+        Self {
+            channel,
+            producer_fragment_instance_id,
+            partition_id,
+        }
+    }
+
+    pub const fn channel(self) -> QueryTerminalRuntimeFilterChannelKeyV1 {
+        self.channel
+    }
+    pub const fn producer_fragment_instance_id(self) -> UniqueId {
+        self.producer_fragment_instance_id
+    }
+    pub const fn partition_id(self) -> u32 {
+        self.partition_id
+    }
+
+    fn validate(self) -> Result<(), QueryLifecycleError> {
+        self.channel.validate()?;
+        validate_unique_id(
+            self.producer_fragment_instance_id,
+            "terminal runtime-filter producer fragment instance id must be nonzero",
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTerminalRuntimeFilterProducerStreamV1 {
+    key: QueryTerminalRuntimeFilterProducerStreamKeyV1,
+    latest_accepted_sequence: Option<u64>,
+    accepted_count: u64,
+    duplicate_count: u64,
+    stale_count: u64,
+    conflict_count: u64,
+    resource_limit_count: u64,
+}
+
+impl QueryTerminalRuntimeFilterProducerStreamV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        key: QueryTerminalRuntimeFilterProducerStreamKeyV1,
+        latest_accepted_sequence: Option<u64>,
+        accepted_count: u64,
+        duplicate_count: u64,
+        stale_count: u64,
+        conflict_count: u64,
+        resource_limit_count: u64,
+    ) -> Self {
+        Self {
+            key,
+            latest_accepted_sequence,
+            accepted_count,
+            duplicate_count,
+            stale_count,
+            conflict_count,
+            resource_limit_count,
+        }
+    }
+
+    pub const fn key(&self) -> QueryTerminalRuntimeFilterProducerStreamKeyV1 {
+        self.key
+    }
+    pub const fn latest_accepted_sequence(&self) -> Option<u64> {
+        self.latest_accepted_sequence
+    }
+    pub const fn accepted_count(&self) -> u64 {
+        self.accepted_count
+    }
+    pub const fn duplicate_count(&self) -> u64 {
+        self.duplicate_count
+    }
+    pub const fn stale_count(&self) -> u64 {
+        self.stale_count
+    }
+    pub const fn conflict_count(&self) -> u64 {
+        self.conflict_count
+    }
+    pub const fn resource_limit_count(&self) -> u64 {
+        self.resource_limit_count
+    }
+
+    fn validate(&self) -> Result<(), QueryLifecycleError> {
+        self.key.validate()?;
+        // ProducerSequence is zero-based. Presence, rather than a non-zero
+        // value, proves that at least one contribution was accepted.
+        if (self.accepted_count == 0) != self.latest_accepted_sequence.is_none() {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter accepted count and latest sequence disagree",
+            ));
+        }
+        checked_sum(
+            [
+                self.accepted_count,
+                self.duplicate_count,
+                self.stale_count,
+                self.conflict_count,
+                self.resource_limit_count,
+            ],
+            "terminal runtime-filter producer counters overflow",
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryTerminalRuntimeFilterTransportRouteKeyV1 {
+    channel: QueryTerminalRuntimeFilterChannelKeyV1,
+    route_edge_id: u64,
+}
+
+impl QueryTerminalRuntimeFilterTransportRouteKeyV1 {
+    pub const fn new(channel: QueryTerminalRuntimeFilterChannelKeyV1, route_edge_id: u64) -> Self {
+        Self {
+            channel,
+            route_edge_id,
+        }
+    }
+
+    pub const fn channel(self) -> QueryTerminalRuntimeFilterChannelKeyV1 {
+        self.channel
+    }
+    pub const fn route_edge_id(self) -> u64 {
+        self.route_edge_id
+    }
+
+    fn validate(self) -> Result<(), QueryLifecycleError> {
+        self.channel.validate()?;
+        if self.route_edge_id == 0 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter route edge id must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTerminalRuntimeFilterTransportRouteV1 {
+    key: QueryTerminalRuntimeFilterTransportRouteKeyV1,
+    sent_count: u64,
+    sent_bytes: u64,
+    retried_count: u64,
+    retried_bytes: u64,
+    acked_count: u64,
+    acked_bytes: u64,
+    fail_open_count: u64,
+    fail_open_bytes: u64,
+}
+
+impl QueryTerminalRuntimeFilterTransportRouteV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        key: QueryTerminalRuntimeFilterTransportRouteKeyV1,
+        sent_count: u64,
+        sent_bytes: u64,
+        retried_count: u64,
+        retried_bytes: u64,
+        acked_count: u64,
+        acked_bytes: u64,
+        fail_open_count: u64,
+        fail_open_bytes: u64,
+    ) -> Self {
+        Self {
+            key,
+            sent_count,
+            sent_bytes,
+            retried_count,
+            retried_bytes,
+            acked_count,
+            acked_bytes,
+            fail_open_count,
+            fail_open_bytes,
+        }
+    }
+
+    pub const fn key(&self) -> QueryTerminalRuntimeFilterTransportRouteKeyV1 {
+        self.key
+    }
+    pub const fn sent_count(&self) -> u64 {
+        self.sent_count
+    }
+    pub const fn sent_bytes(&self) -> u64 {
+        self.sent_bytes
+    }
+    pub const fn retried_count(&self) -> u64 {
+        self.retried_count
+    }
+    pub const fn retried_bytes(&self) -> u64 {
+        self.retried_bytes
+    }
+    pub const fn acked_count(&self) -> u64 {
+        self.acked_count
+    }
+    pub const fn acked_bytes(&self) -> u64 {
+        self.acked_bytes
+    }
+    pub const fn fail_open_count(&self) -> u64 {
+        self.fail_open_count
+    }
+    pub const fn fail_open_bytes(&self) -> u64 {
+        self.fail_open_bytes
+    }
+
+    fn validate(&self) -> Result<(), QueryLifecycleError> {
+        self.key.validate()?;
+        let delivery_count = self
+            .sent_count
+            .checked_add(self.retried_count)
+            .ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter transport delivery counter overflow",
+                )
+            })?;
+        let delivery_bytes = self
+            .sent_bytes
+            .checked_add(self.retried_bytes)
+            .ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter transport delivery bytes overflow",
+                )
+            })?;
+        if self.acked_count > delivery_count || self.acked_bytes > delivery_bytes {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter transport acknowledgement exceeds delivery totals",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryTerminalRuntimeFilterSubscriptionTerminalV1 {
+    Pending,
+    Acquired,
+    TimedOut,
+    Unavailable,
+    Unsupported,
+    Cancelled,
+    Completed,
+    CompletedWithoutArtifact,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
+    unit_facts_missing: u64,
+    column_facts_missing: u64,
+    data_type_unsupported: u64,
+    predicate_capability_unsupported: u64,
+    resource_unavailable: u64,
+    snapshot_unavailable: u64,
+    snapshot_timed_out: u64,
+    snapshot_not_published: u64,
+}
+
+impl QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        unit_facts_missing: u64,
+        column_facts_missing: u64,
+        data_type_unsupported: u64,
+        predicate_capability_unsupported: u64,
+        resource_unavailable: u64,
+        snapshot_unavailable: u64,
+        snapshot_timed_out: u64,
+        snapshot_not_published: u64,
+    ) -> Self {
+        Self {
+            unit_facts_missing,
+            column_facts_missing,
+            data_type_unsupported,
+            predicate_capability_unsupported,
+            resource_unavailable,
+            snapshot_unavailable,
+            snapshot_timed_out,
+            snapshot_not_published,
+        }
+    }
+
+    pub const fn unit_facts_missing(self) -> u64 {
+        self.unit_facts_missing
+    }
+    pub const fn column_facts_missing(self) -> u64 {
+        self.column_facts_missing
+    }
+    pub const fn data_type_unsupported(self) -> u64 {
+        self.data_type_unsupported
+    }
+    pub const fn predicate_capability_unsupported(self) -> u64 {
+        self.predicate_capability_unsupported
+    }
+    pub const fn resource_unavailable(self) -> u64 {
+        self.resource_unavailable
+    }
+    pub const fn snapshot_unavailable(self) -> u64 {
+        self.snapshot_unavailable
+    }
+    pub const fn snapshot_timed_out(self) -> u64 {
+        self.snapshot_timed_out
+    }
+    pub const fn snapshot_not_published(self) -> u64 {
+        self.snapshot_not_published
+    }
+
+    fn total(self) -> Result<u64, QueryLifecycleError> {
+        checked_sum(
+            [
+                self.unit_facts_missing,
+                self.column_facts_missing,
+                self.data_type_unsupported,
+                self.predicate_capability_unsupported,
+                self.resource_unavailable,
+                self.snapshot_unavailable,
+                self.snapshot_timed_out,
+                self.snapshot_not_published,
+            ],
+            "terminal runtime-filter scan not-evaluated counters overflow",
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryTerminalRuntimeFilterConsumerKeyV1 {
+    channel: QueryTerminalRuntimeFilterChannelKeyV1,
+    consumer_binding_id: u32,
+    fragment_instance_id: UniqueId,
+}
+
+impl QueryTerminalRuntimeFilterConsumerKeyV1 {
+    pub const fn new(
+        channel: QueryTerminalRuntimeFilterChannelKeyV1,
+        consumer_binding_id: u32,
+        fragment_instance_id: UniqueId,
+    ) -> Self {
+        Self {
+            channel,
+            consumer_binding_id,
+            fragment_instance_id,
+        }
+    }
+
+    pub const fn channel(self) -> QueryTerminalRuntimeFilterChannelKeyV1 {
+        self.channel
+    }
+    pub const fn consumer_binding_id(self) -> u32 {
+        self.consumer_binding_id
+    }
+    pub const fn fragment_instance_id(self) -> UniqueId {
+        self.fragment_instance_id
+    }
+
+    fn validate(self) -> Result<(), QueryLifecycleError> {
+        self.channel.validate()?;
+        if self.consumer_binding_id == 0 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter consumer binding id must be nonzero",
+            ));
+        }
+        validate_unique_id(
+            self.fragment_instance_id,
+            "terminal runtime-filter consumer fragment instance id must be nonzero",
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTerminalRuntimeFilterConsumerV1 {
+    key: QueryTerminalRuntimeFilterConsumerKeyV1,
+    latest_delivered_logical_version: Option<u64>,
+    latest_applied_logical_version: Option<u64>,
+    subscription_terminal: QueryTerminalRuntimeFilterSubscriptionTerminalV1,
+    row_evaluations: u64,
+    input_rows: u64,
+    output_rows: u64,
+    scan_evaluated: u64,
+    scan_kept: u64,
+    scan_pruned: u64,
+    scan_not_evaluated: u64,
+    scan_not_evaluated_reasons: QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+}
+
+impl QueryTerminalRuntimeFilterConsumerV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        key: QueryTerminalRuntimeFilterConsumerKeyV1,
+        latest_delivered_logical_version: Option<u64>,
+        latest_applied_logical_version: Option<u64>,
+        subscription_terminal: QueryTerminalRuntimeFilterSubscriptionTerminalV1,
+        row_evaluations: u64,
+        input_rows: u64,
+        output_rows: u64,
+        scan_evaluated: u64,
+        scan_kept: u64,
+        scan_pruned: u64,
+        scan_not_evaluated: u64,
+        scan_not_evaluated_reasons: QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+    ) -> Self {
+        Self {
+            key,
+            latest_delivered_logical_version,
+            latest_applied_logical_version,
+            subscription_terminal,
+            row_evaluations,
+            input_rows,
+            output_rows,
+            scan_evaluated,
+            scan_kept,
+            scan_pruned,
+            scan_not_evaluated,
+            scan_not_evaluated_reasons,
+        }
+    }
+
+    pub const fn key(&self) -> QueryTerminalRuntimeFilterConsumerKeyV1 {
+        self.key
+    }
+    pub const fn latest_delivered_logical_version(&self) -> Option<u64> {
+        self.latest_delivered_logical_version
+    }
+    pub const fn latest_applied_logical_version(&self) -> Option<u64> {
+        self.latest_applied_logical_version
+    }
+    pub const fn subscription_terminal(&self) -> QueryTerminalRuntimeFilterSubscriptionTerminalV1 {
+        self.subscription_terminal
+    }
+    pub const fn row_evaluations(&self) -> u64 {
+        self.row_evaluations
+    }
+    pub const fn input_rows(&self) -> u64 {
+        self.input_rows
+    }
+    pub const fn output_rows(&self) -> u64 {
+        self.output_rows
+    }
+    pub const fn scan_evaluated(&self) -> u64 {
+        self.scan_evaluated
+    }
+    pub const fn scan_kept(&self) -> u64 {
+        self.scan_kept
+    }
+    pub const fn scan_pruned(&self) -> u64 {
+        self.scan_pruned
+    }
+    pub const fn scan_not_evaluated(&self) -> u64 {
+        self.scan_not_evaluated
+    }
+    pub const fn scan_not_evaluated_reasons(&self) -> QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
+        self.scan_not_evaluated_reasons
+    }
+
+    fn validate(&self) -> Result<(), QueryLifecycleError> {
+        self.key.validate()?;
+        validate_optional_nonzero(
+            self.latest_delivered_logical_version,
+            "terminal runtime-filter latest delivered logical version must be nonzero",
+        )?;
+        validate_optional_nonzero(
+            self.latest_applied_logical_version,
+            "terminal runtime-filter latest applied logical version must be nonzero",
+        )?;
+        if let Some(applied) = self.latest_applied_logical_version {
+            let Some(delivered) = self.latest_delivered_logical_version else {
+                return Err(QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter applied version requires a delivered version",
+                ));
+            };
+            if applied > delivered {
+                return Err(QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter applied version exceeds delivered version",
+                ));
+            }
+        }
+        if self.output_rows > self.input_rows
+            || (self.row_evaluations == 0 && (self.input_rows != 0 || self.output_rows != 0))
+        {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter row counters are inconsistent",
+            ));
+        }
+        let evaluated = self
+            .scan_kept
+            .checked_add(self.scan_pruned)
+            .ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter scan evaluated counters overflow",
+                )
+            })?;
+        if evaluated != self.scan_evaluated
+            || self.scan_not_evaluated_reasons.total()? != self.scan_not_evaluated
+        {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal runtime-filter scan counters are inconsistent",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTerminalProfileContributionV1 {
+    version: u32,
+    channels: Vec<QueryTerminalRuntimeFilterChannelV1>,
+    producer_streams: Vec<QueryTerminalRuntimeFilterProducerStreamV1>,
+    transport_routes: Vec<QueryTerminalRuntimeFilterTransportRouteV1>,
+    consumers: Vec<QueryTerminalRuntimeFilterConsumerV1>,
+}
+
+impl QueryTerminalProfileContributionV1 {
+    pub const fn empty() -> Self {
+        Self {
+            version: QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+            channels: Vec::new(),
+            producer_streams: Vec::new(),
+            transport_routes: Vec::new(),
+            consumers: Vec::new(),
+        }
+    }
+
+    pub fn try_new(
+        mut channels: Vec<QueryTerminalRuntimeFilterChannelV1>,
+        mut producer_streams: Vec<QueryTerminalRuntimeFilterProducerStreamV1>,
+        mut transport_routes: Vec<QueryTerminalRuntimeFilterTransportRouteV1>,
+        mut consumers: Vec<QueryTerminalRuntimeFilterConsumerV1>,
+    ) -> Result<Self, QueryLifecycleError> {
+        channels.sort_by_key(QueryTerminalRuntimeFilterChannelV1::key);
+        producer_streams.sort_by_key(QueryTerminalRuntimeFilterProducerStreamV1::key);
+        transport_routes.sort_by_key(QueryTerminalRuntimeFilterTransportRouteV1::key);
+        consumers.sort_by_key(QueryTerminalRuntimeFilterConsumerV1::key);
+
+        validate_sorted_unique(
+            &channels,
+            QueryTerminalRuntimeFilterChannelV1::key,
+            "channel",
+        )?;
+        validate_sorted_unique(
+            &producer_streams,
+            QueryTerminalRuntimeFilterProducerStreamV1::key,
+            "producer stream",
+        )?;
+        validate_sorted_unique(
+            &transport_routes,
+            QueryTerminalRuntimeFilterTransportRouteV1::key,
+            "transport route",
+        )?;
+        validate_sorted_unique(
+            &consumers,
+            QueryTerminalRuntimeFilterConsumerV1::key,
+            "consumer",
+        )?;
+
+        let contribution = Self {
+            version: QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+            channels,
+            producer_streams,
+            transport_routes,
+            consumers,
+        };
+        contribution.validate()?;
+        Ok(contribution)
+    }
+
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+    pub fn channels(&self) -> &[QueryTerminalRuntimeFilterChannelV1] {
+        &self.channels
+    }
+    pub fn producer_streams(&self) -> &[QueryTerminalRuntimeFilterProducerStreamV1] {
+        &self.producer_streams
+    }
+    pub fn transport_routes(&self) -> &[QueryTerminalRuntimeFilterTransportRouteV1] {
+        &self.transport_routes
+    }
+    pub fn consumers(&self) -> &[QueryTerminalRuntimeFilterConsumerV1] {
+        &self.consumers
+    }
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+            && self.producer_streams.is_empty()
+            && self.transport_routes.is_empty()
+            && self.consumers.is_empty()
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.put_canonical(&mut bytes);
+        bytes
+    }
+
+    fn validate(&self) -> Result<(), QueryLifecycleError> {
+        if self.version != QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "unsupported query terminal profile contribution version",
+            ));
+        }
+        for (section, len) in [
+            ("channel", self.channels.len()),
+            ("producer stream", self.producer_streams.len()),
+            ("transport route", self.transport_routes.len()),
+            ("consumer", self.consumers.len()),
+        ] {
+            if len > QUERY_TERMINAL_PROFILE_SECTION_MAX_ENTRIES {
+                return Err(QueryLifecycleError::invalid_manifest(format!(
+                    "terminal runtime-filter {section} section exceeds the cardinality limit"
+                )));
+            }
+        }
+        validate_sorted_unique(
+            &self.channels,
+            QueryTerminalRuntimeFilterChannelV1::key,
+            "channel",
+        )?;
+        validate_sorted_unique(
+            &self.producer_streams,
+            QueryTerminalRuntimeFilterProducerStreamV1::key,
+            "producer stream",
+        )?;
+        validate_sorted_unique(
+            &self.transport_routes,
+            QueryTerminalRuntimeFilterTransportRouteV1::key,
+            "transport route",
+        )?;
+        validate_sorted_unique(
+            &self.consumers,
+            QueryTerminalRuntimeFilterConsumerV1::key,
+            "consumer",
+        )?;
+        for value in &self.channels {
+            value.validate()?;
+        }
+        for value in &self.producer_streams {
+            value.validate()?;
+        }
+        for value in &self.transport_routes {
+            value.validate()?;
+        }
+        for value in &self.consumers {
+            value.validate()?;
+        }
+        for channel in self
+            .producer_streams
+            .iter()
+            .map(|value| value.key().channel())
+            .chain(
+                self.transport_routes
+                    .iter()
+                    .map(|value| value.key().channel()),
+            )
+            .chain(self.consumers.iter().map(|value| value.key().channel()))
+        {
+            if self
+                .channels
+                .binary_search_by_key(&channel, QueryTerminalRuntimeFilterChannelV1::key)
+                .is_err()
+            {
+                return Err(QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter section references an unknown channel",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn put_canonical(&self, bytes: &mut Vec<u8>) {
+        put_u32(bytes, self.version);
+        put_u64(bytes, self.channels.len() as u64);
+        for value in &self.channels {
+            put_channel_key(bytes, value.key);
+            put_u8(bytes, 1);
+            put_u8(
+                bytes,
+                match value.terminal_state {
+                    QueryTerminalRuntimeFilterChannelTerminalStateV1::Open => 1,
+                    QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed => 2,
+                    QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable => 3,
+                    QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled => 4,
+                },
+            );
+            put_optional_u64(bytes, value.latest_published_logical_version);
+            put_u64(bytes, value.published_count);
+            put_u64(bytes, value.completed_count);
+            put_u64(bytes, value.unavailable_count);
+            put_u64(bytes, value.cancelled_count);
+        }
+        put_u64(bytes, self.producer_streams.len() as u64);
+        for value in &self.producer_streams {
+            put_channel_key(bytes, value.key.channel);
+            put_unique_id(bytes, value.key.producer_fragment_instance_id);
+            put_u32(bytes, value.key.partition_id);
+            put_optional_u64(bytes, value.latest_accepted_sequence);
+            put_u64(bytes, value.accepted_count);
+            put_u64(bytes, value.duplicate_count);
+            put_u64(bytes, value.stale_count);
+            put_u64(bytes, value.conflict_count);
+            put_u64(bytes, value.resource_limit_count);
+        }
+        put_u64(bytes, self.transport_routes.len() as u64);
+        for value in &self.transport_routes {
+            put_channel_key(bytes, value.key.channel);
+            put_u64(bytes, value.key.route_edge_id);
+            put_u64(bytes, value.sent_count);
+            put_u64(bytes, value.sent_bytes);
+            put_u64(bytes, value.retried_count);
+            put_u64(bytes, value.retried_bytes);
+            put_u64(bytes, value.acked_count);
+            put_u64(bytes, value.acked_bytes);
+            put_u64(bytes, value.fail_open_count);
+            put_u64(bytes, value.fail_open_bytes);
+        }
+        put_u64(bytes, self.consumers.len() as u64);
+        for value in &self.consumers {
+            put_channel_key(bytes, value.key.channel);
+            put_u32(bytes, value.key.consumer_binding_id);
+            put_unique_id(bytes, value.key.fragment_instance_id);
+            put_optional_u64(bytes, value.latest_delivered_logical_version);
+            put_optional_u64(bytes, value.latest_applied_logical_version);
+            put_u8(
+                bytes,
+                match value.subscription_terminal {
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::Pending => 1,
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired => 2,
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::TimedOut => 3,
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unavailable => 4,
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unsupported => 5,
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled => 6,
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed => 7,
+                    QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact => 8,
+                },
+            );
+            put_u64(bytes, value.row_evaluations);
+            put_u64(bytes, value.input_rows);
+            put_u64(bytes, value.output_rows);
+            put_u64(bytes, value.scan_evaluated);
+            put_u64(bytes, value.scan_kept);
+            put_u64(bytes, value.scan_pruned);
+            put_u64(bytes, value.scan_not_evaluated);
+            put_scan_not_evaluated(bytes, value.scan_not_evaluated_reasons);
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryTerminalSnapshot {
@@ -192,11 +1088,38 @@ pub struct QueryTerminalSnapshot {
 }
 
 impl QueryTerminalSnapshot {
+    /// Compatibility entrypoint for existing explicitly RF-less callers.
+    /// New lifecycle code should select one of the named constructors below.
     pub fn new(
         execution_id: QueryExecutionId,
         backend: ParticipantBackendIdentity,
         init_digest: ParticipantManifestDigest,
+        fragments: Vec<FragmentTerminalSnapshot>,
+    ) -> Result<Self, QueryLifecycleError> {
+        Self::new_without_runtime_filters(execution_id, backend, init_digest, fragments)
+    }
+
+    pub fn new_without_runtime_filters(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        init_digest: ParticipantManifestDigest,
+        fragments: Vec<FragmentTerminalSnapshot>,
+    ) -> Result<Self, QueryLifecycleError> {
+        Self::new_with_profile_contribution(
+            execution_id,
+            backend,
+            init_digest,
+            fragments,
+            QueryTerminalProfileContributionV1::empty(),
+        )
+    }
+
+    pub fn new_with_profile_contribution(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        init_digest: ParticipantManifestDigest,
         mut fragments: Vec<FragmentTerminalSnapshot>,
+        profile_contribution: QueryTerminalProfileContributionV1,
     ) -> Result<Self, QueryLifecycleError> {
         fragments.sort_by_key(|fact| fact.fragment_instance_id());
         let mut ids = BTreeSet::new();
@@ -207,13 +1130,14 @@ impl QueryTerminalSnapshot {
                 ));
             }
         }
+        profile_contribution.validate()?;
         let mut snapshot = Self {
             version: QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
             execution_id,
             backend,
             init_digest,
             fragments,
-            profile_contribution: QueryTerminalProfileContributionV1,
+            profile_contribution,
             digest: QueryTerminalSnapshotDigest::new([0; 32]),
         };
         snapshot.digest = snapshot.compute_digest();
@@ -240,6 +1164,10 @@ impl QueryTerminalSnapshot {
         &self.fragments
     }
 
+    pub const fn profile_contribution(&self) -> &QueryTerminalProfileContributionV1 {
+        &self.profile_contribution
+    }
+
     pub const fn digest(&self) -> QueryTerminalSnapshotDigest {
         self.digest
     }
@@ -256,6 +1184,7 @@ impl QueryTerminalSnapshot {
                 "unsupported query terminal snapshot version",
             ));
         }
+        self.profile_contribution.validate()?;
         if self.compute_digest() != self.digest {
             return Err(QueryLifecycleError::new(
                 super::QueryLifecycleErrorCode::Conflict,
@@ -307,8 +1236,7 @@ impl QueryTerminalSnapshot {
             }
             put_bytes(&mut bytes, &fragment.statistics_payload);
         }
-        // V1's query-scoped contribution is explicitly empty and versioned.
-        put_u8(&mut bytes, 0);
+        self.profile_contribution.put_canonical(&mut bytes);
         bytes
     }
 
@@ -529,6 +1457,87 @@ fn put_optional_i64(bytes: &mut Vec<u8>, value: Option<i64>) {
     }
 }
 
+fn put_optional_u64(bytes: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            put_u8(bytes, 1);
+            put_u64(bytes, value);
+        }
+        None => put_u8(bytes, 0),
+    }
+}
+
+fn put_unique_id(bytes: &mut Vec<u8>, value: UniqueId) {
+    put_i64(bytes, value.high());
+    put_i64(bytes, value.low());
+}
+
+fn put_channel_key(bytes: &mut Vec<u8>, value: QueryTerminalRuntimeFilterChannelKeyV1) {
+    put_u32(bytes, value.channel_binding_id);
+    put_u32(bytes, value.channel_id);
+}
+
+fn put_scan_not_evaluated(
+    bytes: &mut Vec<u8>,
+    value: QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+) {
+    put_u64(bytes, value.unit_facts_missing);
+    put_u64(bytes, value.column_facts_missing);
+    put_u64(bytes, value.data_type_unsupported);
+    put_u64(bytes, value.predicate_capability_unsupported);
+    put_u64(bytes, value.resource_unavailable);
+    put_u64(bytes, value.snapshot_unavailable);
+    put_u64(bytes, value.snapshot_timed_out);
+    put_u64(bytes, value.snapshot_not_published);
+}
+
+fn validate_optional_nonzero(
+    value: Option<u64>,
+    detail: &'static str,
+) -> Result<(), QueryLifecycleError> {
+    if value == Some(0) {
+        return Err(QueryLifecycleError::invalid_manifest(detail));
+    }
+    Ok(())
+}
+
+fn validate_unique_id(value: UniqueId, detail: &'static str) -> Result<(), QueryLifecycleError> {
+    if value.high() == 0 && value.low() == 0 {
+        return Err(QueryLifecycleError::invalid_manifest(detail));
+    }
+    Ok(())
+}
+
+fn checked_sum<const N: usize>(
+    values: [u64; N],
+    detail: &'static str,
+) -> Result<u64, QueryLifecycleError> {
+    values.into_iter().try_fold(0_u64, |sum, value| {
+        sum.checked_add(value)
+            .ok_or_else(|| QueryLifecycleError::invalid_manifest(detail))
+    })
+}
+
+fn validate_sorted_unique<T, K>(
+    values: &[T],
+    key: impl Fn(&T) -> K,
+    label: &'static str,
+) -> Result<(), QueryLifecycleError>
+where
+    K: Ord,
+{
+    for pair in values.windows(2) {
+        let previous = key(&pair[0]);
+        let current = key(&pair[1]);
+        if previous >= current {
+            return Err(QueryLifecycleError::invalid_manifest(format!(
+                "query terminal profile contribution contains duplicate or unsorted {label} identity"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn put_u8(bytes: &mut Vec<u8>, value: u8) {
     bytes.push(value);
 }
@@ -638,6 +1647,223 @@ mod tests {
         assert!(ImmutableQueryTerminalRecord::new(snapshot, 1).is_err());
     }
 
+    fn channel(binding_id: u32, channel_id: u32) -> QueryTerminalRuntimeFilterChannelV1 {
+        QueryTerminalRuntimeFilterChannelV1::new(
+            QueryTerminalRuntimeFilterChannelKeyV1::new(binding_id, channel_id),
+            QueryTerminalRuntimeFilterChannelInstallStateV1::Installed,
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Open,
+            Some(1),
+            1,
+            0,
+            0,
+            0,
+        )
+    }
+
+    fn non_empty_contribution() -> QueryTerminalProfileContributionV1 {
+        let channel_key = QueryTerminalRuntimeFilterChannelKeyV1::new(7, 9);
+        QueryTerminalProfileContributionV1::try_new(
+            vec![channel(7, 9)],
+            vec![QueryTerminalRuntimeFilterProducerStreamV1::new(
+                QueryTerminalRuntimeFilterProducerStreamKeyV1::new(
+                    channel_key,
+                    UniqueId::new(3, 4),
+                    0,
+                ),
+                Some(2),
+                2,
+                1,
+                1,
+                0,
+                0,
+            )],
+            vec![QueryTerminalRuntimeFilterTransportRouteV1::new(
+                QueryTerminalRuntimeFilterTransportRouteKeyV1::new(channel_key, 11),
+                2,
+                20,
+                1,
+                10,
+                2,
+                20,
+                1,
+                10,
+            )],
+            vec![QueryTerminalRuntimeFilterConsumerV1::new(
+                QueryTerminalRuntimeFilterConsumerKeyV1::new(channel_key, 13, UniqueId::new(5, 6)),
+                Some(2),
+                Some(1),
+                QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired,
+                1,
+                10,
+                4,
+                2,
+                1,
+                1,
+                1,
+                QueryTerminalRuntimeFilterScanNotEvaluatedV1::new(1, 0, 0, 0, 0, 0, 0, 0),
+            )],
+        )
+        .expect("valid non-empty contribution")
+    }
+
+    #[test]
+    fn terminal_profile_contribution_sorts_sections_and_rejects_duplicate_identity() {
+        let first = QueryTerminalProfileContributionV1::try_new(
+            vec![channel(2, 2), channel(1, 1)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("canonical contribution");
+        let second = QueryTerminalProfileContributionV1::try_new(
+            vec![channel(1, 1), channel(2, 2)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("canonical contribution");
+        assert_eq!(first, second);
+        assert_eq!(first.canonical_bytes(), second.canonical_bytes());
+        assert!(
+            QueryTerminalProfileContributionV1::try_new(
+                vec![channel(1, 1), channel(1, 1)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn transport_fail_open_before_send_is_a_valid_terminal_outcome() {
+        let channel_key = QueryTerminalRuntimeFilterChannelKeyV1::new(7, 9);
+        let contribution = QueryTerminalProfileContributionV1::try_new(
+            vec![channel(7, 9)],
+            Vec::new(),
+            vec![QueryTerminalRuntimeFilterTransportRouteV1::new(
+                QueryTerminalRuntimeFilterTransportRouteKeyV1::new(channel_key, 11),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                128,
+            )],
+            Vec::new(),
+        )
+        .expect("pre-send fail-open is truthful without a synthetic send");
+
+        assert_eq!(contribution.transport_routes()[0].sent_count(), 0);
+        assert_eq!(contribution.transport_routes()[0].fail_open_count(), 1);
+    }
+
+    #[test]
+    fn terminal_profile_contribution_validates_counter_invariants() {
+        let invalid = QueryTerminalRuntimeFilterConsumerV1::new(
+            QueryTerminalRuntimeFilterConsumerKeyV1::new(
+                QueryTerminalRuntimeFilterChannelKeyV1::new(1, 1),
+                2,
+                UniqueId::new(0, 1),
+            ),
+            Some(1),
+            Some(1),
+            QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired,
+            1,
+            4,
+            5,
+            1,
+            1,
+            1,
+            0,
+            QueryTerminalRuntimeFilterScanNotEvaluatedV1::default(),
+        );
+        assert!(
+            QueryTerminalProfileContributionV1::try_new(
+                vec![channel(1, 1)],
+                Vec::new(),
+                Vec::new(),
+                vec![invalid],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_profile_contribution_accepts_zero_based_producer_sequence() {
+        let channel_key = QueryTerminalRuntimeFilterChannelKeyV1::new(1, 1);
+        let contribution = QueryTerminalProfileContributionV1::try_new(
+            vec![channel(1, 1)],
+            vec![QueryTerminalRuntimeFilterProducerStreamV1::new(
+                QueryTerminalRuntimeFilterProducerStreamKeyV1::new(
+                    channel_key,
+                    UniqueId::new(2, 3),
+                    0,
+                ),
+                Some(0),
+                1,
+                0,
+                0,
+                0,
+                0,
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("producer sequences are zero-based");
+        assert_eq!(
+            contribution.producer_streams()[0].latest_accepted_sequence(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn terminal_profile_contribution_rejects_orphan_section_channel() {
+        let orphan = QueryTerminalRuntimeFilterProducerStreamV1::new(
+            QueryTerminalRuntimeFilterProducerStreamKeyV1::new(
+                QueryTerminalRuntimeFilterChannelKeyV1::new(2, 2),
+                UniqueId::new(3, 4),
+                0,
+            ),
+            Some(0),
+            1,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert!(
+            QueryTerminalProfileContributionV1::try_new(
+                vec![channel(1, 1)],
+                vec![orphan],
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_digest_and_wire_include_non_empty_profile_contribution() {
+        let empty = snapshot(&[1]);
+        let non_empty = QueryTerminalSnapshot::new_with_profile_contribution(
+            empty.execution_id(),
+            empty.backend().clone(),
+            empty.init_digest(),
+            empty.fragments().to_vec(),
+            non_empty_contribution(),
+        )
+        .expect("terminal snapshot with contribution");
+        assert_ne!(empty.digest(), non_empty.digest());
+        let decoded = super::super::decode_query_terminal_snapshot(
+            &super::super::encode_query_terminal_snapshot(&non_empty),
+        )
+        .expect("non-empty contribution wire round trip");
+        assert_eq!(decoded, non_empty);
+    }
+
     #[test]
     fn query_lifecycle_terminal_snapshot_profile_digest_is_canonical() {
         let execution =
@@ -697,8 +1923,8 @@ mod tests {
         assert_eq!(
             snapshot.digest().as_bytes(),
             &[
-                205, 192, 254, 18, 75, 113, 213, 79, 168, 77, 99, 79, 229, 39, 20, 179, 214, 213,
-                225, 246, 208, 253, 41, 154, 163, 127, 253, 162, 131, 149, 129, 96,
+                153, 104, 198, 50, 156, 136, 64, 128, 172, 88, 76, 134, 194, 243, 47, 82, 186, 38,
+                226, 160, 113, 146, 238, 2, 152, 233, 135, 200, 244, 10, 143, 233,
             ]
         );
         snapshot.validate().expect("profile digest stays canonical");

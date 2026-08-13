@@ -5,8 +5,12 @@ use novarocks_types::UniqueId;
 pub enum FragmentEvent {
     Progress(FragmentProgress),
     ProfileSnapshot(FragmentProfileSnapshot),
+    /// An evaluated row mask folded by the Backend participant that owns the
+    /// installed consumer identity. Execution emits this exactly once at the
+    /// real application point.
+    RuntimeFilterRowEffect(crate::runtime_filter::RuntimeFilterRowEffect),
     /// Neutral Execution-owned scan-unit evaluation outcome. Backend validates/consumes
-    /// this event but intentionally does not persist or aggregate it yet.
+    /// the full outcome so fail-open reasons cannot be reconstructed later.
     RuntimeFilterScanUnitOutcome(crate::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome),
 }
 

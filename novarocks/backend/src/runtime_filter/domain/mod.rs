@@ -29,6 +29,11 @@ mod snapshot;
 mod subscription;
 mod transport;
 
+/// Per installed producer instance bound used by both the execution binding
+/// and the terminal observation store. A partition id is never a free-form
+/// observation key beyond this frozen bound.
+pub(crate) const MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE: u32 = 16_384;
+
 pub(crate) use coverage::{
     BackendCoverage, BackendCoverageError, BackendCoverageProgress, BackendCoverageState,
     BackendCoverageWitnessId, BackendCoverageWitnessProgress,

@@ -12,11 +12,13 @@ use crate::query_lifecycle::QueryLifecycleRegistry;
 pub(crate) fn lifecycle_fragment_event_sink(
     lifecycle: Arc<QueryLifecycleRegistry>,
     execution_id: QueryExecutionId,
+    fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
 ) -> Arc<dyn FragmentEventSink> {
     Arc::new(LifecycleFragmentEventSink {
         lifecycle,
         execution_id,
+        fragment_instance_id,
         profiler,
     })
 }
@@ -24,27 +26,40 @@ pub(crate) fn lifecycle_fragment_event_sink(
 struct LifecycleFragmentEventSink {
     lifecycle: Arc<QueryLifecycleRegistry>,
     execution_id: QueryExecutionId,
+    fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
 }
 
 impl FragmentEventSink for LifecycleFragmentEventSink {
     fn record(&self, event: FragmentEvent) {
-        let FragmentEvent::Progress(progress) = event else {
-            if let FragmentEvent::RuntimeFilterScanUnitOutcome(outcome) = event {
-                // RFO-8 owns the observation store.  Touch the invariant-bearing
-                // effect here so malformed future event adapters cannot ignore it.
-                let _ = outcome.effect();
+        match event {
+            FragmentEvent::Progress(progress) => {
+                debug_assert_eq!(progress.fragment_instance_id(), self.fragment_instance_id);
+                let profile = self.profiler.as_ref().map(Profiler::to_native_tree);
+                let _ = self.lifecycle.publish_fragment_observation(
+                    self.execution_id,
+                    progress.fragment_instance_id(),
+                    progress.input_rows(),
+                    progress.output_rows(),
+                    progress.elapsed_ms(),
+                    profile,
+                );
             }
-            return;
-        };
-        let profile = self.profiler.as_ref().map(Profiler::to_native_tree);
-        let _ = self.lifecycle.publish_fragment_observation(
-            self.execution_id,
-            progress.fragment_instance_id(),
-            progress.input_rows(),
-            progress.output_rows(),
-            progress.elapsed_ms(),
-            profile,
-        );
+            FragmentEvent::RuntimeFilterRowEffect(effect) => {
+                self.lifecycle.record_runtime_filter_row_effect(
+                    self.execution_id,
+                    self.fragment_instance_id,
+                    effect,
+                );
+            }
+            FragmentEvent::RuntimeFilterScanUnitOutcome(outcome) => {
+                self.lifecycle.record_runtime_filter_scan_unit_outcome(
+                    self.execution_id,
+                    self.fragment_instance_id,
+                    outcome,
+                );
+            }
+            FragmentEvent::ProfileSnapshot(_) => {}
+        }
     }
 }

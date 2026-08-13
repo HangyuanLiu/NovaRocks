@@ -33,7 +33,6 @@ pub mod global_async_runtime;
 #[allow(dead_code)]
 pub mod result_buffer;
 pub mod result_format;
-pub mod runtime_filter_observability;
 pub mod scan_range;
 pub mod sink_commit;
 pub mod start_epoch;

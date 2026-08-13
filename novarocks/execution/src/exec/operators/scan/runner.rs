@@ -64,9 +64,6 @@ const SCAN_TIME: &str = "ScanTime";
 // for correctness.
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
-const RUNTIME_FILTER_SCAN_UNITS_PRUNED: &str = "RuntimeFilterScanUnitsPruned";
-const RUNTIME_FILTER_SCAN_UNITS_KEPT: &str = "RuntimeFilterScanUnitsKept";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED: &str = "RuntimeFilterScanUnitsNotEvaluated";
 
 type PositionedChunk = (Chunk, Option<Vec<i64>>);
 
@@ -266,7 +263,7 @@ impl ScanAsyncRunner {
                     };
                     let Some(chunk) = (match self.native_ordered_live_consumers.as_ref() {
                         Some(consumers) => {
-                            consumers.apply_latest_chunk_profiled(chunk, self.profiles.as_ref())?
+                            consumers.apply_latest_chunk_observed(chunk, Some(&self.event_sink))?
                         }
                         None => Some(chunk),
                     }) else {
@@ -274,7 +271,7 @@ impl ScanAsyncRunner {
                     };
                     let Some(chunk) = (match self.native_runtime_filter_consumers.as_ref() {
                         Some(consumers) => {
-                            consumers.apply_chunk_profiled(chunk, self.profiles.as_ref())?
+                            consumers.apply_chunk_observed(chunk, Some(&self.event_sink))?
                         }
                         None => Some(chunk),
                     }) else {
@@ -368,42 +365,6 @@ impl ScanAsyncRunner {
     ) {
         self.event_sink
             .record(FragmentEvent::RuntimeFilterScanUnitOutcome(*outcome));
-        let Some(profiles) = self.profiles.as_ref() else {
-            return;
-        };
-        let counter = match outcome.evaluation() {
-            crate::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
-                decision: RuntimeFilterScanUnitDecision::Pruned,
-                ..
-            } => RUNTIME_FILTER_SCAN_UNITS_PRUNED,
-            crate::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
-                decision: RuntimeFilterScanUnitDecision::Kept,
-                ..
-            } => RUNTIME_FILTER_SCAN_UNITS_KEPT,
-            crate::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated {
-                ..
-            } => RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
-        };
-        profiles.common.counter_add(counter, ProfileUnit::Unit, 1);
-        if let crate::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated {
-            reason,
-            ..
-        } = outcome.evaluation()
-        {
-            let reason_counter = match reason {
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::UnitFactsMissing(_) => "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing",
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::ColumnFactsMissing(_) => "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing",
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::DataTypeUnsupported => "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported",
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::PredicateCapabilityUnsupported => "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported",
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::ResourceUnavailable => "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable",
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotUnavailable => "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable",
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotTimedOut => "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut",
-                crate::runtime_filter::scan_domain::RuntimeFilterScanUnitNotEvaluatedReason::SnapshotNotPublished => "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
-            };
-            profiles
-                .common
-                .counter_add(reason_counter, ProfileUnit::Unit, 1);
-        }
     }
 
     #[cfg(test)]

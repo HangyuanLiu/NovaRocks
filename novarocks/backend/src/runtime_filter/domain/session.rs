@@ -44,7 +44,8 @@ use super::{
     BackendParticipantIdentity, BackendProducerInstall, BackendProducerStreamIdentity,
     BackendReducedLogicalDomain, BackendReducedLogicalSnapshot, BackendReductionApply,
     BackendReductionState, BackendReductionStateError, BackendRouteEdgeId,
-    BackendRuntimeFilterEventObserver, BackendSubscriptionError, BackendSubscriptionGroup,
+    BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendSubscriptionError,
+    BackendSubscriptionGroup, MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE,
 };
 
 /// A Backend-owned encoded delivery ready for the participant's route authority.
@@ -203,6 +204,7 @@ pub(crate) struct BackendRuntimeFilterSession {
     availability: Option<Mutex<BackendCoverageState>>,
     terminal: Option<Mutex<BackendCoverageState>>,
     materialized_delivery_sink: Mutex<Option<Arc<dyn BackendMaterializedDeliverySink>>>,
+    events: Arc<dyn BackendRuntimeFilterEventObserver>,
 }
 
 impl BackendRuntimeFilterSession {
@@ -271,6 +273,16 @@ impl BackendRuntimeFilterSession {
             );
         }
 
+        for binding_id in channel.producers().keys().chain(channel.consumers().keys()) {
+            events.record(BackendRuntimeFilterEvent::ChannelPlanned {
+                channel: BackendChannelIdentity::new(
+                    participant,
+                    *binding_id,
+                    channel.channel_id(),
+                ),
+            });
+        }
+
         Ok(Self {
             policy,
             participant,
@@ -282,6 +294,7 @@ impl BackendRuntimeFilterSession {
             availability,
             terminal,
             materialized_delivery_sink: Mutex::new(None),
+            events,
         })
     }
 
@@ -397,9 +410,11 @@ impl BackendRuntimeFilterSession {
                 "consumer-only Backend channel cannot accept a producer contribution",
             )
         })?;
+        // Keep reduction and publication in one ordered critical section.
+        // Otherwise two producer threads can reduce v1 then v2 under this
+        // mutex but publish them as v2 then v1 after releasing it.
+        let mut reduction = reduction.lock().unwrap_or_else(|error| error.into_inner());
         let (apply, publication) = reduction
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
             .submit(stream, sequence, contribution)
             .map_err(reduction_violation)?;
         if let Some(snapshot) = publication.as_ref() {
@@ -407,6 +422,7 @@ impl BackendRuntimeFilterSession {
                 self.publish_reduced_snapshot(snapshot, None)?;
             }
         }
+        drop(reduction);
         Ok(BackendRuntimeFilterSessionSubmission {
             outcome: match apply {
                 BackendReductionApply::Applied { .. } => RuntimeFilterSubmitOutcome::Published,
@@ -544,6 +560,10 @@ impl BackendRuntimeFilterSession {
             binding.terminal = Some(BackendProducerBindingTerminal::Failed);
         }
         self.mark_impossible(install.coverage_witness());
+        self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelUnavailable {
+            channel,
+            reason: UnavailableReason::ProducerFailed,
+        });
         for consumer in self.consumers.values() {
             for route in &consumer.routes {
                 consumer
@@ -579,8 +599,32 @@ impl BackendRuntimeFilterSession {
             })?;
         consumer
             .subscriptions
-            .publish(route_edge_id, outcome, terminal)
-            .map_err(subscription_violation)
+            .publish(route_edge_id, outcome.clone(), terminal)
+            .map_err(subscription_violation)?;
+        match &outcome {
+            SnapshotAcquireOutcome::Published(snapshot) => {
+                let version = snapshot.logical_version();
+                self.record_channel_event(|channel| {
+                    BackendRuntimeFilterEvent::LogicalVersionPublished { channel, version }
+                });
+                if terminal == Some(LiveTerminal::Completed) {
+                    self.record_channel_event(|channel| {
+                        BackendRuntimeFilterEvent::ChannelCompleted { channel, version }
+                    });
+                }
+            }
+            SnapshotAcquireOutcome::Unavailable(reason) => {
+                let reason = *reason;
+                self.record_channel_event(|channel| {
+                    BackendRuntimeFilterEvent::ChannelUnavailable { channel, reason }
+                });
+            }
+            SnapshotAcquireOutcome::Cancelled => self.record_channel_event(|channel| {
+                BackendRuntimeFilterEvent::ChannelCancelled { channel }
+            }),
+            SnapshotAcquireOutcome::Unsupported(_) | SnapshotAcquireOutcome::TimedOut => {}
+        }
+        Ok(())
     }
 
     /// Materialize a reduced semantic snapshot into each accepted Backend
@@ -592,6 +636,12 @@ impl BackendRuntimeFilterSession {
         terminal: Option<LiveTerminal>,
     ) -> Result<(), RuntimeFilterContractViolation> {
         let logical_version = self.materialized_logical_version(snapshot);
+        self.record_channel_event(
+            |channel| BackendRuntimeFilterEvent::LogicalVersionPublished {
+                channel,
+                version: logical_version,
+            },
+        );
         for consumer in self.consumers.values() {
             let outcome = match (snapshot.domain(), consumer.contract.contract()) {
                 (
@@ -678,7 +728,26 @@ impl BackendRuntimeFilterSession {
                     .subscriptions
                     .publish(*route, outcome.clone(), terminal)
                     .map_err(subscription_violation)?;
+                if self.owns_outbound_materialization_route(*route) {
+                    self.events
+                        .record(BackendRuntimeFilterEvent::LoopbackDelivered {
+                            channel: BackendChannelIdentity::new(
+                                self.participant,
+                                consumer.contract.binding_id(),
+                                self.channel.channel_id(),
+                            ),
+                            consumer_binding_id: consumer.contract.binding_id(),
+                            route_edge_id: *route,
+                            version: logical_version,
+                        });
+                }
             }
+        }
+        if terminal == Some(LiveTerminal::Completed) {
+            self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelCompleted {
+                channel,
+                version: logical_version,
+            });
         }
         self.dispatch_outbound_snapshot(snapshot, terminal)?;
         Ok(())
@@ -688,6 +757,21 @@ impl BackendRuntimeFilterSession {
         &self,
         terminal: LiveTerminal,
     ) -> Result<(), RuntimeFilterContractViolation> {
+        match terminal {
+            LiveTerminal::CompletedWithoutArtifact => {
+                self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelUnavailable {
+                    channel,
+                    reason: UnavailableReason::IncompleteCoverage,
+                })
+            }
+            LiveTerminal::Unavailable(reason) => self.record_channel_event(|channel| {
+                BackendRuntimeFilterEvent::ChannelUnavailable { channel, reason }
+            }),
+            LiveTerminal::Cancelled => self.record_channel_event(|channel| {
+                BackendRuntimeFilterEvent::ChannelCancelled { channel }
+            }),
+            LiveTerminal::Completed => {}
+        }
         for consumer in self.consumers.values() {
             for route in &consumer.routes {
                 if !self.owns_outbound_materialization_route(*route) {
@@ -701,6 +785,30 @@ impl BackendRuntimeFilterSession {
         }
         self.dispatch_outbound_terminal(terminal)?;
         Ok(())
+    }
+
+    pub(crate) fn record_cancelled_if_open(&self) {
+        self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelCancelled {
+            channel,
+        });
+    }
+
+    fn record_channel_event(
+        &self,
+        event: impl Fn(BackendChannelIdentity) -> BackendRuntimeFilterEvent,
+    ) {
+        for binding_id in self
+            .channel
+            .producers()
+            .keys()
+            .chain(self.channel.consumers().keys())
+        {
+            self.events.record(event(BackendChannelIdentity::new(
+                self.participant,
+                *binding_id,
+                self.channel.channel_id(),
+            )));
+        }
     }
 
     fn owns_outbound_materialization_route(&self, route: BackendRouteEdgeId) -> bool {
@@ -899,6 +1007,12 @@ impl BackendRuntimeFilterSession {
             return Err(contract_violation(
                 RuntimeFilterContractViolationKind::InvalidPartitionCount,
                 "producer requires a non-zero local partition count",
+            ));
+        }
+        if request.local_partition_count() > MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE {
+            return Err(contract_violation(
+                RuntimeFilterContractViolationKind::InvalidPartitionCount,
+                "producer local partition count exceeds the Backend observation bound",
             ));
         }
         if !install
@@ -1133,8 +1247,15 @@ fn validate_open_partition(
 }
 
 fn reduction_violation(error: BackendReductionStateError) -> RuntimeFilterContractViolation {
+    let kind = match &error {
+        BackendReductionStateError::Install(BackendInstallPolicyError::ContributionTooLarge)
+        | BackendReductionStateError::Reducer(super::ReducerError::SizeOverflow) => {
+            RuntimeFilterContractViolationKind::ResourceLimit
+        }
+        _ => RuntimeFilterContractViolationKind::ContractMismatch,
+    };
     contract_violation(
-        RuntimeFilterContractViolationKind::ContractMismatch,
+        kind,
         format!("Backend reduction rejected the Execution contribution: {error:?}"),
     )
 }
@@ -1176,7 +1297,12 @@ fn contract_violation(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::thread;
     use std::time::Duration;
 
     use novarocks_execution::runtime_filter::{
@@ -1199,7 +1325,9 @@ mod tests {
         UniqueId::new(raw, raw + 1)
     }
 
-    fn channel() -> (BackendChannelInstall, BackendRuntimeFilterFixture) {
+    fn channel_with_lifecycle(
+        lifecycle: BackendChannelLifecycle,
+    ) -> (BackendChannelInstall, BackendRuntimeFilterFixture) {
         let fixture = BackendRuntimeFilterFixture::membership();
         let schema = fixture.producer_contract().contract().clone();
         let first = BackendProducerInstall::new(
@@ -1258,7 +1386,7 @@ mod tests {
         let channel = BackendChannelInstall::new(
             RuntimeFilterChannelId::new(11),
             schema,
-            BackendChannelLifecycle::CompleteOnce,
+            lifecycle,
             coverage.clone(),
             coverage,
             BackendMaterializationPolicy::new(8, 3, 5, 1, 1024, 1024, 1).unwrap(),
@@ -1270,6 +1398,10 @@ mod tests {
         )
         .unwrap();
         (channel, fixture)
+    }
+
+    fn channel() -> (BackendChannelInstall, BackendRuntimeFilterFixture) {
+        channel_with_lifecycle(BackendChannelLifecycle::CompleteOnce)
     }
 
     fn session() -> (
@@ -1463,6 +1595,110 @@ mod tests {
         assert_eq!(
             session.materialized_logical_version(&second),
             LogicalVersion::FIRST
+        );
+    }
+
+    struct BlockingFirstPublicationObserver {
+        blocked: AtomicBool,
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl BackendRuntimeFilterEventObserver for BlockingFirstPublicationObserver {
+        fn record(&self, event: BackendRuntimeFilterEvent) {
+            if matches!(
+                event,
+                BackendRuntimeFilterEvent::LogicalVersionPublished {
+                    version: LogicalVersion::FIRST,
+                    ..
+                }
+            ) && !self.blocked.swap(true, Ordering::AcqRel)
+            {
+                self.entered
+                    .send(())
+                    .expect("publication test must observe the first version");
+                self.release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv()
+                    .expect("publication test must release the first version");
+            }
+        }
+    }
+
+    #[test]
+    fn monotonic_reduction_and_publication_share_one_ordered_critical_section() {
+        let (channel, fixture) = channel_with_lifecycle(BackendChannelLifecycle::MonotonicUpdates);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let observer = Arc::new(BlockingFirstPublicationObserver {
+            blocked: AtomicBool::new(false),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let session = Arc::new(
+            BackendRuntimeFilterSession::from_channel_install(
+                fixture.identity(),
+                channel,
+                observer,
+            )
+            .unwrap(),
+        );
+        let RuntimeFilterBindOutcome::Bound(producer) = session
+            .open_producer(
+                instance(37),
+                RuntimeFilterProducerOpenRequest::new(fixture.producer_contract(), 2),
+            )
+            .unwrap()
+        else {
+            panic!("installed producer must bind")
+        };
+
+        let first_producer = Arc::clone(&producer);
+        let first_contribution = fixture.membership_contribution_with_values([3]);
+        let first = thread::spawn(move || {
+            first_producer.submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                first_contribution,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first publication must reach the controlled observer");
+
+        let second_producer = Arc::clone(&producer);
+        let second_contribution = fixture.membership_contribution_with_values([9]);
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+        let second = thread::spawn(move || {
+            let result = second_producer.submit(
+                PartitionId::new(1),
+                ProducerSequence::new(0),
+                second_contribution,
+            );
+            second_done_tx
+                .send(())
+                .expect("test receiver must remain alive");
+            result
+        });
+
+        let published_out_of_order = second_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        release_tx
+            .send(())
+            .expect("blocked publication must still be waiting");
+        first
+            .join()
+            .expect("first producer thread must join")
+            .unwrap();
+        second
+            .join()
+            .expect("second producer thread must join")
+            .unwrap();
+        assert!(
+            !published_out_of_order,
+            "v2 publication must not overtake a blocked v1 publication"
         );
     }
 

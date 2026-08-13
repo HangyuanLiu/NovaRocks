@@ -1219,7 +1219,302 @@ pub fn encode_query_terminal_snapshot(
         init_digest: snapshot.init_digest().as_bytes().to_vec(),
         digest: snapshot.digest().as_bytes().to_vec(),
         fragments,
+        profile_contribution: Some(encode_query_terminal_profile_contribution(
+            snapshot.profile_contribution(),
+        )),
     }
+}
+
+fn encode_query_terminal_profile_contribution(
+    contribution: &super::terminal::QueryTerminalProfileContributionV1,
+) -> novarocks::QueryTerminalProfileContributionV1 {
+    let channels = contribution
+        .channels()
+        .iter()
+        .map(|value| novarocks::QueryTerminalRuntimeFilterChannelV1 {
+            channel_binding_id: value.key().channel_binding_id(),
+            channel_id: value.key().channel_id(),
+            install_state: 1,
+            terminal_state: match value.terminal_state() {
+                super::terminal::QueryTerminalRuntimeFilterChannelTerminalStateV1::Open => 1,
+                super::terminal::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed => 2,
+                super::terminal::QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable => 3,
+                super::terminal::QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled => 4,
+            },
+            latest_published_logical_version: value.latest_published_logical_version(),
+            published_count: value.published_count(),
+            completed_count: value.completed_count(),
+            unavailable_count: value.unavailable_count(),
+            cancelled_count: value.cancelled_count(),
+        })
+        .collect();
+    let producer_streams = contribution
+        .producer_streams()
+        .iter()
+        .map(|value| {
+            let fragment = value.key().producer_fragment_instance_id();
+            novarocks::QueryTerminalRuntimeFilterProducerStreamV1 {
+                channel_binding_id: value.key().channel().channel_binding_id(),
+                channel_id: value.key().channel().channel_id(),
+                producer_fragment_instance_id: Some(common::UniqueId {
+                    hi: fragment.high(),
+                    lo: fragment.low(),
+                }),
+                partition_id: value.key().partition_id(),
+                latest_accepted_sequence: value.latest_accepted_sequence(),
+                accepted_count: value.accepted_count(),
+                duplicate_count: value.duplicate_count(),
+                stale_count: value.stale_count(),
+                conflict_count: value.conflict_count(),
+                resource_limit_count: value.resource_limit_count(),
+            }
+        })
+        .collect();
+    let transport_routes = contribution
+        .transport_routes()
+        .iter()
+        .map(
+            |value| novarocks::QueryTerminalRuntimeFilterTransportRouteV1 {
+                channel_binding_id: value.key().channel().channel_binding_id(),
+                channel_id: value.key().channel().channel_id(),
+                route_edge_id: value.key().route_edge_id(),
+                sent_count: value.sent_count(),
+                sent_bytes: value.sent_bytes(),
+                retried_count: value.retried_count(),
+                retried_bytes: value.retried_bytes(),
+                acked_count: value.acked_count(),
+                acked_bytes: value.acked_bytes(),
+                fail_open_count: value.fail_open_count(),
+                fail_open_bytes: value.fail_open_bytes(),
+            },
+        )
+        .collect();
+    let consumers = contribution
+        .consumers()
+        .iter()
+        .map(|value| {
+            let fragment = value.key().fragment_instance_id();
+            let reasons = value.scan_not_evaluated_reasons();
+            novarocks::QueryTerminalRuntimeFilterConsumerV1 {
+                channel_binding_id: value.key().channel().channel_binding_id(),
+                channel_id: value.key().channel().channel_id(),
+                consumer_binding_id: value.key().consumer_binding_id(),
+                fragment_instance_id: Some(common::UniqueId {
+                    hi: fragment.high(),
+                    lo: fragment.low(),
+                }),
+                latest_delivered_logical_version: value.latest_delivered_logical_version(),
+                latest_applied_logical_version: value.latest_applied_logical_version(),
+                subscription_terminal: match value.subscription_terminal() {
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Pending => 1,
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired => 2,
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::TimedOut => 3,
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unavailable => 4,
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unsupported => 5,
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled => 6,
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed => 7,
+                    super::terminal::QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact => 8,
+                },
+                row_evaluations: value.row_evaluations(),
+                input_rows: value.input_rows(),
+                output_rows: value.output_rows(),
+                scan_evaluated: value.scan_evaluated(),
+                scan_kept: value.scan_kept(),
+                scan_pruned: value.scan_pruned(),
+                scan_not_evaluated: value.scan_not_evaluated(),
+                scan_not_evaluated_reasons: Some(
+                    novarocks::QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
+                        unit_facts_missing: reasons.unit_facts_missing(),
+                        column_facts_missing: reasons.column_facts_missing(),
+                        data_type_unsupported: reasons.data_type_unsupported(),
+                        predicate_capability_unsupported: reasons
+                            .predicate_capability_unsupported(),
+                        resource_unavailable: reasons.resource_unavailable(),
+                        snapshot_unavailable: reasons.snapshot_unavailable(),
+                        snapshot_timed_out: reasons.snapshot_timed_out(),
+                        snapshot_not_published: reasons.snapshot_not_published(),
+                    },
+                ),
+            }
+        })
+        .collect();
+    novarocks::QueryTerminalProfileContributionV1 {
+        version: contribution.version(),
+        channels,
+        producer_streams,
+        transport_routes,
+        consumers,
+    }
+}
+
+fn decode_query_terminal_profile_contribution(
+    contribution: &novarocks::QueryTerminalProfileContributionV1,
+) -> Result<super::terminal::QueryTerminalProfileContributionV1, QueryLifecycleError> {
+    use super::terminal::{
+        QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+        QueryTerminalRuntimeFilterChannelInstallStateV1, QueryTerminalRuntimeFilterChannelKeyV1,
+        QueryTerminalRuntimeFilterChannelTerminalStateV1, QueryTerminalRuntimeFilterChannelV1,
+        QueryTerminalRuntimeFilterConsumerKeyV1, QueryTerminalRuntimeFilterConsumerV1,
+        QueryTerminalRuntimeFilterProducerStreamKeyV1, QueryTerminalRuntimeFilterProducerStreamV1,
+        QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+        QueryTerminalRuntimeFilterSubscriptionTerminalV1,
+        QueryTerminalRuntimeFilterTransportRouteKeyV1, QueryTerminalRuntimeFilterTransportRouteV1,
+    };
+
+    if contribution.version != QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1 {
+        return Err(QueryLifecycleError::invalid_manifest(
+            "unsupported query terminal profile contribution wire version",
+        ));
+    }
+    let channel_key = |binding_id, channel_id| {
+        QueryTerminalRuntimeFilterChannelKeyV1::new(binding_id, channel_id)
+    };
+    let channels = contribution
+        .channels
+        .iter()
+        .map(|value| {
+            let install_state = match value.install_state {
+                1 => QueryTerminalRuntimeFilterChannelInstallStateV1::Installed,
+                _ => {
+                    return Err(QueryLifecycleError::invalid_manifest(
+                        "invalid terminal runtime-filter channel install state",
+                    ));
+                }
+            };
+            let terminal_state = match value.terminal_state {
+                1 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Open,
+                2 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed,
+                3 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable,
+                4 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled,
+                _ => {
+                    return Err(QueryLifecycleError::invalid_manifest(
+                        "invalid terminal runtime-filter channel terminal state",
+                    ));
+                }
+            };
+            Ok(QueryTerminalRuntimeFilterChannelV1::new(
+                channel_key(value.channel_binding_id, value.channel_id),
+                install_state,
+                terminal_state,
+                value.latest_published_logical_version,
+                value.published_count,
+                value.completed_count,
+                value.unavailable_count,
+                value.cancelled_count,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let producer_streams = contribution
+        .producer_streams
+        .iter()
+        .map(|value| {
+            let fragment = value
+                .producer_fragment_instance_id
+                .as_ref()
+                .ok_or_else(|| {
+                    QueryLifecycleError::invalid_manifest(
+                        "terminal runtime-filter producer fragment instance id is required",
+                    )
+                })?;
+            Ok(QueryTerminalRuntimeFilterProducerStreamV1::new(
+                QueryTerminalRuntimeFilterProducerStreamKeyV1::new(
+                    channel_key(value.channel_binding_id, value.channel_id),
+                    novarocks_types::UniqueId::new(fragment.hi, fragment.lo),
+                    value.partition_id,
+                ),
+                value.latest_accepted_sequence,
+                value.accepted_count,
+                value.duplicate_count,
+                value.stale_count,
+                value.conflict_count,
+                value.resource_limit_count,
+            ))
+        })
+        .collect::<Result<Vec<_>, QueryLifecycleError>>()?;
+    let transport_routes = contribution
+        .transport_routes
+        .iter()
+        .map(|value| {
+            QueryTerminalRuntimeFilterTransportRouteV1::new(
+                QueryTerminalRuntimeFilterTransportRouteKeyV1::new(
+                    channel_key(value.channel_binding_id, value.channel_id),
+                    value.route_edge_id,
+                ),
+                value.sent_count,
+                value.sent_bytes,
+                value.retried_count,
+                value.retried_bytes,
+                value.acked_count,
+                value.acked_bytes,
+                value.fail_open_count,
+                value.fail_open_bytes,
+            )
+        })
+        .collect();
+    let consumers = contribution
+        .consumers
+        .iter()
+        .map(|value| {
+            let fragment = value.fragment_instance_id.as_ref().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter consumer fragment instance id is required",
+                )
+            })?;
+            let reasons = value.scan_not_evaluated_reasons.as_ref().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter scan not-evaluated counters are required",
+                )
+            })?;
+            let terminal = match value.subscription_terminal {
+                1 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Pending,
+                2 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired,
+                3 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::TimedOut,
+                4 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unavailable,
+                5 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unsupported,
+                6 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled,
+                7 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed,
+                8 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact,
+                _ => {
+                    return Err(QueryLifecycleError::invalid_manifest(
+                        "invalid terminal runtime-filter subscription terminal state",
+                    ));
+                }
+            };
+            Ok(QueryTerminalRuntimeFilterConsumerV1::new(
+                QueryTerminalRuntimeFilterConsumerKeyV1::new(
+                    channel_key(value.channel_binding_id, value.channel_id),
+                    value.consumer_binding_id,
+                    novarocks_types::UniqueId::new(fragment.hi, fragment.lo),
+                ),
+                value.latest_delivered_logical_version,
+                value.latest_applied_logical_version,
+                terminal,
+                value.row_evaluations,
+                value.input_rows,
+                value.output_rows,
+                value.scan_evaluated,
+                value.scan_kept,
+                value.scan_pruned,
+                value.scan_not_evaluated,
+                QueryTerminalRuntimeFilterScanNotEvaluatedV1::new(
+                    reasons.unit_facts_missing,
+                    reasons.column_facts_missing,
+                    reasons.data_type_unsupported,
+                    reasons.predicate_capability_unsupported,
+                    reasons.resource_unavailable,
+                    reasons.snapshot_unavailable,
+                    reasons.snapshot_timed_out,
+                    reasons.snapshot_not_published,
+                ),
+            ))
+        })
+        .collect::<Result<Vec<_>, QueryLifecycleError>>()?;
+    super::terminal::QueryTerminalProfileContributionV1::try_new(
+        channels,
+        producer_streams,
+        transport_routes,
+        consumers,
+    )
 }
 
 pub fn decode_query_terminal_snapshot(
@@ -1305,13 +1600,19 @@ pub fn decode_query_terminal_snapshot(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let snapshot = QueryTerminalSnapshot::new(
+    let profile_contribution = decode_query_terminal_profile_contribution(
+        value.profile_contribution.as_ref().ok_or_else(|| {
+            QueryLifecycleError::invalid_manifest("query terminal profile contribution is required")
+        })?,
+    )?;
+    let snapshot = QueryTerminalSnapshot::new_with_profile_contribution(
         decode_required_execution_id(value.execution_id.as_ref())?,
         decode_backend_identity(value.backend.as_ref().ok_or_else(|| {
             QueryLifecycleError::invalid_manifest("terminal backend identity is required")
         })?)?,
         ParticipantManifestDigest::try_from_slice(&value.init_digest)?,
         fragments,
+        profile_contribution,
     )?;
     if value.version != snapshot.version()
         || QueryTerminalSnapshotDigest::try_from_slice(&value.digest)? != snapshot.digest()
@@ -1683,6 +1984,7 @@ mod tests {
     use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
     use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
+    use novarocks_protocol::novarocks;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -1722,6 +2024,29 @@ mod tests {
             .expect("terminal snapshot wire round trip");
         assert_eq!(decoded.digest(), snapshot.digest());
         assert_eq!(decoded.canonical_bytes(), snapshot.canonical_bytes());
+
+        let mut missing = encode_query_terminal_snapshot(&snapshot);
+        missing.profile_contribution = None;
+        assert!(decode_query_terminal_snapshot(&missing).is_err());
+
+        let mut conflict = encode_query_terminal_snapshot(&snapshot);
+        conflict
+            .profile_contribution
+            .as_mut()
+            .expect("typed contribution")
+            .channels
+            .push(novarocks::QueryTerminalRuntimeFilterChannelV1 {
+                channel_binding_id: 1,
+                channel_id: 1,
+                install_state: 1,
+                terminal_state: 1,
+                latest_published_logical_version: None,
+                published_count: 0,
+                completed_count: 0,
+                unavailable_count: 0,
+                cancelled_count: 0,
+            });
+        assert!(decode_query_terminal_snapshot(&conflict).is_err());
     }
 
     fn observation_backend() -> ParticipantBackendIdentity {
