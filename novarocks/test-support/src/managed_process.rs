@@ -58,6 +58,8 @@ fn wait_siginfo_abi_supported(target_os: &str, target_arch: &str, pointer_width:
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
+const SIGINT: i32 = 2;
+#[cfg(unix)]
 const SIGKILL: i32 = 9;
 #[cfg(unix)]
 const ESRCH: i32 = 3;
@@ -373,7 +375,7 @@ impl ProcessGroupOwnership {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadyMarker {
+pub enum ReadyMarker {
     StdoutContains(String),
     FileContains { path: PathBuf, needle: String },
 }
@@ -389,6 +391,7 @@ enum ReadinessBaseline {
 #[derive(Debug)]
 struct FileReadinessSnapshot {
     bytes: Vec<u8>,
+    #[allow(dead_code)] // Used by Unix generation-regression tests.
     modified: Option<SystemTime>,
     generation: FileGeneration,
 }
@@ -557,7 +560,7 @@ fn bytes_match_ending_after(haystack: &[u8], needle: &[u8], boundary: usize) -> 
         .any(|(start, window)| window == needle && start + needle.len() > boundary)
 }
 
-pub(crate) struct ManagedProcess {
+pub struct ManagedProcess {
     label: String,
     child: Child,
     #[cfg(unix)]
@@ -584,7 +587,7 @@ impl std::fmt::Debug for ManagedProcess {
 }
 
 impl ManagedProcess {
-    pub(crate) fn run_to_completion(
+    pub fn run_to_completion(
         label: String,
         command: Command,
         marker: ReadyMarker,
@@ -606,7 +609,7 @@ impl ManagedProcess {
         process.wait_for_successful_exit(deadline, timeout)
     }
 
-    pub(crate) fn spawn(
+    pub fn spawn(
         label: String,
         command: Command,
         marker: ReadyMarker,
@@ -759,11 +762,11 @@ impl ManagedProcess {
         Ok(process)
     }
 
-    pub(crate) fn pid(&self) -> u32 {
+    pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
-    pub(crate) fn is_running(&self) -> Result<bool> {
+    pub fn is_running(&self) -> Result<bool> {
         self.ensure_output_io_ok("inspect process state")?;
         #[cfg(unix)]
         {
@@ -781,15 +784,15 @@ impl ManagedProcess {
         }
     }
 
-    pub(crate) fn stdout_tail(&self) -> String {
+    pub fn stdout_tail(&self) -> String {
         read_tail(&self.stdout_buffer, "<stdout lock poisoned>")
     }
 
-    pub(crate) fn stderr_tail(&self) -> String {
+    pub fn stderr_tail(&self) -> String {
         read_tail(&self.stderr_buffer, "<stderr lock poisoned>")
     }
 
-    pub(crate) fn assert_log_contains(&self, needle: &str) -> Result<()> {
+    pub fn assert_log_contains(&self, needle: &str) -> Result<()> {
         self.ensure_output_io_ok("assert durable log contents")?;
         let flush_deadline = short_output_join_deadline();
         loop {
@@ -847,7 +850,7 @@ impl ManagedProcess {
         )
     }
 
-    pub(crate) fn log_count(&self, needle: &str) -> Result<usize> {
+    pub fn log_count(&self, needle: &str) -> Result<usize> {
         if needle.is_empty() {
             bail!("durable log count pattern must not be empty");
         }
@@ -857,13 +860,79 @@ impl ManagedProcess {
         Ok(log.match_indices(needle).count())
     }
 
-    pub(crate) fn log_contents(&self) -> Result<String> {
+    pub fn log_contents(&self) -> Result<String> {
         self.ensure_output_io_ok("read durable log contents")?;
         fs::read_to_string(&self.log_path)
             .with_context(|| format!("read durable process log {}", self.log_path.display()))
     }
 
-    pub(crate) fn restart(
+    /// Waits for a marker in the process's combined durable output log.
+    ///
+    /// This is for post-readiness observations. Startup readiness itself must
+    /// use [`ReadyMarker`] when spawning the process, so an old log marker
+    /// cannot make a new child appear ready.
+    pub fn wait_for_log_contains(&mut self, needle: &str, timeout: Duration) -> Result<()> {
+        if needle.is_empty() {
+            bail!("durable log wait pattern must not be empty");
+        }
+        let started = Instant::now();
+        let deadline = started.checked_add(timeout).unwrap_or(started);
+        loop {
+            self.ensure_output_io_ok("wait for durable log marker")?;
+            if self.log_contents()?.contains(needle) {
+                return Ok(());
+            }
+
+            #[cfg(unix)]
+            if self.leader_exit_observed()? {
+                let status = self.finish_group_with_signal(
+                    SIGKILL,
+                    "wait after exit before durable log marker",
+                    short_output_join_deadline(),
+                )?;
+                bail!(
+                    "{} exited with status {status} before durable log marker {needle:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
+            #[cfg(not(unix))]
+            if let Some(status) = self.child.try_wait()? {
+                self.stopped = true;
+                self.join_output_threads_until(short_output_join_deadline());
+                bail!(
+                    "{} exited with status {status} before durable log marker {needle:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                let message = format!(
+                    "{} timed out waiting for durable log marker {needle:?} after {timeout:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+                return match self.kill_now() {
+                    Ok(()) => Err(anyhow::anyhow!(message)),
+                    Err(cleanup_error) => Err(anyhow::anyhow!(message).context(format!(
+                        "also failed to clean up {}: {cleanup_error:#}",
+                        self.label
+                    ))),
+                };
+            }
+            thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+        }
+    }
+
+    pub fn restart(
         &mut self,
         command: Command,
         marker: ReadyMarker,
@@ -877,7 +946,7 @@ impl ManagedProcess {
         Ok(())
     }
 
-    pub(crate) fn stop(&mut self) -> Result<()> {
+    pub fn stop(&mut self) -> Result<()> {
         let started = Instant::now();
         let graceful_deadline = started.checked_add(STOP_TIMEOUT).unwrap_or(started);
         let cleanup_deadline = graceful_deadline
@@ -931,7 +1000,7 @@ impl ManagedProcess {
         }
     }
 
-    pub(crate) fn kill_now(&mut self) -> Result<()> {
+    pub fn kill_now(&mut self) -> Result<()> {
         let cleanup_deadline = short_output_join_deadline();
         if self.stopped {
             self.join_output_threads_until(cleanup_deadline);
@@ -966,6 +1035,58 @@ impl ManagedProcess {
             self.stopped = true;
             self.join_output_threads_until(cleanup_deadline);
             self.ensure_output_io_ok("kill process")
+        }
+    }
+
+    /// Sends SIGINT to the child process group and requires a successful exit.
+    ///
+    /// The group remains owned until its direct child is reaped, and surviving
+    /// descendants are forcefully cleaned up after that exit observation.
+    #[cfg(unix)]
+    pub fn interrupt_and_wait(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        if self.stopped {
+            bail!("cannot interrupt {} after it was stopped", self.label);
+        }
+        let started = Instant::now();
+        let deadline = started.checked_add(timeout).unwrap_or(started);
+        self.signal_group(SIGINT)?;
+        loop {
+            if self.leader_exit_observed()? {
+                let status = self.finish_group_with_signal(
+                    SIGKILL,
+                    "wait for process-group cleanup after SIGINT",
+                    short_output_join_deadline(),
+                )?;
+                self.ensure_output_io_ok("wait for SIGINT process exit")?;
+                if status.success() {
+                    return Ok(status);
+                }
+                bail!(
+                    "{} did not exit successfully after SIGINT: status={status}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let message = format!(
+                    "{} timed out after SIGINT waiting for successful exit after {timeout:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+                return match self.kill_now() {
+                    Ok(()) => Err(anyhow::anyhow!(message)),
+                    Err(cleanup_error) => Err(anyhow::anyhow!(message).context(format!(
+                        "also failed to clean up {}: {cleanup_error:#}",
+                        self.label
+                    ))),
+                };
+            }
+            thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
         }
     }
 
@@ -1038,7 +1159,7 @@ impl ManagedProcess {
         }
     }
 
-    pub(crate) fn runtime_diagnostic(
+    pub fn runtime_diagnostic(
         &mut self,
         label: &str,
         endpoint: &str,
@@ -1628,6 +1749,7 @@ fn record_output_io_error(errors: &SharedOutputIoError, error: String) {
     }
 }
 
+#[allow(dead_code)] // Exercised by the platform capability-contract test.
 fn unsupported_runtime_exit_status(
     label: &str,
     pid: u32,
@@ -3021,6 +3143,73 @@ mod tests {
         assert_eq!(
             fs::read_to_string(term_path).expect("read TERM marker"),
             "TERM"
+        );
+    }
+
+    #[test]
+    fn managed_process_waits_for_post_readiness_log_marker() {
+        let temp = TempDir::new("post-readiness-log-marker");
+        let mut process = ManagedProcess::spawn(
+            "post-readiness log marker fixture".to_string(),
+            shell("printf 'READY\\n'; sleep 0.05; printf 'AFTER_READY\\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn post-readiness log marker fixture");
+
+        process
+            .wait_for_log_contains("AFTER_READY", Duration::from_secs(2))
+            .expect("wait for post-readiness marker");
+        process.kill_now().expect("kill post-readiness fixture");
+    }
+
+    #[test]
+    fn managed_process_log_wait_kills_process_on_timeout() {
+        let temp = TempDir::new("post-readiness-log-timeout");
+        let mut process = ManagedProcess::spawn(
+            "post-readiness log timeout fixture".to_string(),
+            shell("printf 'READY\\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn post-readiness log timeout fixture");
+        let pid = process.pid();
+
+        let error = process
+            .wait_for_log_contains("MISSING", Duration::from_millis(100))
+            .expect_err("missing marker must time out");
+
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(wait_until(Duration::from_secs(1), || !pid_exists(pid)));
+    }
+
+    #[test]
+    fn managed_process_interrupt_requires_successful_exit() {
+        let temp = TempDir::new("sigint");
+        let interrupt_path = temp.path().join("interrupt.txt");
+        let command = shell_with_arg(
+            "trap 'printf INT > \"$1\"; exit 0' INT; printf 'READY\\n'; while :; do sleep 1; done",
+            &interrupt_path,
+        );
+        let mut process = ManagedProcess::spawn(
+            "SIGINT fixture".to_string(),
+            command,
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn SIGINT fixture");
+
+        let status = process
+            .interrupt_and_wait(Duration::from_secs(2))
+            .expect("SIGINT fixture exits successfully");
+
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(interrupt_path).expect("read INT marker"),
+            "INT"
         );
     }
 
