@@ -22,11 +22,12 @@ use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetrics
 use novarocks::query_execution::lifecycle::{
     AttemptId, FragmentTerminalOutcome, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
-    QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest,
-    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport,
-    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationReason,
-    RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
+    QueryControlAttachment, QueryControlEndpoint, QueryControlEvent, QueryExecutionId,
+    QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
+    QueryStageOutcome, QueryStageRequest, QueryStartOutcome, QueryStartRequest, QueryTerminalAck,
+    QueryTerminalFallbackTransport, QueryTerminalReportAck, QueryTerminalReportOutcome,
+    QueryTerminalSnapshot, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
+    StageDigestVersion, StageFragment,
 };
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -107,6 +108,7 @@ struct RecordingLocalRuntimeState {
 #[derive(Default)]
 struct RecordingMetricsSink {
     snapshots: Mutex<Vec<BackendQueryLifecycleMetricsSnapshot>>,
+    termination_reasons: Mutex<Vec<[u64; 6]>>,
 }
 
 struct RejectedTerminalFallback;
@@ -156,18 +158,31 @@ impl RecordingMetricsSink {
             .last()
             .expect("published metrics snapshot")
     }
+
+    fn last_termination_reasons(&self) -> [u64; 6] {
+        *self
+            .termination_reasons
+            .lock()
+            .expect("termination reason snapshots")
+            .last()
+            .expect("published termination reason snapshot")
+    }
 }
 
 impl QueryLifecycleMetricsSink for RecordingMetricsSink {
     fn publish(
         &self,
         snapshot: BackendQueryLifecycleMetricsSnapshot,
-        _termination_reasons: [u64; 6],
+        termination_reasons: [u64; 6],
     ) {
         self.snapshots
             .lock()
             .expect("metrics snapshots")
             .push(snapshot);
+        self.termination_reasons
+            .lock()
+            .expect("termination reason snapshots")
+            .push(termination_reasons);
     }
 }
 
@@ -738,13 +753,27 @@ fn fragment_runtime_filter_init_request_fixture(
 fn attach_control(
     registry: &Arc<QueryLifecycleRegistry>,
     request: &QueryInitRequest,
-) -> novarocks::query_execution::lifecycle::QueryControlAttachment {
+) -> QueryControlAttachment {
     registry
         .attach_control(
             QueryControlAttach::new(request.manifest().execution_id(), request.digest(), 1)
                 .expect("valid control attach"),
         )
         .expect("control attaches")
+}
+
+fn wait_for_terminal_snapshot(attachment: &mut QueryControlAttachment) -> QueryTerminalSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match attachment.events.try_recv() {
+            Ok(QueryControlEvent::TerminalSnapshot { snapshot }) => return snapshot,
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("terminal snapshot was not delivered: {error}"),
+        }
+    }
 }
 
 fn stage_fragment(instance_id: UniqueId) -> StageFragment {
@@ -1810,6 +1839,110 @@ fn spi5b_local_failure_then_coordinator_abort_acknowledges_the_abort_command() {
             Err(error) => panic!("coordinator abort acknowledgement was not delivered: {error}"),
         }
     }
+}
+
+#[test]
+fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
+    let runtime = RecordingLocalRuntime::default();
+    let metrics = Arc::new(RecordingMetricsSink::default());
+    let clock = Arc::new(ManualClock::default());
+    let mut config = registry_config(8);
+    config.terminal_retention = Duration::from_millis(1);
+    let registry =
+        QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
+            LOCAL_BACKEND_ID,
+            LOCAL_START_EPOCH,
+            Arc::new(runtime.clone()),
+            config,
+            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            Arc::clone(&metrics) as Arc<dyn QueryLifecycleMetricsSink>,
+            Arc::new(RejectedTerminalFallback),
+            Arc::new(runtime),
+        );
+
+    let failed_fragment = UniqueId::new(76, 4);
+    let failed_request = fragment_init_request_fixture(76_004, &[failed_fragment]);
+    let failed_execution = failed_request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(failed_request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut failed_attachment = attach_control(&registry, &failed_request);
+    registry
+        .admit_fragment(failed_execution, failed_fragment)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+    registry.record_fragment_terminal(
+        failed_execution,
+        failed_fragment,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "pipeline worker failed",
+        )),
+    );
+    let failed_snapshot = wait_for_terminal_snapshot(&mut failed_attachment);
+    failed_attachment
+        .control
+        .terminal_ack(QueryTerminalAck::from_snapshot(&failed_snapshot))
+        .expect("local-failure terminal snapshot ACK");
+    assert_eq!(metrics.last_termination_reasons(), [0, 0, 0, 0, 1, 0]);
+
+    let aborted_fragment = UniqueId::new(76, 5);
+    let aborted_request = fragment_init_request_fixture(76_005, &[aborted_fragment]);
+    let aborted_execution = aborted_request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(aborted_request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut aborted_attachment = attach_control(&registry, &aborted_request);
+    registry
+        .admit_fragment(aborted_execution, aborted_fragment)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+    aborted_attachment
+        .control
+        .abort("coordinator cancellation".to_string())
+        .expect("coordinator abort is accepted");
+    registry.record_fragment_terminal(
+        aborted_execution,
+        aborted_fragment,
+        &FragmentOutcome::Succeeded,
+    );
+    let aborted_snapshot = wait_for_terminal_snapshot(&mut aborted_attachment);
+    aborted_attachment
+        .control
+        .terminal_ack(QueryTerminalAck::from_snapshot(&aborted_snapshot))
+        .expect("coordinator-abort terminal snapshot ACK");
+    assert_eq!(metrics.last_termination_reasons(), [1, 0, 0, 0, 1, 0]);
+
+    let expired_fragment = UniqueId::new(76, 6);
+    let expired_request = fragment_init_request_fixture(76_006, &[expired_fragment]);
+    let expired_execution = expired_request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(expired_request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut expired_attachment = attach_control(&registry, &expired_request);
+    registry
+        .admit_fragment(expired_execution, expired_fragment)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+    expired_attachment
+        .control
+        .abort("coordinator cancellation".to_string())
+        .expect("coordinator abort is accepted");
+    registry.record_fragment_terminal(
+        expired_execution,
+        expired_fragment,
+        &FragmentOutcome::Succeeded,
+    );
+    let _expired_snapshot = wait_for_terminal_snapshot(&mut expired_attachment);
+    clock.advance(Duration::from_millis(2));
+    registry.sweep_expired(clock.now());
+    assert_eq!(metrics.last_termination_reasons(), [2, 0, 0, 0, 1, 0]);
 }
 
 #[test]

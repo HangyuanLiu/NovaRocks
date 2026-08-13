@@ -1508,7 +1508,13 @@ fn mysql_disconnect_triggers_cancel() {
     }
     let _lock = lock_cluster_mvp();
 
-    let cluster = ClusterHarness::start("", "");
+    let cluster = ClusterHarness::start(
+        r#"
+[runtime]
+query_control_terminal_drain_timeout_ms = 1000
+"#,
+        "",
+    );
 
     let stream = send_mysql_query(cluster.fe_mysql, disconnect_blocking_query_sql());
     wait_for_backend_running_fragment_control(cluster.be_http, Duration::from_secs(3));
@@ -1572,6 +1578,7 @@ fn cross_process_three_be_connector_read_distributes_splits_and_cancels() {
         r#"
 [runtime]
 operator_buffer_chunks = 1
+query_control_terminal_drain_timeout_ms = 1000
 "#,
     );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create cancellation warehouse");
