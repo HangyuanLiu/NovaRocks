@@ -106,20 +106,57 @@ pub enum DeleteWriteReport {
 /// guard keeps the exact request carrier unavailable for replacement or
 /// execution until Frontend has produced the corresponding bundle.
 pub struct DeleteNativeEncoding<'a> {
-    assembly: std::sync::MutexGuard<
-        'a,
-        Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>,
-    >,
+    inner: DeleteNativeEncodingInner<'a>,
+}
+
+enum DeleteNativeEncodingInner<'a> {
+    Assembly(
+        std::sync::MutexGuard<
+            'a,
+            Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>,
+        >,
+    ),
+    #[cfg(feature = "query-execution-contract-test-support")]
+    TestFixture(&'static crate::query_execution::compiler::NativeFragmentEncodingInput),
 }
 
 impl DeleteNativeEncoding<'_> {
     pub fn input(
         &self,
     ) -> Result<&crate::query_execution::compiler::NativeFragmentEncodingInput, String> {
-        self.assembly
-            .as_ref()
-            .map(crate::query_execution::compiler::PreparedDmlWriteAssembly::encoding)
-            .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string())
+        match &self.inner {
+            DeleteNativeEncodingInner::Assembly(assembly) => assembly
+                .as_ref()
+                .map(crate::query_execution::compiler::PreparedDmlWriteAssembly::encoding)
+                .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string()),
+            #[cfg(feature = "query-execution-contract-test-support")]
+            DeleteNativeEncodingInner::TestFixture(input) => Ok(input),
+        }
+    }
+
+    /// Feature-gated sealed fixture for Frontend DELETE application doubles.
+    /// It exposes only immutable encoder input, never a raw plan or mutable
+    /// preparation handle.
+    #[cfg(feature = "query-execution-contract-test-support")]
+    #[doc(hidden)]
+    pub fn test_fixture() -> Result<DeleteNativeEncoding<'static>, String> {
+        use std::sync::OnceLock;
+
+        static INPUT: OnceLock<crate::query_execution::compiler::NativeFragmentEncodingInput> =
+            OnceLock::new();
+        let input = INPUT.get_or_init(|| {
+            let plan = novarocks_sql::planning::dml::native_encoder_test_fixture_plan()
+                .expect("test native DELETE fixture plan must seal");
+            let prepared =
+                crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(
+                    &plan,
+                )
+                .expect("test native DELETE fixture must prepare");
+            crate::query_execution::compiler::NativeFragmentEncodingInput::new(plan, prepared)
+        });
+        Ok(DeleteNativeEncoding {
+            inner: DeleteNativeEncodingInner::TestFixture(input),
+        })
     }
 }
 

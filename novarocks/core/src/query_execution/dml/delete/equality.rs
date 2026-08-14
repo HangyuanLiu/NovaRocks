@@ -175,7 +175,9 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
                 )?,
             );
         }
-        Ok(crate::query_execution::dml::delete::DeleteNativeEncoding { assembly })
+        Ok(crate::query_execution::dml::delete::DeleteNativeEncoding {
+            inner: super::DeleteNativeEncodingInner::Assembly(assembly),
+        })
     }
 
     fn run_with_native_bundle(
