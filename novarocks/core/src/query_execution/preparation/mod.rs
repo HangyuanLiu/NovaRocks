@@ -47,6 +47,8 @@ pub(crate) fn prepare_fragments(
     resolver: Option<&dyn scan::ScanBindingResolver>,
     scan_options: ScanPreparationOptions,
 ) -> Result<PreparedFragmentSet, String> {
+    let preparation_facts =
+        novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
         novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
     let sealed_ids = plan
@@ -54,7 +56,7 @@ pub(crate) fn prepare_fragments(
         .iter()
         .map(|fragment| fragment.fragment_id)
         .collect::<BTreeSet<_>>();
-    let topological_fragment_order = plan.topology().topological_fragment_order().to_vec();
+    let topological_fragment_order = preparation_facts.topological_fragment_order().to_vec();
     let ordered_ids = topological_fragment_order
         .iter()
         .copied()
@@ -64,21 +66,19 @@ pub(crate) fn prepare_fragments(
             "prepared fragment topology order {topological_fragment_order:?} does not match sealed fragment ids {sealed_ids:?}"
         ));
     }
-    let execution_anchor_fragment_id = plan.topology().execution_anchor_fragment_id();
+    let execution_anchor_fragment_id = preparation_facts.execution_anchor_fragment_id();
     if !sealed_ids.contains(&execution_anchor_fragment_id) {
         return Err(format!(
             "prepared execution anchor fragment {execution_anchor_fragment_id} is not among sealed fragment ids {sealed_ids:?}"
         ));
     }
-    let result_fragment_id = plan.topology().result_fragment_id();
-    let terminal_write_fragment_ids = plan
-        .topology()
+    let result_fragment_id = preparation_facts.result_fragment_id();
+    let terminal_write_fragment_ids = preparation_facts
         .terminal_write_fragment_ids()
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    let producer_fragment_ids = plan
-        .topology()
+    let producer_fragment_ids = preparation_facts
         .producer_fragment_ids()
         .iter()
         .copied()
@@ -98,7 +98,7 @@ pub(crate) fn prepare_fragments(
         result_fragment_id,
         &write_contract_fragment_ids,
         plan.edges(),
-        plan.boundaries().contracts(),
+        preparation_facts.boundary_contracts(),
         &sealed_ids,
     )?;
     let scan_bindings = prepare_scan_bindings(
@@ -129,7 +129,7 @@ pub(crate) fn prepare_fragments(
         let mut scan_nodes = Vec::new();
         collect_scan_nodes(fragment.fragment_id, &fragment.root, &mut scan_nodes);
         scan_nodes.sort_by_key(|(node_id, _)| *node_id);
-        for (node_id, source) in &scan_nodes {
+        for (node_id, _source) in &scan_nodes {
             expected_range_keys.insert((fragment.fragment_id, *node_id));
             if scan_bindings
                 .scan_ranges(fragment.fragment_id, *node_id)
@@ -251,6 +251,8 @@ pub(crate) fn prepare_fragments(
 pub(crate) fn prepared_fragment_set_for_native_encode_test(
     plan: &novarocks_sql::plan_read::DistributedPlan,
 ) -> Result<PreparedFragmentSet, String> {
+    let preparation_facts =
+        novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
         novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
     let runtime_filter_facts =
@@ -258,9 +260,8 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             runtime_filter_facts,
             Vec::new(),
         )?;
-    let result_fragment_id = plan.topology().result_fragment_id();
-    let terminal_write_fragment_ids = plan
-        .topology()
+    let result_fragment_id = preparation_facts.result_fragment_id();
+    let terminal_write_fragment_ids = preparation_facts
         .terminal_write_fragment_ids()
         .iter()
         .copied()
@@ -298,8 +299,8 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
     Ok(PreparedFragmentSet::new(
         by_fragment,
         scan::ScanExecutionBindings::default(),
-        plan.topology().topological_fragment_order().to_vec(),
-        plan.topology().execution_anchor_fragment_id(),
+        preparation_facts.topological_fragment_order().to_vec(),
+        preparation_facts.execution_anchor_fragment_id(),
         plan.edges().to_vec(),
         runtime_filter_facts,
     ))
@@ -307,134 +308,22 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
 
 #[cfg(test)]
 mod test_support {
-    use arrow::datatypes::DataType;
-
-    use novarocks_sql::plan_read::ColumnId;
-    use novarocks_sql::plan_read::OutputColumn;
-    use novarocks_sql::plan_read::{
-        DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
-    };
-    use novarocks_sql::planner::payload::PlanValuesNode;
-    use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-
     pub(super) fn result_plan() -> novarocks_sql::plan_read::DistributedPlan {
-        let columns = vec![
-            OutputColumn {
-                column_id: ColumnId::new_for_test(1),
-                name: "a".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            },
-            OutputColumn {
-                column_id: ColumnId::new_for_test(2),
-                name: "b".to_string(),
-                data_type: DataType::Utf8,
-                nullable: true,
-                is_internal: false,
-            },
-        ];
-        let fragment = PlanFragment {
-            fragment_id: 7,
-            root: DistributedNode {
-                node_id: 70,
-                fragment_id: 7,
-                tuple_ids: vec![70],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                runtime_filter_binding_ids: Vec::new(),
-                children: Vec::new(),
-                stats: PhysicalPlanStats {
-                    output_row_count: 0.0,
-                    row_count_confidence: PlannerConfidence::Fallback,
-                    column_statistics: Default::default(),
-                    cost_estimate: None,
-                    broadcast_decision: None,
-                },
-                payload: DistributedNodeKind::Values(PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: columns.clone(),
-                }),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Result,
-            output_exprs: None,
-            output_columns: columns,
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        novarocks_sql::plan_read::test_support::distributed_plan_for_test! {
-            fragments: vec![fragment],
-            root_fragment_id: 7,
-            edges: Vec::new(),
-            runtime_filter_graph: Default::default(),
-        }
+        novarocks_sql::test_support::native_preparation_plan(
+            novarocks_sql::test_support::NativePreparationFixture::ResultOutput,
+        )
+        .expect("sealed result preparation fixture")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
-
     use super::*;
-    use novarocks_sql::plan_read::ColumnId;
-    use novarocks_sql::plan_read::OutputColumn;
-    use novarocks_sql::plan_read::{
-        DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
-    };
-    use novarocks_sql::planner::payload::PlanValuesNode;
-    use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
     fn write_plan() -> novarocks_sql::plan_read::DistributedPlan {
-        let columns = vec![OutputColumn {
-            column_id: ColumnId::new_for_test(1),
-            name: "id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        }];
-        let fragment = PlanFragment {
-            fragment_id: 9,
-            root: DistributedNode {
-                node_id: 90,
-                fragment_id: 9,
-                tuple_ids: vec![90],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                runtime_filter_binding_ids: Vec::new(),
-                children: Vec::new(),
-                stats: PhysicalPlanStats {
-                    output_row_count: 0.0,
-                    row_count_confidence: PlannerConfidence::Fallback,
-                    column_statistics: Default::default(),
-                    cost_estimate: None,
-                    broadcast_decision: None,
-                },
-                payload: DistributedNodeKind::Values(PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: columns.clone(),
-                }),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::ConnectorWrite(
-                novarocks_sql::plan_read::write::sink::ConnectorWriteFragmentSink {
-                    handle: None,
-                    input: novarocks_sql::plan_read::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-                    output_contract: None,
-                },
-            ),
-            output_exprs: None,
-            output_columns: columns,
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        novarocks_sql::plan_read::test_support::distributed_plan_for_test! {
-            fragments: vec![fragment],
-            root_fragment_id: 9,
-            edges: Vec::new(),
-            runtime_filter_graph: Default::default(),
-        }
+        novarocks_sql::test_support::native_preparation_plan(
+            novarocks_sql::test_support::NativePreparationFixture::TerminalWrite,
+        )
+        .expect("sealed terminal-write preparation fixture")
     }
 
     #[test]
@@ -468,8 +357,10 @@ mod tests {
 
     #[test]
     fn production_preparation_rejects_missing_non_write_output_contract() {
-        let mut plan = test_support::result_plan();
-        novarocks_sql::plan_read::test_support::remove_fragment_output_for_test(&mut plan, 7);
+        let plan = novarocks_sql::test_support::native_preparation_plan(
+            novarocks_sql::test_support::NativePreparationFixture::MissingResultOutput,
+        )
+        .expect("closed missing-output preparation fixture");
         let registry = crate::connector::ConnectorRegistry::new();
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let error = match prepare_fragments(

@@ -29,7 +29,7 @@ use crate::analysis::OutputColumn;
 use crate::binding::SqlTableBindingId;
 use crate::catalog::ResolvedAnalyzerTable;
 use crate::column_id::ColumnRefFactory;
-use crate::plan_read::PlanScanNode;
+use crate::plan_read::{BoundaryContract, DistributedPlan, FragmentId, PlanScanNode};
 use novarocks_spi::connector::ConnectorReadPurpose;
 
 mod pruning;
@@ -41,6 +41,60 @@ pub use pruning::{
 };
 pub use runtime_filter::*;
 pub use static_predicate::lower_static_connector_predicates;
+
+/// Immutable execution-preparation facts copied from one sealed distributed
+/// plan. These values describe only sealed fragment topology and boundary
+/// membership; they contain no planner tree, provider authority, lease, wire
+/// payload, or lifecycle state.
+#[derive(Clone, Debug)]
+pub struct SqlExecutionPreparationFacts {
+    topological_fragment_order: Vec<FragmentId>,
+    execution_anchor_fragment_id: FragmentId,
+    result_fragment_id: Option<FragmentId>,
+    terminal_write_fragment_ids: Vec<FragmentId>,
+    producer_fragment_ids: Vec<FragmentId>,
+    boundary_contracts: Vec<BoundaryContract>,
+}
+
+impl SqlExecutionPreparationFacts {
+    pub fn topological_fragment_order(&self) -> &[FragmentId] {
+        &self.topological_fragment_order
+    }
+
+    pub fn execution_anchor_fragment_id(&self) -> FragmentId {
+        self.execution_anchor_fragment_id
+    }
+
+    pub fn result_fragment_id(&self) -> Option<FragmentId> {
+        self.result_fragment_id
+    }
+
+    pub fn terminal_write_fragment_ids(&self) -> &[FragmentId] {
+        &self.terminal_write_fragment_ids
+    }
+
+    pub fn producer_fragment_ids(&self) -> &[FragmentId] {
+        &self.producer_fragment_ids
+    }
+
+    pub fn boundary_contracts(&self) -> &[BoundaryContract] {
+        &self.boundary_contracts
+    }
+}
+
+/// Project immutable coordinator-preparation values from an already sealed
+/// plan. The private topology and boundary catalogs remain SQL-owned.
+pub fn project_execution_preparation_facts(plan: &DistributedPlan) -> SqlExecutionPreparationFacts {
+    let topology = plan.topology();
+    SqlExecutionPreparationFacts {
+        topological_fragment_order: topology.topological_fragment_order().to_vec(),
+        execution_anchor_fragment_id: topology.execution_anchor_fragment_id(),
+        result_fragment_id: topology.result_fragment_id(),
+        terminal_write_fragment_ids: topology.terminal_write_fragment_ids().to_vec(),
+        producer_fragment_ids: topology.producer_fragment_ids().to_vec(),
+        boundary_contracts: plan.boundaries().contracts().to_vec(),
+    }
+}
 
 /// Immutable SQL identity for a synthetic, application-admitted connector
 /// scan.  It carries no catalog handle or provider capability.
@@ -540,7 +594,7 @@ mod tests {
     use super::{
         FrozenConnectorScanIdentity, SqlScanPreparationCategory, build_frozen_connector_scan_plan,
         frozen_connector_resolved_analyzer_table, matches_frozen_connector_scan,
-        scan_preparation_facts,
+        project_execution_preparation_facts, scan_preparation_facts,
     };
     use crate::binding::SqlTableBindingId;
     use crate::plan_read::DistributedNodeKind;
@@ -643,5 +697,27 @@ mod tests {
                 "_last_updated_sequence_number"
             ]
         );
+    }
+
+    #[test]
+    fn execution_preparation_facts_copy_only_sealed_topology_and_boundaries() {
+        use crate::test_support::{NativePreparationFixture, native_preparation_plan};
+
+        let result = native_preparation_plan(NativePreparationFixture::ResultOutput)
+            .expect("sealed result fixture");
+        let result_facts = project_execution_preparation_facts(&result);
+        assert_eq!(result_facts.topological_fragment_order(), [7]);
+        assert_eq!(result_facts.execution_anchor_fragment_id(), 7);
+        assert_eq!(result_facts.result_fragment_id(), Some(7));
+        assert!(result_facts.terminal_write_fragment_ids().is_empty());
+        assert!(result_facts.producer_fragment_ids().is_empty());
+        assert_eq!(result_facts.boundary_contracts().len(), 1);
+
+        let write = native_preparation_plan(NativePreparationFixture::TerminalWrite)
+            .expect("sealed terminal-write fixture");
+        let write_facts = project_execution_preparation_facts(&write);
+        assert_eq!(write_facts.result_fragment_id(), None);
+        assert_eq!(write_facts.terminal_write_fragment_ids(), [9]);
+        assert_eq!(write_facts.boundary_contracts().len(), 1);
     }
 }

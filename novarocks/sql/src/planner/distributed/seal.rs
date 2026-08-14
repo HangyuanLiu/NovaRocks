@@ -143,10 +143,7 @@ impl DistributedPlan {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(in crate::planner::distributed) fn remove_fragment_output_for_test(
-        &mut self,
-        fragment_id: FragmentId,
-    ) {
+    pub(crate) fn remove_fragment_output_for_test(&mut self, fragment_id: FragmentId) {
         self.data
             .fragment_edge_outputs
             .remove_fragment_output_for_test(fragment_id);

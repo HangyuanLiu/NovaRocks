@@ -115,7 +115,7 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
                 contribution_kinds: contribution_kinds
                     .iter()
                     .copied()
-                    .map(|value| RuntimeFilterContributionKind::from_sql(*value))
+                    .map(RuntimeFilterContributionKind::from_sql)
                     .collect(),
                 completion_requirement: RuntimeFilterCompletionRequirement::from_sql(
                     *completion_requirement,
@@ -130,7 +130,7 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
                 capabilities: capabilities
                     .iter()
                     .copied()
-                    .map(|value| RuntimeFilterArtifactCapability::from_sql(*value))
+                    .map(RuntimeFilterArtifactCapability::from_sql)
                     .collect(),
                 activation: RuntimeFilterConsumerActivation::from_sql(*activation),
                 target: RuntimeFilterConsumerTarget::from_sql(target),
@@ -508,7 +508,7 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
     }
 
     pub fn reduction(self) -> RuntimeFilterReductionFacts {
-        RuntimeFilterReductionFacts::from_sql(self.channel.reduction_requirement)
+        RuntimeFilterReductionFacts::from_sql(self.channel.reduction)
     }
 
     pub fn allowed_contribution_kinds(self) -> Vec<RuntimeFilterContributionKind> {
@@ -786,8 +786,8 @@ pub struct RuntimeFilterFrontierEdgeFacts {
 impl RuntimeFilterFrontierEdgeFacts {
     fn from_sql(edge: &sql_facts::SqlRuntimeFilterFrontierEdgeFacts) -> Self {
         Self {
-            source_fragment_id: edge.source_fragment,
-            target_exchange_node_id: edge.target_exchange_node,
+            source_fragment_id: edge.source_fragment_id,
+            target_exchange_node_id: edge.target_exchange_node_id,
         }
     }
 }
