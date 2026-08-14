@@ -20,14 +20,14 @@ use std::time::{Duration, Instant};
 
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    AttemptId, FragmentTerminalOutcome, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
-    QueryControlAttachment, QueryControlEndpoint, QueryControlEvent, QueryExecutionId,
-    QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryStageOutcome, QueryStageRequest, QueryStartOutcome, QueryStartRequest, QueryTerminalAck,
-    QueryTerminalFallbackTransport, QueryTerminalReportAck, QueryTerminalReportOutcome,
-    QueryTerminalSnapshot, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
-    StageDigestVersion, StageFragment,
+    AttemptId, FragmentTerminalOutcome, NegativeAttestationReason, ParticipantBackendIdentity,
+    ParticipantManifest, ParticipantQueryOptions, ParticipantRole, QueryAbortRequest,
+    QueryControlAttach, QueryControlAttachment, QueryControlEndpoint, QueryControlEvent,
+    QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
+    QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
+    QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationReason,
+    RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -48,6 +48,7 @@ use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
 };
+use novarocks::common::query_lifecycle_fault::QueryLifecycleFaultKind;
 
 const LOCAL_BACKEND_ID: u64 = 7;
 const LOCAL_START_EPOCH: u64 = 11;
@@ -1794,6 +1795,79 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
     assert_eq!(metrics.terminal_facts, 1);
     assert_eq!(metrics.terminal_records_frozen, 1);
     assert_eq!(metrics.terminal_locally_drained, 0);
+}
+
+#[test]
+fn terminal_p1_faults_keep_the_attestation_delivery_permit() {
+    for (query_low, fault, expected_reason) in [
+        (
+            76_101,
+            QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+            NegativeAttestationReason::CorrectnessEvidenceEncodingFailed,
+        ),
+        (
+            76_102,
+            QueryLifecycleFaultKind::TerminalP1RetentionExhausted,
+            NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted,
+        ),
+    ] {
+        let registry = registry_with(RecordingLocalRuntime::default(), 8);
+        let expected = UniqueId::new(query_low, 1);
+        let request = fragment_init_request_fixture(query_low, &[expected]);
+        let execution_id = request.manifest().execution_id();
+        assert_eq!(
+            registry.init_query(request.clone()).outcome(),
+            QueryInitOutcome::Applied
+        );
+        let mut attachment = attach_control(&registry, &request);
+        assert!(matches!(
+            attachment.events.try_recv(),
+            Ok(QueryControlEvent::ControlReady)
+        ));
+        registry.inject_terminal_fault_for_test(execution_id, fault);
+        registry
+            .admit_fragment(execution_id, expected)
+            .expect("fragment permit")
+            .commit()
+            .expect("fragment admission commits");
+        registry.record_fragment_terminal(
+            execution_id,
+            expected,
+            &FragmentOutcome::Failed(FragmentExecutionError::new(
+                FragmentExecutionErrorKind::Pipeline,
+                "inject terminal P1 fault",
+            )),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let outcome = loop {
+            match attachment.events.try_recv() {
+                Ok(QueryControlEvent::TerminalOutcome { outcome }) => break outcome,
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("terminal attestation was not delivered: {error}"),
+            }
+        };
+        let novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(
+            attestation,
+        ) = &outcome
+        else {
+            panic!("P1 failure must deliver a negative attestation, got {outcome:?}");
+        };
+        assert_eq!(attestation.reason(), expected_reason);
+        assert_eq!(
+            registry.metrics_snapshot().terminal_retained,
+            1,
+            "the attach-time P0 permit must remain retained for attestation delivery"
+        );
+        attachment
+            .control
+            .terminal_ack(QueryTerminalAck::from_outcome(&outcome))
+            .expect("attestation ACK releases the retained P0 permit");
+        assert_eq!(registry.metrics_snapshot().terminal_retained, 0);
+    }
 }
 
 #[test]
