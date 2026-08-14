@@ -59,6 +59,57 @@ SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
 SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
 
 -- query 6
+-- P2 assembly is optional telemetry: the query and P1 proof remain valid,
+-- while the retained outcome records typed unavailable evidence.
+-- @query_lifecycle_fault=observation-p2-assembly-failure,0
+-- @query_control_fragment_backend_limit=3
+-- @expect_participant_outcome=proof
+-- @result_contains=3
+SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
+
+-- query 7
+-- The independent P2 budget path has the same non-vetoing contract.
+-- @query_lifecycle_fault=observation-p2-budget-pressure,1
+-- @query_control_fragment_backend_limit=3
+-- @expect_participant_outcome=proof
+-- @result_contains=3
+SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
+
+-- query 8
+-- Losing the proof control-stream frame must deliver the retained proof via
+-- the unary fallback rather than turning a successful participant into an
+-- attestation or a timeout.
+-- @query_lifecycle_fault=terminal-proof-stream-drop,0
+-- @query_control_fragment_backend_limit=3
+-- @expect_participant_outcome=proof
+-- @result_contains=3
+SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
+
+-- query 9
+-- The attestation branch has the same fallback identity and is not dependent
+-- on a control-stream frame.
+-- @query_lifecycle_fault=terminal-attestation-stream-drop,1
+-- @query_lifecycle_fault=terminal-p1-encode-failure,1
+-- @query_control_fragment_backend_limit=3
+-- @expect_error=CorrectnessEvidenceEncodingFailed
+-- @expect_lifecycle_error_source=backend-attestation
+-- @expect_participant_outcome=attestation:CorrectnessEvidenceEncodingFailed
+SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
+
+-- query 10
+-- Once Finalizing has retained immutable terminal evidence, a BE loss is a
+-- frontend-owned liveness failure rather than a fabricated backend outcome.
+-- @query_lifecycle_fault=terminal-outcome-suppress,1
+-- @kill_be_at_lifecycle_phase=1,terminal-retained
+-- @query_control_fragment_backend_limit=2
+-- @expect_error=query lifecycle terminal ACK failed
+-- @expect_lifecycle_error_source=frontend-liveness
+SELECT SUM(left_side.id)
+FROM ${case_db}.terminal_outcome_contract left_side
+JOIN ${case_db}.terminal_outcome_contract right_side
+  ON left_side.id = right_side.id;
+
+-- query 11
 -- A faulted lifecycle attempt must not poison the next query.
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract;

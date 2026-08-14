@@ -146,9 +146,10 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.drop_terminal_snapshot_stream_be_index.is_some()
         || meta.terminal_snapshot_conflict_be_index.is_some()
-        || meta.query_lifecycle_fault.is_some()
+        || !configured_query_lifecycle_faults(meta).is_empty()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
+        || meta.kill_be_at_lifecycle_phase.is_some()
         || meta
             .stop_query_control_heartbeat_after_stage_be_index
             .is_some()
@@ -195,14 +196,25 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.drop_terminal_snapshot_stream_be_index.is_some()
         || meta.terminal_snapshot_conflict_be_index.is_some()
-        || meta.query_lifecycle_fault.is_some()
+        || !configured_query_lifecycle_faults(meta).is_empty()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
+        || meta.kill_be_at_lifecycle_phase.is_some()
         || meta
             .stop_query_control_heartbeat_after_stage_be_index
             .is_some()
         || meta.hold_start_until_early_ingress
         || meta.query_control_fragment_backend_limit.is_some()
+}
+
+fn configured_query_lifecycle_faults(
+    meta: &QueryMeta,
+) -> Vec<crate::types::QueryLifecycleFaultDirective> {
+    if meta.query_lifecycle_faults.is_empty() {
+        meta.query_lifecycle_fault.into_iter().collect()
+    } else {
+        meta.query_lifecycle_faults.clone()
+    }
 }
 
 /// A frontend crash may leave bounded terminal delivery records after the FE
@@ -244,9 +256,10 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.drop_next_terminal_ack_be_index.is_some(),
         meta.drop_terminal_snapshot_stream_be_index.is_some(),
         meta.terminal_snapshot_conflict_be_index.is_some(),
-        meta.query_lifecycle_fault.is_some(),
+        !configured_query_lifecycle_faults(meta).is_empty(),
         meta.kill_query_at_lifecycle_phase.is_some(),
         meta.kill_fe_at_lifecycle_phase.is_some(),
+        meta.kill_be_at_lifecycle_phase.is_some(),
         meta.stop_query_control_heartbeat_after_stage_be_index
             .is_some(),
     ]
@@ -256,9 +269,19 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     let start_ack_and_terminal_ack_compound = meta.suppress_start_ack_be_index.is_some()
         && meta.drop_next_terminal_ack_be_index.is_some()
         && lifecycle_fault_count == 2;
-    if lifecycle_fault_count > 1 && !start_ack_and_terminal_ack_compound {
+    // A terminal-retained BE kill is intentionally composable with one or
+    // more owner-local RFO arms. The arms hold one participant's terminal
+    // delivery open; the FE phase barrier then proves another participant is
+    // already finalizing before the process death is released.
+    let terminal_kill_and_rfo_compound = meta.kill_be_at_lifecycle_phase.is_some()
+        && !configured_query_lifecycle_faults(meta).is_empty()
+        && lifecycle_fault_count == 2;
+    if lifecycle_fault_count > 1
+        && !start_ack_and_terminal_ack_compound
+        && !terminal_kill_and_rfo_compound
+    {
         bail!(
-            "a SQL step may configure at most one query lifecycle fault directive; hold_start_until_early_ingress is schedule-shaping and persistent StartAck suppression may be combined with one TerminalAck drop"
+            "a SQL step may configure at most one query lifecycle fault directive; hold_start_until_early_ingress is schedule-shaping, persistent StartAck suppression may be combined with one TerminalAck drop, and a terminal-retained BE kill may be combined with RFO terminal delivery arms"
         );
     }
 
@@ -347,12 +370,20 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     {
         bail!("query_control_fragment_backend_limit must be between 1 and {be_count}, got {limit}");
     }
-    if let Some(fault) = meta.query_lifecycle_fault
+    for fault in configured_query_lifecycle_faults(meta) {
+        if fault.be_index >= be_count {
+            bail!(
+                "query_lifecycle_fault {} BE index {} is out of bounds for {be_count} BE(s)",
+                fault.kind.as_str(),
+                fault.be_index
+            );
+        }
+    }
+    if let Some(fault) = meta.kill_be_at_lifecycle_phase
         && fault.be_index >= be_count
     {
         bail!(
-            "query_lifecycle_fault {} BE index {} is out of bounds for {be_count} BE(s)",
-            fault.kind.as_str(),
+            "kill_be_at_lifecycle_phase BE index {} is out of bounds for {be_count} BE(s)",
             fault.be_index
         );
     }
@@ -390,7 +421,7 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     if let Some(index) = meta.terminal_snapshot_conflict_be_index {
         server.arm_terminal_snapshot_conflict(index)?;
     }
-    if let Some(fault) = meta.query_lifecycle_fault {
+    for fault in configured_query_lifecycle_faults(meta) {
         server.arm_query_lifecycle_fault(fault.be_index, fault.kind.as_str())?;
     }
     if let Some(phase) = meta.kill_query_at_lifecycle_phase {
@@ -398,6 +429,9 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     if let Some(phase) = meta.kill_fe_at_lifecycle_phase {
         server.arm_fe_crash_at_lifecycle_phase(phase)?;
+    }
+    if let Some(fault) = meta.kill_be_at_lifecycle_phase {
+        server.arm_be_kill_at_lifecycle_phase(fault.phase)?;
     }
     if let Some(index) = meta.stop_query_control_heartbeat_after_stage_be_index {
         server.arm_query_control_heartbeat_stop_after_stage(index)?;
@@ -457,6 +491,10 @@ where
             connection_id: u32,
         },
         KillFrontendAtLifecyclePhase(crate::types::QueryLifecyclePhase),
+        KillBackendAtLifecyclePhase {
+            index: usize,
+            phase: crate::types::QueryLifecyclePhase,
+        },
     }
 
     enum FaultBaseline {
@@ -531,6 +569,12 @@ where
             .transpose()?,
         meta.kill_fe_at_lifecycle_phase
             .map(PostQueryFault::KillFrontendAtLifecyclePhase),
+        meta.kill_be_at_lifecycle_phase.map(|fault| {
+            PostQueryFault::KillBackendAtLifecyclePhase {
+                index: fault.be_index,
+                phase: fault.phase,
+            }
+        }),
     ]
     .into_iter()
     .flatten()
@@ -610,7 +654,8 @@ where
                 }
             }
             PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
-            | PostQueryFault::KillFrontendAtLifecyclePhase(phase) => FaultBaseline::FrontendPhase {
+            | PostQueryFault::KillFrontendAtLifecyclePhase(phase)
+            | PostQueryFault::KillBackendAtLifecyclePhase { phase, .. } => FaultBaseline::FrontendPhase {
                 phase,
                 fe_crash: matches!(fault, PostQueryFault::KillFrontendAtLifecyclePhase(_)),
                 marker_count: lifecycle_phase_marker_count(
@@ -736,7 +781,8 @@ where
                             marker_count,
                         },
                         PostQueryFault::KillQueryAtLifecyclePhase { .. }
-                        | PostQueryFault::KillFrontendAtLifecyclePhase(_),
+                        | PostQueryFault::KillFrontendAtLifecyclePhase(_)
+                        | PostQueryFault::KillBackendAtLifecyclePhase { .. },
                     ) => fresh_lifecycle_phase_execution(
                         &server.fe_log_contents()?,
                         *marker_count as usize,
@@ -815,6 +861,10 @@ where
                             server.kill_fe()?;
                             server.release_query_lifecycle_phase_fault(phase, true)?;
                             server.restart_fe_until(deadline)?;
+                        }
+                        PostQueryFault::KillBackendAtLifecyclePhase { index, phase } => {
+                            server.kill_be(index)?;
+                            server.release_be_kill_at_lifecycle_phase(phase)?;
                         }
                         PostQueryFault::KillFrontendAfterControlReady(_) => {
                             server.kill_fe()?;
@@ -1282,6 +1332,11 @@ mod tests {
             Ok(())
         }
 
+        fn arm_query_lifecycle_fault(&mut self, index: usize, kind: &'static str) -> Result<()> {
+            self.events.push(format!("arm-rfo-8r2:{kind}:{index}"));
+            Ok(())
+        }
+
         fn arm_kill_query_at_lifecycle_phase(
             &mut self,
             phase: crate::types::QueryLifecyclePhase,
@@ -1297,6 +1352,15 @@ mod tests {
         ) -> Result<()> {
             self.events
                 .push(format!("arm-fe-crash-phase:{}", phase.as_str()));
+            Ok(())
+        }
+
+        fn arm_be_kill_at_lifecycle_phase(
+            &mut self,
+            phase: crate::types::QueryLifecyclePhase,
+        ) -> Result<()> {
+            self.events
+                .push(format!("arm-be-kill-phase:{}", phase.as_str()));
             Ok(())
         }
 
@@ -1731,6 +1795,18 @@ mod tests {
             ),
             (
                 QueryMeta {
+                    kill_be_at_lifecycle_phase: Some(
+                        crate::types::KillBeAtLifecyclePhaseDirective {
+                            be_index: 2,
+                            phase: crate::types::QueryLifecyclePhase::TerminalRetained,
+                        },
+                    ),
+                    ..QueryMeta::default()
+                },
+                "arm-be-kill-phase:terminal-retained",
+            ),
+            (
+                QueryMeta {
                     stop_query_control_heartbeat_after_stage_be_index: Some(1),
                     ..QueryMeta::default()
                 },
@@ -1748,6 +1824,38 @@ mod tests {
             apply_pre_query(&meta, &mut server).expect("arm lifecycle hook");
             assert_eq!(server.events, vec![expected_event]);
         }
+    }
+
+    #[test]
+    fn rfo_8r2_fault_directives_arm_every_configured_hook() {
+        let mut server = RecordingServerHandle::default();
+        let meta = QueryMeta {
+            query_lifecycle_fault: Some(crate::types::QueryLifecycleFaultDirective {
+                kind: crate::types::QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                be_index: 1,
+            }),
+            query_lifecycle_faults: vec![
+                crate::types::QueryLifecycleFaultDirective {
+                    kind: crate::types::QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                    be_index: 1,
+                },
+                crate::types::QueryLifecycleFaultDirective {
+                    kind: crate::types::QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+                    be_index: 1,
+                },
+            ],
+            ..QueryMeta::default()
+        };
+
+        apply_pre_query(&meta, &mut server).expect("arm all RFO-8R2 faults");
+
+        assert_eq!(
+            server.events,
+            vec![
+                "arm-rfo-8r2:terminal-p1-encode-failure:1",
+                "arm-rfo-8r2:terminal-attestation-stream-drop:1",
+            ]
+        );
     }
 
     #[test]

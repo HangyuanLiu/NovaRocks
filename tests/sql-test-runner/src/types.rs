@@ -78,6 +78,16 @@ pub struct QueryLifecycleFaultDirective {
     pub be_index: usize,
 }
 
+/// A runner-owned BE process fault released only after the frontend reaches a
+/// stable lifecycle barrier. The phase trigger is deliberately separate from
+/// the BE action: the frontend owns the phase marker while the harness owns
+/// process lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KillBeAtLifecyclePhaseDirective {
+    pub be_index: usize,
+    pub phase: QueryLifecyclePhase,
+}
+
 /// Structured fault assertions deliberately name a result category rather
 /// than matching a human-readable diagnostic. T7/T9 provide the actual
 /// snapshot producer; T4 owns this stable runner contract.
@@ -232,11 +242,18 @@ pub struct QueryMeta {
     /// One RFO-8R2 owner-local lifecycle fault. The first field names the
     /// stable arm and the second scopes it to one runner-owned BE.
     pub query_lifecycle_fault: Option<QueryLifecycleFaultDirective>,
+    /// All explicitly configured RFO-8R2 owner-local lifecycle faults. The
+    /// legacy scalar remains for existing programmatic callers and for the
+    /// primary BE-log token, while parsed SQL directives populate this list.
+    pub query_lifecycle_faults: Vec<QueryLifecycleFaultDirective>,
     /// Typed outcome/source assertion for RFO-8R2 resilience cases. It is
     /// intentionally separate from `expect_error` and log assertions.
     pub query_lifecycle_structured_assertion: Option<QueryLifecycleStructuredAssertion>,
     pub kill_query_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     pub kill_fe_at_lifecycle_phase: Option<QueryLifecyclePhase>,
+    /// Kill one BE only after FE has retained an immutable participant outcome
+    /// for the requested lifecycle phase.
+    pub kill_be_at_lifecycle_phase: Option<KillBeAtLifecyclePhaseDirective>,
     pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,
     pub hold_start_until_early_ingress: bool,
     pub query_control_fragment_backend_limit: Option<usize>,

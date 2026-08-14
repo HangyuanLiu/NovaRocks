@@ -1496,6 +1496,11 @@ impl AttemptControl {
         let mut terminal = self.terminal.0.lock().expect("query terminal state");
         terminal.backend_stream_closed.insert(backend_idx);
         self.terminal.1.notify_all();
+        // A terminal reader may close while Finalizing still awaits a unary
+        // fallback. Wake the generation-fenced heartbeat owner immediately
+        // so an actually dead participant is classified as FE liveness before
+        // the ordinary NoOutcome deadline elapses.
+        self.stop.1.notify_all();
     }
 
     fn stop_readers(&self) {

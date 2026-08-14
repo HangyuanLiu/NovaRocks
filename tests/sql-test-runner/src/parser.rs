@@ -158,6 +158,32 @@ fn parse_query_lifecycle_fault(raw: &str) -> anyhow::Result<QueryLifecycleFaultD
     Ok(QueryLifecycleFaultDirective { kind, be_index })
 }
 
+fn parse_kill_be_at_lifecycle_phase(
+    raw: &str,
+) -> anyhow::Result<KillBeAtLifecyclePhaseDirective> {
+    let (be_index, phase) = raw.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!(
+            "@kill_be_at_lifecycle_phase requires <be_index>,<phase>; received {raw:?}"
+        )
+    })?;
+    let be_index = be_index
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid kill_be_at_lifecycle_phase BE index {be_index:?}"))?;
+    let phase = QueryLifecyclePhase::parse(phase.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid kill_be_at_lifecycle_phase phase {phase:?}; expected terminal-retained"
+        )
+    })?;
+    if phase != QueryLifecyclePhase::TerminalRetained {
+        bail!(
+            "invalid kill_be_at_lifecycle_phase phase {}; expected terminal-retained",
+            phase.as_str()
+        );
+    }
+    Ok(KillBeAtLifecyclePhaseDirective { be_index, phase })
+}
+
 fn parse_participant_outcome_expectation(
     raw: &str,
 ) -> anyhow::Result<ParticipantOutcomeExpectation> {
@@ -440,7 +466,11 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 meta.terminal_snapshot_conflict_be_index = Some(value);
             }
             "query_lifecycle_fault" => {
-                meta.query_lifecycle_fault = Some(parse_query_lifecycle_fault(&raw_value)?);
+                let fault = parse_query_lifecycle_fault(&raw_value)?;
+                if meta.query_lifecycle_fault.is_none() {
+                    meta.query_lifecycle_fault = Some(fault);
+                }
+                meta.query_lifecycle_faults.push(fault);
             }
             "expect_lifecycle_error_source" => {
                 let source = QueryLifecycleErrorSource::parse(&raw_value).ok_or_else(|| {
@@ -483,6 +513,9 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     );
                 }
                 meta.kill_fe_at_lifecycle_phase = Some(phase);
+            }
+            "kill_be_at_lifecycle_phase" => {
+                meta.kill_be_at_lifecycle_phase = Some(parse_kill_be_at_lifecycle_phase(&raw_value)?);
             }
             "stop_query_control_heartbeat_after_stage_be_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -724,6 +757,11 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         query_lifecycle_fault: override_meta
             .query_lifecycle_fault
             .or(base.query_lifecycle_fault),
+        query_lifecycle_faults: if override_meta.query_lifecycle_faults.is_empty() {
+            base.query_lifecycle_faults.clone()
+        } else {
+            override_meta.query_lifecycle_faults.clone()
+        },
         query_lifecycle_structured_assertion: match (
             base.query_lifecycle_structured_assertion.as_ref(),
             override_meta.query_lifecycle_structured_assertion.as_ref(),
@@ -740,6 +778,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_fe_at_lifecycle_phase: override_meta
             .kill_fe_at_lifecycle_phase
             .or(base.kill_fe_at_lifecycle_phase),
+        kill_be_at_lifecycle_phase: override_meta
+            .kill_be_at_lifecycle_phase
+            .or(base.kill_be_at_lifecycle_phase),
         stop_query_control_heartbeat_after_stage_be_index: override_meta
             .stop_query_control_heartbeat_after_stage_be_index
             .or(base.stop_query_control_heartbeat_after_stage_be_index),
@@ -1246,6 +1287,7 @@ mod opt5_directive_tests {
             "-- @drop_next_terminal_ack_be_index=1".to_string(),
             "-- @kill_query_at_lifecycle_phase=starting".to_string(),
             "-- @kill_fe_at_lifecycle_phase=staged".to_string(),
+            "-- @kill_be_at_lifecycle_phase=2,terminal-retained".to_string(),
             "-- @stop_query_control_heartbeat_after_stage_be_index=1".to_string(),
             "-- @hold_start_until_early_ingress=true".to_string(),
             "-- @query_control_fragment_backend_limit=2".to_string(),
@@ -1267,6 +1309,13 @@ mod opt5_directive_tests {
         assert_eq!(meta.drop_next_start_ack_be_index, Some(2));
         assert_eq!(meta.suppress_start_ack_be_index, Some(0));
         assert_eq!(meta.drop_next_terminal_ack_be_index, Some(1));
+        assert_eq!(
+            meta.kill_be_at_lifecycle_phase,
+            Some(KillBeAtLifecyclePhaseDirective {
+                be_index: 2,
+                phase: QueryLifecyclePhase::TerminalRetained,
+            })
+        );
         assert_eq!(
             meta.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Starting)
@@ -1693,6 +1742,13 @@ mod opt5_directive_tests {
                 be_index: 2,
             })
         );
+        assert_eq!(
+            meta.query_lifecycle_faults,
+            vec![QueryLifecycleFaultDirective {
+                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                be_index: 2,
+            }]
+        );
         let assertion = meta
             .query_lifecycle_structured_assertion
             .expect("structured assertion");
@@ -1712,6 +1768,53 @@ mod opt5_directive_tests {
                 metric: "terminal_retained".to_string(),
                 delta: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn parse_meta_accumulates_rfo_8r2_fault_directives() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @query_lifecycle_fault=terminal-p1-encode-failure,2".to_string(),
+            "-- @query_lifecycle_fault=terminal-attestation-stream-drop,2".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse multiple RFO-8R2 directives");
+
+        assert_eq!(
+            meta.query_lifecycle_fault,
+            Some(QueryLifecycleFaultDirective {
+                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                be_index: 2,
+            })
+        );
+        assert_eq!(
+            meta.query_lifecycle_faults,
+            vec![
+                QueryLifecycleFaultDirective {
+                    kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                    be_index: 2,
+                },
+                QueryLifecycleFaultDirective {
+                    kind: QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+                    be_index: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_meta_rejects_be_kill_before_terminal_retention() {
+        let re = meta_re();
+        let error = parse_meta(
+            &["-- @kill_be_at_lifecycle_phase=1,running".to_string()],
+            &re,
+        )
+        .expect_err("BE kill must wait for immutable terminal evidence");
+
+        assert!(
+            format!("{error:#}").contains("expected terminal-retained"),
+            "unexpected error: {error:#}"
         );
     }
 

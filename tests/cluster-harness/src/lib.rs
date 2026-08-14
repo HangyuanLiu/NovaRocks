@@ -767,6 +767,21 @@ pub trait ServerHandle: Send {
             phase.as_str()
         )
     }
+    /// Arms the existing FE-owned phase barrier for a runner-owned BE kill.
+    /// The trigger is released by `release_be_kill_at_lifecycle_phase` after
+    /// the harness has killed its selected BE process.
+    fn arm_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        bail!(
+            "BE lifecycle phase kill is unsupported by this server mode (phase={})",
+            phase.as_str()
+        )
+    }
+    fn release_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        bail!(
+            "BE lifecycle phase kill release is unsupported by this server mode (phase={})",
+            phase.as_str()
+        )
+    }
     fn arm_query_control_heartbeat_stop_after_stage(&mut self, index: usize) -> Result<()> {
         bail!(
             "query-control heartbeat stop-after-stage is unsupported by this server mode (index={index})"
@@ -1957,6 +1972,24 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
+    fn arm_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        // `record_lifecycle_phase_marker_for_execution` is a shared FE-owned
+        // barrier. Its kill-query trigger name describes the historical
+        // consumer, not the runner action; this caller kills a BE after the
+        // same immutable phase marker and releases that trigger itself.
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_kill_query_at_phase(phase)?;
+        println!(
+            "armed BE kill at lifecycle phase={} token={token} trigger={}",
+            phase.as_str(),
+            self.query_lifecycle_fault_files
+                .kill_query_at_phase_path(phase)
+                .display()
+        );
+        Ok(())
+    }
+
     fn arm_query_control_heartbeat_stop_after_stage(&mut self, index: usize) -> Result<()> {
         self.ensure_be_index(index)?;
         let token = self
@@ -2005,6 +2038,14 @@ impl ServerHandle for CrossProcessServerHandle {
                 phase.as_str()
             )
         })
+    }
+
+    fn release_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        let path = self
+            .query_lifecycle_fault_files
+            .kill_query_at_phase_path(phase);
+        remove_fragment_failure_file(&path)
+            .with_context(|| format!("release BE kill lifecycle phase barrier {}", phase.as_str()))
     }
 
     fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
