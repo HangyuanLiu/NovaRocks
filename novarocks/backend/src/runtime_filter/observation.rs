@@ -1300,6 +1300,25 @@ mod tests {
     }
 
     #[test]
+    fn cross_driver_effect_reordering_currently_sticks_version_regression() {
+        let fixture = fixture();
+        let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        for version in [LogicalVersion::new(2), LogicalVersion::FIRST] {
+            emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
+                identity: fixture.consumer,
+                logical_version: version,
+                input_rows: 1,
+                output_rows: 1,
+            });
+        }
+
+        assert_eq!(
+            emitter.capture(),
+            Err(RuntimeFilterObservationError::VersionRegression)
+        );
+    }
+
+    #[test]
     fn unknown_or_unopened_stream_is_a_first_wins_sticky_error() {
         let fixture = fixture();
         let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
