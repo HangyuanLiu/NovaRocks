@@ -865,6 +865,11 @@ where
                         PostQueryFault::KillBackendAtLifecyclePhase { index, phase } => {
                             server.kill_be(index)?;
                             server.release_be_kill_at_lifecycle_phase(phase)?;
+                            // This fault proves convergence against the
+                            // generation that died; restore the runner-owned
+                            // backend before the next SQL step so a later
+                            // case observes a healthy 1FE+3BE topology.
+                            server.restart_be_until(index, deadline)?;
                         }
                         PostQueryFault::KillFrontendAfterControlReady(_) => {
                             server.kill_fe()?;
