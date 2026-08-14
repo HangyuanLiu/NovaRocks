@@ -89,60 +89,35 @@ pub(super) fn sealed_cte_projection(
 #[cfg(test)]
 mod tests {
     use super::sealed_cte_projection;
-    use novarocks_sql::plan_read::ColumnId;
-    use novarocks_sql::plan_read::{
-        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
-    };
+    use novarocks_sql::test_support::{NativeBuildFixture, native_build_plan};
 
     #[test]
     fn sealed_cte_multicast_projection_sorts_edges_and_preserves_receive_occurrence_order() {
-        let cte_id = 42;
-        let first_column = ColumnId::new_for_test(1);
-        let second_column = ColumnId::new_for_test(2);
-        let third_column = ColumnId::new_for_test(3);
-        let fourth_column = ColumnId::new_for_test(4);
-        let mut fragment = super::super::test_support::result_plan().fragments()[0].clone();
-        fragment.cte_exchange_nodes = vec![
-            (cte_id, 11, vec![fourth_column, second_column]),
-            (cte_id, 3, vec![third_column, first_column]),
-        ];
-        let edges = vec![
-            FragmentEdge {
-                source_fragment_id: 1,
-                target_fragment_id: fragment.fragment_id,
-                target_exchange_node_id: 11,
-                output_partition: DataPartition::unpartitioned(),
-                stream_kind: FragmentStreamKind::Gather,
-                edge_kind: FragmentEdgeKind::CteMulticast {
-                    cte_id,
-                    receive_producer_column_ids: vec![fourth_column, second_column],
-                },
-                output_slot_ids: vec![2],
-            },
-            FragmentEdge {
-                source_fragment_id: 2,
-                target_fragment_id: fragment.fragment_id,
-                target_exchange_node_id: 3,
-                output_partition: DataPartition::unpartitioned(),
-                stream_kind: FragmentStreamKind::Gather,
-                edge_kind: FragmentEdgeKind::CteMulticast {
-                    cte_id,
-                    receive_producer_column_ids: vec![third_column, first_column],
-                },
-                output_slot_ids: vec![1],
-            },
-        ];
+        let plan = native_build_plan(NativeBuildFixture::CteMulticastOrdering)
+            .expect("sealed CTE ordering fixture");
+        let fragment = plan
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.fragment_id == plan.root_fragment_id())
+            .expect("result fragment");
 
         let (producer, consumers) =
-            sealed_cte_projection(&edges, &fragment).expect("sealed CTE projection");
+            sealed_cte_projection(plan.edges(), fragment).expect("sealed CTE projection");
 
         assert_eq!(producer, None);
+        assert_eq!(consumers.len(), 2);
         assert_eq!(
-            consumers,
-            vec![
-                (cte_id, 3, vec![third_column, first_column]),
-                (cte_id, 11, vec![fourth_column, second_column]),
-            ]
+            consumers
+                .iter()
+                .map(|(cte_id, exchange_node_id, column_ids)| {
+                    (
+                        *cte_id,
+                        *exchange_node_id,
+                        column_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(42, 3, vec![3, 1]), (42, 11, vec![4, 2])]
         );
     }
 }

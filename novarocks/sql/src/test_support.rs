@@ -152,6 +152,7 @@ pub enum NativeBuildFixture {
     LimitOffsetStream,
     TopNSplitStream,
     CteMulticastStream,
+    CteMulticastOrdering,
     RouterStream,
 }
 
@@ -366,6 +367,7 @@ pub fn native_build_plan(fixture: NativeBuildFixture) -> Result<DistributedPlan,
             })
         }
         NativeBuildFixture::CteMulticastStream => native_cte_multicast_stream_plan(),
+        NativeBuildFixture::CteMulticastOrdering => native_cte_multicast_ordering_plan(),
         NativeBuildFixture::RouterStream => native_router_stream_plan(),
     }
 }
@@ -1312,6 +1314,145 @@ fn native_cte_multicast_stream_plan() -> Result<DistributedPlan, String> {
     )
     .seal()
     .map_err(|error| format!("native CTE topology fixture must seal: {error}"))
+}
+
+/// A closed CTE multicast plan whose two target receivers are deliberately
+/// declared and edged in descending exchange-node order. Core consumes only
+/// the sealed read model to verify its deterministic projection ordering.
+fn native_cte_multicast_ordering_plan() -> Result<DistributedPlan, String> {
+    let cte_id: CteId = 42;
+    let producer_columns = vec![
+        output_column(1, "first", DataType::Int64),
+        output_column(2, "second", DataType::Int64),
+        output_column(3, "third", DataType::Int64),
+        output_column(4, "fourth", DataType::Int64),
+    ];
+    let first_receive_columns = vec![producer_columns[3].clone(), producer_columns[1].clone()];
+    let first_receive_ids = vec![ColumnId(4), ColumnId(2)];
+    let second_receive_columns = vec![producer_columns[2].clone(), producer_columns[0].clone()];
+    let second_receive_ids = vec![ColumnId(3), ColumnId(1)];
+    let source = PlanFragment {
+        fragment_id: 1,
+        root: values_node(1, 10, producer_columns.clone()),
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: producer_columns,
+        cte_id: Some(cte_id),
+        cte_exchange_nodes: Vec::new(),
+    };
+    let first_receiver = DistributedNode {
+        node_id: 11,
+        fragment_id: 0,
+        tuple_ids: vec![11],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: Vec::new(),
+        stats: physical_stats(),
+        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+            partition: DataPartition::unpartitioned(),
+            source_fragment_id: 1,
+            output_columns: first_receive_columns.clone(),
+            output_qualifier: Some("cte_first".to_string()),
+            flavor: ExchangeFlavor::CteMulticast {
+                cte_id,
+                receive_producer_column_ids: first_receive_ids.clone(),
+            },
+        }),
+    };
+    let second_receiver = DistributedNode {
+        node_id: 3,
+        fragment_id: 0,
+        tuple_ids: vec![3],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: Vec::new(),
+        stats: physical_stats(),
+        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+            partition: DataPartition::unpartitioned(),
+            source_fragment_id: 1,
+            output_columns: second_receive_columns.clone(),
+            output_qualifier: Some("cte_second".to_string()),
+            flavor: ExchangeFlavor::CteMulticast {
+                cte_id,
+                receive_producer_column_ids: second_receive_ids.clone(),
+            },
+        }),
+    };
+    let target_output_columns = vec![
+        first_receive_columns[0].clone(),
+        first_receive_columns[1].clone(),
+        second_receive_columns[0].clone(),
+        second_receive_columns[1].clone(),
+    ];
+    let target = PlanFragment {
+        fragment_id: 0,
+        root: DistributedNode {
+            node_id: 30,
+            fragment_id: 0,
+            tuple_ids: vec![30],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: vec![first_receiver, second_receiver],
+            stats: physical_stats(),
+            payload: DistributedNodeKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: Vec::new(),
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+                output_columns: target_output_columns.clone(),
+            })),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: target_output_columns,
+        cte_id: None,
+        cte_exchange_nodes: vec![
+            (cte_id, 11, first_receive_ids.clone()),
+            (cte_id, 3, second_receive_ids.clone()),
+        ],
+    };
+    crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![source, target],
+        Some(0),
+        vec![
+            FragmentEdge {
+                source_fragment_id: 1,
+                target_fragment_id: 0,
+                target_exchange_node_id: 11,
+                output_partition: DataPartition::unpartitioned(),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids: first_receive_ids,
+                },
+                output_slot_ids: vec![4, 2],
+            },
+            FragmentEdge {
+                source_fragment_id: 1,
+                target_fragment_id: 0,
+                target_exchange_node_id: 3,
+                output_partition: DataPartition::unpartitioned(),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids: second_receive_ids,
+                },
+                output_slot_ids: vec![3, 1],
+            },
+        ],
+        Default::default(),
+    )
+    .seal()
+    .map_err(|error| format!("native CTE ordering fixture must seal: {error}"))
 }
 
 fn native_router_stream_plan() -> Result<DistributedPlan, String> {
@@ -2390,6 +2531,7 @@ mod tests {
             NativeBuildFixture::LimitOffsetStream,
             NativeBuildFixture::TopNSplitStream,
             NativeBuildFixture::CteMulticastStream,
+            NativeBuildFixture::CteMulticastOrdering,
             NativeBuildFixture::RouterStream,
         ] {
             let plan = native_build_plan(fixture).expect("build fixture must seal");
