@@ -1596,7 +1596,7 @@ fn native_ordinary_iceberg_all_columns_scan_plan() -> Result<DistributedPlan, St
         ordinary_iceberg_columns(),
         vec![
             output_column(1, "id", DataType::Int32),
-            output_column(3, "category", DataType::Utf8),
+            output_column_with_nullability(3, "category", DataType::Utf8, true),
         ],
         None,
         Vec::new(),
@@ -2372,11 +2372,20 @@ fn lambda_expr(body: TypedExpr) -> TypedExpr {
 }
 
 fn output_column(id: u32, name: &str, data_type: DataType) -> OutputColumn {
+    output_column_with_nullability(id, name, data_type, false)
+}
+
+fn output_column_with_nullability(
+    id: u32,
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+) -> OutputColumn {
     OutputColumn {
         column_id: ColumnId(id),
         name: name.to_string(),
         data_type,
-        nullable: false,
+        nullable,
         is_internal: false,
     }
 }
