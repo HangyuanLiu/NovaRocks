@@ -31,6 +31,11 @@ const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 
+fn lifecycle_convergence_debug_enabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR").is_some()
+}
+
 #[derive(serde::Serialize)]
 struct LifecycleConvergenceDebugSnapshot {
     execution_id: String,
@@ -341,17 +346,21 @@ impl FrontendReportServerHandle {
                             "/{}/*rest",
                             <NovaRocksGrpcServer<FrontendReportService> as NamedService>::NAME
                         );
-                        let debug_reader = Arc::clone(&convergence_reader);
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
                             .route("/metrics", get(novarocks::service::handle_metrics))
-                            .route(
+                            .fallback(grpc_unimplemented_fallback);
+                        let app = if lifecycle_convergence_debug_enabled() {
+                            let debug_reader = Arc::clone(&convergence_reader);
+                            app.route(
                                 LIFECYCLE_CONVERGENCE_DEBUG_PATH,
                                 get(move || {
                                     latest_lifecycle_convergence_snapshot(Arc::clone(&debug_reader))
                                 }),
                             )
-                            .fallback(grpc_unimplemented_fallback);
+                        } else {
+                            app
+                        };
                         let mut shutdown_rx = shutdown_rx;
                         axum::serve(listener, app)
                             .with_graceful_shutdown(async move {
