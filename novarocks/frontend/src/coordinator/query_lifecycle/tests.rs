@@ -61,7 +61,9 @@ use super::{
     QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
     QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
-use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQueryRegistry};
+use crate::coordinator::query_registry::{
+    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceErrorSource,
+};
 
 fn terminal_outcome(
     snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
@@ -739,6 +741,12 @@ fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input(
             if attestation.reason()
                 == NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted
     ));
+    assert_eq!(
+        ActiveQueryAttemptControl::convergence_snapshot(control.as_ref())
+            .expect("stored terminal outcome retains convergence evidence")
+            .error_source,
+        Some(QueryLifecycleConvergenceErrorSource::BackendAttestation)
+    );
 }
 
 #[test]

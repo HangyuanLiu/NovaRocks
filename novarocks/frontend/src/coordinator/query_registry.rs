@@ -29,6 +29,13 @@ use novarocks_types::UniqueId;
 
 type QueryKey = (i64, i64);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryLifecycleConvergenceErrorSource {
+    BackendAttestation,
+    FrontendLiveness,
+    NoOutcome,
+}
+
 /// Immutable, query-scoped terminal convergence evidence retained alongside
 /// the unary terminal ingress.  It is intentionally produced by the attempt
 /// control that owns the control streams, never reconstructed from process
@@ -36,6 +43,7 @@ type QueryKey = (i64, i64);
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct QueryLifecycleConvergenceSnapshot {
     pub(crate) execution_id: QueryExecutionId,
+    pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
     pub(crate) primary_error: Option<String>,
     pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
 }
@@ -792,6 +800,7 @@ mod tests {
         fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
             Some(QueryLifecycleConvergenceSnapshot {
                 execution_id: self.execution_id,
+                error_source: None,
                 primary_error: Some("stable test failure".to_string()),
                 participant_outcomes: Vec::new(),
             })

@@ -23,7 +23,10 @@ use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 
-use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+use crate::coordinator::{
+    QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
+    QueryLifecycleConvergenceSnapshot,
+};
 
 use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 
@@ -82,29 +85,14 @@ fn lifecycle_convergence_debug_snapshot(
         }
         })
         .collect::<Vec<_>>();
-    let error_source = if participant_outcomes.iter().any(|outcome| {
-        matches!(
-            outcome,
-            LifecycleParticipantOutcomeDebug::Attestation { .. }
-        )
-    }) {
-        Some("backend-attestation")
-    } else if snapshot
-        .primary_error
-        .as_deref()
-        .is_some_and(|error| error.contains("query lifecycle NoOutcome"))
-    {
-        participant_outcomes.push(LifecycleParticipantOutcomeDebug::NoOutcome);
-        Some("no-outcome")
-    } else if snapshot.primary_error.as_deref().is_some_and(|error| {
-        error.contains("heartbeat")
-            || error.contains("coordinator")
-            || error.contains("control stream")
-    }) {
-        Some("frontend-liveness")
-    } else {
-        None
-    };
+    let error_source = snapshot.error_source.map(|source| match source {
+        QueryLifecycleConvergenceErrorSource::BackendAttestation => "backend-attestation",
+        QueryLifecycleConvergenceErrorSource::FrontendLiveness => "frontend-liveness",
+        QueryLifecycleConvergenceErrorSource::NoOutcome => {
+            participant_outcomes.push(LifecycleParticipantOutcomeDebug::NoOutcome);
+            "no-outcome"
+        }
+    });
     LifecycleConvergenceDebugSnapshot {
         execution_id: format!(
             "{}:{}:{}",

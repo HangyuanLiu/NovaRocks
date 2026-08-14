@@ -43,7 +43,8 @@ use super::{
 };
 use crate::coordinator::query_registry::ActiveQueryAttemptBinding;
 use crate::coordinator::query_registry::{
-    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceSnapshot,
+    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceErrorSource,
+    QueryLifecycleConvergenceSnapshot,
 };
 
 const ACTIVE: u8 = 0;
@@ -308,6 +309,7 @@ pub(super) struct AttemptControl {
     // retention interval.
     retain_terminal_ingress: AtomicBool,
     primary_error: Mutex<Option<String>>,
+    convergence_error_source: Mutex<Option<QueryLifecycleConvergenceErrorSource>>,
     stop: (Mutex<bool>, Condvar),
     terminal: (Mutex<TerminalState>, Condvar),
     observations: Mutex<FragmentObservationState>,
@@ -337,6 +339,7 @@ impl AttemptControl {
             state: AtomicU8::new(ACTIVE),
             retain_terminal_ingress: AtomicBool::new(false),
             primary_error: Mutex::new(None),
+            convergence_error_source: Mutex::new(None),
             stop: (Mutex::new(false), Condvar::new()),
             terminal: (Mutex::new(TerminalState::default()), Condvar::new()),
             observations: Mutex::new(FragmentObservationState::default()),
@@ -586,6 +589,13 @@ impl AttemptControl {
             return Err(contract_violation(
                 "query terminal outcome execution id differs from active lifecycle attempt",
             ));
+        }
+        if matches!(outcome, ParticipantTerminalOutcome::NegativeAttestation(_)) {
+            *self
+                .convergence_error_source
+                .lock()
+                .expect("query lifecycle convergence source") =
+                Some(QueryLifecycleConvergenceErrorSource::BackendAttestation);
         }
         let backend_idx = self.terminal_outcome_backend_idx(&outcome)?;
         self.store_terminal_outcome_at(backend_idx, outcome)
@@ -1069,6 +1079,11 @@ impl AttemptControl {
     }
 
     fn no_outcome_error(&self) -> String {
+        *self
+            .convergence_error_source
+            .lock()
+            .expect("query lifecycle convergence source") =
+            Some(QueryLifecycleConvergenceErrorSource::NoOutcome);
         let admitted = self
             .admitted
             .lock()
@@ -1147,6 +1162,11 @@ impl AttemptControl {
     }
 
     fn supervisor_failed(&self, reason: String, kind: SupervisorFailureKind) {
+        *self
+            .convergence_error_source
+            .lock()
+            .expect("query lifecycle convergence source") =
+            Some(QueryLifecycleConvergenceErrorSource::FrontendLiveness);
         match kind {
             SupervisorFailureKind::HeartbeatTimeout => self.metrics.heartbeat_timeout(),
             SupervisorFailureKind::CoordinatorLost => self.metrics.coordinator_lost(),
@@ -1646,6 +1666,10 @@ impl ActiveQueryAttemptControl for AttemptControl {
         }
         Some(QueryLifecycleConvergenceSnapshot {
             execution_id: self.execution_id,
+            error_source: *self
+                .convergence_error_source
+                .lock()
+                .expect("query lifecycle convergence source"),
             primary_error: self
                 .primary_error
                 .lock()
