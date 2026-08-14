@@ -24,21 +24,19 @@
 //! against this store rather than acquiring a current connector generation.
 
 use std::collections::{BTreeMap, HashMap};
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use arrow::datatypes::SchemaRef;
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
     ConnectorWritePreparation,
 };
-use novarocks_sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
-use novarocks_sql::catalog::ResolvedAnalyzerTable;
-use novarocks_sql::planner::table::{
-    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
+use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTableBindingScopeId};
+use novarocks_sql::planning::catalog::{
+    self, MetadataTableKind as SqlMetadataTableKind, ResolvedAnalyzerTable,
 };
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -296,19 +294,9 @@ impl std::fmt::Debug for QueryScanMaterialization {
 }
 
 impl QueryTableBinding {
-    pub(crate) fn local(mut resolved: ResolvedAnalyzerTable, binding: SqlTableBindingId) -> Self {
-        let identity = &resolved.catalog.identity;
-        resolved.planner.source = ScanSource::Sql(SqlScanSource::new(
-            binding,
-            SqlTableIdentity {
-                catalog: identity.catalog.clone(),
-                namespace: identity.namespace.clone(),
-                table: identity.table.clone(),
-            },
-            SqlScanKind::ConnectorRead,
-        ));
+    pub(crate) fn local(resolved: ResolvedAnalyzerTable, binding: SqlTableBindingId) -> Self {
         Self {
-            resolved,
+            resolved: catalog::attach_binding_to_local_materialization(resolved, binding),
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Local,
             scan_materialization: None,
@@ -327,13 +315,7 @@ impl QueryTableBinding {
         &self,
         binding: SqlTableBindingId,
     ) -> Result<(), String> {
-        match &self.resolved.planner.source {
-            ScanSource::Sql(source) if source.binding == binding => Ok(()),
-            ScanSource::Sql(_) => Err(
-                "catalog materialization produced a SQL scan with a different request binding"
-                    .to_string(),
-            ),
-        }
+        catalog::validate_materialization_binding(&self.resolved, binding)
     }
 }
 
@@ -343,8 +325,7 @@ struct StoredBinding {
 
 /// Exact application authority paired with one compiler request.
 pub(crate) struct QueryTableBindingStore {
-    scope: SqlTableBindingScopeId,
-    next_ordinal: Mutex<u32>,
+    allocator: Mutex<SqlTableBindingAllocator>,
     entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
 }
@@ -361,8 +342,7 @@ impl QueryTableBindingStore {
         let scope = NonZeroU64::new(raw_scope)
             .ok_or_else(|| "SQL table binding scope space is exhausted".to_string())?;
         Ok(Self {
-            scope: SqlTableBindingScopeId::new(scope),
-            next_ordinal: Mutex::new(0),
+            allocator: Mutex::new(SqlTableBindingAllocator::try_new(scope)?),
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
         })
@@ -375,8 +355,10 @@ impl QueryTableBindingStore {
     #[cfg(test)]
     pub(crate) fn try_new_with_scope_for_test(scope: NonZeroU64) -> Self {
         Self {
-            scope: SqlTableBindingScopeId::new(scope),
-            next_ordinal: Mutex::new(0),
+            allocator: Mutex::new(
+                SqlTableBindingAllocator::try_new(scope)
+                    .expect("test binding scope must construct SQL allocator"),
+            ),
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
         }
@@ -395,7 +377,7 @@ impl QueryTableBindingStore {
         material.extend_from_slice(&self.scope().get().get().to_be_bytes());
         for (binding_id, binding) in self.captured_bindings() {
             material.extend_from_slice(&binding_id.ordinal().get().to_be_bytes());
-            let identity = binding.resolved.catalog.identity.fqn();
+            let identity = catalog::materialization_identity_facts(&binding.resolved).fqn();
             material.extend_from_slice(&(identity.len() as u64).to_be_bytes());
             material.extend_from_slice(identity.as_bytes());
             if let Some(pin) = &binding.statistics_pin {
@@ -418,7 +400,10 @@ impl QueryTableBindingStore {
     }
 
     pub(crate) fn scope(&self) -> SqlTableBindingScopeId {
-        self.scope
+        self.allocator
+            .lock()
+            .expect("query table binding allocator lock")
+            .scope()
     }
 
     /// Memoize both success and failure.  The supplied load closure executes
@@ -468,7 +453,7 @@ impl QueryTableBindingStore {
     }
 
     pub(crate) fn binding(&self, id: SqlTableBindingId) -> Result<Arc<QueryTableBinding>, String> {
-        if !id.belongs_to(self.scope) {
+        if !id.belongs_to(self.scope()) {
             return Err("SQL table binding token belongs to a different request".to_string());
         }
         self.by_id
@@ -568,9 +553,8 @@ impl QueryTableBindingStore {
             .captured_bindings()
             .into_iter()
             .filter(|(_, binding)| {
-                binding.resolved.catalog.identity.catalog == catalog
-                    && binding.resolved.catalog.identity.namespace == namespace
-                    && binding.resolved.catalog.identity.table == table
+                catalog::materialization_identity_facts(&binding.resolved)
+                    .matches(catalog, namespace, table)
                     && binding.write_target_admission.is_some()
             })
             .collect::<Vec<_>>();
@@ -580,8 +564,7 @@ impl QueryTableBindingStore {
             ));
         };
         let binding = &binding.1;
-        let ScanSource::Sql(source) = &binding.resolved.planner.source;
-        Ok(source.binding)
+        Ok(catalog::table_binding_id(&binding.resolved))
     }
 
     /// Return the unique Provider-signed preparation admitted for a terminal
@@ -597,9 +580,8 @@ impl QueryTableBindingStore {
             .captured_bindings()
             .into_iter()
             .filter(|(_, binding)| {
-                binding.resolved.catalog.identity.catalog == catalog
-                    && binding.resolved.catalog.identity.namespace == namespace
-                    && binding.resolved.catalog.identity.table == table
+                catalog::materialization_identity_facts(&binding.resolved)
+                    .matches(catalog, namespace, table)
                     && binding.write_target_admission.is_some()
             })
             .collect::<Vec<_>>();
@@ -637,10 +619,7 @@ impl QueryTableBindingStore {
             ));
         };
         match binding.write_target_admission.as_ref() {
-            Some(_) => {
-                let ScanSource::Sql(source) = &binding.resolved.planner.source;
-                Ok(source.binding)
-            }
+            Some(_) => Ok(catalog::table_binding_id(&binding.resolved)),
             _ => Err(format!(
                 "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"
             )),
@@ -696,55 +675,45 @@ impl QueryTableBindingStore {
     }
 
     fn allocate_id(&self) -> Result<SqlTableBindingId, String> {
-        let mut next = self
-            .next_ordinal
+        self.allocator
             .lock()
-            .expect("query table binding ordinal lock");
-        *next = next
-            .checked_add(1)
-            .ok_or_else(|| "SQL table binding ordinal space is exhausted".to_string())?;
-        let ordinal = NonZeroU32::new(*next)
-            .ok_or_else(|| "SQL table binding ordinal space is exhausted".to_string())?;
-        Ok(SqlTableBindingId::new(self.scope, ordinal))
+            .expect("query table binding allocator lock")
+            .allocate()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore};
 
     fn local_binding() -> QueryTableBinding {
-        let binding = novarocks_sql::binding::SqlTableBindingId::new(
-            novarocks_sql::binding::SqlTableBindingScopeId::new(
-                std::num::NonZeroU64::new(1).expect("scope"),
-            ),
-            std::num::NonZeroU32::new(1).expect("ordinal"),
-        );
-        QueryTableBinding::local(
-            novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
-                Some("default_catalog"),
-                "db",
-                novarocks_sql::planner::table::TableDef {
-                    name: "orders".to_string(),
-                    columns: vec![],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: novarocks_sql::planner::table::ScanSource::Sql(
-                        novarocks_sql::planner::table::SqlScanSource::new(
-                            binding,
-                            novarocks_sql::planner::table::SqlTableIdentity {
-                                catalog: "default_catalog".to_string(),
-                                namespace: "db".to_string(),
-                                table: "orders".to_string(),
-                            },
-                            novarocks_sql::planner::table::SqlScanKind::ConnectorRead,
-                        ),
-                    ),
-                },
-            ),
-            binding,
+        let mut allocator = novarocks_sql::binding::SqlTableBindingAllocator::try_new(
+            NonZeroU64::new(1).expect("test scope"),
         )
+        .expect("test allocator");
+        local_binding_for(allocator.allocate().expect("test binding"))
+    }
+
+    fn local_binding_for(binding: novarocks_sql::binding::SqlTableBindingId) -> QueryTableBinding {
+        let resolved = novarocks_sql::planning::catalog::materialize_connector_read_table(
+            novarocks_sql::planning::catalog::ConnectorReadTableFacts {
+                catalog: "default_catalog".to_string(),
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                columns: Vec::new(),
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                schema: std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                binding,
+                selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+            },
+        )
+        .expect("test catalog facts materialize")
+        .into_resolved_table();
+        QueryTableBinding::local(resolved, binding)
     }
 
     #[test]
@@ -781,10 +750,12 @@ mod tests {
     fn sqlx2_binding_store_rejects_cross_request_tokens_before_submission() {
         let first = QueryTableBindingStore::try_new().expect("first store");
         let second = QueryTableBindingStore::try_new().expect("second store");
-        let token = novarocks_sql::binding::SqlTableBindingId::new(
-            first.scope(),
-            std::num::NonZeroU32::new(1).expect("nonzero"),
-        );
+        let token = first
+            .resolve_or_insert_with_id(
+                QueryTableBindingKey::strict_base("ice", "db", "orders"),
+                |binding| Ok(local_binding_for(binding)),
+            )
+            .expect("first request binding");
 
         assert!(second.binding(token).is_err());
     }
@@ -808,13 +779,11 @@ mod tests {
         assert_eq!(first_token, repeated_token);
         assert_ne!(first_token, second_token);
         assert_eq!(
-            first
-                .binding(first_token)
-                .expect("exact binding")
-                .resolved
-                .planner
-                .name,
-            "orders"
+            novarocks_sql::planning::catalog::materialization_identity_facts(
+                &first.binding(first_token).expect("exact binding").resolved,
+            )
+            .fqn(),
+            "default_catalog.db.orders"
         );
         assert!(second.binding(first_token).is_err());
     }
@@ -847,7 +816,7 @@ mod tests {
         let token = store
             .resolve_or_insert_with_id(key, |id| {
                 *observed.lock().expect("observed token lock") = Some(id);
-                Ok(local_binding())
+                Ok(local_binding_for(id))
             })
             .expect("binding token");
 
@@ -856,7 +825,10 @@ mod tests {
             Some(token),
             "the SQL projection must carry the exact token published by admission"
         );
-        assert!(store.binding(token).is_ok());
+        let binding = store.binding(token).expect("binding stored");
+        binding
+            .validate_sql_scan_binding(token)
+            .expect("materialization carries the published token");
     }
 
     #[test]
@@ -872,7 +844,7 @@ mod tests {
             "ice",
             "db",
             "orders",
-            novarocks_sql::planner::table::SqlMetadataTableKind::Snapshots,
+            novarocks_sql::planning::catalog::MetadataTableKind::Snapshots,
         );
         let metadata = store
             .resolve_or_insert(metadata_key.clone(), || Ok(local_binding()))

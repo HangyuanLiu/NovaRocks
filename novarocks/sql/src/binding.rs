@@ -63,27 +63,78 @@ impl SqlTableBindingId {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(ordinal: u32) -> Self {
-        Self::new(
-            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("test binding scope is nonzero")),
-            NonZeroU32::new(ordinal).expect("test binding ordinal is nonzero"),
+        let ordinal = NonZeroU32::new(ordinal).expect("test binding ordinal is nonzero");
+        let mut allocator = SqlTableBindingAllocator::try_new(
+            NonZeroU64::new(1).expect("test binding scope is nonzero"),
         )
+        .expect("test binding allocator must be valid");
+        for _ in 1..ordinal.get() {
+            allocator
+                .allocate()
+                .expect("test binding ordinal must be valid");
+        }
+        allocator
+            .allocate()
+            .expect("test binding ordinal must be valid")
+    }
+}
+
+/// Opaque request-local token allocator.
+///
+/// The application owns the globally unique nonzero seed. SQL owns conversion
+/// of that seed into binding tokens, so consumers cannot construct a token
+/// from a scope and ordinal independently. Tokens retain no provider, plan,
+/// wire, or lifecycle data.
+pub struct SqlTableBindingAllocator {
+    scope: SqlTableBindingScopeId,
+    next_ordinal: u32,
+}
+
+impl SqlTableBindingAllocator {
+    /// Start one request-local allocator from an application-allocated unique
+    /// nonzero seed. A duplicate seed is rejected later by the application
+    /// binding store's scope check; SQL never serializes this identity.
+    pub fn try_new(scope_seed: NonZeroU64) -> Result<Self, String> {
+        Ok(Self {
+            scope: SqlTableBindingScopeId::new(scope_seed),
+            next_ordinal: 0,
+        })
+    }
+
+    pub fn scope(&self) -> SqlTableBindingScopeId {
+        self.scope
+    }
+
+    /// Mint exactly one next token in this request-local scope.
+    pub fn allocate(&mut self) -> Result<SqlTableBindingId, String> {
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or_else(|| "SQL table binding ordinal space is exhausted".to_string())?;
+        let ordinal = NonZeroU32::new(self.next_ordinal)
+            .ok_or_else(|| "SQL table binding ordinal space is exhausted".to_string())?;
+        Ok(SqlTableBindingId::new(self.scope, ordinal))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU32, NonZeroU64};
+    use std::num::NonZeroU64;
 
-    use super::{SqlTableBindingId, SqlTableBindingScopeId};
+    use super::SqlTableBindingAllocator;
 
     #[test]
     fn sqlx2_binding_token_is_scoped_and_nonzero() {
-        let first_scope = SqlTableBindingScopeId::new(NonZeroU64::new(17).unwrap());
-        let second_scope = SqlTableBindingScopeId::new(NonZeroU64::new(18).unwrap());
-        let binding = SqlTableBindingId::new(first_scope, NonZeroU32::new(1).unwrap());
+        let mut first = SqlTableBindingAllocator::try_new(NonZeroU64::new(17).unwrap())
+            .expect("first allocator");
+        let second = SqlTableBindingAllocator::try_new(NonZeroU64::new(18).unwrap())
+            .expect("second allocator");
+        let first_scope = first.scope();
+        let second_scope = second.scope();
+        let binding = first.allocate().expect("first binding");
 
         assert_eq!(binding.scope(), first_scope);
-        assert_eq!(binding.ordinal(), NonZeroU32::new(1).unwrap());
+        assert_eq!(binding.ordinal().get(), 1);
         assert!(binding.belongs_to(first_scope));
         assert!(!binding.belongs_to(second_scope));
         assert_eq!(first_scope.get(), NonZeroU64::new(17).unwrap());

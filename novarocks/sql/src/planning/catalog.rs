@@ -64,6 +64,28 @@ impl ConnectorReadTableMaterialization {
     }
 }
 
+/// Copied identity facts from an opaque SQL materialization.
+///
+/// This is deliberately not a planner table or scan source. Consumers can
+/// compare a candidate identity or form a stable digest, but cannot recreate
+/// the SQL graph that carried it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlCatalogIdentityFacts {
+    catalog: String,
+    namespace: String,
+    table: String,
+}
+
+impl SqlCatalogIdentityFacts {
+    pub fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
+    }
+
+    pub fn matches(&self, catalog: &str, namespace: &str, table: &str) -> bool {
+        self.catalog == catalog && self.namespace == namespace && self.table == table
+    }
+}
+
 /// Materialize immutable connector metadata facts as one SQL analyzer table.
 /// The request-local binding is the only route from this table to later scan
 /// preparation, so this constructor cannot recreate or replace an admission.
@@ -122,6 +144,59 @@ pub fn materialize_connector_read_table(
         ),
         frozen_snapshot_id,
     })
+}
+
+/// Attach one application-reserved token to a local SQL relation.
+///
+/// Local catalog relations have no connector authority, but their scan source
+/// must still carry the exact request-local token selected by the application
+/// binding store. The planner table and scan source remain SQL-private.
+pub fn attach_binding_to_local_materialization(
+    mut materialization: crate::catalog::ResolvedAnalyzerTable,
+    binding: crate::binding::SqlTableBindingId,
+) -> crate::catalog::ResolvedAnalyzerTable {
+    let identity = &materialization.catalog.identity;
+    materialization.planner.source =
+        crate::planner::table::ScanSource::Sql(crate::planner::table::SqlScanSource::new(
+            binding,
+            crate::planner::table::SqlTableIdentity {
+                catalog: identity.catalog.clone(),
+                namespace: identity.namespace.clone(),
+                table: identity.table.clone(),
+            },
+            crate::planner::table::SqlScanKind::ConnectorRead,
+        ));
+    materialization
+}
+
+/// Verify that an opaque materialization carries the application-reserved
+/// binding token. Any mismatch is a fail-closed admission error.
+pub fn validate_materialization_binding(
+    materialization: &crate::catalog::ResolvedAnalyzerTable,
+    binding: crate::binding::SqlTableBindingId,
+) -> Result<(), String> {
+    if table_binding_id(materialization) == binding {
+        Ok(())
+    } else {
+        Err(
+            "catalog materialization produced a SQL scan with a different request binding"
+                .to_string(),
+        )
+    }
+}
+
+/// Copy only catalog identity facts needed by application-side validation and
+/// stable digest construction. The analyzer relation and SQL scan graph stay
+/// inaccessible outside SQL.
+pub fn materialization_identity_facts(
+    materialization: &crate::catalog::ResolvedAnalyzerTable,
+) -> SqlCatalogIdentityFacts {
+    let identity = &materialization.catalog.identity;
+    SqlCatalogIdentityFacts {
+        catalog: identity.catalog.clone(),
+        namespace: identity.namespace.clone(),
+        table: identity.table.clone(),
+    }
 }
 
 /// Build the SQL-owned analyzer relation for an already admitted metadata
@@ -301,7 +376,35 @@ pub fn analyze_view_query(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+
     use super::*;
+
+    fn test_binding_allocator() -> crate::binding::SqlTableBindingAllocator {
+        crate::binding::SqlTableBindingAllocator::try_new(
+            NonZeroU64::new(17).expect("test scope is nonzero"),
+        )
+        .expect("test allocator")
+    }
+
+    fn connector_read_materialization(
+        binding: crate::binding::SqlTableBindingId,
+    ) -> crate::catalog::ResolvedAnalyzerTable {
+        materialize_connector_read_table(ConnectorReadTableFacts {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "orders".to_string(),
+            columns: Vec::new(),
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            schema: Arc::new(arrow::datatypes::Schema::empty()),
+            binding,
+            selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+        })
+        .expect("materialize connector test facts")
+        .into_resolved_table()
+    }
 
     #[test]
     fn test_catalog_fixture_registers_only_catalog_visible_schema_facts() {
@@ -323,5 +426,27 @@ mod tests {
         )
         .expect("register sealed connector fixture");
         assert!(catalog.get("analytics", "orders").is_ok());
+    }
+
+    #[test]
+    fn sqlx4a_catalog_binding_facts_are_opaque_and_fail_closed() {
+        let mut allocator = test_binding_allocator();
+        let original = allocator.allocate().expect("original binding");
+        let replacement = allocator.allocate().expect("replacement binding");
+        let materialization = connector_read_materialization(original);
+
+        let identity = materialization_identity_facts(&materialization);
+        assert_eq!(identity.fqn(), "ice.analytics.orders");
+        assert!(identity.matches("ice", "analytics", "orders"));
+        assert!(!identity.matches("ice", "analytics", "customers"));
+        validate_materialization_binding(&materialization, original)
+            .expect("original binding validates");
+        assert!(validate_materialization_binding(&materialization, replacement).is_err());
+
+        let local = attach_binding_to_local_materialization(materialization, replacement);
+        validate_materialization_binding(&local, replacement)
+            .expect("local materialization carries the replacement token");
+        assert!(validate_materialization_binding(&local, original).is_err());
+        assert_eq!(materialization_identity_facts(&local), identity);
     }
 }
