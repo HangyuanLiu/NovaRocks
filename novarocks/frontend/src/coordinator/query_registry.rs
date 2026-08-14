@@ -23,6 +23,7 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
+use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
@@ -46,6 +47,7 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
     pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
     pub(crate) primary_error: Option<String>,
     pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
+    pub(crate) metrics: FrontendQueryLifecycleMetricsSnapshot,
 }
 
 /// Read-only diagnostic seam for the immutable terminal evidence retained by
@@ -803,6 +805,7 @@ mod tests {
                 error_source: None,
                 primary_error: Some("stable test failure".to_string()),
                 participant_outcomes: Vec::new(),
+                metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
             })
         }
     }

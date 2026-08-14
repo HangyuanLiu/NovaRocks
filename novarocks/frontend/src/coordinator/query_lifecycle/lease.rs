@@ -272,8 +272,7 @@ impl FrontendLifecycleMetrics {
         self.update(|snapshot| snapshot.terminal_finalize_failures += 1);
     }
 
-    #[cfg(test)]
-    pub fn snapshot(&self) -> FrontendQueryLifecycleMetricsSnapshot {
+    pub(super) fn snapshot(&self) -> FrontendQueryLifecycleMetricsSnapshot {
         *self.snapshot.lock().expect("frontend lifecycle metrics")
     }
 
@@ -1702,6 +1701,7 @@ impl ActiveQueryAttemptControl for AttemptControl {
                 .expect("query lifecycle primary error")
                 .clone(),
             participant_outcomes: outcomes,
+            metrics: self.metrics.snapshot(),
         })
     }
 }

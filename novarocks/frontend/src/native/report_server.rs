@@ -102,8 +102,52 @@ fn lifecycle_convergence_debug_snapshot(
         ),
         error_source,
         participant_outcomes,
-        metrics: BTreeMap::new(),
+        metrics: lifecycle_metric_map(snapshot.metrics),
     }
+}
+
+fn lifecycle_metric_map(
+    metrics: novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+) -> BTreeMap<String, i64> {
+    [
+        ("active_attempts", metrics.active_attempts as i64),
+        ("init_applied", metrics.init_applied as i64),
+        ("init_idempotent", metrics.init_idempotent as i64),
+        ("init_failed", metrics.init_failed as i64),
+        ("control_ready", metrics.control_ready as i64),
+        ("attach_failed", metrics.attach_failed as i64),
+        ("heartbeat_timeouts", metrics.heartbeat_timeouts as i64),
+        ("coordinator_lost", metrics.coordinator_lost as i64),
+        ("local_failures", metrics.local_failures as i64),
+        (
+            "backend_epoch_mismatches",
+            metrics.backend_epoch_mismatches as i64,
+        ),
+        ("cleanup_failures", metrics.cleanup_failures as i64),
+        (
+            "terminal_locally_drained",
+            metrics.terminal_locally_drained as i64,
+        ),
+        (
+            "terminal_snapshots_accepted",
+            metrics.terminal_snapshots_accepted as i64,
+        ),
+        (
+            "terminal_snapshots_idempotent",
+            metrics.terminal_snapshots_idempotent as i64,
+        ),
+        (
+            "terminal_snapshot_conflicts",
+            metrics.terminal_snapshot_conflicts as i64,
+        ),
+        (
+            "terminal_finalize_failures",
+            metrics.terminal_finalize_failures as i64,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
 }
 
 #[derive(Clone)]

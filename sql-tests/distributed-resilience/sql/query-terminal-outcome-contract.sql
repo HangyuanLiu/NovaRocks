@@ -104,6 +104,7 @@ SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
 -- @query_control_fragment_backend_limit=2
 -- @expect_error=query lifecycle terminal ACK failed
 -- @expect_lifecycle_error_source=frontend-liveness
+-- @expect_lifecycle_metric_delta=heartbeat_timeouts,1
 SELECT SUM(left_side.id)
 FROM ${case_db}.terminal_outcome_contract left_side
 JOIN ${case_db}.terminal_outcome_contract right_side
