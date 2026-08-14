@@ -50,6 +50,7 @@ pub(crate) enum ArtifactCodecError {
     InvalidHashContract,
     KindMismatch,
     SchemaMismatch,
+    InvalidLogicalVersion,
     VersionMismatch,
     HashContractMismatch,
     LengthOverflow,
@@ -422,7 +423,8 @@ fn parse_header(encoded: &[u8]) -> Result<ParsedHeader<'_>, ArtifactCodecError> 
     let schema_len = usize::from(reader.u16()?);
     let schema = RuntimeFilterMembershipSchema::from_canonical(reader.take(schema_len)?, digest)
         .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?;
-    let version = LogicalVersion::new(reader.u64()?);
+    let version = LogicalVersion::try_new(reader.u64()?)
+        .map_err(|_| ArtifactCodecError::InvalidLogicalVersion)?;
     let flags = reader.u8()?;
     if flags & !FLAG_CONTAINS_NULL != 0 {
         return Err(ArtifactCodecError::InvalidFlags);
@@ -943,6 +945,32 @@ mod tests {
             "4e52464c0001013e87cf7b4c695573789dcd308efb51da3696ddd9e900e417e9ec460463254f0a002b6e6f7661726f636b732e72756e74696d652d66696c7465722e61727469666163742d736368656d6101050100000000000000010000000000000000001905000000000000000200000000000000030000000000000009",
         );
         assert_eq!(backend, expected);
+    }
+
+    #[test]
+    fn nrfl_rejects_zero_logical_version() {
+        let schema = RuntimeFilterMembershipSchema::new(
+            &DataType::Int64,
+            RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .unwrap();
+        let domain = ValueDomainDelta::new(MembershipValues::int64([3]), false);
+        let mut bytes = encode_membership_leaf(&domain, &schema, LogicalVersion::FIRST).unwrap();
+        let version_offset = 4 + 2 + 1 + 32 + 2 + schema.canonical_bytes().len();
+        bytes[version_offset..version_offset + 8].fill(0);
+        assert!(matches!(
+            decode_leaf(
+                &bytes,
+                ArtifactDecodeExpectations {
+                    expected_kind: ArtifactKind::ValueSet,
+                    schema: &schema,
+                    expected_logical_version: LogicalVersion::FIRST,
+                    expected_hash_contract: None,
+                },
+                4096,
+            ),
+            Err(ArtifactCodecError::InvalidLogicalVersion)
+        ));
     }
 
     fn hex_bytes(hex: &str) -> Vec<u8> {
