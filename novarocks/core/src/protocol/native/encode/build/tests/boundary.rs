@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use novarocks_sql::plan_read::{BoundaryContract, BoundaryKind as PlannerBoundaryKind, ColumnId};
+use novarocks_sql::plan_read::{ColumnId, SqlBoundaryKindRead, boundary_contract_reads};
 use novarocks_sql::test_support::{
     NativeBuildFixture, NativeEncoderPlanFixture, NativeScanFixture, native_build_plan,
     native_encoder_plan, native_scan_plan,
@@ -38,20 +38,17 @@ use novarocks_sql::test_support::{
 /// per-occurrence `ExecutionColumnId`s, so matching them means they were
 /// copied, not re-derived.
 fn assert_reports_mirror_catalog(plan: &DistributedPlan) {
-    let contracts = plan.boundaries().contracts();
+    let contracts = boundary_contract_reads(plan);
     let reports = project_boundary_reports(plan);
     assert_eq!(
         reports.len(),
         contracts.len(),
         "exactly one report per sealed boundary contract"
     );
-    for (report, contract) in reports.iter().zip(contracts) {
+    for (report, contract) in reports.iter().zip(&contracts) {
         assert_eq!(report.fragment_id, Some(contract.fragment_id as i32));
         assert_eq!(report.node_id, contract.node_id);
-        assert_eq!(
-            report.boundary_kind,
-            BoundaryKind::from_planner(contract.kind)
-        );
+        assert_eq!(report.boundary_kind, BoundaryKind::from_sql(contract.kind));
         assert_eq!(
             report.columns.len(),
             contract.columns.len(),
@@ -199,11 +196,10 @@ fn boundary_schema_columns_carry_planner_provenance() {
 
     // Anchor the provenance to the concrete planner contract it projects, so
     // the pin fails if codegen ever re-derives instead of copying.
-    let contract: &BoundaryContract = plan
-        .boundaries()
-        .contracts()
+    let contracts = boundary_contract_reads(&plan);
+    let contract = contracts
         .iter()
-        .find(|contract| contract.kind == PlannerBoundaryKind::ResultOutput)
+        .find(|contract| contract.kind == SqlBoundaryKindRead::ResultOutput)
         .expect("cte plan has a result-output contract");
     assert_eq!(contract.columns.len(), result_root.columns.len());
     for (projected, source) in result_root.columns.iter().zip(&contract.columns) {

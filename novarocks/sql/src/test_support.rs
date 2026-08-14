@@ -312,6 +312,28 @@ pub fn native_scan_fixture_binding(plan: &DistributedPlan) -> Option<NativeScanF
     })
 }
 
+/// Return the analyzer table carrier from a sealed scan fixture. The fixture
+/// keeps the planner table payload internal while Core receives the same opaque
+/// resolved-table value it uses in ordinary prepared bindings.
+pub fn native_scan_fixture_resolved_table(
+    plan: &DistributedPlan,
+    catalog: Option<&str>,
+    database: &str,
+) -> Option<crate::catalog::ResolvedAnalyzerTable> {
+    plan.fragments()
+        .iter()
+        .find_map(|fragment| match &fragment.root.payload {
+            DistributedNodeKind::Scan(scan) => {
+                Some(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                    catalog,
+                    database,
+                    scan.table.clone(),
+                ))
+            }
+            _ => None,
+        })
+}
+
 /// Build a sealed topology fixture without exposing physical-plan or draft APIs.
 pub fn native_build_plan(fixture: NativeBuildFixture) -> Result<DistributedPlan, String> {
     match fixture {

@@ -20,11 +20,12 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use bytes::Bytes;
+use novarocks_protocol::plan as wire_plan;
 use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn};
 use novarocks_sql::test_support::{NativeEncoderPlanFixture, native_encoder_plan};
 use prost::Message;
 
-use super::super::plan;
+use super::super::plan::encode_distributed_plan;
 use crate::protocol::native::type_mapping::decode_type;
 use crate::query_execution::preparation::scan::ScanExecutionBindings;
 
@@ -153,19 +154,20 @@ fn prepared_connector_scan_bindings(
     bindings
 }
 
-fn encode_stream_fixture(fixture: NativeEncoderPlanFixture) -> plan::DistributedPlan {
+fn encode_stream_fixture(fixture: NativeEncoderPlanFixture) -> wire_plan::DistributedPlan {
     let plan = native_encoder_plan(fixture).expect("sealed stream-edge fixture");
-    plan::encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode distributed plan")
+    encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode distributed plan")
 }
 
-fn encoded_exchange(encoded: &plan::DistributedPlan) -> &plan::ExchangeNode {
+fn encoded_exchange(encoded: &wire_plan::DistributedPlan) -> &wire_plan::ExchangeNode {
     let target_fragment = encoded
         .fragments
         .iter()
         .find(|fragment| fragment.fragment_id == 1)
         .expect("target fragment");
     let root = target_fragment.root.as_ref().expect("target root");
-    let Some(plan::distributed_node::Payload::Exchange(exchange)) = root.payload.as_ref() else {
+    let Some(wire_plan::distributed_node::Payload::Exchange(exchange)) = root.payload.as_ref()
+    else {
         panic!("expected exchange receiver payload");
     };
     exchange
@@ -175,8 +177,8 @@ fn encoded_exchange(encoded: &plan::DistributedPlan) -> &plan::ExchangeNode {
 fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange() {
     let plan = native_encoder_plan(NativeEncoderPlanFixture::HashExchange)
         .expect("native hash exchange fixture must seal");
-    let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
-        .expect("encode distributed plan");
+    let encoded =
+        encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode distributed plan");
     let decoded =
         novarocks_protocol::plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice())
             .expect("decode proto message");
@@ -205,8 +207,7 @@ fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange(
         .find(|fragment| fragment.fragment_id == 1)
         .expect("root fragment");
     let root = root_fragment.root.as_ref().expect("root node");
-    let Some(novarocks_protocol::plan::distributed_node::Payload::Exchange(exchange)) =
-        root.payload.as_ref()
+    let Some(wire_plan::distributed_node::Payload::Exchange(exchange)) = root.payload.as_ref()
     else {
         panic!("expected exchange receiver payload");
     };
@@ -232,7 +233,7 @@ fn stream_edge_projects_pruned_scan_columns_by_column_id() {
         .expect("sealed pruned scan fixture");
     let scan_bindings =
         prepared_connector_scan_bindings(0, 11, &all_scan_columns, &["s2", "array1"]);
-    let encoded = plan::encode_distributed_plan(&plan, &scan_bindings).expect("encode plan");
+    let encoded = encode_distributed_plan(&plan, &scan_bindings).expect("encode plan");
 
     let patched = encoded_exchange(&encoded)
         .output_columns

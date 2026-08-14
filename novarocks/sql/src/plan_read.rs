@@ -658,34 +658,7 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
                     .table
                     .iceberg_row_lineage_metadata_columns
                     .clone(),
-                source: match &node.table.source {
-                    crate::planner::table::ScanSource::Sql(source) => match &source.kind {
-                        crate::planner::table::SqlScanKind::ConnectorRead => {
-                            SqlScanSourceRead::ConnectorRead
-                        }
-                        crate::planner::table::SqlScanKind::Data { .. } => SqlScanSourceRead::Data,
-                        crate::planner::table::SqlScanKind::FrozenInputSet { .. } => {
-                            SqlScanSourceRead::FrozenInputSet
-                        }
-                        crate::planner::table::SqlScanKind::Metadata { .. } => {
-                            SqlScanSourceRead::Metadata
-                        }
-                        crate::planner::table::SqlScanKind::Delta {
-                            from_snapshot_id,
-                            to_snapshot_id,
-                            ..
-                        } => SqlScanSourceRead::Delta {
-                            from_snapshot_id: *from_snapshot_id,
-                            to_snapshot_id: *to_snapshot_id,
-                        },
-                        crate::planner::table::SqlScanKind::MvTargetState { .. } => {
-                            SqlScanSourceRead::MvTargetState
-                        }
-                        crate::planner::table::SqlScanKind::MvTargetLocator { .. } => {
-                            SqlScanSourceRead::MvTargetLocator
-                        }
-                    },
-                },
+                source: sql_scan_source_read(&node.table.source),
             },
             alias: node.alias.clone(),
             columns: node.columns.clone(),
@@ -879,10 +852,112 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
     }
 }
 
+fn sql_scan_source_read(source: &crate::planner::table::ScanSource) -> SqlScanSourceRead {
+    match source {
+        crate::planner::table::ScanSource::Sql(source) => match &source.kind {
+            crate::planner::table::SqlScanKind::ConnectorRead => SqlScanSourceRead::ConnectorRead,
+            crate::planner::table::SqlScanKind::Data { .. } => SqlScanSourceRead::Data,
+            crate::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+                SqlScanSourceRead::FrozenInputSet
+            }
+            crate::planner::table::SqlScanKind::Metadata { .. } => SqlScanSourceRead::Metadata,
+            crate::planner::table::SqlScanKind::Delta {
+                from_snapshot_id,
+                to_snapshot_id,
+                ..
+            } => SqlScanSourceRead::Delta {
+                from_snapshot_id: *from_snapshot_id,
+                to_snapshot_id: *to_snapshot_id,
+            },
+            crate::planner::table::SqlScanKind::MvTargetState { .. } => {
+                SqlScanSourceRead::MvTargetState
+            }
+            crate::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+                SqlScanSourceRead::MvTargetLocator
+            }
+        },
+    }
+}
+
+/// Immutable boundary facts projected from the sealed plan catalog.
+///
+/// Boundary derivation and occurrence allocation remain SQL-owned. Consumers
+/// may inspect the frozen result but cannot rebuild or mutate its catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlBoundaryContractRead {
+    pub fragment_id: FragmentId,
+    pub node_id: Option<i32>,
+    pub kind: SqlBoundaryKindRead,
+    pub columns: Vec<SqlBoundaryColumnRead>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlBoundaryKindRead {
+    ResultOutput,
+    ExchangeSend,
+    ExchangeReceive,
+    IcebergWriteInput,
+    ChangeStreamRouterInput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlBoundaryColumnRead {
+    pub execution_column_id: ExecutionColumnId,
+    pub column_id: ColumnId,
+    pub output_ordinal: usize,
+    pub name: String,
+    pub data_type: arrow::datatypes::DataType,
+    pub nullable: bool,
+}
+
+pub fn boundary_contract_reads(plan: &DistributedPlan) -> Vec<SqlBoundaryContractRead> {
+    plan.boundaries()
+        .contracts()
+        .iter()
+        .map(|contract| SqlBoundaryContractRead {
+            fragment_id: contract.fragment_id,
+            node_id: contract.node_id,
+            kind: match contract.kind {
+                crate::planner::distributed::BoundaryKind::ResultOutput => {
+                    SqlBoundaryKindRead::ResultOutput
+                }
+                crate::planner::distributed::BoundaryKind::ExchangeSend => {
+                    SqlBoundaryKindRead::ExchangeSend
+                }
+                crate::planner::distributed::BoundaryKind::ExchangeReceive => {
+                    SqlBoundaryKindRead::ExchangeReceive
+                }
+                crate::planner::distributed::BoundaryKind::IcebergWriteInput => {
+                    SqlBoundaryKindRead::IcebergWriteInput
+                }
+                crate::planner::distributed::BoundaryKind::ChangeStreamRouterInput => {
+                    SqlBoundaryKindRead::ChangeStreamRouterInput
+                }
+            },
+            columns: contract
+                .columns
+                .iter()
+                .map(|column| SqlBoundaryColumnRead {
+                    execution_column_id: column.execution_column_id,
+                    column_id: column.column_id,
+                    output_ordinal: column.output_ordinal,
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SqlExpressionReadKind, expression_read};
-    use crate::test_support::native_lambda_expression;
+    use super::{
+        SqlBoundaryKindRead, SqlExpressionReadKind, boundary_contract_reads, expression_read,
+    };
+    use crate::test_support::{
+        NativeEncoderPlanFixture, native_encoder_plan, native_lambda_expression,
+    };
 
     #[test]
     fn expression_read_projects_lambda_parameters_without_exposing_analyzer_payload() {
@@ -894,6 +969,26 @@ mod tests {
         assert_eq!(params[0].name, "x");
         assert_eq!(params[0].slot_id, 3);
         assert!(params[0].nullable);
+    }
+
+    #[test]
+    fn boundary_contract_reads_preserve_sealed_exchange_occurrences() {
+        let plan = native_encoder_plan(NativeEncoderPlanFixture::HashExchange)
+            .expect("sealed exchange fixture");
+        let contracts = boundary_contract_reads(&plan);
+        let send = contracts
+            .iter()
+            .find(|contract| contract.kind == SqlBoundaryKindRead::ExchangeSend)
+            .expect("exchange send boundary");
+        let receive = contracts
+            .iter()
+            .find(|contract| contract.kind == SqlBoundaryKindRead::ExchangeReceive)
+            .expect("exchange receive boundary");
+        assert_eq!(send.columns[0].column_id, receive.columns[0].column_id);
+        assert_ne!(
+            send.columns[0].execution_column_id,
+            receive.columns[0].execution_column_id
+        );
     }
 }
 

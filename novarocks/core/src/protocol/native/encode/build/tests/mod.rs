@@ -26,9 +26,10 @@ use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorReadSelector, ConnectorTableIdentity,
     ConnectorTableRequest, ConnectorTableResolution,
 };
-use novarocks_sql::catalog::ResolvedAnalyzerTable;
-use novarocks_sql::plan_read::{DistributedNodeKind, DistributedPlan};
-use novarocks_sql::test_support::native_scan_fixture_binding;
+use novarocks_sql::plan_read::DistributedPlan;
+use novarocks_sql::test_support::{
+    native_scan_fixture_binding, native_scan_fixture_resolved_table,
+};
 
 /// Build-only tests model application admission explicitly: the SQL fixture
 /// supplies a copied identity snapshot, and Core creates the request-local
@@ -41,14 +42,9 @@ pub(super) fn fixture_query_table_bindings(
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
 
-    let scan = plan
-        .fragments()
-        .iter()
-        .find_map(|fragment| match &fragment.root.payload {
-            DistributedNodeKind::Scan(scan) => Some(scan),
-            _ => None,
-        })?;
     let fixture = native_scan_fixture_binding(plan)?;
+    let resolved =
+        native_scan_fixture_resolved_table(plan, Some(&fixture.catalog), &fixture.namespace)?;
     let store = QueryTableBindingStore::try_new_with_scope_for_test(
         NonZeroU64::new(1).expect("fixture scope"),
     );
@@ -63,8 +59,6 @@ pub(super) fn fixture_query_table_bindings(
         // they can assert resolver failure before generic read planning.
         return Some(store);
     }
-    let planner = scan.table.clone();
-
     store
         .resolve_or_insert_with_id(
             QueryTableBindingKey::strict_base(
@@ -91,11 +85,7 @@ pub(super) fn fixture_query_table_bindings(
                     })
                     .map_err(|error| error.to_string())?;
                 Ok(QueryTableBinding {
-                    resolved: ResolvedAnalyzerTable::from_planner(
-                        Some(&fixture.catalog),
-                        &fixture.namespace,
-                        planner.clone(),
-                    ),
+                    resolved: resolved.clone(),
                     statistics_pin: None,
                     admission:
                         crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact(
