@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use common::coordination_fixture::JournalInspect;
-use novarocks::common::app_config::ClusterRole;
 use novarocks::query_execution::backend::BackendTopologySnapshot;
 use novarocks::query_execution::cancellation::QueryCancellationSource;
 use novarocks::query_execution::dml::insert::{
@@ -56,6 +55,7 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata, ConnectorTableRequest, ConnectorWriteReceipt, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
+use novarocks_types::ClusterRole;
 use uuid::Uuid;
 
 mod common;

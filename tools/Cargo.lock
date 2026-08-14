@@ -2901,7 +2901,6 @@ name = "novarocks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apache-avro",
  "arrow",
  "arrow-buffer",
  "arrow-data",
@@ -2920,9 +2919,6 @@ dependencies = [
  "futures",
  "hashbrown 0.14.5",
  "hex",
- "iceberg",
- "iceberg-catalog-hms",
- "iceberg-catalog-rest",
  "libc",
  "libm",
  "md-5",
@@ -2939,7 +2935,6 @@ dependencies = [
  "num-traits",
  "num_cpus",
  "once_cell",
- "opendal",
  "opensrv-mysql",
  "openssl",
  "orc-rust",
@@ -2948,12 +2943,10 @@ dependencies = [
  "prometheus",
  "prost 0.13.5",
  "prost-reflect",
- "protoc-bin-vendored",
  "rand 0.8.5",
  "regex",
  "reqwest",
  "roaring 0.10.12",
- "rusqlite",
  "ryu",
  "serde",
  "serde_json",
@@ -2963,16 +2956,38 @@ dependencies = [
  "tdigest",
  "threadpool",
  "tokio",
- "tokio-stream",
  "toml",
- "tonic",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "twox-hash 2.1.2",
  "typetag",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-backend"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-buffer",
+ "async-trait",
+ "axum",
+ "bytes",
+ "novarocks",
+ "novarocks-execution",
+ "novarocks-protocol",
+ "novarocks-spi",
+ "novarocks-types",
+ "parquet",
+ "prost 0.13.5",
+ "protoc-bin-vendored",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
@@ -2983,11 +2998,138 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-iceberg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "datasketches",
+ "iceberg",
+ "iceberg-catalog-hms",
+ "iceberg-catalog-rest",
+ "novarocks-catalog",
+ "novarocks-fs",
+ "novarocks-spi",
+ "novarocks-types",
+ "opendal",
+ "ordered-float 4.6.0",
+ "parquet",
+ "rand 0.8.5",
+ "roaring 0.10.12",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "typetag",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-connector-starrocks"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "crc32c",
+ "lz4_flex 0.11.5",
+ "novarocks-fs",
+ "novarocks-spi",
+ "parquet",
+ "prost 0.13.5",
+ "protoc-bin-vendored",
+ "reqwest",
+ "roaring 0.10.12",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-execution"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-buffer",
+ "arrow-data",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "crc32c",
+ "datasketches",
+ "hashbrown 0.14.5",
+ "hex",
+ "libm",
+ "md-5",
+ "novarocks-spi",
  "novarocks-types",
+ "num-traits",
+ "once_cell",
+ "openssl",
+ "parquet",
+ "prometheus",
+ "rand 0.8.5",
+ "regex",
+ "ryu",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sm3",
+ "threadpool",
+ "tokio",
+ "tracing",
+ "twox-hash 2.1.2",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-frontend"
+version = "0.1.0"
+dependencies = [
+ "apache-avro",
+ "arrow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "novarocks",
+ "novarocks-catalog",
+ "novarocks-execution",
+ "novarocks-fs",
+ "novarocks-protocol",
+ "novarocks-spi",
+ "novarocks-state-store",
+ "novarocks-types",
+ "prost 0.13.5",
+ "protoc-bin-vendored",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlparser",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3003,6 +3145,7 @@ dependencies = [
  "parquet",
  "reqwest",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -3013,6 +3156,29 @@ dependencies = [
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
+]
+
+[[package]]
+name = "novarocks-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "novarocks",
+ "novarocks-backend",
+ "novarocks-connector-iceberg",
+ "novarocks-connector-starrocks",
+ "novarocks-execution",
+ "novarocks-frontend",
+ "novarocks-fs",
+ "novarocks-spi",
+ "novarocks-state-store",
+ "novarocks-types",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3052,6 +3218,14 @@ name = "novarocks-types"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-buffer",
+ "base64 0.22.1",
+ "chrono",
+ "num-traits",
+ "roaring 0.10.12",
+ "ryu",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4885,6 +5059,7 @@ dependencies = [
  "futures",
  "novarocks",
  "novarocks-fs",
+ "novarocks-server",
  "opendal",
  "parquet",
  "tokio",

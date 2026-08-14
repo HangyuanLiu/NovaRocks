@@ -18,72 +18,9 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use std::path::PathBuf;
 use std::time::Duration;
-use tempfile::TempDir;
 
-use novarocks::novarocks_config;
-use novarocks::novarocks_logging;
 use novarocks_types::UniqueId;
-
-/// Test configuration for integration tests.
-pub struct TestConfig {
-    /// Temporary directory for test artifacts
-    pub temp_dir: TempDir,
-    /// Test config path
-    pub config_path: PathBuf,
-}
-
-impl TestConfig {
-    /// Create a new test configuration with default settings.
-    pub fn new() -> anyhow::Result<Self> {
-        let temp_dir = tempfile::tempdir()?;
-        let config_path = temp_dir.path().join("test_novarocks.toml");
-
-        // Create a minimal test config
-        let config_content = r#"
-[server]
-host = "127.0.0.1"
-http_port = 8040
-grpc_port = 9080
-
-[runtime]
-exchange_wait_ms = 5000
-
-[runtime.cache]
-parquet_meta_cache_enable = false
-parquet_page_cache_enable = false
-parquet_meta_cache_capacity = 1000
-parquet_meta_cache_ttl_seconds = 3600
-parquet_page_cache_capacity = 1000
-parquet_page_cache_ttl_seconds = 3600
-
-"#;
-
-        std::fs::write(&config_path, config_content)?;
-
-        Ok(Self {
-            temp_dir,
-            config_path,
-        })
-    }
-
-    /// Initialize logging for tests.
-    pub fn init_logging(&self) {
-        novarocks_logging::init_with_level("debug", &Default::default());
-    }
-
-    /// Load the test configuration.
-    pub fn load_config(&self) -> anyhow::Result<novarocks_config::NovaRocksConfig> {
-        novarocks_config::load_from_path(&self.config_path)
-    }
-}
-
-impl Default for TestConfig {
-    fn default() -> Self {
-        Self::new().expect("Failed to create test config")
-    }
-}
 
 /// Generate a test query ID.
 pub fn test_query_id() -> UniqueId {

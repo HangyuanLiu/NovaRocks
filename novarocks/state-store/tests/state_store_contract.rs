@@ -409,60 +409,6 @@ async fn mysql_config_feature_off_open_fails_without_fallback() {
 }
 
 #[test]
-fn foundationdb_config_parses_exact_tagged_provider() -> anyhow::Result<()> {
-    let config: StateStoreConfig = toml::from_str(
-        r#"
-provider = "foundationdb"
-cluster_id = "cluster-a"
-cluster_file = "/tmp/fdb.cluster"
-keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
-"#,
-    )?;
-
-    assert!(matches!(
-        config.provider,
-        StateStoreProviderConfig::Foundationdb { keyspace_id, .. }
-            if keyspace_id == Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41")?
-    ));
-    Ok(())
-}
-
-#[test]
-fn foundationdb_config_rejects_missing_provider_and_cross_provider_fields() {
-    for input in [
-        r#"
-cluster_id = "cluster-a"
-cluster_file = "/tmp/fdb.cluster"
-keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
-"#,
-        r#"
-provider = "sqlite"
-cluster_id = "cluster-a"
-path = "meta/state-store.sqlite"
-deployment_owner = "fe-a"
-cluster_file = "/tmp/fdb.cluster"
-"#,
-        r#"
-provider = "foundationdb"
-cluster_id = "cluster-a"
-cluster_file = "/tmp/fdb.cluster"
-keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
-path = "meta/state-store.sqlite"
-"#,
-        r#"
-provider = "sqlite"
-provider = "foundationdb"
-cluster_id = "cluster-a"
-cluster_file = "/tmp/fdb.cluster"
-keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
-"#,
-    ] {
-        toml::from_str::<StateStoreConfig>(input)
-            .expect_err("missing and cross-provider fields must fail closed");
-    }
-}
-
-#[test]
 fn foundationdb_config_rejects_empty_cluster_id_and_invalid_cluster_files() {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let missing = temp.path().join("missing.cluster");

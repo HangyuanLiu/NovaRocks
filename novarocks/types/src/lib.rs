@@ -19,6 +19,7 @@ pub mod aggregate;
 mod arithmetic;
 pub mod arrow_cast;
 pub mod arrow_primitive;
+pub mod cluster_role;
 pub mod coercion;
 pub mod decimal;
 pub mod field_render_schema;
@@ -34,6 +35,7 @@ pub use arithmetic::{
     arithmetic_result_type, arithmetic_result_type_with_op, canonical_agg_decimal_type,
     decimal_arithmetic_result_type,
 };
+pub use cluster_role::ClusterRole;
 pub use coercion::{comparison_common_type, wider_type};
 pub use field_render_schema::FieldRenderSchema;
 pub use identity::{QueryId, UniqueId, format_uuid};

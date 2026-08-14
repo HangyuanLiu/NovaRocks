@@ -19,8 +19,6 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
 
-use crate::common::app_config::{NovaRocksConfig, ServerConfig};
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Cidr {
     network: IpAddr,
@@ -39,27 +37,29 @@ pub struct AdvertiseEndpoint {
     pub port: u16,
 }
 
-pub fn standalone_advertise_endpoint_for_config(
-    cfg: &NovaRocksConfig,
+pub fn standalone_advertise_endpoint(
+    bind_host: &str,
+    priority_networks: &str,
+    configured_advertise_host: &str,
+    grpc_port: u16,
 ) -> Result<AdvertiseEndpoint, String> {
-    let host = advertise_host_for_cluster_config(cfg)?;
+    let host = if configured_advertise_host.trim().is_empty() {
+        advertise_host_for_server(bind_host, priority_networks)
+    } else {
+        Ok(configured_advertise_host.trim().to_string())
+    }?;
     Ok(AdvertiseEndpoint {
         host,
-        port: cfg.server.grpc_port,
+        port: grpc_port,
     })
 }
 
-fn advertise_host_for_cluster_config(cfg: &NovaRocksConfig) -> Result<String, String> {
-    if cfg.cluster.advertise_host.trim().is_empty() {
-        advertise_host_for_server(&cfg.server)
-    } else {
-        Ok(cfg.cluster.advertise_host.trim().to_string())
-    }
-}
-
-pub fn advertise_host_for_server(server: &ServerConfig) -> Result<String, String> {
+pub fn advertise_host_for_server(
+    bind_host: &str,
+    priority_networks: &str,
+) -> Result<String, String> {
     let candidates = local_address_candidates()?;
-    choose_advertise_host(&server.host, &server.priority_networks, &candidates)
+    choose_advertise_host(bind_host, priority_networks, &candidates)
 }
 
 pub fn format_host_for_url(host: &str) -> String {
@@ -253,8 +253,7 @@ fn mask_v6(addr: Ipv6Addr, prefix_len: u8) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalAddress, choose_advertise_host, format_host_for_url,
-        standalone_advertise_endpoint_for_config,
+        LocalAddress, choose_advertise_host, format_host_for_url, standalone_advertise_endpoint,
     };
     use std::net::IpAddr;
 
@@ -336,24 +335,16 @@ mod tests {
 
     #[test]
     fn standalone_advertise_endpoint_uses_grpc_port_when_port_is_zero() {
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.server.grpc_port = 19080;
-        cfg.cluster.advertise_host = "be.example.com".to_string();
-        cfg.cluster.advertise_port = 0;
-
-        let endpoint = standalone_advertise_endpoint_for_config(&cfg).expect("resolve endpoint");
+        let endpoint = standalone_advertise_endpoint("0.0.0.0", "", "be.example.com", 19080)
+            .expect("resolve endpoint");
         assert_eq!(endpoint.host, "be.example.com");
         assert_eq!(endpoint.port, 19080);
     }
 
     #[test]
     fn standalone_advertise_endpoint_ignores_cluster_advertise_port() {
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.server.grpc_port = 19080;
-        cfg.cluster.advertise_host = "be.example.com".to_string();
-        cfg.cluster.advertise_port = 19081;
-
-        let endpoint = standalone_advertise_endpoint_for_config(&cfg).expect("resolve endpoint");
+        let endpoint = standalone_advertise_endpoint("0.0.0.0", "", "be.example.com", 19080)
+            .expect("resolve endpoint");
         assert_eq!(endpoint.host, "be.example.com");
         assert_eq!(endpoint.port, 19080);
     }

@@ -33,6 +33,7 @@ opendal = { version = "0.55", features = ["services-oss", "services-fs", "servic
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 novarocks = { path = "../novarocks/core" }
 novarocks-fs = { path = "../novarocks/fs" }
+novarocks-server = { path = "../novarocks-server" }
 
 [patch.crates-io]
 iceberg = { path = "../vendor/iceberg-0.9.0" }

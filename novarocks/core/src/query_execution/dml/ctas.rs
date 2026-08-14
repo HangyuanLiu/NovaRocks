@@ -2184,13 +2184,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::common::app_config::ClusterRole;
     use crate::query_execution::backend::BackendTopologySnapshot;
     use crate::query_execution::backend::LiveBackendTarget;
     use crate::query_execution::cancellation::QueryCancellationSource;
     use crate::sql::optimizer::options::SessionOptimizerSettings;
     use bytes::Bytes;
     use novarocks_spi::connector::*;
+    use novarocks_types::ClusterRole;
 
     struct NeverCancelled;
     impl ConnectorCancellation for NeverCancelled {

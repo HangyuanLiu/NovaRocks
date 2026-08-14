@@ -150,11 +150,11 @@ mod request_context_tests {
     use std::time::{Duration, Instant};
 
     use super::connector_request_context_for_execution;
-    use crate::common::app_config::ClusterRole;
     use crate::query_execution::backend::BackendTopologySnapshot;
     use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::request_context::{RequestAdmission, RequestContext};
     use crate::sql::optimizer::options::SessionOptimizerSettings;
+    use novarocks_types::ClusterRole;
 
     #[test]
     fn connector_context_preserves_admitted_deadline_and_cancellation() {

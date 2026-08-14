@@ -27,7 +27,6 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks::catalog_application::command::CatalogCommandExecutor;
 use novarocks::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-use novarocks::common::app_config::ClusterRole;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
 use novarocks::maintenance::command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor};
 use novarocks::mv::command::MvCommandExecutor;
@@ -60,6 +59,7 @@ use novarocks::view::view_command::ViewCommandExecutor;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_types::ClusterRole;
 use tokio::task;
 
 use crate::dml::DmlService;

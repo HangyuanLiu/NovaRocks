@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::common::app_config::NovaRocksConfig;
+use novarocks_server::app_config::NovaRocksConfig;
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{
     FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MySqlTlsMode, StateStoreHost, StateStoreHostConfig,

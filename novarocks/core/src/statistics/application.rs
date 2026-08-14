@@ -165,7 +165,7 @@ pub trait StatisticsAttemptExecutorSink: Send + Sync {
 /// path.  Every dependency must be supplied by the composition root.
 #[derive(Clone)]
 pub struct StatisticsAttemptExecutionPorts {
-    execution_role: crate::common::app_config::ClusterRole,
+    execution_role: novarocks_types::ClusterRole,
     connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     backend_topology: crate::query_execution::backend::BackendTopologyService,
@@ -174,7 +174,7 @@ pub struct StatisticsAttemptExecutionPorts {
 
 impl StatisticsAttemptExecutionPorts {
     pub fn new(
-        execution_role: crate::common::app_config::ClusterRole,
+        execution_role: novarocks_types::ClusterRole,
         connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         backend_topology: crate::query_execution::backend::BackendTopologyService,

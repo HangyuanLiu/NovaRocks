@@ -3414,21 +3414,27 @@ name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "libc",
  "mysql",
  "novarocks",
  "novarocks-backend",
  "novarocks-connector-iceberg",
  "novarocks-connector-starrocks",
+ "novarocks-execution",
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-spi",
  "novarocks-state-store",
  "novarocks-test-support",
+ "novarocks-types",
  "reqwest",
+ "serde",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3464,7 +3470,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "toml",
  "tracing",
  "uuid",
 ]
@@ -3487,7 +3492,9 @@ dependencies = [
  "num-traits",
  "roaring 0.10.12",
  "ryu",
+ "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

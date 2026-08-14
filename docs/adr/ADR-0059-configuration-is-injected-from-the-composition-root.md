@@ -2,9 +2,9 @@
 id: ADR-0059
 title: "Configuration is injected from the composition root, not read from a process global"
 domain: [configuration]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0072
 date: 2026-08-12
 provenance:
   - "spec: 2026-08-11 CFG application-config ownership design"

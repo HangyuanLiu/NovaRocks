@@ -26,7 +26,6 @@ use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
-use crate::novarocks_config;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
@@ -1485,7 +1484,7 @@ fn test_request_context(
     test_request_context_with_role(
         current_catalog,
         current_database,
-        crate::common::app_config::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::AllInOne,
     )
 }
 
@@ -1493,7 +1492,7 @@ fn test_request_context(
 fn test_request_context_with_role(
     current_catalog: Option<&str>,
     current_database: &str,
-    role: crate::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
 ) -> crate::query_execution::request_context::RequestContext {
     use crate::query_execution::backend::{BackendTopologySnapshot, LiveBackendTarget};
     use crate::query_execution::cancellation::QueryCancellationSource;
@@ -1818,37 +1817,20 @@ fn statistics_string_result(
 
 fn require_backend_management_role(
     statement: &str,
-    role: crate::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
 ) -> Result<(), String> {
     match role {
-        crate::common::app_config::ClusterRole::Fe => Ok(()),
-        crate::common::app_config::ClusterRole::Be => Err(format!(
+        novarocks_types::ClusterRole::Fe => Ok(()),
+        novarocks_types::ClusterRole::Be => Err(format!(
             "{statement} is not available in role=be; backend management is owned by StarRocks FE"
         )),
-        crate::common::app_config::ClusterRole::AllInOne => {
-            Err(format!("{statement} requires role=fe"))
-        }
+        novarocks_types::ClusterRole::AllInOne => Err(format!("{statement} requires role=fe")),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Local parquet table helpers
 // ---------------------------------------------------------------------------
-
-/// Matches the `[standalone_server] mv_partition_state_max_entries` default.
-pub(crate) const DEFAULT_MV_PARTITION_STATE_MAX_ENTRIES: usize = 10_000;
-
-fn resolve_mv_refresh_pruning_limits(
-    cfg: &novarocks_config::NovaRocksConfig,
-) -> MvRefreshPruningLimits {
-    cfg.standalone_server
-        .as_ref()
-        .map(|config| MvRefreshPruningLimits {
-            max_touched_groups: config.mv_refresh_max_touched_groups,
-            max_affected_partitions: config.mv_refresh_max_affected_partitions,
-        })
-        .unwrap_or_default()
-}
 
 // ---------------------------------------------------------------------------
 // Utility functions

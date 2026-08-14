@@ -44,6 +44,8 @@ pub use application::{
     FrontendExecutionConfig, FrontendQueryControlTimeouts,
 };
 pub use mv::FrontendMvService;
+pub use mv::maintenance::MaintenanceCoordinatorConfig;
+pub use mv::scheduler::FrontendMvSchedulerConfig;
 pub use query::FrontendQueryService;
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,

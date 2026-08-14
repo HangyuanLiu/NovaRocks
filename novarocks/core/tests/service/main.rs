@@ -16,7 +16,7 @@
 // under the License.
 //! Integration tests for the service control surface.
 
-use crate::common::{TestConfig, test_query_id, unique_query_id};
+use crate::common::{test_query_id, unique_query_id};
 use novarocks::service::fragment_control::cancel_runtime_fragment;
 use novarocks_types::UniqueId;
 
@@ -40,20 +40,6 @@ fn test_unique_id_creation() {
 
     assert_eq!(id1, id2);
     assert_ne!(id1, id3);
-}
-
-#[test]
-fn test_config_loading() {
-    // Test that test configuration can be loaded
-    let test_config = TestConfig::new().expect("Failed to create test config");
-    test_config.init_logging();
-
-    let config = test_config.load_config().expect("Failed to load config");
-    assert!(
-        !config.server.host.trim().is_empty(),
-        "config host should not be empty"
-    );
-    assert!(config.server.grpc_port > 0);
 }
 
 #[test]

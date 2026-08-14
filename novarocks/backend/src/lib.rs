@@ -8,9 +8,11 @@ pub(crate) mod runtime_filter;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-    BackendServerConfig, run_backend_server_until_shutdown, run_backend_server_until_signal,
+    BackendServerConfig, BackendStoreSettings, run_backend_server_until_shutdown,
+    run_backend_server_until_signal,
 };
 pub use connector::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
 };
 pub use fragment::NativeFragmentService;
+pub use query_lifecycle::QueryLifecycleRegistryConfig;

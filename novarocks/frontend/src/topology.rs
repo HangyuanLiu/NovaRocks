@@ -29,7 +29,6 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use novarocks::common::app_config::ClusterRole;
 use novarocks::query_execution::backend::{
     BackendQueryEvent, BackendQueryEventSink, BackendTopologyError, BackendTopologyMetricsSnapshot,
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
@@ -40,6 +39,7 @@ use novarocks_spi::state_store::{
     CommitResolution, Key, Precondition, StateRecord, StateStore, Value,
 };
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
+use novarocks_types::ClusterRole;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
@@ -1611,7 +1611,7 @@ mod tests {
         let endpoint: SocketAddr = "127.0.0.1:9010".parse().unwrap();
         assert!(
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::Fe,
+                novarocks_types::ClusterRole::Fe,
                 vec![endpoint, endpoint],
                 std::time::Duration::from_secs(1),
                 1,

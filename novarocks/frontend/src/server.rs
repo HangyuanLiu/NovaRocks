@@ -16,22 +16,18 @@
 // under the License.
 
 use std::future::Future;
-use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::Duration;
 
 use crate::capabilities as core_capabilities;
-use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::maintenance::BackgroundMaintenanceAttemptFactory;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks::query_execution::session::QuerySessionFactory;
+use novarocks::server::ResolvedMysqlListenerSettings;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
-use crate::mv::{maintenance::MaintenanceCoordinatorConfig, scheduler::FrontendMvSchedulerConfig};
 use crate::native::report_server::FrontendReportServerHandle;
 use crate::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
@@ -42,7 +38,7 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
-    role: novarocks::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
     topology: novarocks::query_execution::backend::BackendTopologyService,
 }
 
@@ -56,9 +52,11 @@ impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemp
 
 #[derive(Clone)]
 pub struct FrontendServerConfig {
-    pub config: NovaRocksConfig,
-    pub config_path: Option<PathBuf>,
-    pub port_override: Option<u16>,
+    pub execution: FrontendExecutionConfig,
+    pub backend_open: ClusterBackendOpenConfig,
+    pub report_bind_host: String,
+    pub report_grpc_port: u16,
+    pub mysql_listener: ResolvedMysqlListenerSettings,
     /// Provider-owned FE control factories composed by the server root.
     pub connector_control_factories: Vec<Arc<dyn ConnectorControlFactory>>,
     /// Application-owned storage observation composed by the server role.
@@ -75,12 +73,10 @@ pub struct FrontendServerConfig {
 pub async fn open_frontend_application_for_server(
     config: &FrontendServerConfig,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    let execution = resolve_frontend_execution_config(config)?;
-    let backend = cluster_backend_open_config(&config.config)?;
     FrontendApplicationHost::open_with_factories(
-        resolved_state_store_host_config(config),
-        execution,
-        backend,
+        config.state_store_host_config.clone(),
+        config.execution.clone(),
+        config.backend_open.clone(),
         config.connector_control_factories.clone(),
     )
     .await
@@ -409,8 +405,8 @@ where
     F: Future<Output = ()> + Send,
 {
     let mut report_server = FrontendReportServerHandle::start(
-        &config.config.server.host,
-        config.config.server.grpc_port,
+        &config.report_bind_host,
+        config.report_grpc_port,
         host.terminal_ingress(),
     )
     .map_err(FrontendApplicationError::server)?;
@@ -433,77 +429,17 @@ where
             return combine_server_and_shutdown(Err(error), stop_result);
         }
     };
-    let listener =
-        novarocks::server::resolve_mysql_listener_settings(&config.config, config.port_override)
-            .map_err(FrontendApplicationError::server)?;
-    let server_result =
-        novarocks::server::run_mysql_server_until_shutdown(listener, session_factory, shutdown)
-            .await
-            .map_err(FrontendApplicationError::server);
+    let server_result = novarocks::server::run_mysql_server_until_shutdown(
+        config.mysql_listener,
+        session_factory,
+        shutdown,
+    )
+    .await
+    .map_err(FrontendApplicationError::server);
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
     combine_server_and_shutdown(server_result, stop_result)
-}
-
-fn resolve_frontend_execution_config(
-    server: &FrontendServerConfig,
-) -> Result<FrontendExecutionConfig, FrontendApplicationError> {
-    let advertised =
-        novarocks::common::network::standalone_advertise_endpoint_for_config(&server.config)
-            .map_err(FrontendApplicationError::server)?;
-    let runtime_filter_worker_count =
-        NonZeroUsize::new(server.config.runtime.actual_exec_threads()).ok_or_else(|| {
-            FrontendApplicationError::server("frontend runtime-filter worker count must be nonzero")
-        })?;
-    let mut execution = FrontendExecutionConfig::new(
-        advertised.host,
-        advertised.port,
-        runtime_filter_worker_count,
-    )
-    .with_optimizer_query_mem_limit_bytes(server.config.runtime.optimizer_query_mem_limit_bytes)
-    .with_query_control_timeouts(FrontendQueryControlTimeouts {
-        heartbeat_interval_ms: server.config.runtime.query_control_heartbeat_interval_ms,
-        heartbeat_timeout_ms: server.config.runtime.query_control_heartbeat_timeout_ms,
-        init_rpc_timeout_ms: server.config.runtime.query_control_init_rpc_timeout_ms,
-        attach_timeout_ms: server.config.runtime.query_control_attach_timeout_ms,
-        stage_rpc_timeout_ms: server.config.runtime.query_control_stage_rpc_timeout_ms,
-        start_rpc_timeout_ms: server.config.runtime.query_control_start_rpc_timeout_ms,
-        terminal_drain_timeout_ms: server
-            .config
-            .runtime
-            .query_control_terminal_drain_timeout_ms,
-        terminal_ack_timeout_ms: server.config.runtime.query_control_terminal_ack_timeout_ms,
-        pre_start_timeout_ms: server.config.runtime.query_control_pre_start_timeout_ms,
-    });
-    if let Some(standalone) = server.config.standalone_server.as_ref() {
-        let failure_backoff_ms = standalone.mv_refresh_scheduler_failure_backoff_ms.max(1);
-        execution = execution.with_mv_scheduler_config(FrontendMvSchedulerConfig {
-            enabled: standalone.mv_refresh_scheduler_enabled,
-            tick_interval_ms: standalone.mv_refresh_scheduler_interval_ms.max(1),
-            max_concurrent_refreshes: standalone.mv_refresh_scheduler_max_concurrent.max(1),
-            failure_backoff_ms,
-            max_failure_backoff_ms: standalone
-                .mv_refresh_scheduler_max_failure_backoff_ms
-                .max(failure_backoff_ms),
-        });
-        execution = execution.with_mv_maintenance_config(MaintenanceCoordinatorConfig {
-            enabled: standalone.iceberg_maintenance_enabled,
-            tick_interval_ms: standalone.iceberg_maintenance_tick_interval_ms.max(1),
-            max_concurrent: standalone.iceberg_maintenance_max_concurrent.max(1),
-            compaction_min_data_files: standalone
-                .iceberg_maintenance_compaction_min_data_files
-                .try_into()
-                .unwrap_or(i64::MAX),
-            dv_min_delete_files: standalone
-                .iceberg_maintenance_dv_min_delete_files
-                .try_into()
-                .unwrap_or(i64::MAX),
-            action_cooldown_ms: standalone.iceberg_maintenance_action_cooldown_ms,
-            max_consecutive_failures: standalone.iceberg_maintenance_max_consecutive_failures,
-        });
-    }
-    Ok(execution)
 }
 
 #[cfg(test)]
@@ -536,7 +472,7 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let state_store_host_config = resolved_state_store_host_config(&config);
+    let state_store_host_config = config.state_store_host_config.clone();
     let host = open_host(state_store_host_config).await?;
     let service = extract_service(&host);
     let server_result = serve(config, service, shutdown).await;
@@ -577,54 +513,13 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let state_store_host_config = resolved_state_store_host_config(&config);
+    let state_store_host_config = config.state_store_host_config.clone();
     let host = open_host(state_store_host_config).await?;
     let service = extract_service(&host);
     let server_result = run_server_until_signal(config, service, signal, serve).await;
     let shutdown_result = shutdown_host(host).await;
 
     combine_server_and_shutdown(server_result, shutdown_result)
-}
-
-fn resolved_state_store_host_config(config: &FrontendServerConfig) -> Option<StateStoreHostConfig> {
-    config.state_store_host_config.clone().or_else(|| {
-        config
-            .config
-            .state_store
-            .clone()
-            .map(|state_store| StateStoreHostConfig {
-                state_store,
-                foundationdb_client: config.config.foundationdb_client.clone(),
-            })
-    })
-}
-
-fn cluster_backend_open_config(
-    config: &NovaRocksConfig,
-) -> Result<ClusterBackendOpenConfig, FrontendApplicationError> {
-    let seeds = config
-        .cluster
-        .backends
-        .iter()
-        .map(|endpoint| {
-            endpoint.parse().map_err(|error| {
-                FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::ClusterBackendOpen,
-                    format!("parse configured backend endpoint '{endpoint}' failed: {error}"),
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ClusterBackendOpenConfig::new(
-        config.cluster.role,
-        seeds,
-        Duration::from_millis(config.cluster.heartbeat_interval_ms),
-        config.cluster.heartbeat_timeout_retries,
-        Duration::from_secs(config.cluster.decommission_timeout_secs),
-    )
-    .map_err(|error| {
-        FrontendApplicationError::new(FrontendApplicationErrorKind::ClusterBackendOpen, error)
-    })
 }
 
 fn combine_server_and_shutdown(
@@ -715,8 +610,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
         FrontendServerConfig, build_frontend_query_session_factory, run_frontend_server,
@@ -724,11 +621,12 @@ mod tests {
         run_frontend_server_with_signal_and_ports,
     };
     use crate::{
-        FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig,
+        ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
+        FrontendApplicationHost, FrontendExecutionConfig,
     };
     use novarocks::{
         catalog_application::CatalogAdmission, query_execution::session::QuerySessionOpenRequest,
+        server::ResolvedMysqlListenerSettings,
     };
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
@@ -756,15 +654,35 @@ mod tests {
 
     fn frontend_config() -> FrontendServerConfig {
         FrontendServerConfig {
-            config: novarocks::common::app_config::NovaRocksConfig::default(),
-            config_path: None,
-            port_override: None,
+            execution: FrontendExecutionConfig::new(
+                "127.0.0.1",
+                0,
+                NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+            ),
+            backend_open: frontend_backend_open_config(),
+            report_bind_host: "127.0.0.1".to_string(),
+            report_grpc_port: 0,
+            mysql_listener: ResolvedMysqlListenerSettings::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                "root",
+            ),
             connector_control_factories: Vec::new(),
             mv_storage_observation: Arc::new(
                 novarocks::mv::storage_observation::UnavailableMvStorageObservationPort,
             ),
             state_store_host_config: None,
         }
+    }
+
+    fn frontend_backend_open_config() -> ClusterBackendOpenConfig {
+        ClusterBackendOpenConfig::new(
+            novarocks_types::ClusterRole::AllInOne,
+            Vec::new(),
+            Duration::from_secs(1),
+            3,
+            Duration::from_secs(1),
+        )
+        .expect("valid all-in-one backend config")
     }
 
     /// Answers whichever catalog instance the factory request carries, so the
@@ -806,8 +724,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
         let temp = tempfile::tempdir().expect("temporary cutover directory");
-        let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
         let state_store = StateStoreHostConfig {
             state_store: StateStoreAppConfig {
                 store: StateStoreConfig {
@@ -829,7 +745,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
             ),
-            super::cluster_backend_open_config(&config).expect("valid all-in-one backend config"),
+            frontend_backend_open_config(),
             vec![Arc::new(EchoingControlFactory)],
         )
         .await
@@ -910,22 +826,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frontend_report_endpoint_binds_loopback_without_core_transport_facade() {
-        let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
-        config.cluster.advertise_host = "127.0.0.1".to_string();
-        config.server.host = "127.0.0.1".to_string();
-        config.server.grpc_port = 0;
         let host = FrontendApplicationHost::open(
             None,
             FrontendExecutionConfig::new("127.0.0.1", 0, std::num::NonZeroUsize::new(1).unwrap()),
-            super::cluster_backend_open_config(&config).expect("valid all-in-one backend config"),
+            frontend_backend_open_config(),
         )
         .await
         .expect("open frontend application host");
         let report_endpoint = host.coordinator_report_endpoint_sink();
         let mut report_server = crate::native::report_server::FrontendReportServerHandle::start(
-            &config.server.host,
-            config.server.grpc_port,
+            "127.0.0.1",
+            0,
             host.terminal_ingress(),
         )
         .expect("start frontend-owned report endpoint");
@@ -948,8 +859,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
-        let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
         let host = FrontendApplicationHost::open(
             None,
             FrontendExecutionConfig::new(
@@ -957,7 +866,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
             ),
-            super::cluster_backend_open_config(&config).expect("valid all-in-one backend config"),
+            frontend_backend_open_config(),
         )
         .await
         .expect("open frontend application host");
@@ -1126,36 +1035,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preloaded_config_is_not_reread() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let unreadable_config_path: PathBuf = temp.path().join("missing.toml");
-        let mut config = frontend_config();
-        config.config.log_level = "sentinel-preloaded".to_string();
-        config.config_path = Some(unreadable_config_path.clone());
-        let server_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let server_called_in_port = Arc::clone(&server_called);
-
-        run_frontend_server_until_shutdown_with_ports(
-            config,
-            async {},
-            |_| async { Ok(RecordingHostPort) },
-            |_| (),
-            move |config, (), shutdown| async move {
-                assert_eq!(config.config.log_level, "sentinel-preloaded");
-                assert_eq!(config.config_path, Some(unreadable_config_path));
-                server_called_in_port.store(true, std::sync::atomic::Ordering::SeqCst);
-                shutdown.await;
-                Ok(())
-            },
-            |_| async { Ok(()) },
-        )
-        .await
-        .expect("preloaded config should reach the core port without a disk read");
-
-        assert!(server_called.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test]
     async fn ctrl_c_listener_failure_shuts_host_without_server_bind() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let host_port = RecordingServerPort::new(Arc::clone(&events));
@@ -1222,17 +1101,6 @@ mod tests {
     async fn full_process_config_pairs_foundationdb_client_with_state_store_for_host() {
         let cluster_file = tempfile::NamedTempFile::new().expect("FoundationDB cluster file");
         let mut config = frontend_config();
-        config.config.state_store = Some(StateStoreAppConfig {
-            store: StateStoreConfig {
-                cluster_id: "frontend-cluster".to_owned(),
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Foundationdb {
-                    cluster_file: cluster_file.path().to_path_buf(),
-                    keyspace_id: Uuid::nil(),
-                },
-            },
-            mysql_client: None,
-        });
         let foundationdb_client = FoundationDbClientConfig {
             disable_multi_version_client: true,
             tls_cert_path: None,
@@ -1241,7 +1109,20 @@ mod tests {
             tls_verify_peers: None,
             tls_password_env: None,
         };
-        config.config.foundationdb_client = Some(foundationdb_client.clone());
+        config.state_store_host_config = Some(StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: StateStoreConfig {
+                    cluster_id: "frontend-cluster".to_owned(),
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Foundationdb {
+                        cluster_file: cluster_file.path().to_path_buf(),
+                        keyspace_id: Uuid::nil(),
+                    },
+                },
+                mysql_client: None,
+            },
+            foundationdb_client: Some(foundationdb_client.clone()),
+        });
         let captured = Arc::new(Mutex::new(None::<StateStoreHostConfig>));
         let captured_in_port = Arc::clone(&captured);
 
