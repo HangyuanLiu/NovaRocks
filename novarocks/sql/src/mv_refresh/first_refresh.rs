@@ -229,7 +229,7 @@ pub fn compile_mv_first_refresh_connector_write(
     );
     let settings = context.optimizer_settings.clone();
     let request = crate::compiler::SqlCompileRequest::new(
-        crate::compiler::SqlStatementInput::Sql(artifact.sql().to_string()),
+        crate::compiler::SqlStatementInput::sql(artifact.sql()),
         crate::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         crate::compiler::SqlSessionContext {
             current_catalog: context.current_catalog,
@@ -297,13 +297,12 @@ pub fn compile_join_first_refresh_connector_write(
         context.functions,
         context.control.clone(),
     );
-    let crate::compiler::SqlCompileOutput::Logical(logical_output) =
-        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
-    else {
-        return Err(
-            "join first-refresh logical intent did not produce logical SQL facts".to_string(),
-        );
-    };
+    let logical_output = crate::compiler::SqlCompiler::compile(request)
+        .map_err(|error| error.to_string())?
+        .into_logical_output()
+        .map_err(|_| {
+            "join first-refresh logical intent did not produce logical SQL facts".to_string()
+        })?;
     let (plan, factory) = build_join_first_refresh_append_logical_plan(
         crate::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
             logical_output.logical_plan,
@@ -396,13 +395,12 @@ pub fn compile_join_incremental_refresh_change_stream(
         context.functions,
         context.control,
     );
-    let crate::compiler::SqlCompileOutput::Logical(logical_output) =
-        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
-    else {
-        return Err(
-            "join incremental refresh logical intent did not produce logical SQL facts".to_string(),
-        );
-    };
+    let logical_output = crate::compiler::SqlCompiler::compile(request)
+        .map_err(|error| error.to_string())?
+        .into_logical_output()
+        .map_err(|_| {
+            "join incremental refresh logical intent did not produce logical SQL facts".to_string()
+        })?;
     let logical = crate::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
         logical_output.logical_plan,
     );
@@ -426,14 +424,12 @@ pub fn compile_join_incremental_refresh_change_stream(
         &statistics,
         crate::compiler::SqlCompileControl::unbounded(),
     );
-    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::compiler::SqlCompiler::compile(logical_request)
-            .map_err(|error| error.to_string())?
-    else {
-        return Err(
-            "join incremental logical input did not produce an optimized SQL plan".to_string(),
-        );
-    };
+    let compiled = crate::compiler::SqlCompiler::compile(logical_request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| {
+            "join incremental logical input did not produce an optimized SQL plan".to_string()
+        })?;
     let change_stream = change_stream_override.unwrap_or(compiled.change_stream);
     let producer = add_join_incremental_change_stream_effect(
         compiled.optimized_tree,
@@ -498,13 +494,12 @@ pub fn compile_mv_incremental_refresh_change_stream(
         context.functions,
         context.control,
     );
-    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
-    else {
-        return Err(
-            "canonical incremental MV intent did not produce an optimized SQL plan".to_string(),
-        );
-    };
+    let compiled = crate::compiler::SqlCompiler::compile(request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| {
+            "canonical incremental MV intent did not produce an optimized SQL plan".to_string()
+        })?;
     let producer = add_join_incremental_change_stream_effect(
         compiled.optimized_tree,
         &compiled.change_stream,
@@ -531,7 +526,7 @@ fn canonical_incremental_change_stream_request<'a>(
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlCompileRequest<'a> {
     crate::compiler::SqlCompileRequest::new(
-        crate::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        crate::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         crate::compiler::SqlCompileIntent::ChangeStreamWrite,
         crate::compiler::SqlSessionContext {
             current_catalog,
@@ -1114,7 +1109,7 @@ fn plain_join_first_refresh_logical_request<'a>(
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlCompileRequest<'a> {
     crate::compiler::SqlCompileRequest::new(
-        crate::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        crate::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         crate::compiler::SqlCompileIntent::LogicalOnly,
         crate::compiler::SqlSessionContext {
             current_catalog,

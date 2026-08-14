@@ -284,7 +284,7 @@ impl FrontendQueryCompiler {
                 "SQL compilation requires a non-empty admitted backend topology".to_string()
             })?;
         Ok(SqlCompileRequest::new(
-            SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+            SqlStatementInput::parsed_query(Box::new(query.clone())),
             intent,
             SqlSessionContext {
                 current_catalog: current_catalog.map(str::to_string),

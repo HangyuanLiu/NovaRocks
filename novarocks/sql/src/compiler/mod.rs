@@ -196,8 +196,18 @@ pub trait SqlFunctionCatalog: Send + Sync {
 }
 
 /// Statement material already owned by the SQL boundary.
+///
+/// The public constructors accept only source syntax. SQL-internal logical
+/// re-entry is intentionally represented by a private variant so application
+/// code cannot smuggle a mutable logical tree or column factory back across
+/// the compiler boundary.
 #[derive(Clone, Debug)]
-pub enum SqlStatementInput {
+pub struct SqlStatementInput {
+    kind: SqlStatementInputKind,
+}
+
+#[derive(Clone, Debug)]
+enum SqlStatementInputKind {
     Sql(String),
     ParsedQuery(Box<sqlparser::ast::Query>),
     /// A SQL-owned logical transformation that must re-enter the canonical
@@ -208,6 +218,29 @@ pub enum SqlStatementInput {
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
     },
+}
+
+impl SqlStatementInput {
+    pub fn sql(sql: impl Into<String>) -> Self {
+        Self {
+            kind: SqlStatementInputKind::Sql(sql.into()),
+        }
+    }
+
+    pub fn parsed_query(query: Box<sqlparser::ast::Query>) -> Self {
+        Self {
+            kind: SqlStatementInputKind::ParsedQuery(query),
+        }
+    }
+
+    pub(crate) fn logical_plan(
+        plan: crate::planner::logical::LogicalPlanNode,
+        factory: crate::column_id::ColumnRefFactory,
+    ) -> Self {
+        Self {
+            kind: SqlStatementInputKind::LogicalPlan { plan, factory },
+        }
+    }
 }
 
 /// The compiler result shape required by the caller.
@@ -388,7 +421,7 @@ impl<'a> SqlCompileRequest<'a> {
         control: SqlCompileControl,
     ) -> Self {
         Self {
-            statement: SqlStatementInput::LogicalPlan { plan, factory },
+            statement: SqlStatementInput::logical_plan(plan, factory),
             intent,
             session,
             environment,
@@ -435,7 +468,15 @@ pub(crate) struct SqlDistributedOutput {
 
 /// SQL-owned compiler facts. Native DTOs/bytes, lifecycle state and result
 /// buffers are intentionally absent; application owns post-compile assembly.
-pub enum SqlCompileOutput {
+///
+/// The carrier is intentionally opaque outside SQL. Its public terminals
+/// expose only a sealed distributed plan or rendered EXPLAIN lines; compiler
+/// internal logical/optimized graphs never become a cross-owner API.
+pub struct SqlCompileOutput {
+    kind: SqlCompileOutputKind,
+}
+
+enum SqlCompileOutputKind {
     Analysis(SqlAnalysisOutput),
     Logical(SqlAnalysisOutput),
     Optimized(SqlOptimizedOutput),
@@ -533,7 +574,7 @@ fn imv_refresh_explain_request<'a>(
     control: SqlCompileControl,
 ) -> SqlCompileRequest<'a> {
     SqlCompileRequest::new(
-        SqlStatementInput::ParsedQuery(Box::new(query)),
+        SqlStatementInput::parsed_query(Box::new(query)),
         SqlCompileIntent::LogicalOnly,
         SqlSessionContext {
             current_catalog,
@@ -551,14 +592,67 @@ fn imv_refresh_explain_request<'a>(
 }
 
 impl SqlCompileOutput {
+    fn analysis(output: SqlAnalysisOutput) -> Self {
+        Self {
+            kind: SqlCompileOutputKind::Analysis(output),
+        }
+    }
+
+    fn logical(output: SqlAnalysisOutput) -> Self {
+        Self {
+            kind: SqlCompileOutputKind::Logical(output),
+        }
+    }
+
+    fn optimized(output: SqlOptimizedOutput) -> Self {
+        Self {
+            kind: SqlCompileOutputKind::Optimized(output),
+        }
+    }
+
+    fn immediate_explain(lines: Vec<String>) -> Self {
+        Self {
+            kind: SqlCompileOutputKind::ImmediateExplain(lines),
+        }
+    }
+
+    fn distributed(output: SqlDistributedOutput) -> Self {
+        Self {
+            kind: SqlCompileOutputKind::Distributed(output),
+        }
+    }
+
+    pub(crate) fn into_logical_output(self) -> Result<SqlAnalysisOutput, SqlCompileError> {
+        match self.kind {
+            SqlCompileOutputKind::Logical(output) => Ok(output),
+            _ => Err(SqlCompileError::InvalidRequest(
+                "SQL compilation did not produce logical SQL facts".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn into_optimized_output(self) -> Result<SqlOptimizedOutput, SqlCompileError> {
+        match self.kind {
+            SqlCompileOutputKind::Optimized(output) => Ok(output),
+            _ => Err(SqlCompileError::InvalidRequest(
+                "SQL compilation did not produce optimized SQL facts".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_distributed(&self) -> bool {
+        matches!(self.kind, SqlCompileOutputKind::Distributed(_))
+    }
+
     /// Consume the only output shape that may cross into Core post-compile
     /// preparation.  The plan remains sealed and callers receive no mutable
     /// builder or validation constructor.
     pub fn into_distributed_plan(
         self,
     ) -> Result<crate::plan_read::DistributedPlan, SqlCompileError> {
-        match self {
-            Self::Distributed(output) => Ok(output.distributed_plan),
+        match self.kind {
+            SqlCompileOutputKind::Distributed(output) => Ok(output.distributed_plan),
             _ => Err(SqlCompileError::InvalidRequest(
                 "SQL compilation did not produce a distributed plan".to_string(),
             )),
@@ -572,12 +666,12 @@ impl SqlCompileOutput {
         level: ExplainLevel,
         logical: bool,
     ) -> Result<Vec<String>, SqlCompileError> {
-        match self {
-            Self::Logical(output) if logical => {
+        match self.kind {
+            SqlCompileOutputKind::Logical(output) if logical => {
                 crate::explain::explain_plan_checked(&output.logical_plan, level)
                     .map_err(SqlCompileError::Compilation)
             }
-            Self::ImmediateExplain(lines) if !logical => Ok(lines),
+            SqlCompileOutputKind::ImmediateExplain(lines) if !logical => Ok(lines),
             _ => Err(SqlCompileError::InvalidRequest(
                 "EXPLAIN intent produced unexpected SQL facts".to_string(),
             )),
@@ -848,8 +942,8 @@ pub struct SqlCompiler;
 impl SqlCompiler {
     pub fn compile(request: SqlCompileRequest<'_>) -> Result<SqlCompileOutput, SqlCompileError> {
         request.check_control()?;
-        let (mut logical_plan, mut factory, logical_input) = match &request.statement {
-            SqlStatementInput::LogicalPlan { plan, factory } => {
+        let (mut logical_plan, mut factory, logical_input) = match &request.statement.kind {
+            SqlStatementInputKind::LogicalPlan { plan, factory } => {
                 (plan.clone(), factory.clone(), true)
             }
             _ => {
@@ -871,14 +965,14 @@ impl SqlCompiler {
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
-            return Ok(SqlCompileOutput::Analysis(SqlAnalysisOutput {
+            return Ok(SqlCompileOutput::analysis(SqlAnalysisOutput {
                 logical_plan,
                 factory,
             }));
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) && request.imv_rewrite.is_none()
         {
-            return Ok(SqlCompileOutput::Logical(SqlAnalysisOutput {
+            return Ok(SqlCompileOutput::logical(SqlAnalysisOutput {
                 logical_plan,
                 factory,
             }));
@@ -936,7 +1030,7 @@ impl SqlCompiler {
             request.check_control()?;
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) {
-            return Ok(SqlCompileOutput::Logical(SqlAnalysisOutput {
+            return Ok(SqlCompileOutput::logical(SqlAnalysisOutput {
                 logical_plan,
                 factory,
             }));
@@ -1019,14 +1113,14 @@ impl SqlCompiler {
                 &distributed,
                 level,
             ));
-            return Ok(SqlCompileOutput::ImmediateExplain(lines));
+            return Ok(SqlCompileOutput::immediate_explain(lines));
         }
 
         if matches!(
             request.intent,
             SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
         ) {
-            return Ok(SqlCompileOutput::Optimized(SqlOptimizedOutput {
+            return Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
                 optimized_tree,
                 statistics,
                 change_stream,
@@ -1040,7 +1134,7 @@ impl SqlCompiler {
             crate::planner::pipeline::build_distributed_plan_with_settings(physical, &settings)
                 .map_err(SqlCompileError::Compilation)?;
         request.check_control()?;
-        Ok(SqlCompileOutput::Distributed(SqlDistributedOutput {
+        Ok(SqlCompileOutput::distributed(SqlDistributedOutput {
             distributed_plan,
             statistics,
             mv_rewrite_diagnostics,
@@ -1049,10 +1143,10 @@ impl SqlCompiler {
 }
 
 fn parse_query(statement: &SqlStatementInput) -> Result<sqlparser::ast::Query, SqlCompileError> {
-    let sql = match statement {
-        SqlStatementInput::Sql(sql) => sql,
-        SqlStatementInput::ParsedQuery(query) => return Ok((**query).clone()),
-        SqlStatementInput::LogicalPlan { .. } => {
+    let sql = match &statement.kind {
+        SqlStatementInputKind::Sql(sql) => sql,
+        SqlStatementInputKind::ParsedQuery(query) => return Ok((**query).clone()),
+        SqlStatementInputKind::LogicalPlan { .. } => {
             return Err(SqlCompileError::InvalidRequest(
                 "logical SQL compiler input must bypass parsing".to_string(),
             ));
@@ -1269,7 +1363,7 @@ mod tests {
 
     fn request(control: SqlCompileControl) -> SqlCompileRequest<'static> {
         SqlCompileRequest::new(
-            SqlStatementInput::Sql("select 1".to_string()),
+            SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 current_catalog: Some("iceberg".to_string()),
@@ -1395,7 +1489,7 @@ mod tests {
 
     #[test]
     fn explain_output_terminal_rejects_the_wrong_output_shape() {
-        let error = SqlCompileOutput::ImmediateExplain(vec!["EXPLAIN".to_string()])
+        let error = SqlCompileOutput::immediate_explain(vec!["EXPLAIN".to_string()])
             .into_explain_lines(ExplainLevel::Normal, true)
             .expect_err("logical explain must not accept immediate explain facts");
         assert!(matches!(error, SqlCompileError::InvalidRequest(_)));
@@ -1562,7 +1656,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let plan = SqlCompiler::compile(SqlCompileRequest::new(
-            SqlStatementInput::Sql("select 1".to_string()),
+            SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 current_catalog: None,
@@ -1614,7 +1708,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlCompileRequest::new(
-            SqlStatementInput::Sql("select 1".to_string()),
+            SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 current_catalog: None,
@@ -1631,10 +1725,11 @@ mod tests {
             control(None, &cancellation),
         );
 
-        assert!(matches!(
-            SqlCompiler::compile(request),
-            Ok(SqlCompileOutput::Distributed(_))
-        ));
+        assert!(
+            SqlCompiler::compile(request)
+                .expect("query compile")
+                .is_distributed()
+        );
     }
 
     #[test]
@@ -1643,7 +1738,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlCompileRequest::new(
-            SqlStatementInput::Sql("select 1".to_string()),
+            SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 current_catalog: None,
@@ -1660,10 +1755,11 @@ mod tests {
             control(None, &cancellation),
         );
 
-        assert!(matches!(
-            SqlCompiler::compile(request),
-            Ok(SqlCompileOutput::Distributed(_))
-        ));
+        assert!(
+            SqlCompiler::compile(request)
+                .expect("query compile")
+                .is_distributed()
+        );
     }
 
     #[test]
@@ -1676,7 +1772,7 @@ mod tests {
         };
 
         assert_eq!(
-            parse_query(&SqlStatementInput::ParsedQuery(query.clone())),
+            parse_query(&SqlStatementInput::parsed_query(query.clone())),
             Ok(*query)
         );
     }
@@ -1687,7 +1783,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlCompileRequest::new(
-            SqlStatementInput::Sql("select 1 as payload".to_string()),
+            SqlStatementInput::sql("select 1 as payload"),
             SqlCompileIntent::IcebergWrite {
                 root_distribution: RootDistributionRequirement::ShuffleOutputName(
                     "missing".to_string(),

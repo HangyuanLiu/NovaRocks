@@ -2187,7 +2187,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             "Iceberg write requires a non-empty admitted backend topology".to_string()
         })?;
     let compiler_request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared)),
+        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
@@ -2605,7 +2605,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         _ => crate::query_execution::contract::DistributedQueryIntent::Result,
     };
     let compiler_request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         intent,
         novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
@@ -2696,7 +2696,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     };
     let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
         compile_request: novarocks_sql::compiler::SqlCompileRequest::new(
-            novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
             intent,
             novarocks_sql::compiler::SqlSessionContext {
                 current_catalog: current_catalog.map(str::to_string),

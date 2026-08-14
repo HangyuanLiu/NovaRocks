@@ -49,7 +49,7 @@ fn external_sql_contract_compiles_and_reads_a_sealed_plan() {
     let catalog = EmptyCatalog;
     let statistics = DmlStatisticsSnapshot::empty();
     let request = SqlCompileRequest::new(
-        SqlStatementInput::Sql("SELECT 1".to_string()),
+        SqlStatementInput::sql("SELECT 1"),
         SqlCompileIntent::Query,
         SqlSessionContext {
             current_catalog: None,

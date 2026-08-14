@@ -413,7 +413,7 @@ fn compile_dml_change_stream_write(
             "MOR change-stream write requires a frozen non-empty backend topology".to_string()
         })?;
     let request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
         novarocks_sql::compiler::SqlSessionContext {
             current_catalog: None,
@@ -2881,7 +2881,7 @@ fn execute_exact_cow_match_query(
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| "COW match execution requires a non-empty admitted topology".to_string())?;
     let request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::Query,
         novarocks_sql::compiler::SqlSessionContext {
             current_catalog: Some(target.catalog.clone()),

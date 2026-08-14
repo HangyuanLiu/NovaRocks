@@ -406,7 +406,7 @@ fn plan_query_for_ctas_source(
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| "CTAS requires a frozen non-empty backend topology".to_string())?;
     let request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
             root_distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
         },

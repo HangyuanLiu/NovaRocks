@@ -478,11 +478,10 @@ pub fn compile_connector_write_distributed_plan(
     sink: DmlWritePlanInput,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
-    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
-    else {
-        return Err("connector write intent did not produce optimized SQL facts".to_string());
-    };
+    let compiled = crate::compiler::SqlCompiler::compile(request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     crate::planner::pipeline::build_sql_write_distributed_plan_with_settings(
         physical, sink.0, settings,
@@ -554,11 +553,10 @@ impl DmlCtasSourcePlan {
 pub fn compile_ctas_source(
     request: crate::compiler::SqlCompileRequest<'_>,
 ) -> Result<DmlCtasSourcePlan, String> {
-    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
-    else {
-        return Err("CTAS source did not produce optimized SQL facts".to_string());
-    };
+    let compiled = crate::compiler::SqlCompiler::compile(request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
     Ok(DmlCtasSourcePlan {
         optimized: compiled.optimized_tree,
     })
@@ -703,12 +701,10 @@ impl DmlChangeStreamPlan {
 pub fn compile_dml_change_stream(
     request: DmlChangeStreamCompileRequest<'_>,
 ) -> Result<DmlChangeStreamPlan, String> {
-    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::compiler::SqlCompiler::compile(request.compile_request)
-            .map_err(|error| error.to_string())?
-    else {
-        return Err("change-stream intent did not produce an optimized SQL plan".to_string());
-    };
+    let compiled = crate::compiler::SqlCompiler::compile(request.compile_request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
 
     let producer = match request.kind {
         DmlChangeStreamKind::Update {
