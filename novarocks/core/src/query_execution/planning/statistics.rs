@@ -37,6 +37,7 @@ use crate::query_execution::planning::catalog_materializer::{
     load_connector_table_alias_materialization_with_lease,
     load_connector_table_materialization_with_lease,
 };
+use novarocks_sql::planning::catalog::materialization_statistics_facts;
 use novarocks_sql::planning::dml::{
     DmlStatisticsEvidence, DmlStatisticsFailure, DmlStatisticsSnapshot,
 };
@@ -120,9 +121,9 @@ fn project_statistics_evidence(
 ) -> Vec<DmlStatisticsEvidence> {
     let mut evidence = Vec::new();
     for (binding_id, binding) in bindings.captured_bindings() {
-        let label = binding.resolved.catalog.identity.fqn();
+        let facts = materialization_statistics_facts(&binding.resolved);
         evidence.push(project_binding_statistics(
-            resolver, binding_id, &label, &binding,
+            resolver, binding_id, &facts, &binding,
         ));
     }
     evidence
@@ -131,9 +132,10 @@ fn project_statistics_evidence(
 fn project_binding_statistics(
     resolver: &UnifiedStatisticsResolver,
     binding_id: novarocks_sql::binding::SqlTableBindingId,
-    label: &str,
+    facts: &novarocks_sql::planning::catalog::SqlCatalogStatisticsFacts,
     binding: &QueryTableBinding,
 ) -> DmlStatisticsEvidence {
+    let label = facts.label();
     let Some(pin) = binding.statistics_pin.as_ref() else {
         return DmlStatisticsEvidence::Missing {
             binding: binding_id,
@@ -162,7 +164,7 @@ fn project_binding_statistics(
             reason: "resolved connector generation does not expose statistics".to_string(),
         };
     };
-    let metrics = match metric_request(&binding.resolved.planner.columns) {
+    let metrics = match metric_request(facts.columns()) {
         Ok(metrics) => metrics,
         Err(error) => {
             return fatal_statistics_evidence(
@@ -213,9 +215,9 @@ fn project_binding_statistics(
     DmlStatisticsEvidence::Available {
         binding: binding_id,
         label: label.to_string(),
-        columns: binding.resolved.planner.columns.clone(),
+        columns: facts.columns().to_vec(),
         optimizer_usable: UnifiedStatisticsResolver::optimizer_usable(&evidence),
-        evidence,
+        evidence: (*evidence).clone(),
     }
 }
 

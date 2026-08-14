@@ -86,6 +86,26 @@ impl SqlCatalogIdentityFacts {
     }
 }
 
+/// Copied relation facts required to request connector statistics for an
+/// already admitted table. This does not reveal the analyzer relation, scan
+/// source, or any provider authority, so it cannot be used to rebuild a SQL
+/// graph or reopen a catalog lookup.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SqlCatalogStatisticsFacts {
+    label: String,
+    columns: Vec<novarocks_catalog::schema::ColumnDef>,
+}
+
+impl SqlCatalogStatisticsFacts {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn columns(&self) -> &[novarocks_catalog::schema::ColumnDef] {
+        &self.columns
+    }
+}
+
 /// Materialize immutable connector metadata facts as one SQL analyzer table.
 /// The request-local binding is the only route from this table to later scan
 /// preparation, so this constructor cannot recreate or replace an admission.
@@ -196,6 +216,18 @@ pub fn materialization_identity_facts(
         catalog: identity.catalog.clone(),
         namespace: identity.namespace.clone(),
         table: identity.table.clone(),
+    }
+}
+
+/// Copy the only SQL relation facts needed by the application statistics
+/// resolver. Connector lease, table handle, version pin, and resolver stay
+/// application-owned; planner and analyzer internals remain in SQL.
+pub fn materialization_statistics_facts(
+    materialization: &crate::catalog::ResolvedAnalyzerTable,
+) -> SqlCatalogStatisticsFacts {
+    SqlCatalogStatisticsFacts {
+        label: materialization.catalog.identity.fqn(),
+        columns: materialization.planner.columns.clone(),
     }
 }
 
@@ -395,9 +427,17 @@ mod tests {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
             table: "orders".to_string(),
-            columns: Vec::new(),
+            columns: vec![novarocks_catalog::schema::ColumnDef {
+                name: "order_id".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
             iceberg_row_lineage_metadata_columns: Vec::new(),
-            schema: Arc::new(arrow::datatypes::Schema::empty()),
+            schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("order_id", arrow::datatypes::DataType::Int64, false),
+            ])),
             binding,
             selector: novarocks_spi::connector::ConnectorReadSelector::Current,
             planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
@@ -448,5 +488,17 @@ mod tests {
             .expect("local materialization carries the replacement token");
         assert!(validate_materialization_binding(&local, original).is_err());
         assert_eq!(materialization_identity_facts(&local), identity);
+    }
+
+    #[test]
+    fn statistics_facts_copy_only_label_and_columns() {
+        let mut allocator = test_binding_allocator();
+        let binding = allocator.allocate().expect("binding");
+        let materialization = connector_read_materialization(binding);
+
+        let facts = materialization_statistics_facts(&materialization);
+        assert_eq!(facts.label(), "ice.analytics.orders");
+        assert_eq!(facts.columns().len(), 1);
+        assert_eq!(facts.columns()[0].name, "order_id");
     }
 }

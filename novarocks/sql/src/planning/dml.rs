@@ -70,6 +70,12 @@ pub enum DmlStatisticsFailure {
 #[derive(Clone, Debug)]
 pub struct DmlStatisticsSnapshot(pub(crate) crate::optimizer::stats_input::SqlStatisticsSnapshot);
 
+impl Default for DmlStatisticsSnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl DmlStatisticsSnapshot {
     /// Construct an intentionally empty snapshot for an already SQL-owned
     /// logical input. Empty means evidence is unavailable, never that a table
@@ -1375,9 +1381,14 @@ pub fn build_statistics_connector_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        StatisticsCommand, dml_change_stream_optimizer_settings, parse_statistics_command,
-        parse_truncate_command,
+        DmlStatisticsSnapshot, StatisticsCommand, dml_change_stream_optimizer_settings,
+        parse_statistics_command, parse_truncate_command,
     };
+
+    #[test]
+    fn empty_statistics_snapshot_is_the_default_without_implying_zero_rows() {
+        let _snapshot = DmlStatisticsSnapshot::default();
+    }
 
     #[test]
     fn dml_facade_parses_truncate_without_exposing_the_custom_ast() {
