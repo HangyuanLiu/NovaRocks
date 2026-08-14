@@ -442,6 +442,89 @@ pub enum SqlCompileOutput {
     Distributed(SqlDistributedOutput),
 }
 
+/// Immutable application facts for rendering one IMV refresh EXPLAIN result.
+/// SQL consumes the opaque rewrite snapshot and keeps logical-plan ownership
+/// internal; Core receives only the rendered lines.
+pub struct SqlImvRefreshExplainContext<'a> {
+    pub canonical_query: Box<sqlparser::ast::Query>,
+    pub imv_rewrite: SqlImvPlanningInput,
+    pub current_catalog: Option<String>,
+    pub current_database: String,
+    pub optimizer_settings: SessionOptimizerSettings,
+    pub environment: SqlPlanningEnvironment,
+    pub catalog: &'a dyn SqlCatalogSnapshot,
+    pub statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    pub functions: &'a dyn SqlFunctionCatalog,
+    pub control: SqlCompileControl,
+    pub level: ExplainLevel,
+}
+
+/// Compile and render an IMV refresh EXPLAIN request without exposing its
+/// logical plan, rewrite trace, or column factory to application code.
+pub fn compile_imv_refresh_explain_lines(
+    context: SqlImvRefreshExplainContext<'_>,
+) -> Result<Vec<String>, SqlCompileError> {
+    let SqlImvRefreshExplainContext {
+        canonical_query,
+        imv_rewrite,
+        current_catalog,
+        current_database,
+        optimizer_settings,
+        environment,
+        catalog,
+        statistics,
+        functions,
+        control,
+        level,
+    } = context;
+    let mut query = *canonical_query;
+    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let request = imv_refresh_explain_request(
+        query,
+        &imv_rewrite,
+        current_catalog,
+        current_database,
+        optimizer_settings,
+        environment,
+        catalog,
+        statistics,
+        functions,
+        control,
+    );
+    SqlCompiler::compile(request)?.into_explain_lines(level, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn imv_refresh_explain_request<'a>(
+    query: sqlparser::ast::Query,
+    imv_rewrite: &'a SqlImvPlanningInput,
+    current_catalog: Option<String>,
+    current_database: String,
+    optimizer_settings: SessionOptimizerSettings,
+    environment: SqlPlanningEnvironment,
+    catalog: &'a dyn SqlCatalogSnapshot,
+    statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    functions: &'a dyn SqlFunctionCatalog,
+    control: SqlCompileControl,
+) -> SqlCompileRequest<'a> {
+    SqlCompileRequest::new(
+        SqlStatementInput::ParsedQuery(Box::new(query)),
+        SqlCompileIntent::LogicalOnly,
+        SqlSessionContext {
+            current_catalog,
+            current_database,
+            optimizer_settings,
+        },
+        environment,
+        catalog,
+        statistics,
+        functions,
+        None,
+        control,
+    )
+    .with_imv_rewrite(imv_rewrite)
+}
+
 impl SqlCompileOutput {
     /// Consume the only output shape that may cross into Core post-compile
     /// preparation.  The plan remains sealed and callers receive no mutable
@@ -1179,6 +1262,60 @@ mod tests {
         )
     }
 
+    fn imv_validation_input(validation: SqlImvRewriteValidation) -> SqlImvPlanningInput {
+        SqlImvPlanningInput::new(
+            crate::compiler::mv_rewrite::test_incremental_snapshot_handle(),
+            validation,
+        )
+    }
+
+    fn imv_validation_outcome(
+        changed_rules: &[&'static str],
+        aggregate_change_stream: bool,
+    ) -> crate::planner::imv_rewrite::entrypoint::ImvRewriteOutcome {
+        let mut trace = crate::optimizer::rewrite::trace::RewriteTrace::default();
+        for rule in changed_rules {
+            trace.rule_changed(
+                crate::optimizer::rewrite::phase::RewritePhase::SemanticRewrite,
+                rule,
+                0,
+            );
+        }
+        let mut annotation = crate::planner::imv_rewrite::annotation::ImvPlanAnnotation::default();
+        if aggregate_change_stream {
+            annotation.change_stream = crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor {
+                aggregate: Some(
+                    crate::planner::imv_rewrite::change_stream::AggregateChangeStreamDescriptor {
+                        action_column_id: crate::column_id::ColumnId::new_for_test(1),
+                        action_column_name: crate::common::CHANGE_OP_COLUMN.to_string(),
+                        shape: crate::planner::imv_rewrite::change_stream::AggregateChangeStreamShape::UnionChangeStream,
+                        target_state: crate::planner::imv_rewrite::change_stream::TargetStateProof {
+                            present: true,
+                        },
+                        signed_state_aggregate: crate::planner::imv_rewrite::change_stream::SignedStateAggregateProof {
+                            present: true,
+                        },
+                    },
+                ),
+                ..Default::default()
+            };
+        }
+        crate::planner::imv_rewrite::entrypoint::ImvRewriteOutcome {
+            plan: crate::planner::logical::LogicalPlanNode::new(
+                crate::planner::logical::LogicalPlanKind::Values(
+                    crate::planner::payload::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    },
+                ),
+                Vec::new(),
+                None,
+            ),
+            trace,
+            annotation,
+        }
+    }
+
     #[test]
     fn sqlx2_request_keeps_sql_owned_cancellation_observation() {
         let cancellation = Arc::new(Cancellation::default());
@@ -1240,6 +1377,37 @@ mod tests {
 
         let _: fn(SqlCompileOutput, ExplainLevel, bool) -> Result<Vec<String>, SqlCompileError> =
             SqlCompileOutput::into_explain_lines;
+    }
+
+    #[test]
+    fn imv_refresh_explain_terminal_keeps_logical_rewrite_inside_sql() {
+        let statement = crate::parser::parse_sql_raw("SELECT 1").expect("query fixture parses");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query fixture");
+        };
+        let cancellation = Arc::new(Cancellation::default());
+        let input = imv_validation_input(SqlImvRewriteValidation::None);
+        let request = imv_refresh_explain_request(
+            *query,
+            &input,
+            Some("ice".to_string()),
+            "db".to_string(),
+            SessionOptimizerSettings::default(),
+            SqlPlanningEnvironment::NotApplicable,
+            &CATALOG,
+            &STATISTICS,
+            &FUNCTIONS,
+            control(None, &cancellation),
+        );
+
+        assert!(matches!(request.intent, SqlCompileIntent::LogicalOnly));
+        assert!(matches!(
+            request.environment,
+            SqlPlanningEnvironment::NotApplicable
+        ));
+        assert!(request.imv_rewrite.is_some());
+        let _: fn(SqlImvRefreshExplainContext<'_>) -> Result<Vec<String>, SqlCompileError> =
+            compile_imv_refresh_explain_lines;
     }
 
     fn explain_operator_facts(node_id: i32) -> SqlExplainAnalyzeOperatorFacts {
@@ -1472,6 +1640,111 @@ mod tests {
             validate_imv_rewrite_outcome(&input, &outcome),
             Err(SqlCompileError::Compilation(error)) if error.contains("RewriteAggregateState")
         ));
+    }
+
+    #[test]
+    fn aggregate_refresh_rejects_unchanged_rewrite_outcome() {
+        let error = validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::Aggregate),
+            &imv_validation_outcome(&[], false),
+        )
+        .expect_err("aggregate refresh must not continue with unchanged rewrite outcome");
+        assert!(
+            error
+                .to_string()
+                .contains("did not apply RewriteAggregateState")
+        );
+    }
+
+    #[test]
+    fn aggregate_refresh_rejects_missing_merge_plan_evidence() {
+        let error = validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::Aggregate),
+            &imv_validation_outcome(&["RewriteAggregateState"], false),
+        )
+        .expect_err("aggregate refresh must require change stream in the rewrite plan");
+        assert!(
+            error
+                .to_string()
+                .contains("does not contain aggregate state change stream")
+        );
+    }
+
+    #[test]
+    fn join_aggregate_refresh_rejects_missing_join_rewrite_evidence() {
+        let error = validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::JoinAggregate),
+            &imv_validation_outcome(&["RewriteAggregateState"], true),
+        )
+        .expect_err("join aggregate refresh must require join rewrite evidence");
+        assert!(error.to_string().contains("did not apply RewriteJoinDelta"));
+    }
+
+    #[test]
+    fn join_aggregate_refresh_missing_merge_plan_uses_join_label() {
+        let error = validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::JoinAggregate),
+            &imv_validation_outcome(&["RewriteJoinDelta", "RewriteAggregateState"], false),
+        )
+        .expect_err("join aggregate refresh must require change stream in the rewrite plan");
+        assert!(
+            error.to_string().contains("iceberg join aggregate MV")
+                && error
+                    .to_string()
+                    .contains("does not contain aggregate state change stream")
+        );
+    }
+
+    #[test]
+    fn branch_union_aggregate_refresh_rejects_missing_branch_union_rewrite_evidence() {
+        let error = validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::BranchUnionAggregate),
+            &imv_validation_outcome(&["RewriteAggregateState"], true),
+        )
+        .expect_err("branch UNION ALL aggregate refresh must require branch rewrite evidence");
+        assert!(
+            error.to_string().contains("branch UNION ALL aggregate")
+                && error
+                    .to_string()
+                    .contains("did not apply RewriteBranchUnion")
+        );
+    }
+
+    #[test]
+    fn branch_union_aggregate_refresh_requires_state_merge_plan_evidence() {
+        let error = validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::BranchUnionAggregate),
+            &imv_validation_outcome(&["RewriteBranchUnion"], false),
+        )
+        .expect_err("branch UNION ALL aggregate refresh must require change-stream plan evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("iceberg branch UNION ALL aggregate MV")
+                && error
+                    .to_string()
+                    .contains("does not contain aggregate state change stream")
+        );
+    }
+
+    #[test]
+    fn branch_union_aggregate_refresh_accepts_branch_rewrite_with_change_stream_plan() {
+        validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::BranchUnionAggregate),
+            &imv_validation_outcome(&["RewriteBranchUnion"], true),
+        )
+        .expect("branch UNION ALL aggregate refresh should accept aggregate-state change-stream evidence");
+    }
+
+    #[test]
+    fn aggregate_refresh_accepts_change_stream_descriptor_evidence() {
+        validate_imv_rewrite_outcome(
+            &imv_validation_input(SqlImvRewriteValidation::Aggregate),
+            &imv_validation_outcome(&["RewriteAggregateState"], true),
+        )
+        .expect(
+            "aggregate refresh should accept aggregate-state change-stream descriptor evidence",
+        );
     }
 }
 pub(crate) mod mv_rewrite;

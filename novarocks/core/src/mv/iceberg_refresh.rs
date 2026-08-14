@@ -64,7 +64,7 @@ use crate::mv::persistence::schema::{
 };
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
-use crate::mv::refresh::contract::{ImvRefreshContract, MvTargetWriteEffect};
+use crate::mv::refresh::contract::ImvRefreshContract;
 use crate::mv::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
     plan_non_join_incremental_changes,
@@ -104,15 +104,7 @@ use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExecutionBindingKey,
     ConnectorInstanceId, ConnectorTableIdentity,
 };
-#[cfg(test)]
-use novarocks_sql::analysis::ProjectItem;
-use novarocks_sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-use novarocks_sql::catalog::ResolvedAnalyzerTable;
-use novarocks_sql::column_id::ColumnId;
 use novarocks_sql::mv_refresh::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
-use novarocks_sql::planner::table::{
-    ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
-};
 use novarocks_sql::planning::mv::UnionBranchKind;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
@@ -4443,10 +4435,6 @@ mod tests {
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::PartitionPruningPolicy;
     use arrow::datatypes::DataType;
-    use novarocks_sql::optimizer::scalar::ScalarArena;
-    use novarocks_sql::planner::logical::*;
-    use novarocks_sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
-    use novarocks_sql::planner::payload::*;
     use std::cell::Cell;
 
     #[test]
@@ -4549,231 +4537,6 @@ mod tests {
                 .any(|effect| *effect
                     == novarocks_spi::connector::ConnectorRowMutationEffect::Replace)
         );
-    }
-
-    #[test]
-    fn normalize_imv_rewrite_root_project_preserves_aggregate_output_identity() {
-        let group_output = OutputColumn {
-            column_id: ColumnId::new_for_test(1),
-            name: "region".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            is_internal: false,
-        };
-        let aggregate_output = OutputColumn {
-            column_id: ColumnId::new_for_test(11),
-            name: "sum(amount)".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
-            is_internal: false,
-        };
-        let child = LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: vec![group_output.clone()],
-            }),
-            vec![],
-            None,
-        );
-        let aggregate = LogicalPlanNode::new(
-            LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![column_ref_expr(&group_output)],
-                aggregates: vec![AggregateCall {
-                    name: "sum".to_string(),
-                    args: Vec::new(),
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: Vec::new(),
-                    output_column_id: aggregate_output.column_id,
-                }],
-                output_columns: vec![group_output.clone(), aggregate_output.clone()],
-                already_pushed: false,
-            }),
-            vec![child],
-            None,
-        );
-        let root = LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: vec![
-                    ProjectItem {
-                        expr: column_ref_expr(&group_output),
-                        output_name: "region".to_string(),
-                        output_column_id: ColumnId::new_for_test(21),
-                    },
-                    ProjectItem {
-                        expr: column_ref_expr(&aggregate_output),
-                        output_name: "s".to_string(),
-                        output_column_id: ColumnId::new_for_test(22),
-                    },
-                ],
-                output_qualifier: None,
-            }),
-            vec![aggregate],
-            None,
-        );
-
-        let normalized = normalize_imv_rewrite_root_project(root);
-        let LogicalPlanKind::Aggregate(aggregate) = &normalized.kind else {
-            panic!(
-                "expected normalized root Aggregate, got {:?}",
-                normalized.kind
-            );
-        };
-
-        assert_eq!(
-            aggregate
-                .output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (group_output.column_id, "region"),
-                (aggregate_output.column_id, "s")
-            ]
-        );
-        assert_eq!(
-            aggregate.aggregates[0].output_column_id,
-            aggregate_output.column_id
-        );
-
-        let mut arena = ScalarArena::new();
-        try_to_optimizer_expr(&normalized, &mut arena)
-            .expect("normalized aggregate must satisfy optimizer bridge contract");
-    }
-
-    #[test]
-    fn normalize_imv_rewrite_root_project_keeps_reordered_passthrough_project() {
-        let (g1, g2, sum_output) = normalization_aggregate_outputs();
-        let root = normalization_project_over_aggregate(vec![
-            normalization_project_item(&g2, 21, "g2"),
-            normalization_project_item(&g1, 22, "g1"),
-            normalization_project_item(&sum_output, 23, "s"),
-        ]);
-
-        let normalized = normalize_imv_rewrite_root_project(root);
-
-        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
-        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
-            panic!("expected preserved Project over Aggregate");
-        };
-        assert_eq!(
-            aggregate
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![g1.column_id, g2.column_id, sum_output.column_id]
-        );
-    }
-
-    #[test]
-    fn normalize_imv_rewrite_root_project_keeps_duplicate_passthrough_project() {
-        let (g1, g2, sum_output) = normalization_aggregate_outputs();
-        let root = normalization_project_over_aggregate(vec![
-            normalization_project_item(&g1, 21, "g1"),
-            normalization_project_item(&g1, 22, "g1_again"),
-            normalization_project_item(&sum_output, 23, "s"),
-        ]);
-
-        let normalized = normalize_imv_rewrite_root_project(root);
-
-        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
-        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
-            panic!("expected preserved Project over Aggregate");
-        };
-        assert_eq!(
-            aggregate
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![g1.column_id, g2.column_id, sum_output.column_id]
-        );
-    }
-
-    fn normalization_aggregate_outputs() -> (OutputColumn, OutputColumn, OutputColumn) {
-        (
-            normalization_output_column(1, "g1", DataType::Utf8, false),
-            normalization_output_column(2, "g2", DataType::Utf8, false),
-            normalization_output_column(11, "sum(amount)", DataType::Int64, true),
-        )
-    }
-
-    fn normalization_project_over_aggregate(project_items: Vec<ProjectItem>) -> LogicalPlanNode {
-        let (g1, g2, sum_output) = normalization_aggregate_outputs();
-        let child = LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: vec![g1.clone(), g2.clone()],
-            }),
-            vec![],
-            None,
-        );
-        let aggregate = LogicalPlanNode::new(
-            LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![column_ref_expr(&g1), column_ref_expr(&g2)],
-                aggregates: vec![AggregateCall {
-                    name: "sum".to_string(),
-                    args: Vec::new(),
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: Vec::new(),
-                    output_column_id: sum_output.column_id,
-                }],
-                output_columns: vec![g1, g2, sum_output],
-                already_pushed: false,
-            }),
-            vec![child],
-            None,
-        );
-        LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: project_items,
-                output_qualifier: None,
-            }),
-            vec![aggregate],
-            None,
-        )
-    }
-
-    fn normalization_project_item(
-        source: &OutputColumn,
-        output_id: u32,
-        name: &str,
-    ) -> ProjectItem {
-        ProjectItem {
-            expr: column_ref_expr(source),
-            output_name: name.to_string(),
-            output_column_id: ColumnId::new_for_test(output_id),
-        }
-    }
-
-    fn normalization_output_column(
-        id: u32,
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-    ) -> OutputColumn {
-        OutputColumn {
-            column_id: ColumnId::new_for_test(id),
-            name: name.to_string(),
-            data_type,
-            nullable,
-            is_internal: false,
-        }
-    }
-
-    #[test]
-    fn imv_change_stream_write_recognizes_physical_change_op_by_reserved_shape() {
-        let output = OutputColumn {
-            column_id: ColumnId(17),
-            name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
-            is_internal: false,
-        };
-
-        assert!(is_imv_change_op_output_column(&output));
     }
 
     #[test]
@@ -7489,190 +7252,6 @@ fn synthetic_snapshot_object_name(
     ])
 }
 
-/// Build a one-shot InMemoryCatalog for IMV optimizer-pipeline planning.
-///
-/// Registers each base in `ctx.rewrite.base_refs` under its namespace at
-/// the snapshot captured by `ctx.rewrite.pin`. The catalog mirrors what
-/// `canonical_select_query` references after `canonicalize_iceberg_mv_select_query`
-/// rewrites `db.table` to `db.<synthetic>_at_<snapshot_id>`.
-///
-/// Reuses `build_iceberg_table_def_for_snapshot_scan` for per-base
-/// table-def construction, so schemas / partition specs match what the
-/// existing snapshot-scan path already uses.
-/// Re-plan ctx.rewrite.canonical_select_query into a LogicalPlanNode suitable
-/// for handing to `run_imv_rewrite`.
-///
-/// Failure here is fail-fast: if the canonical SELECT cannot be analyzed
-/// or planned, the refresh attempt aborts. This deliberately surfaces
-/// canonicalization bugs early rather than tolerating divergence between
-/// today's hand-built refresh path and the IMV pipeline.
-/// Plan a canonical IMV SELECT against the same request-local bindings that
-/// will later prepare its scans.  This is the application adapter for the
-/// remaining logical join artifact: it deliberately does not re-register
-/// snapshot tables in `PlannerMemoryCatalog`.
-pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
-    query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
-    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    bindings: Arc<QueryTableBindingStore>,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
-    overlays: Vec<crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay>,
-) -> Result<
-    (
-        novarocks_sql::planner::logical::LogicalPlanNode,
-        novarocks_sql::column_id::ColumnRefFactory,
-    ),
-    RefreshError,
-> {
-    let catalog_service_snapshot =
-        crate::query_execution::compiler::catalog_service_snapshot(query_kernel);
-    let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-        None,
-        &catalog_service_snapshot,
-        bindings,
-        crate::query_execution::planning::statistics::iceberg_table_binding_loader(
-            query_kernel.connector_control().as_ref(),
-            connector_context.clone(),
-        ),
-        overlays,
-    );
-    let mut query = (*rewrite.canonical_select_query).clone();
-    novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
-    let statistics =
-        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            query_kernel,
-            materializer.query_table_bindings(),
-        );
-    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| {
-            RefreshError::user("IMV join planning requires a non-empty admitted backend topology")
-        })?;
-    let request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
-        novarocks_sql::compiler::SqlCompileIntent::LogicalOnly,
-        novarocks_sql::compiler::SqlSessionContext {
-            current_catalog: None,
-            current_database: rewrite.current_database.clone(),
-            optimizer_settings: execution.optimizer_settings().clone(),
-        },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
-        &catalog,
-        &statistics,
-        novarocks_sql::functions::builtin_sql_function_catalog(),
-        None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
-    );
-    let novarocks_sql::compiler::SqlCompileOutput::Logical(output) =
-        novarocks_sql::compiler::SqlCompiler::compile(request).map_err(|error| {
-            RefreshError::user(format!(
-                "imv plan failed for {}.{}.{}: canonical SQL compiler: {error}",
-                rewrite.target.catalog, rewrite.target.namespace, rewrite.target.table
-            ))
-        })?
-    else {
-        return Err(RefreshError::user(
-            "IMV logical intent did not produce logical SQL facts",
-        ));
-    };
-    Ok((
-        novarocks_sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
-            output.logical_plan,
-        ),
-        output.factory,
-    ))
-}
-
-#[cfg(test)]
-pub(crate) fn normalize_imv_rewrite_root_project(
-    plan: novarocks_sql::planner::logical::LogicalPlanNode,
-) -> novarocks_sql::planner::logical::LogicalPlanNode {
-    use novarocks_sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-
-    let LogicalPlanNode {
-        kind,
-        mut children,
-        required_output_columns,
-    } = plan;
-    let LogicalPlanKind::Project(project) = kind else {
-        return LogicalPlanNode::new(kind, children, required_output_columns);
-    };
-    let input = children.remove(0);
-    let LogicalPlanNode {
-        kind: input_kind,
-        children: aggregate_children,
-        required_output_columns: aggregate_required_output_columns,
-    } = input;
-    let LogicalPlanKind::Aggregate(mut aggregate) = input_kind else {
-        let input = LogicalPlanNode::new(
-            input_kind,
-            aggregate_children,
-            aggregate_required_output_columns,
-        );
-        return LogicalPlanNode::new(
-            LogicalPlanKind::Project(project),
-            vec![input],
-            required_output_columns,
-        );
-    };
-    if project.items.len() != aggregate.output_columns.len() {
-        let input = LogicalPlanNode::new(
-            LogicalPlanKind::Aggregate(aggregate),
-            aggregate_children,
-            aggregate_required_output_columns,
-        );
-        return LogicalPlanNode::new(
-            LogicalPlanKind::Project(project),
-            vec![input],
-            required_output_columns,
-        );
-    }
-    let Some(output_columns) = project
-        .items
-        .iter()
-        .zip(aggregate.output_columns.iter())
-        .map(|item| {
-            let (item, aggregate_output) = item;
-            let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind else {
-                return None;
-            };
-            if *column_id != aggregate_output.column_id {
-                return None;
-            }
-            Some(novarocks_sql::analysis::OutputColumn {
-                column_id: *column_id,
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
-                is_internal: false,
-            })
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        let input = LogicalPlanNode::new(
-            LogicalPlanKind::Aggregate(aggregate),
-            aggregate_children,
-            aggregate_required_output_columns,
-        );
-        return LogicalPlanNode::new(
-            LogicalPlanKind::Project(project),
-            vec![input],
-            required_output_columns,
-        );
-    };
-    aggregate.output_columns = output_columns;
-    LogicalPlanNode::new(
-        LogicalPlanKind::Aggregate(aggregate),
-        aggregate_children,
-        aggregate_required_output_columns,
-    )
-}
-
 fn refresh_explain_rewrite_disabled_rules(
     is_aggregate_refresh: bool,
     optimizer_settings: &novarocks_sql::compiler::SessionOptimizerSettings,
@@ -7687,61 +7266,6 @@ fn refresh_explain_rewrite_disabled_rules(
     }
     disabled_rules
 }
-
-#[cfg(test)]
-fn validate_aggregate_refresh_rewrite_outcome(
-    ctx: &crate::mv::rewrite::context::IcebergMvRewriteContext,
-    outcome: &novarocks_sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
-    evidence: RewriteMergeRefreshEvidence,
-) -> Result<(), String> {
-    if evidence == RewriteMergeRefreshEvidence::JoinAggregate
-        && !rewrite_outcome_rule_changed(outcome, "RewriteJoinDelta")
-    {
-        return Err(format!(
-            "iceberg join aggregate MV {} incremental refresh rewrite did not apply RewriteJoinDelta",
-            ctx.target.fqn()
-        ));
-    }
-    if evidence == RewriteMergeRefreshEvidence::BranchUnionAggregate
-        && !rewrite_outcome_rule_changed(outcome, "RewriteBranchUnion")
-    {
-        return Err(format!(
-            "iceberg branch UNION ALL aggregate MV {} incremental refresh rewrite did not apply RewriteBranchUnion",
-            ctx.target.fqn()
-        ));
-    }
-    if evidence != RewriteMergeRefreshEvidence::BranchUnionAggregate
-        && !rewrite_outcome_rule_changed(outcome, "RewriteAggregateState")
-    {
-        let label = match evidence {
-            RewriteMergeRefreshEvidence::JoinAggregate => "join aggregate",
-            _ => "aggregate",
-        };
-        return Err(format!(
-            "iceberg {label} MV {} incremental refresh rewrite did not apply RewriteAggregateState",
-            ctx.target.fqn()
-        ));
-    }
-    if !outcome.annotation.change_stream.has_aggregate() {
-        let label = match evidence {
-            RewriteMergeRefreshEvidence::JoinAggregate => "join aggregate",
-            RewriteMergeRefreshEvidence::BranchUnionAggregate => "branch UNION ALL aggregate",
-            _ => "aggregate",
-        };
-        return Err(format!(
-            "iceberg {label} MV {} incremental refresh rewrite plan does not contain aggregate state change stream",
-            ctx.target.fqn()
-        ));
-    }
-    tracing::info!(
-        mv_target = ?ctx.target,
-        mv_id = ctx.mv_id,
-        stages = ?outcome.trace.stage_names(),
-        "iceberg aggregate MV incremental refresh rewrite evidence validated"
-    );
-    Ok(())
-}
-
 fn sql_imv_planning_input_from_rewrite(
     rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
     target_binding: novarocks_sql::binding::SqlTableBindingId,
@@ -7807,43 +7331,30 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
         frozen_snapshot_id,
     );
     let token = store.resolve_or_insert_with_id(key, |binding| {
-        let identity = SqlTableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        };
-        let source = ScanSource::Sql(SqlScanSource::new(
-            binding,
-            identity,
-            SqlScanKind::MvTargetLocator {
-                facts: SqlMvTargetLocatorScan {
-                    target_table_uuid: target_table_uuid.clone(),
-                    target_snapshot_id: frozen_snapshot_id,
-                    apply_key_column: rewrite
-                        .schema_contract
-                        .target
-                        .hidden_apply_key
-                        .column_name
-                        .clone(),
-                    branch_id_column: rewrite
-                        .schema_contract
-                        .branch
-                        .as_ref()
-                        .map(|branch| branch.branch_id_column.column_name.clone()),
-                },
-            },
-        ));
+        let resolved = novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
+            novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
+                target.catalog.clone(),
+                target.namespace.clone(),
+                target.table.clone(),
+                target_table_uuid.clone(),
+                frozen_snapshot_id,
+                rewrite
+                    .schema_contract
+                    .target
+                    .hidden_apply_key
+                    .column_name
+                    .clone(),
+                rewrite
+                    .schema_contract
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.branch_id_column.column_name.clone()),
+                binding,
+            )?,
+        )
+        .into_resolved_table();
         Ok(QueryTableBinding {
-            resolved: ResolvedAnalyzerTable::from_planner(
-                Some(&target.catalog),
-                &target.namespace,
-                TableDef {
-                    name: target.table.clone(),
-                    columns: Vec::new(),
-                    iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source,
-                },
-            ),
+            resolved,
             // IMV target scans use their frozen file materialization; no
             // optimizer statistics are resolved for this target as a side
             // channel during refresh preparation.
@@ -7970,20 +7481,6 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
         );
     }
     Ok(overlays)
-}
-
-#[cfg(test)]
-fn rewrite_outcome_rule_changed(
-    outcome: &novarocks_sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
-    rule_name: &str,
-) -> bool {
-    outcome.trace.events().iter().any(|event| {
-        matches!(
-            event,
-            novarocks_sql::optimizer::rewrite::trace::RewriteTraceEvent::RuleChanged { rule, .. }
-                if *rule == rule_name
-        )
-    })
 }
 
 #[cfg(test)]
@@ -8156,214 +7653,6 @@ mod partition_planning_tests {
             crate::mv::model::AffectedTargetPartitions::known(std::iter::empty::<
                 crate::mv::model::MvPartitionKey,
             >(),)
-        );
-    }
-}
-
-#[cfg(test)]
-mod aggregate_refresh_rewrite_validation_tests {
-    use super::*;
-
-    use novarocks_sql::column_id::ColumnId;
-    use novarocks_sql::optimizer::rewrite::phase::RewritePhase;
-    use novarocks_sql::optimizer::rewrite::trace::RewriteTrace;
-    use novarocks_sql::planner::imv_rewrite::annotation::ImvPlanAnnotation;
-    use novarocks_sql::planner::imv_rewrite::change_stream::{
-        AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
-        SignedStateAggregateProof, TargetStateProof,
-    };
-    use novarocks_sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome;
-    use novarocks_sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-    use novarocks_sql::planner::payload::PlanValuesNode;
-
-    fn empty_values_plan() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            }),
-            vec![],
-            None,
-        )
-    }
-
-    fn outcome(plan: LogicalPlanNode, changed_rules: &[&'static str]) -> ImvRewriteOutcome {
-        let mut trace = RewriteTrace::default();
-        for rule in changed_rules {
-            trace.rule_changed(RewritePhase::SemanticRewrite, rule, 0);
-        }
-        ImvRewriteOutcome {
-            plan,
-            trace,
-            annotation: ImvPlanAnnotation::default(),
-        }
-    }
-
-    fn aggregate_change_stream_descriptor() -> ImvChangeStreamDescriptor {
-        ImvChangeStreamDescriptor {
-            aggregate: Some(AggregateChangeStreamDescriptor {
-                action_column_id: ColumnId::new_for_test(1),
-                action_column_name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
-                    .to_string(),
-                shape: AggregateChangeStreamShape::UnionChangeStream,
-                target_state: TargetStateProof { present: true },
-                signed_state_aggregate: SignedStateAggregateProof { present: true },
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn outcome_with_aggregate_descriptor(
-        plan: LogicalPlanNode,
-        changed_rules: &[&'static str],
-    ) -> ImvRewriteOutcome {
-        let mut outcome = outcome(plan, changed_rules);
-        outcome.annotation.change_stream = aggregate_change_stream_descriptor();
-        outcome
-    }
-
-    #[test]
-    fn aggregate_refresh_rejects_unchanged_rewrite_outcome() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome = outcome(empty_values_plan(), &[]);
-
-        let err = validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::Aggregate,
-        )
-        .expect_err("aggregate refresh must not continue with unchanged rewrite outcome");
-
-        assert!(
-            err.contains("did not apply RewriteAggregateState"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn aggregate_refresh_rejects_missing_merge_plan_evidence() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome = outcome(empty_values_plan(), &["RewriteAggregateState"]);
-
-        let err = validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::Aggregate,
-        )
-        .expect_err("aggregate refresh must require change stream in the rewrite plan");
-
-        assert!(
-            err.contains("does not contain aggregate state change stream"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn join_aggregate_refresh_rejects_missing_join_rewrite_evidence() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome =
-            outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteAggregateState"]);
-
-        let err = validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::JoinAggregate,
-        )
-        .expect_err("join aggregate refresh must require join rewrite evidence");
-
-        assert!(err.contains("did not apply RewriteJoinDelta"), "got: {err}");
-    }
-
-    #[test]
-    fn join_aggregate_refresh_missing_merge_plan_uses_join_label() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome = outcome(
-            empty_values_plan(),
-            &["RewriteJoinDelta", "RewriteAggregateState"],
-        );
-
-        let err = validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::JoinAggregate,
-        )
-        .expect_err("join aggregate refresh must require change stream in the rewrite plan");
-
-        assert!(
-            err.contains("iceberg join aggregate MV")
-                && err.contains("does not contain aggregate state change stream"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn branch_union_aggregate_refresh_rejects_missing_branch_union_rewrite_evidence() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome =
-            outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteAggregateState"]);
-
-        let err = validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::BranchUnionAggregate,
-        )
-        .expect_err("branch UNION ALL aggregate refresh must require branch rewrite evidence");
-
-        assert!(
-            err.contains("branch UNION ALL aggregate")
-                && err.contains("did not apply RewriteBranchUnion"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn branch_union_aggregate_refresh_requires_state_merge_plan_evidence() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome = outcome(empty_values_plan(), &["RewriteBranchUnion"]);
-
-        let err = validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::BranchUnionAggregate,
-        )
-        .expect_err("branch UNION ALL aggregate refresh must require change-stream plan evidence");
-
-        assert!(
-            err.contains("iceberg branch UNION ALL aggregate MV")
-                && err.contains("does not contain aggregate state change stream"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn branch_union_aggregate_refresh_accepts_branch_rewrite_with_change_stream_plan() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome =
-            outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteBranchUnion"]);
-
-        validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::BranchUnionAggregate,
-        )
-        .expect(
-            "branch UNION ALL aggregate refresh should accept branch rewrite with aggregate-state change-stream evidence",
-        );
-    }
-
-    #[test]
-    fn aggregate_refresh_accepts_change_stream_descriptor_evidence() {
-        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
-        let outcome =
-            outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteAggregateState"]);
-
-        validate_aggregate_refresh_rewrite_outcome(
-            &ctx,
-            &outcome,
-            RewriteMergeRefreshEvidence::Aggregate,
-        )
-        .expect(
-            "aggregate refresh should accept aggregate-state change-stream descriptor evidence",
         );
     }
 }
@@ -8604,36 +7893,30 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
             materializer.query_table_bindings(),
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-    let mut query = (*rewrite.canonical_select_query).clone();
-    novarocks_sql::planning::mv::strip_catalog_from_three_part_names(&mut query);
-    let input = novarocks_sql::compiler::SqlImvPlanningInput::new(
-        rewrite.to_sql_rewrite_snapshot(target_binding)?,
-        novarocks_sql::compiler::SqlImvRewriteValidation::None,
-    );
-    let request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
-        novarocks_sql::compiler::SqlCompileIntent::LogicalOnly,
-        novarocks_sql::compiler::SqlSessionContext {
+    novarocks_sql::compiler::compile_imv_refresh_explain_lines(
+        novarocks_sql::compiler::SqlImvRefreshExplainContext {
+            canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
+            imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput::new(
+                rewrite.to_sql_rewrite_snapshot(target_binding)?,
+                novarocks_sql::compiler::SqlImvRewriteValidation::None,
+            ),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
+            environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
+            catalog: &catalog,
+            statistics: &statistics,
+            functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+            control: novarocks_sql::compiler::SqlCompileControl::new(
+                Some(connector_context.deadline()),
+                Arc::new(MvRefreshConnectorCancellationObservation {
+                    cancellation: connector_context.cancellation().clone(),
+                }),
+            ),
+            level,
         },
-        novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
-        &catalog,
-        &statistics,
-        novarocks_sql::compiler::builtin_sql_function_catalog(),
-        None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            Some(connector_context.deadline()),
-            Arc::new(MvRefreshConnectorCancellationObservation {
-                cancellation: connector_context.cancellation().clone(),
-            }),
-        ),
     )
-    .with_imv_rewrite(&input);
-    novarocks_sql::compiler::SqlCompiler::compile(request)
-        .and_then(|output| output.into_explain_lines(level, true))
-        .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())
 }
 
 struct MvRefreshConnectorCancellationObservation {
@@ -8645,18 +7928,6 @@ impl novarocks_sql::compiler::SqlCancellationObservation
 {
     fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
-    }
-}
-
-fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: column.column_id,
-            qualifier: None,
-            column: column.name.clone(),
-        },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
     }
 }
 
