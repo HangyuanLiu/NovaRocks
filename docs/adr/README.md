@@ -237,9 +237,12 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 
 ### configuration
 
-领域哲学：配置由组合根加载并按值注入，不存在进程级 `config()` 单例。深层执行/连接器代码
-接收构造时传入的字段，配置校验尽量前移到启动而不是首次使用；debug/test 开关归启动进程的
-环境变量，不进配置文件。真正的进程单例（如 data runtime）保留单例形态，但其配置尺寸由
-组合根显式安装，且安装晚于首次使用时启动失败而非静默降级。
+领域哲学：Server composition root 唯一拥有完整应用 TOML wire、默认值、加载与跨 section 校验，并在启动时一次性投影为
+各 owner 的 resolved typed input；domain crate 不重复解析 TOML，也不接收完整根配置。不存在进程级 `config()` 单例，
+debug/test 开关归启动进程环境。跨域 wire section 不因名字相似而整体归某一 kernel crate，Core 不拥有 application schema。
 
-- ADR-0059 — 配置为何由组合根注入，而不从进程全局读取（active）
+- ADR-0072 — 完整应用配置 wire 为何由 Server 唯一拥有，并投影为各 domain 的 resolved typed input（active）
+
+#### 历史
+
+- ADR-0059 — 配置为何由组合根注入，而不从进程全局读取（superseded → ADR-0072）
