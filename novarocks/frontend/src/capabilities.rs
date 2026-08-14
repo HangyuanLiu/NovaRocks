@@ -658,7 +658,7 @@ pub fn bind_statistics_table_reader(
 /// capability as the rest of this startup composition.
 #[derive(Clone)]
 pub struct StatisticsAttemptExecutorPorts {
-    execution_role: novarocks::common::app_config::ClusterRole,
+    execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
@@ -667,7 +667,7 @@ pub struct StatisticsAttemptExecutorPorts {
 
 impl StatisticsAttemptExecutorPorts {
     pub fn new(
-        execution_role: novarocks::common::app_config::ClusterRole,
+        execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
@@ -730,7 +730,7 @@ pub fn background_maintenance_engine(
 /// and topology. `QueryExecutionContext` remains opaque so callers cannot
 /// manufacture a default topology, deadline, or cancellation identity.
 pub fn background_maintenance_attempt(
-    role: novarocks::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
     topology: BackendTopologyService,
 ) -> Result<novarocks::maintenance::BackgroundMaintenanceAttempt, String> {
     let topology = topology.snapshot().map_err(|error| error.to_string())?;

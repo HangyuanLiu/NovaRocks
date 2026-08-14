@@ -25,7 +25,7 @@ use novarocks_server::composition;
 struct StandaloneServerCliArgs {
     mysql_port: Option<u16>,
     config_path: Option<String>,
-    role: Option<novarocks::common::app_config::ClusterRole>,
+    role: Option<novarocks_types::ClusterRole>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,7 +75,7 @@ fn parse_standalone_server_args(
     let mut idx = 0usize;
     let mut mysql_port: Option<u16> = None;
     let mut config_path: Option<String> = None;
-    let mut role: Option<novarocks::common::app_config::ClusterRole> = None;
+    let mut role: Option<novarocks_types::ClusterRole> = None;
 
     while let Some(arg) = args.get(idx) {
         match arg.as_str() {
@@ -147,11 +147,11 @@ fn parse_server_command(args: &[String]) -> Result<ServerCommand, String> {
     }
 }
 
-fn parse_cluster_role(value: &str) -> Result<novarocks::common::app_config::ClusterRole, String> {
+fn parse_cluster_role(value: &str) -> Result<novarocks_types::ClusterRole, String> {
     match value {
-        "fe" => Ok(novarocks::common::app_config::ClusterRole::Fe),
-        "be" => Ok(novarocks::common::app_config::ClusterRole::Be),
-        "all-in-one" => Ok(novarocks::common::app_config::ClusterRole::AllInOne),
+        "fe" => Ok(novarocks_types::ClusterRole::Fe),
+        "be" => Ok(novarocks_types::ClusterRole::Be),
+        "all-in-one" => Ok(novarocks_types::ClusterRole::AllInOne),
         other => Err(format!(
             "invalid cluster role '{}'; expected one of: fe, be, all-in-one",
             other
@@ -161,8 +161,8 @@ fn parse_cluster_role(value: &str) -> Result<novarocks::common::app_config::Clus
 
 fn resolve_cluster_role(
     cfg: &novarocks::common::app_config::NovaRocksConfig,
-    role_override: Option<novarocks::common::app_config::ClusterRole>,
-) -> novarocks::common::app_config::ClusterRole {
+    role_override: Option<novarocks_types::ClusterRole>,
+) -> novarocks_types::ClusterRole {
     role_override.unwrap_or(cfg.cluster.role)
 }
 
@@ -175,7 +175,7 @@ fn load_config_and_resolve_role(
     cli: &StandaloneServerCliArgs,
 ) -> anyhow::Result<(
     novarocks::common::app_config::NovaRocksConfig,
-    novarocks::common::app_config::ClusterRole,
+    novarocks_types::ClusterRole,
     Option<PathBuf>,
 )> {
     // C2: honour NOVAROCKS_CONFIG env var and ./novarocks.toml fallback, not
@@ -216,7 +216,7 @@ fn be_role_start_warning(port_override: Option<u16>) -> Option<String> {
 }
 
 fn dispatch_standalone_role_with_all_in_one(
-    role: novarocks::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
     cfg: novarocks::common::app_config::NovaRocksConfig,
     port_override: Option<u16>,
     run_frontend: impl FnOnce(
@@ -233,9 +233,9 @@ fn dispatch_standalone_role_with_all_in_one(
     ) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match role {
-        novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
-        novarocks::common::app_config::ClusterRole::Fe => run_frontend(cfg, port_override),
-        novarocks::common::app_config::ClusterRole::Be => run_backend(cfg, port_override),
+        novarocks_types::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
+        novarocks_types::ClusterRole::Fe => run_frontend(cfg, port_override),
+        novarocks_types::ClusterRole::Be => run_backend(cfg, port_override),
     }
 }
 
@@ -448,7 +448,7 @@ mod tests {
             ServerCommand::Standalone(StandaloneServerCliArgs {
                 mysql_port: None,
                 config_path: Some("test.toml".to_string()),
-                role: Some(novarocks::common::app_config::ClusterRole::Be),
+                role: Some(novarocks_types::ClusterRole::Be),
             })
         );
     }
@@ -459,8 +459,8 @@ mod tests {
         #[test]
         fn fe_and_all_in_one_dispatch_use_distinct_composition_roots() {
             for role in [
-                novarocks::common::app_config::ClusterRole::Fe,
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::Fe,
+                novarocks_types::ClusterRole::AllInOne,
             ] {
                 let frontend_calls = std::cell::Cell::new(0);
                 let backend_calls = std::cell::Cell::new(0);
@@ -485,12 +485,12 @@ mod tests {
                 .expect("role dispatch should succeed");
                 assert_eq!(
                     frontend_calls.get(),
-                    (role == novarocks::common::app_config::ClusterRole::Fe) as usize
+                    (role == novarocks_types::ClusterRole::Fe) as usize
                 );
                 assert_eq!(backend_calls.get(), 0, "{role:?} must not invoke backend");
                 assert_eq!(
                     all_in_one_calls.get(),
-                    (role == novarocks::common::app_config::ClusterRole::AllInOne) as usize
+                    (role == novarocks_types::ClusterRole::AllInOne) as usize
                 );
             }
         }
@@ -502,7 +502,7 @@ mod tests {
             let all_in_one_calls = std::cell::Cell::new(0);
 
             dispatch_standalone_role_with_all_in_one(
-                novarocks::common::app_config::ClusterRole::Be,
+                novarocks_types::ClusterRole::Be,
                 novarocks::common::app_config::NovaRocksConfig::default(),
                 None,
                 |_, _| {
@@ -580,10 +580,7 @@ mod tests {
         let parsed = parse_standalone_server_args(&args)
             .expect("parse args")
             .expect("args");
-        assert_eq!(
-            parsed.role,
-            Some(novarocks::common::app_config::ClusterRole::Fe)
-        );
+        assert_eq!(parsed.role, Some(novarocks_types::ClusterRole::Fe));
         assert_eq!(parsed.config_path.as_deref(), Some("fe.toml"));
     }
 
@@ -593,10 +590,7 @@ mod tests {
         let parsed = parse_standalone_server_args(&args)
             .expect("parse args")
             .expect("args");
-        assert_eq!(
-            parsed.role,
-            Some(novarocks::common::app_config::ClusterRole::AllInOne)
-        );
+        assert_eq!(parsed.role, Some(novarocks_types::ClusterRole::AllInOne));
     }
 
     #[test]
@@ -609,9 +603,9 @@ mod tests {
     #[test]
     fn test_role_override_wins_over_config() {
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
-        cfg.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
-        let role = resolve_cluster_role(&cfg, Some(novarocks::common::app_config::ClusterRole::Fe));
-        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        cfg.cluster.role = novarocks_types::ClusterRole::AllInOne;
+        let role = resolve_cluster_role(&cfg, Some(novarocks_types::ClusterRole::Fe));
+        assert_eq!(role, novarocks_types::ClusterRole::Fe);
     }
 
     #[test]
@@ -619,7 +613,7 @@ mod tests {
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends.clear();
         dispatch_standalone_role_with_all_in_one(
-            novarocks::common::app_config::ClusterRole::Fe,
+            novarocks_types::ClusterRole::Fe,
             cfg,
             None,
             |_, _| Ok(()),
@@ -664,7 +658,7 @@ mod tests {
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends = vec![addr1.to_string(), addr2.to_string()];
         dispatch_standalone_role_with_all_in_one(
-            novarocks::common::app_config::ClusterRole::Fe,
+            novarocks_types::ClusterRole::Fe,
             cfg,
             None,
             |_, _| Ok(()),
@@ -688,7 +682,7 @@ mod tests {
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends = vec![live_addr.to_string(), format!("127.0.0.1:{dead_port}")];
         dispatch_standalone_role_with_all_in_one(
-            novarocks::common::app_config::ClusterRole::Fe,
+            novarocks_types::ClusterRole::Fe,
             cfg,
             None,
             |_, _| Ok(()),
@@ -741,7 +735,7 @@ backends = ["{backend_addr}"]
         };
         let (cfg, role, _) =
             load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
-        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        assert_eq!(role, novarocks_types::ClusterRole::Fe);
         dispatch_standalone_role_with_all_in_one(
             role,
             cfg,
@@ -770,7 +764,7 @@ backends = []
         };
         let (cfg, role, _) =
             load_config_and_resolve_role(&cli).expect("fe with zero backends must load");
-        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        assert_eq!(role, novarocks_types::ClusterRole::Fe);
         assert!(cfg.cluster.backends.is_empty());
     }
 
@@ -787,12 +781,12 @@ role = "all-in-one"
         let f = write_toml_tempfile(toml);
         let cli = StandaloneServerCliArgs {
             config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
-            role: Some(novarocks::common::app_config::ClusterRole::Be),
+            role: Some(novarocks_types::ClusterRole::Be),
             mysql_port: None,
         };
         let (cfg, role, _) = load_config_and_resolve_role(&cli)
             .expect("load and resolve must succeed (be with no backends is valid)");
-        assert_eq!(role, novarocks::common::app_config::ClusterRole::Be);
+        assert_eq!(role, novarocks_types::ClusterRole::Be);
         assert!(cfg.cluster.backends.is_empty());
     }
 
@@ -809,7 +803,7 @@ backends = ["127.0.0.1:9070"]
         let f = write_toml_tempfile(toml);
         let cli = StandaloneServerCliArgs {
             config_path: Some(f.path().to_str().expect("utf-8").to_string()),
-            role: Some(novarocks::common::app_config::ClusterRole::Be),
+            role: Some(novarocks_types::ClusterRole::Be),
             mysql_port: None,
         };
         let result = load_config_and_resolve_role(&cli);
@@ -852,7 +846,7 @@ backends = ["127.0.0.1:9070"]
         }
 
         let (_, role, _) = result.expect("NOVAROCKS_CONFIG must be picked up");
-        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        assert_eq!(role, novarocks_types::ClusterRole::Fe);
     }
 
     // C2: ./novarocks.toml in CWD must be discovered when no --config and no env var.
@@ -888,7 +882,7 @@ backends = ["127.0.0.1:9070"]
         }
 
         let (_, role, _) = result.expect("./novarocks.toml in CWD must be picked up");
-        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        assert_eq!(role, novarocks_types::ClusterRole::Fe);
     }
 
     // I1: dispatch_standalone_role must pass the pre-loaded cfg to the
@@ -905,7 +899,7 @@ backends = ["127.0.0.1:9070"]
         });
         let captured_port: std::cell::Cell<u16> = std::cell::Cell::new(0);
         dispatch_standalone_role_with_all_in_one(
-            novarocks::common::app_config::ClusterRole::AllInOne,
+            novarocks_types::ClusterRole::AllInOne,
             cfg,
             None,
             |_, _| panic!("all-in-one must not use the frontend-only runner"),

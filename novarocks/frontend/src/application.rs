@@ -134,7 +134,7 @@ pub struct FrontendApplicationHost {
     query_execution: Option<QueryExecutionService>,
     query_control: novarocks::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
-    execution_role: novarocks::common::app_config::ClusterRole,
+    execution_role: novarocks_types::ClusterRole,
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
 }
@@ -817,7 +817,7 @@ impl FrontendApplicationHost {
         self.coordination.as_ref().map(Arc::clone)
     }
 
-    pub fn execution_role(&self) -> novarocks::common::app_config::ClusterRole {
+    pub fn execution_role(&self) -> novarocks_types::ClusterRole {
         self.execution_role
     }
 
@@ -1248,7 +1248,7 @@ mod tests {
             foundationdb_client: None,
         };
         let backend = crate::topology::ClusterBackendOpenConfig::new(
-            novarocks::common::app_config::ClusterRole::AllInOne,
+            novarocks_types::ClusterRole::AllInOne,
             Vec::new(),
             Duration::from_secs(1),
             1,

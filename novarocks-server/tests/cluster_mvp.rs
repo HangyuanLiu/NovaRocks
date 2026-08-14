@@ -2507,7 +2507,7 @@ fn cross_process_three_be_frontend_insert_service_lifecycle() {
             )),
             frontend_execution_config(),
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::AllInOne,
                 Vec::new(),
                 Duration::from_secs(1),
                 1,
@@ -2654,7 +2654,7 @@ fn cross_process_three_be_frontend_delete_service_lifecycle() {
             )),
             frontend_execution_config(),
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::AllInOne,
                 Vec::new(),
                 Duration::from_secs(1),
                 1,
@@ -2901,7 +2901,7 @@ enable_path_style_access = true
             Some(sqlite_state_store_config(&state_store_path, cluster_id)),
             frontend_execution_config(),
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::AllInOne,
                 Vec::new(),
                 Duration::from_secs(1),
                 1,
@@ -3164,7 +3164,7 @@ enable_path_style_access = true
             Some(sqlite_state_store_config(&state_store_path, cluster_id)),
             frontend_execution_config(),
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::AllInOne,
                 Vec::new(),
                 Duration::from_secs(1),
                 1,
@@ -3427,7 +3427,7 @@ enable_path_style_access = true
             Some(sqlite_state_store_config(&state_store_path, cluster_id)),
             frontend_execution_config(),
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::AllInOne,
                 Vec::new(),
                 Duration::from_secs(1),
                 1,
@@ -3828,7 +3828,7 @@ fn cross_process_three_be_catalog_attachment_lifecycle() {
             Some(sqlite_state_store_config(&state_store_path, CLUSTER_ID)),
             frontend_execution_config(),
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::AllInOne,
                 Vec::new(),
                 Duration::from_secs(1),
                 1,
@@ -4098,7 +4098,7 @@ fn cross_process_three_be_mv_state_store_restart() {
             )),
             frontend_execution_config(),
             ClusterBackendOpenConfig::new(
-                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks_types::ClusterRole::AllInOne,
                 Vec::new(),
                 Duration::from_secs(1),
                 1,

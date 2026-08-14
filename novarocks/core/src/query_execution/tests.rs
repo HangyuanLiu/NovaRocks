@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 
 fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
     QueryExecutionContext::new(
-        crate::common::app_config::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::AllInOne,
         BackendTopologySnapshot::empty(0),
         None,
         cancellation,

@@ -17,9 +17,9 @@
 
 //! Closed Frontend backend-membership command capability.
 
-use crate::common::app_config::ClusterRole;
 use crate::query_execution::StatementResult;
 use crate::query_execution::kernels::BackendManagementKernel;
+use novarocks_types::ClusterRole;
 
 #[derive(Clone)]
 pub struct BackendCommandExecutor {

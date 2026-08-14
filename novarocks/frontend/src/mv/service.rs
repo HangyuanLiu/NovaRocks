@@ -67,7 +67,7 @@ pub struct FrontendMvService {
     scheduler_config: FrontendMvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_service: Option<Arc<dyn novarocks::maintenance::TableMaintenanceService>>,
-    execution_role: novarocks::common::app_config::ClusterRole,
+    execution_role: novarocks_types::ClusterRole,
     topology: Option<BackendTopologyService>,
     /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
     /// carries the value that statement admission would otherwise have to guess.
@@ -85,7 +85,7 @@ impl FrontendMvService {
             scheduler_config: FrontendMvSchedulerConfig::default(),
             maintenance_config: MaintenanceCoordinatorConfig::default(),
             table_maintenance_service: None,
-            execution_role: novarocks::common::app_config::ClusterRole::AllInOne,
+            execution_role: novarocks_types::ClusterRole::AllInOne,
             topology: None,
             optimizer_query_mem_limit_bytes: 2 * 1024 * 1024 * 1024,
         }
@@ -96,7 +96,7 @@ impl FrontendMvService {
         query_execution: QueryExecutionService,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         provider_activation: Arc<refresh::FrontendMvRefreshProviderActivationPort>,
-        execution_role: novarocks::common::app_config::ClusterRole,
+        execution_role: novarocks_types::ClusterRole,
         topology: BackendTopologyService,
         scheduler_config: FrontendMvSchedulerConfig,
         maintenance_config: MaintenanceCoordinatorConfig,
@@ -403,7 +403,7 @@ struct RefreshWorkerDependencies {
     refresh: refresh::FrontendMvRefreshDependencies,
     background_engine: Arc<dyn novarocks::mv::background::MvBackgroundEngine>,
     topology: BackendTopologyService,
-    role: novarocks::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
     scheduler_config: FrontendMvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_engine: Arc<dyn novarocks::maintenance::TableMaintenanceEngine>,

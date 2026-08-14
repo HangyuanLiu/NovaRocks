@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use novarocks_state_store::config::{
     FoundationDbClientConfig, StateStoreAppConfig, StateStoreProviderConfig,
 };
+use novarocks_types::ClusterRole;
 
 pub use crate::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
@@ -38,22 +39,6 @@ fn default_sys_log_roll_mode() -> String {
 
 fn default_sys_log_roll_num() -> usize {
     10
-}
-
-/// Cluster role for distributed deployments.
-/// The default is `AllInOne`, which preserves existing single-process behavior.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClusterRole {
-    Fe,
-    Be,
-    AllInOne,
-}
-
-impl Default for ClusterRole {
-    fn default() -> Self {
-        ClusterRole::AllInOne
-    }
 }
 
 /// Configuration for the `[cluster]` TOML section.

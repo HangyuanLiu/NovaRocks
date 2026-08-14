@@ -1485,7 +1485,7 @@ fn test_request_context(
     test_request_context_with_role(
         current_catalog,
         current_database,
-        crate::common::app_config::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::AllInOne,
     )
 }
 
@@ -1493,7 +1493,7 @@ fn test_request_context(
 fn test_request_context_with_role(
     current_catalog: Option<&str>,
     current_database: &str,
-    role: crate::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
 ) -> crate::query_execution::request_context::RequestContext {
     use crate::query_execution::backend::{BackendTopologySnapshot, LiveBackendTarget};
     use crate::query_execution::cancellation::QueryCancellationSource;
@@ -1818,16 +1818,14 @@ fn statistics_string_result(
 
 fn require_backend_management_role(
     statement: &str,
-    role: crate::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
 ) -> Result<(), String> {
     match role {
-        crate::common::app_config::ClusterRole::Fe => Ok(()),
-        crate::common::app_config::ClusterRole::Be => Err(format!(
+        novarocks_types::ClusterRole::Fe => Ok(()),
+        novarocks_types::ClusterRole::Be => Err(format!(
             "{statement} is not available in role=be; backend management is owned by StarRocks FE"
         )),
-        crate::common::app_config::ClusterRole::AllInOne => {
-            Err(format!("{statement} requires role=fe"))
-        }
+        novarocks_types::ClusterRole::AllInOne => Err(format!("{statement} requires role=fe")),
     }
 }
 

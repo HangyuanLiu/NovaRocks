@@ -235,7 +235,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use novarocks::common::app_config::ClusterRole;
     use novarocks::query_execution::backend::BackendTopologySnapshot;
     use novarocks::query_execution::cancellation::QueryCancellationSource;
     use novarocks::query_execution::dml::mutation::{
@@ -245,6 +244,7 @@ mod tests {
     use novarocks::query_execution::request_context::{
         RequestAdmission, RequestContext, SessionOptimizerSettings,
     };
+    use novarocks_types::ClusterRole;
 
     use super::*;
     use crate::dml::OperationJournal;

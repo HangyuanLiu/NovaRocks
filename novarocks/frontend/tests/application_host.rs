@@ -55,7 +55,7 @@ async fn open_host(
 
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
-        novarocks::common::app_config::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::AllInOne,
         Vec::new(),
         Duration::from_secs(1),
         1,
@@ -66,7 +66,7 @@ fn backend_config() -> ClusterBackendOpenConfig {
 
 fn fe_backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
-        novarocks::common::app_config::ClusterRole::Fe,
+        novarocks_types::ClusterRole::Fe,
         Vec::new(),
         Duration::from_secs(1),
         1,

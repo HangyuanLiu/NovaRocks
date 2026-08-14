@@ -3425,6 +3425,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-state-store",
  "novarocks-test-support",
+ "novarocks-types",
  "reqwest",
  "tempfile",
  "tokio",
@@ -3487,7 +3488,9 @@ dependencies = [
  "num-traits",
  "roaring 0.10.12",
  "ryu",
+ "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

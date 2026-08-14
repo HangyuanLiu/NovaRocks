@@ -42,7 +42,7 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
-    role: novarocks::common::app_config::ClusterRole,
+    role: novarocks_types::ClusterRole,
     topology: novarocks::query_execution::backend::BackendTopologyService,
 }
 
@@ -807,7 +807,7 @@ mod tests {
     async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
         let temp = tempfile::tempdir().expect("temporary cutover directory");
         let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
+        config.cluster.role = novarocks_types::ClusterRole::AllInOne;
         let state_store = StateStoreHostConfig {
             state_store: StateStoreAppConfig {
                 store: StateStoreConfig {
@@ -911,7 +911,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frontend_report_endpoint_binds_loopback_without_core_transport_facade() {
         let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
+        config.cluster.role = novarocks_types::ClusterRole::AllInOne;
         config.cluster.advertise_host = "127.0.0.1".to_string();
         config.server.host = "127.0.0.1".to_string();
         config.server.grpc_port = 0;
@@ -949,7 +949,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
         let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
+        config.cluster.role = novarocks_types::ClusterRole::AllInOne;
         let host = FrontendApplicationHost::open(
             None,
             FrontendExecutionConfig::new(

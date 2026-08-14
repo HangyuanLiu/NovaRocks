@@ -1028,7 +1028,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use novarocks::common::app_config::ClusterRole;
     use novarocks::query_execution::backend::BackendTopologySnapshot;
     use novarocks::query_execution::cancellation::QueryCancellationSource;
     use novarocks::query_execution::dml::add_files::{AddFilesCommand, AddFilesPrepared};
@@ -1038,6 +1037,7 @@ mod tests {
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
         ConnectorMutationOperationId, ConnectorProviderId,
     };
+    use novarocks_types::ClusterRole;
 
     use super::*;
     use crate::dml::model::{DML_OPERATION_SCHEMA_VERSION, validate_operation_transition};

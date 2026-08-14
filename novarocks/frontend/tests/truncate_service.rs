@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::common::app_config::ClusterRole;
 use novarocks::query_execution::backend::BackendTopologySnapshot;
 use novarocks::query_execution::cancellation::QueryCancellationSource;
 use novarocks::query_execution::dml::truncate::{
@@ -51,6 +50,7 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationOperationId,
     ConnectorProviderId, ExternalMutationEvidence,
 };
+use novarocks_types::ClusterRole;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 

@@ -578,7 +578,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::common::app_config::ClusterRole;
     use crate::common::types::UniqueId;
     use crate::query_execution::backend::BackendTopologySnapshot;
     use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
@@ -589,6 +588,7 @@ mod tests {
     };
     use crate::runtime::query_result::QueryResult;
     use crate::sql::optimizer::options::SessionOptimizerSettings;
+    use novarocks_types::ClusterRole;
 
     fn cancelled_execution() -> QueryExecutionContext {
         let cancellation = QueryCancellationSource::new();

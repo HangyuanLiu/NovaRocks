@@ -20,10 +20,10 @@
 
 use std::time::Instant;
 
-use crate::common::app_config::ClusterRole;
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::QueryCancellationView;
 pub use crate::sql::optimizer::options::SessionOptimizerSettings;
+use novarocks_types::ClusterRole;
 
 /// All inputs accepted at the frontend statement-admission boundary.
 ///
