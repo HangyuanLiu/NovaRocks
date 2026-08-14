@@ -338,7 +338,7 @@ fn table_columns_from_local_catalog(
         .local()
         .read()
         .expect("standalone catalog read lock");
-    let table = catalog.get(database, table)?;
+    let table = novarocks_sql::planning::catalog::local_catalog_table(&catalog, database, table)?;
     Ok(table
         .columns
         .iter()

@@ -207,11 +207,7 @@ pub(super) fn encode_node_with_context(
         tuple_ids: src.tuple_ids.clone(),
         nullable_tuple_ids: src.nullable_tuple_ids.clone(),
         limit: src.limit,
-        runtime_filter_binding_ids: src
-            .runtime_filter_binding_ids
-            .iter()
-            .map(|binding_id| binding_id.get())
-            .collect(),
+        runtime_filter_binding_ids: src.runtime_filter_binding_ids().collect(),
         children,
         payload: Some(payload),
     };

@@ -94,11 +94,11 @@ impl Catalog<CatalogRuntimeMetadata> for InternalCatalog {
         table: &str,
     ) -> Result<CatalogRuntimeMetadata, String> {
         let local = self.local.read().expect("internal catalog read lock");
-        let table =
+        let catalog_table =
             novarocks_sql::planning::catalog::local_catalog_table(&local, namespace, table)?;
         Ok(CatalogRuntimeMetadata::from_local_catalog_table(
             TableIdentity::new(&self.name, namespace, table),
-            table,
+            catalog_table,
         ))
     }
 }

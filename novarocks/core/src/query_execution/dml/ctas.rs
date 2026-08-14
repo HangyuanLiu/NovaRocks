@@ -1491,7 +1491,10 @@ impl CtasEngine for DmlExecutionKernel {
             .map_err(internal_failure)?;
         let schema_text = format!("{output_schema:?}");
         let optimized_fingerprint = planned.source.capture_fingerprint();
-        let settings_material = planned.optimizer_settings.stable_digest_material();
+        let settings_material =
+            novarocks_sql::planning::dml::optimizer_settings_stable_digest_material(
+                &planned.optimizer_settings,
+            );
         let binding_material = planned.table_bindings.stable_digest_material();
         let execution_nonce = uuid::Uuid::now_v7();
         let execution_identity =

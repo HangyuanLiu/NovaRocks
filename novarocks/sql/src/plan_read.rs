@@ -47,6 +47,16 @@ pub use novarocks_spi::connector::{
     ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteRouteId,
 };
 
+impl DistributedNode {
+    /// Project sealed runtime-filter binding identifiers for protocol encoding.
+    /// The typed SQL binding identifiers remain internal to the planner.
+    pub fn runtime_filter_binding_ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.runtime_filter_binding_ids
+            .iter()
+            .map(|binding_id| binding_id.get())
+    }
+}
+
 /// Read-only access to one sealed connector writer sink. The opaque provider
 /// payload remains inside the signed SPI handle; plan readers can only encode
 /// its immutable envelope.

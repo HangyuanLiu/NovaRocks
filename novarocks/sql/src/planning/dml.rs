@@ -656,6 +656,14 @@ pub fn dml_change_stream_optimizer_settings() -> crate::optimizer::options::Sess
     settings
 }
 
+/// Return deterministic SQL-owned optimizer settings material for a CTAS
+/// execution digest. The exact canonicalization remains private to SQL.
+pub fn optimizer_settings_stable_digest_material(
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Vec<u8> {
+    settings.stable_digest_material()
+}
+
 /// Read-only routing facts needed by Core when it binds a prepared write
 /// operation to fragment cohorts.  SQL keeps the mutable writer topology and
 /// all physical graph state private.
@@ -1382,8 +1390,27 @@ pub fn build_statistics_connector_plan(
 mod tests {
     use super::{
         DmlStatisticsSnapshot, StatisticsCommand, dml_change_stream_optimizer_settings,
-        parse_statistics_command, parse_truncate_command,
+        optimizer_settings_stable_digest_material, parse_statistics_command,
+        parse_truncate_command,
     };
+    use crate::compiler::SessionOptimizerSettings;
+
+    #[test]
+    fn optimizer_settings_digest_material_is_stable_across_rule_order_and_duplicates() {
+        let mut unordered = SessionOptimizerSettings::default();
+        unordered.disabled_rules = vec![
+            "RuleB".to_string(),
+            "RuleA".to_string(),
+            "RuleB".to_string(),
+        ];
+        let mut canonical = SessionOptimizerSettings::default();
+        canonical.disabled_rules = vec!["RuleA".to_string(), "RuleB".to_string()];
+
+        assert_eq!(
+            optimizer_settings_stable_digest_material(&unordered),
+            optimizer_settings_stable_digest_material(&canonical)
+        );
+    }
 
     #[test]
     fn empty_statistics_snapshot_is_the_default_without_implying_zero_rows() {
