@@ -4858,9 +4858,8 @@ mod tests {
     }
 
     fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(q) = stmt else {
             panic!("expected SELECT");
         };
@@ -7082,9 +7081,9 @@ fn build_aggregate_layout_for_refresh_select_sql(
     crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(&facts)
 }
 pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
         .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;
-    let statement = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
+    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
         .map_err(|err| format!("sql parser error: {err}"))?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("stored MV SQL must be a SELECT query".to_string());
@@ -7676,7 +7675,7 @@ pub(crate) fn normalize_imv_rewrite_root_project(
 
 fn refresh_explain_rewrite_disabled_rules(
     is_aggregate_refresh: bool,
-    optimizer_settings: &novarocks_sql::optimizer::options::SessionOptimizerSettings,
+    optimizer_settings: &novarocks_sql::compiler::SessionOptimizerSettings,
 ) -> Vec<String> {
     let mut disabled_rules = optimizer_settings.disabled_rules.clone();
     if is_aggregate_refresh
@@ -8396,7 +8395,7 @@ mod join_delta_append_only_fast_path_tests {
     fn aggregate_refresh_explain_disables_join_refresh_descriptor_recording() {
         let disabled_rules = refresh_explain_rewrite_disabled_rules(
             true,
-            &novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
+            &novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
 
         assert!(
@@ -8498,9 +8497,8 @@ mod join_delta_append_only_fast_path_tests {
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };

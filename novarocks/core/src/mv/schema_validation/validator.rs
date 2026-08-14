@@ -26,7 +26,14 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
-use novarocks_sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::{
+    planner::vocabulary::ApplyKeySource,
+    planning::mv::{
+        MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+        MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
+        MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
+    },
+};
 
 use super::model::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, JoinSchemaValidationError,
@@ -39,9 +46,6 @@ use crate::mv::persistence::schema::{
 use crate::mv::storage_observation::{
     MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
     MvSchemaValidationPartitionTransform,
-};
-use novarocks_sql::planner::vocabulary::{
-    GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 pub(crate) fn validate_schema_contract(
@@ -623,9 +627,11 @@ mod tests {
         TargetContract, TargetVisibleColumn,
     };
     use crate::mv::storage_observation::MvSchemaValidationPartitionField;
-    use novarocks_sql::planner::vocabulary::{
-        BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-        JOIN_APPLY_KEY_COLUMN_NAME,
+    use novarocks_sql::planning::mv::{
+        MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
+        MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+        MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
+        MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
     };
 
     /// Test-local, provider-neutral stand-in for the target schema facts an

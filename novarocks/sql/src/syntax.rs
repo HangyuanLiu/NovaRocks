@@ -155,6 +155,21 @@ pub fn literal_from_batch(
     crate::literal::literal_from_batch(column, row_idx)
 }
 
+/// Convert an admitted SQL type to its Arrow value representation.
+pub fn sql_type_to_arrow_type(
+    sql_type: &novarocks_catalog::schema::SqlType,
+) -> Result<arrow::datatypes::DataType, String> {
+    crate::literal::sql_type_to_arrow_type(sql_type)
+}
+
+/// Compare Arrow value shapes while ignoring non-semantic field metadata.
+pub fn arrow_type_equals_ignoring_metadata(
+    left: &arrow::datatypes::DataType,
+    right: &arrow::datatypes::DataType,
+) -> bool {
+    crate::literal::arrow_type_equals_ignoring_metadata(left, right)
+}
+
 /// Hashable syntax value used only to group admitted aggregate-table rows.
 /// The representation deliberately stays independent from the literal module's
 /// internal key type.
@@ -312,9 +327,28 @@ pub fn parse_alter_iceberg_ref(sql: &str) -> Result<Option<AlterIcebergRefStmt>,
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendManagementCommand, MvAdmittedStatement, parse_backend_management_command,
-        parse_mv_admitted_statement,
+        BackendManagementCommand, MvAdmittedStatement, arrow_type_equals_ignoring_metadata,
+        parse_backend_management_command, parse_mv_admitted_statement, sql_type_to_arrow_type,
     };
+
+    #[test]
+    fn syntax_value_helpers_keep_sql_type_conversion_and_metadata_tolerant_shape_equality() {
+        use arrow::datatypes::DataType;
+        use novarocks_catalog::schema::SqlType;
+
+        assert_eq!(
+            sql_type_to_arrow_type(&SqlType::BigInt).expect("SQL type conversion"),
+            DataType::Int64
+        );
+        assert!(arrow_type_equals_ignoring_metadata(
+            &DataType::Utf8,
+            &DataType::Utf8
+        ));
+        assert!(!arrow_type_equals_ignoring_metadata(
+            &DataType::Utf8,
+            &DataType::Int64
+        ));
+    }
 
     #[test]
     fn mv_admission_exposes_only_typed_mv_syntax() {
