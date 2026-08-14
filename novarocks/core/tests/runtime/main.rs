@@ -16,7 +16,7 @@
 // under the License.
 //! Integration tests for runtime components (exchange, query context, etc.).
 
-use crate::common::{TestConfig, test_query_id};
+use crate::common::test_query_id;
 use novarocks_execution::runtime::exchange::{ExchangeKey, ExecutionExchangeRegistry};
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_types::UniqueId;

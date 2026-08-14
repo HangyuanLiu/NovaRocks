@@ -16,7 +16,7 @@
 // under the License.
 //! Integration tests for the service control surface.
 
-use crate::common::{TestConfig, test_query_id, unique_query_id};
+use crate::common::{test_query_id, unique_query_id};
 use novarocks::service::fragment_control::cancel_runtime_fragment;
 use novarocks_types::UniqueId;
 

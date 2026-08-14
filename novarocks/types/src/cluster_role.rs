@@ -16,18 +16,13 @@
 // under the License.
 
 /// Native deployment role shared by server composition and role applications.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClusterRole {
     Fe,
     Be,
+    #[default]
     AllInOne,
-}
-
-impl Default for ClusterRole {
-    fn default() -> Self {
-        Self::AllInOne
-    }
 }
 
 #[cfg(test)]

@@ -16,7 +16,6 @@
 // under the License.
 //! Integration tests for supported connector infrastructure.
 
-use crate::common::TestConfig;
 use novarocks::connector;
 
 #[path = "../common/mod.rs"]
