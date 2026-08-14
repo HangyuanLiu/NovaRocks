@@ -692,6 +692,22 @@ mod tests {
         .expect("lease manager")
     }
 
+    fn assert_clock_unsafe_authority_failure(failure: &MaintenanceAuthorityFailure) {
+        assert!(
+            matches!(
+                failure,
+                MaintenanceAuthorityFailure::Coordination(error)
+                    if error.kind() == CoordinationErrorKind::ClockUnsafe
+            ) || matches!(
+                failure,
+                MaintenanceAuthorityFailure::Cancelled(
+                    novarocks_state_store::coordination::LeaseCancellationReason::ClockUnsafe
+                )
+            ),
+            "unexpected maintenance authority failure: {failure:?}"
+        );
+    }
+
     #[test]
     fn maintenance_defaults_and_process_holders_are_explicit() {
         let settings = maintenance_lease_settings().expect("maintenance lease settings");
@@ -900,19 +916,12 @@ mod tests {
         })
         .await
         .expect("unsafe clock must fail the renewal loop");
-        assert!(
-            matches!(
-                &failure,
-                MaintenanceAuthorityFailure::Coordination(error)
-                    if error.kind() == CoordinationErrorKind::ClockUnsafe
-            ) || matches!(
-                &failure,
-                MaintenanceAuthorityFailure::Cancelled(
-                    novarocks_state_store::coordination::LeaseCancellationReason::ClockUnsafe
-                )
-            )
+        assert_clock_unsafe_authority_failure(&failure);
+        assert_clock_unsafe_authority_failure(
+            &attempt
+                .ensure_active()
+                .expect_err("failed renewal must revoke maintenance authority"),
         );
-        assert_eq!(attempt.ensure_active(), Err(failure));
 
         let validator = attempt.fence_validator();
         let mut transaction = store
@@ -925,18 +934,7 @@ mod tests {
         let validation_failure = validator(transaction.as_mut())
             .await
             .expect_err("failed renewal must revoke transaction authority");
-        assert!(
-            matches!(
-                validation_failure,
-                MaintenanceAuthorityFailure::Coordination(ref error)
-                    if error.kind() == CoordinationErrorKind::ClockUnsafe
-            ) || matches!(
-                validation_failure,
-                MaintenanceAuthorityFailure::Cancelled(
-                    novarocks_state_store::coordination::LeaseCancellationReason::ClockUnsafe
-                )
-            )
-        );
+        assert_clock_unsafe_authority_failure(&validation_failure);
         transaction
             .abort()
             .await
