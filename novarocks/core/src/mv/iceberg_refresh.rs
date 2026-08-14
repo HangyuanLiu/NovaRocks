@@ -67,10 +67,6 @@ use crate::mv::persistence::schema::{
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::{ImvRefreshContract, MvTargetWriteEffect};
-use crate::mv::refresh::join_incremental_refresh::{
-    JoinIncrementalLogicalInput, JoinIncrementalRefreshMode,
-    build_join_incremental_refresh_logical_plan, select_join_incremental_refresh_mode,
-};
 use crate::mv::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
     plan_non_join_incremental_changes,
@@ -1209,9 +1205,9 @@ fn prepare_frontend_incremental_write(
             return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
         }
         let join_mode = if is_aggregate {
-            JoinIncrementalRefreshMode::Coalesce
+            crate::mv::application::MvIncrementalJoinMode::Coalesce
         } else {
-            select_join_incremental_refresh_mode(left_facts.has_deletes, right_facts.has_deletes)
+            select_join_incremental_execution_mode(left_facts.has_deletes, right_facts.has_deletes)
         };
         let request = crate::mv::application::MvIncrementalWriteRequest::try_new(
             target.catalog.clone(),
@@ -1253,10 +1249,10 @@ fn prepare_frontend_incremental_write(
                 Some(frozen_base_overlays),
             )?,
             match join_mode {
-                JoinIncrementalRefreshMode::AppendOnly => {
+                crate::mv::application::MvIncrementalJoinMode::AppendOnly => {
                     crate::mv::application::MvIncrementalWriteMode::FastAppend
                 }
-                JoinIncrementalRefreshMode::Coalesce => {
+                crate::mv::application::MvIncrementalJoinMode::Coalesce => {
                     crate::mv::application::MvIncrementalWriteMode::RowDelta
                 }
             },
@@ -1267,10 +1263,10 @@ fn prepare_frontend_incremental_write(
             },
             crate::mv::application::MvIncrementalExecutionArtifact::JoinLogical {
                 mode: match join_mode {
-                    JoinIncrementalRefreshMode::AppendOnly => {
+                    crate::mv::application::MvIncrementalJoinMode::AppendOnly => {
                         crate::mv::application::MvIncrementalJoinMode::AppendOnly
                     }
-                    JoinIncrementalRefreshMode::Coalesce => {
+                    crate::mv::application::MvIncrementalJoinMode::Coalesce => {
                         crate::mv::application::MvIncrementalJoinMode::Coalesce
                     }
                 },
@@ -4961,77 +4957,6 @@ mod tests {
     }
 
     #[test]
-    fn join_coalesce_locator_ids_reserve_rewritten_plan_outputs() {
-        let child_output = novarocks_sql::analysis::OutputColumn {
-            column_id: novarocks_sql::column_id::ColumnId(42),
-            name: "child_k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let root_output = novarocks_sql::analysis::OutputColumn {
-            column_id: novarocks_sql::column_id::ColumnId(6),
-            name: "root_k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let child = novarocks_sql::planner::logical::LogicalPlanNode::new(
-            novarocks_sql::planner::logical::LogicalPlanKind::Values(
-                novarocks_sql::planner::payload::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: vec![child_output.clone()],
-                },
-            ),
-            Vec::new(),
-            None,
-        );
-        let plan = novarocks_sql::planner::logical::LogicalPlanNode::new(
-            novarocks_sql::planner::logical::LogicalPlanKind::Project(
-                novarocks_sql::planner::payload::PlanProjectNode {
-                    items: vec![novarocks_sql::analysis::ProjectItem {
-                        expr: novarocks_sql::analysis::TypedExpr {
-                            kind: novarocks_sql::analysis::ExprKind::ColumnRef {
-                                column_id: child_output.column_id,
-                                qualifier: None,
-                                column: child_output.name.clone(),
-                            },
-                            data_type: child_output.data_type.clone(),
-                            nullable: child_output.nullable,
-                        },
-                        output_name: root_output.name.clone(),
-                        output_column_id: root_output.column_id,
-                    }],
-                    output_qualifier: None,
-                },
-            ),
-            vec![child],
-            None,
-        );
-        let mut factory = novarocks_sql::column_id::ColumnRefFactory::new();
-
-        let ids = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
-            &mut factory,
-            &plan,
-        )
-        .expect("allocate locator column ids");
-
-        let allocated = [
-            ids.net,
-            ids.file,
-            ids.pos,
-            ids.row_id,
-            ids.last_updated_sequence_number,
-        ];
-        assert!(allocated.iter().all(|id| *id > child_output.column_id.0));
-        let unique = allocated
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), allocated.len());
-    }
-
-    #[test]
     fn imv_change_stream_write_recognizes_physical_change_op_by_reserved_shape() {
         let output = OutputColumn {
             column_id: ColumnId(17),
@@ -5328,319 +5253,6 @@ mod tests {
         assert_eq!(status.fqn, "ice.sales.orders");
         assert_eq!(status.previous_snapshot_id, Some(10));
         assert_eq!(status.current_snapshot_id_before_pin, Some(11));
-    }
-
-    #[test]
-    fn join_coalesce_builder_factory_metadata_survives_rewritten_plan_reserve() {
-        let desc = join_coalesce_factory_test_descriptor();
-        let branch_union = join_coalesce_factory_test_branch_union(&desc);
-        let locator =
-            novarocks_sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                target_binding: novarocks_sql::compiler::mv_rewrite::test_target_binding(),
-                target_table_uuid: "target-uuid".to_string(),
-                target_snapshot_id: Some(77),
-            };
-        let mut factory = novarocks_sql::column_id::ColumnRefFactory::new();
-        factory.reserve_until(109);
-        let locator_columns = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
-            &mut factory,
-            &branch_union,
-        )
-        .expect("allocate locator column ids");
-
-        let plan =
-            novarocks_sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                branch_union,
-                &desc,
-                &locator,
-                &mut factory,
-                locator_columns.net,
-                locator_columns.file,
-                locator_columns.pos,
-                locator_columns.row_id,
-                locator_columns.last_updated_sequence_number,
-            )
-            .expect("join coalesce plan");
-        crate::mv::refresh::join_incremental_refresh::reserve_factory_for_logical_plan(
-            &mut factory,
-            &plan,
-        )
-        .expect("reserve rewritten plan outputs");
-
-        let watched_columns =
-            collect_join_coalesce_factory_watch_columns(&plan, ColumnId(locator_columns.net));
-        let watched_names = watched_columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<BTreeSet<_>>();
-        for expected in [
-            "net",
-            JOIN_APPLY_KEY_COLUMN_NAME,
-            "__pending_insert_count",
-            "__pending_delete_count",
-            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
-            novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-            novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-        ] {
-            assert!(
-                watched_names.contains(expected),
-                "missing watched column {expected}; watched={watched_columns:?}"
-            );
-        }
-        for column in watched_columns {
-            let metadata = factory.get(column.column_id);
-            assert!(
-                !metadata.name.starts_with("__reserved_col_"),
-                "column {} leaked reserved metadata {:?}",
-                column.name,
-                metadata
-            );
-            assert_eq!(metadata.name, column.name);
-            assert_eq!(metadata.data_type, column.data_type);
-            assert_eq!(metadata.nullable, column.nullable);
-        }
-    }
-
-    fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
-        OutputColumn {
-            column_id: novarocks_sql::column_id::ColumnId::UNSET,
-            name: name.to_string(),
-            data_type: ty,
-            nullable,
-            is_internal: false,
-        }
-    }
-
-    fn join_coalesce_factory_test_descriptor()
-    -> novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
-        use novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::{
-            JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
-            JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity,
-            JoinRefreshOutputMapping, JoinRefreshOutputSource,
-        };
-
-        let payload = join_coalesce_factory_test_column(1, "id", DataType::Int32, false, false);
-        let payload_output =
-            join_coalesce_factory_test_column(80, "id", DataType::Int32, false, false);
-        let action = join_coalesce_factory_test_column(
-            4,
-            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
-            DataType::Int8,
-            false,
-            true,
-        );
-        let action_output = join_coalesce_factory_test_column(
-            91,
-            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
-            DataType::Int8,
-            false,
-            true,
-        );
-        let join_apply_key = join_coalesce_factory_test_column(
-            5,
-            JOIN_APPLY_KEY_COLUMN_NAME,
-            DataType::Utf8,
-            false,
-            true,
-        );
-        let join_apply_key_output = join_coalesce_factory_test_column(
-            90,
-            JOIN_APPLY_KEY_COLUMN_NAME,
-            DataType::Utf8,
-            false,
-            true,
-        );
-
-        JoinRefreshDescriptor {
-            mode: JoinRefreshMode::Coalesce,
-            mv_identity: JoinRefreshMvIdentity {
-                catalog: "ice".to_string(),
-                database: "sales".to_string(),
-                name: "mv_join".to_string(),
-            },
-            left_base_fqn: "ice.sales.left_orders".to_string(),
-            right_base_fqn: "ice.sales.right_orders".to_string(),
-            left_row_id_column: join_coalesce_factory_test_column(
-                2,
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                DataType::Int64,
-                false,
-                true,
-            ),
-            right_row_id_column: join_coalesce_factory_test_column(
-                3,
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                DataType::Int64,
-                false,
-                true,
-            ),
-            action_column: action.clone(),
-            join_apply_key_column: join_apply_key.clone(),
-            payload_columns: vec![payload.clone()],
-            join_key_pairs: vec![JoinRefreshJoinKeyPair {
-                left_column: join_coalesce_factory_test_column(
-                    6,
-                    "left_id",
-                    DataType::Int32,
-                    false,
-                    false,
-                ),
-                right_column: join_coalesce_factory_test_column(
-                    7,
-                    "right_id",
-                    DataType::Int32,
-                    false,
-                    false,
-                ),
-            }],
-            output_mappings: vec![
-                JoinRefreshOutputMapping {
-                    mv_output_column: payload_output,
-                    source: JoinRefreshOutputSource::Payload(payload.column_id),
-                },
-                JoinRefreshOutputMapping {
-                    mv_output_column: join_apply_key_output,
-                    source: JoinRefreshOutputSource::JoinApplyKey(join_apply_key.column_id),
-                },
-                JoinRefreshOutputMapping {
-                    mv_output_column: action_output,
-                    source: JoinRefreshOutputSource::Action(action.column_id),
-                },
-            ],
-            branches: vec![
-                JoinRefreshBranchDescriptor {
-                    side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
-                    action_column_id: action.column_id,
-                },
-                JoinRefreshBranchDescriptor {
-                    side: JoinRefreshBranchSide::LeftSnapshotRightDelta,
-                    action_column_id: action.column_id,
-                },
-            ],
-            needs_target_locator: true,
-        }
-    }
-
-    fn join_coalesce_factory_test_branch_union(
-        desc: &novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
-    ) -> novarocks_sql::planner::logical::LogicalPlanNode {
-        let mut output_columns = desc.payload_columns.clone();
-        output_columns.push(desc.action_column.clone());
-        output_columns.push(desc.join_apply_key_column.clone());
-        let branch = novarocks_sql::planner::logical::LogicalPlanNode::new(
-            novarocks_sql::planner::logical::LogicalPlanKind::Values(
-                novarocks_sql::planner::payload::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: output_columns.clone(),
-                },
-            ),
-            Vec::new(),
-            None,
-        );
-        novarocks_sql::planner::logical::LogicalPlanNode::new(
-            novarocks_sql::planner::logical::LogicalPlanKind::Union(
-                novarocks_sql::planner::logical::LogicalUnionNode {
-                    all: true,
-                    output_columns,
-                },
-            ),
-            vec![branch.clone(), branch],
-            None,
-        )
-    }
-
-    fn collect_join_coalesce_factory_watch_columns(
-        plan: &novarocks_sql::planner::logical::LogicalPlanNode,
-        min_id: ColumnId,
-    ) -> Vec<OutputColumn> {
-        let mut columns = Vec::new();
-        collect_join_coalesce_factory_watch_columns_inner(plan, min_id, &mut columns);
-        columns
-    }
-
-    fn collect_join_coalesce_factory_watch_columns_inner(
-        plan: &novarocks_sql::planner::logical::LogicalPlanNode,
-        min_id: ColumnId,
-        columns: &mut Vec<OutputColumn>,
-    ) {
-        match &plan.kind {
-            novarocks_sql::planner::logical::LogicalPlanKind::Project(project) => {
-                columns.extend(project.items.iter().filter_map(|item| {
-                    is_join_coalesce_factory_locator_output(&item.output_name).then(|| {
-                        OutputColumn {
-                            column_id: item.output_column_id,
-                            name: item.output_name.clone(),
-                            data_type: item.expr.data_type.clone(),
-                            nullable: item.expr.nullable,
-                            is_internal: true,
-                        }
-                    })
-                }));
-            }
-            novarocks_sql::planner::logical::LogicalPlanKind::Aggregate(aggregate) => {
-                columns.extend(
-                    aggregate
-                        .output_columns
-                        .iter()
-                        .filter(|column| {
-                            column.column_id >= min_id
-                                && is_join_coalesce_factory_internal_output(&column.name)
-                        })
-                        .cloned(),
-                );
-            }
-            novarocks_sql::planner::logical::LogicalPlanKind::Scan(scan) => {
-                columns.extend(
-                    scan.columns
-                        .iter()
-                        .filter(|column| {
-                            column.column_id >= min_id && column.name == JOIN_APPLY_KEY_COLUMN_NAME
-                        })
-                        .cloned(),
-                );
-            }
-            _ => {}
-        }
-        for child in &plan.children {
-            collect_join_coalesce_factory_watch_columns_inner(child, min_id, columns);
-        }
-    }
-
-    fn is_join_coalesce_factory_internal_output(name: &str) -> bool {
-        matches!(
-            name,
-            "net"
-                | JOIN_APPLY_KEY_COLUMN_NAME
-                | "__pending_insert_count"
-                | "__pending_delete_count"
-        )
-    }
-
-    fn is_join_coalesce_factory_locator_output(name: &str) -> bool {
-        matches!(
-            name,
-            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL
-                | novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL
-                | novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
-                | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
-        )
-    }
-
-    fn join_coalesce_factory_test_column(
-        id: u32,
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-        is_internal: bool,
-    ) -> OutputColumn {
-        OutputColumn {
-            column_id: ColumnId(id),
-            name: name.to_string(),
-            data_type,
-            nullable,
-            is_internal,
-        }
     }
 }
 
@@ -9046,12 +8658,21 @@ mod join_delta_append_only_fast_path_tests {
 
     #[test]
     fn join_incremental_refresh_plan_kind_uses_logical_cutover() {
-        let mode = select_join_incremental_refresh_mode(false, false);
-        assert_eq!(mode, JoinIncrementalRefreshMode::AppendOnly);
-        let mode = select_join_incremental_refresh_mode(true, false);
-        assert_eq!(mode, JoinIncrementalRefreshMode::Coalesce);
-        let mode = select_join_incremental_refresh_mode(false, true);
-        assert_eq!(mode, JoinIncrementalRefreshMode::Coalesce);
+        let mode = select_join_incremental_execution_mode(false, false);
+        assert_eq!(
+            mode,
+            crate::mv::application::MvIncrementalJoinMode::AppendOnly
+        );
+        let mode = select_join_incremental_execution_mode(true, false);
+        assert_eq!(
+            mode,
+            crate::mv::application::MvIncrementalJoinMode::Coalesce
+        );
+        let mode = select_join_incremental_execution_mode(false, true);
+        assert_eq!(
+            mode,
+            crate::mv::application::MvIncrementalJoinMode::Coalesce
+        );
     }
 
     #[test]
@@ -9340,6 +8961,17 @@ fn should_use_join_delta_append_only_fast_path(
         && crate::mv::iceberg_join_branch::is_append_only_join_delta_eligible(query)
 }
 
+fn select_join_incremental_execution_mode(
+    left_has_delete_changes: bool,
+    right_has_delete_changes: bool,
+) -> crate::mv::application::MvIncrementalJoinMode {
+    if left_has_delete_changes || right_has_delete_changes {
+        crate::mv::application::MvIncrementalJoinMode::Coalesce
+    } else {
+        crate::mv::application::MvIncrementalJoinMode::AppendOnly
+    }
+}
+
 fn normalize_join_branch_snapshot_tables(
     query: &mut sqlparser::ast::Query,
     branch: &crate::mv::iceberg_join_branch::JoinDeltaBranchPlan,
@@ -9560,18 +9192,60 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         .first()
         .map(|route| route.cohort_id())
         .ok_or_else(|| "MV incremental provider plan has no writer routes".to_string())?;
-    for route in &provider_routes {
-        crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
-            target_bindings.as_ref(),
-            novarocks_sql::planner::table::SqlTableIdentity {
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-            },
-            route.preparation().clone(),
-            planning_lease.clone(),
-        )?;
-    }
+    let sealed_change_stream_routes = provider_routes
+        .iter()
+        .map(|route| {
+            let target_binding = crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
+                target_bindings.as_ref(),
+                novarocks_sql::plan_read::table::SqlTableIdentity::try_new(
+                    target.catalog.clone(),
+                    target.namespace.clone(),
+                    target.table.clone(),
+                )?,
+                route.preparation().clone(),
+                planning_lease.clone(),
+            )?;
+            let mode = match route.input() {
+                novarocks_spi::connector::ConnectorWriteInputShape::Data { .. } => {
+                    novarocks_sql::planning::dml::DmlWriteSinkMode::Data
+                }
+                novarocks_spi::connector::ConnectorWriteInputShape::RowLineage { .. } => {
+                    novarocks_sql::planning::dml::DmlWriteSinkMode::RowLineageData
+                }
+                novarocks_spi::connector::ConnectorWriteInputShape::PositionDelete { .. } => {
+                    novarocks_sql::planning::dml::DmlWriteSinkMode::PositionDeletes
+                }
+                novarocks_spi::connector::ConnectorWriteInputShape::DeletionVector { .. } => {
+                    novarocks_sql::planning::dml::DmlWriteSinkMode::DeletionVectors
+                }
+                novarocks_spi::connector::ConnectorWriteInputShape::EqualityDelete { .. } => {
+                    novarocks_sql::planning::dml::DmlWriteSinkMode::EqualityDeletes
+                }
+            };
+            let sink = crate::query_execution::planning::write_sink::dml_write_plan_input_for_admitted_target(
+                target_bindings.as_ref(),
+                target_binding,
+                mode,
+                novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            )?;
+            Ok(novarocks_sql::planning::dml::DmlChangeStreamRoute {
+                route_id: route.route_id(),
+                cohort_id: route.cohort_id(),
+                accepted_effects: route.accepted_effects().to_vec(),
+                input_fields: route
+                    .input()
+                    .fields()
+                    .into_iter()
+                    .map(|field| novarocks_sql::planning::dml::DmlChangeStreamRouteField {
+                        token: field.token(),
+                        output_name: field.field().name().to_string(),
+                    })
+                    .collect(),
+                partition_input_tokens: route.partition_fields().to_vec(),
+                sink,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let managed_publication =
         crate::mv::iceberg_activation::managed_publication_activation_intent(
             &publication_intent,
@@ -9659,13 +9333,23 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 execution,
             )?
         }
-        crate::mv::application::MvIncrementalExecutionArtifact::JoinLogical { mode } => {
-            let join_mode = match mode {
+        crate::mv::application::MvIncrementalExecutionArtifact::JoinLogical {
+            mode: join_execution_mode,
+        } => {
+            let join_mode = match join_execution_mode {
                 crate::mv::application::MvIncrementalJoinMode::AppendOnly => {
-                    JoinIncrementalRefreshMode::AppendOnly
+                    novarocks_sql::mv_refresh::first_refresh::SqlMvJoinIncrementalRefreshMode::AppendOnly
                 }
                 crate::mv::application::MvIncrementalJoinMode::Coalesce => {
-                    JoinIncrementalRefreshMode::Coalesce
+                    novarocks_sql::mv_refresh::first_refresh::SqlMvJoinIncrementalRefreshMode::Coalesce
+                }
+            };
+            let write_mode = match mode {
+                crate::mv::application::MvIncrementalWriteMode::FastAppend => {
+                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::FastAppend
+                }
+                crate::mv::application::MvIncrementalWriteMode::RowDelta => {
+                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
@@ -9675,30 +9359,76 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 &refresh_rewrite.pin,
                 &refresh_rewrite.previous_snapshot_ids,
             )?;
-            let (plan, factory) = compile_canonical_select_for_imv_with_frozen_rewrite(
-                query_kernel,
-                &refresh_rewrite,
-                &connector_context,
+            let catalog_service_snapshot =
+                crate::query_execution::compiler::catalog_service_snapshot(query_kernel);
+            let analyzer_catalog = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+                None,
+                &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
-                execution,
+                crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+                    query_kernel.connector_control().as_ref(),
+                    connector_context.clone(),
+                ),
                 base_overlays,
-            )
-            .map_err(|error| error.message)?;
-            let logical = build_join_incremental_refresh_logical_plan(
-                &refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
-                join_mode,
-                JoinIncrementalLogicalInput { plan, factory },
+            );
+            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+                .ok_or_else(|| {
+                "IMV join incremental refresh requires a non-empty admitted backend topology"
+                    .to_string()
+            })?;
+            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+                query_kernel,
+                analyzer_catalog.query_table_bindings(),
+            );
+            let sealed = novarocks_sql::mv_refresh::first_refresh::compile_join_incremental_refresh_change_stream(
+                novarocks_sql::mv_refresh::first_refresh::SqlMvJoinIncrementalRefreshCompileContext {
+                    canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
+                    rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
+                    join_mode,
+                    write_mode,
+                    routes: sealed_change_stream_routes,
+                    current_catalog: None,
+                    current_database: refresh_rewrite.current_database.clone(),
+                    optimizer_settings: execution.optimizer_settings().clone(),
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
+                        backend_count,
+                    },
+                    catalog: &catalog,
+                    statistics: &statistics,
+                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    control: novarocks_sql::compiler::SqlCompileControl::new(
+                        execution.deadline(),
+                        crate::query_execution::planning::sql_cancellation_observation(
+                            execution.cancellation().clone(),
+                        ),
+                    ),
+                },
             )?;
-            let mut planned =
-                crate::query_execution::compiler::plan_logical_for_iceberg_change_stream_refresh(
-                    logical.plan,
-                    logical.factory,
+            let planned =
+                crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
+                    query_kernel.connector_control().as_ref(),
+                    execution,
+                    sealed,
+                    target_bindings.as_ref(),
+                    &connector_context,
                 )?;
-            if let Some(change_stream) = logical.change_stream_override {
-                planned.change_stream = change_stream;
+            let distributed =
+                crate::query_execution::compiler::prepare_planned_iceberg_change_stream_write(
+                    planned.encoding,
+                    None,
+                    Some(
+                        crate::query_execution::compiler::DistributedConnectorWrite::Begin(
+                            connector_write,
+                        ),
+                    ),
+                )?;
+            if distributed.write_operation_id() != request.operation_id
+                || distributed.write_cohort_id() != selected_cohort
+            {
+                return Err("MV incremental distributed artifact identity mismatch".to_string());
             }
-            planned.table_bindings = Some(Arc::clone(&target_bindings));
-            planned
+            return Ok(distributed);
         }
     };
     let producer_branches = match mode {

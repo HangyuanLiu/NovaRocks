@@ -720,8 +720,37 @@ pub fn compile_dml_change_stream(
             not_matched_insert,
         )?,
     };
-    let dag = bind_route_layout(&producer.output_columns, request.routes)?;
-    let keyed_assert = request.pre_expand_keyed_assert.map(|assertion| {
+    seal_change_stream_producer(producer, request.routes, request.pre_expand_keyed_assert)
+}
+
+/// Seal an SQL-owned generated change-stream producer after a specialized
+/// compiler terminal has applied its immutable transformation.  This stays
+/// crate-private: public callers submit only value-only terminal contexts and
+/// receive [`DmlChangeStreamPlan`], never an optimizer tree or draft DAG.
+pub(crate) fn seal_change_stream_producer(
+    producer: crate::optimizer::OptimizedOperatorNode,
+    routes: Vec<DmlChangeStreamRoute>,
+    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+) -> Result<DmlChangeStreamPlan, String> {
+    seal_change_stream_producer_with_effect_column(
+        producer,
+        routes,
+        crate::common::ROW_MUTATION_EFFECT_COLUMN,
+        pre_expand_keyed_assert,
+    )
+}
+
+/// Seal a specialized SQL-owned change-stream producer that uses a
+/// terminal-specific effect output.  The effect name never crosses the public
+/// boundary; the returned plan remains opaque to application code.
+pub(crate) fn seal_change_stream_producer_with_effect_column(
+    producer: crate::optimizer::OptimizedOperatorNode,
+    routes: Vec<DmlChangeStreamRoute>,
+    effect_output_name: &str,
+    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+) -> Result<DmlChangeStreamPlan, String> {
+    let dag = bind_route_layout(&producer.output_columns, routes, effect_output_name)?;
+    let keyed_assert = pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
             key_column_name: assertion.key_column_name,
             key_label: assertion.key_label,
@@ -756,6 +785,7 @@ pub fn compile_dml_change_stream(
 fn bind_route_layout(
     output_columns: &[crate::analysis::OutputColumn],
     routes: Vec<DmlChangeStreamRoute>,
+    effect_output_name: &str,
 ) -> Result<crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String> {
     use crate::planner::distributed::write::change_stream::{
         ChangeStreamWriteLayoutRequest, ChangeStreamWriteLayoutRoute,
@@ -764,7 +794,7 @@ fn bind_route_layout(
 
     let effect_output_ordinal = output_columns
         .iter()
-        .position(|column| column.name == crate::common::ROW_MUTATION_EFFECT_COLUMN)
+        .position(|column| column.name == effect_output_name)
         .ok_or_else(|| "row-mutation producer has no logical effect output".to_string())?;
     let routes = routes
         .into_iter()
