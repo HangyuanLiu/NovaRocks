@@ -27,6 +27,7 @@ use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
+use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -39,6 +40,8 @@ pub struct BackendServerConfig {
     pub store_settings: BackendStoreSettings,
     pub query_lifecycle_sweep_interval: Duration,
     pub query_lifecycle_config: QueryLifecycleRegistryConfig,
+    /// Server-resolved per-fragment terminal write evidence budget.
+    pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     /// Provider-owned execution installers composed by the server role.
     ///
@@ -258,6 +261,7 @@ impl Drop for QueryLifecycleSweepTask {
 fn compose_backend_application_services(
     execution_runtime_config: ExecutionRuntimeConfig,
     query_lifecycle_config: QueryLifecycleRegistryConfig,
+    write_commit_evidence_limits: WriteCommitEvidenceLimits,
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
@@ -299,6 +303,7 @@ fn compose_backend_application_services(
             Arc::clone(&execution_host),
             Arc::clone(&execution_runtime),
         )
+        .with_write_commit_evidence_limits(write_commit_evidence_limits)
         .with_exchange_receiver_port(Arc::clone(&exchange_receiver_port)),
     );
     controls.publish_resource_snapshot();
@@ -410,6 +415,7 @@ impl BackendApplicationHost {
             store_settings,
             query_lifecycle_sweep_interval,
             query_lifecycle_config,
+            write_commit_evidence_limits,
             execution_runtime_config,
             execution_installers,
         } = config;
@@ -423,6 +429,7 @@ impl BackendApplicationHost {
         let services = compose_backend_application_services(
             execution_runtime_config,
             query_lifecycle_config,
+            write_commit_evidence_limits,
             &execution_installers,
         )?;
         let metrics_http_server = if metrics_http_port == grpc_port {
@@ -670,6 +677,7 @@ mod tests {
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest,
     };
+    use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -749,6 +757,7 @@ mod tests {
             store_settings: super::BackendStoreSettings::new(false, 0, 0),
             query_lifecycle_sweep_interval: Duration::from_millis(1_000),
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
+            write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             execution_runtime_config: execution_runtime_config(),
             execution_installers: Vec::new(),
         }
@@ -795,6 +804,7 @@ mod tests {
         let services = compose_backend_application_services(
             execution_runtime_config(),
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
+            WriteCommitEvidenceLimits::default(),
             &[],
         )
         .expect("compose backend application services");

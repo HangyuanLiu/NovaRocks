@@ -53,6 +53,8 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             4_096,
             256 * 1024 * 1024,
         ),
+        write_commit_evidence_limits: novarocks_spi::connector::WriteCommitEvidenceLimits::default(
+        ),
         execution_runtime_config: ExecutionRuntimeConfig {
             driver_threads: 1,
             scan_threads: 1,

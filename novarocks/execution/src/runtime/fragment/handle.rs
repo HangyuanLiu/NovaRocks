@@ -163,11 +163,25 @@ struct TestFragmentCommitLease;
 
 #[cfg(test)]
 impl crate::runtime::fragment::io::FragmentCommitLease for TestFragmentCommitLease {
+    fn write_commit_evidence_ledger(&self) -> novarocks_spi::connector::WriteCommitEvidenceLedger {
+        novarocks_spi::connector::WriteCommitEvidenceLedger::default()
+    }
+
     fn add_load_stats(&mut self, _stats: crate::runtime::fragment::io::FragmentSinkLoadStats) {}
 
-    fn add_tablet_commit_info(&mut self, _info: crate::runtime::fragment::io::TabletCommitInfo) {}
+    fn add_tablet_commit_info(
+        &mut self,
+        _info: crate::runtime::fragment::io::TabletCommitInfo,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
-    fn add_tablet_fail_info(&mut self, _info: crate::runtime::fragment::io::TabletFailInfo) {}
+    fn add_tablet_fail_info(
+        &mut self,
+        _info: crate::runtime::fragment::io::TabletFailInfo,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     fn finish(
         self: Box<Self>,
@@ -650,6 +664,24 @@ pub fn prepare_fragment(
     let prepare_result = (|| {
         resources.acquire_sink_commit(finst_id)?;
         context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;
+        if let Some(collector) = program.sink().program().connector_staged_report_collector() {
+            let ledger = resources.write_commit_evidence_ledger().ok_or_else(|| {
+                FragmentLaunchError::new(
+                    FragmentLaunchStage::Register,
+                    FragmentLaunchErrorKind::ResourceUnavailable,
+                    "sink commit lease did not provide a write commit evidence ledger",
+                )
+            })?;
+            collector
+                .bind_write_commit_evidence_ledger(ledger)
+                .map_err(|error| {
+                    FragmentLaunchError::new(
+                        FragmentLaunchStage::Register,
+                        FragmentLaunchErrorKind::ResourceUnavailable,
+                        format!("bind connector staged report ledger: {error}"),
+                    )
+                })?;
+        }
         let result_spec = context.result_spec.clone().unwrap_or_else(|| {
             ResultWriteSpec::new(
                 finst_id,

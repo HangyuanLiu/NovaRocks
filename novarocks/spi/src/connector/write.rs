@@ -52,6 +52,8 @@ pub const MAX_CONNECTOR_WRITE_ACTIVATIONS: usize = 16_384;
 pub const MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS: usize = 4096;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES: usize = 4096;
+pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES: usize = 16_384;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
 const CONNECTOR_WRITE_COHORT_SET_DOMAIN: &[u8] = b"novarocks.connector-write-cohort-set.v1\0";
@@ -63,6 +65,142 @@ const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement-id.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement.v1\0";
+
+/// Resolved per-fragment bounds for evidence returned by a distributed write.
+///
+/// This is intentionally an application input rather than a connector wire
+/// limit. Individual reports retain their independent SPI framing bounds; the
+/// ledger combines connector frames with tablet terminal facts for one
+/// fragment instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteCommitEvidenceLimits {
+    max_bytes: usize,
+    max_entries: usize,
+}
+
+impl WriteCommitEvidenceLimits {
+    pub fn try_new(max_bytes: usize, max_entries: usize) -> Result<Self, ConnectorError> {
+        if max_bytes == 0 || max_entries == 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "write commit evidence byte and entry limits must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            max_bytes,
+            max_entries,
+        })
+    }
+
+    pub const fn max_bytes(self) -> usize {
+        self.max_bytes
+    }
+
+    pub const fn max_entries(self) -> usize {
+        self.max_entries
+    }
+}
+
+impl Default for WriteCommitEvidenceLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
+            max_entries: DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES,
+        }
+    }
+}
+
+/// Fragment-local reserve-before-publish budget shared by all write evidence.
+#[derive(Clone, Debug)]
+pub struct WriteCommitEvidenceLedger {
+    limits: WriteCommitEvidenceLimits,
+    usage: Arc<Mutex<WriteCommitEvidenceUsage>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteCommitEvidenceUsage {
+    bytes: usize,
+    entries: usize,
+}
+
+impl WriteCommitEvidenceUsage {
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+
+    pub const fn entries(self) -> usize {
+        self.entries
+    }
+}
+
+impl WriteCommitEvidenceLedger {
+    pub fn new(limits: WriteCommitEvidenceLimits) -> Self {
+        Self {
+            limits,
+            usage: Arc::new(Mutex::new(WriteCommitEvidenceUsage::default())),
+        }
+    }
+
+    /// Reserve before the caller makes evidence visible to a later terminal
+    /// report. A failed reservation leaves the ledger unchanged.
+    pub fn reserve(&self, bytes: usize, entries: usize) -> Result<(), ConnectorError> {
+        let mut usage = self.usage.lock().map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("lock write commit evidence ledger: {error}"),
+            )
+        })?;
+        let next_bytes = usage.bytes.checked_add(bytes).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "write commit evidence byte accounting overflowed",
+            )
+        })?;
+        let next_entries = usage.entries.checked_add(entries).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "write commit evidence entry accounting overflowed",
+            )
+        })?;
+        if next_bytes > self.limits.max_bytes || next_entries > self.limits.max_entries {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                format!(
+                    "write commit evidence exceeds fragment budget: bytes {next_bytes}/{} entries {next_entries}/{}",
+                    self.limits.max_bytes, self.limits.max_entries
+                ),
+            ));
+        }
+        *usage = WriteCommitEvidenceUsage {
+            bytes: next_bytes,
+            entries: next_entries,
+        };
+        Ok(())
+    }
+
+    pub const fn limits(&self) -> WriteCommitEvidenceLimits {
+        self.limits
+    }
+
+    pub fn usage(&self) -> Result<WriteCommitEvidenceUsage, ConnectorError> {
+        self.usage.lock().map(|usage| *usage).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("lock write commit evidence ledger: {error}"),
+            )
+        })
+    }
+
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.usage, &other.usage)
+    }
+}
+
+impl Default for WriteCommitEvidenceLedger {
+    fn default() -> Self {
+        Self::new(WriteCommitEvidenceLimits::default())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectorWriteOperationId(Uuid);
@@ -2132,6 +2270,37 @@ impl ConnectorStagedReportFrame {
     }
     pub const fn frame_payload_digest(&self) -> [u8; 32] {
         self.frame_payload_digest
+    }
+
+    /// Exact canonical terminal-record bytes contributed by this frame, not
+    /// merely its opaque payload. The shared fragment ledger uses the same
+    /// representation as Core's terminal digest/retention path.
+    pub fn terminal_evidence_encoded_len(&self) -> Result<usize, ConnectorError> {
+        const LENGTH_PREFIX_BYTES: usize = 8;
+        const DIGEST_BYTES: usize = 32;
+        let writer = self.writer();
+        let fixed = 4 // contract_version
+            + 1 // writer presence
+            + (LENGTH_PREFIX_BYTES + 16) * 3 // operation/cohort/execution query ids
+            + 8 // execution attempt
+            + 1 + 16 // fragment instance presence + value
+            + 4 + 4 + 4 // fragment/backend/sink ids
+            + LENGTH_PREFIX_BYTES + 16 // connector incarnation
+            + 4 // terminal state
+            + 8 * 3 // summary
+            + 4 + 4 // part index/count
+            + 8 // logical payload len
+            + (LENGTH_PREFIX_BYTES + DIGEST_BYTES) * 2 // payload digests
+            + LENGTH_PREFIX_BYTES; // frame payload length
+        fixed
+            .checked_add(writer.binding_key().instance_id.as_str().len())
+            .and_then(|total| total.checked_add(self.frame_payload.len()))
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "connector staged report terminal byte accounting overflowed",
+                )
+            })
     }
 }
 

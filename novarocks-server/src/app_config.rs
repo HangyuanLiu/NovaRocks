@@ -820,6 +820,10 @@ pub struct RuntimeConfig {
     pub query_control_stage_max_inflight_encoded_bytes: usize,
     #[serde(default = "default_query_control_stage_max_dormant_workers")]
     pub query_control_stage_max_dormant_workers: usize,
+    #[serde(default = "default_write_commit_evidence_max_bytes")]
+    pub write_commit_evidence_max_bytes: usize,
+    #[serde(default = "default_write_commit_evidence_max_entries")]
+    pub write_commit_evidence_max_entries: usize,
     #[serde(default = "default_mem_limit")]
     pub mem_limit: String,
     #[serde(default = "default_be_mem_limit_bytes")]
@@ -1190,6 +1194,14 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.query_control_stage_max_dormant_workers",
             runtime.query_control_stage_max_dormant_workers,
         ),
+        (
+            "runtime.write_commit_evidence_max_bytes",
+            runtime.write_commit_evidence_max_bytes,
+        ),
+        (
+            "runtime.write_commit_evidence_max_entries",
+            runtime.write_commit_evidence_max_entries,
+        ),
     ];
     for (field, value) in nonzero_limits {
         if value == 0 {
@@ -1262,6 +1274,14 @@ fn default_olap_sink_write_buffer_size_bytes() -> usize {
 
 fn default_olap_sink_max_tablet_write_chunk_bytes() -> usize {
     512 * 1024 * 1024 // 512MB, aligned with StarRocks `max_tablet_write_chunk_bytes`
+}
+
+fn default_write_commit_evidence_max_bytes() -> usize {
+    novarocks_spi::connector::DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES
+}
+
+fn default_write_commit_evidence_max_entries() -> usize {
+    novarocks_spi::connector::DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES
 }
 
 fn default_pipeline_exec_thread_pool_thread_num() -> usize {
@@ -1394,6 +1414,8 @@ impl Default for RuntimeConfig {
                 default_query_control_stage_max_inflight_encoded_bytes(),
             query_control_stage_max_dormant_workers:
                 default_query_control_stage_max_dormant_workers(),
+            write_commit_evidence_max_bytes: default_write_commit_evidence_max_bytes(),
+            write_commit_evidence_max_entries: default_write_commit_evidence_max_entries(),
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
