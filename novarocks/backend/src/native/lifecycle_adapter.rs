@@ -203,9 +203,40 @@ pub async fn handle_query_control_stream(
     }
     let attach = decode_query_control_attach(&first).map_err(status_from_lifecycle_error)?;
     let execution_id = attach.execution_id();
+    for kind in [
+        QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
+        QueryLifecycleFaultKind::TerminalP0BytesExhausted,
+        QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
+    ] {
+        if let Some(scope) = claim_backend_fault(kind, execution_id)? {
+            eprintln!(
+                "NOVAROCKS_QUERY_TERMINAL_ATTACH_REJECTED kind={} execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                kind.file_stem(),
+                scope.execution_id.query_id().high(),
+                scope.execution_id.query_id().low(),
+                scope.execution_id.attempt_id().get(),
+                scope.backend_index,
+                scope.backend_id,
+                scope.start_epoch,
+                scope.token,
+            );
+            return Err(tonic::Status::resource_exhausted(format!(
+                "injected query lifecycle fault {} before ControlReady",
+                kind.file_stem()
+            )));
+        }
+    }
     let heartbeat_stop = claim_backend_fault(QueryLifecycleFaultKind::HeartbeatStop, execution_id)?;
     let terminal_snapshot_stream_drop = claim_backend_fault(
         QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
+        execution_id,
+    )?;
+    let terminal_proof_stream_drop = claim_backend_fault(
+        QueryLifecycleFaultKind::TerminalProofStreamDrop,
+        execution_id,
+    )?;
+    let terminal_attestation_stream_drop = claim_backend_fault(
+        QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
         execution_id,
     )?;
     let attachment = ingress
@@ -221,6 +252,8 @@ pub async fn handle_query_control_stream(
         shutdown,
         heartbeat_stop,
         terminal_snapshot_stream_drop,
+        terminal_proof_stream_drop,
+        terminal_attestation_stream_drop,
         execution_id,
     ));
     Ok(ReceiverStream::new(outbound_rx))
@@ -234,6 +267,8 @@ async fn run_attached_control_stream(
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
     terminal_snapshot_stream_drop: Option<QueryLifecycleFaultScope>,
+    terminal_proof_stream_drop: Option<QueryLifecycleFaultScope>,
+    terminal_attestation_stream_drop: Option<QueryLifecycleFaultScope>,
     execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) {
     let first_event = tokio::select! {
@@ -391,9 +426,20 @@ async fn run_attached_control_stream(
                 let Some(event) = event else {
                     break;
                 };
-                if matches!(event, QueryControlEvent::TerminalOutcome { .. })
-                    && let Some(scope) = terminal_snapshot_stream_drop.as_ref()
-                {
+                let terminal_stream_drop = match &event {
+                    QueryControlEvent::TerminalOutcome {
+                        outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof { .. },
+                    } => terminal_proof_stream_drop
+                        .as_ref()
+                        .or(terminal_snapshot_stream_drop.as_ref()),
+                    QueryControlEvent::TerminalOutcome {
+                        outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(_),
+                    } => terminal_attestation_stream_drop
+                        .as_ref()
+                        .or(terminal_snapshot_stream_drop.as_ref()),
+                    _ => None,
+                };
+                if let Some(scope) = terminal_stream_drop {
                     eprintln!(
                         "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
                         scope.execution_id.query_id().high(),
