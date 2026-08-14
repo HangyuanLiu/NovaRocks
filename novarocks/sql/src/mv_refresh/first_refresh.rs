@@ -1489,6 +1489,194 @@ impl MvFirstRefreshTargetContract {
         }
         Ok(())
     }
+
+    fn validate_for_artifact(&self) -> Result<(), String> {
+        self.validate_observed(
+            self.schema.as_ref(),
+            &self.field_ids,
+            self.partition_spec_id,
+        )
+    }
+}
+
+/// Closed source-shaping choices for a first-refresh SQL artifact.
+///
+/// These values contain copied SQL syntax and Arrow type facts only.  They
+/// cannot carry a planner tree, catalog/provider handle, lease, or lifecycle
+/// state into the SQL compiler.
+pub enum SqlMvFirstRefreshArtifactShape {
+    Projection,
+    UnionProjection {
+        branch_count: usize,
+    },
+    Aggregate {
+        calls: crate::planning::mv::SqlMvAggregateCalls,
+        aggregate_input_types: Vec<Option<DataType>>,
+    },
+    FanInAggregate {
+        calls: crate::planning::mv::SqlMvAggregateCalls,
+        aggregate_input_types: Vec<Option<DataType>>,
+    },
+    BranchUnionAggregate {
+        branch_count: usize,
+        calls: crate::planning::mv::SqlMvAggregateCalls,
+    },
+}
+
+/// Facts-only builder for the move-only first-refresh SQL artifact.
+///
+/// Core supplies immutable, already-admitted target and snapshot facts. SQL
+/// alone selects the private state-shaping path and verifies that its root
+/// distribution matches the frozen target contract.
+pub struct SqlMvFirstRefreshArtifactBuilder {
+    select_sql: String,
+    pin: SqlMvSnapshotPin,
+    current_catalog: Option<String>,
+    current_database: String,
+    target_contract: MvFirstRefreshTargetContract,
+    shape: SqlMvFirstRefreshArtifactShape,
+}
+
+impl SqlMvFirstRefreshArtifactBuilder {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        select_sql: String,
+        pin: SqlMvSnapshotPin,
+        current_catalog: Option<String>,
+        current_database: String,
+        target_contract: MvFirstRefreshTargetContract,
+        shape: SqlMvFirstRefreshArtifactShape,
+    ) -> Result<Self, String> {
+        if select_sql.trim().is_empty() || current_database.trim().is_empty() {
+            return Err("invalid MV first-refresh artifact facts".to_string());
+        }
+        target_contract.validate_for_artifact()?;
+        match &shape {
+            SqlMvFirstRefreshArtifactShape::UnionProjection { branch_count }
+            | SqlMvFirstRefreshArtifactShape::BranchUnionAggregate { branch_count, .. }
+                if *branch_count == 0 =>
+            {
+                return Err("MV first-refresh branch count must be non-zero".to_string());
+            }
+            _ => {}
+        }
+        Ok(Self {
+            select_sql,
+            pin,
+            current_catalog,
+            current_database,
+            target_contract,
+            shape,
+        })
+    }
+
+    pub fn build(self) -> Result<SqlMvFirstRefreshArtifact, String> {
+        let current_catalog = self.current_catalog.as_deref();
+        let target_schema = self.target_contract.schema();
+        let physical = match &self.shape {
+            SqlMvFirstRefreshArtifactShape::Projection => {
+                prepare_projection_first_refresh_write_sql(
+                    &self.select_sql,
+                    &self.pin,
+                    current_catalog,
+                    &self.current_database,
+                )?
+            }
+            SqlMvFirstRefreshArtifactShape::UnionProjection { branch_count } => {
+                prepare_union_projection_first_refresh_write_sql(
+                    &self.select_sql,
+                    *branch_count,
+                    &self.pin,
+                    current_catalog,
+                    &self.current_database,
+                )?
+            }
+            SqlMvFirstRefreshArtifactShape::Aggregate {
+                calls,
+                aggregate_input_types,
+            } => {
+                let calls = private_aggregate_calls(calls);
+                prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
+                    &self.select_sql,
+                    &calls,
+                    &self.pin,
+                    current_catalog,
+                    &self.current_database,
+                    Some(target_schema),
+                    Some(aggregate_input_types),
+                )?
+            }
+            SqlMvFirstRefreshArtifactShape::FanInAggregate {
+                calls,
+                aggregate_input_types,
+            } => {
+                let calls = private_aggregate_calls(calls);
+                prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
+                    &self.select_sql,
+                    &calls,
+                    &self.pin,
+                    current_catalog,
+                    &self.current_database,
+                    Some(target_schema),
+                    Some(aggregate_input_types),
+                )?
+            }
+            SqlMvFirstRefreshArtifactShape::BranchUnionAggregate {
+                branch_count,
+                calls,
+            } => {
+                let calls = private_aggregate_calls(calls);
+                prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
+                    &self.select_sql,
+                    *branch_count,
+                    &calls,
+                    &self.pin,
+                    current_catalog,
+                    &self.current_database,
+                    Some(target_schema),
+                )?
+            }
+        };
+        validate_root_distribution(
+            &RootDistributionRequirement::ShuffleOutputName(
+                physical.root_hash_column().to_string(),
+            ),
+            physical.root_hash_column(),
+            self.target_contract.hidden_hash_key(),
+        )?;
+        Ok(physical)
+    }
+}
+
+fn private_aggregate_calls(calls: &crate::planning::mv::SqlMvAggregateCalls) -> SqlAggregateCalls {
+    use crate::mv_refresh::aggregate_shape::{
+        SqlAggregateCall, SqlAggregateGroupKey, SqlAggregateInput,
+    };
+    use crate::planning::mv::AggregateInput;
+
+    SqlAggregateCalls {
+        group_keys: calls
+            .group_keys
+            .iter()
+            .map(|key| SqlAggregateGroupKey {
+                output_name: key.output_name.clone(),
+                expr: key.expr.clone(),
+            })
+            .collect(),
+        aggregates: calls
+            .aggregates
+            .iter()
+            .map(|aggregate| SqlAggregateCall {
+                output_name: aggregate.output_name.clone(),
+                function: aggregate.function,
+                input: match &aggregate.input {
+                    AggregateInput::Star => SqlAggregateInput::Star,
+                    AggregateInput::Expr(expr) => SqlAggregateInput::Expr(expr.clone()),
+                },
+            })
+            .collect(),
+        visible_outputs: calls.visible_outputs.clone(),
+    }
 }
 
 pub(crate) fn prepare_projection_first_refresh_write_sql(
@@ -2264,6 +2452,207 @@ mod tests {
 
     fn pin() -> SqlMvSnapshotPin {
         SqlMvSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-uuid")])
+    }
+
+    fn aggregate_calls(sql: &str) -> crate::planning::mv::SqlMvAggregateCalls {
+        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).unwrap();
+        let statement = crate::parser::parse_normalized_sql_raw(&normalized).unwrap();
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected SELECT")
+        };
+        crate::planning::mv::extract_aggregate_sql_calls(&query).unwrap()
+    }
+
+    fn aggregate_target_contract() -> MvFirstRefreshTargetContract {
+        MvFirstRefreshTargetContract::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(SQL_MV_ROW_ID_COLUMN, DataType::Utf8, false),
+                Field::new("k", DataType::Int64, true),
+                Field::new("total", DataType::Int64, true),
+                Field::new("__agg_state_total", DataType::Binary, true),
+                Field::new(
+                    SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN,
+                    DataType::Binary,
+                    true,
+                ),
+            ])),
+            vec![1, 2, 3, 4, 5],
+            0,
+            SQL_MV_ROW_ID_COLUMN.to_string(),
+        )
+        .expect("valid aggregate target contract")
+    }
+
+    fn projection_target_contract() -> MvFirstRefreshTargetContract {
+        let hidden_key = crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
+        MvFirstRefreshTargetContract::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                hidden_key,
+                DataType::Utf8,
+                false,
+            )])),
+            vec![1],
+            0,
+            hidden_key.to_string(),
+        )
+        .expect("valid projection target contract")
+    }
+
+    #[test]
+    fn first_refresh_artifact_builder_seals_every_supported_shape() {
+        let aggregate_sql = "SELECT k, sum(v) AS total FROM ice.db.fact GROUP BY k";
+        let aggregate_shape = aggregate_calls(aggregate_sql);
+        let union_sql = "SELECT v FROM ice.db.a UNION ALL SELECT v FROM ice.db.b";
+        let union_pin = SqlMvSnapshotPin::from_entries_for_tests(&[
+            ("ice.db.a", 11, "a-uuid"),
+            ("ice.db.b", 22, "b-uuid"),
+        ]);
+        let branch_sql = "SELECT k, sum(v) AS total FROM ice.db.a GROUP BY k UNION ALL SELECT k, sum(v) AS total FROM ice.db.b GROUP BY k";
+        let branch_calls = aggregate_calls("SELECT k, sum(v) AS total FROM ice.db.a GROUP BY k");
+
+        let projection = SqlMvFirstRefreshArtifactBuilder::try_new(
+            "SELECT v FROM ice.db.fact".to_string(),
+            pin(),
+            Some("ice".to_string()),
+            "db".to_string(),
+            projection_target_contract(),
+            SqlMvFirstRefreshArtifactShape::Projection,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(
+            projection.root_hash_column(),
+            crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME
+        );
+
+        let union = SqlMvFirstRefreshArtifactBuilder::try_new(
+            union_sql.to_string(),
+            union_pin.clone(),
+            Some("ice".to_string()),
+            "db".to_string(),
+            projection_target_contract(),
+            SqlMvFirstRefreshArtifactShape::UnionProjection { branch_count: 2 },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(
+            union.root_hash_column(),
+            crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME
+        );
+
+        let aggregate = SqlMvFirstRefreshArtifactBuilder::try_new(
+            aggregate_sql.to_string(),
+            pin(),
+            Some("ice".to_string()),
+            "db".to_string(),
+            aggregate_target_contract(),
+            SqlMvFirstRefreshArtifactShape::Aggregate {
+                calls: aggregate_shape.clone(),
+                aggregate_input_types: vec![None],
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(aggregate.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
+
+        let fan_in_sql = "SELECT k, sum(v) AS total FROM (SELECT k, v FROM ice.db.a UNION ALL SELECT k, v FROM ice.db.b) AS input GROUP BY k";
+        let fan_in = SqlMvFirstRefreshArtifactBuilder::try_new(
+            fan_in_sql.to_string(),
+            union_pin.clone(),
+            Some("ice".to_string()),
+            "db".to_string(),
+            aggregate_target_contract(),
+            SqlMvFirstRefreshArtifactShape::FanInAggregate {
+                calls: aggregate_calls(fan_in_sql),
+                aggregate_input_types: vec![None],
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(fan_in.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
+
+        let branch = SqlMvFirstRefreshArtifactBuilder::try_new(
+            branch_sql.to_string(),
+            union_pin,
+            Some("ice".to_string()),
+            "db".to_string(),
+            aggregate_target_contract(),
+            SqlMvFirstRefreshArtifactShape::BranchUnionAggregate {
+                branch_count: 2,
+                calls: branch_calls,
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(branch.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
+    }
+
+    #[test]
+    fn first_refresh_artifact_builder_fails_closed_for_malformed_facts() {
+        assert!(
+            SqlMvFirstRefreshArtifactBuilder::try_new(
+                "SELECT v FROM ice.db.fact".to_string(),
+                pin(),
+                Some("ice".to_string()),
+                "db".to_string(),
+                projection_target_contract(),
+                SqlMvFirstRefreshArtifactShape::UnionProjection { branch_count: 0 },
+            )
+            .is_err()
+        );
+
+        let missing_root_contract = MvFirstRefreshTargetContract::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                true,
+            )])),
+            vec![1],
+            0,
+            "__missing_apply_key__".to_string(),
+        )
+        .unwrap();
+        assert!(
+            SqlMvFirstRefreshArtifactBuilder::try_new(
+                "SELECT v FROM ice.db.fact".to_string(),
+                pin(),
+                Some("ice".to_string()),
+                "db".to_string(),
+                missing_root_contract,
+                SqlMvFirstRefreshArtifactShape::Projection,
+            )
+            .is_err()
+        );
+
+        let mismatched_root_contract = MvFirstRefreshTargetContract::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "other_key",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![1],
+            0,
+            "other_key".to_string(),
+        )
+        .unwrap();
+        assert!(
+            SqlMvFirstRefreshArtifactBuilder::try_new(
+                "SELECT v FROM ice.db.fact".to_string(),
+                pin(),
+                Some("ice".to_string()),
+                "db".to_string(),
+                mismatched_root_contract,
+                SqlMvFirstRefreshArtifactShape::Projection,
+            )
+            .unwrap()
+            .build()
+            .is_err()
+        );
     }
 
     #[test]

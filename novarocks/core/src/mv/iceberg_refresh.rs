@@ -748,7 +748,6 @@ fn prepare_frontend_first_refresh_write(
             connector_context.clone(),
         )?;
         let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
-            definition.select_sql.clone(),
             target.catalog,
             target.namespace,
             target.table,
@@ -776,8 +775,11 @@ fn prepare_frontend_first_refresh_write(
             prepared
         });
     }
-    let sql_pin = sql_first_refresh_snapshot_pin(&pin)?;
-    let physical_sql = if capabilities.has_agg_state {
+    let sql_pin = novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
+        pin.to_snapshot_map(),
+        pin.to_table_uuid_map(),
+    )?;
+    let shape = if capabilities.has_agg_state {
         // A branch UNION ALL has no top-level GROUP BY. Its aggregate-state
         // layout is defined by the first branch and CREATE-time validation
         // guarantees the remaining branches share that layout.
@@ -802,58 +804,39 @@ fn prepare_frontend_first_refresh_write(
             &aggregate_layout_sql,
             &connector_context,
         )?;
-        // The aggregate-state layout remains an application/runtime concern,
-        // while first-refresh SQL shaping consumes an immutable SQL value.
-        // Convert the already validated aggregate surface exactly once at the
-        // application boundary; no SQL module receives the legacy MV shape.
-        let sql_calls = sql_first_refresh_aggregate_calls(&calls);
         if let Some(branch) = &schema_contract.branch {
-            novarocks_sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
-                    &definition.select_sql,
-                    branch.branch_count as usize,
-                    &sql_calls,
-                    &sql_pin,
-                    current_catalog,
-                    current_database,
-                    Some(target_contract.schema()),
-                )?
+            novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::BranchUnionAggregate {
+                branch_count: branch.branch_count as usize,
+                calls,
+            }
         } else if !schema_contract.bases.is_empty() {
-            novarocks_sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-                    &definition.select_sql,
-                    &sql_calls,
-                    &sql_pin,
-                    current_catalog,
-                    current_database,
-                    Some(target_contract.schema()),
-                    Some(&aggregate_layout.aggregate_input_types),
-                )?
+            novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::FanInAggregate {
+                calls,
+                aggregate_input_types: aggregate_layout.aggregate_input_types,
+            }
         } else {
-            novarocks_sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-                    &definition.select_sql,
-                    &sql_calls,
-                    &sql_pin,
-                    current_catalog,
-                    current_database,
-                    Some(target_contract.schema()),
-                    Some(&aggregate_layout.aggregate_input_types),
-                )?
+            novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::Aggregate {
+                calls,
+                aggregate_input_types: aggregate_layout.aggregate_input_types,
+            }
         }
     } else if let Some(branch) = &schema_contract.branch {
-        novarocks_sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
-            &definition.select_sql,
-            branch.branch_count as usize,
-            &sql_pin,
-            current_catalog,
-            current_database,
-        )?
+        novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::UnionProjection {
+            branch_count: branch.branch_count as usize,
+        }
     } else {
-        novarocks_sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
-            &definition.select_sql,
-            &sql_pin,
-            current_catalog,
-            current_database,
-        )?
+        novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::Projection
     };
+    let physical_sql =
+        novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactBuilder::try_new(
+            definition.select_sql.clone(),
+            sql_pin,
+            current_catalog.map(str::to_string),
+            current_database.to_string(),
+            target_contract,
+            shape,
+        )?
+        .build()?;
     let table = first_refresh_target_handle(
         retained_repartition_target.map(|retained| retained.binding.handle()),
         &write_lease,
@@ -861,7 +844,6 @@ fn prepare_frontend_first_refresh_write(
         connector_context.clone(),
     )?;
     let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
-        definition.select_sql,
         target.catalog,
         target.namespace,
         target.table,
@@ -2616,54 +2598,6 @@ fn validate_aggregate_fan_in_base_refs(base_refs: &[TableIdentity]) -> Result<()
         }
     }
     Ok(())
-}
-
-/// Project the validated aggregate-state surface into the SQL compiler's
-/// immutable vocabulary.  The legacy shape continues to serve runtime merge
-/// layout construction; SQL first-refresh shaping must not depend on it.
-fn sql_first_refresh_aggregate_calls(
-    calls: &SqlMvAggregateCalls,
-) -> novarocks_sql::mv_refresh::aggregate_shape::SqlAggregateCalls {
-    use novarocks_sql::mv_refresh::aggregate_shape::{
-        SqlAggregateCall, SqlAggregateGroupKey, SqlAggregateInput,
-    };
-    use novarocks_sql::planning::mv::AggregateInput;
-
-    novarocks_sql::mv_refresh::aggregate_shape::SqlAggregateCalls {
-        group_keys: calls
-            .group_keys
-            .iter()
-            .map(|key| SqlAggregateGroupKey {
-                output_name: key.output_name.clone(),
-                expr: key.expr.clone(),
-            })
-            .collect(),
-        aggregates: calls
-            .aggregates
-            .iter()
-            .map(|aggregate| SqlAggregateCall {
-                output_name: aggregate.output_name.clone(),
-                function: aggregate.function,
-                input: match &aggregate.input {
-                    AggregateInput::Star => SqlAggregateInput::Star,
-                    AggregateInput::Expr(expr) => SqlAggregateInput::Expr(expr.clone()),
-                },
-            })
-            .collect(),
-        visible_outputs: calls.visible_outputs.clone(),
-    }
-}
-
-/// Project the admitted application pin before SQL first-refresh shaping.
-/// This is the only conversion from the refresh owner's pin into the
-/// compiler-facing immutable snapshot vocabulary.
-fn sql_first_refresh_snapshot_pin(
-    pin: &crate::mv::refresh::pin::RefreshSnapshotPin,
-) -> Result<novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin, String> {
-    novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
-        pin.to_snapshot_map(),
-        pin.to_table_uuid_map(),
-    )
 }
 
 /// Validate the resolved base-ref set for a branch UNION ALL aggregate MV.
