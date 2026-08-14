@@ -23,6 +23,7 @@
 // Design: ADR-0025 (docs/adr/ADR-0025-sql-compiler-explicit-input-boundary.md)
 // Design: ADR-0036 (docs/adr/ADR-0036-sql-compiler-dependency-inversion.md)
 
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -473,6 +474,241 @@ impl SqlCompileOutput {
                 "EXPLAIN intent produced unexpected SQL facts".to_string(),
             )),
         }
+    }
+}
+
+/// Immutable runtime observations for one sealed distributed-plan node.
+///
+/// This copied value deliberately contains no profile tree, runtime handle, or
+/// lifecycle state. SQL only consumes it while rendering EXPLAIN ANALYZE.
+pub struct SqlExplainAnalyzeOperatorFacts {
+    node_id: i32,
+    output_rows: i64,
+    total_time_ns: i64,
+    peak_mem_bytes: i64,
+    total_time_max_ns: i64,
+    total_time_min_ns: i64,
+    build_ht_ns: i64,
+    search_ns: i64,
+    out_build_ns: i64,
+    out_probe_ns: i64,
+    dict_input_rows: i64,
+    dict_input_columns: i64,
+    dict_kept_rows: i64,
+    dict_kept_columns: i64,
+    dict_hydrated_rows: i64,
+    dict_hydrated_columns: i64,
+    dict_unsupported_columns: i64,
+}
+
+impl SqlExplainAnalyzeOperatorFacts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        node_id: i32,
+        output_rows: i64,
+        total_time_ns: i64,
+        peak_mem_bytes: i64,
+        total_time_max_ns: i64,
+        total_time_min_ns: i64,
+        build_ht_ns: i64,
+        search_ns: i64,
+        out_build_ns: i64,
+        out_probe_ns: i64,
+        dict_input_rows: i64,
+        dict_input_columns: i64,
+        dict_kept_rows: i64,
+        dict_kept_columns: i64,
+        dict_hydrated_rows: i64,
+        dict_hydrated_columns: i64,
+        dict_unsupported_columns: i64,
+    ) -> Result<Self, SqlCompileError> {
+        if node_id < 0 {
+            return Err(SqlCompileError::InvalidRequest(
+                "EXPLAIN ANALYZE operator facts require a non-negative node id".to_string(),
+            ));
+        }
+        Ok(Self {
+            node_id,
+            output_rows,
+            total_time_ns,
+            peak_mem_bytes,
+            total_time_max_ns,
+            total_time_min_ns,
+            build_ht_ns,
+            search_ns,
+            out_build_ns,
+            out_probe_ns,
+            dict_input_rows,
+            dict_input_columns,
+            dict_kept_rows,
+            dict_kept_columns,
+            dict_hydrated_rows,
+            dict_hydrated_columns,
+            dict_unsupported_columns,
+        })
+    }
+}
+
+/// Immutable fragment-runtime summary for one sealed distributed-plan root.
+pub struct SqlExplainAnalyzeFragmentFacts {
+    root_node_id: i32,
+    operator_active_time_ns: i64,
+    driver_blocked_time_ns: i64,
+    dependency_wait_time_ns: i64,
+    exchange_wait_time_ns: i64,
+    network_time_ns: i64,
+    scan_io_time_ns: i64,
+}
+
+impl SqlExplainAnalyzeFragmentFacts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        root_node_id: i32,
+        operator_active_time_ns: i64,
+        driver_blocked_time_ns: i64,
+        dependency_wait_time_ns: i64,
+        exchange_wait_time_ns: i64,
+        network_time_ns: i64,
+        scan_io_time_ns: i64,
+    ) -> Result<Self, SqlCompileError> {
+        if root_node_id < 0 {
+            return Err(SqlCompileError::InvalidRequest(
+                "EXPLAIN ANALYZE fragment facts require a non-negative root node id".to_string(),
+            ));
+        }
+        Ok(Self {
+            root_node_id,
+            operator_active_time_ns,
+            driver_blocked_time_ns,
+            dependency_wait_time_ns,
+            exchange_wait_time_ns,
+            network_time_ns,
+            scan_io_time_ns,
+        })
+    }
+}
+
+/// SQL-owned, opaque runtime profile for rendering one sealed EXPLAIN ANALYZE
+/// plan. Application code may provide copied observations but cannot inspect or
+/// mutate SQL's formatter state.
+pub struct SqlExplainAnalyzeProfile {
+    profile: crate::explain::distributed::SqlExplainProfile,
+}
+
+impl SqlExplainAnalyzeProfile {
+    pub fn try_new(
+        operator_facts: Vec<SqlExplainAnalyzeOperatorFacts>,
+        fragment_facts: Vec<SqlExplainAnalyzeFragmentFacts>,
+    ) -> Result<Self, SqlCompileError> {
+        let mut operators = HashMap::with_capacity(operator_facts.len());
+        for facts in operator_facts {
+            let node_id = facts.node_id;
+            let metrics = crate::explain::distributed::SqlOperatorMetrics {
+                output_rows: facts.output_rows,
+                total_time_ns: facts.total_time_ns,
+                peak_mem_bytes: facts.peak_mem_bytes,
+                total_time_max_ns: facts.total_time_max_ns,
+                total_time_min_ns: facts.total_time_min_ns,
+                build_ht_ns: facts.build_ht_ns,
+                search_ns: facts.search_ns,
+                out_build_ns: facts.out_build_ns,
+                out_probe_ns: facts.out_probe_ns,
+                dict_input_rows: facts.dict_input_rows,
+                dict_input_columns: facts.dict_input_columns,
+                dict_kept_rows: facts.dict_kept_rows,
+                dict_kept_columns: facts.dict_kept_columns,
+                dict_hydrated_rows: facts.dict_hydrated_rows,
+                dict_hydrated_columns: facts.dict_hydrated_columns,
+                dict_unsupported_columns: facts.dict_unsupported_columns,
+            };
+            if operators.insert(node_id, metrics).is_some() {
+                return Err(SqlCompileError::InvalidRequest(format!(
+                    "EXPLAIN ANALYZE profile has duplicate operator node id {node_id}"
+                )));
+            }
+        }
+
+        let mut fragments = HashMap::with_capacity(fragment_facts.len());
+        for facts in fragment_facts {
+            let root_node_id = facts.root_node_id;
+            let profile = crate::explain::distributed::SqlFragmentProfile {
+                operator_active_time_ns: facts.operator_active_time_ns,
+                driver_blocked_time_ns: facts.driver_blocked_time_ns,
+                dependency_wait_time_ns: facts.dependency_wait_time_ns,
+                exchange_wait_time_ns: facts.exchange_wait_time_ns,
+                network_time_ns: facts.network_time_ns,
+                scan_io_time_ns: facts.scan_io_time_ns,
+            };
+            if fragments.insert(root_node_id, profile).is_some() {
+                return Err(SqlCompileError::InvalidRequest(format!(
+                    "EXPLAIN ANALYZE profile has duplicate fragment root node id {root_node_id}"
+                )));
+            }
+        }
+
+        Ok(Self {
+            profile: crate::explain::distributed::SqlExplainProfile {
+                operators,
+                fragments,
+            },
+        })
+    }
+}
+
+/// Render EXPLAIN ANALYZE for a sealed distributed plan and copied runtime
+/// observations. The plan remains read-only and profile facts fail closed if
+/// they name nodes that are absent from the sealed plan.
+pub fn render_distributed_explain_analyze(
+    plan: &crate::plan_read::DistributedPlan,
+    profile: &SqlExplainAnalyzeProfile,
+) -> Result<Vec<String>, SqlCompileError> {
+    let mut plan_node_ids = HashSet::new();
+    let fragment_root_ids = plan
+        .fragments()
+        .iter()
+        .map(|fragment| {
+            collect_distributed_plan_node_ids(&fragment.root, &mut plan_node_ids);
+            fragment.root.node_id
+        })
+        .collect::<HashSet<_>>();
+
+    if let Some(node_id) = profile
+        .profile
+        .operators
+        .keys()
+        .find(|node_id| !plan_node_ids.contains(node_id))
+    {
+        return Err(SqlCompileError::InvalidRequest(format!(
+            "EXPLAIN ANALYZE operator facts reference unknown sealed-plan node id {node_id}"
+        )));
+    }
+    if let Some(root_node_id) = profile
+        .profile
+        .fragments
+        .keys()
+        .find(|node_id| !fragment_root_ids.contains(node_id))
+    {
+        return Err(SqlCompileError::InvalidRequest(format!(
+            "EXPLAIN ANALYZE fragment facts reference unknown sealed-plan root node id {root_node_id}"
+        )));
+    }
+
+    Ok(
+        crate::explain::distributed::explain_distributed_plan_with_profile(
+            plan,
+            ExplainLevel::Analyze,
+            &profile.profile,
+        ),
+    )
+}
+
+fn collect_distributed_plan_node_ids(
+    node: &crate::plan_read::DistributedNode,
+    node_ids: &mut HashSet<i32>,
+) {
+    node_ids.insert(node.node_id);
+    for child in &node.children {
+        collect_distributed_plan_node_ids(child, node_ids);
     }
 }
 
@@ -991,6 +1227,106 @@ mod tests {
 
         let _: fn(SqlCompileOutput, ExplainLevel, bool) -> Result<Vec<String>, SqlCompileError> =
             SqlCompileOutput::into_explain_lines;
+    }
+
+    fn explain_operator_facts(node_id: i32) -> SqlExplainAnalyzeOperatorFacts {
+        SqlExplainAnalyzeOperatorFacts::try_new(
+            node_id, 7, 10_000, 64, 11_000, 9_000, 2_000, 3_000, 4_000, 5_000, 6, 2, 5, 1, 4, 1, 0,
+        )
+        .expect("valid operator facts")
+    }
+
+    fn explain_fragment_facts(root_node_id: i32) -> SqlExplainAnalyzeFragmentFacts {
+        SqlExplainAnalyzeFragmentFacts::try_new(
+            root_node_id,
+            20_000,
+            1_000,
+            2_000,
+            3_000,
+            4_000,
+            5_000,
+        )
+        .expect("valid fragment facts")
+    }
+
+    #[test]
+    fn explain_analyze_profile_rejects_invalid_and_duplicate_facts() {
+        assert!(matches!(
+            SqlExplainAnalyzeOperatorFacts::try_new(
+                -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ),
+            Err(SqlCompileError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            SqlExplainAnalyzeFragmentFacts::try_new(-1, 0, 0, 0, 0, 0, 0),
+            Err(SqlCompileError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            SqlExplainAnalyzeProfile::try_new(
+                vec![explain_operator_facts(1), explain_operator_facts(1)],
+                Vec::new(),
+            ),
+            Err(SqlCompileError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            SqlExplainAnalyzeProfile::try_new(
+                Vec::new(),
+                vec![explain_fragment_facts(1), explain_fragment_facts(1)],
+            ),
+            Err(SqlCompileError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn explain_analyze_renderer_accepts_only_facts_for_the_sealed_plan() {
+        let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let cancellation = Arc::new(Cancellation::default());
+        let plan = SqlCompiler::compile(SqlCompileRequest::new(
+            SqlStatementInput::Sql("select 1".to_string()),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed {
+                backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
+            },
+            &catalog_snapshot,
+            &STATISTICS,
+            crate::functions::builtin_sql_function_catalog(),
+            None,
+            control(None, &cancellation),
+        ))
+        .expect("compile distributed query")
+        .into_distributed_plan()
+        .expect("sealed distributed plan");
+        let root_node_id = plan
+            .fragments()
+            .first()
+            .expect("fixture has a fragment")
+            .root
+            .node_id;
+        let profile = SqlExplainAnalyzeProfile::try_new(
+            vec![explain_operator_facts(root_node_id)],
+            vec![explain_fragment_facts(root_node_id)],
+        )
+        .expect("sealed profile");
+        let rendered = render_distributed_explain_analyze(&plan, &profile)
+            .expect("render sealed profile")
+            .join("\n");
+        assert!(rendered.contains("PLAN FRAGMENT"), "{rendered}");
+        assert!(rendered.contains("act={rows=7"), "{rendered}");
+        assert!(rendered.contains("Profile: active=20us"), "{rendered}");
+
+        let unknown =
+            SqlExplainAnalyzeProfile::try_new(vec![explain_operator_facts(i32::MAX)], Vec::new())
+                .expect("well-formed but mismatched facts");
+        assert!(matches!(
+            render_distributed_explain_analyze(&plan, &unknown),
+            Err(SqlCompileError::InvalidRequest(_))
+        ));
     }
 
     #[test]

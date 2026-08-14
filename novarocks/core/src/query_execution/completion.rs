@@ -219,13 +219,55 @@ fn complete_profile(
             lines.push(counters);
         }
     }
+    let operator_facts = actuals
+        .into_iter()
+        .map(|(node_id, metrics)| {
+            novarocks_sql::compiler::SqlExplainAnalyzeOperatorFacts::try_new(
+                node_id,
+                metrics.output_rows,
+                metrics.total_time_ns,
+                metrics.peak_mem_bytes,
+                metrics.total_time_max_ns,
+                metrics.total_time_min_ns,
+                metrics.build_ht_ns,
+                metrics.search_ns,
+                metrics.out_build_ns,
+                metrics.out_probe_ns,
+                metrics.dict_input_rows,
+                metrics.dict_input_columns,
+                metrics.dict_kept_rows,
+                metrics.dict_kept_columns,
+                metrics.dict_hydrated_rows,
+                metrics.dict_hydrated_columns,
+                metrics.dict_unsupported_columns,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let fragment_facts = per_fragment
+        .into_iter()
+        .map(|(root_node_id, summary)| {
+            novarocks_sql::compiler::SqlExplainAnalyzeFragmentFacts::try_new(
+                root_node_id,
+                summary.operator_active_time_ns,
+                summary.driver_blocked_time_ns,
+                summary.dependency_wait_time_ns,
+                summary.exchange_wait_time_ns,
+                summary.network_time_ns,
+                summary.scan_io_time_ns,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let profile =
+        novarocks_sql::compiler::SqlExplainAnalyzeProfile::try_new(operator_facts, fragment_facts)
+            .map_err(|error| error.to_string())?;
     lines.extend(
-        novarocks_sql::explain::distributed::explain_distributed_plan_analyze(
+        novarocks_sql::compiler::render_distributed_explain_analyze(
             &formatter.distributed_plan,
-            novarocks_sql::explain::ExplainLevel::Analyze,
-            &actuals,
-            Some(&per_fragment),
-        ),
+            &profile,
+        )
+        .map_err(|error| error.to_string())?,
     );
     build_string_query_result("Explain String", lines).map(StatementResult::Query)
 }
