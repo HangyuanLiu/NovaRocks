@@ -30,6 +30,7 @@ use crate::binding::SqlTableBindingId;
 use crate::catalog::ResolvedAnalyzerTable;
 use crate::column_id::ColumnRefFactory;
 use crate::plan_read::PlanScanNode;
+use novarocks_spi::connector::ConnectorReadPurpose;
 
 mod pruning;
 mod runtime_filter;
@@ -219,6 +220,303 @@ pub fn matches_frozen_connector_scan(
         && source.table == identity.planner_identity()
 }
 
+/// The execution-relevant category of one sealed SQL scan. This is a copied
+/// routing label, not a planner source or provider request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlScanPreparationCategory {
+    ConnectorRead,
+    AdmittedData,
+    AdmittedFrozenCurrent,
+    AdmittedFrozenSnapshot,
+    FrozenTimestampWithoutAdmittedSnapshot,
+    AdmittedMetadata,
+    Delta,
+    MvTargetState,
+    MvTargetLocator,
+}
+
+/// Immutable catalog identity copied from a sealed SQL scan.
+///
+/// The fields remain private so callers can report and compare identity, but
+/// cannot reconstruct the tokenized scan source that carried it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlScanPreparationIdentity {
+    catalog: String,
+    namespace: String,
+    table: String,
+}
+
+impl SqlScanPreparationIdentity {
+    pub fn catalog(&self) -> &str {
+        &self.catalog
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
+    }
+}
+
+/// One copied immutable change window from a sealed delta scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlScanPreparationDeltaWindow {
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+}
+
+impl SqlScanPreparationDeltaWindow {
+    pub fn from_snapshot_id(&self) -> i64 {
+        self.from_snapshot_id
+    }
+
+    pub fn to_snapshot_id(&self) -> i64 {
+        self.to_snapshot_id
+    }
+}
+
+/// Copied immutable MV target facts needed only to select an already admitted
+/// query-local materialization. It contains no MV plan, provider handle, or
+/// lifecycle state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvTargetScanPreparationFacts {
+    target_table_uuid: String,
+    target_snapshot_id: Option<i64>,
+    use_affected_partitions: bool,
+}
+
+impl SqlMvTargetScanPreparationFacts {
+    pub fn target_table_uuid(&self) -> &str {
+        &self.target_table_uuid
+    }
+
+    pub fn target_snapshot_id(&self) -> Option<i64> {
+        self.target_snapshot_id
+    }
+
+    pub fn use_affected_partitions(&self) -> bool {
+        self.use_affected_partitions
+    }
+}
+
+/// Opaque execution facts projected from one sealed SQL scan.
+///
+/// Core may recover its paired request-local provider authority by the binding
+/// token and select a route by category. It cannot inspect or reconstruct the
+/// SQL scan graph, optimizer tree, wire state, or connector lease.
+#[derive(Clone, Debug)]
+pub struct SqlScanPreparationFacts {
+    category: SqlScanPreparationCategory,
+    binding: SqlTableBindingId,
+    identity: SqlScanPreparationIdentity,
+    frozen_snapshot_id: Option<i64>,
+    frozen_timestamp_millis: Option<i64>,
+    delta_window: Option<SqlScanPreparationDeltaWindow>,
+    mv_target: Option<SqlMvTargetScanPreparationFacts>,
+    connector_read_purpose: ConnectorReadPurpose,
+    refresh_projected_names: Option<Vec<String>>,
+}
+
+impl SqlScanPreparationFacts {
+    pub fn category(&self) -> SqlScanPreparationCategory {
+        self.category
+    }
+
+    pub fn binding(&self) -> SqlTableBindingId {
+        self.binding
+    }
+
+    pub fn identity(&self) -> &SqlScanPreparationIdentity {
+        &self.identity
+    }
+
+    pub fn frozen_snapshot_id(&self) -> Option<i64> {
+        self.frozen_snapshot_id
+    }
+
+    pub fn frozen_timestamp_millis(&self) -> Option<i64> {
+        self.frozen_timestamp_millis
+    }
+
+    pub fn delta_window(&self) -> Option<SqlScanPreparationDeltaWindow> {
+        self.delta_window
+    }
+
+    pub fn mv_target(&self) -> Option<&SqlMvTargetScanPreparationFacts> {
+        self.mv_target.as_ref()
+    }
+
+    pub fn connector_read_purpose(&self) -> ConnectorReadPurpose {
+        self.connector_read_purpose
+    }
+
+    pub fn refresh_projected_names(&self) -> Option<&[String]> {
+        self.refresh_projected_names.as_deref()
+    }
+
+    pub fn source_kind_label(&self) -> &'static str {
+        match self.category {
+            SqlScanPreparationCategory::ConnectorRead => "SqlConnectorRead",
+            SqlScanPreparationCategory::AdmittedData => "SqlData",
+            SqlScanPreparationCategory::AdmittedFrozenCurrent
+            | SqlScanPreparationCategory::AdmittedFrozenSnapshot
+            | SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot => {
+                "SqlFrozenInputSet"
+            }
+            SqlScanPreparationCategory::AdmittedMetadata => "SqlMetadata",
+            SqlScanPreparationCategory::Delta => "SqlDelta",
+            SqlScanPreparationCategory::MvTargetState => "SqlMvTargetState",
+            SqlScanPreparationCategory::MvTargetLocator => "SqlMvTargetLocator",
+        }
+    }
+
+    pub fn source_context(&self) -> String {
+        match self.delta_window {
+            Some(window) => format!(
+                "SqlDelta from_snapshot_id={} to_snapshot_id={}",
+                window.from_snapshot_id, window.to_snapshot_id
+            ),
+            None => self.source_kind_label().to_string(),
+        }
+    }
+}
+
+/// Project exactly the immutable facts needed by application scan preparation
+/// from a sealed plan node. SQL owns all raw source and MV scan vocabulary;
+/// callers receive only copied values and a request-local binding token.
+pub fn scan_preparation_facts(scan: &PlanScanNode) -> SqlScanPreparationFacts {
+    let crate::planner::table::ScanSource::Sql(source) = &scan.table.source;
+    let identity = SqlScanPreparationIdentity {
+        catalog: source.table.catalog.clone(),
+        namespace: source.table.namespace.clone(),
+        table: source.table.table.clone(),
+    };
+    let mut facts = SqlScanPreparationFacts {
+        category: SqlScanPreparationCategory::ConnectorRead,
+        binding: source.binding,
+        identity,
+        frozen_snapshot_id: None,
+        frozen_timestamp_millis: None,
+        delta_window: None,
+        mv_target: None,
+        connector_read_purpose: ConnectorReadPurpose::Query,
+        refresh_projected_names: None,
+    };
+    match &source.kind {
+        crate::planner::table::SqlScanKind::ConnectorRead => {}
+        crate::planner::table::SqlScanKind::Data { .. } => {
+            facts.category = SqlScanPreparationCategory::AdmittedData;
+        }
+        crate::planner::table::SqlScanKind::FrozenInputSet {
+            version: crate::planner::table::SqlTableVersionSelector::Current,
+        } => {
+            facts.category = SqlScanPreparationCategory::AdmittedFrozenCurrent;
+        }
+        crate::planner::table::SqlScanKind::FrozenInputSet {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
+        } => {
+            facts.category = SqlScanPreparationCategory::AdmittedFrozenSnapshot;
+            facts.frozen_snapshot_id = Some(*snapshot_id);
+        }
+        crate::planner::table::SqlScanKind::FrozenInputSet {
+            version: crate::planner::table::SqlTableVersionSelector::TimestampMillis(timestamp),
+        } => {
+            facts.category = SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot;
+            facts.frozen_timestamp_millis = Some(*timestamp);
+        }
+        crate::planner::table::SqlScanKind::Metadata { .. } => {
+            facts.category = SqlScanPreparationCategory::AdmittedMetadata;
+        }
+        crate::planner::table::SqlScanKind::Delta {
+            from_snapshot_id,
+            to_snapshot_id,
+        } => {
+            facts.category = SqlScanPreparationCategory::Delta;
+            facts.delta_window = Some(SqlScanPreparationDeltaWindow {
+                from_snapshot_id: *from_snapshot_id,
+                to_snapshot_id: *to_snapshot_id,
+            });
+        }
+        crate::planner::table::SqlScanKind::MvTargetState { facts: target } => {
+            facts.category = SqlScanPreparationCategory::MvTargetState;
+            facts.connector_read_purpose = ConnectorReadPurpose::MvTargetState;
+            facts.mv_target = Some(SqlMvTargetScanPreparationFacts {
+                target_table_uuid: target.target_table_uuid.clone(),
+                target_snapshot_id: target.target_snapshot_id,
+                use_affected_partitions: matches!(
+                    target.partition_constraint,
+                    crate::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
+                ),
+            });
+            facts.refresh_projected_names = Some(target_state_projected_names(target));
+        }
+        crate::planner::table::SqlScanKind::MvTargetLocator { facts: target } => {
+            facts.category = SqlScanPreparationCategory::MvTargetLocator;
+            facts.connector_read_purpose = ConnectorReadPurpose::MvTargetLocator;
+            facts.mv_target = Some(SqlMvTargetScanPreparationFacts {
+                target_table_uuid: target.target_table_uuid.clone(),
+                target_snapshot_id: target.target_snapshot_id,
+                use_affected_partitions: false,
+            });
+            facts.refresh_projected_names = Some(target_locator_projected_names(target));
+        }
+    }
+    facts
+}
+
+fn target_state_projected_names(
+    target: &crate::planner::table::SqlMvTargetStateScan,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    push_unique_name(&mut names, &target.row_id_column_name);
+    for name in target
+        .group_key_names
+        .iter()
+        .chain(target.aggregate_state_names.iter())
+    {
+        push_unique_name(&mut names, name);
+    }
+    if let crate::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+        branch_scope: Some(scope),
+        ..
+    } = &target.row_filter
+    {
+        push_unique_name(&mut names, &scope.branch_id_column_name);
+    }
+    for name in ["_file", "_pos", "_row_id", "_last_updated_sequence_number"] {
+        push_unique_name(&mut names, name);
+    }
+    names
+}
+
+fn target_locator_projected_names(
+    target: &crate::planner::table::SqlMvTargetLocatorScan,
+) -> Vec<String> {
+    let mut names = vec![target.apply_key_column.clone()];
+    if let Some(branch_id_column) = &target.branch_id_column {
+        push_unique_name(&mut names, branch_id_column);
+    }
+    for name in ["_file", "_pos", "_row_id", "_last_updated_sequence_number"] {
+        push_unique_name(&mut names, name);
+    }
+    names
+}
+
+fn push_unique_name(names: &mut Vec<String>, name: &str) {
+    if !names
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(name))
+    {
+        names.push(name.to_string());
+    }
+}
+
 fn column_defs(input_schema: &SchemaRef) -> Vec<novarocks_catalog::schema::ColumnDef> {
     input_schema
         .fields()
@@ -240,10 +538,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::{
-        FrozenConnectorScanIdentity, build_frozen_connector_scan_plan,
+        FrozenConnectorScanIdentity, SqlScanPreparationCategory, build_frozen_connector_scan_plan,
         frozen_connector_resolved_analyzer_table, matches_frozen_connector_scan,
+        scan_preparation_facts,
     };
     use crate::binding::SqlTableBindingId;
+    use crate::plan_read::DistributedNodeKind;
 
     fn binding() -> SqlTableBindingId {
         SqlTableBindingId::new_for_test(7)
@@ -281,5 +581,67 @@ mod tests {
             true,
         )]));
         let _resolved = frozen_connector_resolved_analyzer_table(&identity, schema, binding());
+    }
+
+    #[test]
+    fn scan_preparation_facts_copy_only_sealed_scan_admission_data() {
+        use crate::test_support::{NativeScanFixture, native_scan_plan};
+
+        let facts_for = |fixture| {
+            let plan = native_scan_plan(fixture).expect("sealed scan fixture");
+            let scan = plan
+                .fragments()
+                .iter()
+                .find_map(|fragment| match &fragment.root.payload {
+                    DistributedNodeKind::Scan(scan) => Some(scan),
+                    _ => None,
+                })
+                .expect("fixture has one scan");
+            scan_preparation_facts(scan)
+        };
+
+        let delta = facts_for(NativeScanFixture::DeltaForPreparedBinding);
+        assert_eq!(delta.category(), SqlScanPreparationCategory::Delta);
+        assert_eq!(
+            delta
+                .delta_window()
+                .expect("delta window")
+                .from_snapshot_id(),
+            6
+        );
+        assert_eq!(
+            delta.delta_window().expect("delta window").to_snapshot_id(),
+            7
+        );
+
+        let timestamp = facts_for(NativeScanFixture::FrozenTimestamp);
+        assert_eq!(
+            timestamp.category(),
+            SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot
+        );
+        assert_eq!(timestamp.frozen_timestamp_millis(), Some(1_704_067_200_000));
+
+        let target = facts_for(NativeScanFixture::RefreshMvTargetState);
+        assert_eq!(target.category(), SqlScanPreparationCategory::MvTargetState);
+        assert_eq!(
+            target.connector_read_purpose(),
+            novarocks_spi::connector::ConnectorReadPurpose::MvTargetState
+        );
+        assert!(
+            !target
+                .mv_target()
+                .expect("target facts")
+                .use_affected_partitions()
+        );
+        assert_eq!(
+            target.refresh_projected_names().expect("target projection"),
+            [
+                "bound_order_id",
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number"
+            ]
+        );
     }
 }

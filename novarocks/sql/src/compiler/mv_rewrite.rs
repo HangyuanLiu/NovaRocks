@@ -1303,7 +1303,7 @@ impl SqlImvRewriteSnapshot {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_target_binding() -> SqlTableBindingId {
     use std::num::{NonZeroU32, NonZeroU64};
 
@@ -1319,7 +1319,7 @@ pub(crate) fn test_target_binding() -> SqlTableBindingId {
 /// The prior and admitted snapshots deliberately describe one exact
 /// incremental window. Tests that exercise delta or version rewriting must
 /// never rely on a synthetic first-refresh fallback.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     let base = novarocks_catalog::identifier::TableIdentity::new("ice", "db", "b");
     let target = novarocks_catalog::identifier::TableIdentity::new("ice", "db", "mv");
@@ -1369,7 +1369,7 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_incremental_snapshot_handle() -> SqlImvRewriteSnapshotHandle {
     SqlImvRewriteSnapshotHandle(test_incremental_snapshot())
 }
@@ -1377,7 +1377,7 @@ pub(crate) fn test_incremental_snapshot_handle() -> SqlImvRewriteSnapshotHandle 
 /// SQL-only scan fixture for rewrite-rule tests.  Test plans must exercise the
 /// same tokenized scan vocabulary as production compiler artifacts; connector
 /// table metadata belongs to application-owned preparation tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_scan_source(kind: crate::planner::table::SqlScanKind) -> ScanSource {
     test_scan_source_for("ice", "db", "b", kind)
 }
@@ -1385,7 +1385,7 @@ pub(crate) fn test_scan_source(kind: crate::planner::table::SqlScanKind) -> Scan
 /// SQL-only scan fixture with an explicit canonical table identity. Tests
 /// comparing physical table identity must not collapse unrelated tables into
 /// the shared default fixture identity.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_scan_source_for(
     catalog: &str,
     namespace: &str,
@@ -1403,14 +1403,14 @@ pub(crate) fn test_scan_source_for(
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_data_scan_source() -> ScanSource {
     test_scan_source(crate::planner::table::SqlScanKind::Data {
         version: crate::planner::table::SqlTableVersionSelector::Current,
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_data_scan_source_for(catalog: &str, namespace: &str, table: &str) -> ScanSource {
     test_scan_source_for(
         catalog,
@@ -1422,7 +1422,7 @@ pub(crate) fn test_data_scan_source_for(catalog: &str, namespace: &str, table: &
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_delta_scan_source(from_snapshot_id: i64, to_snapshot_id: i64) -> ScanSource {
     test_scan_source(crate::planner::table::SqlScanKind::Delta {
         from_snapshot_id,
@@ -1432,7 +1432,7 @@ pub(crate) fn test_delta_scan_source(from_snapshot_id: i64, to_snapshot_id: i64)
 
 /// Build aggregate-refresh facts without persisted records or connector
 /// metadata. Rule tests vary these compiler-facing values directly.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_aggregate_snapshot(
     state_columns: Vec<SqlImvAggregateStateColumnContract>,
     partition: Option<SqlImvPartitionContract>,
@@ -1589,7 +1589,7 @@ pub(crate) fn test_aggregate_snapshot(
 
 /// SQL-owned join fixture for rewrite rules. It has no persistence, provider,
 /// or application-context dependency.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> {
     let qualified =
         |table_fqn: &str, qualifier_at_create: &str, field_id| SqlImvQualifiedFieldLineage {

@@ -50,7 +50,7 @@ pub(crate) use optimized_tree::OptimizedOperatorNode;
 pub(crate) use property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use std::cell::RefCell;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use crate::column_id::ColumnRefFactory;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::ScalarArena;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::optimizer::statistics::TableStatistics;
 use crate::optimizer::stats_input::{OptimizerStatsInput, QueryStatsSnapshot};
 use memo::MExpr;
@@ -130,7 +130,7 @@ pub(crate) fn optimize_with_root_distribution(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn optimize_with_test_table_statistics(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,

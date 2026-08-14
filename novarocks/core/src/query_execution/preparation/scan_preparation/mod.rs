@@ -22,8 +22,10 @@ use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use novarocks_sql::plan_read::PlanScanNode;
-use novarocks_sql::plan_read::table::ScanSource;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
+use novarocks_sql::planning::query_execution::{
+    SqlScanPreparationCategory, SqlScanPreparationFacts, scan_preparation_facts,
+};
 
 mod iceberg;
 mod projection;
@@ -117,7 +119,6 @@ fn collect_scan_bindings(
             fragment_id,
             node.node_id,
             scan,
-            controls,
             context,
             query_table_bindings,
             resolver,
@@ -147,132 +148,86 @@ fn prepare_scan_node(
     fragment_id: FragmentId,
     node_id: i32,
     scan: &PlanScanNode,
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: ScanPreparationOptions,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
-    let execution = match &scan.table.source {
-        ScanSource::Sql(source) => match &source.kind {
-            novarocks_sql::plan_read::table::SqlScanKind::Data { .. }
-            | novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
-                version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Current,
-            } => {
-                let query_table_bindings = query_table_bindings.ok_or_else(|| {
+    let facts = scan_preparation_facts(scan);
+    let execution = match facts.category() {
+        SqlScanPreparationCategory::AdmittedData
+        | SqlScanPreparationCategory::AdmittedFrozenCurrent => {
+            let query_table_bindings = query_table_bindings.ok_or_else(|| {
+                format!(
+                    "SQL scan node_id={node_id} has binding token but no query-local binding store"
+                )
+            })?;
+            let materialization = query_table_bindings
+                .scan_materialization(facts.binding())?
+                .ok_or_else(|| {
                     format!(
-                        "SQL scan node_id={node_id} has binding token but no query-local binding store"
+                        "SQL scan binding for '{}.{}.{}' has no scan materialization",
+                        facts.identity().catalog(),
+                        facts.identity().namespace(),
+                        facts.identity().table()
                     )
                 })?;
-                let materialization = query_table_bindings
-                    .scan_materialization(source.binding)?
-                    .ok_or_else(|| {
-                        format!(
-                            "SQL scan binding for '{}.{}.{}' has no scan materialization",
-                            source.table.catalog, source.table.namespace, source.table.table
-                        )
-                    })?;
-                match materialization {
-                    connector @ QueryScanMaterialization { .. } => {
-                        ResolvedScanExecution::AdmittedConnectorRead(connector)
-                    }
-                    _ => {
-                        return Err(format!(
-                            "SQL data scan binding for '{}.{}.{}' is missing its admitted connector read",
-                            source.table.catalog, source.table.namespace, source.table.table
-                        ));
-                    }
-                }
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
-                version:
-                    novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(snapshot_id),
-            } => {
-                let query_table_bindings = query_table_bindings.ok_or_else(|| {
+            ResolvedScanExecution::AdmittedConnectorRead(materialization)
+        }
+        SqlScanPreparationCategory::AdmittedFrozenSnapshot => {
+            let query_table_bindings = query_table_bindings.ok_or_else(|| {
                     format!(
                         "SQL frozen scan node_id={node_id} has binding token but no query-local binding store"
                     )
                 })?;
-                let materialization = query_table_bindings
-                    .frozen_snapshot_materialization(source.binding, *snapshot_id)?;
-                match materialization {
-                    connector @ QueryScanMaterialization { .. } => {
-                        ResolvedScanExecution::AdmittedConnectorRead(connector)
-                    }
-                    _ => {
-                        return Err(format!(
-                            "SQL frozen scan binding for '{}.{}.{}' has non-neutral materialization",
-                            source.table.catalog, source.table.namespace, source.table.table
-                        ));
-                    }
-                }
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
-                version:
-                    novarocks_sql::plan_read::table::SqlTableVersionSelector::TimestampMillis(timestamp),
-            } => {
-                return Err(format!(
-                    "SQL frozen scan node_id={node_id} has timestamp selector {timestamp} without an admitted snapshot file set"
-                ));
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => {
-                let query_table_bindings = query_table_bindings.ok_or_else(|| {
+            let snapshot_id = facts.frozen_snapshot_id().ok_or_else(|| {
+                format!("SQL frozen scan node_id={node_id} has no admitted snapshot file set")
+            })?;
+            let materialization = query_table_bindings
+                .frozen_snapshot_materialization(facts.binding(), snapshot_id)?;
+            ResolvedScanExecution::AdmittedConnectorRead(materialization)
+        }
+        SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot => {
+            let timestamp = facts.frozen_timestamp_millis().ok_or_else(|| {
+                format!("SQL frozen scan node_id={node_id} has no admitted timestamp selector")
+            })?;
+            return Err(format!(
+                "SQL frozen scan node_id={node_id} has timestamp selector {timestamp} without an admitted snapshot file set"
+            ));
+        }
+        SqlScanPreparationCategory::AdmittedMetadata => {
+            let query_table_bindings = query_table_bindings.ok_or_else(|| {
                     format!(
                         "SQL metadata scan node_id={node_id} has binding token but no query-local binding store"
                     )
                 })?;
-                let materialization = query_table_bindings
-                    .scan_materialization(source.binding)?
-                    .ok_or_else(|| {
-                        format!(
-                            "SQL metadata scan binding for '{}.{}.{}' has no scan materialization",
-                            source.table.catalog, source.table.namespace, source.table.table
-                        )
-                    })?;
-                match materialization {
-                    connector @ QueryScanMaterialization { .. } => {
-                        ResolvedScanExecution::AdmittedConnectorRead(connector)
-                    }
-                    _ => {
-                        return Err(format!(
-                            "SQL metadata scan binding for '{}.{}.{}' has non-metadata materialization",
-                            source.table.catalog, source.table.namespace, source.table.table
-                        ));
-                    }
-                }
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { facts } => {
-                resolve_frozen_mv_target_scan(
-                    node_id,
-                    source,
-                    query_table_bindings,
-                    &facts.target_table_uuid,
-                    facts.target_snapshot_id,
-                    "target-state",
-                    Some(&facts.partition_constraint),
-                )?
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { facts } => {
-                resolve_frozen_mv_target_scan(
-                    node_id,
-                    source,
-                    query_table_bindings,
-                    &facts.target_table_uuid,
-                    facts.target_snapshot_id,
-                    "target-locator",
-                    None,
-                )?
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead
-            | novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => {
-                let source_context = scan_source_context(&scan.table.source);
-                let resolver = resolver.ok_or_else(|| {
+            let materialization = query_table_bindings
+                .scan_materialization(facts.binding())?
+                .ok_or_else(|| {
                     format!(
-                        "scan source {source_context} node_id={node_id} requires scan binding resolver"
+                        "SQL metadata scan binding for '{}.{}.{}' has no scan materialization",
+                        facts.identity().catalog(),
+                        facts.identity().namespace(),
+                        facts.identity().table()
                     )
                 })?;
-                resolver
+            ResolvedScanExecution::AdmittedConnectorRead(materialization)
+        }
+        SqlScanPreparationCategory::MvTargetState => {
+            resolve_frozen_mv_target_scan(node_id, &facts, query_table_bindings, "target-state")?
+        }
+        SqlScanPreparationCategory::MvTargetLocator => {
+            resolve_frozen_mv_target_scan(node_id, &facts, query_table_bindings, "target-locator")?
+        }
+        SqlScanPreparationCategory::ConnectorRead | SqlScanPreparationCategory::Delta => {
+            let source_context = facts.source_context();
+            let resolver = resolver.ok_or_else(|| {
+                format!(
+                    "scan source {source_context} node_id={node_id} requires scan binding resolver"
+                )
+            })?;
+            resolver
                     .resolve_scan(node_id, scan)
                     .map_err(|err| {
                         format!(
@@ -284,11 +239,10 @@ fn prepare_scan_node(
                             "scan binding resolver returned no binding for required source {source_context} node_id={node_id}"
                         )
                     })?
-            }
-        },
+        }
     };
-    validate_resolved_execution_kind(node_id, &scan.table.source, &execution)?;
-    reject_target_equality_deletes(node_id, &scan.table.source, &execution)?;
+    validate_resolved_execution_kind(node_id, &facts, &execution)?;
+    reject_target_equality_deletes(node_id, &facts, &execution)?;
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required, connector_read) = match &execution {
         ResolvedScanExecution::ConnectorRead => {
@@ -313,9 +267,7 @@ fn prepare_scan_node(
             let static_predicates = options
                 .enable_connector_static_predicate_pushdown
                 .then(|| {
-                    let QueryScanMaterialization { schema, .. } = materialization else {
-                        return Vec::new();
-                    };
+                    let QueryScanMaterialization { schema, .. } = materialization;
                     let connector_schema_fields = schema
                         .fields()
                         .iter()
@@ -328,6 +280,7 @@ fn prepare_scan_node(
                 context.clone(),
                 scan,
                 materialization,
+                facts.connector_read_purpose(),
                 static_predicates,
                 options.connector_target_parallelism,
                 options.connector_max_split_bytes,
@@ -336,12 +289,7 @@ fn prepare_scan_node(
             (Vec::new(), Vec::new(), Some(planned))
         }
         ResolvedScanExecution::SealedConnectorScan(connector_scan) => {
-            let ScanSource::Sql(source) = &scan.table.source;
-            let novarocks_sql::plan_read::table::SqlScanKind::Delta {
-                from_snapshot_id,
-                to_snapshot_id,
-            } = source.kind
-            else {
+            let Some(window) = facts.delta_window() else {
                 return Err(format!(
                     "scan preparation node_id={node_id}: sealed change-window scan requires a SQL delta source"
                 ));
@@ -351,8 +299,7 @@ fn prepare_scan_node(
                     "SQL delta scan node_id={node_id} has binding token but no query-local binding store"
                 )
             })?;
-            let exact_lease =
-                exact_query_binding_lease_for_source(query_table_bindings, &scan.table.source)?;
+            let exact_lease = exact_query_binding_lease_for_facts(query_table_bindings, &facts)?;
             let planned = plan_sealed_connector_read(
                 exact_lease,
                 context.clone(),
@@ -360,8 +307,8 @@ fn prepare_scan_node(
                 connector_scan.clone(),
                 novarocks_spi::connector::ConnectorScanSelection::ChangeWindow(
                     novarocks_spi::connector::ConnectorChangeWindow::new(
-                        from_snapshot_id,
-                        to_snapshot_id,
+                        window.from_snapshot_id(),
+                        window.to_snapshot_id(),
                     ),
                 ),
                 options.connector_target_parallelism,
@@ -390,40 +337,37 @@ fn prepare_scan_node(
 /// generation or invokes the legacy MV scan resolver.
 fn resolve_frozen_mv_target_scan(
     node_id: i32,
-    source: &novarocks_sql::plan_read::table::SqlScanSource,
+    facts: &SqlScanPreparationFacts,
     query_table_bindings: Option<&QueryTableBindingStore>,
-    expected_uuid: &str,
-    expected_snapshot_id: Option<i64>,
     lane: &str,
-    target_state_partition_constraint: Option<
-        &novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint,
-    >,
 ) -> Result<ResolvedScanExecution, String> {
+    let target = facts.mv_target().ok_or_else(|| {
+        format!("SQL MV {lane} scan node_id={node_id} has no immutable target facts")
+    })?;
     let query_table_bindings = query_table_bindings.ok_or_else(|| {
         format!(
             "SQL MV {lane} scan node_id={node_id} has binding token but no query-local binding store"
         )
     })?;
-    let binding = query_table_bindings.binding(source.binding)?;
+    let binding = query_table_bindings.binding(facts.binding())?;
     let materialization = binding.mv_target_read.as_ref().ok_or_else(|| {
         format!(
             "SQL MV {lane} scan binding for '{}.{}.{}' has no frozen target materialization",
-            source.table.catalog, source.table.namespace, source.table.table
+            facts.identity().catalog(),
+            facts.identity().namespace(),
+            facts.identity().table()
         )
     })?;
-    if materialization.target_table_uuid != expected_uuid
-        || materialization.frozen_snapshot_id != expected_snapshot_id
+    if materialization.target_table_uuid != target.target_table_uuid()
+        || materialization.frozen_snapshot_id != target.target_snapshot_id()
     {
         return Err(format!(
             "SQL MV {lane} scan node_id={node_id} target UUID or snapshot does not match its frozen binding"
         ));
     }
-    let connector_read = match target_state_partition_constraint {
-        Some(
-            novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
-        ) => &materialization.affected_partitions,
-        Some(novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint::Unpartitioned)
-        | None => &materialization.full,
+    let connector_read = match target.use_affected_partitions() {
+        true => &materialization.affected_partitions,
+        false => &materialization.full,
     };
     Ok(ResolvedScanExecution::AdmittedConnectorRead(
         connector_read.clone(),
@@ -433,22 +377,13 @@ fn resolve_frozen_mv_target_scan(
 /// Once SQL catalog resolution selected a query binding, preparation must use
 /// that same connector generation.  A missing binding is a contract error,
 /// not permission to reacquire `current` and silently mix metadata versions.
-fn exact_query_binding_lease_for_source(
+fn exact_query_binding_lease_for_facts(
     bindings: &QueryTableBindingStore,
-    source: &ScanSource,
+    facts: &SqlScanPreparationFacts,
 ) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
-    let (binding_id, expected_catalog, source_name) = match source {
-        ScanSource::Sql(source) => (
-            Some(source.binding),
-            source.table.catalog.as_str(),
-            format!(
-                "'{}.{}.{}'",
-                source.table.catalog, source.table.namespace, source.table.table
-            ),
-        ),
-    };
-    let binding_id = binding_id
-        .ok_or_else(|| format!("scan preparation has no exact query binding for {source_name}"))?;
+    let binding_id = facts.binding();
+    let expected_catalog = facts.identity().catalog();
+    let source_name = format!("'{}'", facts.identity().fqn());
     let lease = bindings
         .exact_planning_lease(binding_id)
         .map_err(|_| format!("query binding for {source_name} has no connector planning lease"))?;
@@ -464,70 +399,56 @@ fn exact_query_binding_lease_for_source(
 
 fn validate_resolved_execution_kind(
     node_id: i32,
-    source: &ScanSource,
+    facts: &SqlScanPreparationFacts,
     execution: &ResolvedScanExecution,
 ) -> Result<(), String> {
-    let valid = match source {
-        ScanSource::Sql(source) => match &source.kind {
-            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead => {
-                matches!(execution, ResolvedScanExecution::ConnectorRead)
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => {
-                matches!(execution, ResolvedScanExecution::SealedConnectorScan(_))
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::Data { .. }
-            | novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet { .. } => {
-                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. }
-            | novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. } => {
-                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => {
-                matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
-            }
-        },
+    let valid = match facts.category() {
+        SqlScanPreparationCategory::ConnectorRead => {
+            matches!(execution, ResolvedScanExecution::ConnectorRead)
+        }
+        SqlScanPreparationCategory::Delta => {
+            matches!(execution, ResolvedScanExecution::SealedConnectorScan(_))
+        }
+        SqlScanPreparationCategory::AdmittedData
+        | SqlScanPreparationCategory::AdmittedFrozenCurrent
+        | SqlScanPreparationCategory::AdmittedFrozenSnapshot
+        | SqlScanPreparationCategory::AdmittedMetadata
+        | SqlScanPreparationCategory::MvTargetState
+        | SqlScanPreparationCategory::MvTargetLocator => {
+            matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
+        }
+        SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot => false,
     };
     if valid {
         return Ok(());
     }
-    let required = match source {
-        ScanSource::Sql(sql_source) => match sql_source.kind {
-            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead => "ConnectorRead",
-            novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => "IcebergDelta",
-            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => {
-                "AdmittedConnectorRead"
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::Data { .. }
-            | novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet { .. } => {
-                "AdmittedConnectorRead"
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. }
-            | novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. } => {
-                "AdmittedConnectorRead"
-            }
-        },
+    let required = match facts.category() {
+        SqlScanPreparationCategory::ConnectorRead => "ConnectorRead",
+        SqlScanPreparationCategory::Delta => "IcebergDelta",
+        SqlScanPreparationCategory::AdmittedData
+        | SqlScanPreparationCategory::AdmittedFrozenCurrent
+        | SqlScanPreparationCategory::AdmittedFrozenSnapshot
+        | SqlScanPreparationCategory::AdmittedMetadata
+        | SqlScanPreparationCategory::MvTargetState
+        | SqlScanPreparationCategory::MvTargetLocator => "AdmittedConnectorRead",
+        SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot => {
+            "admitted frozen snapshot"
+        }
     };
     Err(format!(
         "scan source {} node_id={node_id} requires {required} execution",
-        scan_source_kind(source)
+        facts.source_kind_label()
     ))
 }
 
 fn reject_target_equality_deletes(
     node_id: i32,
-    source: &ScanSource,
+    facts: &SqlScanPreparationFacts,
     execution: &ResolvedScanExecution,
 ) -> Result<(), String> {
-    let target_kind = match source {
-        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
-            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. },
-            ..
-        }) => "target-state",
-        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
-            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. },
-            ..
-        }) => "target-locator",
+    let target_kind = match facts.category() {
+        SqlScanPreparationCategory::MvTargetState => "target-state",
+        SqlScanPreparationCategory::MvTargetLocator => "target-locator",
         _ => return Ok(()),
     };
     // Query-local neutral reads are deliberately opaque to Core. The provider
@@ -535,40 +456,6 @@ fn reject_target_equality_deletes(
     // planning its split set.
     let _ = (node_id, target_kind, execution);
     Ok(())
-}
-
-fn scan_source_kind(source: &ScanSource) -> &'static str {
-    match source {
-        ScanSource::Sql(source) => match source.kind {
-            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead => "SqlConnectorRead",
-            novarocks_sql::plan_read::table::SqlScanKind::Data { .. } => "SqlData",
-            novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet { .. } => {
-                "SqlFrozenInputSet"
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => "SqlMetadata",
-            novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => "SqlDelta",
-            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. } => {
-                "SqlMvTargetState"
-            }
-            novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. } => {
-                "SqlMvTargetLocator"
-            }
-        },
-    }
-}
-
-fn scan_source_context(source: &ScanSource) -> String {
-    match source {
-        ScanSource::Sql(sql_source) => match sql_source.kind {
-            novarocks_sql::plan_read::table::SqlScanKind::Delta {
-                from_snapshot_id,
-                to_snapshot_id,
-            } => format!(
-                "SqlDelta from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}"
-            ),
-            _ => scan_source_kind(source).to_string(),
-        },
-    }
 }
 
 #[cfg(test)]

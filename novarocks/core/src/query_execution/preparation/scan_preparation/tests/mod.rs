@@ -23,22 +23,19 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::DataType;
-
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::{FixtureDeleteFile, FixtureScanFile};
 use crate::query_execution::preparation::scan::{
     ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
-use novarocks_catalog::schema::ColumnDef;
-use novarocks_sql::analysis::OutputColumn;
-use novarocks_sql::column_id::ColumnId;
-use novarocks_sql::plan_read::PlanScanNode;
-use novarocks_sql::plan_read::table::{ScanSource, TableDef};
-use novarocks_sql::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, PlanFragment,
+use novarocks_sql::plan_read::{
+    DistributedNode, DistributedNodeKind, DistributedPlan, PlanScanNode,
 };
-use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+use novarocks_sql::planning::catalog::{ConnectorReadTableFacts, materialize_connector_read_table};
+use novarocks_sql::planning::query_execution::{
+    SqlScanPreparationCategory, SqlScanPreparationFacts, scan_preparation_facts,
+};
+use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
 fn prepare_scan_bindings(
     plan: &DistributedPlan,
@@ -67,9 +64,9 @@ fn prepare_scan_bindings_with_controls(
     )
 }
 
-/// The shared fixture deliberately allocates the same token that the SQL
-/// test scan carrier embeds. Concrete read units remain in the provider-owned
-/// opaque handle, never in `TableDef::source`.
+/// The shared fixture allocates the same token that the sealed SQL scan embeds.
+/// Concrete SQL source construction remains in SQL test support; Core sees
+/// only copied scan facts and supplies the provider admission beside that token.
 fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
@@ -78,60 +75,57 @@ fn fixture_query_table_bindings(
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
     use novarocks_spi::connector::{
-        ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity,
-        ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorControlResolver, ConnectorInstanceId, ConnectorReadSelector,
+        ConnectorTableIdentity, ConnectorTablePlanningFacts, ConnectorTableRequest,
+        ConnectorTableResolution,
     };
-    use novarocks_sql::plan_read::table::{SqlScanKind, SqlScanSource, SqlTableIdentity};
 
-    let scan = plan
-        .fragments()
-        .iter()
-        .find_map(|fragment| match &fragment.root.payload {
-            DistributedNodeKind::Scan(scan) => Some(scan),
-            _ => None,
-        })
-        .expect("shared fixture plan must have a root scan");
-    let ScanSource::Sql(source) = &scan.table.source;
+    fn collect(node: &DistributedNode, facts: &mut Vec<SqlScanPreparationFacts>) {
+        if let DistributedNodeKind::Scan(scan) = &node.payload {
+            facts.push(scan_preparation_facts(scan));
+        }
+        for child in &node.children {
+            collect(child, facts);
+        }
+    }
+
+    let mut fixture_facts = Vec::new();
+    for fragment in plan.fragments() {
+        collect(&fragment.root, &mut fixture_facts);
+    }
+    fixture_facts.sort_by_key(|facts| facts.binding().ordinal().get());
+    fixture_facts.dedup_by_key(|facts| facts.binding());
     let store = QueryTableBindingStore::try_new_with_scope_for_test(
         NonZeroU64::new(1).expect("fixture scope"),
     );
-    if matches!(source.kind, SqlScanKind::ConnectorRead) {
-        // This source kind is supplied by its dedicated resolver tests;
-        // no catalog admission is expected before resolver dispatch.
-        return store;
-    }
-    let planning_lease = controls
-        .acquire_current(
-            &ConnectorInstanceId::parse(&source.table.catalog)
-                .expect("fixture catalog must be a valid connector instance"),
-        )
-        .ok();
-    if planning_lease.is_none() && matches!(&source.kind, SqlScanKind::Delta { .. }) {
-        // Resolver-only negative tests deliberately omit connector admission so
-        // they can assert the resolver error before generic read planning.
-        return store;
-    }
-    let source = source.clone();
-    let planner = scan.table.clone();
-
-    store
+    for facts in fixture_facts {
+        if facts.category() == SqlScanPreparationCategory::ConnectorRead {
+            // This source kind is supplied by its dedicated resolver tests;
+            // no catalog admission is expected before resolver dispatch.
+            continue;
+        }
+        let planning_lease = controls
+            .acquire_current(
+                &ConnectorInstanceId::parse(facts.identity().catalog())
+                    .expect("fixture catalog must be a valid connector instance"),
+            )
+            .ok();
+        if planning_lease.is_none() && facts.category() == SqlScanPreparationCategory::Delta {
+            // Resolver-only negative tests deliberately omit connector admission so
+            // they can assert the resolver error before generic read planning.
+            continue;
+        }
+        store
         .resolve_or_insert_with_id(
             QueryTableBindingKey::strict_base(
-                &source.table.catalog,
-                &source.table.namespace,
-                &source.table.table,
+                facts.identity().catalog(),
+                facts.identity().namespace(),
+                facts.identity().table(),
             ),
             |binding| {
-                let mut resolved_planner = planner.clone();
-                resolved_planner.source = ScanSource::Sql(SqlScanSource::new(
-                    binding,
-                    SqlTableIdentity {
-                        catalog: source.table.catalog.clone(),
-                        namespace: source.table.namespace.clone(),
-                        table: source.table.table.clone(),
-                    },
-                    source.kind.clone(),
-                ));
+                if binding != facts.binding() {
+                    return Err("sealed scan fixture binding token must match Core fixture store".to_string());
+                }
                 let lease = planning_lease.clone().ok_or_else(|| {
                     "scan fixture must acquire an exact connector lease".to_string()
                 })?;
@@ -140,10 +134,10 @@ fn fixture_query_table_bindings(
                     .metadata()
                     .load_table(ConnectorTableRequest {
                         table: ConnectorTableIdentity {
-                            instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                            instance_id: ConnectorInstanceId::parse(facts.identity().catalog())
                                 .expect("fixture catalog must be valid"),
-                            namespace: Arc::from(source.table.namespace.as_str()),
-                            table: Arc::from(source.table.table.as_str()),
+                            namespace: Arc::from(facts.identity().namespace()),
+                            table: Arc::from(facts.identity().table()),
                         },
                         resolution: ConnectorTableResolution::StrictBaseTable,
                         context: crate::connector::test_request_context(),
@@ -152,16 +146,12 @@ fn fixture_query_table_bindings(
                 let scan_materialization = QueryScanMaterialization {
                     table: metadata.table,
                     schema: metadata.schema,
-                    selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+                    selector: ConnectorReadSelector::Current,
                     statistics_pin: None,
                     planning_lease: lease.clone(),
                 };
-                let frozen_snapshot_materializations = match &source.kind {
-                    SqlScanKind::FrozenInputSet {
-                        version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(
-                            snapshot_id,
-                        ),
-                    } => {
+                let frozen_snapshot_materializations = match facts.frozen_snapshot_id() {
+                    Some(snapshot_id) => {
                         let lease = planning_lease.clone().ok_or_else(|| {
                             "frozen scan fixture must acquire an exact connector lease".to_string()
                         })?;
@@ -170,23 +160,21 @@ fn fixture_query_table_bindings(
                             .metadata()
                             .load_table(ConnectorTableRequest {
                                 table: ConnectorTableIdentity {
-                                    instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                                    instance_id: ConnectorInstanceId::parse(facts.identity().catalog())
                                         .expect("fixture catalog must be valid"),
-                                    namespace: Arc::from(source.table.namespace.as_str()),
-                                    table: Arc::from(source.table.table.as_str()),
+                                    namespace: Arc::from(facts.identity().namespace()),
+                                    table: Arc::from(facts.identity().table()),
                                 },
                                 resolution: ConnectorTableResolution::StrictBaseTable,
                                 context: crate::connector::test_request_context(),
                             })
                             .map_err(|error| error.to_string())?;
                         std::collections::BTreeMap::from([(
-                            *snapshot_id,
+                            snapshot_id,
                             QueryScanMaterialization {
                                 table: metadata.table,
                                 schema: metadata.schema,
-                                selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
-                                    *snapshot_id,
-                                ),
+                                selector: ConnectorReadSelector::SnapshotId(snapshot_id),
                                 statistics_pin: None,
                                 planning_lease: lease,
                             },
@@ -195,32 +183,48 @@ fn fixture_query_table_bindings(
                     _ => std::collections::BTreeMap::new(),
                 };
                 Ok(QueryTableBinding {
-                    resolved: novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
-                        Some(&source.table.catalog),
-                        &source.table.namespace,
-                        resolved_planner,
-                    ),
+                    resolved: materialize_connector_read_table(ConnectorReadTableFacts {
+                        catalog: facts.identity().catalog().to_string(),
+                        namespace: facts.identity().namespace().to_string(),
+                        table: facts.identity().table().to_string(),
+                        columns: scan_materialization
+                            .schema
+                            .fields()
+                            .iter()
+                            .map(|field| novarocks_catalog::schema::ColumnDef {
+                                name: field.name().to_string(),
+                                data_type: field.data_type().clone(),
+                                nullable: field.is_nullable(),
+                                write_default: None,
+                                logical_type: None,
+                            })
+                            .collect(),
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        schema: scan_materialization.schema.clone(),
+                        binding,
+                        selector: ConnectorReadSelector::Current,
+                        planning_facts: ConnectorTablePlanningFacts::empty(),
+                    })
+                    .map_err(|error| format!("fixture SQL materialization: {error}"))?
+                    .into_resolved_table(),
                     statistics_pin: None,
                     admission: planning_lease
                         .clone()
                         .map(crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact)
                         .unwrap_or(crate::query_execution::planning::bindings::QueryTableBindingAdmission::Local),
                     scan_materialization: Some(scan_materialization.clone()),
-                    mv_target_read: match &source.kind {
-                        SqlScanKind::MvTargetState { facts } => Some(
+                    mv_target_read: match facts.mv_target() {
+                        Some(target)
+                            if matches!(
+                                facts.category(),
+                                SqlScanPreparationCategory::MvTargetState
+                                    | SqlScanPreparationCategory::MvTargetLocator
+                            ) => Some(
                             crate::query_execution::planning::bindings::MvTargetReadAdmission {
                                 full: scan_materialization.clone(),
                                 affected_partitions: scan_materialization.clone(),
-                                target_table_uuid: facts.target_table_uuid.clone(),
-                                frozen_snapshot_id: facts.target_snapshot_id,
-                            },
-                        ),
-                        SqlScanKind::MvTargetLocator { facts } => Some(
-                            crate::query_execution::planning::bindings::MvTargetReadAdmission {
-                                full: scan_materialization.clone(),
-                                affected_partitions: scan_materialization.clone(),
-                                target_table_uuid: facts.target_table_uuid.clone(),
-                                frozen_snapshot_id: facts.target_snapshot_id,
+                                target_table_uuid: target.target_table_uuid().to_string(),
+                                frozen_snapshot_id: target.target_snapshot_id(),
                             },
                         ),
                         _ => None,
@@ -232,6 +236,7 @@ fn fixture_query_table_bindings(
             },
         )
         .expect("fixture query binding");
+    }
     store
 }
 
@@ -246,43 +251,6 @@ impl ScanBindingResolver for StaticResolver {
         _scan: &PlanScanNode,
     ) -> Result<Option<ResolvedScanExecution>, String> {
         Ok(Some(self.execution.clone()))
-    }
-}
-
-fn column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
-    OutputColumn {
-        column_id: ColumnId::new_for_test(id),
-        name: name.to_string(),
-        data_type,
-        nullable,
-        is_internal: false,
-    }
-}
-
-fn source_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable,
-        write_default: None,
-        logical_type: None,
-    }
-}
-
-/// The SQL table identity that [`novarocks_sql::plan_read::table::test_sql_scan_source`]
-/// embeds, restated so tests can admit a binding for the same three-part name
-/// without naming a provider.
-struct FixtureTableIdentity {
-    catalog: String,
-    namespace: String,
-    table: String,
-}
-
-fn fixture_table_identity() -> FixtureTableIdentity {
-    FixtureTableIdentity {
-        catalog: "test_catalog".to_string(),
-        namespace: "test_db".to_string(),
-        table: "test_table".to_string(),
     }
 }
 
@@ -302,65 +270,6 @@ fn equality_delete_file(
         &equality_column_names,
         &equality_field_ids,
     )
-}
-
-fn scan_node(node_id: i32) -> DistributedNode {
-    let output = column(1, "id", DataType::Int32, false);
-    let table = TableDef {
-        name: "ice_t".to_string(),
-        columns: vec![source_column("id", DataType::Int32, false)],
-        iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: novarocks_sql::plan_read::table::test_sql_scan_source(
-            novarocks_sql::plan_read::table::SqlScanKind::Data {
-                version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Current,
-            },
-        ),
-    };
-    DistributedNode {
-        node_id,
-        fragment_id: 0,
-        tuple_ids: vec![node_id],
-        nullable_tuple_ids: Vec::new(),
-        limit: -1,
-        runtime_filter_binding_ids: Vec::new(),
-        children: Vec::new(),
-        stats: PhysicalPlanStats {
-            output_row_count: 10.0,
-            row_count_confidence: PlannerConfidence::Fallback,
-            column_statistics: HashMap::new(),
-            cost_estimate: None,
-            broadcast_decision: None,
-        },
-        payload: DistributedNodeKind::Scan(PlanScanNode {
-            database: "default".to_string(),
-            table,
-            alias: None,
-            columns: vec![output],
-            predicates: Vec::new(),
-            required_columns: Some(vec!["id".to_string()]),
-            variant_columns: Vec::new(),
-            mv_rewritten_from: None,
-        }),
-    }
-}
-
-fn plan(root: DistributedNode) -> DistributedPlan {
-    novarocks_sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![PlanFragment {
-            fragment_id: 0,
-            root,
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Result,
-            output_exprs: None,
-            output_columns: vec![column(1, "id", DataType::Int32, false)],
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }],
-        root_fragment_id: 0,
-        runtime_filter_graph: Default::default(),
-        edges: Vec::new(),
-    }
 }
 
 fn registry(files: Vec<FixtureScanFile>) -> ConnectorRegistry {
@@ -480,11 +389,4 @@ fn resolved_delta() -> ResolvedScanExecution {
 
 fn resolved_data_delta() -> ResolvedScanExecution {
     resolved_delta()
-}
-
-fn replace_scan_source(root: &mut DistributedNode, source: ScanSource) {
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("test root must be a scan");
-    };
-    scan.table.source = source;
 }

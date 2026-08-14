@@ -20,13 +20,13 @@ use crate::query_execution::preparation::scan::{
 };
 use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::PlanScanNode;
-use novarocks_sql::plan_read::table::ScanSource;
+use novarocks_sql::planning::query_execution::scan_preparation_facts;
 
 pub(super) fn resolve_physical_columns(
     node_id: i32,
     scan: &PlanScanNode,
 ) -> Result<Vec<ResolvedScanColumn>, String> {
-    if let Some(projected_names) = refresh_scan_projected_names(&scan.table.source) {
+    if let Some(projected_names) = refresh_scan_projected_names(scan) {
         return projected_names
             .into_iter()
             .map(|name| {
@@ -79,71 +79,10 @@ pub(super) fn resolve_physical_columns(
         .collect()
 }
 
-fn refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
-    match source {
-        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
-            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { facts },
-            ..
-        }) => Some(projected_target_state_column_names(facts)),
-        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
-            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { facts },
-            ..
-        }) => Some(projected_target_locator_column_names(facts)),
-        _ => None,
-    }
-}
-
-fn projected_target_state_column_names(
-    scan: &novarocks_sql::plan_read::table::SqlMvTargetStateScan,
-) -> Vec<String> {
-    let mut names = Vec::new();
-    push_unique_projected_name(&mut names, scan.row_id_column_name());
-    for name in scan
-        .group_key_names()
-        .iter()
-        .chain(scan.aggregate_state_names().iter())
-    {
-        push_unique_projected_name(&mut names, name);
-    }
-    if let Some(branch_id_column) = scan.branch_id_column_name() {
-        push_unique_projected_name(&mut names, branch_id_column);
-    }
-    for name in [
-        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-        novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
-        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-    ] {
-        push_unique_projected_name(&mut names, name);
-    }
-    names
-}
-
-fn projected_target_locator_column_names(
-    scan: &novarocks_sql::plan_read::table::SqlMvTargetLocatorScan,
-) -> Vec<String> {
-    let mut names = vec![scan.apply_key_column().to_string()];
-    if let Some(branch_id_column) = scan.branch_id_column() {
-        push_unique_projected_name(&mut names, branch_id_column);
-    }
-    for name in [
-        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-        novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
-        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-    ] {
-        push_unique_projected_name(&mut names, name);
-    }
-    names
-}
-
-fn push_unique_projected_name(names: &mut Vec<String>, name: &str) {
-    if !names
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(name))
-    {
-        names.push(name.to_string());
-    }
+fn refresh_scan_projected_names(scan: &PlanScanNode) -> Option<Vec<String>> {
+    scan_preparation_facts(scan)
+        .refresh_projected_names()
+        .map(ToOwned::to_owned)
 }
 
 pub(super) fn resolve_effective_required_reads(
@@ -151,7 +90,7 @@ pub(super) fn resolve_effective_required_reads(
     scan: &PlanScanNode,
     equality_required: &[String],
 ) -> Result<Vec<ResolvedReadColumn>, String> {
-    let required_names = match refresh_scan_projected_names(&scan.table.source) {
+    let required_names = match refresh_scan_projected_names(scan) {
         Some(projected) => {
             merge_required_columns_with_projected(scan.required_columns.clone(), &projected)
         }
@@ -246,6 +185,15 @@ pub(super) fn merge_required_columns_with_projected(
     out
 }
 
+fn push_unique_projected_name(names: &mut Vec<String>, name: &str) {
+    if !names
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(name))
+    {
+        names.push(name.to_string());
+    }
+}
+
 fn resolved_source_column<'a>(
     scan: &'a PlanScanNode,
     name: &str,
@@ -269,7 +217,7 @@ fn resolved_source_column<'a>(
 }
 
 pub(super) fn effective_scan_column_names(scan: &PlanScanNode) -> Vec<String> {
-    if let Some(projected) = refresh_scan_projected_names(&scan.table.source) {
+    if let Some(projected) = refresh_scan_projected_names(scan) {
         return merge_required_columns_with_projected(scan.required_columns.clone(), &projected);
     }
     let mut names = scan.required_columns.clone().unwrap_or_else(|| {

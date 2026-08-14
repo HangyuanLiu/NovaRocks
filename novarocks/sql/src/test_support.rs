@@ -22,6 +22,7 @@
 //! plans; it exposes neither a draft graph nor a mutation or sealing entrypoint.
 
 use arrow::datatypes::DataType;
+use std::num::NonZeroU64;
 
 use crate::analysis::cte::CteId;
 use crate::analysis::{ExprKind, OutputColumn, SubqueryKind, TypedExpr};
@@ -88,20 +89,35 @@ pub enum NativeEncoderPlanFixture {
 /// Closed sealed scan shapes used by native encoder binding tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeScanFixture {
+    ConnectorRead,
     DeltaWithStaleUnprojectedColumn,
     DeltaForPreparedBinding,
+    DeltaWithInvalidProjection,
     OrdinaryIcebergWithUnprojectedPayload,
     OrdinaryIcebergIdProjection,
     OrdinaryIcebergUnrestricted,
     OrdinaryIcebergAllColumns,
     OrdinaryIcebergWithRequiredPayload,
+    OrdinaryIcebergWithIdEqualityPredicate,
     UnsupportedPredicate,
     RefreshSnapshot,
+    FrozenSnapshotEleven,
+    FrozenSnapshotTwelve,
+    FrozenTimestamp,
+    VersionSnapshotWithStaleOutput,
     RefreshMvTargetLocator,
     RefreshMvTargetState,
     MvTargetLocator,
     MvTargetState,
     VariantProjection,
+    TargetLocatorProjection,
+    TargetStateProjection,
+    EqualityKeyHidden,
+    EqualityKeyProjected,
+    ProjectionMissingColumn,
+    ProjectionTypeMismatch,
+    ProjectionNullabilityMismatch,
+    JoinRefreshCoalesce,
 }
 
 /// Copied scan-admission facts for Core fixture binding. This is intentionally
@@ -138,8 +154,25 @@ pub enum NativePlanEncodingFixture {
 /// Build a sealed scan fixture without exporting a mutable planner draft.
 pub fn native_scan_plan(fixture: NativeScanFixture) -> Result<DistributedPlan, String> {
     match fixture {
+        NativeScanFixture::ConnectorRead => native_scan_fixture_plan(
+            SqlScanKind::ConnectorRead,
+            ordinary_iceberg_columns(),
+            vec![output_column(1, "id", DataType::Int32)],
+            Some(vec!["id".to_string()]),
+            Vec::new(),
+        ),
         NativeScanFixture::DeltaWithStaleUnprojectedColumn => native_delta_scan_plan(),
         NativeScanFixture::DeltaForPreparedBinding => native_prepared_delta_scan_plan(),
+        NativeScanFixture::DeltaWithInvalidProjection => native_scan_fixture_plan(
+            SqlScanKind::Delta {
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            },
+            ordinary_iceberg_columns(),
+            vec![output_column(1, "missing", DataType::Int32)],
+            Some(vec!["missing".to_string()]),
+            Vec::new(),
+        ),
         NativeScanFixture::OrdinaryIcebergWithUnprojectedPayload => {
             native_ordinary_iceberg_scan_plan()
         }
@@ -155,8 +188,41 @@ pub fn native_scan_plan(fixture: NativeScanFixture) -> Result<DistributedPlan, S
         NativeScanFixture::OrdinaryIcebergWithRequiredPayload => {
             native_ordinary_iceberg_required_payload_scan_plan()
         }
+        NativeScanFixture::OrdinaryIcebergWithIdEqualityPredicate => {
+            native_ordinary_iceberg_id_equality_predicate_scan_plan()
+        }
         NativeScanFixture::UnsupportedPredicate => native_unsupported_predicate_scan_plan(),
         NativeScanFixture::RefreshSnapshot => native_refresh_scan_plan(refresh_snapshot_source()),
+        NativeScanFixture::FrozenSnapshotEleven => native_scan_fixture_plan(
+            SqlScanKind::FrozenInputSet {
+                version: SqlTableVersionSelector::Snapshot(11),
+            },
+            ordinary_iceberg_columns(),
+            vec![output_column(1, "id", DataType::Int32)],
+            Some(vec!["id".to_string()]),
+            Vec::new(),
+        ),
+        NativeScanFixture::FrozenSnapshotTwelve => native_scan_fixture_plan(
+            SqlScanKind::FrozenInputSet {
+                version: SqlTableVersionSelector::Snapshot(12),
+            },
+            ordinary_iceberg_columns(),
+            vec![output_column(1, "id", DataType::Int32)],
+            Some(vec!["id".to_string()]),
+            Vec::new(),
+        ),
+        NativeScanFixture::FrozenTimestamp => native_scan_fixture_plan(
+            SqlScanKind::FrozenInputSet {
+                version: SqlTableVersionSelector::TimestampMillis(1_704_067_200_000),
+            },
+            ordinary_iceberg_columns(),
+            vec![output_column(1, "id", DataType::Int32)],
+            Some(vec!["id".to_string()]),
+            Vec::new(),
+        ),
+        NativeScanFixture::VersionSnapshotWithStaleOutput => {
+            native_version_snapshot_with_stale_output_scan_plan()
+        }
         NativeScanFixture::RefreshMvTargetLocator => {
             native_refresh_scan_plan(mv_target_locator_source("bound_order_id"))
         }
@@ -170,7 +236,33 @@ pub fn native_scan_plan(fixture: NativeScanFixture) -> Result<DistributedPlan, S
             native_basic_scan_plan(mv_target_state_source("order_id"))
         }
         NativeScanFixture::VariantProjection => native_variant_projection_scan_plan(),
+        NativeScanFixture::TargetLocatorProjection => native_target_locator_projection_scan_plan(),
+        NativeScanFixture::TargetStateProjection => native_target_state_projection_scan_plan(),
+        NativeScanFixture::EqualityKeyHidden => native_equality_key_hidden_scan_plan(),
+        NativeScanFixture::EqualityKeyProjected => native_equality_key_projected_scan_plan(),
+        NativeScanFixture::ProjectionMissingColumn => {
+            native_projection_mismatch_scan_plan("missing", DataType::Int32, false)
+        }
+        NativeScanFixture::ProjectionTypeMismatch => {
+            native_projection_mismatch_scan_plan("id", DataType::Int64, false)
+        }
+        NativeScanFixture::ProjectionNullabilityMismatch => {
+            native_projection_mismatch_scan_plan("id", DataType::Int32, true)
+        }
+        NativeScanFixture::JoinRefreshCoalesce => native_join_refresh_coalesce_plan(),
     }
+}
+
+fn native_join_refresh_coalesce_plan() -> Result<DistributedPlan, String> {
+    let allocator = crate::binding::SqlTableBindingAllocator::try_new(
+        NonZeroU64::new(1).expect("fixture scope"),
+    )?;
+    let (optimized, _) = crate::planner::imv_rewrite::entrypoint::tests::tests_support::
+        build_tokenized_join_refresh_coalesce_plan_for_lowering(allocator.scope());
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized)
+        .map_err(|error| format!("join-refresh fixture physical plan: {error}"))?;
+    crate::planner::pipeline::build_distributed_plan(physical)
+        .map_err(|error| format!("join-refresh fixture distributed plan: {error}"))
 }
 
 /// Return the copied admission identity needed by Core's prepared-binding
@@ -1206,6 +1298,19 @@ fn native_ordinary_iceberg_scan_plan() -> Result<DistributedPlan, String> {
     )
 }
 
+fn native_ordinary_iceberg_id_equality_predicate_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan_with_predicates(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        ordinary_iceberg_columns(),
+        vec![output_column(1, "id", DataType::Int32)],
+        Some(vec!["id".to_string()]),
+        Vec::new(),
+        vec![id_equality_predicate(12)],
+    )
+}
+
 fn ordinary_iceberg_columns() -> Vec<novarocks_catalog::schema::ColumnDef> {
     vec![
         column_def("id", DataType::Int32, false),
@@ -1381,6 +1486,195 @@ fn native_variant_projection_scan_plan() -> Result<DistributedPlan, String> {
     )
 }
 
+fn native_version_snapshot_with_stale_output_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Snapshot(6),
+        },
+        vec![column_def("id", DataType::Int32, false)],
+        vec![
+            output_column(1, "id", DataType::Int32),
+            output_column(99, "stale_planner_only", DataType::Utf8),
+        ],
+        None,
+        Vec::new(),
+    )
+}
+
+fn native_target_locator_projection_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan_with_lineage(
+        SqlScanKind::MvTargetLocator {
+            facts: SqlMvTargetLocatorScan {
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(6),
+                apply_key_column: "id".to_string(),
+                branch_id_column: None,
+            },
+        },
+        vec![
+            column_def("id", DataType::Int32, false),
+            column_def("extra", DataType::Utf8, true),
+        ],
+        vec![
+            output_column(1, "id", DataType::Int32),
+            OutputColumn {
+                column_id: ColumnId(2),
+                name: "extra".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                is_internal: false,
+            },
+            output_column(11, "_file", DataType::Utf8),
+            output_column(12, "_pos", DataType::Int64),
+            output_column(13, "_row_id", DataType::Int64),
+            OutputColumn {
+                column_id: ColumnId(14),
+                name: "_last_updated_sequence_number".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+        ],
+        None,
+        Vec::new(),
+        Vec::new(),
+        vec![
+            column_def("_file", DataType::Utf8, false),
+            column_def("_pos", DataType::Int64, false),
+            column_def("_row_id", DataType::Int64, false),
+            column_def("_last_updated_sequence_number", DataType::Int64, true),
+        ],
+    )
+}
+
+fn native_target_state_projection_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan_with_lineage(
+        SqlScanKind::MvTargetState {
+            facts: SqlMvTargetStateScan {
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(6),
+                aggregate_state_layout_version: 1,
+                columns: vec![
+                    column_def("id", DataType::Int32, false),
+                    column_def("agg", DataType::Binary, true),
+                    column_def("extra", DataType::Utf8, true),
+                ],
+                group_key_names: vec!["id".to_string()],
+                aggregate_state_names: vec!["agg".to_string()],
+                physical_column_names: vec!["id".to_string(), "agg".to_string()],
+                row_id_column_name: "_row_id".to_string(),
+                row_filter: SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                    row_id_column_name: "_row_id".to_string(),
+                    branch_scope: None,
+                },
+                partition_constraint: SqlMvTargetStatePartitionConstraint::Unpartitioned,
+            },
+        },
+        vec![
+            column_def("id", DataType::Int32, false),
+            column_def("agg", DataType::Binary, true),
+            column_def("extra", DataType::Utf8, true),
+        ],
+        vec![
+            output_column(1, "id", DataType::Int32),
+            OutputColumn {
+                column_id: ColumnId(3),
+                name: "agg".to_string(),
+                data_type: DataType::Binary,
+                nullable: true,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId(4),
+                name: "extra".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                is_internal: false,
+            },
+            output_column(11, "_file", DataType::Utf8),
+            output_column(12, "_pos", DataType::Int64),
+            output_column(13, "_row_id", DataType::Int64),
+            OutputColumn {
+                column_id: ColumnId(14),
+                name: "_last_updated_sequence_number".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            },
+        ],
+        None,
+        Vec::new(),
+        Vec::new(),
+        vec![
+            column_def("_file", DataType::Utf8, false),
+            column_def("_pos", DataType::Int64, false),
+            column_def("_row_id", DataType::Int64, false),
+            column_def("_last_updated_sequence_number", DataType::Int64, true),
+        ],
+    )
+}
+
+fn native_equality_key_hidden_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        vec![
+            column_def("id", DataType::Int32, false),
+            column_def("category", DataType::Utf8, true),
+        ],
+        vec![output_column(1, "id", DataType::Int32)],
+        Some(vec!["id".to_string()]),
+        Vec::new(),
+    )
+}
+
+fn native_equality_key_projected_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        vec![
+            column_def("id", DataType::Int32, false),
+            column_def("category", DataType::Utf8, true),
+        ],
+        vec![
+            output_column(1, "id", DataType::Int32),
+            OutputColumn {
+                column_id: ColumnId(3),
+                name: "category".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                is_internal: false,
+            },
+        ],
+        Some(vec!["id".to_string(), "category".to_string()]),
+        Vec::new(),
+    )
+}
+
+fn native_projection_mismatch_scan_plan(
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+) -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        vec![column_def("id", DataType::Int32, false)],
+        vec![OutputColumn {
+            column_id: ColumnId(1),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }],
+        Some(vec![name.to_string()]),
+        Vec::new(),
+    )
+}
+
 fn refresh_snapshot_source() -> SqlScanKind {
     SqlScanKind::Data {
         version: SqlTableVersionSelector::Snapshot(1),
@@ -1425,10 +1719,48 @@ fn native_scan_fixture_plan(
     required_columns: Option<Vec<String>>,
     variant_columns: Vec<ScanVariantColumn>,
 ) -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan_with_predicates(
+        source,
+        table_columns,
+        output_columns,
+        required_columns,
+        variant_columns,
+        Vec::new(),
+    )
+}
+
+fn native_scan_fixture_plan_with_predicates(
+    source: SqlScanKind,
+    table_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    output_columns: Vec<OutputColumn>,
+    required_columns: Option<Vec<String>>,
+    variant_columns: Vec<ScanVariantColumn>,
+    predicates: Vec<TypedExpr>,
+) -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan_with_lineage(
+        source,
+        table_columns,
+        output_columns,
+        required_columns,
+        variant_columns,
+        predicates,
+        Vec::new(),
+    )
+}
+
+fn native_scan_fixture_plan_with_lineage(
+    source: SqlScanKind,
+    table_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    output_columns: Vec<OutputColumn>,
+    required_columns: Option<Vec<String>>,
+    variant_columns: Vec<ScanVariantColumn>,
+    predicates: Vec<TypedExpr>,
+    iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+) -> Result<DistributedPlan, String> {
     let table = TableDef {
         name: "orders".to_string(),
         columns: table_columns,
-        iceberg_row_lineage_metadata_columns: Vec::new(),
+        iceberg_row_lineage_metadata_columns,
         source: test_sql_scan_source(source),
     };
     let root = DistributedNode {
@@ -1445,7 +1777,7 @@ fn native_scan_fixture_plan(
             table,
             alias: None,
             columns: output_columns.clone(),
-            predicates: Vec::new(),
+            predicates,
             required_columns,
             variant_columns,
             mv_rewritten_from: None,
@@ -1462,6 +1794,30 @@ fn native_scan_fixture_plan(
         cte_id: None,
         cte_exchange_nodes: Vec::new(),
     }])
+}
+
+fn id_equality_predicate(value: i64) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::BinaryOp {
+            left: Box::new(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(1),
+                    qualifier: Some("ice_t".to_string()),
+                    column: "id".to_string(),
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            }),
+            op: BinOp::Eq,
+            right: Box::new(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(value)),
+                data_type: DataType::Int32,
+                nullable: false,
+            }),
+        },
+        data_type: DataType::Boolean,
+        nullable: false,
+    }
 }
 
 /// A column reference suitable for native expression-encoding assertions.
@@ -1814,8 +2170,10 @@ mod tests {
             );
         }
         for fixture in [
+            NativeScanFixture::ConnectorRead,
             NativeScanFixture::DeltaWithStaleUnprojectedColumn,
             NativeScanFixture::DeltaForPreparedBinding,
+            NativeScanFixture::DeltaWithInvalidProjection,
             NativeScanFixture::OrdinaryIcebergWithUnprojectedPayload,
             NativeScanFixture::OrdinaryIcebergIdProjection,
             NativeScanFixture::OrdinaryIcebergUnrestricted,
@@ -1823,14 +2181,31 @@ mod tests {
             NativeScanFixture::OrdinaryIcebergWithRequiredPayload,
             NativeScanFixture::UnsupportedPredicate,
             NativeScanFixture::RefreshSnapshot,
+            NativeScanFixture::FrozenSnapshotEleven,
+            NativeScanFixture::FrozenSnapshotTwelve,
+            NativeScanFixture::FrozenTimestamp,
+            NativeScanFixture::VersionSnapshotWithStaleOutput,
             NativeScanFixture::RefreshMvTargetLocator,
             NativeScanFixture::RefreshMvTargetState,
             NativeScanFixture::MvTargetLocator,
             NativeScanFixture::MvTargetState,
             NativeScanFixture::VariantProjection,
+            NativeScanFixture::TargetLocatorProjection,
+            NativeScanFixture::TargetStateProjection,
+            NativeScanFixture::EqualityKeyHidden,
+            NativeScanFixture::EqualityKeyProjected,
+            NativeScanFixture::ProjectionMissingColumn,
+            NativeScanFixture::ProjectionTypeMismatch,
+            NativeScanFixture::ProjectionNullabilityMismatch,
+            NativeScanFixture::JoinRefreshCoalesce,
         ] {
             let scan = native_scan_plan(fixture).expect("scan fixture must seal");
-            assert_eq!(scan.fragments().len(), 1);
+            let expected_fragments = if fixture == NativeScanFixture::JoinRefreshCoalesce {
+                15
+            } else {
+                1
+            };
+            assert_eq!(scan.fragments().len(), expected_fragments);
         }
         for fixture in [
             NativePlanEncodingFixture::ReorderedSlots,

@@ -449,7 +449,7 @@ fn collect_column_id(column_id: ColumnId, max_id: &mut u32) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
