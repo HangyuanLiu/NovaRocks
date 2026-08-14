@@ -1234,6 +1234,12 @@ impl AttemptControl {
                 Ok(terminal_set) => terminal_set,
                 Err(error) => {
                     self.metrics.terminal_finalize_failure();
+                    // A terminal convergence failure is itself immutable
+                    // query evidence (attestation, liveness, or NoOutcome).
+                    // Keep this attempt reachable after its active binding is
+                    // dropped so the runner can read the same structured
+                    // outcome that determined the SQL failure.
+                    self.retain_terminal_ingress.store(true, Ordering::Release);
                     self.state.store(ABORTED, Ordering::Release);
                     let primary = format!("query lifecycle terminal finalization failed: {error}");
                     let cleanup = self.abort_targets(true, &primary);

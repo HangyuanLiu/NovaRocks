@@ -18,6 +18,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
+#[cfg(debug_assertions)]
+use novarocks::common::query_lifecycle_fault::{
+    QueryLifecycleFaultKind, arm_path, configured_root,
+};
 use novarocks::query_execution::artifact::{
     BackendPlacement, FragmentId, FragmentScheduleDraft, FragmentSchedulingView,
     SchedulingStreamKind, ValidatedFragmentSchedule,
@@ -156,7 +160,6 @@ impl FrontendFragmentScheduler {
         view: FragmentSchedulingView<'_>,
         execution_id: QueryExecutionId,
     ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
-        bind_query_lifecycle_fault_scopes(execution_id, &self.backends)?;
         let fragments = view
             .fragments()
             .map(|fragment| (fragment.fragment_id(), fragment))
@@ -251,7 +254,14 @@ impl FrontendFragmentScheduler {
             counts.insert(root_fragment_id, 1);
         }
 
-        let preferred = (execution_id.query_id().low() as usize) % backend_count;
+        let fault_preferred = query_lifecycle_fault_preferred_live_index(&self.backends)?;
+        if fault_preferred.is_some_and(|live_index| live_index >= backend_count) {
+            return Err(contract_error(
+                "runner-owned lifecycle fault target is excluded by the fragment backend limit",
+            ));
+        }
+        let preferred = fault_preferred
+            .unwrap_or_else(|| (execution_id.query_id().low() as usize) % backend_count);
         let mut draft = FragmentScheduleDraft::new();
         draft.freeze_live_backends(self.backends.live_targets())?;
         for (&fragment_id, &count) in &counts {
@@ -270,7 +280,9 @@ impl FrontendFragmentScheduler {
                 .collect();
             draft.assign_fragment(fragment_id, placements)?;
         }
-        ValidatedFragmentSchedule::validate(view, execution_id, draft)
+        let schedule = ValidatedFragmentSchedule::validate(view, execution_id, draft)?;
+        bind_query_lifecycle_fault_scopes(execution_id, &self.backends, &schedule.backend_ids())?;
+        Ok(schedule)
     }
 }
 
@@ -278,6 +290,7 @@ impl FrontendFragmentScheduler {
 fn bind_query_lifecycle_fault_scopes(
     execution_id: QueryExecutionId,
     backends: &FrontendBackendSnapshot,
+    scheduled_backend_ids: &[usize],
 ) -> Result<(), DistributedQueryError> {
     use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, bind_armed_fault};
 
@@ -285,6 +298,9 @@ fn bind_query_lifecycle_fault_scopes(
         return Ok(());
     };
     for &(backend_index, _) in &backends.entries {
+        if !scheduled_backend_ids.contains(&backend_index) {
+            continue;
+        }
         let start_epoch = backends
             .generations
             .get(&backend_index)
@@ -349,8 +365,58 @@ fn bind_query_lifecycle_fault_scopes(
 fn bind_query_lifecycle_fault_scopes(
     _execution_id: QueryExecutionId,
     _backends: &FrontendBackendSnapshot,
+    _scheduled_backend_ids: &[usize],
 ) -> Result<(), DistributedQueryError> {
     Ok(())
+}
+
+/// A runner arm names one exact BE. Pin single-instance fragments to that BE
+/// so the owner-local fault is actually reachable; without this, a valid arm
+/// can remain unclaimed merely because hash placement chose another live BE.
+#[cfg(debug_assertions)]
+fn query_lifecycle_fault_preferred_live_index(
+    backends: &FrontendBackendSnapshot,
+) -> Result<Option<usize>, DistributedQueryError> {
+    let Some(root) = configured_root() else {
+        return Ok(None);
+    };
+    let fault_kinds = [
+        QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
+        QueryLifecycleFaultKind::ObservationP2BudgetPressure,
+        QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
+        QueryLifecycleFaultKind::TerminalP0BytesExhausted,
+        QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
+        QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+        QueryLifecycleFaultKind::TerminalP1RetentionExhausted,
+        QueryLifecycleFaultKind::TerminalProofStreamDrop,
+        QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+        QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+    ];
+    let armed = backends
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(live_index, (backend_index, _))| {
+            fault_kinds
+                .iter()
+                .any(|kind| arm_path(&root, *backend_index, *kind).exists())
+                .then_some(live_index)
+        })
+        .collect::<Vec<_>>();
+    match armed.as_slice() {
+        [] => Ok(None),
+        [live_index] => Ok(Some(*live_index)),
+        _ => Err(contract_error(
+            "runner-owned query lifecycle faults target more than one live backend",
+        )),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn query_lifecycle_fault_preferred_live_index(
+    _backends: &FrontendBackendSnapshot,
+) -> Result<Option<usize>, DistributedQueryError> {
+    Ok(None)
 }
 
 #[cfg(debug_assertions)]
