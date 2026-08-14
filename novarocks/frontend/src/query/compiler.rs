@@ -47,6 +47,7 @@ use novarocks_sql::compiler::{
     ExplainLevel, SqlCompileControl, SqlCompileIntent, SqlCompileRequest, SqlCompiler,
     SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
+use novarocks_sql::planning::dml::DmlStatisticsSnapshot;
 use novarocks_sql::syntax::{normalize_for_raw_parse, parse_normalized_sql_raw};
 
 #[derive(Clone)]
@@ -274,7 +275,7 @@ impl FrontendQueryCompiler {
         current_database: &str,
         execution: &QueryExecutionContext,
         materializer: &'a dyn novarocks_sql::compiler::SqlCatalogSnapshot,
-        statistics: &'a dyn novarocks_sql::compiler::SqlStatisticsSnapshot,
+        statistics: &'a DmlStatisticsSnapshot,
         mv_definitions: Option<&'a novarocks_sql::compiler::MvRewriteDefinitionIndex>,
         intent: SqlCompileIntent,
     ) -> Result<SqlCompileRequest<'a>, String> {
