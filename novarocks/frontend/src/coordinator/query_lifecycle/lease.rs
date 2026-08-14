@@ -288,7 +288,16 @@ pub(super) struct AttemptControl {
     transport: Arc<dyn QueryLifecycleTransport>,
     registry: Weak<FrontendQueryRegistry>,
     config: FrontendQueryLifecycleConfig,
-    attempted: Mutex<BTreeMap<usize, MaterializedParticipant>>,
+    /// The complete participant plan frozen before InitQuery begins.
+    planned: Mutex<BTreeMap<usize, MaterializedParticipant>>,
+    /// Participants to which FE may still owe pre-ready cleanup. This remains
+    /// distinct from the post-ControlReady admitted terminal set.
+    init_attempted: Mutex<BTreeMap<usize, MaterializedParticipant>>,
+    /// Ready evidence is accumulated while concurrent Attach calls complete.
+    /// It is never itself a partially visible admitted set.
+    control_ready: Mutex<BTreeSet<usize>>,
+    /// Installed exactly once after every planned participant is ControlReady.
+    admitted: Mutex<Option<BTreeMap<usize, MaterializedParticipant>>>,
     sessions: Mutex<BTreeMap<usize, ActiveSession>>,
     state: AtomicU8,
     // A running abort may finish its caller before every BE has delivered an
@@ -318,7 +327,10 @@ impl AttemptControl {
             transport,
             registry,
             config,
-            attempted: Mutex::new(BTreeMap::new()),
+            planned: Mutex::new(BTreeMap::new()),
+            init_attempted: Mutex::new(BTreeMap::new()),
+            control_ready: Mutex::new(BTreeSet::new()),
+            admitted: Mutex::new(None),
             sessions: Mutex::new(BTreeMap::new()),
             state: AtomicU8::new(ACTIVE),
             retain_terminal_ingress: AtomicBool::new(false),
@@ -339,14 +351,88 @@ impl AttemptControl {
         self.execution_id
     }
 
-    pub fn set_attempted(&self, participants: &[MaterializedParticipant]) {
-        let mut attempted = self.attempted.lock().expect("attempted participant set");
-        attempted.extend(
+    pub(super) fn set_planned(&self, participants: &[MaterializedParticipant]) {
+        let mut planned = self.planned.lock().expect("planned participant set");
+        debug_assert!(planned.is_empty(), "planned participant set is immutable");
+        planned.extend(
             participants
                 .iter()
                 .cloned()
                 .map(|participant| (participant.target.backend_idx(), participant)),
         );
+    }
+
+    pub fn set_init_attempted(&self, participants: &[MaterializedParticipant]) {
+        let mut init_attempted = self
+            .init_attempted
+            .lock()
+            .expect("init-attempted participant set");
+        init_attempted.extend(
+            participants
+                .iter()
+                .cloned()
+                .map(|participant| (participant.target.backend_idx(), participant)),
+        );
+    }
+
+    pub(super) fn mark_control_ready(&self, backend_idx: usize) {
+        self.control_ready
+            .lock()
+            .expect("control-ready participant set")
+            .insert(backend_idx);
+    }
+
+    pub(super) fn freeze_admitted(&self) -> Result<(), DistributedQueryError> {
+        let planned = self.planned.lock().expect("planned participant set");
+        let init_attempted = self
+            .init_attempted
+            .lock()
+            .expect("init-attempted participant set");
+        let control_ready = self
+            .control_ready
+            .lock()
+            .expect("control-ready participant set");
+        if planned.len() != init_attempted.len()
+            || !planned.keys().eq(init_attempted.keys())
+            || planned.len() != control_ready.len()
+            || !planned
+                .keys()
+                .all(|backend_idx| control_ready.contains(backend_idx))
+        {
+            return Err(contract_violation(
+                "cannot freeze admitted participants before every planned participant is ControlReady",
+            ));
+        }
+        let mut admitted = self.admitted.lock().expect("admitted participant set");
+        if admitted.is_some() {
+            return Err(contract_violation(
+                "admitted participant set was already frozen",
+            ));
+        }
+        *admitted = Some(planned.clone());
+        Ok(())
+    }
+
+    fn admitted_len(&self) -> Result<usize, DistributedQueryError> {
+        self.admitted
+            .lock()
+            .expect("admitted participant set")
+            .as_ref()
+            .map(BTreeMap::len)
+            .ok_or_else(|| {
+                contract_violation(
+                    "terminal completeness is unavailable before the admitted participant set freezes",
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn admitted_for_test(&self) -> Option<Vec<usize>> {
+        self.admitted
+            .lock()
+            .expect("admitted participant set")
+            .as_ref()
+            .map(|participants| participants.keys().copied().collect())
     }
 
     /// Applies a best-effort live observation after checking that it belongs to
@@ -361,9 +447,9 @@ impl AttemptControl {
     ) -> FragmentObservationStoreOutcome {
         let backend_idx = session.target.backend_idx();
         let participant = self
-            .attempted
+            .init_attempted
             .lock()
-            .expect("attempted participant set")
+            .expect("init-attempted participant set")
             .get(&backend_idx)
             .cloned();
         let valid = participant.is_some_and(|participant| {
@@ -508,9 +594,9 @@ impl AttemptControl {
         outcome: &ParticipantTerminalOutcome,
     ) -> Result<usize, DistributedQueryError> {
         let (backend_idx, participant) = self
-            .attempted
+            .init_attempted
             .lock()
-            .expect("attempted participant set")
+            .expect("init-attempted participant set")
             .iter()
             .find(|(_, participant)| {
                 participant.digest == outcome.init_digest()
@@ -519,12 +605,12 @@ impl AttemptControl {
             .map(|(backend_idx, participant)| (*backend_idx, participant.clone()))
             .ok_or_else(|| {
                 contract_violation(
-                    "query terminal outcome is not owned by an attempted lifecycle participant",
+                    "query terminal outcome is not owned by an init-attempted lifecycle participant",
                 )
             })?;
         if participant.request.manifest().execution_id() != self.execution_id {
             return Err(contract_violation(
-                "attempted participant manifest execution id differs from active lifecycle attempt",
+                "init-attempted participant manifest execution id differs from active lifecycle attempt",
             ));
         }
         Ok(backend_idx)
@@ -613,11 +699,7 @@ impl AttemptControl {
     }
 
     pub(crate) fn terminal_set(&self) -> Result<QueryTerminalSet, DistributedQueryError> {
-        let expected = self
-            .attempted
-            .lock()
-            .expect("attempted participant set")
-            .len();
+        let expected = self.admitted_len()?;
         let terminal = self.terminal.0.lock().expect("query terminal store");
         if terminal.outcomes.len() != expected {
             return Err(failed(format!(
@@ -729,9 +811,9 @@ impl AttemptControl {
 
     fn abort_targets(&self, force_unary: bool, reason: &str) -> Vec<AbortCleanupFailure> {
         let attempted = self
-            .attempted
+            .init_attempted
             .lock()
-            .expect("attempted participant set")
+            .expect("init-attempted participant set")
             .values()
             .cloned()
             .collect::<Vec<_>>();
@@ -927,11 +1009,7 @@ impl AttemptControl {
     }
 
     fn wait_for_all_drained(&self, timeout: Duration) -> Result<(), String> {
-        let expected = self
-            .attempted
-            .lock()
-            .expect("attempted participant set")
-            .len();
+        let expected = self.admitted_len().map_err(|error| error.to_string())?;
         self.wait_terminal_event(timeout, |terminal| {
             if self.state.load(Ordering::Acquire) == ABORTED
                 && let Some(error) = self
@@ -954,12 +1032,12 @@ impl AttemptControl {
 
     fn terminal_delivery_started(&self, terminal: &TerminalState) -> bool {
         self.state.load(Ordering::Acquire) == FINALIZING
-            && terminal.locally_drained.len()
-                == self
-                    .attempted
-                    .lock()
-                    .expect("attempted participant set")
-                    .len()
+            && self
+                .admitted
+                .lock()
+                .expect("admitted participant set")
+                .as_ref()
+                .is_some_and(|admitted| terminal.locally_drained.len() == admitted.len())
     }
 
     fn release_session(&self, backend_idx: usize) {
@@ -970,11 +1048,7 @@ impl AttemptControl {
     }
 
     fn wait_for_all_outcomes(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
-        let expected = self
-            .attempted
-            .lock()
-            .expect("attempted participant set")
-            .len();
+        let expected = self.admitted_len().map_err(|error| error.to_string())?;
         self.wait_terminal_event(timeout, |terminal| {
             if let Some(error) = &terminal.reader_failure {
                 return Some(Err(error.clone()));

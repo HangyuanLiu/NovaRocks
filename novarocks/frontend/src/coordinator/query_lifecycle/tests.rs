@@ -540,7 +540,14 @@ fn observation_control(
         config(),
         Arc::new(FrontendLifecycleMetrics::default()),
     );
-    control.set_attempted(&materialized.participants);
+    control.set_planned(&materialized.participants);
+    control.set_init_attempted(&materialized.participants);
+    for participant in &materialized.participants {
+        control.mark_control_ready(participant.target.backend_idx());
+    }
+    control
+        .freeze_admitted()
+        .expect("fixture admits every ControlReady participant");
     let session = ActiveSession::new(
         participant.target,
         participant.digest,
@@ -1038,7 +1045,8 @@ fn frontend_query_lifecycle_pre_ready_guard_unwind_aborts_and_unbinds() {
         config(),
         Arc::clone(&metrics),
     );
-    control.set_attempted(&materialized.participants);
+    control.set_planned(&materialized.participants);
+    control.set_init_attempted(&materialized.participants);
     let active: Arc<dyn ActiveQueryAttemptControl> = control.clone();
     let binding = registry
         .bind_active_attempt(execution_id, active)
@@ -1115,6 +1123,50 @@ fn frontend_query_lifecycle_all_participant_barrier_aborts_attempted_targets() {
         "{error}"
     );
     assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+}
+
+#[test]
+fn control_ready_then_peer_attach_failure_never_freezes_admitted_participants() {
+    let plan = query_init_plan(None);
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().attach_results.insert(
+        1,
+        VecDeque::from([Err(transport_error(
+            QueryLifecycleTransportErrorKind::Unavailable,
+            "backend 1 attach failed",
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let materialized = super::manifest::materialize(plan).expect("materialize fixture plan");
+    let control = AttemptControl::new(
+        execution_id,
+        Arc::new(transport.clone()),
+        Arc::downgrade(&registry),
+        config(),
+        Arc::new(FrontendLifecycleMetrics::default()),
+    );
+    control.set_planned(&materialized.participants);
+    control.set_init_attempted(&materialized.participants);
+
+    let errors = super::barrier::attach_all(
+        &transport,
+        &materialized.participants,
+        execution_id.attempt_id().get(),
+        config(),
+        &FrontendLifecycleMetrics::default(),
+        &control,
+    );
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("backend 1 attach failed")),
+        "expected backend 1 attach failure: {errors:?}"
+    );
+    assert_eq!(control.admitted_for_test(), None);
+
+    control.abort_before_ready("fixture cleanup".to_string());
 }
 
 #[test]

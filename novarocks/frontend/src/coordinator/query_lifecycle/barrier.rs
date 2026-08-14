@@ -304,7 +304,8 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
                 )
             })
             .collect::<Vec<_>>();
-        control.set_attempted(&materialized.participants);
+        control.set_planned(&materialized.participants);
+        control.set_init_attempted(&materialized.participants);
         if let Err(error) = self
             .registry
             .extend_attempt_backend_ownership(execution_id.query_id(), &ownership)
@@ -368,6 +369,10 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         if let Some(primary) = attach_errors.into_iter().next() {
             let message = control.abort_before_ready(primary);
             return Err(failed(message));
+        }
+        if let Err(error) = control.freeze_admitted() {
+            let message = control.abort_before_ready(error.message().to_string());
+            return Err(DistributedQueryError::new(error.kind(), message));
         }
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(control.abort_before_ready(reason)));
@@ -818,7 +823,7 @@ fn init_one(
     Ok(ack.outcome())
 }
 
-fn attach_all(
+pub(super) fn attach_all(
     transport: &dyn QueryLifecycleTransport,
     participants: &[MaterializedParticipant],
     frontend_owner_epoch: u64,
@@ -848,7 +853,10 @@ fn attach_all(
                         "frontend query lifecycle control attach completed"
                     );
                     match &outcome {
-                        Ok(session) => control.add_session(session.clone()),
+                        Ok(session) => {
+                            control.add_session(session.clone());
+                            control.mark_control_ready(participant.target.backend_idx());
+                        }
                         Err((Some(session), _)) => control.add_session(session.clone()),
                         Err((None, _)) => {}
                     }
