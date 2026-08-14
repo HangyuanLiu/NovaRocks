@@ -78,7 +78,7 @@ impl InfoColumn {
 /// The materialized-views virtual table needs only the durable MV repository.
 /// Keeping this as a leaf port lets query composition use the MV kernel without
 /// recovering the retired standalone application state.
-pub(crate) trait MaterializedViewCatalog {
+trait MaterializedViewCatalog {
     fn mv_repository(&self) -> &Arc<dyn MvRepository>;
 }
 
@@ -94,8 +94,8 @@ impl MaterializedViewCatalog for SystemTableQueryKernel {
     }
 }
 
-pub(crate) fn try_query_materialized_views(
-    catalog: &impl MaterializedViewCatalog,
+pub fn try_query_materialized_views(
+    catalog: &crate::query_execution::kernels::SystemTableQueryKernel,
     query: &sqlast::Query,
 ) -> Result<Option<StatementResult>, String> {
     let sqlast::SetExpr::Select(select) = query.body.as_ref() else {

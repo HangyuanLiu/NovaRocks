@@ -32,7 +32,7 @@ pub(crate) mod frozen_connector_read;
 pub mod kernels;
 pub mod lifecycle;
 pub(crate) mod outcome;
-pub(crate) mod planning;
+pub mod planning;
 pub use completion::{
     PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
     PreparedQueryCompletion, PreparedQueryOperation, StatementResult,
@@ -55,6 +55,7 @@ pub use preparation::runtime_filter_view::{
     RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget, RuntimeFilterSortDirection,
     RuntimeFilterValidatedPlacementFacts,
 };
+pub mod post_compile;
 pub mod prepared_write;
 pub(crate) mod profile;
 pub mod read_session;

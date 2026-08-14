@@ -58,7 +58,7 @@ pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 
 /// Walk a query AST and replace virtual-table references with VALUES-backed
 /// derived tables. Returns `Ok(())` even when no virtual tables are matched.
-pub(crate) fn rewrite_query(
+pub fn rewrite_query(
     kernel: &SystemTableQueryKernel,
     query: &mut sqlast::Query,
 ) -> Result<(), String> {

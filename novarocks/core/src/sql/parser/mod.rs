@@ -29,13 +29,15 @@ use sqlparser::parser::Parser;
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::dialect::StarRocksDialect;
 
+pub use dialect::normalize_for_raw_parse;
+
 /// Parse SQL into a raw sqlparser AST (no custom AST conversion).
 /// Used by standalone analysis and planning paths that consume sqlparser types.
 pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     raw::parse_sql_raw(sql)
 }
 
-pub(crate) fn parse_normalized_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
+pub fn parse_normalized_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     raw::parse_normalized_sql_raw(sql)
 }
 

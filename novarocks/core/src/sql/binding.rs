@@ -25,21 +25,21 @@ use std::num::{NonZeroU32, NonZeroU64};
 
 /// Process-local identity of one application binding store.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SqlTableBindingScopeId(NonZeroU64);
+pub struct SqlTableBindingScopeId(NonZeroU64);
 
 impl SqlTableBindingScopeId {
     pub(crate) fn new(value: NonZeroU64) -> Self {
         Self(value)
     }
 
-    pub(crate) fn get(self) -> NonZeroU64 {
+    pub fn get(self) -> NonZeroU64 {
         self.0
     }
 }
 
 /// One table fact allocated by a query-local binding store.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SqlTableBindingId {
+pub struct SqlTableBindingId {
     scope: SqlTableBindingScopeId,
     ordinal: NonZeroU32,
 }
@@ -49,15 +49,15 @@ impl SqlTableBindingId {
         Self { scope, ordinal }
     }
 
-    pub(crate) fn scope(self) -> SqlTableBindingScopeId {
+    pub fn scope(self) -> SqlTableBindingScopeId {
         self.scope
     }
 
-    pub(crate) fn ordinal(self) -> NonZeroU32 {
+    pub fn ordinal(self) -> NonZeroU32 {
         self.ordinal
     }
 
-    pub(crate) fn belongs_to(self, scope: SqlTableBindingScopeId) -> bool {
+    pub fn belongs_to(self, scope: SqlTableBindingScopeId) -> bool {
         self.scope == scope
     }
 }

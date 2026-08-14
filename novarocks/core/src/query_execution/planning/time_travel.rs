@@ -110,7 +110,7 @@ fn project_iceberg_ref_metadata(facts: &ConnectorReadReferenceFacts) -> SqlIcebe
 
 /// Returns true if the query contains any `TableFactor::Table` node with a
 /// `version: Some(...)` clause. Used as a cheap pre-check before cloning.
-pub(crate) fn has_time_travel_refs(query: &sqlparser::ast::Query) -> bool {
+pub fn has_time_travel_refs(query: &sqlparser::ast::Query) -> bool {
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             if has_time_travel_in_set_expr(cte.query.body.as_ref()) {
@@ -192,7 +192,7 @@ impl_kernel_time_travel_resolver!(MvExecutionKernel);
 ///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
 ///
 /// Tables without a version clause are left untouched.
-pub(crate) fn rewrite_time_travel_refs(
+pub fn rewrite_time_travel_refs(
     resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,

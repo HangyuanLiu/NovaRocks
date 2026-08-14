@@ -45,7 +45,7 @@ pub(crate) mod refresh_io;
 pub(crate) mod refresh_pin_adapter;
 pub mod repository;
 pub(crate) mod rewrite;
-pub(crate) mod rewrite_prep;
+pub mod rewrite_prep;
 pub(crate) mod schema_validation;
 pub mod startup_restore;
 pub(crate) mod stateless_rebuild;

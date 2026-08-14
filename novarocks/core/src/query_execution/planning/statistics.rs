@@ -56,7 +56,7 @@ use crate::sql::planner::table::{
 /// Query-scoped handles for the one unified statistics resolver.  This is not
 /// a provider registry: absent pins intentionally produce missing statistics
 /// rather than a second latest-resolution path.
-pub(crate) struct QueryStatisticsContext {
+pub struct QueryStatisticsContext {
     bindings: Option<Arc<QueryTableBindingStore>>,
     snapshot: Arc<SqlStatisticsSnapshot>,
     resolver: Option<Arc<UnifiedStatisticsResolver>>,

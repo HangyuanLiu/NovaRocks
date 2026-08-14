@@ -20,10 +20,10 @@
 //! the paired exact connector admission and never reacquire a newer binding.
 
 pub(crate) mod bindings;
-pub(crate) mod catalog_materializer;
+pub mod catalog_materializer;
 pub(crate) mod delta_scan;
-pub(crate) mod statistics;
-pub(crate) mod time_travel;
+pub mod statistics;
+pub mod time_travel;
 pub(crate) mod write_sink;
 
 use std::{collections::HashMap, sync::Arc};
@@ -104,7 +104,7 @@ impl SqlCancellationObservation for QueryCancellationObservation {
     }
 }
 
-pub(crate) fn sql_cancellation_observation(
+pub fn sql_cancellation_observation(
     view: QueryCancellationView,
 ) -> Arc<dyn SqlCancellationObservation> {
     Arc::new(QueryCancellationObservation::new(view))

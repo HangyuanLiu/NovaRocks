@@ -265,7 +265,7 @@ impl CatalogCommandKernel {
         &self.mv_storage_observation
     }
 
-    pub(crate) fn view_service(&self) -> &Arc<dyn ViewService> {
+    pub fn view_service(&self) -> &Arc<dyn ViewService> {
         &self.view_service
     }
 }
@@ -442,7 +442,7 @@ impl ViewExecutionKernel {
         &self.connector_control
     }
 
-    pub(crate) fn view_service(&self) -> &Arc<dyn ViewService> {
+    pub fn view_service(&self) -> &Arc<dyn ViewService> {
         &self.view_service
     }
 }

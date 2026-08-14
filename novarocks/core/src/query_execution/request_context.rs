@@ -91,7 +91,7 @@ impl RequestSessionContext {
         &self.current_database
     }
 
-    pub(crate) fn optimizer_settings(&self) -> &SessionOptimizerSettings {
+    pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
         &self.optimizer_settings
     }
 }
@@ -142,7 +142,7 @@ impl QueryExecutionContext {
 
     /// Settings frozen with the request so DML and coordinator-adjacent plan
     /// construction never consult process- or thread-local session state.
-    pub(crate) fn optimizer_settings(&self) -> &SessionOptimizerSettings {
+    pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
         &self.optimizer_settings
     }
 }

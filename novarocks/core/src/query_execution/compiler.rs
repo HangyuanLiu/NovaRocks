@@ -17,7 +17,6 @@
 // under the License.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use arrow::array::{ArrayRef, StringArray};
@@ -26,6 +25,9 @@ use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
+pub use crate::query_execution::post_compile::{
+    NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
+};
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
@@ -42,7 +44,7 @@ use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
 use crate::mv::repository::MvRepository;
 #[cfg(test)]
 use crate::mv::repository::UnavailableMvRepository;
-use crate::sql::catalog::TableLookupMode;
+pub use crate::sql::catalog::TableLookupMode;
 #[cfg(test)]
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -97,6 +99,63 @@ pub(crate) fn catalog_service_snapshot(source: &impl CatalogServiceSource) -> Qu
     QueryCatalogService::new(
         Arc::new(RwLock::new(source.catalog_service().local_snapshot())),
         source.catalog_service().registry_snapshot(),
+    )
+}
+
+/// Freeze the catalog source for one Frontend-admitted query.  The returned
+/// value is owned by the caller so the paired materializer can borrow the
+/// same snapshot throughout parse, compile, and post-compile preparation.
+pub fn query_catalog_service_snapshot(
+    query_kernel: &domain::QueryPreparationKernel,
+) -> QueryCatalogService {
+    catalog_service_snapshot(query_kernel)
+}
+
+/// Build the only request-local catalog materializer available to Frontend
+/// query admission.  It allocates the paired binding store inside Core; the
+/// caller can pass the materializer to SQL and post-compile preparation but
+/// cannot inject a different store.
+pub fn build_query_catalog_materializer<'a>(
+    query_kernel: &'a domain::QueryPreparationKernel,
+    current_catalog: Option<&'a str>,
+    catalog_service: &'a QueryCatalogService,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    lookup_mode: TableLookupMode,
+) -> crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'a> {
+    build_catalog_service_provider(
+        current_catalog,
+        catalog_service,
+        query_kernel.connector_control().as_ref(),
+        connector_context,
+        lookup_mode,
+        query_kernel.catalog_application().map(Arc::as_ref),
+    )
+}
+
+/// Freeze optional MV rewrite candidates through the request's exact Core
+/// ports.  Frontend chooses whether an unavailable repository means no
+/// candidates; it never gains connector-control access directly.
+pub fn freeze_query_mv_rewrite_definition_index(
+    query_kernel: &domain::QueryPreparationKernel,
+    repository: &dyn MvRepository,
+    storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
+) -> Result<crate::sql::compiler::MvRewriteDefinitionIndex, String> {
+    crate::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+        repository,
+        query_kernel.connector_control().as_ref(),
+        storage_observation,
+    )
+}
+
+/// Freeze request-local statistics evidence from the same catalog binding
+/// store used by SQL analysis.  It never resolves a newer connector state.
+pub fn query_statistics_snapshot(
+    query_kernel: &domain::QueryPreparationKernel,
+    analyzer_catalog: &crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'_>,
+) -> crate::query_execution::planning::statistics::QueryStatisticsContext {
+    crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+        query_kernel,
+        analyzer_catalog.query_table_bindings(),
     )
 }
 
@@ -1002,121 +1061,8 @@ pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
     Arc::new(crate::mv::test_repository::InMemoryMvRepository::default())
 }
 
-/// Exact plan/preparation pair frozen by Core for one Frontend-owned native
-/// assembly step. It has no constructor and exposes only immutable encoder
-/// inputs, so callers cannot replace bindings or acquire a newer generation.
-pub struct NativeFragmentEncodingInput {
-    distributed_plan: crate::sql::plan_read::DistributedPlan,
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    provenance: u64,
-}
-
-impl NativeFragmentEncodingInput {
-    pub(crate) fn new(
-        distributed_plan: crate::sql::plan_read::DistributedPlan,
-        prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    ) -> Self {
-        Self {
-            distributed_plan,
-            prepared,
-            provenance: next_native_encoding_provenance(),
-        }
-    }
-
-    pub fn distributed_plan(&self) -> &crate::sql::plan_read::DistributedPlan {
-        &self.distributed_plan
-    }
-
-    pub fn prepared(&self) -> &crate::query_execution::preparation::PreparedFragmentSet {
-        &self.prepared
-    }
-
-    pub fn source(&self) -> crate::protocol::native::encode::NativeFragmentEncodingSource<'_> {
-        crate::protocol::native::encode::NativeFragmentEncodingSource::sealed(
-            &self.distributed_plan,
-            &self.prepared,
-            self.provenance,
-        )
-    }
-
-    pub(crate) fn matches_native_bundle(
-        &self,
-        native_bundle: &crate::protocol::native::encode::NativeFragmentBundle,
-    ) -> bool {
-        native_bundle.matches_provenance(self.provenance)
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        crate::sql::plan_read::DistributedPlan,
-        crate::query_execution::preparation::PreparedFragmentSet,
-    ) {
-        (self.distributed_plan, self.prepared)
-    }
-}
-
-fn next_native_encoding_provenance() -> u64 {
-    static NEXT_PROVENANCE: AtomicU64 = AtomicU64::new(1);
-    loop {
-        let provenance = NEXT_PROVENANCE.fetch_add(1, Ordering::Relaxed);
-        if provenance != 0 {
-            return provenance;
-        }
-    }
-}
-
-/// Core-owned request finalizer for one Frontend-encoded distributed query.
-/// Frontend supplies the only native bundle after reading the exact sealed
-/// pair; Core retains lifecycle request construction and completion pairing.
-pub struct PreparedDistributedQueryAssembly {
-    encoding: NativeFragmentEncodingInput,
-    query_options: Option<QueryOptions>,
-    intent: crate::query_execution::contract::DistributedQueryIntent,
-    execution: crate::query_execution::request_context::QueryExecutionContext,
-}
-
-impl PreparedDistributedQueryAssembly {
-    fn new(
-        encoding: NativeFragmentEncodingInput,
-        query_options: Option<QueryOptions>,
-        intent: crate::query_execution::contract::DistributedQueryIntent,
-        execution: crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Self {
-        Self {
-            encoding,
-            query_options,
-            intent,
-            execution,
-        }
-    }
-
-    pub fn encoding(&self) -> &NativeFragmentEncodingInput {
-        &self.encoding
-    }
-
-    pub fn finish(
-        self,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
-    ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
-        if !self.encoding.matches_native_bundle(&native_bundle) {
-            return Err(
-                "native fragment bundle does not match the sealed query encoding input".into(),
-            );
-        }
-        let (_, prepared) = self.encoding.into_parts();
-        crate::query_execution::contract::build_distributed_query_request_with_execution(
-            prepared,
-            native_bundle,
-            self.query_options,
-            self.intent,
-            &self.execution,
-        )
-        .map_err(|error| error.to_string())
-    }
-}
-
-pub enum CorePreparedQueryOperation {
+#[cfg(test)]
+pub enum TestPreparedQueryOperation {
     Immediate(PreparedImmediateQuery),
     Distributed {
         assembly: PreparedDistributedQueryAssembly,
@@ -1128,8 +1074,9 @@ pub enum CorePreparedQueryOperation {
 ///
 /// It deliberately exposes neither a composition aggregate nor connector internals.
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
+#[cfg(test)]
 #[derive(Clone)]
-pub struct CoreQueryCompiler {
+pub struct TestQueryCompiler {
     query: domain::QueryPreparationKernel,
     view: domain::ViewExecutionKernel,
     system_tables: domain::SystemTableQueryKernel,
@@ -1137,7 +1084,8 @@ pub struct CoreQueryCompiler {
     mv_storage_observation: Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
 }
 
-impl CoreQueryCompiler {
+#[cfg(test)]
+impl TestQueryCompiler {
     pub fn from_domain_kernels(
         query: domain::QueryPreparationKernel,
         view: domain::ViewExecutionKernel,
@@ -1159,7 +1107,7 @@ impl CoreQueryCompiler {
         sql: &str,
         context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
-    ) -> Result<CorePreparedQueryOperation, String> {
+    ) -> Result<TestPreparedQueryOperation, String> {
         let connector_context = crate::connector::connector_request_context_for_query(
             query_opts.as_ref(),
             context.execution().cancellation().clone(),
@@ -1173,7 +1121,7 @@ impl CoreQueryCompiler {
         request_context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<CorePreparedQueryOperation, String> {
+    ) -> Result<TestPreparedQueryOperation, String> {
         if !is_query_sql(sql) {
             return Err(
                 "non-query statements must be executed through a typed command capability".into(),
@@ -1238,7 +1186,7 @@ impl CoreQueryCompiler {
                     level,
                     force_logical_explain,
                 )?;
-                Ok(CorePreparedQueryOperation::Immediate(
+                Ok(TestPreparedQueryOperation::Immediate(
                     PreparedImmediateQuery::new(StatementResult::Query(result)),
                 ))
             }
@@ -1266,7 +1214,7 @@ impl CoreQueryCompiler {
                         query,
                     )?
                 {
-                    return Ok(CorePreparedQueryOperation::Immediate(
+                    return Ok(TestPreparedQueryOperation::Immediate(
                         PreparedImmediateQuery::new(result),
                     ));
                 }
@@ -1316,7 +1264,7 @@ impl CoreQueryCompiler {
                     crate::sql::compiler::SqlCompileIntent::Query,
                     true,
                 )?;
-                Ok(CorePreparedQueryOperation::Distributed {
+                Ok(TestPreparedQueryOperation::Distributed {
                     assembly,
                     completion: PreparedQueryCompletion::result(),
                 })
@@ -1333,7 +1281,7 @@ impl CoreQueryCompiler {
         query_opts: Option<QueryOptions>,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<CorePreparedQueryOperation, String> {
+    ) -> Result<TestPreparedQueryOperation, String> {
         let query = prepare_explain_query_with_ports(
             &self.query,
             &self.view,
@@ -1370,7 +1318,7 @@ impl CoreQueryCompiler {
                 },
                 true,
             )?;
-        Ok(CorePreparedQueryOperation::Distributed {
+        Ok(TestPreparedQueryOperation::Distributed {
             assembly,
             completion: PreparedQueryCompletion::profile(
                 distributed_plan,
@@ -1382,6 +1330,7 @@ impl CoreQueryCompiler {
     }
 }
 
+#[cfg(test)]
 fn is_query_sql(sql: &str) -> bool {
     let mut words = sql.split_whitespace();
     match words.next().map(|word| word.to_ascii_lowercase()) {
@@ -1850,7 +1799,7 @@ where
 // Query plan build + execute (delegates to crate::sql::*)
 // ---------------------------------------------------------------------------
 
-fn ensure_mainline_distributed_execution(
+pub(crate) fn ensure_mainline_distributed_execution(
     has_terminal_sink: bool,
     exchange_port: u16,
 ) -> Result<(), String> {
@@ -1883,7 +1832,7 @@ fn optimizer_settings_for_execution(
     settings
 }
 
-fn scan_preparation_options(
+pub(crate) fn scan_preparation_options(
     settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
@@ -1912,7 +1861,7 @@ fn scan_preparation_options(
     )
 }
 
-fn connector_static_planning_metrics(
+pub(crate) fn connector_static_planning_metrics(
     prepared: &crate::query_execution::preparation::PreparedFragmentSet,
 ) -> Result<crate::query_execution::profile::ConnectorStaticPlanningMetrics, String> {
     let mut metrics = crate::query_execution::profile::ConnectorStaticPlanningMetrics::default();
@@ -1922,6 +1871,7 @@ fn connector_static_planning_metrics(
     Ok(metrics)
 }
 
+#[cfg(test)]
 fn prepare_explain_query_with_ports(
     query_kernel: &domain::QueryPreparationKernel,
     view_kernel: &domain::ViewExecutionKernel,
@@ -1956,6 +1906,7 @@ fn prepare_explain_query_with_ports(
     Ok(prepared)
 }
 
+#[cfg(test)]
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {
     let mut query_options = query_options.unwrap_or_default();
     query_options.enable_profile = true;
@@ -2919,6 +2870,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
 /// native encoding receive the exact binding store returned by that same
 /// compilation request.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn prepare_query_with_sql_compiler_kernel_with_ports(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'_>,
@@ -3029,6 +2981,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn explain_query_with_sql_compiler_kernel_with_ports(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'_>,
@@ -3324,6 +3277,7 @@ fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
 /// and append a StarRocks-style `Unexpected input '<token>'` clause when
 /// the underlying error mentions the offending token (`found: <token>`),
 /// so tests can assert against the StarRocks-FE-style wording.
+#[cfg(test)]
 fn format_parser_error(raw: &str) -> String {
     let mut out = format!("sql parser error: {raw}");
     if let Some(start) = raw.find("found: ") {
@@ -3341,6 +3295,7 @@ fn format_parser_error(raw: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
     let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
     Some((
@@ -3349,6 +3304,7 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
     ))
 }
 
+#[cfg(test)]
 fn split_explain_logical_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
     let mut body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "LOGICAL")?;
     let mut level = crate::sql::explain::ExplainLevel::Normal;
@@ -3366,6 +3322,7 @@ fn split_explain_logical_sql(sql: &str) -> Option<(String, crate::sql::explain::
     Some((format!("EXPLAIN {}", body.trim_start()), level))
 }
 
+#[cfg(test)]
 fn consume_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
     let trimmed = sql.trim_start();
     let head = trimmed.as_bytes().get(..keyword.len())?;

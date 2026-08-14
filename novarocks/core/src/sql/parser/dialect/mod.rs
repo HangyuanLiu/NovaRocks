@@ -323,7 +323,7 @@ pub(crate) fn parse_create_database_name(
 
 /// Normalize SQL syntax for parsing. This applies rewrites that make
 /// StarRocks-specific syntax compatible with the sqlparser crate.
-pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
+pub fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_set_user_variables(sql)?;
     let sql = rewrite_from_dual(&sql)?;
     let sql = normalize_function_syntax(&sql)?;

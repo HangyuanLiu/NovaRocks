@@ -19,15 +19,16 @@ pub(crate) mod agg_mergeability;
 pub mod common;
 
 pub(crate) mod analysis;
-pub(crate) mod binding;
-pub(crate) mod catalog;
+pub mod binding;
+pub mod catalog;
 pub(crate) mod column_id;
-pub(crate) mod compiler;
+pub mod compiler;
 pub(crate) mod functions;
 pub(crate) mod literal;
 pub mod mv_refresh;
 pub(crate) mod parser;
 pub mod plan_read;
+pub mod syntax;
 
 pub(crate) mod optimizer;
 

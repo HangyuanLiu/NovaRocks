@@ -34,6 +34,21 @@ pub enum PreparedQueryOperation {
     Distributed(PreparedDistributedQuery),
 }
 
+impl PreparedQueryOperation {
+    /// Build a completed statement result without exposing the immediate
+    /// operation constructor to application callers.
+    pub fn immediate(result: StatementResult) -> Self {
+        Self::Immediate(PreparedImmediateQuery::new(result))
+    }
+
+    /// Build the canonical single-column response used by EXPLAIN.
+    pub fn explain_lines(lines: Vec<String>) -> Result<Self, String> {
+        Ok(Self::immediate(StatementResult::Query(
+            build_string_query_result("Explain String", lines)?,
+        )))
+    }
+}
+
 pub struct PreparedImmediateQuery {
     result: StatementResult,
 }

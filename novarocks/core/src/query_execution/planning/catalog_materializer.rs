@@ -373,7 +373,7 @@ pub(crate) trait QueryTableBindingLoader: Send + Sync {
 /// Application-owned catalog facade.  Its binding store is request-local and
 /// retained by the caller as post-compile context; the SQL catalog trait does
 /// not expose it.
-pub(crate) struct CatalogServiceMaterializer<'a> {
+pub struct CatalogServiceMaterializer<'a> {
     current_catalog: Option<&'a str>,
     service: &'a crate::catalog_application::query_catalog::QueryCatalogService,
     bindings: Arc<QueryTableBindingStore>,
@@ -672,6 +672,12 @@ impl PlannerTableProvider for CatalogServiceMaterializer<'_> {
 
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         Some(self)
+    }
+}
+
+impl crate::sql::compiler::SqlCatalogSnapshot for CatalogServiceMaterializer<'_> {
+    fn planner_table_provider(&self) -> &dyn PlannerTableProvider {
+        self
     }
 }
 

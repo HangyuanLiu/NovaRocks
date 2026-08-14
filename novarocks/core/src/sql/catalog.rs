@@ -22,13 +22,13 @@ use novarocks_catalog::table::CatalogTable;
 pub(crate) mod local;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TableLookupMode {
+pub enum TableLookupMode {
     SchemaOnly,
     ExplainStats,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ResolvedAnalyzerTable {
+pub struct ResolvedAnalyzerTable {
     pub(crate) catalog: CatalogTable,
     pub(crate) planner: TableDef,
 }
@@ -57,7 +57,7 @@ impl ResolvedAnalyzerTable {
 /// This is the only ordinary analyzer/planner lookup seam: implementations
 /// must return the neutral schema and planner binding from one authoritative
 /// resolution.
-pub(crate) trait PlannerTableProvider {
+pub trait PlannerTableProvider {
     fn resolve_table_for_analysis(
         &self,
         catalog: Option<&str>,
@@ -70,7 +70,7 @@ pub(crate) trait PlannerTableProvider {
     }
 }
 
-pub(crate) trait IcebergMetadataTableProvider {
+pub trait IcebergMetadataTableProvider {
     fn get_iceberg_metadata_table(
         &self,
         catalog: Option<&str>,

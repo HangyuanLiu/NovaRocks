@@ -88,8 +88,7 @@ impl crate::sql::compiler::SqlFunctionCatalog for BuiltinSqlFunctionCatalog {
 
 static BUILTIN_SQL_FUNCTION_CATALOG: BuiltinSqlFunctionCatalog = BuiltinSqlFunctionCatalog;
 
-pub(crate) fn builtin_sql_function_catalog() -> &'static dyn crate::sql::compiler::SqlFunctionCatalog
-{
+pub fn builtin_sql_function_catalog() -> &'static dyn crate::sql::compiler::SqlFunctionCatalog {
     &BUILTIN_SQL_FUNCTION_CATALOG
 }
 

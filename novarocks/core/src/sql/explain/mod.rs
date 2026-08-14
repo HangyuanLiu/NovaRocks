@@ -31,7 +31,7 @@ use crate::sql::planner::table::ScanSource;
 
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExplainLevel {
+pub enum ExplainLevel {
     Normal,
     Verbose,
     Costs,

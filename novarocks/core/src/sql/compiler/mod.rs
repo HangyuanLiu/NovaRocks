@@ -27,15 +27,17 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::sql::explain::ExplainLevel;
+pub use crate::sql::explain::ExplainLevel;
+pub use crate::sql::functions::builtin_sql_function_catalog;
 use crate::sql::optimizer::options::SessionOptimizerSettings;
+pub use mv_rewrite::MvRewriteDefinitionIndex;
 
 /// SQL's read-only observation of statement cancellation.
 ///
 /// The application owns cancellation reasons and sources.  Compiler phases
 /// only need this single immutable fact, so the SQL boundary never imports
 /// query-lifecycle cancellation state.
-pub(crate) trait SqlCancellationObservation: Send + Sync {
+pub trait SqlCancellationObservation: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
 
@@ -44,7 +46,7 @@ pub(crate) trait SqlCancellationObservation: Send + Sync {
 /// Concrete connector clients and registry mutation APIs are intentionally not
 /// part of this contract. The provider is a query-scoped snapshot and owns the
 /// one binding store shared by analysis, statistics, and scan preparation.
-pub(crate) trait SqlCatalogSnapshot {
+pub trait SqlCatalogSnapshot {
     fn planner_table_provider(&self) -> &dyn crate::sql::catalog::PlannerTableProvider;
 }
 
@@ -98,7 +100,7 @@ impl SqlStatisticsPlan {
 /// A narrow, exact statistics capability available to one request.  It reads
 /// only bindings captured by the paired catalog snapshot; it cannot ask for a
 /// newer connector generation.
-pub(crate) trait SqlStatisticsSnapshot {
+pub trait SqlStatisticsSnapshot {
     fn collect_table_statistics(
         &self,
         database: &str,
@@ -145,7 +147,7 @@ impl SqlImvPlanningInput {
 ///
 /// The function implementation and its execution kernels are explicitly out
 /// of scope for this compiler-facing contract.
-pub(crate) trait SqlFunctionCatalog: Send + Sync {
+pub trait SqlFunctionCatalog: Send + Sync {
     fn resolve_scalar_signature(
         &self,
         name: &str,
@@ -157,7 +159,7 @@ pub(crate) trait SqlFunctionCatalog: Send + Sync {
 
 /// Statement material already owned by the SQL boundary.
 #[derive(Clone, Debug)]
-pub(crate) enum SqlStatementInput {
+pub enum SqlStatementInput {
     Sql(String),
     ParsedQuery(Box<sqlparser::ast::Query>),
     /// A SQL-owned logical transformation that must re-enter the canonical
@@ -172,7 +174,7 @@ pub(crate) enum SqlStatementInput {
 
 /// The compiler result shape required by the caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SqlCompileIntent {
+pub enum SqlCompileIntent {
     Query,
     Explain {
         level: ExplainLevel,
@@ -188,7 +190,7 @@ pub(crate) enum SqlCompileIntent {
 
 /// A SQL-owned replacement for write-planning callbacks.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RootDistributionRequirement {
+pub enum RootDistributionRequirement {
     Any,
     ShuffleOutputOrdinal(usize),
     ShuffleOutputName(String),
@@ -196,22 +198,22 @@ pub(crate) enum RootDistributionRequirement {
 
 /// SQL-relevant session state frozen at statement admission.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SqlSessionContext {
-    pub(crate) current_catalog: Option<String>,
-    pub(crate) current_database: String,
-    pub(crate) optimizer_settings: SessionOptimizerSettings,
+pub struct SqlSessionContext {
+    pub current_catalog: Option<String>,
+    pub current_database: String,
+    pub optimizer_settings: SessionOptimizerSettings,
 }
 
 /// Deployment facts consumed by planning without exposing topology objects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SqlPlanningEnvironment {
+pub enum SqlPlanningEnvironment {
     Distributed { backend_count: NonZeroUsize },
     NotApplicable,
 }
 
 /// Read-only request control observed by compiler phases.
 #[derive(Clone)]
-pub(crate) struct SqlCompileControl {
+pub struct SqlCompileControl {
     deadline: Option<Instant>,
     cancellation: Arc<dyn SqlCancellationObservation>,
 }
@@ -225,7 +227,7 @@ impl SqlCancellationObservation for SqlNeverCancelled {
 }
 
 impl SqlCompileControl {
-    pub(crate) fn new(
+    pub fn new(
         deadline: Option<Instant>,
         cancellation: Arc<dyn SqlCancellationObservation>,
     ) -> Self {
@@ -238,7 +240,7 @@ impl SqlCompileControl {
     /// Explicitly unbounded control for an already-admitted SQL logical
     /// transformation.  It is not an execution fallback: callers that have
     /// a request control must still pass its deadline and cancellation view.
-    pub(crate) fn unbounded() -> Self {
+    pub fn unbounded() -> Self {
         Self {
             deadline: None,
             cancellation: Arc::new(SqlNeverCancelled),
@@ -297,7 +299,7 @@ static SQL_LOGICAL_INPUT_FUNCTIONS: SqlLogicalInputFunctions = SqlLogicalInputFu
 /// Conservative statistics source for SQL-owned logical transformations that
 /// cannot admit a new catalog binding.  Missing evidence remains missing; it
 /// is never guessed as an empty table.
-pub(crate) struct SqlUnavailableStatisticsSnapshot;
+pub struct SqlUnavailableStatisticsSnapshot;
 
 impl SqlStatisticsSnapshot for SqlUnavailableStatisticsSnapshot {
     fn collect_table_statistics(
@@ -320,7 +322,7 @@ impl SqlStatisticsSnapshot for SqlUnavailableStatisticsSnapshot {
 }
 
 /// Complete immutable input consumed by the pure SQL compiler.
-pub(crate) struct SqlCompileRequest<'a> {
+pub struct SqlCompileRequest<'a> {
     pub(crate) statement: SqlStatementInput,
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
@@ -328,14 +330,14 @@ pub(crate) struct SqlCompileRequest<'a> {
     pub(crate) catalog: &'a dyn SqlCatalogSnapshot,
     pub(crate) statistics: &'a dyn SqlStatisticsSnapshot,
     pub(crate) functions: &'a dyn SqlFunctionCatalog,
-    pub(crate) mv_rewrite: Option<&'a mv_rewrite::MvRewriteDefinitionIndex>,
+    pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
 }
 
 impl<'a> SqlCompileRequest<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         statement: SqlStatementInput,
         intent: SqlCompileIntent,
         session: SqlSessionContext,
@@ -343,7 +345,7 @@ impl<'a> SqlCompileRequest<'a> {
         catalog: &'a dyn SqlCatalogSnapshot,
         statistics: &'a dyn SqlStatisticsSnapshot,
         functions: &'a dyn SqlFunctionCatalog,
-        mv_rewrite: Option<&'a mv_rewrite::MvRewriteDefinitionIndex>,
+        mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -422,7 +424,7 @@ pub(crate) struct SqlDistributedOutput {
 
 /// SQL-owned compiler facts. Native DTOs/bytes, lifecycle state and result
 /// buffers are intentionally absent; application owns post-compile assembly.
-pub(crate) enum SqlCompileOutput {
+pub enum SqlCompileOutput {
     Analysis(SqlAnalysisOutput),
     Logical(SqlAnalysisOutput),
     Optimized(SqlOptimizedOutput),
@@ -430,8 +432,43 @@ pub(crate) enum SqlCompileOutput {
     Distributed(SqlDistributedOutput),
 }
 
+impl SqlCompileOutput {
+    /// Consume the only output shape that may cross into Core post-compile
+    /// preparation.  The plan remains sealed and callers receive no mutable
+    /// builder or validation constructor.
+    pub fn into_distributed_plan(
+        self,
+    ) -> Result<crate::sql::plan_read::DistributedPlan, SqlCompileError> {
+        match self {
+            Self::Distributed(output) => Ok(output.distributed_plan),
+            _ => Err(SqlCompileError::InvalidRequest(
+                "SQL compilation did not produce a distributed plan".to_string(),
+            )),
+        }
+    }
+
+    /// Render an EXPLAIN result without exposing the compiler-private logical
+    /// plan tree to application code.
+    pub fn into_explain_lines(
+        self,
+        level: ExplainLevel,
+        logical: bool,
+    ) -> Result<Vec<String>, SqlCompileError> {
+        match self {
+            Self::Logical(output) if logical => {
+                crate::sql::explain::explain_plan_checked(&output.logical_plan, level)
+                    .map_err(SqlCompileError::Compilation)
+            }
+            Self::ImmediateExplain(lines) if !logical => Ok(lines),
+            _ => Err(SqlCompileError::InvalidRequest(
+                "EXPLAIN intent produced unexpected SQL facts".to_string(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SqlCompileError {
+pub enum SqlCompileError {
     Cancelled,
     DeadlineExceeded,
     InvalidRequest(String),
@@ -453,12 +490,10 @@ impl std::error::Error for SqlCompileError {}
 /// The canonical parse/analyze/logical/optimize/physical/distributed kernel.
 /// It accepts only immutable SQL facts and checks request control at every
 /// externally visible phase boundary.
-pub(crate) struct SqlCompiler;
+pub struct SqlCompiler;
 
 impl SqlCompiler {
-    pub(crate) fn compile(
-        request: SqlCompileRequest<'_>,
-    ) -> Result<SqlCompileOutput, SqlCompileError> {
+    pub fn compile(request: SqlCompileRequest<'_>) -> Result<SqlCompileOutput, SqlCompileError> {
         request.check_control()?;
         let (mut logical_plan, mut factory, logical_input) = match &request.statement {
             SqlStatementInput::LogicalPlan { plan, factory } => {

@@ -1069,7 +1069,7 @@ pub(crate) struct MvRewriteDefinition {
 
 /// Repository-order-preserving MV definition snapshot for one compiler request.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MvRewriteDefinitionIndex {
+pub struct MvRewriteDefinitionIndex {
     definitions: Vec<MvRewriteDefinition>,
 }
 
