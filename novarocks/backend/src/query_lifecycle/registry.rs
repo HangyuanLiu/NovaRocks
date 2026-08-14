@@ -231,7 +231,7 @@ fn terminal_profile_contribution(
     )
 }
 
-// Design: ADR-0068 (docs/adr/ADR-0068-backend-owned-runtime-filter-terminal-observation.md)
+// Design: ADR-0073 (docs/adr/ADR-0073-runtime-filter-terminal-observation-without-lifecycle-veto.md)
 fn capture_terminal_profile_contribution(
     participant: Option<&Arc<RuntimeFilterParticipant>>,
     runtime_filter_installed: bool,
@@ -1261,6 +1261,15 @@ impl QueryLifecycleRegistry {
                     format!("reserve TerminalSnapshot control event failed: {error}"),
                 )
             })?;
+        if self.claim_terminal_fault(
+            QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
+            attach.execution_id(),
+        )? {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "injected terminal P0 delivery permit exhaustion before ControlReady",
+            ));
+        }
         let terminal_event_permit = events_tx.clone().try_reserve_owned().map_err(|error| {
             QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Internal,
@@ -1268,6 +1277,24 @@ impl QueryLifecycleRegistry {
             )
         })?;
         let p0_bytes = p0_max_encoded_len(&entry.manifest);
+        if self.claim_terminal_fault(
+            QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
+            attach.execution_id(),
+        )? {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "injected terminal P0 retained-record exhaustion before ControlReady",
+            ));
+        }
+        if self.claim_terminal_fault(
+            QueryLifecycleFaultKind::TerminalP0BytesExhausted,
+            attach.execution_id(),
+        )? {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "injected terminal P0 retained-byte exhaustion before ControlReady",
+            ));
+        }
         self.reserve_terminal_p0(attach.execution_id(), p0_bytes)?;
         {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
@@ -2495,8 +2522,11 @@ impl QueryLifecycleRegistry {
         if let Some(participant) = participant.as_ref() {
             participant.prepare_terminal_capture(termination_reason);
         }
-        let contribution =
-            capture_terminal_profile_contribution(participant.as_ref(), runtime_filter_installed);
+        let contribution = self.capture_terminal_profile_contribution(
+            execution_id,
+            participant.as_ref(),
+            runtime_filter_installed,
+        );
         let snapshot = match QueryTerminalSnapshot::new_with_profile_telemetry(
             execution_id,
             entry.manifest.backend().clone(),
@@ -2691,8 +2721,11 @@ impl QueryLifecycleRegistry {
         }
         // Finish the immutable record outside the lifecycle entry lock. The
         // local-drained gate makes the cloned fact set stable.
-        let contribution =
-            capture_terminal_profile_contribution(participant.as_ref(), runtime_filter_installed);
+        let contribution = self.capture_terminal_profile_contribution(
+            execution_id,
+            participant.as_ref(),
+            runtime_filter_installed,
+        );
         let snapshot = QueryTerminalSnapshot::new_with_profile_telemetry(
             execution_id,
             backend,
@@ -2779,6 +2812,44 @@ impl QueryLifecycleRegistry {
         Ok(())
     }
 
+    /// P2 telemetry is optional by contract. A fault while building or
+    /// budgeting it therefore becomes typed-unavailable telemetry, never a
+    /// lifecycle failure or negative attestation.
+    fn capture_terminal_profile_contribution(
+        &self,
+        execution_id: QueryExecutionId,
+        participant: Option<&Arc<RuntimeFilterParticipant>>,
+        runtime_filter_installed: bool,
+    ) -> TerminalTelemetry<QueryTerminalProfileContributionV1> {
+        for (kind, code) in [
+            (
+                QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
+                "INJECTED_P2_ASSEMBLY_FAILURE",
+            ),
+            (
+                QueryLifecycleFaultKind::ObservationP2BudgetPressure,
+                "INJECTED_P2_BUDGET_PRESSURE",
+            ),
+        ] {
+            match self.claim_terminal_fault(kind, execution_id) {
+                Ok(true) => {
+                    return TerminalTelemetry::unavailable("runtime_filter_terminal_capture", code)
+                        .expect("static injected runtime-filter telemetry is valid");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        target: "novarocks::query_lifecycle",
+                        error = %error,
+                        kind = kind.file_stem(),
+                        "unable to claim optional runtime-filter observation fault"
+                    );
+                }
+            }
+        }
+        capture_terminal_profile_contribution(participant, runtime_filter_installed)
+    }
+
     fn fail_if_terminal_p1_retention_fault(
         &self,
         execution_id: QueryExecutionId,
@@ -2833,6 +2904,32 @@ impl QueryLifecycleRegistry {
                 );
             }
             return;
+        }
+        let stream_fault = match &outcome {
+            ParticipantTerminalOutcome::Proof { .. } => {
+                QueryLifecycleFaultKind::TerminalProofStreamDrop
+            }
+            ParticipantTerminalOutcome::NegativeAttestation(_) => {
+                QueryLifecycleFaultKind::TerminalAttestationStreamDrop
+            }
+        };
+        match self.claim_terminal_fault(stream_fault, execution_id) {
+            Ok(true) => {
+                // Deliberately leave the retained P0/P1 outcome intact and
+                // skip only the attached control stream. The ordinary unary
+                // fallback owns eventual delivery from the immutable record.
+                self.schedule_terminal_fallback(entry, outcome);
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    target: "novarocks::query_lifecycle",
+                    error = %error,
+                    kind = stream_fault.file_stem(),
+                    "unable to claim terminal stream-drop fault; delivering on control stream"
+                );
+            }
         }
         send_reserved_control_event(
             permit,

@@ -472,7 +472,7 @@ struct ObservationState {
     sealed: Option<RuntimeFilterObservationSnapshot>,
 }
 
-// Design: ADR-0068 (docs/adr/ADR-0068-backend-owned-runtime-filter-terminal-observation.md)
+// Design: ADR-0073 (docs/adr/ADR-0073-runtime-filter-terminal-observation-without-lifecycle-veto.md)
 pub(crate) struct RuntimeFilterObservationStore {
     state: Mutex<ObservationState>,
     saturated: AtomicU64,

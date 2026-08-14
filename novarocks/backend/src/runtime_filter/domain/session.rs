@@ -360,8 +360,9 @@ impl BackendRuntimeFilterSession {
     }
 
     /// Resolves an installed consumer by its exact Execution binding contract
-    /// and fragment instance. A missing local slot remains an unavailable
-    /// route, rather than a permissive synthetic subscription.
+    /// and fragment instance. The sealed installation authorizes both values;
+    /// an unexpected fragment instance is a contract violation, not a
+    /// runtime route-unavailable outcome.
     pub(crate) fn subscribe(
         &self,
         fragment_instance_id: UniqueId,
@@ -383,13 +384,13 @@ impl BackendRuntimeFilterSession {
                 "consumer execution contract does not match the installed Backend binding",
             ));
         }
-        Ok(consumer
-            .subscriptions
-            .handle(fragment_instance_id)
-            .map(RuntimeFilterBindOutcome::Bound)
-            .unwrap_or(RuntimeFilterBindOutcome::Unavailable(
-                UnavailableReason::RouteUnavailable,
-            )))
+        let subscription = consumer.subscriptions.handle(fragment_instance_id).ok_or_else(|| {
+            contract_violation(
+                RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "consumer fragment instance is not authorized by the sealed Backend installation",
+            )
+        })?;
+        Ok(RuntimeFilterBindOutcome::Bound(subscription))
     }
 
     /// Strictly reduces one canonical Execution contribution. A participant
@@ -1540,6 +1541,29 @@ mod tests {
             error.kind(),
             RuntimeFilterContractViolationKind::UnauthorizedBinding
         );
+    }
+
+    #[test]
+    fn consumer_subscription_rejects_an_unexpected_fragment_instance() {
+        let (session, _) = session();
+        let binding = RuntimeFilterConsumerContract::membership_blocking(
+            RuntimeFilterBindingId::new(70),
+            RuntimeFilterChannelId::new(11),
+            session.channel().execution_contract().clone(),
+        )
+        .unwrap();
+
+        let error =
+            match session.subscribe(instance(52), RuntimeFilterSubscriptionRequest::new(binding)) {
+                Ok(_) => panic!("an unsealed consumer fragment instance must be rejected"),
+                Err(error) => error,
+            };
+
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::UnauthorizedBinding
+        );
+        assert!(error.detail().contains("fragment instance"));
     }
 
     #[test]

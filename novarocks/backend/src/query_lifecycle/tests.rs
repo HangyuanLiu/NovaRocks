@@ -150,6 +150,41 @@ impl QueryTerminalFallbackTransport for GoneTerminalFallback {
     }
 }
 
+#[derive(Clone, Default)]
+struct AcceptedTerminalFallback {
+    outcomes: Arc<Mutex<Vec<novarocks::query_execution::lifecycle::ParticipantTerminalOutcome>>>,
+}
+
+impl AcceptedTerminalFallback {
+    fn outcomes(&self) -> Vec<novarocks::query_execution::lifecycle::ParticipantTerminalOutcome> {
+        self.outcomes
+            .lock()
+            .expect("accepted terminal fallback outcomes")
+            .clone()
+    }
+}
+
+impl QueryTerminalFallbackTransport for AcceptedTerminalFallback {
+    fn report_query_terminal(
+        &self,
+        _endpoint: &QueryControlEndpoint,
+        outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
+        _timeout: Duration,
+    ) -> Result<
+        QueryTerminalReportAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        self.outcomes
+            .lock()
+            .expect("accepted terminal fallback outcomes")
+            .push(outcome);
+        Ok(QueryTerminalReportAck::new(
+            QueryTerminalReportOutcome::Accepted,
+            "accepted injected unary fallback",
+        ))
+    }
+}
+
 impl RecordingMetricsSink {
     fn last_snapshot(&self) -> BackendQueryLifecycleMetricsSnapshot {
         *self
@@ -599,6 +634,50 @@ fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
         second_attachment.events.try_recv(),
         Ok(QueryControlEvent::ControlReady)
     ));
+}
+
+#[test]
+fn injected_p0_faults_reject_before_control_ready_and_leave_entry_retryable() {
+    for (query_low, fault) in [
+        (
+            9_711,
+            QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
+        ),
+        (9_712, QueryLifecycleFaultKind::TerminalP0BytesExhausted),
+        (
+            9_713,
+            QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
+        ),
+    ] {
+        let registry = registry_with(RecordingLocalRuntime::default(), 8);
+        let request = init_request_fixture(query_low, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+        let execution_id = request.manifest().execution_id();
+        assert_eq!(
+            registry.init_query(request.clone()).outcome(),
+            QueryInitOutcome::Applied
+        );
+        registry.inject_terminal_fault_for_test(execution_id, fault);
+
+        let error = match registry.attach_control(
+            QueryControlAttach::new(execution_id, request.digest(), 1)
+                .expect("valid control attach"),
+        ) {
+            Ok(_) => panic!("injected P0 fault rejects before ControlReady"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), QueryLifecycleErrorCode::Capacity);
+        assert_eq!(
+            registry.phase(execution_id),
+            Some(QueryLifecyclePhase::Initialized)
+        );
+        assert_eq!(registry.metrics_snapshot().terminal_retained, 0);
+
+        let mut retry = attach_control(&registry, &request);
+        assert!(matches!(
+            retry.events.try_recv(),
+            Ok(QueryControlEvent::ControlReady)
+        ));
+    }
 }
 
 #[test]
@@ -1867,6 +1946,143 @@ fn terminal_p1_faults_keep_the_attestation_delivery_permit() {
             .terminal_ack(QueryTerminalAck::from_outcome(&outcome))
             .expect("attestation ACK releases the retained P0 permit");
         assert_eq!(registry.metrics_snapshot().terminal_retained, 0);
+    }
+}
+
+#[test]
+fn injected_p2_faults_keep_terminal_proof_and_publish_typed_unavailability() {
+    for (query_low, fault, expected_code) in [
+        (
+            76_111,
+            QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
+            "INJECTED_P2_ASSEMBLY_FAILURE",
+        ),
+        (
+            76_112,
+            QueryLifecycleFaultKind::ObservationP2BudgetPressure,
+            "INJECTED_P2_BUDGET_PRESSURE",
+        ),
+    ] {
+        let registry = registry_with(RecordingLocalRuntime::default(), 8);
+        let fragment = UniqueId::new(query_low, 1);
+        let request = fragment_runtime_filter_init_request_fixture(query_low, &[fragment]);
+        let execution_id = request.manifest().execution_id();
+        assert_eq!(
+            registry.init_query(request.clone()).outcome(),
+            QueryInitOutcome::Applied
+        );
+        let mut attachment = attach_control(&registry, &request);
+        assert!(matches!(
+            attachment.events.try_recv(),
+            Ok(QueryControlEvent::ControlReady)
+        ));
+        registry.inject_terminal_fault_for_test(execution_id, fault);
+        registry
+            .admit_fragment(execution_id, fragment)
+            .expect("fragment permit")
+            .commit()
+            .expect("fragment admission commits");
+        registry.record_fragment_terminal(
+            execution_id,
+            fragment,
+            &FragmentOutcome::Failed(FragmentExecutionError::new(
+                FragmentExecutionErrorKind::Pipeline,
+                "inject optional P2 fault",
+            )),
+        );
+
+        let snapshot = wait_for_terminal_snapshot(&mut attachment);
+        let unavailable = snapshot
+            .profile_contribution_telemetry()
+            .unavailable_reason()
+            .expect("P2 fault is encoded as typed unavailable telemetry");
+        assert_eq!(unavailable.stage(), "runtime_filter_terminal_capture");
+        assert_eq!(unavailable.code(), expected_code);
+        assert_eq!(registry.metrics_snapshot().terminal_records_frozen, 1);
+    }
+}
+
+#[test]
+fn injected_terminal_stream_drops_use_unary_fallback_without_losing_outcomes() {
+    for (query_low, faults, expect_attestation) in [
+        (
+            76_121,
+            vec![QueryLifecycleFaultKind::TerminalProofStreamDrop],
+            false,
+        ),
+        (
+            76_122,
+            vec![
+                QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+            ],
+            true,
+        ),
+    ] {
+        let runtime = RecordingLocalRuntime::default();
+        let mut config = registry_config(8);
+        config.terminal_ack_timeout = Duration::from_millis(1);
+        let fallback = Arc::new(AcceptedTerminalFallback::default());
+        let registry = QueryLifecycleRegistry::new_with_clock_metrics_and_terminal_fallback(
+            LOCAL_BACKEND_ID,
+            LOCAL_START_EPOCH,
+            Arc::new(runtime),
+            config,
+            Arc::new(ManualClock::default()),
+            Arc::new(RecordingMetricsSink::default()),
+            Arc::clone(&fallback) as Arc<dyn QueryTerminalFallbackTransport>,
+        );
+        let fragment = UniqueId::new(query_low, 1);
+        let request = fragment_init_request_fixture(query_low, &[fragment]);
+        let execution_id = request.manifest().execution_id();
+        assert_eq!(
+            registry.init_query(request.clone()).outcome(),
+            QueryInitOutcome::Applied
+        );
+        let mut attachment = attach_control(&registry, &request);
+        assert!(matches!(
+            attachment.events.try_recv(),
+            Ok(QueryControlEvent::ControlReady)
+        ));
+        for fault in faults {
+            registry.inject_terminal_fault_for_test(execution_id, fault);
+        }
+        registry
+            .admit_fragment(execution_id, fragment)
+            .expect("fragment permit")
+            .commit()
+            .expect("fragment admission commits");
+        registry.record_fragment_terminal(
+            execution_id,
+            fragment,
+            &FragmentOutcome::Failed(FragmentExecutionError::new(
+                FragmentExecutionErrorKind::Pipeline,
+                "inject terminal stream drop",
+            )),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while registry.metrics_snapshot().terminal_fallback_accepted == 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(registry.metrics_snapshot().terminal_fallback_accepted, 1);
+        let outcomes = fallback.outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            matches!(
+                outcomes.first().expect("one unary fallback outcome"),
+                novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(_)
+            ),
+            expect_attestation
+        );
+        while let Ok(event) = attachment.events.try_recv() {
+            assert!(
+                !matches!(event, QueryControlEvent::TerminalOutcome { .. }),
+                "injected stream drop must not publish a terminal outcome on the attached stream"
+            );
+        }
     }
 }
 
