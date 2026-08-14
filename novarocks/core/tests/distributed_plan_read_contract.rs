@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::sql::plan_read::{
-    DataSink, DistributedPlan, FragmentEdge, FragmentId, PlanFragment,
-};
+use novarocks_sql::plan_read::{DataSink, DistributedPlan, FragmentEdge, FragmentId, PlanFragment};
 
 fn read_sealed_plan(plan: &DistributedPlan) {
     let _: &[PlanFragment] = plan.fragments();

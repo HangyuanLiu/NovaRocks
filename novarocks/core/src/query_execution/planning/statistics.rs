@@ -390,6 +390,7 @@ fn metric_request(
 
 #[cfg(test)]
 mod unified_tests {
+    use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
     use novarocks_spi::connector::StatisticsMetric;
 
