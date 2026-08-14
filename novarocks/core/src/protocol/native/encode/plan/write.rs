@@ -29,7 +29,7 @@ pub(super) fn encode_connector_write_fragment_sink(
     src: &ConnectorWriteFragmentSink,
 ) -> plan::ConnectorWriteFragmentSink {
     plan::ConnectorWriteFragmentSink {
-        handle: src.handle.as_ref().map(|handle| {
+        handle: src.handle().map(|handle| {
             let writer = handle.writer();
             plan::ConnectorWriterHandleEnvelope {
                 contract_version: handle.version(),
@@ -51,7 +51,7 @@ pub(super) fn encode_connector_write_fragment_sink(
                 payload_sha256: handle.payload_digest().to_vec(),
             }
         }),
-        input: Some(encode_connector_write_input_binding(&src.input)),
+        input: Some(encode_connector_write_input_binding(src.input())),
     }
 }
 
@@ -85,35 +85,34 @@ pub(super) fn encode_change_stream_router_sink(
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ChangeStreamRouterSink, String> {
     Ok(plan::ChangeStreamRouterSink {
-        group_id: src.group_id,
-        effect_output_ordinal: usize_to_u64(src.effect_output_ordinal),
+        group_id: src.group_id(),
+        effect_output_ordinal: usize_to_u64(src.effect_output_ordinal()),
         routes: src
-            .routes
-            .iter()
+            .routes()
             .map(|route| {
                 Ok(plan::ChangeStreamBranchRoute {
-                    target_fragment_id: route.target_fragment_id,
-                    target_exchange_node_id: route.target_exchange_node_id,
+                    target_fragment_id: route.target_fragment_id(),
+                    target_exchange_node_id: route.target_exchange_node_id(),
                     output_partition_ordinals: route
-                        .output_partition_ordinals
+                        .output_partition_ordinals()
                         .iter()
                         .map(|value| usize_to_u64(*value))
                         .collect(),
                     output_partition: Some(encode_finalized_router_branch_partition(
                         ctx,
                         fragment_id,
-                        route.route_id,
+                        route.route_id(),
                     )?),
                     destinations: None,
-                    route_id: route.route_id.to_bytes().to_vec(),
-                    cohort_id: route.cohort_id.to_bytes().to_vec(),
+                    route_id: route.route_id().to_bytes().to_vec(),
+                    cohort_id: route.cohort_id().to_bytes().to_vec(),
                     accepted_effects: route
-                        .accepted_effects
+                        .accepted_effects()
                         .iter()
                         .map(|effect| encode_row_mutation_effect(*effect))
                         .collect(),
                     input_ordinals: route
-                        .input_ordinals
+                        .input_ordinals()
                         .iter()
                         .map(|binding| usize_to_u64(binding.input_ordinal() as usize))
                         .collect(),

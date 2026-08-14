@@ -47,6 +47,146 @@ pub use novarocks_spi::connector::{
     ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteRouteId,
 };
 
+/// Read-only access to one sealed connector writer sink. The opaque provider
+/// payload remains inside the signed SPI handle; plan readers can only encode
+/// its immutable envelope.
+impl ConnectorWriteFragmentSink {
+    pub fn handle(&self) -> Option<&novarocks_spi::connector::ConnectorWriterHandle> {
+        self.handle.as_ref()
+    }
+
+    pub fn input(&self) -> &ConnectorWriteInputBinding {
+        &self.input
+    }
+
+    pub fn has_output_contract(&self) -> bool {
+        self.output_contract.is_some()
+    }
+}
+
+/// Borrowed, read-only projection of one sealed change-stream router route.
+/// Route construction and validation remain private to SQL planning.
+pub struct ChangeStreamRouterRouteRead<'a>(
+    &'a crate::planner::distributed::write::change_stream::ChangeStreamRoute,
+);
+
+impl ChangeStreamRouterRouteRead<'_> {
+    pub fn route_id(&self) -> ConnectorWriteRouteId {
+        self.0.route_id
+    }
+
+    pub fn cohort_id(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
+        self.0.cohort_id
+    }
+
+    pub fn accepted_effects(&self) -> &[ConnectorRowMutationEffect] {
+        &self.0.accepted_effects
+    }
+
+    pub fn input_ordinals(&self) -> &[ConnectorMutationRouteInput] {
+        &self.0.input_ordinals
+    }
+
+    pub const fn target_fragment_id(&self) -> FragmentId {
+        self.0.target_fragment_id
+    }
+
+    pub const fn target_exchange_node_id(&self) -> i32 {
+        self.0.target_exchange_node_id
+    }
+
+    pub fn output_partition_ordinals(&self) -> &[usize] {
+        &self.0.output_partition_ordinals
+    }
+}
+
+impl ChangeStreamRouterSink {
+    pub const fn group_id(&self) -> i32 {
+        self.group_id
+    }
+
+    pub const fn effect_output_ordinal(&self) -> usize {
+        self.effect_output_ordinal
+    }
+
+    pub fn routes(&self) -> impl ExactSizeIterator<Item = ChangeStreamRouterRouteRead<'_>> + '_ {
+        self.routes.iter().map(ChangeStreamRouterRouteRead)
+    }
+}
+
+/// Borrowed read-only projection of one sealed change-event assignment.
+pub struct DistributedChangeEventOutputExprRead<'a>(
+    &'a crate::planner::physical::node::DistributedChangeEventOutputExpr,
+);
+
+impl DistributedChangeEventOutputExprRead<'_> {
+    pub const fn output_column_id(&self) -> ColumnId {
+        self.0.output_column_id
+    }
+
+    pub fn expr(&self) -> Option<&TypedExpr> {
+        self.0.expr.as_ref()
+    }
+}
+
+/// Borrowed read-only projection of one sealed change-event specification.
+pub struct DistributedChangeEventSpecRead<'a>(
+    &'a crate::planner::physical::node::DistributedChangeEventSpec,
+);
+
+impl DistributedChangeEventSpecRead<'_> {
+    pub fn predicate(&self) -> Option<&TypedExpr> {
+        self.0.predicate.as_ref()
+    }
+
+    pub const fn effect(&self) -> ConnectorRowMutationEffect {
+        self.0.effect
+    }
+
+    pub fn assignments(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DistributedChangeEventOutputExprRead<'_>> + '_ {
+        self.0
+            .assignments
+            .iter()
+            .map(DistributedChangeEventOutputExprRead)
+    }
+}
+
+impl crate::planner::physical::node::DistributedChangeEventExpandNode {
+    pub fn output_columns(&self) -> &[OutputColumn] {
+        &self.output_columns
+    }
+
+    pub const fn effect_column_id(&self) -> ColumnId {
+        self.effect_column_id
+    }
+
+    pub fn events(&self) -> impl ExactSizeIterator<Item = DistributedChangeEventSpecRead<'_>> + '_ {
+        self.events.iter().map(DistributedChangeEventSpecRead)
+    }
+}
+
+impl crate::planner::physical::node::PhysicalHashAggregateNode {
+    /// Return the visible aggregate output when present, otherwise the sealed
+    /// full group-key plus aggregate-state layout used by bare-node encoders.
+    pub fn output_columns_or_layout(&self) -> Vec<OutputColumn> {
+        if self.output_columns.is_empty() {
+            self.output_layout.full_output_columns()
+        } else {
+            self.output_columns.clone()
+        }
+    }
+
+    pub fn group_key_columns(&self) -> &[OutputColumn] {
+        &self.output_layout.group_key_columns
+    }
+
+    pub fn aggregate_state_columns(&self) -> &[OutputColumn] {
+        &self.output_layout.aggregate_columns
+    }
+}
+
 /// Read-only SQL table facts used by plan encoders.
 pub mod table {
     pub use crate::planner::table::{
@@ -94,6 +234,14 @@ pub mod table {
         /// Return the optional branch-id column captured by SQL admission.
         pub fn branch_id_column(&self) -> Option<&str> {
             self.branch_id_column.as_deref()
+        }
+    }
+
+    impl SqlScanSource {
+        /// Return the sealed scan kind selected by SQL planning. The binding
+        /// token and table identity remain private to the scan source.
+        pub fn kind(&self) -> &SqlScanKind {
+            &self.kind
         }
     }
 }

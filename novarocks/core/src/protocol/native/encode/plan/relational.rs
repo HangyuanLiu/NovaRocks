@@ -259,11 +259,7 @@ pub(super) fn encode_physical_node(
             // aggregate-state types). This raw form only stands in the bare-node
             // encoder unit tests that have no sealed plan; the intermediate-type
             // determination is owned by the planner (`finalize_hash_aggregate_wire`).
-            let raw_output_columns = if node.output_columns.is_empty() {
-                node.output_layout.full_output_columns()
-            } else {
-                node.output_columns.clone()
-            };
+            let raw_output_columns = node.output_columns_or_layout();
             (
                 encode_output_columns(&raw_output_columns)?,
                 Kind::HashAggregate(plan::HashAggregateNode {
@@ -285,12 +281,8 @@ pub(super) fn encode_physical_node(
                         .collect::<Result<Vec<_>, String>>()?,
                     is_merge: node.is_merge.clone(),
                     output_layout: Some(plan::AggregateOutputLayout {
-                        group_key_columns: encode_output_columns(
-                            &node.output_layout.group_key_columns,
-                        )?,
-                        aggregate_columns: encode_output_columns(
-                            &node.output_layout.aggregate_columns,
-                        )?,
+                        group_key_columns: encode_output_columns(node.group_key_columns())?,
+                        aggregate_columns: encode_output_columns(node.aggregate_state_columns())?,
                     }),
                     output_columns: encode_output_columns(&raw_output_columns)?,
                 }),
@@ -340,34 +332,28 @@ pub(super) fn encode_physical_node(
             }),
         ),
         PhysicalPlanKind::ChangeEventExpand(node) => (
-            encode_output_columns(&node.output_columns)?,
+            encode_output_columns(node.output_columns())?,
             Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
                 events: node
-                    .events
-                    .iter()
+                    .events()
                     .map(|event| {
                         Ok(plan::DistributedChangeEventSpec {
-                            predicate: event.predicate.as_ref().map(encode_expr).transpose()?,
-                            effect: encode_row_mutation_effect(event.effect),
+                            predicate: event.predicate().map(encode_expr).transpose()?,
+                            effect: encode_row_mutation_effect(event.effect()),
                             assignments: event
-                                .assignments
-                                .iter()
+                                .assignments()
                                 .map(|assignment| {
                                     Ok(plan::DistributedChangeEventOutputExpr {
-                                        output_column_id: assignment.output_column_id.0,
-                                        expr: assignment
-                                            .expr
-                                            .as_ref()
-                                            .map(encode_expr)
-                                            .transpose()?,
+                                        output_column_id: assignment.output_column_id().0,
+                                        expr: assignment.expr().map(encode_expr).transpose()?,
                                     })
                                 })
                                 .collect::<Result<Vec<_>, String>>()?,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?,
-                output_columns: encode_output_columns(&node.output_columns)?,
-                effect_column_id: node.effect_column_id.0,
+                output_columns: encode_output_columns(node.output_columns())?,
+                effect_column_id: node.effect_column_id().0,
             }),
         ),
         PhysicalPlanKind::CTEAnchor(node) => (

@@ -414,7 +414,7 @@ fn scan_binding_for_source<'a>(
         ));
     }
     let valid_execution = match source {
-        table_model::ScanSource::Sql(source) => match source.kind {
+        table_model::ScanSource::Sql(source) => match source.kind() {
             table_model::SqlScanKind::ConnectorRead => {
                 matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
             }
@@ -453,7 +453,7 @@ fn scan_binding_for_source<'a>(
 
 fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
     match source {
-        table_model::ScanSource::Sql(source) => match source.kind {
+        table_model::ScanSource::Sql(source) => match source.kind() {
             table_model::SqlScanKind::ConnectorRead => "SqlConnectorRead",
             table_model::SqlScanKind::Data { .. } => "SqlData",
             table_model::SqlScanKind::FrozenInputSet { .. } => "SqlFrozenInputSet",
