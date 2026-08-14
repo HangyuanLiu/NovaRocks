@@ -2241,7 +2241,7 @@ enum ChangeStreamWriteEntrypoint {
 struct ChangeStreamWriteBuildObservation {
     entrypoint: ChangeStreamWriteEntrypoint,
     effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
-    writer_fragment_ids: Vec<Option<novarocks_sql::planner::distributed::FragmentId>>,
+    writer_fragment_ids: Vec<Option<novarocks_sql::plan_read::FragmentId>>,
 }
 
 #[cfg(test)]
@@ -2570,7 +2570,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
 ) -> Result<
     (
         PreparedDistributedQueryAssembly,
-        novarocks_sql::planner::distributed::DistributedPlan,
+        novarocks_sql::plan_read::DistributedPlan,
         crate::query_execution::profile::ConnectorStaticPlanningMetrics,
     ),
     String,
@@ -2634,15 +2634,14 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
             connector_context,
         },
     };
-    let novarocks_sql::compiler::SqlCompileOutput::Distributed(compiled) =
+    let distributed_plan =
         novarocks_sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
             .map_err(|error| error.to_string())?
-    else {
-        return Err("query intent did not produce a distributed SQL plan".to_string());
-    };
+            .into_distributed_plan()
+            .map_err(|error| error.to_string())?;
     ensure_mainline_distributed_execution(false, query_kernel.exchange_port())?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
-        &compiled.distributed_plan,
+        &distributed_plan,
         planning_inputs.post_compile.connector_controls,
         planning_inputs.post_compile.connector_context,
         Some(planning_inputs.post_compile.table_bindings.as_ref()),
@@ -2651,16 +2650,12 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     )?;
     let connector_static_planning = connector_static_planning_metrics(&prepared)?;
     let assembly = PreparedDistributedQueryAssembly::new(
-        NativeFragmentEncodingInput::new(compiled.distributed_plan.clone(), prepared),
+        NativeFragmentEncodingInput::new(distributed_plan.clone(), prepared),
         query_opts,
         distributed_intent,
         execution.clone(),
     );
-    Ok((
-        assembly,
-        compiled.distributed_plan,
-        connector_static_planning,
-    ))
+    Ok((assembly, distributed_plan, connector_static_planning))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2730,13 +2725,9 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     };
     let compiled = novarocks_sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
         .map_err(|error| error.to_string())?;
-    let lines = match compiled {
-        novarocks_sql::compiler::SqlCompileOutput::Logical(compiled) if logical => {
-            novarocks_sql::explain::explain_plan_checked(&compiled.logical_plan, level)?
-        }
-        novarocks_sql::compiler::SqlCompileOutput::ImmediateExplain(lines) if !logical => lines,
-        _ => return Err("EXPLAIN intent produced unexpected SQL facts".to_string()),
-    };
+    let lines = compiled
+        .into_explain_lines(level, logical)
+        .map_err(|error| error.to_string())?;
     build_string_query_result("Explain String", lines)
 }
 
