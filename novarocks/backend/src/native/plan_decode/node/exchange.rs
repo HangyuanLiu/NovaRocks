@@ -170,3 +170,277 @@ pub(super) fn lower_exchange_receiver(
 
     Ok(lowered)
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::super::{NativePlanDecodeContext, decode_node};
+    use crate::native::type_decode::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::runtime::exchange::ExchangeKey;
+    use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
+
+    fn type_desc(data_type: &DataType) -> common::TypeDesc {
+        encode_type(data_type).expect("encode type")
+    }
+
+    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+        common::OutputColumn {
+            column_id,
+            name: name.to_string(),
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: None,
+            })),
+        }
+    }
+
+    fn sort_item(column_id: u32) -> expr::SortItem {
+        expr::SortItem {
+            expr: Some(column_ref(column_id, DataType::Int64)),
+            asc: true,
+            nulls_first: false,
+        }
+    }
+
+    fn topn_exchange_node(node_id: i32) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Hash as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::TopnSplit(
+                            plan::TopNSplitFlavor {
+                                items: vec![sort_item(1)],
+                                limit: Some(3),
+                                offset: Some(1),
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
+    fn limit_offset_exchange_node(
+        node_id: i32,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: limit.unwrap_or(-1),
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::LimitOffset(
+                            plan::LimitOffsetFlavor { limit, offset },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
+    fn cte_multicast_exchange_node(node_id: i32) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::CteMulticast(
+                            plan::CteMulticastFlavor {
+                                cte_id: 3,
+                                receive_producer_column_ids: vec![1],
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn exchange_receiver_requires_sender_count() {
+        let exchange = plan::DistributedNode {
+            node_id: 40,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Hash as i32,
+                    partition_exprs: Vec::new(),
+                    source_fragment_id: 7,
+                    output_columns: vec![output_column(1, "id", DataType::Int64)],
+                    output_qualifier: None,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
+                    }),
+                },
+            )),
+        };
+
+        let mut arena = ExprArena::default();
+        let err =
+            decode_node(&exchange, &mut arena, &NativePlanDecodeContext::default()).unwrap_err();
+        assert!(err.contains("ExchangeReceiver"));
+        assert!(err.contains("sender count"));
+
+        let lowered = decode_node(
+            &exchange,
+            &mut arena,
+            &NativePlanDecodeContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 40,
+                },
+                2,
+            ),
+        )
+        .expect("plain exchange");
+        let ExecNodeKind::ExchangeSource(exchange) = lowered.node.kind else {
+            panic!("expected ExchangeSource");
+        };
+        assert_eq!(exchange.node_id, 40);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_topn_split_exchange_receiver_as_merging_sort() {
+        let mut arena = ExprArena::default();
+        let lowered = decode_node(
+            &topn_exchange_node(41),
+            &mut arena,
+            &NativePlanDecodeContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 41,
+                },
+                2,
+            ),
+        )
+        .expect("TopNSplit exchange receiver");
+
+        let ExecNodeKind::Sort(sort) = lowered.node.kind else {
+            panic!("expected Sort");
+        };
+        assert_eq!(sort.node_id, 41);
+        assert_eq!(sort.limit, Some(3));
+        assert_eq!(sort.offset, 1);
+        assert_eq!(sort.order_by.len(), 1);
+        let ExecNodeKind::ExchangeSource(exchange) = sort.input.kind else {
+            panic!("expected ExchangeSource under Sort");
+        };
+        assert_eq!(exchange.node_id, 41);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_limit_offset_exchange_receiver_as_limit_node() {
+        let mut arena = ExprArena::default();
+        let lowered = decode_node(
+            &limit_offset_exchange_node(42, Some(3), Some(1)),
+            &mut arena,
+            &NativePlanDecodeContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 42,
+                },
+                2,
+            ),
+        )
+        .expect("LimitOffset exchange receiver");
+
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit.node_id, 42);
+        assert_eq!(limit.limit, Some(3));
+        assert_eq!(limit.offset, 1);
+        let ExecNodeKind::ExchangeSource(exchange) = limit.input.kind else {
+            panic!("expected ExchangeSource under Limit");
+        };
+        assert_eq!(exchange.node_id, 42);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_cte_multicast_exchange_receiver_as_exchange_source() {
+        let mut arena = ExprArena::default();
+        let lowered = decode_node(
+            &cte_multicast_exchange_node(43),
+            &mut arena,
+            &NativePlanDecodeContext::default().with_exchange_sender_count(
+                ExchangeKey {
+                    finst_id_hi: 0,
+                    finst_id_lo: 0,
+                    node_id: 43,
+                },
+                2,
+            ),
+        )
+        .expect("CTE multicast exchange receiver");
+
+        let ExecNodeKind::ExchangeSource(exchange) = lowered.node.kind else {
+            panic!("expected ExchangeSource");
+        };
+        assert_eq!(exchange.node_id, 43);
+        assert_eq!(exchange.expected_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+}

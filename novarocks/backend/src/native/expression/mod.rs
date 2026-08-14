@@ -781,7 +781,22 @@ pub(crate) mod tests {
     fn column_ref_missing_from_layout_fails() {
         let err = lower_err_with_slots(&col(42, DataType::Int32), &[7]);
 
-        assert!(err.contains("ColumnRef column_id=42 not found in input layout"));
+        assert_eq!(
+            err,
+            "native protocol error at expr.column_ref.column_id (invalid value): ColumnRef column_id=42 not found in input layout"
+        );
+    }
+
+    #[test]
+    fn input_layout_preserves_unknown_column_error_contract() {
+        let error = NativeExpressionInputLayout::from_slot_ids([SlotId::new(7)])
+            .resolve_column_id(9, FieldPath::root("expr").field("column_ref"))
+            .expect_err("unknown slot must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "native protocol error at expr.column_ref.column_id (invalid value): ColumnRef column_id=9 not found in input layout"
+        );
     }
 
     #[test]

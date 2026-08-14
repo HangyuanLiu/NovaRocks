@@ -191,3 +191,183 @@ fn int64_literal_expr(value: i64) -> expr::Expr {
         })),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::Int64Array;
+
+    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::*;
+    use novarocks_execution::exec::expr::ExprArena;
+
+    fn physical_node(
+        node_id: i32,
+        kind: plan::plan_node::Kind,
+        output_columns: Vec<proto_common::OutputColumn>,
+        children: Vec<plan::DistributedNode>,
+    ) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children,
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns,
+                kind: Some(kind),
+            })),
+        }
+    }
+
+    fn one_col_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![bigint_output_column(1, "id", true)];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int64_literal_expr(10)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    fn lower(node: &plan::DistributedNode) -> DecodedNode {
+        let mut arena = ExprArena::default();
+        decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
+    }
+
+    #[test]
+    fn lowers_generate_series_to_table_function_exec_node() {
+        let node = physical_node(
+            20,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 2,
+                column_name: "x".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::TableFunction(table_function) = lowered.node.kind else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(table_function.node_id, 20);
+        assert_eq!(table_function.function_name, "generate_series");
+        assert_eq!(table_function.param_slots.len(), 3);
+        assert!(table_function.outer_slots.is_empty());
+        assert_eq!(table_function.fn_result_slots, vec![SlotId::new(9)]);
+        assert!(table_function.fn_result_required);
+        assert!(!table_function.is_left_join);
+        assert_eq!(
+            table_function.param_types,
+            vec![DataType::Int64, DataType::Int64, DataType::Int64]
+        );
+        assert_eq!(table_function.ret_types, vec![DataType::Int64]);
+        assert_eq!(
+            table_function.output_chunk_schema.slot_ids(),
+            &[SlotId::new(9)]
+        );
+        assert_eq!(
+            table_function.output_chunk_schema.field(0).unwrap().name(),
+            "x"
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(9)]);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(9)]);
+        assert!(matches!(
+            table_function.output_slot_sources.as_slice(),
+            [TableFunctionOutputSlot::Result { index: 0 }]
+        ));
+
+        let ExecNodeKind::Values(input) = table_function.input.kind else {
+            panic!("expected synthetic Values input");
+        };
+        assert_eq!(input.chunk.len(), 1);
+        assert_eq!(input.chunk.chunk_schema().slot_ids().len(), 3);
+        for (slot, expected) in table_function.param_slots.iter().zip([1, 5, 2]) {
+            let column = input.chunk.column_by_slot_id(*slot).expect("param column");
+            let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(values.value(0), expected);
+        }
+    }
+
+    #[test]
+    fn generate_series_uses_backend_expression_decoder_for_synthetic_values() {
+        let node = physical_node(
+            20,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 2,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::TableFunction(table_function) = lowered.node.kind else {
+            panic!("expected TableFunction");
+        };
+        let ExecNodeKind::Values(input) = table_function.input.kind else {
+            panic!("expected synthetic Values input");
+        };
+        for (slot, expected) in table_function.param_slots.iter().zip([1, 5, 2]) {
+            let column = input.chunk.column_by_slot_id(*slot).expect("param column");
+            let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(values.value(0), expected);
+        }
+    }
+
+    #[test]
+    fn generate_series_rejects_zero_step_and_children() {
+        let zero_step = physical_node(
+            20,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 0,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut arena = ExprArena::default();
+        let err =
+            decode_node(&zero_step, &mut arena, &NativePlanDecodeContext::default()).unwrap_err();
+        assert!(err.contains("step must not be zero"), "{err}");
+
+        let with_child = physical_node(
+            21,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 1,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let err =
+            decode_node(&with_child, &mut arena, &NativePlanDecodeContext::default()).unwrap_err();
+        assert!(
+            err.contains("GenerateSeriesNode expected 0 children"),
+            "{err}"
+        );
+    }
+}

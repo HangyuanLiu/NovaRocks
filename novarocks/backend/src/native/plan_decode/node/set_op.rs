@@ -194,6 +194,49 @@ fn normalize_set_op_inputs(
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::super::tests::{lower, one_col_values_node_with, output_column, physical_node};
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_protocol::plan;
+    use novarocks_types::SlotId;
+
+    #[test]
+    fn union_all_retags_child_slots_when_sidecar_is_missing() {
+        let output_columns = vec![output_column(1, "id", DataType::Int64)];
+        let union_all = physical_node(
+            60,
+            plan::plan_node::Kind::SetOp(plan::SetOpNode {
+                kind: plan::PlanSetOpKind::UnionAll as i32,
+                output_columns: output_columns.clone(),
+                child_output_columns: Vec::new(),
+            }),
+            output_columns,
+            vec![
+                one_col_values_node_with(10, 11, "lhs_id", 10),
+                one_col_values_node_with(11, 21, "rhs_id", 20),
+            ],
+        );
+        let lowered = lower(&union_all);
+        let ExecNodeKind::UnionAll(union) = lowered.node.kind else {
+            panic!("expected UnionAll");
+        };
+        assert_eq!(union.inputs.len(), 2);
+        for input in union.inputs {
+            let ExecNodeKind::Project(project) = input.kind else {
+                panic!("expected retagging Project");
+            };
+            assert!(project.is_subordinate);
+            assert_eq!(project.expr_slot_ids, vec![SlotId::new(1)]);
+            assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        }
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+}
+
 fn normalize_set_op_inputs_by_position(
     node_id: i32,
     children: Vec<DecodedNode>,

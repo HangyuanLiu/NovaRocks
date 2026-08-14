@@ -216,3 +216,237 @@ fn empty_chunk_with_row_count(row_count: usize) -> Result<Chunk, String> {
         .map_err(|err| format!("build empty values input chunk failed: {err}"))?;
     Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::empty()))
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::datatypes::DataType;
+
+    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::*;
+    use crate::native::type_decode::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
+
+    fn type_desc(data_type: &DataType) -> common::TypeDesc {
+        encode_type(data_type).expect("encode type")
+    }
+
+    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+        common::OutputColumn {
+            column_id,
+            name: name.to_string(),
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn int_literal(value: i64) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Int64)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::IntValue(value)),
+                }),
+            })),
+        }
+    }
+
+    fn string_literal(value: &str) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Utf8)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::StringValue(value.to_string())),
+                }),
+            })),
+        }
+    }
+
+    fn null_literal(data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::NullValue(true)),
+                }),
+            })),
+        }
+    }
+
+    fn physical_node(
+        node_id: i32,
+        kind: plan::plan_node::Kind,
+        output_columns: Vec<common::OutputColumn>,
+        children: Vec<plan::DistributedNode>,
+    ) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children,
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns,
+                kind: Some(kind),
+            })),
+        }
+    }
+
+    fn values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "name", DataType::Utf8),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![
+                    plan::ExprList {
+                        values: vec![int_literal(10), string_literal("alice")],
+                    },
+                    plan::ExprList {
+                        values: vec![int_literal(20), string_literal("bob")],
+                    },
+                ],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    fn lower(node: &plan::DistributedNode) -> super::super::DecodedNode {
+        let mut arena = ExprArena::default();
+        decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
+    }
+
+    #[test]
+    fn lowers_values_rows_into_chunk_schema() {
+        let lowered = lower(&values_node(10));
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.node_id, 10);
+        assert_eq!(values.chunk.len(), 2);
+        assert_eq!(
+            values.chunk.chunk_schema().slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(2)]);
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+
+        let id_column = values
+            .chunk
+            .column_by_slot_id(SlotId::new(1))
+            .expect("id column");
+        let id = id_column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 id");
+        assert_eq!(id.value(0), 10);
+        assert_eq!(id.value(1), 20);
+
+        let name_column = values
+            .chunk
+            .column_by_slot_id(SlotId::new(2))
+            .expect("name column");
+        let name = name_column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 name");
+        assert_eq!(name.value(0), "alice");
+        assert_eq!(name.value(1), "bob");
+    }
+
+    #[test]
+    fn values_casts_null_rows_to_declared_column_type_before_concat() {
+        let columns = vec![output_column(1, "id", DataType::Int64)];
+        let node = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![
+                    plan::ExprList {
+                        values: vec![int_literal(10)],
+                    },
+                    plan::ExprList {
+                        values: vec![null_literal(DataType::Null)],
+                    },
+                ],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        let id_column = values
+            .chunk
+            .column_by_slot_id(SlotId::new(1))
+            .expect("id column");
+        assert_eq!(id_column.data_type(), &DataType::Int64);
+        let id = id_column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 id");
+        assert_eq!(id.value(0), 10);
+        assert!(id.is_null(1));
+    }
+
+    #[test]
+    fn lowers_zero_column_values_rows_as_seed_rows() {
+        let node = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList { values: vec![] }],
+                columns: vec![],
+            }),
+            vec![],
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.chunk.len(), 1);
+        assert!(values.chunk.chunk_schema().slot_ids().is_empty());
+        assert!(lowered.layout.order().is_empty());
+        assert!(lowered.output_schema.slot_ids().is_empty());
+    }
+
+    #[test]
+    fn lowers_empty_zero_column_values_as_single_seed_row() {
+        let node = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            Vec::new(),
+        );
+
+        let lowered = lower(&node);
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.chunk.len(), 1);
+        assert!(values.chunk.chunk_schema().slot_ids().is_empty());
+        assert!(lowered.layout.order().is_empty());
+        assert!(lowered.output_schema.slot_ids().is_empty());
+    }
+}

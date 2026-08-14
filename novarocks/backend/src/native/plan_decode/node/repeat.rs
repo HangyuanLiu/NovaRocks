@@ -216,3 +216,176 @@ fn repeat_grouping_values(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{lower, physical_node, two_col_values_node};
+    use novarocks::protocol::common::error::ProtocolErrorKind;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_protocol::plan;
+
+    fn valid_repeat() -> plan::RepeatNode {
+        plan::RepeatNode {
+            repeat_column_ref_ids: vec![plan::UInt32List { values: vec![1] }],
+            grouping_ids: vec![0],
+            all_rollup_column_ids: vec![1, 2],
+            ..Default::default()
+        }
+    }
+
+    fn repeat_node(repeat: plan::RepeatNode) -> plan::DistributedNode {
+        physical_node(
+            20,
+            plan::plan_node::Kind::Repeat(repeat),
+            Vec::new(),
+            vec![two_col_values_node(10)],
+        )
+    }
+
+    fn decode_error(
+        node: &plan::DistributedNode,
+    ) -> crate::native::plan_decode::error::NativeFragmentDecodeError {
+        let mut arena = ExprArena::default();
+        super::super::decode_node(
+            node,
+            &mut arena,
+            &super::super::NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid Repeat node must fail")
+    }
+
+    #[test]
+    fn repeat_grouping_function_uses_sql_reverse_bit_order() {
+        let repeat = physical_node(
+            20,
+            plan::plan_node::Kind::Repeat(plan::RepeatNode {
+                repeat_column_ref_list: Vec::new(),
+                repeat_column_ref_ids: vec![
+                    plan::UInt32List { values: vec![1, 2] },
+                    plan::UInt32List { values: vec![1] },
+                    plan::UInt32List { values: vec![2] },
+                    plan::UInt32List { values: Vec::new() },
+                ],
+                grouping_ids: vec![0, 1, 2, 3],
+                all_rollup_columns: vec!["a".to_string(), "b".to_string()],
+                all_rollup_column_ids: vec![1, 2],
+                grouping_key_aliases: Vec::new(),
+                grouping_fn_args: Vec::new(),
+                grouping_fn_arg_ids: vec![plan::UInt32List { values: vec![1, 2] }],
+                grouping_fn_ids: vec![plan::NamedUInt32 {
+                    name: "__grouping_fn_0".to_string(),
+                    value: 9,
+                }],
+                virtual_tuple_id: Some(7),
+            }),
+            Vec::new(),
+            vec![two_col_values_node(10)],
+        );
+        let lowered = lower(&repeat);
+        let ExecNodeKind::Repeat(repeat) = lowered.node.kind else {
+            panic!("expected Repeat");
+        };
+        assert_eq!(repeat.grouping_list, vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn empty_grouping_ids_uses_exact_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_ids.clear();
+        repeat.repeat_column_ref_ids.clear();
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_ids"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn repeat_set_count_mismatch_uses_exact_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.repeat_column_ref_ids.clear();
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.repeat_column_ref_ids"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn unknown_keep_slot_uses_exact_indexed_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.repeat_column_ref_ids[0].values = vec![999];
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.repeat_column_ref_ids[0].values[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn grouping_function_count_mismatch_uses_exact_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_fn_ids.push(plan::NamedUInt32 {
+            name: "g".to_string(),
+            value: 9,
+        });
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_fn_arg_ids"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn too_many_grouping_arguments_uses_exact_indexed_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_fn_ids.push(plan::NamedUInt32 {
+            name: "g".to_string(),
+            value: 9,
+        });
+        repeat.grouping_fn_arg_ids.push(plan::UInt32List {
+            values: vec![1; 64],
+        });
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_fn_arg_ids[0].values"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn duplicate_grouping_slot_uses_exact_indexed_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_fn_ids.push(plan::NamedUInt32 {
+            name: "g".to_string(),
+            value: 1,
+        });
+        repeat
+            .grouping_fn_arg_ids
+            .push(plan::UInt32List { values: vec![1] });
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_fn_ids[0].value"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::DuplicateField);
+    }
+}

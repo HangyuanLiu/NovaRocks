@@ -633,6 +633,259 @@ fn validate_window_frame(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::super::{NativePlanDecodeContext, decode_node};
+    use crate::native::type_decode::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
+
+    fn type_desc(data_type: &DataType) -> common::TypeDesc {
+        encode_type(data_type).expect("encode type")
+    }
+
+    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+        common::OutputColumn {
+            column_id,
+            name: name.to_string(),
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn int_literal(value: i64) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Int64)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::IntValue(value)),
+                }),
+            })),
+        }
+    }
+
+    fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: None,
+            })),
+        }
+    }
+
+    fn sort_item(column_id: u32) -> expr::SortItem {
+        expr::SortItem {
+            expr: Some(column_ref(column_id, DataType::Int64)),
+            asc: true,
+            nulls_first: false,
+        }
+    }
+
+    fn physical_node(
+        node_id: i32,
+        kind: plan::plan_node::Kind,
+        output_columns: Vec<common::OutputColumn>,
+        children: Vec<plan::DistributedNode>,
+    ) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children,
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns,
+                kind: Some(kind),
+            })),
+        }
+    }
+
+    fn one_col_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![output_column(1, "id", DataType::Int64)];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(10)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    fn lower(node: &plan::DistributedNode) -> super::super::DecodedNode {
+        let mut arena = ExprArena::default();
+        decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
+    }
+
+    #[test]
+    fn lowers_window_node_to_analytic_exec_node() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "rn", DataType::Int64),
+        ];
+        let window = physical_node(
+            80,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![plan::WindowExpr {
+                    name: "row_number".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    partition_by: Vec::new(),
+                    order_by: vec![sort_item(1)],
+                    window_frame: Some(expr::WindowFrame {
+                        frame_type: expr::WindowFrameType::Rows as i32,
+                        start: Some(expr::WindowBound {
+                            bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                        }),
+                        end: Some(expr::WindowBound {
+                            bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                        }),
+                    }),
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    output_name: "rn".to_string(),
+                    output_column_id: 2,
+                    ignore_nulls: false,
+                }],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&window);
+        let ExecNodeKind::Analytic(analytic) = lowered.node.kind else {
+            panic!("expected Analytic");
+        };
+        assert_eq!(analytic.node_id, 80);
+        assert_eq!(analytic.functions.len(), 1);
+        assert!(matches!(
+            analytic.functions[0].kind,
+            novarocks_execution::exec::node::analytic::WindowFunctionKind::RowNumber
+        ));
+        assert_eq!(analytic.order_by_exprs.len(), 1);
+        assert_eq!(
+            analytic.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(2)]);
+    }
+
+    #[test]
+    fn lowers_window_node_with_multiple_specs_as_analytic_chain() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "rn", DataType::Int64),
+            output_column(3, "rnk", DataType::Int64),
+        ];
+        let mut descending_id = sort_item(1);
+        descending_id.asc = false;
+        let window = physical_node(
+            81,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![
+                    plan::WindowExpr {
+                        name: "row_number".to_string(),
+                        args: Vec::new(),
+                        distinct: false,
+                        partition_by: Vec::new(),
+                        order_by: vec![sort_item(1)],
+                        window_frame: Some(expr::WindowFrame {
+                            frame_type: expr::WindowFrameType::Rows as i32,
+                            start: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                            }),
+                            end: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                            }),
+                        }),
+                        result_type: Some(type_desc(&DataType::Int64)),
+                        output_name: "rn".to_string(),
+                        output_column_id: 2,
+                        ignore_nulls: false,
+                    },
+                    plan::WindowExpr {
+                        name: "rank".to_string(),
+                        args: Vec::new(),
+                        distinct: false,
+                        partition_by: Vec::new(),
+                        order_by: vec![descending_id],
+                        window_frame: Some(expr::WindowFrame {
+                            frame_type: expr::WindowFrameType::Rows as i32,
+                            start: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::UnboundedPreceding(true)),
+                            }),
+                            end: Some(expr::WindowBound {
+                                bound: Some(expr::window_bound::Bound::CurrentRow(true)),
+                            }),
+                        }),
+                        result_type: Some(type_desc(&DataType::Int64)),
+                        output_name: "rnk".to_string(),
+                        output_column_id: 3,
+                        ignore_nulls: false,
+                    },
+                ],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let lowered = lower(&window);
+        let ExecNodeKind::Analytic(second) = lowered.node.kind else {
+            panic!("expected final Analytic");
+        };
+        assert_eq!(second.node_id, 83);
+        assert_eq!(second.functions.len(), 1);
+        assert!(matches!(
+            second.functions[0].kind,
+            novarocks_execution::exec::node::analytic::WindowFunctionKind::Rank
+        ));
+        assert_eq!(
+            second.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+
+        let ExecNodeKind::Sort(sort) = second.input.kind else {
+            panic!("expected Sort under final Analytic");
+        };
+        assert_eq!(sort.node_id, 82);
+        assert_eq!(sort.order_by.len(), 1);
+        assert!(!sort.order_by[0].asc);
+
+        let ExecNodeKind::Analytic(first) = sort.input.kind else {
+            panic!("expected first Analytic under Sort");
+        };
+        assert_eq!(first.node_id, 81);
+        assert_eq!(first.functions.len(), 1);
+        assert!(matches!(
+            first.functions[0].kind,
+            novarocks_execution::exec::node::analytic::WindowFunctionKind::RowNumber
+        ));
+        assert_eq!(
+            first.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(
+            lowered.layout.order(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+    }
+}
+
 fn pack_window_function_inputs(
     args: Vec<novarocks_execution::exec::expr::ExprId>,
     arena: &mut ExprArena,

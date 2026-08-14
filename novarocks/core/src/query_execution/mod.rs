@@ -29,8 +29,6 @@ pub mod distributed_rewrite;
 pub mod dml;
 pub mod fragment_transport;
 pub(crate) mod frozen_connector_read;
-#[cfg(test)]
-pub(crate) mod in_process_test;
 pub mod kernels;
 pub mod lifecycle;
 pub(crate) mod outcome;

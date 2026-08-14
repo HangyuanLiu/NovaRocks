@@ -614,9 +614,7 @@ mod tests {
             Arc::clone(&connector_control),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
-            crate::query_execution::compiler::test_query_execution_service_with_connector_control(
-                Some(connector_control),
-            ),
+            crate::query_execution::compiler::test_query_execution_service(),
         )
     }
 

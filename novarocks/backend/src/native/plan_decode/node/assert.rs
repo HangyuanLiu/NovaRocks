@@ -149,3 +149,124 @@ fn lower_row_count_assertion(value: i32) -> Result<Assertion, NativeFragmentLeaf
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{lower, one_col_values_node, physical_node};
+    use novarocks::protocol::common::error::ProtocolErrorKind;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::assert::AssertNumRowsMode;
+    use novarocks_protocol::plan;
+    use novarocks_types::SlotId;
+
+    fn decode_error(
+        node: &plan::DistributedNode,
+    ) -> crate::native::plan_decode::error::NativeFragmentDecodeError {
+        let mut arena = ExprArena::default();
+        super::super::decode_node(
+            node,
+            &mut arena,
+            &super::super::NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid AssertOneRow node must fail")
+    }
+
+    #[test]
+    fn lowers_keyed_assert_num_rows_from_native_proto() {
+        let assert_node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                subquery_text: "DML change-stream matched row uniqueness".to_string(),
+                desired_num_rows: Some(1),
+                assertion: plan::RowCountAssertion::Le as i32,
+                group_key_column_ids: vec![1],
+                group_key_labels: vec!["_row_id".to_string()],
+                keyed_message_prefix: Some("MOR UPDATE matched target row".to_string()),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&assert_node);
+        let ExecNodeKind::AssertNumRows(assert) = lowered.node.kind else {
+            panic!("expected AssertNumRows");
+        };
+        match assert.mode {
+            AssertNumRowsMode::PerKeyAtMostOne {
+                key_slots,
+                key_labels,
+                message_prefix,
+            } => {
+                assert_eq!(key_slots, vec![SlotId::new(1)]);
+                assert_eq!(key_labels, vec!["_row_id".to_string()]);
+                assert_eq!(message_prefix, "MOR UPDATE matched target row");
+            }
+            AssertNumRowsMode::Global { .. } => panic!("expected keyed assert"),
+        }
+    }
+
+    #[test]
+    fn unknown_assertion_uses_exact_path_and_kind() {
+        let node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                assertion: 999,
+                ..Default::default()
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.assert_one_row.assertion"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
+    }
+
+    #[test]
+    fn negative_desired_rows_uses_exact_path_and_kind() {
+        let node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                desired_num_rows: Some(-1),
+                ..Default::default()
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.assert_one_row.desired_num_rows"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn unknown_group_key_uses_exact_indexed_path_and_kind() {
+        let node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                desired_num_rows: Some(1),
+                assertion: plan::RowCountAssertion::Le as i32,
+                group_key_column_ids: vec![999],
+                ..Default::default()
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.assert_one_row.group_key_column_ids[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+}
