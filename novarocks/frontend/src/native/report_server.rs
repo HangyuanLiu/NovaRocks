@@ -44,6 +44,7 @@ struct LifecycleConvergenceDebugSnapshot {
     execution_id: String,
     error_source: Option<&'static str>,
     participant_outcomes: Vec<LifecycleParticipantOutcomeDebug>,
+    telemetry_unavailable: Vec<LifecycleTelemetryUnavailableDebug>,
     /// This endpoint intentionally exposes only query-scoped immutable
     /// terminal evidence. Process metrics are not an acceptable substitute.
     metrics: BTreeMap<String, i64>,
@@ -55,6 +56,13 @@ enum LifecycleParticipantOutcomeDebug {
     Proof,
     Attestation { reason: String },
     NoOutcome,
+}
+
+#[derive(serde::Serialize)]
+struct LifecycleTelemetryUnavailableDebug {
+    scope: &'static str,
+    stage: String,
+    code: String,
 }
 
 async fn latest_lifecycle_convergence_snapshot(
@@ -69,12 +77,35 @@ async fn latest_lifecycle_convergence_snapshot(
 fn lifecycle_convergence_debug_snapshot(
     snapshot: QueryLifecycleConvergenceSnapshot,
 ) -> LifecycleConvergenceDebugSnapshot {
+    let mut telemetry_unavailable = Vec::new();
     let mut participant_outcomes = snapshot
         .participant_outcomes
         .iter()
         .map(|outcome| {
             match outcome {
-            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof { .. } => {
+            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
+                snapshot,
+                ..
+            } => {
+                if let Some(reason) = snapshot
+                    .profile_contribution_telemetry()
+                    .unavailable_reason()
+                {
+                    telemetry_unavailable.push(LifecycleTelemetryUnavailableDebug {
+                        scope: "query",
+                        stage: reason.stage().to_string(),
+                        code: reason.code().to_string(),
+                    });
+                }
+                for fragment in snapshot.fragments() {
+                    if let Some(reason) = fragment.profile_telemetry().unavailable_reason() {
+                        telemetry_unavailable.push(LifecycleTelemetryUnavailableDebug {
+                            scope: "fragment",
+                            stage: reason.stage().to_string(),
+                            code: reason.code().to_string(),
+                        });
+                    }
+                }
                 LifecycleParticipantOutcomeDebug::Proof
             }
             novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(
@@ -102,6 +133,7 @@ fn lifecycle_convergence_debug_snapshot(
         ),
         error_source,
         participant_outcomes,
+        telemetry_unavailable,
         metrics: lifecycle_metric_map(snapshot.metrics),
     }
 }

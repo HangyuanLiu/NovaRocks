@@ -1154,6 +1154,19 @@ fn verify_lifecycle_structured_assertion(
             );
         }
     }
+    for expected in &assertion.telemetry_unavailable {
+        if !after.telemetry_unavailable.iter().any(|actual| {
+            actual.scope == expected.scope
+                && actual.stage == expected.stage
+                && actual.code == expected.code
+        }) {
+            bail!(
+                "structured lifecycle telemetry-unavailable mismatch: expected {expected:?}, actual {:?}, execution_id={:?}",
+                after.telemetry_unavailable,
+                after.execution_id
+            );
+        }
+    }
     if !assertion.metric_deltas.is_empty() {
         let before = before
             .context("structured lifecycle metric delta assertion requires a pre-step snapshot")?;
@@ -3127,6 +3140,7 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "query_lifecycle_fault",
         "expect_lifecycle_error_source",
         "expect_participant_outcome",
+        "expect_lifecycle_telemetry_unavailable",
         "expect_lifecycle_metric_delta",
         "kill_query_at_lifecycle_phase",
         "kill_fe_at_lifecycle_phase",

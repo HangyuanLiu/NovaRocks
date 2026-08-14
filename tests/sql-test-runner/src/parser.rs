@@ -158,13 +158,9 @@ fn parse_query_lifecycle_fault(raw: &str) -> anyhow::Result<QueryLifecycleFaultD
     Ok(QueryLifecycleFaultDirective { kind, be_index })
 }
 
-fn parse_kill_be_at_lifecycle_phase(
-    raw: &str,
-) -> anyhow::Result<KillBeAtLifecyclePhaseDirective> {
+fn parse_kill_be_at_lifecycle_phase(raw: &str) -> anyhow::Result<KillBeAtLifecyclePhaseDirective> {
     let (be_index, phase) = raw.split_once(',').ok_or_else(|| {
-        anyhow::anyhow!(
-            "@kill_be_at_lifecycle_phase requires <be_index>,<phase>; received {raw:?}"
-        )
+        anyhow::anyhow!("@kill_be_at_lifecycle_phase requires <be_index>,<phase>; received {raw:?}")
     })?;
     let be_index = be_index
         .trim()
@@ -230,11 +226,31 @@ fn parse_lifecycle_metric_delta(raw: &str) -> anyhow::Result<QueryLifecycleMetri
     })
 }
 
+fn parse_lifecycle_telemetry_unavailable(
+    raw: &str,
+) -> anyhow::Result<QueryLifecycleTelemetryUnavailableExpectation> {
+    let mut fields = raw.splitn(3, ',');
+    let scope = fields.next().unwrap_or_default();
+    let stage = fields.next().unwrap_or_default();
+    let code = fields.next().unwrap_or_default();
+    if !matches!(scope, "fragment" | "query") || stage.is_empty() || code.is_empty() {
+        bail!(
+            "@expect_lifecycle_telemetry_unavailable requires <fragment|query>,<stage>,<code>; received {raw:?}"
+        );
+    }
+    Ok(QueryLifecycleTelemetryUnavailableExpectation {
+        scope: scope.to_string(),
+        stage: stage.to_string(),
+        code: code.to_string(),
+    })
+}
+
 fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructuredAssertion {
     meta.query_lifecycle_structured_assertion
         .get_or_insert_with(|| QueryLifecycleStructuredAssertion {
             error_source: None,
             participant_outcome: None,
+            telemetry_unavailable: Vec::new(),
             metric_deltas: Vec::new(),
         })
 }
@@ -484,6 +500,11 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 structured_assertion_mut(&mut meta).participant_outcome =
                     Some(parse_participant_outcome_expectation(&raw_value)?);
             }
+            "expect_lifecycle_telemetry_unavailable" => {
+                structured_assertion_mut(&mut meta)
+                    .telemetry_unavailable
+                    .push(parse_lifecycle_telemetry_unavailable(&raw_value)?);
+            }
             "expect_lifecycle_metric_delta" => {
                 structured_assertion_mut(&mut meta)
                     .metric_deltas
@@ -515,7 +536,8 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 meta.kill_fe_at_lifecycle_phase = Some(phase);
             }
             "kill_be_at_lifecycle_phase" => {
-                meta.kill_be_at_lifecycle_phase = Some(parse_kill_be_at_lifecycle_phase(&raw_value)?);
+                meta.kill_be_at_lifecycle_phase =
+                    Some(parse_kill_be_at_lifecycle_phase(&raw_value)?);
             }
             "stop_query_control_heartbeat_after_stage_be_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -636,6 +658,11 @@ fn merge_lifecycle_structured_assertion(
             .participant_outcome
             .clone()
             .or_else(|| base.participant_outcome.clone()),
+        telemetry_unavailable: if override_meta.telemetry_unavailable.is_empty() {
+            base.telemetry_unavailable.clone()
+        } else {
+            override_meta.telemetry_unavailable.clone()
+        },
         metric_deltas: if override_meta.metric_deltas.is_empty() {
             base.metric_deltas.clone()
         } else {
@@ -1731,6 +1758,7 @@ mod opt5_directive_tests {
             "-- @query_lifecycle_fault=terminal-p1-encode-failure,2".to_string(),
             "-- @expect_lifecycle_error_source=backend-attestation".to_string(),
             "-- @expect_participant_outcome=attestation:P1EncodeFailed".to_string(),
+            "-- @expect_lifecycle_telemetry_unavailable=query,runtime_filter_terminal_capture,INJECTED_P2_ASSEMBLY_FAILURE".to_string(),
             "-- @expect_lifecycle_metric_delta=terminal_retained,1".to_string(),
         ];
 
@@ -1761,6 +1789,14 @@ mod opt5_directive_tests {
             Some(ParticipantOutcomeExpectation::Attestation {
                 reason: "P1EncodeFailed".to_string(),
             })
+        );
+        assert_eq!(
+            assertion.telemetry_unavailable,
+            vec![QueryLifecycleTelemetryUnavailableExpectation {
+                scope: "query".to_string(),
+                stage: "runtime_filter_terminal_capture".to_string(),
+                code: "INJECTED_P2_ASSEMBLY_FAILURE".to_string(),
+            }]
         );
         assert_eq!(
             assertion.metric_deltas,

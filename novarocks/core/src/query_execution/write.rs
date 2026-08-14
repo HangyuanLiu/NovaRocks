@@ -885,8 +885,13 @@ fn query_id_to_be_bytes(execution_id: QueryExecutionId) -> [u8; 16] {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use crate::query_execution::lifecycle::AttemptId;
+    use crate::query_execution::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
+        QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalTelemetry,
+    };
+    use crate::runtime::sink_commit::SinkCommitReportSnapshot;
     use novarocks_protocol::plan;
+    use prost::Message;
 
     fn query_id() -> UniqueId {
         UniqueId::new(7, 11)
@@ -964,6 +969,85 @@ mod tests {
             write_id: query_id(),
             writers: vec![writer_commit_input(frames)],
         }
+    }
+
+    fn writer_terminal_fragment() -> FragmentTerminalSnapshot {
+        let staged = decode_connector_staged_report_frame(&frame(b"report", 0, 1, b"report"))
+            .expect("valid staged report frame");
+        FragmentTerminalSnapshot::new(
+            fragment_instance_id(),
+            31,
+            FragmentTerminalOutcome::Succeeded,
+            SinkCommitReportSnapshot::default().with_connector_staged_report_frames(vec![staged]),
+            None,
+        )
+        .expect("writer terminal fragment")
+    }
+
+    fn terminal_snapshot_with_p2(
+        profile_contribution: TerminalTelemetry<QueryTerminalProfileContributionV1>,
+    ) -> QueryTerminalSnapshot {
+        QueryTerminalSnapshot::new_with_profile_telemetry(
+            execution_id(),
+            ParticipantBackendIdentity::new(
+                31,
+                QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+                1,
+            )
+            .expect("backend identity"),
+            ParticipantManifestDigest::new([9; 32]),
+            vec![writer_terminal_fragment()],
+            profile_contribution,
+        )
+        .expect("terminal snapshot")
+    }
+
+    fn staged_report_frame_bytes(snapshot: &QueryTerminalSnapshot) -> Vec<Vec<u8>> {
+        let mut builder = WriteTerminalBuilder {
+            write_id: query_id(),
+            expected: BTreeMap::from([(
+                WriterKey {
+                    query_id: query_id(),
+                    fragment_instance_id: fragment_instance_id(),
+                    backend_num: 31,
+                },
+                (0, 29, execution_id(), None),
+            )]),
+            completed: BTreeMap::new(),
+            failure: None,
+        };
+        builder
+            .apply_terminal(&snapshot.fragments()[0])
+            .expect("apply writer terminal");
+        let (commit, abort) = builder.finish().expect("complete write").into_payloads();
+        assert!(abort.is_none(), "P2 telemetry must not abort the write");
+        commit
+            .expect("commit payload")
+            .writers
+            .into_iter()
+            .flat_map(|writer| writer.connector_staged_report_frames)
+            .map(|frame| frame.encode_to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn p2_unavailable_preserves_staged_report_frame_bytes() {
+        let available = terminal_snapshot_with_p2(TerminalTelemetry::Available(
+            QueryTerminalProfileContributionV1::empty(),
+        ));
+        let unavailable = terminal_snapshot_with_p2(
+            TerminalTelemetry::unavailable(
+                "runtime_filter_terminal_capture",
+                "INJECTED_P2_ASSEMBLY_FAILURE",
+            )
+            .expect("typed P2 unavailable"),
+        );
+
+        assert_eq!(
+            staged_report_frame_bytes(&available),
+            staged_report_frame_bytes(&unavailable),
+            "P2 observation changes must not alter staged write evidence"
+        );
     }
 
     #[test]

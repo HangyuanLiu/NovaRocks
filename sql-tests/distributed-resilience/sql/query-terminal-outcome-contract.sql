@@ -64,6 +64,7 @@ SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
 -- @query_lifecycle_fault=observation-p2-assembly-failure,0
 -- @query_control_fragment_backend_limit=3
 -- @expect_participant_outcome=proof
+-- @expect_lifecycle_telemetry_unavailable=query,runtime_filter_terminal_capture,INJECTED_P2_ASSEMBLY_FAILURE
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
 
@@ -72,6 +73,7 @@ SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
 -- @query_lifecycle_fault=observation-p2-budget-pressure,1
 -- @query_control_fragment_backend_limit=3
 -- @expect_participant_outcome=proof
+-- @expect_lifecycle_telemetry_unavailable=query,runtime_filter_terminal_capture,INJECTED_P2_BUDGET_PRESSURE
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract WHERE sleep(delay_s);
 
@@ -114,3 +116,25 @@ JOIN ${case_db}.terminal_outcome_contract right_side
 -- A faulted lifecycle attempt must not poison the next query.
 -- @result_contains=3
 SELECT COUNT(*) FROM ${case_db}.terminal_outcome_contract;
+
+-- query 12
+-- @skip_result_check=true
+CREATE TABLE ${case_db}.terminal_outcome_p2_write (
+  id BIGINT,
+  value BIGINT
+)
+TBLPROPERTIES ("format-version" = "3");
+
+-- query 13
+-- P2 must not veto a write or alter the P1 staged-report evidence consumed
+-- by the commit path. The Core contract test compares those frame bytes.
+-- @query_lifecycle_fault=observation-p2-assembly-failure,0
+-- @query_control_fragment_backend_limit=3
+-- @expect_participant_outcome=proof
+-- @expect_lifecycle_telemetry_unavailable=query,runtime_filter_terminal_capture,INJECTED_P2_ASSEMBLY_FAILURE
+-- @skip_result_check=true
+INSERT INTO ${case_db}.terminal_outcome_p2_write VALUES (41, 410), (42, 420);
+
+-- query 14
+-- @result_contains=2
+SELECT COUNT(*) FROM ${case_db}.terminal_outcome_p2_write;

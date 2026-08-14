@@ -37,6 +37,7 @@ struct LifecycleConvergenceWireSnapshot {
     execution_id: String,
     error_source: Option<String>,
     participant_outcomes: Vec<LifecycleParticipantOutcomeWire>,
+    telemetry_unavailable: Vec<LifecycleTelemetryUnavailableWire>,
     metrics: BTreeMap<String, i64>,
 }
 
@@ -46,6 +47,13 @@ enum LifecycleParticipantOutcomeWire {
     Proof,
     Attestation { reason: String },
     NoOutcome,
+}
+
+#[derive(serde::Deserialize)]
+struct LifecycleTelemetryUnavailableWire {
+    scope: String,
+    stage: String,
+    code: String,
 }
 
 fn query_lifecycle_structured_snapshot_from_fe(
@@ -93,10 +101,20 @@ fn query_lifecycle_structured_snapshot_from_fe(
             LifecycleParticipantOutcomeWire::NoOutcome => ParticipantTerminalOutcomeKind::NoOutcome,
         })
         .collect();
+    let telemetry_unavailable = wire
+        .telemetry_unavailable
+        .into_iter()
+        .map(|telemetry| QueryLifecycleTelemetryUnavailable {
+            scope: telemetry.scope,
+            stage: telemetry.stage,
+            code: telemetry.code,
+        })
+        .collect();
     Ok(Some(QueryLifecycleStructuredSnapshot {
         execution_id: Some(wire.execution_id),
         error_source,
         participant_outcomes,
+        telemetry_unavailable,
         metrics: wire.metrics,
     }))
 }
@@ -165,11 +183,19 @@ pub enum ParticipantTerminalOutcomeKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleTelemetryUnavailable {
+    pub scope: String,
+    pub stage: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredSnapshot {
     /// The immutable execution identity used to correlate all values below.
     pub execution_id: Option<String>,
     pub error_source: Option<QueryLifecycleErrorSource>,
     pub participant_outcomes: Vec<ParticipantTerminalOutcomeKind>,
+    pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailable>,
     pub metrics: BTreeMap<String, i64>,
 }
 

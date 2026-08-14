@@ -128,6 +128,7 @@ pub enum ParticipantOutcomeExpectation {
 pub struct QueryLifecycleStructuredAssertion {
     pub error_source: Option<QueryLifecycleErrorSource>,
     pub participant_outcome: Option<ParticipantOutcomeExpectation>,
+    pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailableExpectation>,
     pub metric_deltas: Vec<QueryLifecycleMetricDeltaExpectation>,
 }
 
@@ -135,6 +136,13 @@ pub struct QueryLifecycleStructuredAssertion {
 pub struct QueryLifecycleMetricDeltaExpectation {
     pub metric: String,
     pub delta: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleTelemetryUnavailableExpectation {
+    pub scope: String,
+    pub stage: String,
+    pub code: String,
 }
 
 #[derive(Debug, Clone)]

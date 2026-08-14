@@ -2541,6 +2541,7 @@ mod tests {
     fn terminal_snapshot_wire_round_trips_explicit_p2_unavailability() {
         use crate::query_execution::lifecycle::TerminalTelemetry;
 
+        let statistics_payload = vec![0, 1, 2, 0xff, 0, 3, 5, 8];
         let fragment = crate::query_execution::lifecycle::FragmentTerminalSnapshot::new_with_profile_telemetry(
             novarocks_types::UniqueId::new(17, 19),
             3,
@@ -2549,7 +2550,9 @@ mod tests {
             TerminalTelemetry::unavailable("profile_assembly", "BUDGET_EXHAUSTED")
                 .expect("typed fragment telemetry"),
         )
-        .expect("terminal fragment");
+        .expect("terminal fragment")
+        .with_statistics_payload(statistics_payload.clone())
+        .expect("bounded statistics payload");
         let snapshot =
             crate::query_execution::lifecycle::QueryTerminalSnapshot::new_with_profile_telemetry(
                 execution_id(),
@@ -2584,6 +2587,14 @@ mod tests {
                 .expect("fragment telemetry reason")
                 .stage(),
             "profile_assembly"
+        );
+        assert_eq!(
+            decoded.fragments()[0].statistics_payload(),
+            statistics_payload.as_slice()
+        );
+        assert_eq!(
+            decoded.fragments()[0].statistics_payload().len(),
+            statistics_payload.len()
         );
     }
 
